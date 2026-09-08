@@ -1,6 +1,13 @@
 use bondsymphonic_proto::PrereqStatus;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::process::Command;
+
+/// Upper bound on how long any single prerequisite probe (`git --version`,
+/// `gh auth status`, etc.) may run. `check_prereqs` is called on IDE startup
+/// and must return promptly even if a command stalls on a dead network or
+/// hung child process.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn parse_git_version(s: &str) -> Option<(u32, u32)> {
     let v = s.strip_prefix("git version ")?;
@@ -8,19 +15,30 @@ pub fn parse_git_version(s: &str) -> Option<(u32, u32)> {
     Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
 }
 
-async fn run(cmd: &str, args: &[&str]) -> Result<(bool, String), String> {
-    let out = Command::new(cmd)
+async fn run_with_timeout(
+    cmd: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<(bool, String), String> {
+    let fut = Command::new(cmd)
         .args(args)
         .stdin(Stdio::null())
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(timeout, fut).await {
+        Ok(res) => res.map_err(|e| e.to_string())?,
+        Err(_) => return Err(format!("{cmd} timed out after {}s", timeout.as_secs())),
+    };
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
     Ok((
         out.status.success(),
         if text.is_empty() { err } else { text },
     ))
+}
+
+async fn run(cmd: &str, args: &[&str]) -> Result<(bool, String), String> {
+    run_with_timeout(cmd, args, CHECK_TIMEOUT).await
 }
 
 fn status(name: &str, ok: bool, detail: impl Into<String>, fix: &str) -> PrereqStatus {
@@ -198,5 +216,18 @@ mod tests {
                 "gh_auth"
             ]
         );
+    }
+
+    // `sleep`/`gh auth status`/etc. only ever misbehave (hang) on unix-flavored
+    // command sets available in the WSL distro; there is no portable equivalent
+    // reachable from a plain unit test on Windows, so this is unix-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_times_out_on_slow_command() {
+        let start = std::time::Instant::now();
+        let result = run_with_timeout("sleep", &["30"], std::time::Duration::from_secs(1)).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 }
