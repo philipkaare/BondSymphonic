@@ -20,12 +20,23 @@ use tokio::sync::oneshot;
 /// `(pid, has_pty, fds)` for a successful spawn, or init's error message.
 type SpawnReply = Result<(u32, bool, Vec<OwnedFd>), String>;
 
+/// Waiters and already-delivered exit codes, under one lock.
+///
+/// They have to move together: a caller registering a waiter and the reader
+/// thread recording an exit race for the same pid, and with two locks an exit
+/// can be filed as "early" moments after a waiter appeared, leaving that waiter
+/// to hang forever.
+#[derive(Default)]
+struct ExitTable {
+    waiters: HashMap<u32, oneshot::Sender<i32>>,
+    /// Exit codes that arrived before the caller had a channel to receive them.
+    early: HashMap<u32, i32>,
+}
+
 pub struct ExecClient {
     writer: Mutex<UnixStream>,
     pending: Mutex<HashMap<u64, oneshot::Sender<SpawnReply>>>,
-    exits: Mutex<HashMap<u32, oneshot::Sender<i32>>>,
-    /// Exit codes that arrived before the caller had a channel to receive them.
-    early_exits: Mutex<HashMap<u32, i32>>,
+    exits: Mutex<ExitTable>,
     next_id: AtomicU64,
 }
 
@@ -37,7 +48,6 @@ impl ExecClient {
             writer: Mutex::new(stream),
             pending: Default::default(),
             exits: Default::default(),
-            early_exits: Default::default(),
             next_id: AtomicU64::new(1),
         });
         let c = client.clone();
@@ -57,7 +67,15 @@ impl ExecClient {
             {
                 let mut cmsg = cmsg_space!([RawFd; 3]);
                 let mut iov = [IoSliceMut::new(&mut buf)];
-                let msg = match recvmsg::<()>(fd, &mut iov, Some(&mut cmsg), MsgFlags::empty()) {
+                // MSG_CMSG_CLOEXEC: received descriptors must not leak into the
+                // next workspace's bwrap, or one sandbox would hold another's
+                // pipes and PTY open.
+                let msg = match recvmsg::<()>(
+                    fd,
+                    &mut iov,
+                    Some(&mut cmsg),
+                    MsgFlags::MSG_CMSG_CLOEXEC,
+                ) {
                     Ok(m) => m,
                     Err(_) => break,
                 };
@@ -91,7 +109,7 @@ impl ExecClient {
             let _ = tx.send(Err("sandbox init went away".into()));
         }
         let exits = std::mem::take(&mut *self.exits.lock().unwrap());
-        for (_, tx) in exits {
+        for (_, tx) in exits.waiters {
             let _ = tx.send(-1);
         }
     }
@@ -110,14 +128,20 @@ impl ExecClient {
                 }
             }
             InitReply::Exited { pid, code } => {
-                let waiter = self.exits.lock().unwrap().remove(&pid);
-                match waiter {
-                    Some(tx) => {
-                        let _ = tx.send(code);
+                // Take the waiter, or record the exit, without ever releasing
+                // the lock in between.
+                let waiter = {
+                    let mut table = self.exits.lock().unwrap();
+                    match table.waiters.remove(&pid) {
+                        Some(tx) => Some(tx),
+                        None => {
+                            table.early.insert(pid, code);
+                            None
+                        }
                     }
-                    None => {
-                        self.early_exits.lock().unwrap().insert(pid, code);
-                    }
+                };
+                if let Some(tx) = waiter {
+                    let _ = tx.send(code);
                 }
             }
             InitReply::ShuttingDown => {}
@@ -160,13 +184,20 @@ impl ExecClient {
             .map_err(sandbox_error)?;
 
         let (exit_tx, exit_rx) = oneshot::channel();
-        match self.early_exits.lock().unwrap().remove(&pid) {
-            Some(code) => {
-                let _ = exit_tx.send(code);
+        // Claim an exit that already arrived, or register as its waiter, under
+        // one lock: the reader thread may be handling this pid right now.
+        let already_exited = {
+            let mut table = self.exits.lock().unwrap();
+            match table.early.remove(&pid) {
+                Some(code) => Some((exit_tx, code)),
+                None => {
+                    table.waiters.insert(pid, exit_tx);
+                    None
+                }
             }
-            None => {
-                self.exits.lock().unwrap().insert(pid, exit_tx);
-            }
+        };
+        if let Some((tx, code)) = already_exited {
+            let _ = tx.send(code);
         }
 
         let me = Arc::clone(self);

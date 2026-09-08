@@ -23,8 +23,11 @@ use std::time::Duration;
 
 /// Live child pids, keyed so the reaper only reports processes we started.
 type Children = Arc<Mutex<HashSet<i32>>>;
-/// Every daemon connection, so exits can be broadcast to all of them.
-type Conns = Arc<Mutex<Vec<UnixStream>>>;
+/// Every daemon connection, so exits can be broadcast to all of them. Each is
+/// tagged with an id: the stream stored here is a `try_clone` of the one
+/// [`serve`] reads from, a different descriptor number, so a connection can
+/// only be removed again by id.
+type Conns = Arc<Mutex<Vec<(u64, UnixStream)>>>;
 
 /// How long a child gets between SIGTERM and SIGKILL during shutdown.
 const GRACE: Duration = Duration::from_secs(5);
@@ -52,15 +55,15 @@ pub fn run(socket: &std::path::Path) -> anyhow::Result<()> {
         });
     }
 
-    for stream in listener.incoming() {
+    for (id, stream) in (1_u64..).zip(listener.incoming()) {
         let stream = match stream {
             Ok(s) => s,
             Err(_) => break,
         };
-        conns.lock().unwrap().push(stream.try_clone()?);
+        conns.lock().unwrap().push((id, stream.try_clone()?));
         let children = children.clone();
         let conns = conns.clone();
-        std::thread::spawn(move || serve(stream, children, conns));
+        std::thread::spawn(move || serve(id, stream, children, conns));
     }
     Ok(())
 }
@@ -78,10 +81,10 @@ fn notify_exit(conns: &Conns, children: &Children, pid: i32, code: i32) {
     conns
         .lock()
         .unwrap()
-        .retain_mut(|c| c.write_all(&msg).is_ok());
+        .retain_mut(|(_, c)| c.write_all(&msg).is_ok());
 }
 
-fn serve(stream: UnixStream, children: Children, conns: Conns) {
+fn serve(conn_id: u64, stream: UnixStream, children: Children, conns: Conns) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
     let mut line = String::new();
     loop {
@@ -132,7 +135,12 @@ fn serve(stream: UnixStream, children: Children, conns: Conns) {
                 }
             }
             InitRequest::Kill { pid, signal } => {
-                let _ = kill(Pid::from_raw(pid as i32), Signal::try_from(signal).ok());
+                // The process group first, so a shell takes everything it
+                // started down with it, then the leader itself in case it left
+                // its group.
+                let sig = Signal::try_from(signal).ok();
+                let _ = kill(Pid::from_raw(-(pid as i32)), sig);
+                let _ = kill(Pid::from_raw(pid as i32), sig);
             }
             InitRequest::Shutdown => {
                 shutdown_all(&children);
@@ -142,10 +150,7 @@ fn serve(stream: UnixStream, children: Children, conns: Conns) {
         }
     }
     // Daemon went away: tear everything down.
-    conns
-        .lock()
-        .unwrap()
-        .retain(|c| c.as_raw_fd() != stream.as_raw_fd());
+    conns.lock().unwrap().retain(|(id, _)| *id != conn_id);
     if conns.lock().unwrap().is_empty() {
         shutdown_all(&children);
         std::process::exit(0);
