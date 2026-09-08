@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -36,12 +37,27 @@ enum PendingOutcome {
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<PendingOutcome>>>>;
 
+/// Owns the reader task's `JoinHandle` and aborts it on drop. Held behind an `Arc` shared
+/// by every `DaemonClient` clone so the reader task (and, with it, the socket's read half)
+/// is torn down deterministically once the last clone goes away, rather than lingering
+/// until the peer notices the write half closed and closes its own side.
+struct ReaderGuard(Option<JoinHandle<()>>);
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DaemonClient {
     out: mpsc::Sender<ClientMessage>,
     pending: Pending,
     next_id: Arc<AtomicU64>,
     connected: Arc<AtomicBool>,
+    _reader_guard: Arc<ReaderGuard>,
 }
 
 impl DaemonClient {
@@ -59,14 +75,9 @@ impl DaemonClient {
         let (ev_tx, ev_rx) = mpsc::channel::<(Option<WorkspaceId>, Event)>(1024);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(true));
-        let client = Self {
-            out: out_tx,
-            pending: pending.clone(),
-            next_id: Arc::new(AtomicU64::new(1)),
-            connected: connected.clone(),
-        };
 
-        // Writer task: serializes outgoing requests onto the socket.
+        // Writer task: serializes outgoing requests onto the socket. Ends (dropping its
+        // write half) once every `DaemonClient` clone is gone and `out_tx` is dropped.
         tokio::spawn(async move {
             while let Some(msg) = out_rx.recv().await {
                 if codec::write_message(&mut w, &msg).await.is_err() {
@@ -75,10 +86,13 @@ impl DaemonClient {
             }
         });
 
-        // Reader task: demultiplexes responses (by id) from events (fanned out).
+        // Reader task: demultiplexes responses (by id) from events (fanned out). Its
+        // handle is owned by `ReaderGuard` below so it is aborted (and its read half
+        // dropped) as soon as the last `DaemonClient` clone goes away, rather than
+        // lingering until the peer notices and closes its side.
         let conn2 = connected.clone();
         let pend2 = pending.clone();
-        tokio::spawn(async move {
+        let reader_handle: JoinHandle<()> = tokio::spawn(async move {
             loop {
                 match codec::read_message(&mut reader).await {
                     Ok(Some(ServerMessage::Response { id, result, error })) => {
@@ -110,6 +124,14 @@ impl DaemonClient {
             }
         });
 
+        let client = Self {
+            out: out_tx,
+            pending: pending.clone(),
+            next_id: Arc::new(AtomicU64::new(1)),
+            connected: connected.clone(),
+            _reader_guard: Arc::new(ReaderGuard(Some(reader_handle))),
+        };
+
         let hello: HelloResult = client
             .request(Request::Hello(HelloParams {
                 token: token.into(),
@@ -130,10 +152,17 @@ impl DaemonClient {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        self.out
+        if self
+            .out
             .send(ClientMessage::Request { id, request: req })
             .await
-            .map_err(|_| ClientError::Disconnected)?;
+            .is_err()
+        {
+            // The writer task is gone; nothing will ever complete this oneshot, so
+            // remove it instead of leaking it in the pending map.
+            self.pending.lock().unwrap().remove(&id);
+            return Err(ClientError::Disconnected);
+        }
         match rx.await {
             Ok(PendingOutcome::Value(v)) => Ok(v),
             Ok(PendingOutcome::Rpc(e)) => Err(ClientError::Rpc(e)),
