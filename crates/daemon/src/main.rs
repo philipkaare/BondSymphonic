@@ -1,8 +1,14 @@
 use anyhow::Result;
+use bondsymphonic_daemon::daemon::Daemon;
 use bondsymphonic_daemon::sandbox;
+use bondsymphonic_daemon::server::dispatch::SystemHandler;
+use bondsymphonic_daemon::server::handlers::WorkspaceHandler;
 use bondsymphonic_daemon::server::{Server, ServerConfig};
+use bondsymphonic_daemon::workspace::DataDirs;
+use bondsymphonic_proto::{AgentAdapterKind, Capabilities};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
@@ -67,8 +73,6 @@ async fn serve(args: Args) -> Result<()> {
     } else {
         "linux_bwrap"
     };
-    // Task 6 keeps this backend for the workspace registry; for now it decides
-    // what the daemon advertises.
     let backend = sandbox::backend_for(backend_name);
     tracing::info!(
         ?data_dir,
@@ -76,15 +80,29 @@ async fn serve(args: Args) -> Result<()> {
         sandbox_backend = backend.name(),
         "starting"
     );
+    // `backend_for` downgrades an unsupported name to noop, so the running
+    // backend's own name is what gets advertised.
+    let capabilities = Capabilities {
+        sandbox_backend: backend.name().into(),
+        git_protect: backend.name() == "linux_bwrap",
+        adapters: vec![AgentAdapterKind::Terminal],
+    };
 
     let server = Server::bind(ServerConfig {
         bind_port: args.port,
-        capabilities: bondsymphonic_proto::Capabilities {
-            sandbox_backend: backend.name().into(),
-            ..ServerConfig::default().capabilities
-        },
+        capabilities: capabilities.clone(),
     })
     .await?;
+    let daemon = Daemon::new(DataDirs::new(&data_dir), backend, server.event_bus())?;
+    daemon.restore().await;
+    let system = SystemHandler {
+        token: server.token().to_string(),
+        capabilities,
+    };
+    let server = server.with_handler(Arc::new(WorkspaceHandler {
+        system,
+        daemon: daemon.clone(),
+    }));
     // The one and only stdout line: the IDE parses it.
     println!(
         "{}",
@@ -113,6 +131,12 @@ async fn serve(args: Args) -> Result<()> {
     });
 
     server.run(shutdown).await?;
+    // Take the handles out under the lock, then shut them down: a `parking_lot`
+    // guard must never be held across an await.
+    let sandboxes: Vec<_> = daemon.sandboxes.lock().drain().map(|(_, h)| h).collect();
+    for h in sandboxes {
+        let _ = h.shutdown().await;
+    }
     tracing::info!("daemon exited");
     Ok(())
 }

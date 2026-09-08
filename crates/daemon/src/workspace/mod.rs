@@ -1,3 +1,4 @@
+pub mod lifecycle;
 pub mod registry;
 
 use bondsymphonic_proto::{AgentId, RunId, WorkspaceId, WorkspaceInfo, WorkspaceState};

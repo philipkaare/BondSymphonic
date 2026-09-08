@@ -24,3 +24,114 @@ pub fn init_repo(dir: &Path) -> PathBuf {
     git(&["commit", "-q", "-m", "init"]);
     repo
 }
+
+// ---------------------------------------------------------------------------
+// Daemon test harness: a line-protocol client and a server wired to a
+// `WorkspaceHandler` over the noop sandbox backend.
+// ---------------------------------------------------------------------------
+
+use bondsymphonic_daemon::daemon::Daemon;
+use bondsymphonic_daemon::sandbox::backend_for;
+use bondsymphonic_daemon::server::dispatch::SystemHandler;
+use bondsymphonic_daemon::server::handlers::WorkspaceHandler;
+use bondsymphonic_daemon::server::{Server, ServerConfig};
+use bondsymphonic_daemon::workspace::DataDirs;
+use bondsymphonic_proto::*;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio_util::sync::CancellationToken;
+
+pub struct Client {
+    r: BufReader<tokio::net::tcp::OwnedReadHalf>,
+    w: tokio::net::tcp::OwnedWriteHalf,
+    next: u64,
+}
+
+impl Client {
+    pub async fn connect(port: u16, token: &str) -> Client {
+        let s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (r, w) = s.into_split();
+        let mut c = Client {
+            r: BufReader::new(r),
+            w,
+            next: 1,
+        };
+        let v = c
+            .call(Request::Hello(HelloParams {
+                token: token.into(),
+                client_version: "t".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(v["daemon_version"].is_string());
+        c
+    }
+
+    pub async fn send(&mut self, req: Request) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        self.w
+            .write_all(codec::encode(&ClientMessage::Request { id, request: req }).as_bytes())
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Reads until the response for `id` arrives; returns intermediate events.
+    pub async fn recv_response(
+        &mut self,
+        id: u64,
+        events: &mut Vec<(Option<WorkspaceId>, Event)>,
+    ) -> Result<serde_json::Value, RpcError> {
+        loop {
+            let mut line = String::new();
+            assert!(
+                self.r.read_line(&mut line).await.unwrap() > 0,
+                "connection closed"
+            );
+            match codec::decode::<ServerMessage>(line.trim_end()).unwrap() {
+                ServerMessage::Response {
+                    id: rid,
+                    result,
+                    error,
+                } if rid == id => {
+                    return match error {
+                        Some(e) => Err(e),
+                        None => Ok(result.unwrap_or(serde_json::Value::Null)),
+                    }
+                }
+                ServerMessage::Response { .. } => {}
+                ServerMessage::Event {
+                    workspace_id,
+                    event,
+                } => events.push((workspace_id, event)),
+            }
+        }
+    }
+
+    pub async fn call(&mut self, req: Request) -> Result<serde_json::Value, RpcError> {
+        let id = self.send(req).await;
+        let mut ev = Vec::new();
+        self.recv_response(id, &mut ev).await
+    }
+}
+
+/// Binds a server on an ephemeral port with a workspace handler over `root`.
+pub async fn start_daemon(root: &std::path::Path) -> (u16, String, Arc<Daemon>, CancellationToken) {
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let daemon = Daemon::new(DataDirs::new(root), backend_for("noop"), server.event_bus()).unwrap();
+    let system = SystemHandler {
+        token: server.token().to_string(),
+        capabilities: ServerConfig::default().capabilities,
+    };
+    let handler = Arc::new(WorkspaceHandler {
+        system,
+        daemon: daemon.clone(),
+    });
+    let (port, token) = (server.port(), server.token().to_string());
+    let cancel = CancellationToken::new();
+    let c2 = cancel.clone();
+    tokio::spawn(async move { server.with_handler(handler).run(c2).await.unwrap() });
+    (port, token, daemon, cancel)
+}

@@ -1,0 +1,342 @@
+//! Workspace create / destroy / status: the git worktree, the per-workspace
+//! directories and the sandbox that fronts them, kept in step with the registry.
+
+use crate::daemon::Daemon;
+use crate::git::{
+    repo,
+    worktree::{self, Layout},
+};
+use crate::ids::new_id;
+use crate::sandbox::SandboxSpec;
+use crate::workspace::{now_rfc3339, Workspace};
+use bondsymphonic_proto::*;
+use std::path::{Path, PathBuf};
+
+/// The account whose `/home/<user>` the bwrap backend mounts the sandbox home at.
+///
+/// Duplicated from `sandbox::linux_bwrap::whoami`, which is private and behind
+/// `cfg(target_os = "linux")`; the spec has to be built on every host so the
+/// noop backend and the Windows tests see the same layout.
+fn sandbox_user() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "bs".into())
+}
+
+pub async fn layout_for(d: &Daemon, ws: &Workspace) -> Result<Layout, RpcError> {
+    let git_common = repo::common_dir(&d.git, &ws.repo_path).await?;
+    Ok(Layout {
+        repo: ws.repo_path.clone(),
+        git_common,
+        name: ws.name.clone(),
+        branch: ws.branch.clone(),
+        worktree_path: ws.worktree_path.clone(),
+        objects_dir: d.dirs.objects(&ws.id),
+    })
+}
+
+pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
+    let same = |p: &Path| (p.to_path_buf(), p.to_path_buf());
+    let mut rw_binds = vec![same(&ws.worktree_path), same(&layout.objects_dir)];
+    rw_binds.extend(layout.rw_git_paths().iter().map(|p| same(p)));
+    let cache = d.dirs.cache(&ws.id);
+    let home_in_sandbox = PathBuf::from(format!("/home/{}", sandbox_user()));
+    rw_binds.push((cache, home_in_sandbox.join(".cache")));
+    let ro_binds = vec![same(&layout.git_common)];
+    let mut env = layout.sandbox_git_env();
+    env.push(("BS_WORKSPACE".into(), ws.id.to_string()));
+    SandboxSpec {
+        id: ws.id.clone(),
+        rw_binds,
+        ro_binds,
+        home: d.dirs.home(&ws.id),
+        run_dir: d.dirs.run(&ws.id),
+        env,
+        cwd: ws.worktree_path.clone(),
+    }
+}
+
+pub async fn start_sandbox(d: &Daemon, ws: &Workspace) -> Result<(), RpcError> {
+    let layout = layout_for(d, ws).await?;
+    for p in [
+        d.dirs.cache(&ws.id),
+        d.dirs.home(&ws.id),
+        d.dirs.run(&ws.id),
+    ] {
+        std::fs::create_dir_all(p).map_err(|e| RpcError::io(&e))?;
+    }
+    let handle = d.backend.start(&spec_for(d, ws, &layout)).await?;
+    d.sandboxes.lock().insert(ws.id.clone(), handle);
+    Ok(())
+}
+
+/// Gives the sandbox home a git identity, so commits made inside it are not
+/// rejected for a missing `user.email`. Best effort: a repo without an
+/// effective identity simply gets no `.gitconfig`.
+async fn seed_home(d: &Daemon, ws: &Workspace) {
+    let home = d.dirs.home(&ws.id);
+    let _ = std::fs::create_dir_all(&home);
+    let name = d
+        .git
+        .run(&ws.repo_path, &["config", "--get", "user.name"])
+        .await
+        .map(|o| o.stdout.trim().to_string())
+        .unwrap_or_default();
+    let email = d
+        .git
+        .run(&ws.repo_path, &["config", "--get", "user.email"])
+        .await
+        .map(|o| o.stdout.trim().to_string())
+        .unwrap_or_default();
+    if !name.is_empty() || !email.is_empty() {
+        let _ = std::fs::write(
+            home.join(".gitconfig"),
+            format!("[user]\n\tname = {name}\n\temail = {email}\n[safe]\n\tdirectory = *\n"),
+        );
+    }
+}
+
+pub async fn create(d: &Daemon, p: WorkspaceCreateParams) -> Result<WorkspaceInfo, RpcError> {
+    let repo_path = PathBuf::from(&p.repo_path);
+    if p.name.is_empty()
+        || p.name.contains('/')
+        || p.name.contains("..")
+        || p.name.contains(char::is_whitespace)
+    {
+        return Err(RpcError::invalid_params(
+            "workspace name must be a single path-safe word",
+        ));
+    }
+    let git_common = repo::common_dir(&d.git, &repo_path).await?;
+    if d.registry.find_by_name(&repo_path, &p.name).is_some() {
+        return Err(RpcError::new(
+            ErrorCode::Conflict,
+            format!("workspace {} already exists for this repo", p.name),
+        ));
+    }
+    let id = WorkspaceId(new_id("ws_"));
+    d.dirs.ensure_workspace(&id).map_err(|e| RpcError::io(&e))?;
+    let ws = Workspace {
+        id: id.clone(),
+        name: p.name.clone(),
+        repo_path: repo_path.clone(),
+        base_branch: p.base_branch.clone(),
+        branch: Workspace::branch_for(&p.name),
+        worktree_path: d.dirs.worktree(&id),
+        created_at: now_rfc3339(),
+        allowlist: vec![],
+        state: WorkspaceState::Creating,
+        agents: vec![],
+        runs: vec![],
+    };
+    d.registry
+        .insert(ws.clone())
+        .map_err(|e| RpcError::internal(e.to_string()))?;
+    d.emit_state(&ws);
+
+    let layout = Layout {
+        repo: repo_path,
+        git_common,
+        name: ws.name.clone(),
+        branch: ws.branch.clone(),
+        worktree_path: ws.worktree_path.clone(),
+        objects_dir: d.dirs.objects(&id),
+    };
+    if let Err(e) = worktree::create(&d.git, &layout, &p.base_branch).await {
+        // `worktree::create` pre-creates ref, reflog and object directories, and
+        // `git worktree add` can fail halfway; `worktree::remove` is idempotent and
+        // clears all of it. The one failure it must not answer is `Conflict`, which
+        // means the branch already existed: that branch predates this workspace and
+        // is not ours to delete, and `create` rejects it before touching anything.
+        if e.code != ErrorCode::Conflict {
+            let _ = worktree::remove(&d.git, &layout).await;
+        }
+        let _ = d.registry.remove(&id);
+        d.dirs.remove_workspace(&id);
+        return Err(e);
+    }
+    seed_home(d, &ws).await;
+    match start_sandbox(d, &ws).await {
+        Ok(()) => Ok(d.set_state(&id, WorkspaceState::Ready)?.info()),
+        Err(e) => {
+            let ws = d.set_state(
+                &id,
+                WorkspaceState::Error(format!("sandbox failed: {}", e.message)),
+            )?;
+            Ok(ws.info())
+        }
+    }
+}
+
+pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty, RpcError> {
+    let ws = d.workspace(id)?;
+    let layout = layout_for(d, &ws).await?;
+    if !force && ws.worktree_path.exists() {
+        let dirty = !layout
+            .daemon_git()
+            .run(&ws.worktree_path, &["status", "--porcelain"])
+            .await?
+            .stdout
+            .trim()
+            .is_empty();
+        let unmerged = !layout
+            .daemon_git()
+            .run(
+                &ws.repo_path,
+                &["rev-list", &format!("{}..{}", ws.base_branch, ws.branch)],
+            )
+            .await?
+            .stdout
+            .trim()
+            .is_empty();
+        if dirty || unmerged {
+            return Err(RpcError::new(
+                ErrorCode::Conflict,
+                "workspace has uncommitted changes or unmerged commits; use force to discard",
+            )
+            .with_data(serde_json::json!({ "dirty": dirty, "unmerged": unmerged })));
+        }
+    }
+    d.set_state(id, WorkspaceState::Destroying)?;
+    d.ptys.close_workspace(id).await;
+    // The guard is dropped before the await: a `parking_lot` guard held across one
+    // would deadlock any handler that touches `sandboxes` in the meantime.
+    let handle = d.sandboxes.lock().remove(id);
+    if let Some(h) = handle {
+        let _ = h.shutdown().await;
+    }
+    worktree::remove(&d.git, &layout).await?;
+    d.dirs.remove_workspace(id);
+    d.registry
+        .remove(id)
+        .map_err(|e| RpcError::internal(e.to_string()))?;
+    Ok(Empty {})
+}
+
+pub async fn status(d: &Daemon, id: &WorkspaceId) -> Result<WorkspaceStatusResult, RpcError> {
+    let ws = d.workspace(id)?;
+    let layout = layout_for(d, &ws).await?;
+    let out = layout
+        .daemon_git()
+        .run(
+            &ws.worktree_path,
+            &["status", "--porcelain=v2", "--untracked-files=all"],
+        )
+        .await?;
+    Ok(WorkspaceStatusResult {
+        entries: parse_porcelain_v2(&out.stdout),
+    })
+}
+
+/// Parses `git status --porcelain=v2` output into entries (one per path).
+///
+/// The path is the last field of a line, and it may contain spaces, so each line
+/// type is split by its exact field count rather than on the last space:
+/// `1` has 7 fields before the path, `2` has 8 (and is followed by a tab and the
+/// original path), `u` has 9, and `?`/`!` have none.
+pub fn parse_porcelain_v2(text: &str) -> Vec<GitStatusEntry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut it = line.splitn(2, ' ');
+        let kind = it.next();
+        let rest = it.next().unwrap_or("");
+        match kind {
+            Some("?") => out.push(GitStatusEntry {
+                path: rest.to_string(),
+                status: FileStatus::Untracked,
+                staged: false,
+            }),
+            Some(k @ ("1" | "2" | "u")) => {
+                let leading = match k {
+                    "1" => 7,
+                    "2" => 8,
+                    _ => 9,
+                };
+                let fields: Vec<&str> = rest.splitn(leading + 1, ' ').collect();
+                let xy = fields.first().copied().unwrap_or("..");
+                let (x, y) = (
+                    xy.chars().next().unwrap_or('.'),
+                    xy.chars().nth(1).unwrap_or('.'),
+                );
+                // `2` (rename/copy) lines end with "<new path>\t<original path>"; keep the new path.
+                let path = fields
+                    .get(leading)
+                    .copied()
+                    .unwrap_or("")
+                    .split('\t')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let code = if x != '.' { x } else { y };
+                let status = match code {
+                    'A' => FileStatus::Added,
+                    'M' => FileStatus::Modified,
+                    'D' => FileStatus::Deleted,
+                    'R' | 'C' => FileStatus::Renamed,
+                    'U' => FileStatus::Modified,
+                    _ => FileStatus::Unchanged,
+                };
+                out.push(GitStatusEntry {
+                    path,
+                    status,
+                    staged: x != '.',
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_porcelain_v2_lines() {
+        let text = "1 .M N... 100644 100644 100644 abc def src/lib.rs\n1 A. N... 000000 100644 100644 000 abc new.rs\n? wip.txt\n2 R. N... 100644 100644 100644 a b R100 new\told\n";
+        let e = parse_porcelain_v2(text);
+        assert_eq!(e.len(), 4);
+        assert_eq!(
+            (e[0].path.as_str(), e[0].status, e[0].staged),
+            ("src/lib.rs", FileStatus::Modified, false)
+        );
+        assert_eq!(
+            (e[1].path.as_str(), e[1].status, e[1].staged),
+            ("new.rs", FileStatus::Added, true)
+        );
+        assert_eq!(
+            (e[2].path.as_str(), e[2].status),
+            ("wip.txt", FileStatus::Untracked)
+        );
+        assert_eq!(
+            (e[3].path.as_str(), e[3].status),
+            ("new", FileStatus::Renamed)
+        );
+    }
+
+    /// Porcelain v2 leaves spaces in a path unquoted, and the path is the last
+    /// field, so it must be recovered by field count rather than by splitting.
+    #[test]
+    fn keeps_spaces_in_paths() {
+        let text = "1 .D N... 100644 100644 000000 abc def my notes.txt\n? new file.txt\nu UU N... 100644 100644 100644 100644 a b c src/a b.rs\n2 R. N... 100644 100644 100644 a b R100 a b.rs\tc d.rs\n";
+        let e = parse_porcelain_v2(text);
+        assert_eq!(
+            (e[0].path.as_str(), e[0].status, e[0].staged),
+            ("my notes.txt", FileStatus::Deleted, false)
+        );
+        assert_eq!(e[1].path, "new file.txt");
+        assert_eq!(
+            (e[2].path.as_str(), e[2].status),
+            ("src/a b.rs", FileStatus::Modified)
+        );
+        assert_eq!(
+            (e[3].path.as_str(), e[3].status),
+            ("a b.rs", FileStatus::Renamed)
+        );
+    }
+
+    /// Unparseable and header lines are skipped rather than yielding empty paths.
+    #[test]
+    fn ignores_lines_that_are_not_entries() {
+        assert!(parse_porcelain_v2("# branch.oid abc\n\n! ignored.txt\n").is_empty());
+    }
+}

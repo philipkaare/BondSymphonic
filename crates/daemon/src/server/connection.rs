@@ -62,13 +62,31 @@ pub async fn serve_connection(
     // Requests run in their own tasks so a slow one (e.g. `system.check_prereqs`) blocks
     // neither later requests nor event delivery on the same connection.
     let mut inflight: JoinSet<()> = JoinSet::new();
+    // Replies come back through this loop rather than going straight to the writer, so
+    // the events a request published on its way out are written before its response.
+    // See `pending` below.
+    let (resp_tx, mut resp_rx) = mpsc::channel::<ServerMessage>(256);
+    let mut pending: Option<ServerMessage> = None;
 
     loop {
+        // A handler publishes its events (`workspace.state` Ready, say) before it
+        // returns, so by the time its reply reaches this loop they are already in this
+        // connection's broadcast queue. Flushing that queue first turns "the event
+        // arrives before the response" from a scheduling race into a guarantee.
+        if let Some(resp) = pending.take() {
+            if !forward_events(&mut event_rx, &ctx, &out_tx).await {
+                break;
+            }
+            if out_tx.send(codec::encode(&resp)).await.is_err() {
+                break;
+            }
+        }
         tokio::select! {
             _ = shutdown.cancelled() => break,
             // Reaps finished request tasks. On an empty set `join_next` yields `None`, the
             // pattern fails to match and the branch is simply disabled for this iteration.
             Some(_) = inflight.join_next() => {}
+            Some(resp) = resp_rx.recv() => { pending = Some(resp); }
             ev = event_rx.recv() => {
                 if let Ok(msg) = ev {
                     if ctx.is_authenticated() && out_tx.send(codec::encode(&msg)).await.is_err() {
@@ -109,26 +127,68 @@ pub async fn serve_connection(
                 } else {
                     let h = handler.clone();
                     let c = ctx.clone();
-                    let tx = out_tx.clone();
+                    let tx = resp_tx.clone();
                     inflight.spawn(async move {
                         let resp = respond(&*h, id, request, &c).await;
-                        let _ = tx.send(codec::encode(&resp)).await;
+                        let _ = tx.send(resp).await;
                     });
                 }
             }
         }
     }
 
-    drop(out_tx);
     reader.abort();
+    // A reply the loop had in hand when it stopped is still owed to the caller.
+    if let Some(resp) = pending.take() {
+        let _ = out_tx.send(codec::encode(&resp)).await;
+    }
     // Let in-flight handlers finish queueing their replies, then stop waiting on the slow
     // ones: either the peer is gone or the daemon is shutting down.
     let _ = tokio::time::timeout(DRAIN_GRACE, async {
-        while inflight.join_next().await.is_some() {}
+        while inflight.join_next().await.is_some() {
+            drain_responses(&mut resp_rx, &out_tx).await;
+        }
     })
     .await;
     inflight.shutdown().await;
+    drain_responses(&mut resp_rx, &out_tx).await;
+    drop(out_tx);
     let _ = writer.await;
+}
+
+/// Writes every event already queued for this connection. Returns false when the
+/// writer is gone and the connection should be torn down.
+async fn forward_events(
+    event_rx: &mut tokio::sync::broadcast::Receiver<ServerMessage>,
+    ctx: &ConnCtx,
+    out_tx: &mpsc::Sender<String>,
+) -> bool {
+    use tokio::sync::broadcast::error::TryRecvError;
+    loop {
+        match event_rx.try_recv() {
+            Ok(msg) => {
+                if ctx.is_authenticated() && out_tx.send(codec::encode(&msg)).await.is_err() {
+                    return false;
+                }
+            }
+            // `Lagged` is reported once and then reception resumes, so it is skipped
+            // rather than ending the flush.
+            Err(TryRecvError::Lagged(_)) => {}
+            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => return true,
+        }
+    }
+}
+
+/// Writes replies that landed after the connection loop stopped.
+async fn drain_responses(
+    resp_rx: &mut mpsc::Receiver<ServerMessage>,
+    out_tx: &mpsc::Sender<String>,
+) {
+    while let Ok(resp) = resp_rx.try_recv() {
+        if out_tx.send(codec::encode(&resp)).await.is_err() {
+            return;
+        }
+    }
 }
 
 async fn respond(handler: &dyn Handler, id: u64, request: Request, ctx: &ConnCtx) -> ServerMessage {

@@ -1,6 +1,7 @@
 pub mod broadcast;
 pub mod connection;
 pub mod dispatch;
+pub mod handlers;
 
 use self::broadcast::EventBus;
 use self::dispatch::{Handler, SystemHandler};
