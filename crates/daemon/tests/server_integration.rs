@@ -194,3 +194,37 @@ async fn events_are_broadcast_to_authenticated_clients() {
     }
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn server_survives_aborted_connection_and_accepts_next() {
+    let (port, token, cancel, _h) = start().await;
+
+    // First connection: write a malformed, newline-less fragment and then abort it
+    // (drop both halves) mid-handshake, before completing `hello`.
+    {
+        let s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (_r, mut w) = s.into_split();
+        w.write_all(b"not json, no newline").await.unwrap();
+    }
+
+    // The accept loop must still be running: a fresh connection completes `hello` normally.
+    let (mut r, mut w) = connect(port).await;
+    send(
+        &mut w,
+        1,
+        Request::Hello(HelloParams {
+            token,
+            client_version: "0.1.0".into(),
+        }),
+    )
+    .await;
+    match recv(&mut r).await.unwrap() {
+        ServerMessage::Response {
+            id: 1,
+            result: Some(_),
+            error: None,
+        } => {}
+        other => panic!("unexpected {other:?}"),
+    }
+    cancel.cancel();
+}

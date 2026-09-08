@@ -75,7 +75,16 @@ impl Server {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 accepted = self.listener.accept() => {
-                    let (stream, peer) = accepted?;
+                    let (stream, peer) = match accepted {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            // Transient accept errors (e.g. ECONNABORTED, EMFILE) must not
+                            // end the accept loop; log, back off briefly, and keep serving.
+                            tracing::warn!(error = %e, "accept() failed; retrying");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
                     tracing::info!(%peer, "client connected");
                     let h = self.handler.clone();
                     let ev = self.events.clone();
