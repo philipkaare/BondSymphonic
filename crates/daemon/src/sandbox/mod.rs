@@ -5,6 +5,12 @@
 //! `noop` backend runs processes unsandboxed and works on every platform, so
 //! tests and non-Linux hosts have a working path.
 
+#[cfg(target_os = "linux")]
+pub mod exec_client;
+#[cfg(target_os = "linux")]
+pub mod init;
+#[cfg(target_os = "linux")]
+pub mod linux_bwrap;
 pub mod noop;
 pub mod protocol;
 
@@ -85,6 +91,8 @@ pub trait SandboxHandle: Send + Sync {
 pub fn backend_for(name: &str) -> Arc<dyn SandboxBackend> {
     match name {
         "noop" => Arc::new(noop::NoopBackend),
+        #[cfg(target_os = "linux")]
+        "linux_bwrap" => Arc::new(linux_bwrap::BwrapBackend::default()),
         other => {
             tracing::warn!(
                 backend = other,
