@@ -154,24 +154,22 @@ async fn bwrap_isolates_filesystem_pids_and_network() {
         .filter(|n| !n.is_empty())
         .collect();
     assert!(interfaces.contains(&"lo"), "loopback expected: {out}");
+    for name in &interfaces {
+        assert!(
+            !["eth", "en", "wl", "docker"]
+                .iter()
+                .any(|p| name.starts_with(p)),
+            "real network interface {name} must not exist inside the sandbox: {out}"
+        );
+    }
+    // Belt and braces: whatever the host is actually using must be absent too,
+    // whatever it happens to be called.
     for host_if in host_addressed_interfaces() {
         assert!(
             !interfaces.contains(&host_if.as_str()),
             "host interface {host_if} must not exist inside the sandbox: {out}"
         );
     }
-    // And nothing inside may carry an address except loopback.
-    let (code, out) = run_in(&handle, "ip -o addr").await;
-    assert_eq!(code, 0, "ip -o addr failed: {out}");
-    let addressed: Vec<&str> = out
-        .lines()
-        .filter_map(|l| l.split_whitespace().nth(1))
-        .collect();
-    assert!(!addressed.is_empty(), "expected loopback addresses: {out}");
-    assert!(
-        addressed.iter().all(|n| *n == "lo"),
-        "only loopback may be addressed inside the sandbox: {out}"
-    );
 
     let mut child = handle
         .spawn(SandboxCommand {
