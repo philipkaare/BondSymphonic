@@ -55,6 +55,9 @@ async fn commits_in_worktree_go_to_private_objects_and_daemon_can_read_them() {
     let layout = layout_for(dir.path(), &repo_path, "agent-2").await;
     worktree::create(&git, &layout, "main").await.unwrap();
 
+    let shared_objects_dir = layout.git_common.join("objects");
+    let shared_count_before = walkdir_count(&shared_objects_dir);
+
     // Simulate the sandboxed agent: git with the sandbox env.
     let mut agent_git = Git::new()
         .with_env("GIT_AUTHOR_NAME", "a")
@@ -82,6 +85,31 @@ async fn commits_in_worktree_go_to_private_objects_and_daemon_can_read_them() {
     assert!(
         private_count >= 3,
         "blob+tree+commit expected in private objects, got {private_count}"
+    );
+    // The shared store must not have grown: this proves exclusivity, not just presence.
+    assert_eq!(
+        walkdir_count(&shared_objects_dir),
+        shared_count_before,
+        "shared object store must not receive objects written by the sandboxed agent"
+    );
+
+    // The new commit's object file must exist under the private loose-object path
+    // and must not exist under the shared loose-object path.
+    let head_sha = agent_git
+        .run(&layout.worktree_path, &["rev-parse", "HEAD"])
+        .await
+        .unwrap()
+        .stdout
+        .trim()
+        .to_string();
+    let (dir_part, file_part) = head_sha.split_at(2);
+    assert!(
+        layout.objects_dir.join(dir_part).join(file_part).is_file(),
+        "commit object must be present in the private objects dir"
+    );
+    assert!(
+        !shared_objects_dir.join(dir_part).join(file_part).exists(),
+        "commit object must be absent from the shared objects dir"
     );
 
     // The daemon (outside the sandbox) can read the commit via alternates.

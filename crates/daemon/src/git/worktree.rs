@@ -19,6 +19,9 @@ impl Layout {
     pub fn reflog_dir(&self) -> PathBuf {
         self.git_common.join("logs/refs/heads/bs").join(&self.name)
     }
+    /// Relies on worktree directory basenames (the unique `ws_` ids) never colliding;
+    /// git otherwise suffixes the per-worktree gitdir name (e.g. `ws_1`, `ws_11`), which
+    /// would desync this from the actual `<git_common>/worktrees/<...>` directory.
     pub fn worktree_gitdir(&self) -> PathBuf {
         let base = self
             .worktree_path
