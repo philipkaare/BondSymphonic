@@ -1,3 +1,4 @@
+use bondsymphonic_daemon::server::dispatch::{DelayingHandler, SystemHandler};
 use bondsymphonic_daemon::server::{Server, ServerConfig};
 use bondsymphonic_proto::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -224,6 +225,92 @@ async fn server_survives_aborted_connection_and_accepts_next() {
             result: Some(_),
             error: None,
         } => {}
+        other => panic!("unexpected {other:?}"),
+    }
+    cancel.cancel();
+}
+
+/// A slow request must not block a later fast one on the same connection. `workspace.list`
+/// is delayed 500ms by `DelayingHandler`; `repo.inspect` is answered immediately by the
+/// wrapped `SystemHandler`. With serial in-line dispatch the slow reply arrives first and
+/// this test fails; with per-request task spawning the fast reply overtakes it.
+#[tokio::test]
+async fn a_slow_request_does_not_block_a_fast_one() {
+    fn delay_for(req: &Request) -> Option<std::time::Duration> {
+        match req {
+            Request::WorkspaceList {} => Some(std::time::Duration::from_millis(500)),
+            _ => None,
+        }
+    }
+
+    let cfg = ServerConfig::default();
+    let capabilities = cfg.capabilities.clone();
+    let server = Server::bind(cfg).await.unwrap();
+    let port = server.port();
+    let token = server.token().to_string();
+    let server = server.with_handler(std::sync::Arc::new(DelayingHandler {
+        inner: std::sync::Arc::new(SystemHandler {
+            token: token.clone(),
+            capabilities,
+        }),
+        delay_for,
+    }));
+    let cancel = CancellationToken::new();
+    let c2 = cancel.clone();
+    tokio::spawn(async move { server.run(c2).await.unwrap() });
+
+    let (mut r, mut w) = connect(port).await;
+    send(
+        &mut w,
+        1,
+        Request::Hello(HelloParams {
+            token,
+            client_version: "0.1.0".into(),
+        }),
+    )
+    .await;
+    recv(&mut r).await.unwrap();
+
+    send(&mut w, 2, Request::WorkspaceList {}).await;
+    send(
+        &mut w,
+        3,
+        Request::RepoInspect(RepoPathParams { path: "/r".into() }),
+    )
+    .await;
+
+    let first = recv(&mut r).await.unwrap();
+    match first {
+        ServerMessage::Response { id, .. } => assert_eq!(
+            id, 3,
+            "the fast request must be answered while the slow one is still running"
+        ),
+        other => panic!("unexpected {other:?}"),
+    }
+    let second = recv(&mut r).await.unwrap();
+    match second {
+        ServerMessage::Response { id, .. } => assert_eq!(id, 2),
+        other => panic!("unexpected {other:?}"),
+    }
+    cancel.cancel();
+}
+
+/// A well-formed JSON line that fails the typed `ClientMessage` decode (here: a method
+/// name this daemon does not know, which is what version skew looks like) must still be
+/// answered with the caller's own id, otherwise the request can never be resolved.
+#[tokio::test]
+async fn undecodable_line_is_answered_with_the_recovered_id() {
+    let (port, _token, cancel, _h) = start().await;
+    let (mut r, mut w) = connect(port).await;
+    w.write_all(b"{\"type\":\"request\",\"id\":42,\"method\":\"no.such.method\",\"params\":{}}\n")
+        .await
+        .unwrap();
+    match recv(&mut r).await.unwrap() {
+        ServerMessage::Response {
+            id: 42,
+            error: Some(e),
+            ..
+        } => assert_eq!(e.code, ErrorCode::InvalidParams),
         other => panic!("unexpected {other:?}"),
     }
     cancel.cancel();

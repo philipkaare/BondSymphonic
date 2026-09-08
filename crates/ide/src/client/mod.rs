@@ -1,4 +1,4 @@
-pub mod codec;
+﻿pub mod codec;
 
 use bondsymphonic_proto::*;
 use serde::de::DeserializeOwned;
@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -22,7 +23,14 @@ pub enum ClientError {
     Rpc(RpcError),
     #[error("disconnected")]
     Disconnected,
+    #[error("request timed out")]
+    Timeout,
 }
+
+/// How long a request waits for its response before failing with [`ClientError::Timeout`].
+/// Matches the launcher's port-line timeout. Overridable per client with
+/// [`DaemonClient::with_request_timeout`].
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type EventStream = mpsc::Receiver<(Option<WorkspaceId>, Event)>;
 
@@ -57,6 +65,7 @@ pub struct DaemonClient {
     pending: Pending,
     next_id: Arc<AtomicU64>,
     connected: Arc<AtomicBool>,
+    request_timeout: Duration,
     _reader_guard: Arc<ReaderGuard>,
 }
 
@@ -129,6 +138,7 @@ impl DaemonClient {
             pending: pending.clone(),
             next_id: Arc::new(AtomicU64::new(1)),
             connected: connected.clone(),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             _reader_guard: Arc::new(ReaderGuard(Some(reader_handle))),
         };
 
@@ -139,6 +149,14 @@ impl DaemonClient {
             }))
             .await?;
         Ok((client, hello, ev_rx))
+    }
+
+    /// Sets how long each request waits for its response before failing with
+    /// [`ClientError::Timeout`]. Defaults to [`DEFAULT_REQUEST_TIMEOUT`]; the setting is
+    /// per-clone, so apply it to the client that will issue the requests.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     pub fn is_connected(&self) -> bool {
@@ -152,6 +170,14 @@ impl DaemonClient {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
+        // The reader task clears `connected` *before* draining the pending map, so an entry
+        // inserted after that drain would never be completed by anyone. Re-checking here,
+        // after the insert, closes that window: either the drain sees our entry, or we see
+        // the flag already cleared and withdraw it ourselves.
+        if !self.is_connected() {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(ClientError::Disconnected);
+        }
         if self
             .out
             .send(ClientMessage::Request { id, request: req })
@@ -163,11 +189,16 @@ impl DaemonClient {
             self.pending.lock().unwrap().remove(&id);
             return Err(ClientError::Disconnected);
         }
-        match rx.await {
-            Ok(PendingOutcome::Value(v)) => Ok(v),
-            Ok(PendingOutcome::Rpc(e)) => Err(ClientError::Rpc(e)),
-            Ok(PendingOutcome::Disconnected) => Err(ClientError::Disconnected),
-            Err(_) => Err(ClientError::Disconnected),
+        match tokio::time::timeout(self.request_timeout, rx).await {
+            Ok(Ok(PendingOutcome::Value(v))) => Ok(v),
+            Ok(Ok(PendingOutcome::Rpc(e))) => Err(ClientError::Rpc(e)),
+            Ok(Ok(PendingOutcome::Disconnected)) | Ok(Err(_)) => Err(ClientError::Disconnected),
+            Err(_) => {
+                // A daemon that accepts a request and never answers it must not wedge the
+                // caller (nor leak its slot in the pending map) forever.
+                self.pending.lock().unwrap().remove(&id);
+                Err(ClientError::Timeout)
+            }
         }
     }
 

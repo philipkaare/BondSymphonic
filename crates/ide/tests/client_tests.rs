@@ -272,3 +272,64 @@ async fn dropping_all_clients_closes_the_socket() {
         "fake daemon did not observe EOF within 1s of dropping the last DaemonClient clone"
     );
 }
+
+/// Answers `hello` and then goes silent: every later request is read and never replied to,
+/// and the connection stays open so the client cannot detect the peer by EOF either.
+async fn fake_daemon_silent_after_hello(token: &'static str) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut r = BufReader::new(r);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            let ClientMessage::Request { id, request } = codec::decode(line.trim_end()).unwrap();
+            if let Request::Hello(p) = request {
+                if p.token == token {
+                    let ok = ServerMessage::ok(
+                        id,
+                        &HelloResult {
+                            daemon_version: "9.9.9".into(),
+                            capabilities: Capabilities {
+                                sandbox_backend: "noop".into(),
+                                git_protect: false,
+                                adapters: vec![],
+                            },
+                        },
+                    );
+                    w.write_all(codec::encode(&ok).as_bytes()).await.unwrap();
+                }
+            }
+            // Anything else: read and drop it. The caller must time out rather than wait
+            // forever on a daemon that accepts a request and never answers it.
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn a_request_that_is_never_answered_times_out() {
+    let addr = fake_daemon_silent_after_hello("secret").await;
+    let (client, _h, _e) = DaemonClient::connect(addr, "secret", "0.1.0")
+        .await
+        .unwrap();
+    let client = client.with_request_timeout(Duration::from_millis(200));
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.request::<WorkspaceListResult>(Request::WorkspaceList {}),
+    )
+    .await
+    .expect("request_raw must bound its own wait")
+    .expect_err("a request that is never answered must not succeed");
+    assert!(
+        matches!(err, ClientError::Timeout),
+        "expected ClientError::Timeout, got {err:?}"
+    );
+    // The connection itself is still up: a timeout resolves one request, not the session.
+    assert!(client.is_connected());
+}
