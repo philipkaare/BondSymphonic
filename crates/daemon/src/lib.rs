@@ -1,3 +1,4 @@
+pub mod git;
 pub mod ids;
 pub mod prereqs;
 pub mod server;
