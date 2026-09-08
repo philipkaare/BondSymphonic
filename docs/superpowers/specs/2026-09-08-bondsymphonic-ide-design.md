@@ -248,6 +248,19 @@ not in any group land in an "Unsorted" group.
   in an expandable section.
 - Daemon-level problems (disconnect, prereqs) show in the status bar and, when
   blocking, as the `SetupPage` replacing the central area.
+- **Logins happen inside the IDE, never via a terminal command the user must
+  type.** The `SetupPage` lists each failing prerequisite with an action button.
+  For `claude_auth` the button is "Log in to Claude Code": it opens a terminal
+  pane (a PTY in the distro, via `pty.open`) running `claude` so the user
+  completes the OAuth flow there; the IDE watches the PTY output for the login
+  URL and opens it in the system browser automatically, so the user only has
+  to approve in the browser and paste the code if asked. The same pattern
+  serves `gh_auth` with `gh auth login`. Missing tools (`bwrap`, `claude`,
+  `gh`) get an "Install" button that runs the `fix_hint` command in the same
+  terminal pane. After the pane's process exits, the IDE re-runs
+  `check_prereqs`; when everything passes the page dismisses itself. Settings
+  also offers an API-key field (stored in the OS credential store) as the
+  alternative to OAuth for Claude Code.
 - Network denials (`daemon.log warn` with `host`) show a small toast in the run
   panel with an "Allow host" action that calls `workspace.set_allowlist`.
 

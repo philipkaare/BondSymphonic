@@ -294,7 +294,10 @@ Each milestone is independently demonstrable. Plans are written per milestone.
 3. **Editor and changes.** `fs.*`; editor with tree-sitter highlighting and
    save; `workspace.changes/diff`; side-by-side diff view.
 4. **Claude Code adapter.** stream-json process management; transcript events;
-   permission bar; resume; history replay; cost in status bar.
+   permission bar; resume; history replay; cost in status bar; in-IDE login flow
+   on the setup page for Claude Code and GitHub (terminal pane running the login
+   command, login URL auto-opened in the browser, prerequisites re-checked on
+   exit).
 5. **Network and run.** CONNECT proxy with allowlist; Unix-socket port bridge;
    `bondsymphonic.toml` and auto-detection; run panel with URL and open-in-browser.
 6. **Merge flow and persistence.** merge/rebase/squash with conflict reporting;
