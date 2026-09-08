@@ -22,6 +22,7 @@ MainWindow::MainWindow(AppController* controller, QWidget* parent)
     buildStatusBar();
     QObject::connect(m_controller, &AppController::connectionStateChanged, this, &MainWindow::onConnectionStateChanged);
     QObject::connect(m_controller, &AppController::statusMessageChanged, this, &MainWindow::onConnectionStateChanged);
+    QObject::connect(m_controller, &AppController::daemonVersionChanged, this, &MainWindow::onConnectionStateChanged);
     onConnectionStateChanged();
 }
 
@@ -95,8 +96,6 @@ void MainWindow::buildStatusBar() {
 }
 
 void MainWindow::onConnectionStateChanged() {
-    QString text = m_controller->getStatusMessage();
-    const QString version = m_controller->getDaemonVersion();
-    if (!version.isEmpty()) text += " v" + version;
-    m_daemonLabel->setText(text);
+    // AppController composes the full text, including the version suffix.
+    m_daemonLabel->setText(m_controller->getStatusMessage());
 }
