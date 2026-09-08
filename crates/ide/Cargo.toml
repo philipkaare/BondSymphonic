@@ -1,0 +1,31 @@
+[package]
+name = "bondsymphonic-ide"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "bondsymphonic-ide"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+bondsymphonic-proto = { path = "../proto" }
+cxx = "1"
+cxx-qt = "0.10"
+# Default features only: `qt_full` would pull in QtQml and QtQuickControls2,
+# and BondSymphonic is Qt Widgets only.
+cxx-qt-lib = "0.10"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+directories = "5"
+
+[build-dependencies]
+cxx-qt-build = "0.10"
