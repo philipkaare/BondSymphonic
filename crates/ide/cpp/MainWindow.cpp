@@ -23,10 +23,11 @@ MainWindow::MainWindow(AppController* controller, QWidget* parent)
     QObject::connect(m_controller, &AppController::connectionStateChanged, this, &MainWindow::onConnectionStateChanged);
     QObject::connect(m_controller, &AppController::statusMessageChanged, this, &MainWindow::onConnectionStateChanged);
     QObject::connect(m_controller, &AppController::daemonVersionChanged, this, &MainWindow::onConnectionStateChanged);
+    // No showMessage() here: a temporary status bar message hides every addWidget()
+    // widget while it is shown, including the sandbox label the details hang off.
     QObject::connect(m_controller, &AppController::prereqWarning, this, [this](const QString& msg) {
         m_sandboxLabel->setText("sandbox: prerequisites missing");
         m_sandboxLabel->setToolTip(msg);
-        statusBar()->showMessage("Some prerequisites are missing; hover the sandbox label for details", 10000);
     });
     onConnectionStateChanged();
 }

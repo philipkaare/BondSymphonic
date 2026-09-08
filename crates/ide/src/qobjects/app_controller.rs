@@ -97,6 +97,7 @@ impl qobject::AppController {
                 Ok(p) => p,
                 Err(e) => {
                     let msg = format!("daemon: launch failed: {e:#}");
+                    tracing::error!("{msg}");
                     let _ = qt.queue(move |mut q| {
                         q.as_mut().set_state(ConnectionState::Error);
                         q.set_status_message(QString::from(msg.as_str()));
@@ -112,6 +113,7 @@ impl qobject::AppController {
                     Ok(x) => x,
                     Err(e) => {
                         let msg = format!("daemon: connect failed: {e}");
+                        tracing::error!("{msg}");
                         let _ = qt.queue(move |mut q| {
                             q.as_mut().set_state(ConnectionState::Error);
                             q.set_status_message(QString::from(msg.as_str()));

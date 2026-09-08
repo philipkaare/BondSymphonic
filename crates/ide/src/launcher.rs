@@ -12,8 +12,8 @@ use tokio::process::{Child, ChildStdin, Command};
 pub struct LaunchSpec {
     pub distro: String,
     pub daemon_path_in_wsl: String,
-    /// Windows-side path of a freshly built Linux daemon binary; if set and its
-    /// `--version` differs from the installed one, it is copied into the distro first.
+    /// Windows-side path of a freshly built Linux daemon binary; if set and its content
+    /// differs from the installed one, it is copied into the distro first.
     pub local_daemon_binary: Option<PathBuf>,
     pub log_level: String,
 }
@@ -95,7 +95,23 @@ async fn wsl(spec: &LaunchSpec, script: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Copies the local daemon binary into the distro if missing or a different version.
+/// Renders a distro-side path as one shell word for the scripts sent through `wsl.exe`.
+///
+/// Single quotes, not double: the whole script travels as a single argv element, and the
+/// backslash escaping Rust applies to embedded double quotes does not survive `wsl.exe`'s
+/// own command-line splitting, which corrupts the script. A leading `~/` is left outside
+/// the quotes so tilde expansion still happens.
+fn quoted_distro_path(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => format!("~/'{rest}'"),
+        None => format!("'{path}'"),
+    }
+}
+
+/// Copies the local daemon binary into the distro when the installed copy is missing or
+/// holds different content. Comparing `--version` is useless here: every workspace crate
+/// stays at 0.1.0 through development, so a rebuilt daemon would never be reinstalled and
+/// the IDE would silently keep running a stale binary. The two files are hashed instead.
 pub async fn ensure_installed(spec: &LaunchSpec) -> Result<()> {
     let Some(local) = &spec.local_daemon_binary else {
         return Ok(());
@@ -103,27 +119,46 @@ pub async fn ensure_installed(spec: &LaunchSpec) -> Result<()> {
     if !local.exists() {
         return Ok(());
     }
-    // `local` is a Linux ELF binary, so both version checks run inside WSL.
+    // `local` is a Linux ELF binary on a DrvFs mount, so both hashes are taken inside WSL.
     let src = windows_path_to_wsl(local).context("bad local path")?;
-    let local_ver = wsl(spec, &format!("'{src}' --version"))
+    let dst = quoted_distro_path(&spec.daemon_path_in_wsl);
+    let tmp = quoted_distro_path(&format!("{}.tmp", spec.daemon_path_in_wsl));
+    // The parent directory is derived here rather than with `dirname` in the shell, so
+    // the script needs no command substitution and stays one quoting level deep.
+    let dst_dir = quoted_distro_path(
+        spec.daemon_path_in_wsl
+            .rsplit_once('/')
+            .map_or(".", |(parent, _)| parent),
+    );
+
+    let local_hash = wsl(spec, &format!("sha256sum '{src}' | cut -d' ' -f1"))
         .await
         .unwrap_or_default();
-    let installed_ver = wsl(
+    let installed_hash = wsl(
         spec,
-        &format!("{} --version 2>/dev/null || true", spec.daemon_path_in_wsl),
+        &format!("sha256sum {dst} 2>/dev/null | cut -d' ' -f1 || true"),
     )
     .await
     .unwrap_or_default();
-    if !local_ver.is_empty() && local_ver == installed_ver {
+
+    let short = |h: &str| h.chars().take(12).collect::<String>();
+    if !local_hash.is_empty() && local_hash == installed_hash {
+        tracing::info!(hash = %short(&local_hash), "daemon already current in distro");
         return Ok(());
     }
-    let dst = &spec.daemon_path_in_wsl;
+
+    // Copy to a temporary name and rename over the target: replacing a binary that is
+    // currently executing fails with "Text file busy", whereas renaming over it does not.
     wsl(
         spec,
-        &format!("mkdir -p \"$(dirname {dst})\" && cp '{src}' {dst} && chmod +x {dst}"),
+        &format!("mkdir -p {dst_dir} && cp '{src}' {tmp} && chmod +x {tmp} && mv -f {tmp} {dst}"),
     )
     .await?;
-    tracing::info!(%local_ver, %installed_ver, "installed daemon into distro");
+    tracing::info!(
+        local_hash = %short(&local_hash),
+        installed_hash = %short(&installed_hash),
+        "installed daemon into distro"
+    );
     Ok(())
 }
 
@@ -200,6 +235,21 @@ mod tests {
             windows_path_to_wsl(std::path::Path::new("/already/posix")),
             Some("/already/posix".into())
         );
+    }
+
+    #[test]
+    fn quotes_distro_paths_without_double_quotes() {
+        // A leading `~/` stays outside the quotes so bash still expands it, and no
+        // double quote may appear: wsl.exe corrupts the escaping Rust applies to them.
+        assert_eq!(
+            quoted_distro_path("~/.bondsymphonic/bin/bondsymphonic-daemon"),
+            "~/'.bondsymphonic/bin/bondsymphonic-daemon'"
+        );
+        assert_eq!(
+            quoted_distro_path("/opt/bond symphonic/daemon"),
+            "'/opt/bond symphonic/daemon'"
+        );
+        assert!(!quoted_distro_path("~/a/b").contains('"'));
     }
 
     #[test]
