@@ -29,6 +29,7 @@ PALETTE = {
 BG_OUTER = (0x0b, 0x14, 0x2b, 255)   # deep navy barrel
 BG_RING = (0x16, 0x2a, 0x55, 255)    # inner ring
 BG_RIFLE = (0xc9, 0xd3, 0xe6, 255)   # pale rifling ring
+BG_SIGHT = (0xf2, 0xf5, 0xfa, 255)   # crosshair ticks
 BG_INNER = (0x1f, 0x3b, 0x74, 255)   # centre glow
 
 # 32 columns per row. Agent faces the viewer, baton raised to the upper right.
@@ -47,15 +48,15 @@ ART = [
     ".............SssS....kk.........",  # 11
     ".........kkkkkrrrrkkkkk.........",  # 12
     "........kkkkkKwwwwKkkkk.........",  # 13
-    ".......kkkkkkKwwwwKkkkk.....g...",  # 14
-    ".......kkkkkkkKwwKkkkkk.....g...",  # 15
-    ".......kkkkkkkKwwKkkkkk....gg...",  # 16
-    ".......kkkkkkkkwwkkkkkk....gg...",  # 17
+    ".......kkkkkkKwwwwKkkkk.........",  # 14
+    ".......kkkkkkkKwwKkkkkk.........",  # 15
+    ".......kkkkkkkKwwKkkkkk.........",  # 16
+    ".......kkkkkkkkwwkkkkkk.........",  # 17
     ".......kkkkkkkkKkkkkkkk.........",  # 18
-    ".......ss.kkkkkkkkkkkk..........",  # 19
-    ".......ss.kkkkkkkkkkkk..........",  # 20
-    "..........kkkkkkkkkkkk..........",  # 21
-    "..........kkkkk..kkkkk..........",  # 22
+    ".......ss.kkkkkkkkkkkk.....g....",  # 19
+    ".......ss.kkkkkkkkkkkk.....g....",  # 20
+    "..........kkkkkkkkkkkk....gg....",  # 21
+    "..........kkkkk..kkkkk....gg....",  # 22
     "..........kkkk....kkkk..........",  # 23
     "..........kkkk....kkkk..........",  # 24
     "..........kkkk....kkkk..........",  # 25
@@ -77,6 +78,10 @@ def background(x: int, y: int) -> tuple[int, int, int, int] | None:
     r = (SIZE / 2) - 0.5
     if d2 > r * r:
         return None
+    # Gunsight crosshair: four bold ticks from the rim inward, leaving the centre open
+    # so the figure stays readable. 2 px wide because the 32-grid centre is at 15.5.
+    if (15 <= x <= 16 or 15 <= y <= 16) and d2 > (r - 9.0) ** 2:
+        return BG_SIGHT
     if d2 > (r - 2.0) ** 2:
         return BG_OUTER
     if d2 > (r - 3.0) ** 2:
