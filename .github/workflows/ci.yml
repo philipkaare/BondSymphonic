@@ -1,0 +1,18 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - run: cargo test -p bondsymphonic-proto -p bondsymphonic-daemon
+      - run: cargo clippy -p bondsymphonic-proto -p bondsymphonic-daemon -- -D warnings
+  windows-proto:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p bondsymphonic-proto
