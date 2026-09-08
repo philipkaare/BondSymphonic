@@ -26,6 +26,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 directories = "5"
+thiserror.workspace = true
 
 [build-dependencies]
 cxx-qt-build = "0.10"
