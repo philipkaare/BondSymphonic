@@ -1,0 +1,30 @@
+[package]
+name = "bondsymphonic-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bondsymphonic-daemon"
+path = "src/main.rs"
+
+[dependencies]
+bondsymphonic-proto = { path = "../proto" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+hex = "0.4"
+async-trait = "0.1"
+directories = "5"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

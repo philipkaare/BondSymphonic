@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/proto"]
-# crates/daemon and crates/ide are added by later tasks
+members = ["crates/proto", "crates/daemon"]
+# crates/ide is added by a later task
 
 [workspace.package]
 version = "0.1.0"
