@@ -1,4 +1,5 @@
 pub mod repo;
+pub mod worktree;
 
 use bondsymphonic_proto::{ErrorCode, RpcError};
 use std::path::Path;
