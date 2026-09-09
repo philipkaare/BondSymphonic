@@ -513,3 +513,43 @@ async fn destroy_with_force_succeeds_after_the_repository_has_moved() {
         "the worktree directory is removed even without git"
     );
 }
+
+/// Git has no "no hooks" setting. An empty `core.hooksPath` does not disable
+/// hooks, it resolves them relative to the filesystem root — `/pre-commit` —
+/// so daemon-side worktree commands point it at an empty directory the daemon
+/// owns instead.
+#[tokio::test]
+async fn daemon_side_worktree_git_resolves_hooks_into_an_empty_daemon_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "a").await;
+    let layout = lifecycle::layout_for(&daemon, &daemon.registry.get(&ws.id).unwrap())
+        .await
+        .unwrap();
+
+    let out = layout
+        .worktree_git()
+        .run(
+            std::path::Path::new(&ws.worktree_path),
+            &["rev-parse", "--git-path", "hooks/pre-commit"],
+        )
+        .await
+        .unwrap();
+    let path = out.stdout.trim();
+    assert_ne!(path, "/pre-commit", "hooks were relocated to the root");
+    assert!(
+        path.ends_with("nohooks/pre-commit"),
+        "hooks must resolve into the daemon's empty directory, got {path}"
+    );
+
+    let no_hooks = daemon.dirs.no_hooks();
+    assert!(no_hooks.is_dir(), "the daemon must own the directory");
+    assert_eq!(
+        std::fs::read_dir(&no_hooks).unwrap().count(),
+        0,
+        "the hooks directory must stay empty"
+    );
+    cancel.cancel();
+}

@@ -31,6 +31,7 @@ pub async fn layout_for(d: &Daemon, ws: &Workspace) -> Result<Layout, RpcError> 
         branch: ws.branch.clone(),
         worktree_path: ws.worktree_path.clone(),
         objects_dir: d.dirs.objects(&ws.id),
+        no_hooks_dir: d.dirs.no_hooks(),
     })
 }
 
@@ -187,6 +188,7 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
         branch: ws.branch.clone(),
         worktree_path: ws.worktree_path.clone(),
         objects_dir: d.dirs.objects(&id),
+        no_hooks_dir: d.dirs.no_hooks(),
     };
     if let Err(e) = worktree::create(&d.git, &layout, &p.base_branch).await {
         // `worktree::create` pre-creates ref, reflog and object directories, and

@@ -87,6 +87,14 @@ impl DataDirs {
     pub fn bin(&self) -> PathBuf {
         self.root.join("bin")
     }
+    /// An empty directory the daemon owns, pointed at by `core.hooksPath` for
+    /// every daemon-side git command that runs against a worktree. Git has no
+    /// way to say "no hooks": an empty `core.hooksPath` resolves hooks relative
+    /// to the filesystem root (`/pre-commit`) rather than disabling them, so it
+    /// needs a real directory that will never hold one.
+    pub fn no_hooks(&self) -> PathBuf {
+        self.root.join("nohooks")
+    }
 
     pub fn ensure(&self) -> std::io::Result<()> {
         for d in [
@@ -100,6 +108,7 @@ impl DataDirs {
             std::fs::create_dir_all(d)?;
         }
         std::fs::create_dir_all(self.bin())?;
+        std::fs::create_dir_all(self.no_hooks())?;
         Ok(())
     }
     /// Creates (and returns) every per-workspace directory.

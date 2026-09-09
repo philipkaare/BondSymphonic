@@ -17,6 +17,7 @@ async fn layout_for(dir: &std::path::Path, repo_path: &std::path::Path, name: &s
         branch: format!("bs/{name}/work"),
         worktree_path: dir.join("worktrees").join("ws_00000001"),
         objects_dir: dir.join("objects").join("ws_00000001"),
+        no_hooks_dir: dir.join("nohooks"),
     }
 }
 

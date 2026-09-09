@@ -10,6 +10,9 @@ pub struct Layout {
     pub branch: String,
     pub worktree_path: PathBuf,
     pub objects_dir: PathBuf,
+    /// An empty daemon-owned directory, used as `core.hooksPath`. See
+    /// [`crate::workspace::DataDirs::no_hooks`].
+    pub no_hooks_dir: PathBuf,
 }
 
 impl Layout {
@@ -78,7 +81,11 @@ impl Layout {
             .with_env("GIT_COMMON_DIR", s(&self.git_common))
             .with_env("GIT_WORK_TREE", s(&self.worktree_path))
             .with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", s(&self.objects_dir))
-            .with_config("extensions.worktreeConfig", "false");
+            .with_config("extensions.worktreeConfig", "false")
+            // Not in the list below: an empty `core.hooksPath` does not disable
+            // hooks, it moves them to the filesystem root, so this one needs a
+            // real directory that is always empty.
+            .with_config("core.hooksPath", &s(&self.no_hooks_dir));
         for key in NEUTRALISED_CONFIG {
             git = git.with_config(key, "");
         }
@@ -105,9 +112,14 @@ impl Layout {
 /// does **not** turn that off — git takes the extension from the repository
 /// format during setup, before command-line config exists. Measured against git
 /// 2.43 and 2.52: `core.fsmonitor` is the one `git status` reaches by name.
+///
+/// Every key here is emptied, which disables it. `core.hooksPath` is *not* here
+/// for exactly that reason — emptying it relocates hooks to `/` instead of
+/// disabling them — so it is set to an empty daemon-owned directory in
+/// [`Layout::worktree_git`]. Any key added here has to be checked the same way:
+/// an empty value has to mean "off", not "somewhere else".
 const NEUTRALISED_CONFIG: &[&str] = &[
     "core.fsmonitor",
-    "core.hooksPath",
     "core.sshCommand",
     "core.gitProxy",
     "core.askPass",
