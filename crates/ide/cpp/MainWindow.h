@@ -1,18 +1,24 @@
 #pragma once
+#include <QKeySequence>
+#include <QList>
 #include <QMainWindow>
 #include <QPointer>
 #include <QString>
 
 class AgentArea;
 class AppController;
+class EditorArea;
 class ExplorerDock;
 class FileTreeModel;
 class GroupBar;
 class GroupModel;
 class NewAgentDialog;
+class QAction;
+class QJsonObject;
 class QLabel;
-class QSplitter;
+class QMenu;
 class QPlainTextEdit;
+class QSplitter;
 class QTabWidget;
 
 class MainWindow : public QMainWindow {
@@ -36,6 +42,19 @@ private:
     void onActiveTabChanged();
     void onWorkspaceDestroyed(const QString& workspaceId);
     void updateWorkspaceStatus();
+    /// The tab the group model has selected, or an empty object when none is.
+    QJsonObject activeTab() const;
+    /// The workspace the Explorer, the panes and a newly opened file belong to.
+    QString activeWorkspaceId() const;
+    /// Adds one Edit menu item forwarding to the focused editor's view, and
+    /// books it in for enabling and disabling together with its siblings.
+    void addEditAction(QMenu* menu, const QString& text, QKeySequence::StandardKey shortcut,
+                       void (QPlainTextEdit::*slot)());
+    void forwardToEditor(void (QPlainTextEdit::*slot)());
+    /// The Edit items act on the editor, so they are live only while the editor
+    /// has the focus. That is not tidiness: their shortcuts are window-wide, and
+    /// an enabled Ctrl+C here would be taken from the terminal pane.
+    void updateEditActions();
 
     AppController* m_controller;
     GroupModel* m_groupModel;
@@ -47,7 +66,10 @@ private:
     /// to it rather than to a window the modal dialog is blocking.
     QPointer<NewAgentDialog> m_newAgentDialog;
     QSplitter* m_centerSplitter = nullptr;
-    QPlainTextEdit* m_editorPlaceholder = nullptr;
+    /// The centre pane: one tab per open file.
+    EditorArea* m_editorArea = nullptr;
+    /// Undo, Redo, Cut, Copy, Paste and Select All, enabled together.
+    QList<QAction*> m_editActions;
     /// The per-workspace agent pane beside the editor.
     AgentArea* m_agentArea = nullptr;
     QTabWidget* m_bottomTabs = nullptr;

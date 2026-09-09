@@ -1,6 +1,9 @@
 #include "MainWindow.h"
 #include "AgentArea.h"
 #include "Branding.h"
+#include "CodeView.h"
+#include "EditorArea.h"
+#include "EditorWidget.h"
 #include "ExplorerDock.h"
 #include "GroupBar.h"
 #include "NewAgentDialog.h"
@@ -15,6 +18,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPlainTextEdit>
@@ -31,8 +35,10 @@ MainWindow::MainWindow(AppController* controller, GroupModel* groupModel, FileTr
     : QMainWindow(parent), m_controller(controller), m_groupModel(groupModel), m_fileTreeModel(fileTreeModel) {
     setWindowTitle("BondSymphonic");
     resize(1400, 900);
-    buildMenus();
+    // Central first: the File, Edit and View items act on the editor area, so
+    // it has to exist before the menus that reach into it are built.
     buildCentral();
+    buildMenus();
     buildDocks();
     buildToolBar();
     buildStatusBar();
@@ -40,15 +46,42 @@ MainWindow::MainWindow(AppController* controller, GroupModel* groupModel, FileTr
     onConnectionStateChanged();
     updateWorkspaceStatus();
     onActiveTabChanged();
+    updateEditActions();
 }
 
 void MainWindow::buildMenus() {
     auto* file = menuBar()->addMenu("&File");
     file->addAction("&New Agent…", this, &MainWindow::onNewAgent);
     file->addSeparator();
+    auto* save = file->addAction("&Save", this, [this] {
+        if (EditorWidget* editor = m_editorArea->currentEditor()) {
+            editor->save();
+        }
+    });
+    save->setShortcut(QKeySequence::Save);
+    // The working Ctrl+S is the one the focused editor pane owns. A second,
+    // window-wide shortcut on the same keys would make both ambiguous and
+    // neither would fire, so this one is scoped to the menu bar, where it can
+    // never match: it is here to print "Ctrl+S" beside the item.
+    save->setShortcutContext(Qt::WidgetShortcut);
+    auto* saveAll = file->addAction("Save A&ll", this, [this] { m_editorArea->saveAll(); });
+    saveAll->setShortcut(QKeySequence("Ctrl+Shift+S"));
+    file->addSeparator();
     file->addAction("E&xit", this, &QWidget::close);
-    menuBar()->addMenu("&Edit");
-    menuBar()->addMenu("&View");
+
+    auto* edit = menuBar()->addMenu("&Edit");
+    addEditAction(edit, "&Undo", QKeySequence::Undo, &QPlainTextEdit::undo);
+    addEditAction(edit, "&Redo", QKeySequence::Redo, &QPlainTextEdit::redo);
+    edit->addSeparator();
+    addEditAction(edit, "Cu&t", QKeySequence::Cut, &QPlainTextEdit::cut);
+    addEditAction(edit, "&Copy", QKeySequence::Copy, &QPlainTextEdit::copy);
+    addEditAction(edit, "&Paste", QKeySequence::Paste, &QPlainTextEdit::paste);
+    edit->addSeparator();
+    addEditAction(edit, "Select &All", QKeySequence::SelectAll, &QPlainTextEdit::selectAll);
+
+    auto* view = menuBar()->addMenu("&View");
+    view->addAction("&Swap editor and agent", this,
+                    [this] { m_centerSplitter->insertWidget(0, m_centerSplitter->widget(1)); });
     menuBar()->addMenu("&Workspace");
     menuBar()->addMenu("&Run");
     auto* help = menuBar()->addMenu("&Help");
@@ -83,12 +116,10 @@ void MainWindow::buildCentral() {
     layout->addWidget(m_groupBar);
 
     m_centerSplitter = new QSplitter(Qt::Horizontal, central);
-    m_editorPlaceholder = new QPlainTextEdit(m_centerSplitter);
-    m_editorPlaceholder->setReadOnly(true);
-    m_editorPlaceholder->setPlaceholderText("Editor");
+    m_editorArea = new EditorArea(m_centerSplitter);
     m_agentArea = new AgentArea(m_centerSplitter);
     m_agentArea->setPlaceholderText("No agent selected");
-    m_centerSplitter->addWidget(m_editorPlaceholder);
+    m_centerSplitter->addWidget(m_editorArea);
     m_centerSplitter->addWidget(m_agentArea);
     m_centerSplitter->setStretchFactor(0, 3);
     m_centerSplitter->setStretchFactor(1, 2);
@@ -109,6 +140,9 @@ void MainWindow::buildCentral() {
 void MainWindow::buildDocks() {
     m_explorer = new ExplorerDock(m_fileTreeModel, this);
     addDockWidget(Qt::LeftDockWidgetArea, m_explorer);
+    QObject::connect(m_explorer, &ExplorerDock::fileActivated, this, [this](const QString& path) {
+        m_editorArea->openFile(activeWorkspaceId(), path);
+    });
 
     auto* bottom = new QDockWidget("Output", this);
     bottom->setObjectName("BottomDock");
@@ -176,6 +210,49 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::operationFailed, this, &MainWindow::onOperationFailed);
     QObject::connect(m_groupModel, &GroupModel::changed, this, &MainWindow::updateWorkspaceStatus);
     QObject::connect(m_groupModel, &GroupModel::changed, this, &MainWindow::onActiveTabChanged);
+
+    // These three are the only way anything on the Rust side reaches the
+    // editor area.
+    QObject::connect(m_controller, &AppController::openFileRequested, this,
+                     [this](const QString& workspaceId, const QString& path) {
+                         m_editorArea->openFile(workspaceId, path);
+                     });
+    QObject::connect(m_controller, &AppController::openDiffRequested, this,
+                     [this](const QString& workspaceId, const QString& path) {
+                         m_editorArea->openDiff(workspaceId, path);
+                     });
+    QObject::connect(m_controller, &AppController::saveAllRequested, this,
+                     [this] { m_editorArea->saveAll(); });
+
+    QObject::connect(m_editorArea, &EditorArea::currentEditorChanged, this,
+                     [this](EditorWidget*) { updateEditActions(); });
+    QObject::connect(qApp, &QApplication::focusChanged, this,
+                     [this](QWidget*, QWidget*) { updateEditActions(); });
+}
+
+void MainWindow::addEditAction(QMenu* menu, const QString& text,
+                               QKeySequence::StandardKey shortcut,
+                               void (QPlainTextEdit::*slot)()) {
+    QAction* action = menu->addAction(text, this, [this, slot] { forwardToEditor(slot); });
+    action->setShortcut(shortcut);
+    m_editActions.append(action);
+}
+
+void MainWindow::forwardToEditor(void (QPlainTextEdit::*slot)()) {
+    EditorWidget* editor = m_editorArea->currentEditor();
+    if (editor != nullptr) {
+        (editor->view()->*slot)();
+    }
+}
+
+void MainWindow::updateEditActions() {
+    EditorWidget* editor = m_editorArea->currentEditor();
+    const QWidget* focus = QApplication::focusWidget();
+    const bool live = editor != nullptr && focus != nullptr &&
+                      (focus == editor->view() || editor->view()->isAncestorOf(focus));
+    for (QAction* action : m_editActions) {
+        action->setEnabled(live);
+    }
 }
 
 void MainWindow::onConnectionStateChanged() {
@@ -224,15 +301,26 @@ void MainWindow::onOperationFailed(const QString& op, const QString& message) {
     QMessageBox::warning(this, op, message);
 }
 
-void MainWindow::onActiveTabChanged() {
+QJsonObject MainWindow::activeTab() const {
     const QString tabJson = m_groupModel->activeTabJson();
     if (tabJson.isEmpty()) {
+        return QJsonObject();
+    }
+    return QJsonDocument::fromJson(tabJson.toUtf8()).object();
+}
+
+QString MainWindow::activeWorkspaceId() const {
+    return activeTab().value("workspace_id").toString();
+}
+
+void MainWindow::onActiveTabChanged() {
+    const QJsonObject active = activeTab();
+    if (active.isEmpty()) {
         m_agentArea->showPlaceholder();
         m_shellArea->showPlaceholder();
         m_explorer->setWorkspace(QString());
         return;
     }
-    const QJsonObject active = QJsonDocument::fromJson(tabJson.toUtf8()).object();
     const QString workspaceId = active.value("workspace_id").toString();
     m_explorer->setWorkspace(workspaceId);
     // Both areas create their terminal on the workspace's first activation and
@@ -247,22 +335,23 @@ void MainWindow::onActiveTabChanged() {
 
 void MainWindow::onWorkspaceDestroyed(const QString& workspaceId) {
     // Panes first: the model change that follows re-selects a surviving tab,
-    // and the areas must no longer hold the dead one when it does.
+    // and the areas must no longer hold the dead one when it does. The editor
+    // tabs go with them: there is nothing left to save the file to.
     m_agentArea->removeWorkspace(workspaceId);
     m_shellArea->removeWorkspace(workspaceId);
+    m_editorArea->closeWorkspace(workspaceId);
     m_groupModel->removeWorkspace(workspaceId);
 }
 
 void MainWindow::updateWorkspaceStatus() {
     const int group = m_groupModel->activeGroupIndex();
     const int tab = m_groupModel->activeTabIndex();
-    const QString tabJson = m_groupModel->activeTabJson();
-    if (tabJson.isEmpty()) {
+    const QJsonObject active = activeTab();
+    if (active.isEmpty()) {
         m_branchLabel->setText("branch: -");
         m_sandboxLabel->setText(m_sandboxIdleText);
         return;
     }
-    const QJsonObject active = QJsonDocument::fromJson(tabJson.toUtf8()).object();
     m_branchLabel->setText(QString("branch: %1").arg(active.value("branch").toString()));
     // The word itself comes from the model; this only frames it.
     m_sandboxLabel->setText(QString("sandbox: %1").arg(m_groupModel->statusWord(group, tab)));
