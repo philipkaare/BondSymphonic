@@ -32,8 +32,33 @@ pub fn resolve(root: &Path, rel: &str) -> Result<PathBuf, RpcError> {
     }
     let joined = root.join(p);
     let root_c = root.canonicalize().map_err(|e| RpcError::io(&e))?;
-    // Canonicalize the deepest existing ancestor to defeat symlink escapes.
-    let mut probe = joined.clone();
+
+    // Canonicalizing the deepest existing ancestor opens a handle on it, which races a
+    // concurrent rename onto that same path (e.g. two `write_file` calls to the same
+    // destination): on Windows, if the file we open a handle on is unlinked by another
+    // thread's rename between our open and `GetFinalPathNameByHandleW`, NTFS resolves the
+    // (now-orphaned, still-open) handle to a `$Extend\$Deleted\...` path instead of the
+    // real one, and containment fails for a path that was never actually outside the
+    // worktree. Retry briefly on Windows before treating that as a real escape; a genuine
+    // symlink escape resolves the same way every time and still fails after the retries.
+    let mut attempts = 0;
+    loop {
+        match resolve_existing_ancestor(&joined) {
+            Ok(canon) if canon.starts_with(&root_c) => return Ok(canon),
+            _ if cfg!(windows) && attempts < 20 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(_) => return Err(RpcError::invalid_params("path escapes the worktree")),
+            Err(e) => return Err(RpcError::io(&e)),
+        }
+    }
+}
+
+/// Canonicalizes the deepest existing ancestor of `joined` (defeating symlink escapes)
+/// and re-appends the remaining, not-yet-existing path components literally.
+fn resolve_existing_ancestor(joined: &Path) -> std::io::Result<PathBuf> {
+    let mut probe = joined.to_path_buf();
     let mut tail = Vec::new();
     while !probe.exists() {
         tail.push(
@@ -46,12 +71,9 @@ pub fn resolve(root: &Path, rel: &str) -> Result<PathBuf, RpcError> {
             break;
         }
     }
-    let mut canon = probe.canonicalize().map_err(|e| RpcError::io(&e))?;
+    let mut canon = probe.canonicalize()?;
     for t in tail.into_iter().rev() {
         canon.push(t);
-    }
-    if !canon.starts_with(&root_c) {
-        return Err(RpcError::invalid_params("path escapes the worktree"));
     }
     Ok(canon)
 }
@@ -182,9 +204,34 @@ pub fn write_file(root: &Path, rel: &str, content: &str) -> Result<Empty, RpcErr
             std::fs::Permissions::from_mode(md.permissions().mode()),
         );
     }
-    if let Err(e) = std::fs::rename(&tmp, &path) {
+    if let Err(e) = rename_with_retry(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(RpcError::io(&e));
     }
     Ok(Empty {})
+}
+
+/// Renames `from` to `to`, retrying briefly on Windows when the destination is
+/// transiently locked (a sharing or lock violation, or the `PermissionDenied` that
+/// wraps them) by another process or thread's own open handle on the same path -
+/// most often another writer's concurrent temp-file rename to this same destination.
+/// Up to 20 attempts, 5 ms apart, so a brief hold clears without surfacing an error to
+/// the caller; any other error, or persistence past 20 attempts, is returned as-is.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut attempts = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if cfg!(windows) && attempts < 20 && is_sharing_violation(&e) => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn is_sharing_violation(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::PermissionDenied)
+        || matches!(e.raw_os_error(), Some(32) | Some(33) | Some(5))
 }

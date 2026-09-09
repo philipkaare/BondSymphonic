@@ -44,7 +44,7 @@ impl Server {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
         let token = hex::encode(bytes);
-        let events = EventBus::new(1024);
+        let events = EventBus::new(self::broadcast::EVENT_BUS_CAPACITY);
         let handler: Arc<dyn Handler> = Arc::new(SystemHandler {
             token: token.clone(),
             capabilities: cfg.capabilities,

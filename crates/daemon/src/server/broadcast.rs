@@ -1,6 +1,11 @@
 use bondsymphonic_proto::{Event, ServerMessage, WorkspaceId};
 use tokio::sync::broadcast;
 
+/// Capacity of each connection's event backlog. A client that falls this far behind on
+/// unread events (a slow reader, or a burst of `pty.output`) starts dropping the oldest
+/// ones rather than growing without bound; the connection loop tells it how many it lost.
+pub const EVENT_BUS_CAPACITY: usize = 4096;
+
 #[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<ServerMessage>,

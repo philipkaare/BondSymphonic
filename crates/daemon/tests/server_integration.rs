@@ -425,3 +425,76 @@ async fn an_event_published_after_a_reply_is_queued_is_written_after_it() {
     }
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn a_lagging_client_is_told_how_many_events_it_missed() {
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let (port, token, bus) = (
+        server.port(),
+        server.token().to_string(),
+        server.event_bus(),
+    );
+    let cancel = CancellationToken::new();
+    let c2 = cancel.clone();
+    tokio::spawn(async move { server.run(c2).await.unwrap() });
+    let (mut r, mut w) = connect(port).await;
+    send(
+        &mut w,
+        1,
+        Request::Hello(HelloParams {
+            token,
+            client_version: "0.1.0".into(),
+        }),
+    )
+    .await;
+    recv(&mut r).await.unwrap();
+    // Publish far more than the bus capacity while the client reads nothing.
+    for i in 0..(bondsymphonic_daemon::server::broadcast::EVENT_BUS_CAPACITY * 3) {
+        bus.publish(
+            None,
+            Event::DaemonLog {
+                level: LogLevel::Info,
+                message: format!("m{i}"),
+                host: None,
+            },
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Drain: somewhere in the stream there must be exactly one "events dropped: N" with N > 0,
+    // and the messages after it must be in order.
+    let mut dropped: Option<u64> = None;
+    let mut last_seen: Option<u64> = None;
+    for _ in 0..(bondsymphonic_daemon::server::broadcast::EVENT_BUS_CAPACITY * 3 + 5) {
+        let Some(msg) = tokio::time::timeout(std::time::Duration::from_millis(500), recv(&mut r))
+            .await
+            .ok()
+            .flatten()
+        else {
+            break;
+        };
+        if let ServerMessage::Event {
+            event: Event::DaemonLog { message, level, .. },
+            ..
+        } = msg
+        {
+            if let Some(n) = message.strip_prefix("events dropped: ") {
+                assert_eq!(level, LogLevel::Warn);
+                assert!(
+                    dropped.replace(n.parse().unwrap()).is_none(),
+                    "only one drop notice expected"
+                );
+            } else if let Some(i) = message.strip_prefix('m') {
+                let i: u64 = i.parse().unwrap();
+                if let Some(prev) = last_seen {
+                    assert!(i > prev, "events after a drop must stay ordered");
+                }
+                last_seen = Some(i);
+            }
+        }
+    }
+    assert!(
+        dropped.unwrap_or(0) > 0,
+        "expected a drop notice, got {dropped:?}"
+    );
+    cancel.cancel();
+}

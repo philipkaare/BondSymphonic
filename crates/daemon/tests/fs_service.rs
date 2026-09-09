@@ -180,3 +180,50 @@ fn read_file_does_not_load_a_huge_file() {
         "read_file took {elapsed:?}: it is still reading the whole file"
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn write_file_retries_when_destination_is_briefly_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("wt");
+    std::fs::create_dir_all(&root).unwrap();
+    fs::write_file(&root, "locked.txt", "v1").unwrap();
+    // Hold the destination open with share-deny-none is not enough to block rename on Windows;
+    // a mapping does: open + hold a std File and MapViewOfFile-like effect is not available in std,
+    // so emulate contention with concurrent renames: many writers, plus a reader loop that keeps
+    // reopening the file. Success criterion: no writer errors.
+    let path = root.join("locked.txt");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let p = path.clone();
+        let s = stop.clone();
+        std::thread::spawn(move || {
+            while !s.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::fs::read(&p);
+            }
+        })
+    };
+    let writers: Vec<_> = (0..8)
+        .map(|i| {
+            let r = root.clone();
+            std::thread::spawn(move || {
+                for _ in 0..50 {
+                    fs::write_file(&r, "locked.txt", &format!("writer {i}"))
+                        .expect("write_file must not fail under contention");
+                }
+            })
+        })
+        .collect();
+    for w in writers {
+        w.join().unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    reader.join().unwrap();
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .starts_with("writer "));
+    assert!(std::fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .all(|e| !e.file_name().to_string_lossy().ends_with(".bs-tmp")));
+}

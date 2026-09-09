@@ -95,12 +95,34 @@ pub async fn serve_connection(
             Some(_) = inflight.join_next() => {}
             Some(resp) = resp_rx.recv() => { pending = Some((resp, event_rx.len())); }
             ev = event_rx.recv() => {
-                if let Ok(msg) = ev {
-                    if ctx.is_authenticated() && out_tx.send(codec::encode(&msg)).await.is_err() {
-                        break;
+                match ev {
+                    Ok(msg) => {
+                        if ctx.is_authenticated() && out_tx.send(codec::encode(&msg)).await.is_err() {
+                            break;
+                        }
                     }
+                    // The bus dropped events this connection never read (a slow client, or
+                    // a burst that outran `EVENT_BUS_CAPACITY`). Tell the client once, with
+                    // the count, so it knows its view of `pty.output`/`daemon.log` has a
+                    // gap; reception then resumes at the oldest event still buffered.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(dropped = n, "client lagged; events dropped");
+                        if ctx.is_authenticated() {
+                            let notice = ServerMessage::event(
+                                None,
+                                Event::DaemonLog {
+                                    level: LogLevel::Warn,
+                                    message: format!("events dropped: {n}"),
+                                    host: None,
+                                },
+                            );
+                            if out_tx.send(codec::encode(&notice)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-                // Lagged or closed: keep serving requests.
             }
             got = line_rx.recv() => {
                 let Some(line) = got else { break };
