@@ -312,6 +312,134 @@ async fn fake_daemon_silent_after_hello(token: &'static str) -> std::net::Socket
     addr
 }
 
+/// How many events the flooding daemon emits before answering. The client's event
+/// channel holds 1024, so this is comfortably more than enough to fill it.
+const EVENT_FLOOD: usize = 2000;
+
+/// Answers `hello`, then answers `workspace.list` only *after* emitting
+/// [`EVENT_FLOOD`] events. This is a reconnect to a daemon with live PTYs: the
+/// stream is already busy when the first request goes out. A caller that is not
+/// draining the event stream stalls the client's socket reader on a full channel,
+/// and its reply is never parsed.
+async fn fake_daemon_flooding_events(token: &'static str) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut r = BufReader::new(r);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            let ClientMessage::Request { id, request } = codec::decode(line.trim_end()).unwrap();
+            match request {
+                Request::Hello(p) if p.token == token => {
+                    let ok = ServerMessage::ok(
+                        id,
+                        &HelloResult {
+                            daemon_version: "9.9.9".into(),
+                            capabilities: Capabilities {
+                                sandbox_backend: "noop".into(),
+                                git_protect: false,
+                                adapters: vec![],
+                            },
+                        },
+                    );
+                    w.write_all(codec::encode(&ok).as_bytes()).await.unwrap();
+                }
+                Request::WorkspaceList {} => {
+                    // One buffer, one write: the point of the test is the client's
+                    // backpressure, not the daemon's syscall count.
+                    let mut flood = String::new();
+                    for i in 0..EVENT_FLOOD {
+                        flood.push_str(&codec::encode(&ServerMessage::event(
+                            Some("ws_1".into()),
+                            Event::PtyOutput {
+                                pty_id: "pty_1".into(),
+                                data_b64: format!("e{i}"),
+                            },
+                        )));
+                    }
+                    if w.write_all(flood.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    let ok = ServerMessage::ok(id, &WorkspaceListResult { workspaces: vec![] });
+                    if w.write_all(codec::encode(&ok).as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                other => {
+                    let err = ServerMessage::err(
+                        id,
+                        RpcError::internal(format!("not implemented: {}", other.method_name())),
+                    );
+                    w.write_all(codec::encode(&err).as_bytes()).await.unwrap();
+                }
+            }
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn a_request_resolves_while_a_flood_of_events_is_drained() {
+    // `AppController::start` spawns its event drain loop before it issues any
+    // request, for exactly this reason: a daemon that is already streaming must
+    // not be able to starve the connect-time `workspace.list`.
+    let addr = fake_daemon_flooding_events("secret").await;
+    let (client, _h, mut events) = DaemonClient::connect(addr, "secret", "0.1.0")
+        .await
+        .unwrap();
+    let client = client.with_request_timeout(Duration::from_secs(10));
+    let drain = tokio::spawn(async move {
+        let mut n = 0usize;
+        while events.recv().await.is_some() {
+            n += 1;
+        }
+        n
+    });
+    let res = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.request::<WorkspaceListResult>(Request::WorkspaceList {}),
+    )
+    .await
+    .expect("workspace.list must not hang while the event stream is drained")
+    .expect("workspace.list must resolve");
+    assert!(res.workspaces.is_empty());
+    drop(client);
+    let drained = tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .expect("drain task must end once the client is dropped")
+        .unwrap();
+    assert!(
+        drained >= EVENT_FLOOD,
+        "expected at least {EVENT_FLOOD} events, drained {drained}"
+    );
+}
+
+#[tokio::test]
+async fn a_flood_of_events_starves_an_undrained_request() {
+    // The failure mode the test above guards against, pinned so it stays visible:
+    // `_events` is deliberately never polled, the client's socket reader blocks on
+    // the full channel, and the reply is never parsed.
+    let addr = fake_daemon_flooding_events("secret").await;
+    let (client, _h, _events) = DaemonClient::connect(addr, "secret", "0.1.0")
+        .await
+        .unwrap();
+    let client = client.with_request_timeout(Duration::from_millis(500));
+    let err = client
+        .request::<WorkspaceListResult>(Request::WorkspaceList {})
+        .await
+        .expect_err("an undrained event stream must starve the reply");
+    assert!(
+        matches!(err, ClientError::Timeout),
+        "expected ClientError::Timeout, got {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_request_that_is_never_answered_times_out() {
     let addr = fake_daemon_silent_after_hello("secret").await;

@@ -5,6 +5,7 @@ use crate::model::app_state::{compose_status, ConnectionState};
 use crate::qobjects::settings::Settings;
 use bondsymphonic_proto::*;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 /// One process-wide multi-threaded runtime drives the daemon connection. It is
 /// intentionally never dropped: the Qt event loop owns the main thread, and the
@@ -190,6 +191,69 @@ fn report_failure(qt: &QtHandle, op: &'static str, message: String) {
     let _ = qt.queue(move |q| q.operation_failed(QString::from(op), QString::from(&message)));
 }
 
+/// Drains the connection's event stream for the life of the connection. Runs on
+/// its own task, started before any request is issued, so nothing the controller
+/// asks the daemon for can be starved by events the daemon is already sending.
+async fn drain_events(mut events: crate::client::EventStream, router: EventRouter, qt: QtHandle) {
+    while let Some((ws, ev)) = events.recv().await {
+        // Every consumer sees the event before the controller acts on it, so a
+        // terminal's output is never delayed behind UI work.
+        router.dispatch(ws, ev.clone());
+        match ev {
+            Event::WorkspaceStateChanged { info } => {
+                let json = serde_json::to_string(&info).unwrap_or_default();
+                let _ = qt.queue(move |q| q.workspace_changed(QString::from(&json)));
+            }
+            Event::DaemonLog {
+                level, ref message, ..
+            } if level == LogLevel::Warn && message.starts_with(DROP_NOTICE_PREFIX) => {
+                let count = message[DROP_NOTICE_PREFIX.len()..]
+                    .trim()
+                    .parse::<i64>()
+                    .unwrap_or(0);
+                let _ = qt.queue(move |q| q.output_dropped(count));
+            }
+            Event::DaemonLog { level, message, .. } => tracing::info!(?level, "{message}"),
+            _ => {}
+        }
+    }
+    // The stream only ends when the connection does.
+    let _ = qt.queue(|q| q.set_state(ConnectionState::Reconnecting));
+}
+
+/// How long to wait before the single `workspace.list` retry.
+const LIST_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Fetches the daemon's workspace list and queues `workspaces_listed`. The
+/// daemon is authoritative about which workspaces exist and the UI reconciles
+/// its restored tabs against this list, so a single lost reply would leave the
+/// session with no list at all: one retry, and `operation_failed` only if that
+/// also fails.
+async fn load_workspace_list(client: DaemonClient, qt: QtHandle) {
+    let mut last_error = String::new();
+    for attempt in 1..=2 {
+        match client
+            .request::<WorkspaceListResult>(Request::WorkspaceList {})
+            .await
+        {
+            Ok(res) => {
+                let json = serde_json::to_string(&res.workspaces).unwrap_or_else(|_| "[]".into());
+                tracing::info!(count = res.workspaces.len(), attempt, "workspaces_listed");
+                let _ = qt.queue(move |q| q.workspaces_listed(QString::from(&json)));
+                return;
+            }
+            Err(e) => {
+                last_error = e.to_string();
+                if attempt == 1 {
+                    tracing::warn!("workspace.list failed ({last_error}); retrying");
+                    tokio::time::sleep(LIST_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+    report_failure(&qt, "workspace.list", last_error);
+}
+
 impl qobject::AppController {
     pub fn start(self: Pin<&mut Self>) {
         let qt = self.qt_thread();
@@ -217,7 +281,7 @@ impl qobject::AppController {
             let _ = qt.queue(|q| q.set_state(ConnectionState::Connecting));
 
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], proc.port));
-            let (client, hello, mut events) =
+            let (client, hello, events) =
                 match DaemonClient::connect(addr, &proc.token, env!("CARGO_PKG_VERSION")).await {
                     Ok(x) => x,
                     Err(e) => {
@@ -239,6 +303,13 @@ impl qobject::AppController {
                 router: router.clone(),
             });
 
+            // Draining starts before any request goes out. The client's event
+            // channel is bounded, and its socket reader pushes into it with
+            // backpressure, so a daemon that is already streaming (a reconnect to
+            // one with live PTYs) would otherwise fill the channel, stall the
+            // reader, and starve every reply below until the request timeout.
+            runtime().spawn(drain_events(events, router.clone(), qt.clone()));
+
             let version = hello.daemon_version.clone();
             let handle: ProcessHandle = std::sync::Arc::new(tokio::sync::Mutex::new(Some(proc)));
             let c2 = client.clone();
@@ -250,6 +321,9 @@ impl qobject::AppController {
                 q.as_mut().set_state(ConnectionState::Connected);
                 q.apply_daemon_version(QString::from(version.as_str()));
             });
+
+            // Its own task, so the list does not queue behind the prereq check.
+            runtime().spawn(load_workspace_list(client.clone(), qt.clone()));
 
             if let Ok(res) = client
                 .request::<CheckPrereqsResult>(Request::SystemCheckPrereqs {})
@@ -273,47 +347,6 @@ impl qobject::AppController {
                     let _ = qt.queue(move |q| q.prereq_warning(QString::from(msg.as_str())));
                 }
             }
-
-            // The daemon is authoritative about which workspaces exist; the UI
-            // reconciles its restored tabs against this list.
-            match client
-                .request::<WorkspaceListResult>(Request::WorkspaceList {})
-                .await
-            {
-                Ok(res) => {
-                    let json =
-                        serde_json::to_string(&res.workspaces).unwrap_or_else(|_| "[]".into());
-                    tracing::info!(count = res.workspaces.len(), "workspaces_listed");
-                    let _ = qt.queue(move |q| q.workspaces_listed(QString::from(&json)));
-                }
-                Err(e) => report_failure(&qt, "workspace.list", e.to_string()),
-            }
-
-            while let Some((ws, ev)) = events.recv().await {
-                // Every consumer sees the event before the controller acts on it,
-                // so a terminal's output is never delayed behind UI work.
-                router.dispatch(ws, ev.clone());
-                match ev {
-                    Event::WorkspaceStateChanged { info } => {
-                        let json = serde_json::to_string(&info).unwrap_or_default();
-                        let _ = qt.queue(move |q| q.workspace_changed(QString::from(&json)));
-                    }
-                    Event::DaemonLog {
-                        level, ref message, ..
-                    } if level == LogLevel::Warn && message.starts_with(DROP_NOTICE_PREFIX) => {
-                        let count = message[DROP_NOTICE_PREFIX.len()..]
-                            .trim()
-                            .parse::<i64>()
-                            .unwrap_or(0);
-                        let _ = qt.queue(move |q| q.output_dropped(count));
-                    }
-                    Event::DaemonLog { level, message, .. } => {
-                        tracing::info!(?level, "{message}");
-                    }
-                    _ => {}
-                }
-            }
-            let _ = qt.queue(|q| q.set_state(ConnectionState::Reconnecting));
         });
     }
 
