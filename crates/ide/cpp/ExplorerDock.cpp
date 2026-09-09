@@ -12,11 +12,6 @@
 
 namespace {
 
-/// The repo-relative path of an entry; empty on the placeholder and error rows.
-constexpr int kPathRole = Qt::UserRole;
-/// Whether the entry is a directory, as the daemon reported it.
-constexpr int kIsDirRole = Qt::UserRole + 1;
-
 /// Joins a directory path and a child name the way the daemon addresses it.
 QString childPath(const QString& dir, const QString& name) {
     return dir.isEmpty() ? name : dir + QLatin1Char('/') + name;
@@ -57,8 +52,11 @@ void ExplorerDock::setWorkspace(const QString& workspaceId) {
     }
     m_workspaceId = workspaceId;
     m_pending.clear();
+    m_expandedToRestore.clear();
     m_items->clear();
     m_items->setColumnCount(1);
+    // Listings still in flight are dropped by the model, which checks the
+    // workspace an answer belongs to before it emits.
     m_model->setWorkspace(workspaceId);
     if (workspaceId.isEmpty()) {
         return;
@@ -71,21 +69,18 @@ void ExplorerDock::refresh() {
         return;
     }
     m_model->invalidate(QString());
-    // Every listing still in flight describes the tree before the refresh.
-    m_pending.clear();
-    requestDir(QString());
+    m_expandedToRestore.clear();
+    collectExpanded(m_items->invisibleRootItem());
+    // Forced: a root listing already in flight describes the tree before the
+    // refresh, so it is not the answer this asks for.
+    requestDir(QString(), true);
 }
 
 void ExplorerDock::onExpanded(const QModelIndex& index) {
-    if (!index.data(kIsDirRole).toBool()) {
+    if (!index.data(kIsDirRole).toBool() || index.data(kLoadedRole).toBool()) {
         return;
     }
-    const QString path = index.data(kPathRole).toString();
-    // A directory whose listing is cached already shows its real children.
-    if (m_model->isLoaded(path)) {
-        return;
-    }
-    requestDir(path);
+    requestDir(index.data(kPathRole).toString());
 }
 
 void ExplorerDock::onDoubleClicked(const QModelIndex& index) {
@@ -97,19 +92,22 @@ void ExplorerDock::onDoubleClicked(const QModelIndex& index) {
 }
 
 void ExplorerDock::onEntriesLoaded(const QString& path, const QString& entriesJson) {
-    m_pending.remove(path);
     QStandardItem* dir = itemForPath(path);
     if (dir == nullptr) {
         // The tree was emptied while the listing was in flight.
+        noteAnswered(path);
         return;
     }
-    // Re-expanding after the rebuild asks for each of those directories in
-    // turn, which is what carries a refresh down the tree.
-    const QSet<QString> expanded = expandedChildren(dir);
+    // Whatever is expanded under here is about to be destroyed; remember it
+    // alongside anything a refresh already recorded.
+    collectExpanded(dir);
     dir->removeRows(0, dir->rowCount());
+    if (!path.isEmpty()) {
+        dir->setData(true, kLoadedRole);
+    }
 
     const QJsonArray entries = QJsonDocument::fromJson(entriesJson.toUtf8()).array();
-    for (const QJsonValue& value : entries) {
+    for (const QJsonValue value : entries) {
         const QJsonObject entry = value.toObject();
         const QString name = entry.value(QStringLiteral("name")).toString();
         if (name.isEmpty()) {
@@ -123,31 +121,49 @@ void ExplorerDock::onEntriesLoaded(const QString& path, const QString& entriesJs
             item->appendRow(makePlaceholder());
         }
         dir->appendRow(item);
-        if (isDir && expanded.contains(entryPath)) {
+        // Expanding asks for the directory in turn, which is what carries a
+        // reload down the tree.
+        if (isDir && m_expandedToRestore.contains(entryPath)) {
             m_files->expand(m_items->indexFromItem(item));
         }
     }
+    // Last, so the requests the re-expansion just made keep the reload alive.
+    noteAnswered(path);
 }
 
 void ExplorerDock::onLoadFailed(const QString& path, const QString& message) {
-    m_pending.remove(path);
     QStandardItem* dir = itemForPath(path);
     if (dir == nullptr) {
+        noteAnswered(path);
         return;
     }
     // The error takes the placeholder's place, so the reason is visible where
     // the contents would have been. The root's whole listing is the error.
     dir->removeRows(0, dir->rowCount());
+    if (!path.isEmpty()) {
+        dir->setData(false, kLoadedRole);
+    }
     dir->appendRow(makeError(message));
+    noteAnswered(path);
 }
 
-void ExplorerDock::requestDir(const QString& path) {
-    if (m_workspaceId.isEmpty() || m_pending.contains(path)) {
+void ExplorerDock::requestDir(const QString& path, bool force) {
+    if (m_workspaceId.isEmpty() || (!force && m_pending.value(path) > 0)) {
         return;
     }
-    // Inserted first: a load with no daemon behind it fails synchronously.
-    m_pending.insert(path);
+    // Counted first: a load with no daemon behind it fails synchronously.
+    ++m_pending[path];
     m_model->loadDir(m_workspaceId, path);
+}
+
+void ExplorerDock::noteAnswered(const QString& path) {
+    const auto it = m_pending.find(path);
+    if (it != m_pending.end() && --it.value() <= 0) {
+        m_pending.erase(it);
+    }
+    if (m_pending.isEmpty()) {
+        m_expandedToRestore.clear();
+    }
 }
 
 QStandardItem* ExplorerDock::itemForPath(const QString& path) const {
@@ -174,15 +190,17 @@ QStandardItem* ExplorerDock::itemForPath(const QString& path) const {
     return item;
 }
 
-QSet<QString> ExplorerDock::expandedChildren(QStandardItem* parent) const {
-    QSet<QString> expanded;
+void ExplorerDock::collectExpanded(QStandardItem* parent) {
     for (int row = 0; row < parent->rowCount(); ++row) {
         QStandardItem* child = parent->child(row);
-        if (child->data(kIsDirRole).toBool() && m_files->isExpanded(m_items->indexFromItem(child))) {
-            expanded.insert(child->data(kPathRole).toString());
+        if (!child->data(kIsDirRole).toBool()) {
+            continue;
         }
+        if (m_files->isExpanded(m_items->indexFromItem(child))) {
+            m_expandedToRestore.insert(child->data(kPathRole).toString());
+        }
+        collectExpanded(child);
     }
-    return expanded;
 }
 
 QStandardItem* ExplorerDock::makeEntry(const QString& path, const QString& name, bool isDir,
