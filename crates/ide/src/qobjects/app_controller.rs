@@ -1,3 +1,4 @@
+use crate::client::router::EventRouter;
 use crate::client::DaemonClient;
 use crate::launcher::{self, LaunchSpec};
 use crate::model::app_state::{compose_status, ConnectionState};
@@ -20,6 +21,33 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// The connection, plus the router fanning its events out. Published process-wide
+/// once `start` has connected so that QObjects created later (terminal panes, the
+/// file tree) can issue requests and subscribe to events without holding a
+/// pointer to the controller.
+#[derive(Clone)]
+pub struct Shared {
+    pub client: DaemonClient,
+    pub router: EventRouter,
+}
+
+static SHARED: OnceLock<std::sync::Mutex<Option<Shared>>> = OnceLock::new();
+
+fn shared_slot() -> &'static std::sync::Mutex<Option<Shared>> {
+    SHARED.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// The live daemon connection and event router, or `None` before `start` has
+/// connected. The returned clone keeps working across reconnects only until the
+/// next successful connect replaces it, so callers should fetch it per operation
+/// rather than caching it.
+pub fn shared() -> Option<Shared> {
+    shared_slot()
+        .lock()
+        .expect("shared handle mutex poisoned")
+        .clone()
+}
+
 #[cxx_qt::bridge]
 pub mod qobject {
     unsafe extern "C++" {
@@ -40,6 +68,43 @@ pub mod qobject {
         #[qsignal]
         fn prereq_warning(self: Pin<&mut AppController>, message: QString);
 
+        /// The daemon's full workspace list, as a JSON array of `WorkspaceInfo`,
+        /// emitted once per successful connect.
+        #[qsignal]
+        fn workspaces_listed(self: Pin<&mut AppController>, json: QString);
+
+        /// One workspace changed state: a JSON `WorkspaceInfo`.
+        #[qsignal]
+        fn workspace_changed(self: Pin<&mut AppController>, info_json: QString);
+
+        /// A `create_workspace` call succeeded. `group`, `adapter` and `command`
+        /// are echoed back from the call so the UI can place the new tab without
+        /// tracking the in-flight request itself.
+        #[qsignal]
+        fn workspace_created(
+            self: Pin<&mut AppController>,
+            info_json: QString,
+            group: QString,
+            adapter: QString,
+            command: QString,
+        );
+
+        /// A `destroy_workspace` call succeeded, for the workspace with this id.
+        #[qsignal]
+        fn workspace_destroyed(self: Pin<&mut AppController>, id: QString);
+
+        /// An `inspect_repo` call succeeded: a JSON `RepoInfo` for `path`.
+        #[qsignal]
+        fn repo_inspected(self: Pin<&mut AppController>, path: QString, info_json: QString);
+
+        /// The daemon dropped `count` events because a consumer fell behind.
+        #[qsignal]
+        fn output_dropped(self: Pin<&mut AppController>, count: i64);
+
+        /// An asynchronous operation failed. `op` is the daemon method name.
+        #[qsignal]
+        fn operation_failed(self: Pin<&mut AppController>, op: QString, message: QString);
+
         /// Launch the daemon inside WSL and connect to it.
         #[qinvokable]
         fn start(self: Pin<&mut AppController>);
@@ -48,6 +113,35 @@ pub mod qobject {
         /// this rather than `set_daemon_version` so the status bar stays in sync.
         #[qinvokable]
         fn apply_daemon_version(self: Pin<&mut AppController>, version: QString);
+
+        /// Create a workspace. Answers with `workspace_created` or
+        /// `operation_failed`; `group`, `adapter` and `command` are not sent to
+        /// the daemon, only echoed back to the caller.
+        #[qinvokable]
+        fn create_workspace(
+            self: Pin<&mut AppController>,
+            repo_path: QString,
+            base_branch: QString,
+            name: QString,
+            group: QString,
+            adapter: QString,
+            command: QString,
+        );
+
+        /// Destroy a workspace. Answers with `workspace_destroyed` or
+        /// `operation_failed`.
+        #[qinvokable]
+        fn destroy_workspace(self: Pin<&mut AppController>, id: QString, force: bool);
+
+        /// Inspect a git repository. Answers with `repo_inspected` or
+        /// `operation_failed`.
+        #[qinvokable]
+        fn inspect_repo(self: Pin<&mut AppController>, path: QString);
+
+        /// Translates a Windows path to the WSL path the daemon expects, or
+        /// returns an empty string if it is not a translatable path.
+        #[qinvokable]
+        fn wsl_path(self: &AppController, windows_path: QString) -> QString;
     }
 
     impl cxx_qt::Threading for AppController {}
@@ -58,8 +152,17 @@ use cxx_qt::CxxQtType;
 use cxx_qt::Threading;
 use cxx_qt_lib::QString;
 
+type QtHandle = cxx_qt::CxxQtThread<qobject::AppController>;
+
 /// Shared handle to the running daemon so a later "Exit" action can shut it down.
 type ProcessHandle = std::sync::Arc<tokio::sync::Mutex<Option<launcher::DaemonProcess>>>;
+
+/// Warn-level daemon logs starting with this are the event-queue overflow
+/// notice, which the UI surfaces as a terminal banner rather than a log line.
+const DROP_NOTICE_PREFIX: &str = "events dropped: ";
+
+/// Reported when an invokable runs before `start` has connected.
+const NOT_CONNECTED: &str = "not connected to the daemon";
 
 pub struct AppControllerRust {
     connection_state: i32,
@@ -79,6 +182,12 @@ impl Default for AppControllerRust {
             process: None,
         }
     }
+}
+
+/// Queues an `operation_failed` for `op` back onto the Qt thread.
+fn report_failure(qt: &QtHandle, op: &'static str, message: String) {
+    tracing::warn!("{op} failed: {message}");
+    let _ = qt.queue(move |q| q.operation_failed(QString::from(op), QString::from(&message)));
 }
 
 impl qobject::AppController {
@@ -122,6 +231,14 @@ impl qobject::AppController {
                     }
                 };
 
+            // Published before any event is dispatched, so a QObject woken by the
+            // first `workspaces_listed` can already reach the daemon.
+            let router = EventRouter::new();
+            *shared_slot().lock().expect("shared handle mutex poisoned") = Some(Shared {
+                client: client.clone(),
+                router: router.clone(),
+            });
+
             let version = hello.daemon_version.clone();
             let handle: ProcessHandle = std::sync::Arc::new(tokio::sync::Mutex::new(Some(proc)));
             let c2 = client.clone();
@@ -157,14 +274,149 @@ impl qobject::AppController {
                 }
             }
 
-            while let Some((_ws, ev)) = events.recv().await {
-                if let Event::DaemonLog { level, message, .. } = ev {
-                    tracing::info!(?level, "{message}");
+            // The daemon is authoritative about which workspaces exist; the UI
+            // reconciles its restored tabs against this list.
+            match client
+                .request::<WorkspaceListResult>(Request::WorkspaceList {})
+                .await
+            {
+                Ok(res) => {
+                    let json =
+                        serde_json::to_string(&res.workspaces).unwrap_or_else(|_| "[]".into());
+                    tracing::info!(count = res.workspaces.len(), "workspaces_listed");
+                    let _ = qt.queue(move |q| q.workspaces_listed(QString::from(&json)));
                 }
-                // Later milestones route events to their QObjects here.
+                Err(e) => report_failure(&qt, "workspace.list", e.to_string()),
+            }
+
+            while let Some((ws, ev)) = events.recv().await {
+                // Every consumer sees the event before the controller acts on it,
+                // so a terminal's output is never delayed behind UI work.
+                router.dispatch(ws, ev.clone());
+                match ev {
+                    Event::WorkspaceStateChanged { info } => {
+                        let json = serde_json::to_string(&info).unwrap_or_default();
+                        let _ = qt.queue(move |q| q.workspace_changed(QString::from(&json)));
+                    }
+                    Event::DaemonLog {
+                        level, ref message, ..
+                    } if level == LogLevel::Warn && message.starts_with(DROP_NOTICE_PREFIX) => {
+                        let count = message[DROP_NOTICE_PREFIX.len()..]
+                            .trim()
+                            .parse::<i64>()
+                            .unwrap_or(0);
+                        let _ = qt.queue(move |q| q.output_dropped(count));
+                    }
+                    Event::DaemonLog { level, message, .. } => {
+                        tracing::info!(?level, "{message}");
+                    }
+                    _ => {}
+                }
             }
             let _ = qt.queue(|q| q.set_state(ConnectionState::Reconnecting));
         });
+    }
+
+    pub fn create_workspace(
+        self: Pin<&mut Self>,
+        repo_path: QString,
+        base_branch: QString,
+        name: QString,
+        group: QString,
+        adapter: QString,
+        command: QString,
+    ) {
+        let qt = self.qt_thread();
+        let params = WorkspaceCreateParams {
+            repo_path: repo_path.to_string(),
+            base_branch: base_branch.to_string(),
+            name: name.to_string(),
+        };
+        // Echoed straight back on success: the controller keeps no tab state.
+        let (group, adapter, command) =
+            (group.to_string(), adapter.to_string(), command.to_string());
+        let Some(shared) = shared() else {
+            report_failure(&qt, "workspace.create", NOT_CONNECTED.to_owned());
+            return;
+        };
+        runtime().spawn(async move {
+            match shared
+                .client
+                .request::<WorkspaceInfo>(Request::WorkspaceCreate(params))
+                .await
+            {
+                Ok(info) => {
+                    let json = serde_json::to_string(&info).unwrap_or_default();
+                    let _ = qt.queue(move |q| {
+                        q.workspace_created(
+                            QString::from(&json),
+                            QString::from(&group),
+                            QString::from(&adapter),
+                            QString::from(&command),
+                        )
+                    });
+                }
+                Err(e) => report_failure(&qt, "workspace.create", e.to_string()),
+            }
+        });
+    }
+
+    pub fn destroy_workspace(self: Pin<&mut Self>, id: QString, force: bool) {
+        let qt = self.qt_thread();
+        let id = id.to_string();
+        let Some(shared) = shared() else {
+            report_failure(&qt, "workspace.destroy", NOT_CONNECTED.to_owned());
+            return;
+        };
+        runtime().spawn(async move {
+            let params = WorkspaceDestroyParams {
+                workspace_id: WorkspaceId(id.clone()),
+                force,
+            };
+            match shared
+                .client
+                .request_raw(Request::WorkspaceDestroy(params))
+                .await
+            {
+                Ok(_) => {
+                    let _ = qt.queue(move |q| q.workspace_destroyed(QString::from(&id)));
+                }
+                Err(e) => report_failure(&qt, "workspace.destroy", e.to_string()),
+            }
+        });
+    }
+
+    pub fn inspect_repo(self: Pin<&mut Self>, path: QString) {
+        let qt = self.qt_thread();
+        let path = path.to_string();
+        let Some(shared) = shared() else {
+            report_failure(&qt, "repo.inspect", NOT_CONNECTED.to_owned());
+            return;
+        };
+        runtime().spawn(async move {
+            let params = RepoPathParams { path: path.clone() };
+            match shared
+                .client
+                .request::<RepoInfo>(Request::RepoInspect(params))
+                .await
+            {
+                Ok(info) => {
+                    let json = serde_json::to_string(&info).unwrap_or_default();
+                    let _ = qt.queue(move |q| {
+                        q.repo_inspected(QString::from(&path), QString::from(&json))
+                    });
+                }
+                Err(e) => report_failure(&qt, "repo.inspect", e.to_string()),
+            }
+        });
+    }
+
+    pub fn wsl_path(&self, windows_path: QString) -> QString {
+        let path = windows_path.to_string();
+        match launcher::windows_path_to_wsl(std::path::Path::new(&path)) {
+            Some(p) => QString::from(&p),
+            None => QString::from(""),
+        }
     }
 
     pub fn set_state(mut self: Pin<&mut Self>, state: ConnectionState) {

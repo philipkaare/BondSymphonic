@@ -1,4 +1,5 @@
 ﻿pub mod codec;
+pub mod router;
 
 use bondsymphonic_proto::*;
 use serde::de::DeserializeOwned;
