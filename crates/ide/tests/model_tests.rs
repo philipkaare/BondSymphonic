@@ -81,6 +81,41 @@ fn workspace_info_updates_status_and_reconcile_drops_and_adds() {
 }
 
 #[test]
+fn reconcile_preserves_active_tab_identity_when_possible() {
+    let build = || {
+        let mut w = Workspaces::new_default();
+        w.add_tab(0, tab("ws_a", "a"));
+        w.add_tab(0, tab("ws_b", "b"));
+        w.add_tab(0, tab("ws_c", "c"));
+        assert!(w.set_active(0, 1)); // "b" is active
+        w
+    };
+
+    // Dropping an unrelated tab positioned before the active one in the same
+    // group must not silently move `active` onto whatever slid into its slot.
+    let mut w = build();
+    w.reconcile(&[
+        info("ws_b", "b", WorkspaceState::Ready),
+        info("ws_c", "c", WorkspaceState::Ready),
+    ]);
+    assert_eq!(w.active().unwrap().workspace_id, WorkspaceId::from("ws_b"));
+
+    // Dropping the active tab itself falls back to another tab in the same group.
+    let mut w = build();
+    w.reconcile(&[
+        info("ws_a", "a", WorkspaceState::Ready),
+        info("ws_c", "c", WorkspaceState::Ready),
+    ]);
+    assert_eq!(w.active_group, 0);
+    assert_ne!(w.active().unwrap().workspace_id, WorkspaceId::from("ws_b"));
+
+    // Dropping every tab leaves no active tab.
+    let mut w = build();
+    w.reconcile(&[]);
+    assert!(w.active().is_none());
+}
+
+#[test]
 fn tab_status_glyphs_and_mapping() {
     assert_eq!(
         TabStatus::from_workspace_state(&WorkspaceState::Creating),

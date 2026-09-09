@@ -253,17 +253,17 @@ impl Workspaces {
     /// does not yet know about are added to an "Unsorted" group (created at
     /// the end if missing), and known workspaces have their info refreshed.
     pub fn reconcile(&mut self, daemon_list: &[WorkspaceInfo]) {
+        // Remember which workspace (and which group it lived in) was active
+        // before mutating, so we can re-point at it afterward instead of
+        // relying on its numeric index, which `retain` below can shift out
+        // from under an unrelated tab in the same group.
+        let active_id = self.active().map(|t| t.workspace_id.clone());
+        let prev_active_group = self.active_group;
+
         let daemon_ids: std::collections::HashSet<&WorkspaceId> =
             daemon_list.iter().map(|info| &info.id).collect();
         for group in &mut self.groups {
             group.tabs.retain(|t| daemon_ids.contains(&t.workspace_id));
-        }
-        let active_valid = self
-            .groups
-            .get(self.active_group)
-            .is_some_and(|grp| self.active_tab < grp.tabs.len());
-        if !active_valid {
-            self.fallback_active();
         }
 
         for info in daemon_list {
@@ -271,6 +271,8 @@ impl Workspaces {
                 self.apply_workspace_info(info);
                 continue;
             }
+            // Unknown workspaces are filed into a group named "Unsorted",
+            // looked up (and created if absent) by name, not by a stable id.
             let group_idx = match self.groups.iter().position(|g| g.name == "Unsorted") {
                 Some(idx) => idx,
                 None => self.add_group("Unsorted"),
@@ -288,6 +290,26 @@ impl Workspaces {
                 adapter: AgentAdapterKind::Terminal,
                 command: None,
             });
+        }
+
+        // Restore the active selection: keep pointing at the same workspace
+        // if it survived reconciliation, else prefer another tab that is
+        // still in its former group, else fall back to the first non-empty
+        // group.
+        match active_id.and_then(|id| self.find(&id)) {
+            Some((g, t)) => {
+                self.active_group = g;
+                self.active_tab = t;
+            }
+            None if self
+                .groups
+                .get(prev_active_group)
+                .is_some_and(|g| !g.tabs.is_empty()) =>
+            {
+                self.active_group = prev_active_group;
+                self.active_tab = 0;
+            }
+            None => self.fallback_active(),
         }
     }
 
