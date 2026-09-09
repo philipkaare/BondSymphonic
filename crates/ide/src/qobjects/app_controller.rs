@@ -293,23 +293,50 @@ pub mod qobject {
         #[qsignal]
         fn open_diff_requested(self: Pin<&mut AppController>, workspace_id: QString, path: QString);
 
+        /// Someone in Rust asked the window to answer the tool-permission
+        /// request `request_id` on `agent_id`'s transcript.
+        #[qsignal]
+        fn permission_reply_requested(
+            self: Pin<&mut AppController>,
+            agent_id: QString,
+            request_id: QString,
+            allow: bool,
+        );
+
         /// Someone in Rust asked the window to save every dirty editor.
         #[qsignal]
         fn save_all_requested(self: Pin<&mut AppController>);
 
         /// Asks the window to open `path` of `workspace_id` in an editor tab.
         ///
-        /// These three are the one path by which anything on the Rust side
-        /// reaches the window: the controller has no pointer to it, and the
-        /// window is the only thing that knows which tabs exist. The smoke
-        /// script drives them today; the transcript's tool cards will drive
-        /// them next.
+        /// These four `request_*` invokables are the one path by which anything
+        /// on the Rust side reaches the window: the controller has no pointer
+        /// to it, and the window is the only thing that knows which tabs exist.
+        /// The smoke script drives them today; the transcript's tool cards will
+        /// drive them next.
         #[qinvokable]
         fn request_open_file(self: Pin<&mut AppController>, workspace_id: QString, path: QString);
 
         /// Asks the window to open the diff for `path` of `workspace_id`.
         #[qinvokable]
         fn request_open_diff(self: Pin<&mut AppController>, workspace_id: QString, path: QString);
+
+        /// Asks the window to answer `request_id` on `agent_id`'s transcript
+        /// with allow or deny, as if the user had pressed the button on the
+        /// permission bar.
+        ///
+        /// The controller owns no transcript: only the window knows which pane
+        /// is attached to which agent, so this goes out as a signal like the
+        /// three above. It is production API, not a test hook — Milestone 6's
+        /// desktop notifications answer a permission the same way — and the
+        /// smoke script is its first caller.
+        #[qinvokable]
+        fn request_permission_reply(
+            self: Pin<&mut AppController>,
+            agent_id: QString,
+            request_id: QString,
+            allow: bool,
+        );
 
         /// Asks the window to save every dirty editor.
         #[qinvokable]
@@ -902,6 +929,15 @@ impl qobject::AppController {
 
     pub fn request_open_diff(self: Pin<&mut Self>, workspace_id: QString, path: QString) {
         self.open_diff_requested(workspace_id, path);
+    }
+
+    pub fn request_permission_reply(
+        self: Pin<&mut Self>,
+        agent_id: QString,
+        request_id: QString,
+        allow: bool,
+    ) {
+        self.permission_reply_requested(agent_id, request_id, allow);
     }
 
     pub fn request_save_all(self: Pin<&mut Self>) {

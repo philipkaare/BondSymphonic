@@ -328,6 +328,36 @@ built from them: the debug executable is 24.6 MB. A release build and pruning th
 grammar list are the levers if this ever approaches the target; at 109 MB against
 150 MB it does not, so no profiling pass was made.
 
+**Measured, Milestone 4 (2026-09-09).** The same machine and the same debug build
+against the real daemon in WSL, with a fake `claude` in the workspace sandbox. One
+Claude workspace whose transcript holds **198 items** — a permission turn plus 194
+assistant paragraphs, replayed from `agent.history` after a detach/re-attach, not
+merely streamed — the bottom Terminal tab's shell PTY in that workspace, three
+open editor tabs and one open diff; plus a second workspace the daemon restored at
+startup, whose sandbox is up but which has no pane open. Left idle for 75 s:
+
+| | measured | M3 | target |
+|---|---|---|---|
+| `bondsymphonic-ide.exe` working set | 119.0 MB | 108.9 MB | < 150 MB |
+| `bondsymphonic-ide.exe` private bytes | 59.5 MB | 56.6 MB | — |
+| `bondsymphonic-daemon` RSS | 6.8 MB | 9.2 MB | < 30 MB |
+
+The daemon is *smaller* than in M3 because this scenario runs one PTY rather than
+four; the agent it supervises costs nothing to the daemon process itself. Inside
+the distro the supervised tree — four `bwrap`, two sandbox-init helpers, the
+sandboxed shell and the agent process — came to about 31 MB, of which the agent
+(here a python stand-in) was 11 MB.
+
+The IDE is 10 MB over M3, but the two scenarios are not a controlled comparison:
+this one adds 198 transcript frames and drops three PTYs with their 10,000-line
+scrollbacks, so the transcript's own share is somewhere above 10 MB. What the
+number does settle is that a long transcript is affordable at this size.
+
+The "2,000 items per agent" collapse in the list above is **not implemented**: a
+transcript grows one frame per item without bound today. A 2,000-item transcript
+would therefore be the first thing to push this measurement towards the target,
+and the collapse is the fix when it does.
+
 ## 14. Testing (IDE-specific)
 
 - `model/` unit tests: transcript delta coalescing and tool-result matching; diff
@@ -339,17 +369,41 @@ grammar list are the levers if this ever approaches the target; at 109 MB agains
   implementing the proto types).
 - `smoke.rs`: start the fake daemon, launch the real binary with
   `QT_QPA_PLATFORM=offscreen`, and drive it through `BS_SMOKE_SCRIPT` —
-  `create,open,tree,open_file,open_diff,close,destroy,quit`. `open_file` and
-  `open_diff` emit `AppController::openFileRequested`/`openDiffRequested`, the
-  same signals the Explorer's double-click produces, so the window builds the
-  editor and diff tabs itself. The assertions are on the requests the fake daemon
-  received and on what the IDE logged: `hello`, `workspace.create`, `pty.open`,
-  `fs.list_dir`, `fs.read_file`, `workspace.diff`, `pty.close`,
-  `workspace.destroy` in that order; `fs.watch` and `workspace.changes` each seen
-  after `workspace.create`; two `fs.list_dir` and two `pty.open`, since the
-  window issues its own beside the script's; no `pty.close`, `pty.resize` or
-  `pty.write` after `workspace.destroy`, because those PTYs have already exited;
-  and no failure warning logged for any of `fs.read_file`, `workspace.diff`,
-  `workspace.changes` or `fs.watch`. Runs in `cargo test` on Windows when Qt is
-  present; skipped with a message otherwise. Feeding a recorded transcript joins
-  this test when the transcript view lands in Milestone 4.
+  `create_claude,open_agent,send,allow,tree,open_file,open_diff,stop,create,open,close,destroy,quit`.
+  Two workspaces, because the two halves need different panes: the first is a
+  Claude tab and carries one whole agent turn, the second a terminal tab whose
+  PTY the `close`/`destroy` pair tears down. `open_file` and `open_diff` emit
+  `AppController::openFileRequested`/`openDiffRequested` and `allow` emits
+  `permissionReplyRequested`, all signals a person's click produces, so the
+  window builds the editor and diff tabs and answers the permission bar itself.
+
+  The assertions are on the requests the fake daemon received, on the one
+  permission reply it received, and on what the IDE logged.
+
+  - `hello`, `workspace.create`, `agent.start`, `agent.history`, `agent.send`,
+    `agent.permission_reply`, `fs.list_dir`, `fs.read_file`, `workspace.diff`,
+    `agent.stop`, `pty.open`, `pty.close`, `workspace.destroy` in that order.
+    `agent.history` is the window's own: only `TranscriptModel::attach` sends it,
+    and the model attaches only because the window reacted to `agentStarted`, so
+    its place before `agent.send` shows the pane was wired up before the turn.
+  - The reply the daemon received is exactly one `allow` for the request the
+    transcript was showing. The window routes `permissionReplyRequested` to the
+    active pane only when that pane is attached to the named agent *and* has
+    that request on its bar, and logs "permission reply not routed" otherwise —
+    so a reply reaching the daemon at all is the proof the bar was up.
+  - `fs.watch` and `workspace.changes` each seen after `workspace.create`; two
+    `fs.list_dir` and two `pty.open`, since the window issues its own beside the
+    script's.
+  - No `agent.*` after `workspace.destroy`: a destroyed workspace's transcript
+    detaches and stops nothing, because the daemon reaps its agents itself. No
+    `pty.close`, `pty.resize` or `pty.write` after it either, because those PTYs
+    have already exited.
+  - `system.setup_pty` never asked for: every prerequisite the fake daemon
+    reports passes, so the setup page never appears and no login terminal opens.
+  - No failure warning logged for any of `fs.read_file`, `workspace.diff`,
+    `workspace.changes`, `fs.watch`, `agent.history`, `agent.send`,
+    `agent.permission_reply` or `agent.stop` — the journal shows a request
+    arrived, these show its reply was accepted.
+
+  Runs in `cargo test` on Windows when Qt is present; skipped with a message
+  otherwise.

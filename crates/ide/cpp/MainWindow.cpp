@@ -387,6 +387,28 @@ void MainWindow::connectController() {
                      });
     QObject::connect(m_controller, &AppController::saveAllRequested, this,
                      [this] { m_editorArea->saveAll(); });
+    // Answering a permission request from outside the transcript view. Only the
+    // view that is actually showing `requestId` may answer it: an answer routed
+    // to any other pane would allow a tool the user never saw.
+    QObject::connect(m_controller, &AppController::permissionReplyRequested, this,
+                     [this](const QString& agentId, const QString& requestId, bool allow) {
+                         const QString workspaceId = activeWorkspaceId();
+                         TranscriptModel* model =
+                             workspaceId.isEmpty() ? nullptr : m_agentArea->transcriptModel(workspaceId);
+                         const QString pending =
+                             model == nullptr ? QString() : model->getPendingJson();
+                         const QString shown = QJsonDocument::fromJson(pending.toUtf8())
+                                                   .object()
+                                                   .value("request_id")
+                                                   .toString();
+                         if (model == nullptr || model->getAgentId() != agentId || shown != requestId) {
+                             qWarning("permission reply not routed: no visible transcript is showing "
+                                      "request %s for agent %s",
+                                      qUtf8Printable(requestId), qUtf8Printable(agentId));
+                             return;
+                         }
+                         model->reply(requestId, allow, false, QString());
+                     });
 
     QObject::connect(m_editorArea, &EditorArea::currentEditorChanged, this,
                      [this](EditorWidget*) { updateEditActions(); });

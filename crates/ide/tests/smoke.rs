@@ -7,14 +7,17 @@
 //! (perform these steps once connected). Both are inert when unset.
 //!
 //! What it proves: the window builds, the daemon connection comes up, the
-//! workspace/PTY/file-tree requests reach the daemon in the right order, an
-//! editor tab and a diff tab open through the same controller signals the
-//! Explorer emits and fetch their contents (`fs.read_file`, `workspace.diff`)
-//! and their live-update watches (`fs.watch`, `workspace.changes`), panes whose
-//! process has exited are torn down without talking to the daemon about the
-//! PTYs it has already reaped, the Qt event loop is still responsive at the end
-//! (the `quit` step runs on it), and the process ends with status 0 well inside
-//! the time limit.
+//! workspace/PTY/file-tree requests reach the daemon in the right order, a
+//! Claude agent's tab attaches a transcript of its own accord and carries one
+//! whole turn — prompt, permission request, allow, tool call, result — with the
+//! answer routed back through the window to the pane that was showing the
+//! request, an editor tab and a diff tab open through the same controller
+//! signals the Explorer emits and fetch their contents (`fs.read_file`,
+//! `workspace.diff`) and their live-update watches (`fs.watch`,
+//! `workspace.changes`), panes whose process has exited are torn down without
+//! talking to the daemon about the PTYs it has already reaped, the Qt event
+//! loop is still responsive at the end (the `quit` step runs on it), and the
+//! process ends with status 0 well inside the time limit.
 
 use base64::Engine as _;
 use bondsymphonic_proto::*;
@@ -31,25 +34,49 @@ const BASE64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
 
 const TOKEN: &str = "smoke-token";
-const SCRIPT: &str = "create,open,tree,open_file,open_diff,close,destroy,quit";
+/// The Claude half comes first, on its own workspace, and the terminal half
+/// second on another: a Claude tab has a transcript pane and no PTY, so the
+/// `close`/`destroy` pair only means something over a workspace whose pane is a
+/// terminal.
+const SCRIPT: &str = "create_claude,open_agent,send,allow,tree,open_file,open_diff,stop,create,\
+                      open,close,destroy,quit";
 /// The file `open_file` and `open_diff` act on, and the one entry of the fake
 /// `fs.list_dir` listing that is not a directory.
 const OPEN_PATH: &str = "README.md";
-/// The `quit` step alone waits 2 s, `close` another 0.75 s and each of
-/// `open_file` and `open_diff` another 0.75 s; the rest is a Qt startup on a
-/// cold cache.
-const RUN_LIMIT: Duration = Duration::from_secs(40);
-/// The methods the script must produce, in this order. `fs.read_file` is the
-/// editor tab loading its file and `workspace.diff` the diff tab loading its
-/// alignment, so their place in the sequence is what shows the two tabs opened
-/// in the order the script asked for them.
-const EXPECTED: [&str; 8] = [
+/// The agent the fake daemon hands out, the tool it asks about and the id of
+/// the request the `allow` step answers. The script agrees the request id with
+/// the daemon rather than reading it off the transcript, and the window refuses
+/// to route an answer to a pane that is not showing exactly that request.
+const AGENT_ID: &str = "ag_smoke1";
+const REQUEST_ID: &str = "req-1";
+const TOOL_NAME: &str = "Bash";
+/// What the turn cost, so the assertion on the result frame has a number.
+const TURN_COST_USD: f64 = 0.002;
+/// The `quit` step alone waits 2 s, each of `open_agent`, `send` and `allow`
+/// another 1.5 s, and `create`, `create_claude`, `open_file`, `open_diff`,
+/// `stop` and `close` another 0.75 s each; the rest is a Qt startup on a cold
+/// cache.
+const RUN_LIMIT: Duration = Duration::from_secs(60);
+/// The methods the script must produce, in this order. `agent.history` is the
+/// window's own doing — only `TranscriptModel::attach` sends it, and the model
+/// only attaches because the window reacted to `agentStarted` — so its place
+/// between `agent.start` and `agent.send` shows the pane was built and wired up
+/// before the turn began. `fs.read_file` is the editor tab loading its file and
+/// `workspace.diff` the diff tab loading its alignment, so their place in the
+/// sequence is what shows the two tabs opened in the order the script asked for
+/// them.
+const EXPECTED: [&str; 13] = [
     "hello",
     "workspace.create",
-    "pty.open",
+    "agent.start",
+    "agent.history",
+    "agent.send",
+    "agent.permission_reply",
     "fs.list_dir",
     "fs.read_file",
     "workspace.diff",
+    "agent.stop",
+    "pty.open",
     "pty.close",
     "workspace.destroy",
 ];
@@ -70,11 +97,24 @@ const WORK_TEXT: &str = "hello\nworld\n";
 /// `fs.write_file` is not among them: no step saves, so asserting on its
 /// warning would assert nothing. The fake daemon answers it anyway, so a future
 /// step that does save needs no change on the daemon side.
-const NO_WARNINGS: [&str; 4] = [
+const NO_WARNINGS: [&str; 9] = [
     "fs.read_file failed",
     "workspace.diff failed",
     "workspace.changes failed",
     "fs.watch enable",
+    // The transcript's own four. The fake daemon answers every one of them, so
+    // any of these means the IDE refused a reply it was given -- a body it
+    // could not deserialise, say -- which the journal alone cannot show.
+    "agent.history failed",
+    "agent.send failed",
+    "agent.permission_reply failed",
+    "agent.stop failed",
+    // The window's, when an answer arrives for a request no visible transcript
+    // is showing. This is what makes the `allow` step an assertion rather than
+    // a wish: `agent.permission_reply` reaches the daemon only through
+    // `TranscriptModel::reply`, and the window calls that only after it has
+    // found the pane attached to the agent with this request on its bar.
+    "permission reply not routed",
 ];
 
 /// Every request method the fake daemon answered, in arrival order.
@@ -94,7 +134,7 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let (addr, journal) = rt.block_on(fake_daemon());
+    let (addr, journal, replies) = rt.block_on(fake_daemon());
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
         .env("QT_QPA_PLATFORM", "offscreen")
@@ -122,14 +162,18 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
         err.recv().expect("the stderr drain thread is alive"),
     );
     let seen = journal.lock().expect("journal mutex").clone();
-    let context = format!("requests: {seen:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+    let answered = replies.lock().expect("replies mutex").clone();
+    let context = format!(
+        "requests: {seen:?}\npermission replies: {answered:?}\n--- stdout ---\n{out}\n\
+         --- stderr ---\n{err}"
+    );
     // Both pipes together. `tracing_subscriber::fmt()` writes to *stdout* by
     // default and `main` does not override the writer, so every warning the IDE
     // logs arrives on stdout; only a panic message comes out on stderr. An
     // assertion that read stderr alone would pass whatever was logged, which is
     // what the three terminal-warning assertions below used to do.
     let logs = format!("{out}\n{err}");
-    eprintln!("smoke: the fake daemon answered {seen:?}");
+    eprintln!("smoke: the fake daemon answered {seen:?}, permission replies {answered:?}");
 
     let status =
         status.unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
@@ -175,15 +219,41 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
             "the window never sent {method} after workspace.create\n{context}"
         );
     }
+    // What the `allow` step actually did. The journal shows an answer was sent;
+    // this shows it named the request the transcript was showing and said yes.
+    assert_eq!(
+        answered,
+        vec![format!("{REQUEST_ID}:allow")],
+        "the permission reply the fake daemon received was not a single allow for \
+         {REQUEST_ID}\n{context}"
+    );
+    // A login terminal on the host is the one thing this run must never open,
+    // and nothing in the script asks for one: every prerequisite the fake
+    // daemon reports passes, so the setup page never appears.
+    assert!(
+        !seen.iter().any(|m| m == "system.setup_pty"),
+        "the IDE asked for a setup terminal\n{context}"
+    );
+    // The transcript detaches when its workspace goes, and stops nothing: the
+    // daemon reaps a destroyed workspace's agents itself. An `agent.*` after
+    // the destroy would be the IDE talking about an agent that is already gone,
+    // which the daemon answers `NotFound`.
+    // The Claude workspace is never destroyed in this script -- the destroy is
+    // for the terminal workspace created later -- so this also covers a live
+    // transcript sitting through another tab's teardown.
+    let after_destroy: Vec<&String> = seen
+        .iter()
+        .skip_while(|m| *m != "workspace.destroy")
+        .collect();
+    assert!(
+        !after_destroy.iter().any(|m| m.starts_with("agent.")),
+        "the IDE sent an agent request after workspace.destroy\n{context}"
+    );
     // The `close` step ended every PTY the fake daemon had open, so by the time
     // `destroy` tears the panes down their processes have exited. A pane in that
     // state must not send `pty.close` or `pty.resize`: the daemon has reaped
     // those PTYs and answers `NotFound`, which used to put an error banner over
     // a pane whose only news was that its process had finished.
-    let after_destroy: Vec<&String> = seen
-        .iter()
-        .skip_while(|m| *m != "workspace.destroy")
-        .collect();
     for method in ["pty.close", "pty.resize", "pty.write"] {
         assert!(
             !after_destroy.iter().any(|m| *m == method),
@@ -268,6 +338,50 @@ fn workspace(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
     }
 }
 
+/// The timestamp every transcript message carries. The IDE displays it and
+/// never orders by it -- `seq` does that -- so one value for the run is enough.
+const TS: &str = "2026-09-09T10:00:00Z";
+
+/// Records `body` in the fake's transcript, so `agent.history` can read it
+/// back, and returns the `agent.message` event a real daemon broadcasts for it.
+/// `seq` is the position in that transcript, which is what makes it monotonic.
+fn emit(
+    transcript: &mut Vec<AgentMessage>,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+    body: AgentMessageBody,
+) -> ServerMessage {
+    let message = AgentMessage {
+        seq: transcript.len() as u64 + 1,
+        ts: TS.to_owned(),
+        body,
+    };
+    transcript.push(message.clone());
+    ServerMessage::event(
+        Some(workspace_id.clone()),
+        Event::AgentMessage {
+            agent_id: agent_id.clone(),
+            message,
+        },
+    )
+}
+
+fn agent_state(
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+    state: AgentState,
+    detail: Option<&str>,
+) -> ServerMessage {
+    ServerMessage::event(
+        Some(workspace_id.clone()),
+        Event::AgentStateChanged {
+            agent_id: agent_id.clone(),
+            state,
+            detail: detail.map(str::to_owned),
+        },
+    )
+}
+
 fn entry(name: &str, is_dir: bool, size: u64) -> FileEntry {
     FileEntry {
         name: name.to_owned(),
@@ -283,11 +397,16 @@ fn entry(name: &str, is_dir: bool, size: u64) -> FileEntry {
 /// output for each PTY, an exit for each PTY it ends). Everything else is an
 /// explicit error, so an unexpected request shows up in the journal rather than
 /// hanging the IDE.
-async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
+async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     let journal: Journal = Arc::new(Mutex::new(Vec::new()));
     let recorded = journal.clone();
+    // Every `agent.permission_reply` as `<request id>:<decision>`. The method
+    // journal shows that an answer was sent; this shows which request it
+    // answered and what it said, which is the whole point of the `allow` step.
+    let replies: Journal = Arc::new(Mutex::new(Vec::new()));
+    let recorded_replies = replies.clone();
 
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept");
@@ -303,6 +422,10 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
         let mut open_ptys: Vec<(WorkspaceId, PtyId)> = Vec::new();
         // The id of a `pty.close` whose reply is being held; see the arm below.
         let mut held_close: Option<u64> = None;
+        // The one agent this daemon hands out, the workspace it belongs to, and
+        // everything it has broadcast, which `agent.history` reads back.
+        let mut agent: Option<(WorkspaceId, AgentId)> = None;
+        let mut transcript: Vec<AgentMessage> = Vec::new();
         loop {
             line.clear();
             // The `quit` step ends the process, which resets this socket rather
@@ -327,7 +450,10 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                         capabilities: Capabilities {
                             sandbox_backend: "noop".into(),
                             git_protect: false,
-                            adapters: vec![],
+                            // What a daemon with a `claude` on PATH advertises.
+                            // The New Agent dialog opens on Claude only when it
+                            // sees this, so the list is part of the fixture.
+                            adapters: vec![AgentAdapterKind::Terminal, AgentAdapterKind::Claude],
                         },
                     },
                 )),
@@ -390,6 +516,151 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                     None
                 }
                 Request::WorkspaceDestroy(_) => Some(ServerMessage::ok(id, &Empty {})),
+                // One agent, started once. A real daemon reports the process
+                // coming up as a state change rather than in the reply, so the
+                // IDE has to survive an `agent.state` that arrives before its
+                // transcript has subscribed -- which is exactly what the
+                // router's early buffer is for.
+                Request::AgentStart(p) => {
+                    let agent_id = AgentId(AGENT_ID.to_owned());
+                    agent = Some((p.workspace_id.clone(), agent_id.clone()));
+                    follow_ups.push(agent_state(
+                        &p.workspace_id,
+                        &agent_id,
+                        AgentState::Working,
+                        None,
+                    ));
+                    Some(ServerMessage::ok(id, &AgentStartResult { agent_id }))
+                }
+                // A file read on a real daemon. Here it is whatever has been
+                // broadcast so far, which is what a reopened tab would replay.
+                Request::AgentHistory(_) => Some(ServerMessage::ok(
+                    id,
+                    &HistoryResult {
+                        messages: transcript.clone(),
+                    },
+                )),
+                // The prompt, then the turn stalling on a tool the user has to
+                // allow: the same shape as the `permission_turn.ndjson` fixture
+                // the daemon's parser tests run on.
+                Request::AgentSend(p) => match agent.clone() {
+                    Some((ws, ag)) => {
+                        follow_ups.push(emit(
+                            &mut transcript,
+                            &ws,
+                            &ag,
+                            AgentMessageBody::UserText { text: p.text },
+                        ));
+                        follow_ups.push(emit(
+                            &mut transcript,
+                            &ws,
+                            &ag,
+                            AgentMessageBody::System {
+                                subtype: "init".to_owned(),
+                                data: serde_json::json!({
+                                    "session_id": "sess-3",
+                                    "model": "claude-opus-5",
+                                    "tools": [TOOL_NAME],
+                                }),
+                            },
+                        ));
+                        follow_ups.push(emit(
+                            &mut transcript,
+                            &ws,
+                            &ag,
+                            AgentMessageBody::PermissionRequest {
+                                request_id: REQUEST_ID.to_owned(),
+                                tool_name: TOOL_NAME.to_owned(),
+                                input: serde_json::json!({ "command": "rm -rf build" }),
+                                suggestions: Vec::new(),
+                            },
+                        ));
+                        follow_ups.push(agent_state(
+                            &ws,
+                            &ag,
+                            AgentState::WaitingPermission,
+                            Some(TOOL_NAME),
+                        ));
+                        Some(ServerMessage::ok(id, &Empty {}))
+                    }
+                    None => Some(ServerMessage::err(
+                        id,
+                        RpcError::internal("agent.send before agent.start"),
+                    )),
+                },
+                // The answer, and the rest of the turn it unblocks.
+                Request::AgentPermissionReply(p) => {
+                    let decision = match p.decision {
+                        PermissionDecision::Allow => "allow",
+                        PermissionDecision::Deny => "deny",
+                    };
+                    recorded_replies
+                        .lock()
+                        .expect("replies mutex")
+                        .push(format!("{}:{decision}", p.request_id));
+                    match agent.clone() {
+                        Some((ws, ag)) => {
+                            follow_ups.push(agent_state(&ws, &ag, AgentState::Working, None));
+                            follow_ups.push(emit(
+                                &mut transcript,
+                                &ws,
+                                &ag,
+                                AgentMessageBody::ToolUse {
+                                    id: "toolu_2".to_owned(),
+                                    name: TOOL_NAME.to_owned(),
+                                    input: serde_json::json!({ "command": "rm -rf build" }),
+                                },
+                            ));
+                            follow_ups.push(emit(
+                                &mut transcript,
+                                &ws,
+                                &ag,
+                                AgentMessageBody::ToolResult {
+                                    id: "toolu_2".to_owned(),
+                                    output: "removed 'build'".to_owned(),
+                                    is_error: false,
+                                },
+                            ));
+                            follow_ups.push(emit(
+                                &mut transcript,
+                                &ws,
+                                &ag,
+                                AgentMessageBody::Result {
+                                    cost_usd: TURN_COST_USD,
+                                    duration_ms: 500,
+                                    num_turns: 1,
+                                    session_id: "sess-3".to_owned(),
+                                },
+                            ));
+                            follow_ups.push(agent_state(&ws, &ag, AgentState::Idle, None));
+                            Some(ServerMessage::ok(id, &Empty {}))
+                        }
+                        None => Some(ServerMessage::err(
+                            id,
+                            RpcError::internal("agent.permission_reply before agent.start"),
+                        )),
+                    }
+                }
+                Request::AgentInterrupt(_) => Some(ServerMessage::ok(id, &Empty {})),
+                Request::AgentStop(_) => {
+                    if let Some((ws, ag)) = agent.clone() {
+                        follow_ups.push(agent_state(
+                            &ws,
+                            &ag,
+                            AgentState::Exited,
+                            Some("exit code 0"),
+                        ));
+                    }
+                    Some(ServerMessage::ok(id, &Empty {}))
+                }
+                // Answered, and answered with a failure: a login terminal on
+                // the host is the one thing this run must never open, and an
+                // error here would show up in the journal rather than starting
+                // one. The assertions below require it never to be asked for.
+                Request::SystemSetupPty(_) => Some(ServerMessage::err(
+                    id,
+                    RpcError::internal("the smoke run never logs in"),
+                )),
                 // The terminal widget restates its size once the PTY exists.
                 Request::PtyResize(_) | Request::PtyWrite(_) => {
                     Some(ServerMessage::ok(id, &Empty {}))
@@ -471,64 +742,113 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
         }
     });
 
-    (addr, journal)
+    (addr, journal, replies)
 }
 
 #[test]
 fn request_order_is_checked_as_a_subsequence() {
-    let seen: Vec<String> = [
+    /// A run the way the journal really comes out: the connect-time calls, the
+    /// window's own requests for each tab, and the script's, interleaved.
+    fn journal(methods: &[&str]) -> Vec<String> {
+        methods.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    let seen = journal(&[
         "hello",
         "workspace.list",
+        "system.check_prereqs",
+        "workspace.create",
+        "fs.list_dir",
+        "fs.watch",
+        "workspace.changes",
+        "agent.start",
+        "agent.history",
+        "agent.send",
+        "agent.permission_reply",
+        "fs.list_dir",
+        "fs.read_file",
+        "fs.watch",
+        "workspace.diff",
+        "agent.stop",
         "workspace.create",
         "fs.list_dir",
         "pty.open",
-        "fs.watch",
-        "workspace.changes",
-        "fs.list_dir",
-        "fs.read_file",
-        "workspace.diff",
+        "pty.open",
         "pty.close",
         "workspace.destroy",
-    ]
-    .iter()
-    .map(|s| (*s).to_owned())
-    .collect();
+    ]);
     assert!(contains_in_order(&seen, &EXPECTED));
-    // Order still matters: a `pty.open` before the create is not a match.
-    let reordered: Vec<String> = [
+    // Order still matters: a `pty.open` before the first create is not a match.
+    let reordered = journal(&[
         "hello",
         "pty.open",
         "workspace.create",
+        "agent.start",
+        "agent.history",
+        "agent.send",
+        "agent.permission_reply",
         "fs.list_dir",
         "fs.read_file",
         "workspace.diff",
+        "agent.stop",
         "pty.close",
         "workspace.destroy",
-    ]
-    .iter()
-    .map(|s| (*s).to_owned())
-    .collect();
+    ]);
     assert!(!contains_in_order(&reordered, &EXPECTED));
     // Nor does the diff count as the file's own load: a run that opened the
     // diff first would put `workspace.diff` ahead of `fs.read_file`.
-    let diff_first: Vec<String> = [
+    let diff_first = journal(&[
         "hello",
         "workspace.create",
-        "pty.open",
+        "agent.start",
+        "agent.history",
+        "agent.send",
+        "agent.permission_reply",
         "fs.list_dir",
         "workspace.diff",
         "fs.read_file",
+        "agent.stop",
+        "pty.open",
         "pty.close",
         "workspace.destroy",
-    ]
-    .iter()
-    .map(|s| (*s).to_owned())
-    .collect();
+    ]);
     assert!(!contains_in_order(&diff_first, &EXPECTED));
+    // A transcript that replayed its history only after the turn had started
+    // would be a pane attached too late to have shown the permission bar.
+    let history_late = journal(&[
+        "hello",
+        "workspace.create",
+        "agent.start",
+        "agent.send",
+        "agent.history",
+        "agent.permission_reply",
+        "fs.list_dir",
+        "fs.read_file",
+        "workspace.diff",
+        "agent.stop",
+        "pty.open",
+        "pty.close",
+        "workspace.destroy",
+    ]);
+    assert!(!contains_in_order(&history_late, &EXPECTED));
+    // A turn that never asked for permission, or was never answered, is not a
+    // match: the whole point of the Claude half is that one reply went out.
+    let unanswered = journal(&[
+        "hello",
+        "workspace.create",
+        "agent.start",
+        "agent.history",
+        "agent.send",
+        "fs.list_dir",
+        "fs.read_file",
+        "workspace.diff",
+        "agent.stop",
+        "pty.open",
+        "pty.close",
+        "workspace.destroy",
+    ]);
+    assert!(!contains_in_order(&unanswered, &EXPECTED));
     // A missing step is not a match either.
-    let short: Vec<String> = ["hello", "workspace.create", "pty.open", "fs.list_dir"]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
+    let short = journal(&["hello", "workspace.create", "agent.start", "fs.list_dir"]);
     assert!(!contains_in_order(&short, &EXPECTED));
 }

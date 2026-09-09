@@ -5,12 +5,27 @@
 //! The variable holds a comma-separated step list, run in order once the daemon
 //! connection is up. `tests/smoke.rs` runs the real IDE binary offscreen against
 //! an in-process fake daemon with
-//! `create,open,tree,open_file,open_diff,close,destroy,quit`. The steps are:
+//! `create_claude,open_agent,send,allow,tree,open_file,open_diff,stop,create,open,close,destroy,quit`.
+//! The steps are:
 //!
 //! * `create` — create a workspace over the repository in `BS_SMOKE_REPO` and
 //!   emit `workspace_created`, so the window builds its tab, its terminal pane
 //!   and its file tree from the same signal a user's New Agent would produce.
-//! * `open` — open a PTY in the workspace the last `create` made.
+//! * `create_claude` — the same, with adapter `claude`, so the window builds a
+//!   transcript pane instead of a terminal.
+//! * `open_agent` — start a Claude agent in the workspace the last `create*`
+//!   made and emit `agent_started`. The window reacts by recording the id on
+//!   the tab and attaching the pane's `TranscriptModel`, which is what issues
+//!   `agent.history` and subscribes to the agent's events.
+//! * `send` — send a prompt to that agent, then wait for the permission request
+//!   the fake daemon answers with to reach the transcript.
+//! * `allow` — allow the pending tool call through
+//!   `AppController::requestPermissionReply`, the same production path
+//!   Milestone 6's notifications will use: the window finds the transcript that
+//!   is showing the request and calls `TranscriptModel::reply` on it.
+//! * `stop` — stop the agent. A destroy would reap it daemon-side, so this is
+//!   the only step that puts `agent.stop` on the wire.
+//! * `open` — open a PTY in the workspace the last `create*` made.
 //! * `tree` — list that workspace's root directory.
 //! * `open_file` — ask the window to open [`OPEN_PATH`] in an editor tab, by
 //!   emitting the same `open_file_requested` signal the Explorer's double-click
@@ -59,6 +74,23 @@ const OPEN_PATH: &str = "README.md";
 const OPEN_SETTLE: Duration = Duration::from_millis(750);
 const PTY_COLS: u16 = 80;
 const PTY_ROWS: u16 = 24;
+/// How long a `create*` step waits after announcing its workspace. The window
+/// builds the tab, the pane and the file tree on the Qt thread when it sees the
+/// signal, and a terminal pane opens its PTY only once Qt has laid it out and
+/// shown it; a step that returned at once would race all of that.
+const CREATE_SETTLE: Duration = Duration::from_millis(750);
+/// The prompt `send` puts to the agent.
+const PROMPT: &str = "hi";
+/// The permission request `allow` answers. The script cannot read the
+/// transcript, so the id is agreed with the fake daemon rather than discovered;
+/// the window refuses to route an answer to a pane that is not showing exactly
+/// this request, so a wrong id fails the run instead of passing it quietly.
+const PERMISSION_REQUEST_ID: &str = "req-1";
+/// How long `send` waits for the permission request to travel from the daemon
+/// through the router and the transcript onto the Qt thread. Everything after
+/// the reply reaches the window through the same queue, so `allow` gets the
+/// same grace before the next step reads the result.
+const AGENT_SETTLE: Duration = Duration::from_millis(1_500);
 
 /// The steps in `BS_SMOKE_SCRIPT`, or `None` when it is unset or empty.
 pub(crate) fn script() -> Option<Vec<String>> {
@@ -76,16 +108,29 @@ pub(crate) async fn run(steps: Vec<String>, client: DaemonClient, qt: QtHandle) 
     let repo = std::env::var(REPO_ENV).unwrap_or_else(|_| DEFAULT_REPO.to_owned());
     let mut workspace: Option<WorkspaceId> = None;
     let mut pty: Option<PtyId> = None;
+    let mut agent: Option<AgentId> = None;
     let mut created = 0usize;
     for step in steps {
         tracing::info!(target: "smoke", "step: {step}");
         let outcome = match step.as_str() {
             "create" => {
                 created += 1;
-                create(&client, &qt, &repo, created)
+                create(&client, &qt, &repo, created, TERMINAL_ADAPTER)
                     .await
                     .map(|id| workspace = Some(id))
             }
+            "create_claude" => {
+                created += 1;
+                create(&client, &qt, &repo, created, CLAUDE_ADAPTER)
+                    .await
+                    .map(|id| workspace = Some(id))
+            }
+            "open_agent" => open_agent(&client, &qt, workspace.as_ref())
+                .await
+                .map(|id| agent = Some(id)),
+            "send" => send(&client, agent.as_ref()).await,
+            "allow" => allow(&qt, agent.as_ref()).await,
+            "stop" => stop(&client, agent.take()).await,
             "open" => open(&client, workspace.as_ref())
                 .await
                 .map(|id| pty = Some(id)),
@@ -104,6 +149,11 @@ pub(crate) async fn run(steps: Vec<String>, client: DaemonClient, qt: QtHandle) 
     }
 }
 
+/// The two adapters a `create*` step can file its tab under. The window builds
+/// a terminal pane for one and a transcript pane for the other.
+const TERMINAL_ADAPTER: &str = "terminal";
+const CLAUDE_ADAPTER: &str = "claude";
+
 /// Creates a workspace and announces it with the signal the
 /// `create_workspace` invokable emits, which is what the window listens for.
 async fn create(
@@ -111,6 +161,7 @@ async fn create(
     qt: &QtHandle,
     repo: &str,
     nth: usize,
+    adapter: &'static str,
 ) -> Result<WorkspaceId, String> {
     let name = if nth == 1 {
         "smoke".to_owned()
@@ -131,11 +182,100 @@ async fn create(
         q.workspace_created(
             QString::from(&json),
             QString::from(GROUP),
-            QString::from("terminal"),
+            QString::from(adapter),
             QString::from(""),
         )
     });
+    tokio::time::sleep(CREATE_SETTLE).await;
     Ok(info.id)
+}
+
+/// Starts a Claude agent and announces it with the signal
+/// `AppController::start_agent` emits.
+///
+/// The request goes out on the script's own client, the way `create` makes its
+/// workspace, so the script learns the agent id; everything the *window* does
+/// with it — recording it on the tab, building the transcript pane, replaying
+/// `agent.history` and subscribing to the live stream — happens because it
+/// reacted to `agent_started`, not because this module asked for it.
+async fn open_agent(
+    client: &DaemonClient,
+    qt: &QtHandle,
+    workspace: Option<&WorkspaceId>,
+) -> Result<AgentId, String> {
+    let workspace_id = need(workspace, "open_agent")?;
+    let res = client
+        .request::<AgentStartResult>(Request::AgentStart(AgentStartParams {
+            workspace_id: workspace_id.clone(),
+            adapter: AgentAdapterKind::Claude,
+            options: AgentStartOptions {
+                command: None,
+                resume_session: None,
+                model: None,
+                permission_mode: None,
+                api_key: None,
+            },
+        }))
+        .await
+        .map_err(|e| e.to_string())?;
+    tracing::info!(target: "smoke", "agent started {:?}", res.agent_id);
+    let (ws, id) = (workspace_id.to_string(), res.agent_id.to_string());
+    qt.queue(move |q| q.agent_started(QString::from(&ws), QString::from(&id)))
+        .map_err(|_| "the Qt thread is gone".to_owned())?;
+    // The pane attaches on the Qt thread, and `agent.history` goes out from
+    // there; a `send` that raced it would answer into a transcript that is
+    // still replaying.
+    tokio::time::sleep(AGENT_SETTLE).await;
+    Ok(res.agent_id)
+}
+
+/// Sends a prompt, then waits for the permission request the fake daemon
+/// answers with to reach the transcript.
+async fn send(client: &DaemonClient, agent: Option<&AgentId>) -> Result<(), String> {
+    let agent_id = need_agent(agent, "send")?;
+    client
+        .request_raw(Request::AgentSend(AgentSendParams {
+            agent_id,
+            text: PROMPT.to_owned(),
+        }))
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::time::sleep(AGENT_SETTLE).await;
+    Ok(())
+}
+
+/// Allows the pending tool call the way a desktop notification will: through
+/// the window, which is the only thing that knows which pane is showing it.
+///
+/// Nothing here talks to the daemon. `agent.permission_reply` appears on the
+/// wire only if the window found a transcript attached to `agent_id` with
+/// [`PERMISSION_REQUEST_ID`] on its permission bar and called
+/// `TranscriptModel::reply` on it.
+async fn allow(qt: &QtHandle, agent: Option<&AgentId>) -> Result<(), String> {
+    let agent_id = need_agent(agent, "allow")?.to_string();
+    qt.queue(move |q| {
+        q.request_permission_reply(
+            QString::from(&agent_id),
+            QString::from(PERMISSION_REQUEST_ID),
+            true,
+        )
+    })
+    .map_err(|_| "the Qt thread is gone".to_owned())?;
+    tokio::time::sleep(AGENT_SETTLE).await;
+    tracing::info!(target: "smoke", "allowed {PERMISSION_REQUEST_ID}");
+    Ok(())
+}
+
+/// Stops the agent. `destroy` would reap it daemon-side without the IDE saying
+/// anything, so this is the step that exercises `agent.stop`.
+async fn stop(client: &DaemonClient, agent: Option<AgentId>) -> Result<(), String> {
+    let agent_id = need_agent(agent.as_ref(), "stop")?;
+    client
+        .request_raw(Request::AgentStop(AgentIdParams { agent_id }))
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::time::sleep(EXIT_SETTLE).await;
+    Ok(())
 }
 
 async fn open(client: &DaemonClient, workspace: Option<&WorkspaceId>) -> Result<PtyId, String> {
@@ -270,4 +410,11 @@ fn need(workspace: Option<&WorkspaceId>, step: &str) -> Result<WorkspaceId, Stri
     workspace
         .cloned()
         .ok_or_else(|| format!("`{step}` needs a `create` before it"))
+}
+
+/// The agent a step operates on, or an error naming what is missing.
+fn need_agent(agent: Option<&AgentId>, step: &str) -> Result<AgentId, String> {
+    agent
+        .cloned()
+        .ok_or_else(|| format!("`{step}` needs an `open_agent` before it"))
 }

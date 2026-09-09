@@ -352,17 +352,36 @@ emits is appended to `transcripts/<agent_id>.ndjson` before broadcast, so
 `agent.history` is a file read.
 
 ### 8.2 Claude Code adapter
-Spawns inside the sandbox:
+Spawns inside the sandbox, as built by `claude_argv` in
+`crates/daemon/src/agents/claude.rs`:
 
 ```
 claude -p --input-format stream-json --output-format stream-json --verbose \
-       --include-partial-messages --permission-prompt-tool stdio \
+       --include-partial-messages --permission-prompts host \
        [--resume <session_id>] [--model M] [--permission-mode MODE]
 ```
 
-The exact flag set is pinned per Claude Code version and verified by the
-implementation plan against `claude --help` of the installed version; the adapter
-records the version it was tested with and warns if the installed version differs.
+`--permission-prompts host` is what routes a tool prompt back over stdout as a
+`control_request` for the IDE to answer, instead of the CLI asking at a terminal
+it does not have. The three optional flags are appended only when
+`agent.start.options` carries a non-empty value for them, and `permission_mode`
+is validated against the CLI's own list (`default`, `acceptEdits`, `plan`,
+`dontAsk`, `bypassPermissions`, `auto`, `manual`) so a bad value is an
+`InvalidParams` on `agent.start` rather than a usage error a second later.
+
+The flag set is pinned per Claude Code version: the adapter records
+`TESTED_CLAUDE_VERSION = "2.1.263"` and warns once per daemon lifetime when the
+installed `claude --version` differs. Every flag above was verified accepted by
+2.1.263 — a wrong flag makes `claude` exit with "unknown option" before any login
+check, so this is testable without being logged in. Two traps found in practice:
+
+- Under WSL a *non-login* shell inherits the Windows PATH, so `claude` can
+  resolve to a Windows npm install of a different version. 2.1.177 rejects
+  `--permission-prompts` outright. The daemon puts `$HOME/.local/bin` first for
+  this reason, and `scripts/record-claude-stream.sh` refuses a `/mnt/...` binary.
+- `BS_CLAUDE_BIN` replaces the program (split with `shell_words`, so an
+  interpreter plus a script works) and suppresses the version warning, because a
+  stand-in's version says nothing about the protocol.
 
 Input: each `agent.send` is first recorded as a `user_text` transcript event
 (so history replay shows the user's side), then becomes a
@@ -386,9 +405,14 @@ updated input) or deny (with message). `interrupt` writes a `control_request`
 Unknown message types are stored verbatim as `system {subtype:"raw"}` so nothing
 is lost when Claude Code adds message kinds.
 
-Recorded real streams live in `tests/fixtures/claude-stream/` and drive the parser
-tests. A fake `claude` shell script that replays a fixture is used for
-integration tests without network.
+Fixtures in `tests/fixtures/claude-stream/` drive the parser tests, and
+`tests/fixtures/fake_claude.py` replays one of them in place of the real CLI for
+the integration tests, so no suite needs a network or a login. As of Milestone 4
+those fixtures are **synthetic**: written from the documented shapes, with every
+flag verified against the real binary, but no line in them came out of a real
+`claude`. `scripts/record-claude-stream.sh` records one real turn into
+`recorded-<version>.ndjson` beside them; run it once from a login shell on a
+logged-in machine and correct any synthetic shape that differs.
 
 ### 8.3 Credentials and home seeding
 On workspace creation, `homes/<id>/` receives:
@@ -405,9 +429,15 @@ the host, not the credentials. A `.claude/settings.json` supplied via
 repo can pin allowed tools.
 
 ### 8.4 Terminal adapter
-`pty.open` with the configured command (default `$SHELL -l`, or e.g. `codex`)
-inside the sandbox. Events are raw `pty.output`. `send` writes bytes. State is
-`working` while the process lives, `exited` on exit. No transcript parsing.
+A terminal agent is a PTY, not an entry in the agent registry: the IDE calls
+`pty.open` directly with the configured command (default `$SHELL -l`, or e.g.
+`codex`) inside the sandbox, and never `agent.start`. Events are raw
+`pty.output`; input is `pty.write`; the process dying is `pty.exit`. There is no
+`AgentAdapter` implementation behind it, no transcript file and no `agent.state`,
+which is why a terminal tab's status follows its workspace rather than an agent.
+`AgentAdapterKind::Terminal` exists in the protocol and in `capabilities.adapters`
+only to name the choice in the New Agent dialog; `agent.start` refuses it with
+`InvalidParams("terminal agents use pty.open")`.
 
 ## 9. PTY
 `portable-pty` (Rust) opens a pty pair; the slave is handed to the sandboxed

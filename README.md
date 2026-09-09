@@ -9,6 +9,38 @@ Design: `docs/superpowers/specs/`. Plans: `docs/superpowers/plans/`.
 
 ## What works now
 
+Milestone 4: a New Agent tab can be a Claude Code agent running inside the workspace's
+sandbox, with its transcript, its tool permissions and its cost in the IDE — and logging
+in to Claude Code and GitHub happens on a setup page inside the IDE.
+
+- **Claude Code tabs.** New Agent → Claude Code creates the workspace, then starts
+  `claude` inside its sandbox in stream-json mode with a pinned flag set. The pane shows
+  the conversation as it arrives: your prompts, the assistant's answers rendered as
+  Markdown, one card per tool call with its input and its result, and a line per turn with
+  the cost and how long it took. Model and permission mode are fields on the dialog, and
+  an initial prompt is sent as soon as the agent is up. The tab's glyph follows the
+  agent's state (idle, working, waiting, done) and the status bar shows the cost of the
+  tab you are looking at. Interrupt abandons the current turn and leaves the agent alive;
+  Stop ends the process. A pane replays the whole transcript from the daemon when it
+  attaches, so an IDE restarted while the daemon kept running finds its tabs where it left
+  them.
+- **Tool permissions.** When the agent asks to use a tool, a bar appears above the prompt
+  box with the tool's name, what it wants to run, Allow, Deny, and "always allow this tool
+  for this session". The answer travels back to `claude` as a `control_response`. Which
+  tool is allowed is decided in the IDE, not in the pane: a ticked box means later
+  requests for that same tool are answered without asking again.
+- **Signing in, inside the IDE.** Help > Setup… lists every prerequisite with a tick or a
+  cross. A failing one that the IDE can fix carries a button — "Log in to Claude Code",
+  "Log in to GitHub", "Install Claude Code", "Install GitHub CLI" — and pressing it runs
+  that command in a terminal pane on the page, on the host rather than in a sandbox, since
+  a login has to write to your home directory. A login URL that appears in that output is
+  opened in your browser for you. When the command exits, the prerequisites are re-checked;
+  when they all pass, the page steps aside. The page also appears by itself at startup
+  when something is missing that would stop a workspace being created.
+- **API key.** File > Settings… stores an Anthropic API key in the Windows credential
+  store (never in a config file), and it is passed to the daemon with each agent start.
+  `settings.json` records only whether a key is set.
+
 Milestone 3: the IDE drives the daemon end to end on real worktrees inside real
 sandboxes, and edits, saves and diffs the files in them.
 
@@ -41,7 +73,23 @@ sandboxes, and edits, saves and diffs the files in them.
   green and red tints, two line-number columns, synchronised scrolling in both axes and
   the same syntax highlighting as the editor.
 
-Known limits in this milestone:
+Known limits in Milestone 4:
+
+- The stream-json fixtures the parser is tested against are **synthetic**. Every flag the
+  adapter passes was verified accepted by Claude Code 2.1.263, but no line in the fixtures
+  came out of a real `claude`. `scripts/record-claude-stream.sh` records a real turn beside
+  them; it needs someone logged in, and it will not log you in itself.
+- An agent does not survive a daemon restart. The session id `claude --resume` would need
+  is kept in memory only, and the IDE never sends one, so a restarted daemon starts a fresh
+  conversation. Resume lands in Milestone 6.
+- "Always allow this tool for this session" lives in the tab's transcript in the IDE. It is
+  never sent to the daemon and never written to disk, and it is forgotten when that pane
+  re-attaches — reopening the workspace, or pointing the tab at another agent.
+- The status bar shows the cost of the tab you are looking at, not of every agent running.
+- The permission bar answers with the tool input `claude` proposed. It never edits it, so
+  the "allow with a changed input" path of the protocol is unused and untested.
+
+Known limits in Milestone 3:
 
 - A file over 512 KiB opens without highlighting, because highlighting re-runs over the
   whole buffer after every edit rather than incrementally.
@@ -52,8 +100,8 @@ Known limits in this milestone:
 - Languages embedded in another (`<script>` in HTML, fenced code in Markdown) are not
   highlighted: tree-sitter injections are not wired up.
 
-Still placeholders: run configurations, the transcript view, and every agent adapter other
-than a plain terminal.
+Still placeholders: run configurations, and every agent adapter other than Claude Code and
+a plain terminal.
 
 ## Quick start (Windows 11)
 
@@ -68,8 +116,10 @@ run downloads several gigabytes and takes a while; later runs are incremental. S
 `-Debug` (debug daemon build), `-Release` (release IDE build), `-SkipDaemon` (reuse the
 last daemon binary), `-NoSetup` (fail instead of installing prerequisites).
 
-Signing in to Claude Code and GitHub happens inside the IDE from its setup page (planned
-for Milestone 4). Until then the setup page lists what is missing.
+Signing in to Claude Code and GitHub happens inside the IDE, on its setup page: the page
+appears by itself when something needed is missing, and Help > Setup… opens it any time.
+Each failing item the IDE can fix has a button that runs the command in a terminal on the
+page, opens any login URL in your browser, and re-checks when it finishes.
 
 ## The pieces behind `launch.ps1`
 
@@ -119,7 +169,7 @@ The daemon keeps its state under its data directory (default `~/.bondsymphonic`,
   homes/<id>/        # $HOME inside the sandbox
   caches/<id>/       # writable cache, mounted at $HOME/.cache inside the sandbox
   run/<id>/          # the sandbox's exec socket and other runtime files
-  transcripts/        # agent transcripts (from Milestone 4)
+  transcripts/        # one NDJSON transcript per agent, replayed by agent.history
   bin/                # daemon binaries installed into the distro
 ```
 
@@ -132,8 +182,8 @@ find the Qt DLLs:
 
 ```powershell
 . .\scripts\env.ps1
-cargo test --workspace                                    # Windows; ide suites: lib, client, connection, diff, editor, model, qobject_smoke, router, smoke
-.\scripts\test-daemon.ps1                                 # daemon tests inside WSL (12 integration test files; unit tests: 20 on Windows, 23 on Linux)
+cargo test --workspace                                    # Windows; ide suites: lib, client, connection, diff, editor, model, qobject_smoke, router, smoke, transcript
+.\scripts\test-daemon.ps1                                 # daemon tests inside WSL (14 integration test files; unit tests: 45 on Windows, 48 on Linux)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -150,15 +200,38 @@ are read once at startup and do nothing at all when unset, which is every ordina
   traffic; anything else, and anything that is not a `host:port` at all, is reported and
   ignored rather than guessed at.
 - `BS_SMOKE_SCRIPT`: a comma-separated list of steps the controller performs once the
-  connection is up — `create` (a workspace over `BS_SMOKE_REPO`, announced with the same
-  signal New Agent produces), `open` (a PTY in it), `tree` (its root listing), `open_file`
-  and `open_diff` (ask the window to open `README.md` as an editor tab and as a diff tab,
-  through the same controller signals the Explorer's double-click emits), `close` (close
-  the script's PTY), `destroy` (destroy the workspace), `quit` (end the process with
-  status 0 after letting the window settle).
+  connection is up. `create` and `create_claude` make a workspace over `BS_SMOKE_REPO`,
+  announced with the same signal New Agent produces, as a terminal tab or a Claude tab;
+  `open_agent` starts a Claude agent in it and announces that; `send` puts a prompt to the
+  agent; `allow` allows the pending tool call through the window, the same way a
+  notification will; `stop` stops the agent; `open` opens a PTY; `tree` lists the
+  workspace root; `open_file` and `open_diff` ask the window to open `README.md` as an
+  editor tab and as a diff tab, through the same controller signals the Explorer's
+  double-click emits; `close` closes the script's PTY; `destroy` destroys the workspace;
+  `quit` ends the process with status 0 after letting the window settle.
 
 The smoke test skips itself with a message when `QMAKE` is unset, since the IDE cannot
 start without the Qt runtime on PATH.
+
+The daemon carries three, all read from its own environment, all inert when unset. No test
+needs a Claude login or a network.
+
+- `BS_CLAUDE_BIN`: the command to run instead of `claude`, split the way a shell would, so
+  a stand-in can be an interpreter plus a script
+  (`python3 /opt/fake/fake_claude.py`). It also suppresses the "untested Claude Code
+  version" warning, since a stand-in's version says nothing about the protocol.
+- `FAKE_CLAUDE_FIXTURE`: which NDJSON stream `crates/daemon/tests/fixtures/fake_claude.py`
+  replays. Inside a bubblewrap sandbox this never arrives — the sandbox builds the agent's
+  environment from the spec alone — so the fake also falls back to `fixture.ndjson` beside
+  itself, which is how you point it at a stream in a real sandbox.
+- `FAKE_CLAUDE_ECHO_DELAY`: seconds the fake holds an echoed turn open before answering,
+  for testing interrupt against something that is actually still working.
+
+The daemon reads these where it spawns an agent, so they have to be in the *daemon's*
+environment. When the IDE launches it through `wsl.exe`, name them in `WSLENV`
+(`WSLENV=BS_CLAUDE_BIN/u:FAKE_CLAUDE_FIXTURE/u`) before starting the IDE, and put the fake
+somewhere the sandbox can see — `/opt/...`, not under `/home`, which the workspace's own
+home is mounted over.
 
 ## Layout
 
