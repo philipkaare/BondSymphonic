@@ -147,12 +147,16 @@ fn serve(conn_id: u64, stream: UnixStream, children: Children, conns: Conns) {
                 if !children.lock().unwrap().contains(&(pid as i32)) {
                     continue;
                 }
-                // The process group first, so a shell takes everything it
-                // started down with it, then the leader itself in case it left
-                // its group.
+                // The process group, so a shell takes everything it started
+                // down with it. The leader is signalled directly only when the
+                // group send fails (it left its group): init runs children
+                // under setsid, so the leader is in that group and a second
+                // send would deliver the signal twice, which for SIGINT is
+                // what CLIs read as "exit now".
                 let sig = Signal::try_from(signal).ok();
-                let _ = kill(Pid::from_raw(-(pid as i32)), sig);
-                let _ = kill(Pid::from_raw(pid as i32), sig);
+                if kill(Pid::from_raw(-(pid as i32)), sig).is_err() {
+                    let _ = kill(Pid::from_raw(pid as i32), sig);
+                }
             }
             InitRequest::Shutdown => {
                 // Connection 1 is the daemon's: it is accepted before the
