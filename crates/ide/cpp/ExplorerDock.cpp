@@ -1,4 +1,5 @@
 #include "ExplorerDock.h"
+#include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
 #include <QChar>
@@ -18,29 +19,27 @@
 
 namespace {
 
-/// Below this the dock is treated as dark, and the status colours are lifted.
-constexpr int kDarkLightnessCutoff = 128;
-
 /// Joins a directory path and a child name the way the daemon addresses it.
 QString childPath(const QString& dir, const QString& name) {
     return dir.isEmpty() ? name : dir + QLatin1Char('/') + name;
 }
 
 /// The colour a git status is drawn in, or an invalid colour for a status that
-/// is not a change, `unchanged` among them. Lifted on a dark palette, where the
-/// flat accents sit too close to the background to read.
+/// is not a change, `unchanged` among them. The accents are the diff's, so a
+/// file listed as modified here and a rewritten row over in the diff view are
+/// the same amber.
 QColor statusColour(const QString& status, bool dark) {
     QColor colour;
     if (status == QLatin1String("added") || status == QLatin1String("untracked")) {
-        colour = QColor(0x2e, 0xa0, 0x43);
+        colour = theme::added();
     } else if (status == QLatin1String("modified")) {
-        colour = QColor(0xc9, 0x96, 0x2a);
+        colour = theme::changed();
     } else if (status == QLatin1String("deleted")) {
-        colour = QColor(0xd0, 0x39, 0x33);
+        colour = theme::removed();
     } else if (status == QLatin1String("renamed")) {
-        colour = QColor(0x3b, 0x7d, 0xd8);
+        colour = theme::renamed();
     }
-    return colour.isValid() && dark ? colour.lighter(135) : colour;
+    return colour.isValid() ? theme::ink(colour, dark) : colour;
 }
 
 /// One right-aligned count for the `+` and `−` columns.
@@ -209,7 +208,7 @@ void ExplorerDock::onLoadFailed(const QString& path, const QString& message) {
 
 void ExplorerDock::onChangesLoaded(const QString& json) {
     m_changeItems->removeRows(0, m_changeItems->rowCount());
-    const bool dark = palette().base().color().lightness() < kDarkLightnessCutoff;
+    const bool dark = theme::isDark(palette());
     const QJsonArray files = QJsonDocument::fromJson(json.toUtf8()).array();
     for (const QJsonValue value : files) {
         const QJsonObject file = value.toObject();
@@ -310,8 +309,7 @@ QStandardItem* ExplorerDock::makeEntry(const QString& path, const QString& name,
     item->setToolTip(isDir ? path : QStringLiteral("%1\n%2 bytes").arg(path).arg(size));
     // `fs.list_dir` reports every entry as `unchanged` today, so this lights up
     // the day the daemon fills the field in; nothing here goes looking for it.
-    const QColor colour =
-        statusColour(status, palette().base().color().lightness() < kDarkLightnessCutoff);
+    const QColor colour = statusColour(status, theme::isDark(palette()));
     if (colour.isValid()) {
         item->setForeground(colour);
     }

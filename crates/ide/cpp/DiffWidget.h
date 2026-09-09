@@ -8,7 +8,6 @@ class CodeView;
 class DiffDocument;
 class QLabel;
 class QScrollBar;
-class RustHighlighter;
 
 /// One file's working copy beside its base: a header and two read-only panes.
 ///
@@ -24,12 +23,6 @@ public:
     /// Takes ownership of `doc`, so closing the tab ends its work.
     explicit DiffWidget(DiffDocument* doc, QWidget* parent = nullptr);
 
-    DiffDocument* document() const;
-    /// The base side.
-    CodeView* leftView() const;
-    /// The working side.
-    CodeView* rightView() const;
-
 private:
     /// Fills both panes from `rowsJson`: text, gutter numbers and row tints.
     void onRowsLoaded();
@@ -37,8 +30,9 @@ private:
     void onLoadFailed(const QString& message);
     /// The path, the stat and whatever the header has to say about the diff.
     void updateHeader();
-    /// Makes `to` follow `from`, without the answer coming back.
-    void link(QScrollBar* from, QScrollBar* to);
+    /// Makes `to` follow `from`, without the answer coming back. `guard` is the
+    /// flag for that axis, and the two axes must not share one.
+    void link(QScrollBar* from, QScrollBar* to, bool* guard);
 
     QPointer<DiffDocument> m_doc;
     QLabel* m_path = nullptr;
@@ -47,8 +41,6 @@ private:
     QLabel* m_notice = nullptr;
     CodeView* m_left = nullptr;
     CodeView* m_right = nullptr;
-    RustHighlighter* m_leftSyntax = nullptr;
-    RustHighlighter* m_rightSyntax = nullptr;
     /// The 1-based line number each block carries on that side, 0 where the row
     /// does not occupy the side. Indexed by block number, which is the row
     /// index: one row is one block.
@@ -62,6 +54,10 @@ private:
     int m_rightDigits = 0;
     /// The last `loadFailed` message, cleared by the next set of rows.
     QString m_loadError;
-    /// Set while one scrollbar is moving the other.
-    bool m_syncing = false;
+    /// Set while one scrollbar is moving the other, one flag per axis. They
+    /// cannot be a single flag: scrolling vertically can clamp the driven
+    /// pane's horizontal value in the same call, and a shared flag would drop
+    /// that as an echo and leave the two sides on different columns.
+    bool m_syncingVertical = false;
+    bool m_syncingHorizontal = false;
 };

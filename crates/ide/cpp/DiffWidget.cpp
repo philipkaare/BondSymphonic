@@ -1,6 +1,7 @@
 #include "DiffWidget.h"
 #include "CodeView.h"
 #include "RustHighlighter.h"
+#include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/diff_document.cxxqt.h"
 #include <QChar>
 #include <QColor>
@@ -21,9 +22,6 @@
 
 namespace {
 
-/// Below this the pane is treated as dark, and the document picks the dark
-/// syntax theme.
-constexpr int kDarkLightnessCutoff = 128;
 /// How far a changed row's background is pulled off the pane's own base
 /// colour. Enough to read the shape of the diff at a glance, faint enough that
 /// the text on top keeps its contrast on a light and on a dark palette alike.
@@ -31,26 +29,6 @@ constexpr qreal kChangeWeight = 0.22;
 /// The same, for the blank half of a one-sided row. Only enough to say "there
 /// is nothing here", never enough to look like a change of its own.
 constexpr qreal kAbsentWeight = 0.09;
-
-/// The accents every diff colour is mixed from. Chosen to stay legible as text
-/// on both palettes; `accent` lightens them for a dark one.
-const QColor kAdded(0x2e, 0xa0, 0x43);
-const QColor kRemoved(0xd0, 0x39, 0x33);
-const QColor kChanged(0xc9, 0x96, 0x2a);
-
-/// `base` pulled `weight` of the way towards `accent`.
-QColor blend(const QColor& base, const QColor& accent, qreal weight) {
-    const qreal keep = 1.0 - weight;
-    return QColor::fromRgbF(base.redF() * keep + accent.redF() * weight,
-                            base.greenF() * keep + accent.greenF() * weight,
-                            base.blueF() * keep + accent.blueF() * weight);
-}
-
-/// An accent as header text rather than as a background: the same hue, lifted
-/// on a dark palette where the flat colour would sit too close to the base.
-QColor accent(const QColor& colour, bool dark) {
-    return dark ? colour.lighter(135) : colour;
-}
 
 /// How many characters the widest number in `numbers` needs.
 int digitsFor(const QVector<int>& numbers) {
@@ -94,6 +72,12 @@ DiffWidget::DiffWidget(DiffDocument* doc, QWidget* parent) : QWidget(parent), m_
     m_stat = new QLabel(header);
     m_notice = new QLabel(header);
     m_notice->hide();
+    // A path and a daemon error are text, not markup: an angle bracket in
+    // either would otherwise be parsed away. Only the stat is rich text, and
+    // this widget composes every character of it.
+    m_path->setTextFormat(Qt::PlainText);
+    m_notice->setTextFormat(Qt::PlainText);
+    m_stat->setTextFormat(Qt::RichText);
     headerLayout->addWidget(m_path);
     headerLayout->addWidget(m_stat);
     headerLayout->addWidget(m_notice);
@@ -114,14 +98,16 @@ DiffWidget::DiffWidget(DiffDocument* doc, QWidget* parent) : QWidget(parent), m_
 
     // The same highlighter both sides, over the two halves of the document's
     // own tree-sitter pass. It maps character columns onto UTF-16 units, which
-    // is the reason not to colour the spans here by hand.
-    m_leftSyntax = new RustHighlighter(m_left->document(), [this](int block) {
+    // is the reason not to colour the spans here by hand. Each one parents
+    // itself to the document it colours, so neither is held here: nothing
+    // re-runs them by hand, and replacing the text re-runs them by itself.
+    new RustHighlighter(m_left->document(), [this](int block) {
         if (m_doc.isNull() || block < 0 || block >= m_leftNo.size()) {
             return QStringLiteral("[]");
         }
         return m_doc->spansForLeftLine(m_leftNo.at(block));
     });
-    m_rightSyntax = new RustHighlighter(m_right->document(), [this](int block) {
+    new RustHighlighter(m_right->document(), [this](int block) {
         if (m_doc.isNull() || block < 0 || block >= m_rightNo.size()) {
             return QStringLiteral("[]");
         }
@@ -132,10 +118,10 @@ DiffWidget::DiffWidget(DiffDocument* doc, QWidget* parent) : QWidget(parent), m_
     // same row on the other and no measuring is needed. Horizontally the two
     // panes share a font and a tab stop, so a pixel means the same thing in
     // both.
-    link(m_left->verticalScrollBar(), m_right->verticalScrollBar());
-    link(m_right->verticalScrollBar(), m_left->verticalScrollBar());
-    link(m_left->horizontalScrollBar(), m_right->horizontalScrollBar());
-    link(m_right->horizontalScrollBar(), m_left->horizontalScrollBar());
+    link(m_left->verticalScrollBar(), m_right->verticalScrollBar(), &m_syncingVertical);
+    link(m_right->verticalScrollBar(), m_left->verticalScrollBar(), &m_syncingVertical);
+    link(m_left->horizontalScrollBar(), m_right->horizontalScrollBar(), &m_syncingHorizontal);
+    link(m_right->horizontalScrollBar(), m_left->horizontalScrollBar(), &m_syncingHorizontal);
 
     updateHeader();
     if (doc == nullptr) {
@@ -143,7 +129,7 @@ DiffWidget::DiffWidget(DiffDocument* doc, QWidget* parent) : QWidget(parent), m_
     }
     // Set before `load`, so the first highlight pass already uses the right
     // palette. The pane's own colours are the only theme signal there is.
-    doc->setDarkTheme(palette().base().color().lightness() < kDarkLightnessCutoff);
+    doc->setDarkTheme(theme::isDark(palette()));
 
     QObject::connect(doc, &DiffDocument::rowsLoaded, this, &DiffWidget::onRowsLoaded);
     QObject::connect(doc, &DiffDocument::loadFailed, this, &DiffWidget::onLoadFailed);
@@ -155,29 +141,21 @@ DiffWidget::DiffWidget(DiffDocument* doc, QWidget* parent) : QWidget(parent), m_
     QObject::connect(doc, &DiffDocument::truncatedChanged, this, &DiffWidget::updateHeader);
 }
 
-DiffDocument* DiffWidget::document() const {
-    return m_doc.data();
-}
-
-CodeView* DiffWidget::leftView() const {
-    return m_left;
-}
-
-CodeView* DiffWidget::rightView() const {
-    return m_right;
-}
-
-void DiffWidget::link(QScrollBar* from, QScrollBar* to) {
-    QObject::connect(from, &QScrollBar::valueChanged, this, [this, to](int value) {
+void DiffWidget::link(QScrollBar* from, QScrollBar* to, bool* guard) {
+    QObject::connect(from, &QScrollBar::valueChanged, this, [to, guard](int value) {
         // Without the guard the answering `setValue` comes straight back, and a
         // value one side cannot reach (a shorter horizontal range) would ring
-        // between the two.
-        if (m_syncing) {
+        // between the two. The guard is per axis: `QPlainTextEdit` lays blocks
+        // out lazily, so scrolling one pane vertically can re-measure its
+        // longest visible line and clamp its horizontal value in the same call.
+        // One flag for both axes would swallow that as an echo and leave the
+        // two sides on different columns.
+        if (*guard) {
             return;
         }
-        m_syncing = true;
+        *guard = true;
         to->setValue(value);
-        m_syncing = false;
+        *guard = false;
     });
 }
 
@@ -189,10 +167,10 @@ void DiffWidget::onRowsLoaded() {
     const QJsonArray rows = QJsonDocument::fromJson(m_doc->rowsJson().toUtf8()).array();
 
     const QColor base = palette().base().color();
-    const QColor addedTint = blend(base, kAdded, kChangeWeight);
-    const QColor removedTint = blend(base, kRemoved, kChangeWeight);
-    const QColor changedTint = blend(base, kChanged, kChangeWeight);
-    const QColor absentTint = blend(base, palette().text().color(), kAbsentWeight);
+    const QColor addedTint = codeview::wash(base, theme::added(), kChangeWeight);
+    const QColor removedTint = codeview::wash(base, theme::removed(), kChangeWeight);
+    const QColor changedTint = codeview::wash(base, theme::changed(), kChangeWeight);
+    const QColor absentTint = codeview::wash(base, palette().text().color(), kAbsentWeight);
 
     QStringList left;
     QStringList right;
@@ -263,22 +241,23 @@ void DiffWidget::updateHeader() {
     m_path->setText(m_doc->getPath());
     m_path->setToolTip(m_doc->getWorkspaceId() + QLatin1Char(':') + m_doc->getPath());
 
-    const bool dark = palette().base().color().lightness() < kDarkLightnessCutoff;
+    const bool dark = theme::isDark(palette());
     // U+2212, the minus sign, written as a code point: the file is compiled
     // without a byte order mark and MSVC would read a literal as the ANSI code
     // page.
     const QString minus(QChar(0x2212));
     m_stat->setText(QStringLiteral("<span style=\"color:%1\">+%2</span> "
                                    "<span style=\"color:%3\">%4%5</span>")
-                        .arg(accent(kAdded, dark).name(), QString::number(m_doc->getAdditions()),
-                             accent(kRemoved, dark).name(), minus,
+                        .arg(theme::ink(theme::added(), dark).name(),
+                             QString::number(m_doc->getAdditions()),
+                             theme::ink(theme::removed(), dark).name(), minus,
                              QString::number(m_doc->getDeletions())));
 
     QString notice = m_loadError;
-    QColor colour = accent(kRemoved, dark);
+    QColor colour = theme::ink(theme::removed(), dark);
     if (notice.isEmpty() && m_doc->getTruncated()) {
         notice = QStringLiteral("diff truncated (time budget)");
-        colour = accent(kChanged, dark);
+        colour = theme::ink(theme::changed(), dark);
     }
     QPalette noticePalette = m_notice->palette();
     noticePalette.setColor(QPalette::WindowText, colour);
