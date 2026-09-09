@@ -65,6 +65,12 @@ pub mod qobject {
         #[qsignal]
         fn exited_signal(self: Pin<&mut TerminalSession>);
 
+        /// The output stream carried a Claude or GitHub login URL. Emitted at
+        /// most once per distinct URL for the life of the session, so a link
+        /// the shell echoes back does not open a second browser tab.
+        #[qsignal]
+        fn link_detected(self: Pin<&mut TerminalSession>, url: QString);
+
         /// Opens a PTY of `cols` x `rows` in `workspace_id`. An empty
         /// `command` runs the daemon default shell. Answers with `opened`, or
         /// sets `error` and emits `frame` on failure.
@@ -76,6 +82,16 @@ pub mod qobject {
             rows: i32,
             command: QString,
         );
+
+        /// Adopts a PTY somebody else opened -- the host terminal
+        /// `system.setup_pty` answers with -- and drives it exactly as `open`
+        /// does from that point on: subscribes to its events, resizes it to
+        /// `cols` x `rows`, and answers with `opened`.
+        ///
+        /// A host terminal belongs to no workspace, so `workspace_id` is left
+        /// empty: its events carry no workspace and are routed by PTY id.
+        #[qinvokable]
+        fn attach(self: Pin<&mut TerminalSession>, pty_id: QString, cols: i32, rows: i32);
 
         /// Sends text (a paste, or composed input) to the PTY.
         #[qinvokable]
@@ -137,6 +153,156 @@ const DROP_MARKER: &str = "[output dropped]";
 
 const DEFAULT_COLS: i32 = 80;
 const DEFAULT_ROWS: i32 = 24;
+
+/// The only two URLs the IDE will open a browser for, both of them printed by
+/// a setup terminal that is waiting for a login to happen elsewhere.
+///
+/// A deliberately closed list. The output of a terminal is whatever the program
+/// inside it chose to print, so anything wider would let a repository's build
+/// script open a page on the developer's desktop by writing a link.
+const LINK_PREFIXES: [&str; 2] = ["https://claude.ai/", "https://github.com/login/device"];
+
+/// How much of the output stream a [`LinkScanner`] keeps, so that a URL split
+/// across two `pty.output` events is still seen whole. One kibibyte is several
+/// times the longest login URL either CLI prints.
+pub const TAIL_BYTES: usize = 1024;
+
+/// Punctuation that ends a sentence rather than a URL.
+const TRAILING_PUNCTUATION: [char; 5] = ['.', ',', ')', '\'', '"'];
+
+/// How many distinct URLs a [`LinkScanner`] remembers before it starts over.
+///
+/// The scanner runs on every terminal, not only the setup one, and a program
+/// inside a workspace shell chooses what it prints. A login flow shows one or
+/// two links, so this is far beyond any honest use and only bounds what a
+/// dishonest one can make the IDE hold on to.
+const SEEN_LIMIT: usize = 256;
+
+/// Where a URL stops: whitespace, a quote, or any control character.
+///
+/// The control characters matter as much as the spaces. Both CLIs wrap their
+/// link in an OSC 8 hyperlink, whose terminator is an ESC, so a scanner that
+/// only stopped at whitespace would hand the browser a URL with an escape
+/// sequence glued to the end of it.
+fn is_url_boundary(c: char) -> bool {
+    c.is_whitespace() || c.is_control() || c == '"' || c == '\''
+}
+
+/// Every login URL in `tail`, in the order they appear, without repeats.
+///
+/// A URL runs from one of [`LINK_PREFIXES`] to the next boundary, minus any
+/// trailing sentence punctuation. The end of the string counts as a boundary,
+/// which is why this is the *complete-buffer* scan: [`LinkScanner`] decides
+/// which part of a growing stream is complete before calling it.
+pub fn find_links(tail: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut from = 0usize;
+    while from < tail.len() {
+        let Some(start) = LINK_PREFIXES
+            .iter()
+            .filter_map(|prefix| tail[from..].find(prefix).map(|off| from + off))
+            .min()
+        else {
+            break;
+        };
+        let end = tail[start..]
+            .find(is_url_boundary)
+            .map_or(tail.len(), |off| start + off);
+        let url = tail[start..end].trim_end_matches(TRAILING_PUNCTUATION);
+        if !url.is_empty() && !found.iter().any(|seen| seen == url) {
+            found.push(url.to_owned());
+        }
+        // `end` is past `start` because a prefix begins with a non-boundary
+        // character, so the walk always advances.
+        from = end;
+    }
+    found
+}
+
+/// Finds login URLs in a stream that arrives in arbitrary chunks.
+///
+/// Two things make this more than a call to [`find_links`] per chunk. The
+/// scanner keeps the last [`TAIL_BYTES`] of the stream, so a URL split down the
+/// middle by the daemon's batching is still seen whole; and it remembers what
+/// it has already reported, so the tail it re-scans, and any echo of the link
+/// later in the session, do not open a second browser tab.
+///
+/// A URL that reaches the end of the buffer with nothing after it is held back
+/// rather than reported: the rest of it may still be arriving, and half a URL
+/// is worse than a moment's delay. [`LinkScanner::flush`] releases whatever is
+/// left when the terminal exits and no more can arrive.
+pub struct LinkScanner {
+    tail: Vec<u8>,
+    seen: std::collections::HashSet<String>,
+}
+
+impl Default for LinkScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LinkScanner {
+    pub fn new() -> Self {
+        Self {
+            tail: Vec::new(),
+            seen: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Feeds one decoded `pty.output` chunk; answers with the URLs that are
+    /// new. Bytes rather than text: a chunk boundary can fall inside a
+    /// multi-byte character, and joining the pieces here is what keeps the
+    /// stream intact. URLs are ASCII, so the lossy decode used to scan cannot
+    /// damage one.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.tail.extend_from_slice(chunk);
+        let candidates = {
+            let text = String::from_utf8_lossy(&self.tail);
+            match text.rfind(is_url_boundary) {
+                // Everything up to and including the last boundary is settled;
+                // whatever follows it may still be growing.
+                Some(idx) => {
+                    let width = text[idx..].chars().next().map_or(1, char::len_utf8);
+                    find_links(&text[..idx + width])
+                }
+                None => Vec::new(),
+            }
+        };
+        let fresh = self.take_unseen(candidates);
+        if self.tail.len() > TAIL_BYTES {
+            let excess = self.tail.len() - TAIL_BYTES;
+            self.tail.drain(..excess);
+        }
+        fresh
+    }
+
+    /// Reports whatever is left in the tail, terminated or not. Called when the
+    /// PTY exits: nothing more is coming, so a URL still sitting at the end of
+    /// the buffer is as complete as it will ever be.
+    pub fn flush(&mut self) -> Vec<String> {
+        let candidates = find_links(&String::from_utf8_lossy(&self.tail));
+        self.take_unseen(candidates)
+    }
+
+    /// How much of the stream is being kept. Exists for the test that pins the
+    /// bound; nothing in the IDE reads it.
+    pub fn tail_len(&self) -> usize {
+        self.tail.len()
+    }
+
+    fn take_unseen(&mut self, candidates: Vec<String>) -> Vec<String> {
+        if self.seen.len() >= SEEN_LIMIT {
+            // Starting over rather than refusing to report: forgetting can
+            // cost one repeated link, refusing would cost a real login.
+            self.seen.clear();
+        }
+        candidates
+            .into_iter()
+            .filter(|url| self.seen.insert(url.clone()))
+            .collect()
+    }
+}
 
 pub struct TerminalSessionRust {
     pty_id: QString,
@@ -288,6 +454,9 @@ async fn pump(
     let mut batch_started: Option<Instant> = None;
     let mut exit: Option<i32> = None;
     let mut gone = false;
+    // Scanned here rather than in the frame closure: a login URL is news the
+    // moment it arrives, and the Qt thread has enough to do painting.
+    let mut links = LinkScanner::new();
 
     loop {
         let received = match batch_started {
@@ -319,7 +488,13 @@ async fn pump(
         match event {
             Event::PtyOutput { data_b64, .. } => {
                 match BASE64.decode(data_b64.as_bytes()) {
-                    Ok(bytes) => batch.extend_from_slice(&bytes),
+                    Ok(bytes) => {
+                        for url in links.push(&bytes) {
+                            tracing::info!("login link in terminal output: {url}");
+                            let _ = qt.queue(move |q| q.link_detected(QString::from(&url)));
+                        }
+                        batch.extend_from_slice(&bytes);
+                    }
                     Err(e) => tracing::warn!("pty.output: undecodable base64: {e}"),
                 }
                 if batch_started.is_none() {
@@ -337,6 +512,13 @@ async fn pump(
     router.unsubscribe_pty(&pty_id);
     if gone {
         return;
+    }
+    // Nothing more can arrive, so a URL still sitting unterminated at the end
+    // of the tail is complete. Queued before the closure below, so the link is
+    // acted on before the pane reports the process gone.
+    for url in links.flush() {
+        tracing::info!("login link in terminal output: {url}");
+        let _ = qt.queue(move |q| q.link_detected(QString::from(&url)));
     }
     // The last frame carries whatever is left plus the exit state, so the
     // final output is painted before the pane is marked dead. Queued directly
@@ -369,6 +551,45 @@ async fn pump(
     });
 }
 
+/// Publishes a PTY the caller has already subscribed to, then pumps it until
+/// it exits. The half of `open` and `attach` that is the same terminal either
+/// way: from the moment an id exists, where it came from stops mattering.
+async fn adopt(
+    router: EventRouter,
+    qt: QtHandle,
+    pty_id: PtyId,
+    rx: EventRx,
+    pending: Arc<AtomicBool>,
+) {
+    let unsubscribe = {
+        let router = router.clone();
+        let pty_id = pty_id.clone();
+        move || router.unsubscribe_pty(&pty_id)
+    };
+    let id_text = pty_id.to_string();
+    let queued = qt.queue(move |mut q| {
+        // `close` ran while the id was in flight, so the session never learned
+        // an id it could close. It exists now: close it here, rather than
+        // leaving a shell running with nothing reading it.
+        if q.as_ref().rust().close_requested {
+            q.as_mut().rust_mut().close_requested = false;
+            close_pty(id_text);
+            return;
+        }
+        q.as_mut().set_pty_id(QString::from(&id_text));
+        q.as_mut().rust_mut().unsubscribe = Some(Box::new(unsubscribe));
+        q.opened();
+    });
+    if queued.is_err() {
+        // The QObject went away before the id reached it: the same orphan,
+        // from the other direction.
+        router.unsubscribe_pty(&pty_id);
+        close_pty(pty_id.to_string());
+        return;
+    }
+    pump(rx, pty_id, router, qt, pending).await;
+}
+
 impl qobject::TerminalSession {
     pub fn open(
         mut self: Pin<&mut Self>,
@@ -378,25 +599,8 @@ impl qobject::TerminalSession {
         command: QString,
     ) {
         let (cols, rows) = clamp_size(cols, rows);
-        // Re-opening: drop the previous subscription first so its pump ends.
-        self.as_mut().teardown();
-        self.as_mut().set_pty_id(QString::from(""));
+        let pending = self.as_mut().begin(cols, rows);
         self.as_mut().set_workspace_id(workspace_id.clone());
-        self.as_mut().set_cols(i32::from(cols));
-        self.as_mut().set_rows(i32::from(rows));
-        self.as_mut().set_exited(false);
-        self.as_mut().set_exit_code(0);
-        self.as_mut().set_error(QString::from(""));
-        {
-            let mut rust = self.as_mut().rust_mut();
-            rust.close_requested = false;
-            rust.grid = Some(TerminalGrid::new(cols, rows));
-            // A fresh flag: any closure still queued by an older pump clears
-            // that pump's flag, not this session's.
-            rust.frame_pending = Arc::new(AtomicBool::new(false));
-        }
-        let pending = self.as_ref().rust().frame_pending.clone();
-        self.as_mut().apply_frame();
 
         let shared = match require_connection() {
             Ok(shared) => shared,
@@ -431,35 +635,48 @@ impl qobject::TerminalSession {
             // Subscribing before the id reaches the Qt thread: the router
             // replays output that arrived while `pty.open` was in flight.
             let rx = shared.router.subscribe_pty(&pty_id);
-            let router = shared.router.clone();
-            let unsubscribe = {
-                let router = router.clone();
-                let pty_id = pty_id.clone();
-                move || router.unsubscribe_pty(&pty_id)
-            };
-            let id_text = pty_id.to_string();
-            let queued = qt.queue(move |mut q| {
-                // `close` ran while this `pty.open` was in flight, so the
-                // session never learned an id it could close. It exists now:
-                // close it here, rather than leaving a shell running in the
-                // sandbox with nothing reading it.
-                if q.as_ref().rust().close_requested {
-                    q.as_mut().rust_mut().close_requested = false;
-                    close_pty(id_text);
-                    return;
-                }
-                q.as_mut().set_pty_id(QString::from(&id_text));
-                q.as_mut().rust_mut().unsubscribe = Some(Box::new(unsubscribe));
-                q.opened();
-            });
-            if queued.is_err() {
-                // The QObject went away before the id reached it: the same
-                // orphan, from the other direction.
-                router.unsubscribe_pty(&pty_id);
-                close_pty(pty_id.to_string());
+            adopt(shared.router.clone(), qt, pty_id, rx, pending).await;
+        });
+    }
+
+    pub fn attach(mut self: Pin<&mut Self>, pty_id: QString, cols: i32, rows: i32) {
+        let id = pty_id.to_string();
+        if id.is_empty() {
+            self.fail("no terminal to attach to");
+            return;
+        }
+        let (cols, rows) = clamp_size(cols, rows);
+        let pending = self.as_mut().begin(cols, rows);
+        // A host terminal belongs to no workspace. Left empty rather than
+        // guessed at: its events carry no workspace id either, which is why
+        // the router has to key this one by PTY id alone.
+        self.as_mut().set_workspace_id(QString::from(""));
+
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                self.fail(message);
                 return;
             }
-            pump(rx, pty_id, router, qt, pending).await;
+        };
+        let qt = self.qt_thread();
+        runtime().spawn(async move {
+            let pty_id = PtyId(id);
+            // Subscribed before anything else, exactly as in `open`: the
+            // daemon starts writing the moment the terminal opens, and the
+            // router replays what arrived before this session existed.
+            let rx = shared.router.subscribe_pty(&pty_id);
+            // The terminal was opened at whatever size the request asked for.
+            // This is where it becomes the size of the pane showing it.
+            let params = PtyResizeParams {
+                pty_id: pty_id.clone(),
+                cols,
+                rows,
+            };
+            if let Err(e) = shared.client.request_raw(Request::PtyResize(params)).await {
+                report(&qt, format!("pty.resize failed: {e}"));
+            }
+            adopt(shared.router.clone(), qt, pty_id, rx, pending).await;
         });
     }
 
@@ -568,6 +785,32 @@ impl qobject::TerminalSession {
             grid.insert_marker(DROP_MARKER);
         }
         self.apply_frame();
+    }
+
+    /// Clears the session down to an empty `cols` x `rows` screen and hands
+    /// back the frame flag the new pump is to use. Both `open` and `attach`
+    /// start here, because a session that is being pointed at a second PTY has
+    /// to let go of the first one first.
+    fn begin(mut self: Pin<&mut Self>, cols: u16, rows: u16) -> Arc<AtomicBool> {
+        // Re-opening: drop the previous subscription first so its pump ends.
+        self.as_mut().teardown();
+        self.as_mut().set_pty_id(QString::from(""));
+        self.as_mut().set_cols(i32::from(cols));
+        self.as_mut().set_rows(i32::from(rows));
+        self.as_mut().set_exited(false);
+        self.as_mut().set_exit_code(0);
+        self.as_mut().set_error(QString::from(""));
+        {
+            let mut rust = self.as_mut().rust_mut();
+            rust.close_requested = false;
+            rust.grid = Some(TerminalGrid::new(cols, rows));
+            // A fresh flag: any closure still queued by an older pump clears
+            // that pump's flag, not this session's.
+            rust.frame_pending = Arc::new(AtomicBool::new(false));
+        }
+        let pending = self.as_ref().rust().frame_pending.clone();
+        self.apply_frame();
+        pending
     }
 
     /// Feeds PTY bytes into the screen. No-op before `open`.

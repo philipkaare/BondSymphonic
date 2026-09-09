@@ -103,6 +103,20 @@ pub mod qobject {
         #[qsignal]
         fn prereq_warning(self: Pin<&mut AppController>, message: QString);
 
+        /// Every prerequisite the daemon reported, as a JSON array of
+        /// `PrereqStatus`. Emitted after every check: the one at start-up and
+        /// every `recheck_prereqs`. This is what the setup page draws its rows
+        /// from, and what the window decides to show the page at all from.
+        #[qsignal]
+        fn prereqs_checked(self: Pin<&mut AppController>, json: QString);
+
+        /// A setup terminal is open. `action` is echoed back from the call, so
+        /// a page that started two of them can tell which answered; `pty_id`
+        /// is an ordinary PTY id, taking `pty.write`, `pty.resize` and
+        /// `pty.close` with no special casing.
+        #[qsignal]
+        fn setup_pty_opened(self: Pin<&mut AppController>, action: QString, pty_id: QString);
+
         /// The daemon's full workspace list, as a JSON array of `WorkspaceInfo`,
         /// emitted once per successful connect.
         #[qsignal]
@@ -216,6 +230,61 @@ pub mod qobject {
         #[qinvokable]
         fn wsl_path(self: &AppController, windows_path: QString) -> QString;
 
+        /// Asks the daemon for the prerequisites again and answers with
+        /// `prereqs_checked`. Called after a setup terminal exits, and by the
+        /// setup page's "Re-check" button.
+        #[qinvokable]
+        fn recheck_prereqs(self: Pin<&mut AppController>);
+
+        /// Opens a host terminal running one of the four fixed setup commands.
+        /// `action` is `claude_login`, `gh_login`, `install_claude` or
+        /// `install_gh`; anything else is refused without reaching the daemon.
+        /// Answers with `setup_pty_opened` or `operation_failed("setup", ...)`.
+        #[qinvokable]
+        fn open_setup_pty(self: Pin<&mut AppController>, action: QString, cols: i32, rows: i32);
+
+        /// Whether any prerequisite in `json` is one the IDE cannot work
+        /// without. The window asks before deciding between the setup page and
+        /// a status-bar warning.
+        #[qinvokable]
+        fn prereqs_block(self: &AppController, json: QString) -> bool;
+
+        /// What the daemon said it could do, as a JSON `Capabilities`, or an
+        /// empty string before `hello` has answered. The New Agent dialog reads
+        /// the adapter list out of it.
+        #[qinvokable]
+        fn capabilities_json(self: &AppController) -> QString;
+
+        /// Stores the Anthropic API key in the Windows credential store,
+        /// replacing any previous one. Returns whether it was stored.
+        ///
+        /// The key goes no further than the credential store and, later, the
+        /// `agent.start` request: it is never held on this object, never
+        /// logged, and never sent back out through a signal or a property.
+        #[qinvokable]
+        fn set_api_key(self: &AppController, key: QString) -> bool;
+
+        /// Removes the stored API key. Removing one that is not there
+        /// succeeds: the caller asked for there to be none, and there is none.
+        #[qinvokable]
+        fn clear_api_key(self: &AppController) -> bool;
+
+        /// Whether a key is in the credential store. Asks the store, not the
+        /// settings file, so a key deleted in Credential Manager is not still
+        /// advertised by the dialog.
+        #[qinvokable]
+        fn api_key_set(self: &AppController) -> bool;
+
+        /// The permission mode a new Claude agent should start on, from
+        /// `settings.json`. The settings dialog writes it; the New Agent dialog
+        /// opens on it.
+        #[qinvokable]
+        fn default_permission_mode(self: &AppController) -> QString;
+
+        /// Records the permission mode new agents start on.
+        #[qinvokable]
+        fn set_default_permission_mode(self: &AppController, mode: QString);
+
         /// Someone in Rust asked the window to open a file in an editor tab.
         #[qsignal]
         fn open_file_requested(self: Pin<&mut AppController>, workspace_id: QString, path: QString);
@@ -268,10 +337,45 @@ pub const NOT_CONNECTED: &str = "not connected to the daemon";
 /// one is "wait", the other is "restart the IDE".
 pub const CONNECTION_LOST: &str = "daemon connection lost";
 
+/// The prerequisites the IDE cannot work around.
+///
+/// Without git there is no worktree, without bubblewrap and unprivileged user
+/// namespaces there is no sandbox, and without a sandbox there is nowhere to
+/// put an agent: a workbench on top of any of those would only be able to
+/// report the same failure once per click. Everything else on the list -- the
+/// two CLIs and their two logins -- costs the user Claude Code and leaves the
+/// rest of the IDE working, so it is a warning rather than a wall.
+pub const BLOCKING_PREREQS: [&str; 4] = ["git", "bwrap", "userns", "sandbox"];
+
+/// Whether any of `items` is a failing [`BLOCKING_PREREQS`] entry.
+///
+/// A name this build has never heard of is not blocking. A daemon that grows a
+/// new check should not be able to lock an older IDE out of its own workbench.
+pub fn prereqs_blocking(items: &[PrereqStatus]) -> bool {
+    items
+        .iter()
+        .any(|item| !item.ok && BLOCKING_PREREQS.contains(&item.name.as_str()))
+}
+
+/// The four setup terminals, by the names the UI and the daemon both use.
+/// Anything else is refused here rather than sent on: the enum is the whole
+/// point of `system.setup_pty`, and a typo should fail loudly and locally.
+fn parse_setup_action(action: &str) -> Option<SetupAction> {
+    match action {
+        "claude_login" => Some(SetupAction::ClaudeLogin),
+        "gh_login" => Some(SetupAction::GhLogin),
+        "install_claude" => Some(SetupAction::InstallClaude),
+        "install_gh" => Some(SetupAction::InstallGh),
+        _ => None,
+    }
+}
+
 pub struct AppControllerRust {
     connection_state: i32,
     status_message: QString,
     daemon_version: QString,
+    /// What `hello` said the daemon supports, as JSON. Empty until connected.
+    capabilities: QString,
     client: Option<DaemonClient>,
     process: Option<ProcessHandle>,
 }
@@ -282,6 +386,7 @@ impl Default for AppControllerRust {
             connection_state: ConnectionState::Disconnected.as_i32(),
             status_message: QString::from(ConnectionState::Disconnected.label()),
             daemon_version: QString::from(""),
+            capabilities: QString::from(""),
             client: None,
             process: None,
         }
@@ -350,13 +455,57 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
 
 /// The Anthropic API key to put in `agent.start`'s options.
 ///
-/// Always `None` today: Task 7 fills this in from the OS credential store
-/// (`keyring`, service `BondSymphonic`, user `anthropic_api_key`). It lives
-/// here, and is merged in [`start_options`], because the key must never cross
-/// into C++, never reach a signal, and never be logged: the dialog builds the
-/// options without it and the controller is the only thing that adds it.
+/// Read from the OS credential store at the moment the request is built, never
+/// cached. It lives here, and is merged in [`start_options`], because the key
+/// must never cross into C++, never reach a signal, and never be logged: the
+/// dialog builds the options without it and the controller is the only thing
+/// that adds it.
 pub fn api_key_for_start() -> Option<String> {
-    None
+    crate::qobjects::settings::api_key()
+}
+
+/// Runs `system.check_prereqs` and reports the answer twice: the whole list as
+/// `prereqs_checked`, which is what the setup page draws, and the failures as
+/// one sentence in `prereq_warning`, which is what the status bar shows.
+///
+/// Both are queued from the same closure, `prereqs_checked` first, so the
+/// window has already decided which of the two views it is in by the time the
+/// warning text reaches it.
+async fn check_prereqs(client: DaemonClient, qt: QtHandle) {
+    let items = match client
+        .request::<CheckPrereqsResult>(Request::SystemCheckPrereqs {})
+        .await
+    {
+        Ok(res) => res.items,
+        Err(e) => {
+            report_failure(&qt, "system.check_prereqs", e.to_string());
+            return;
+        }
+    };
+    let failures: Vec<String> = items
+        .iter()
+        .filter(|i| !i.ok)
+        .map(|i| {
+            let fix = i
+                .fix_hint
+                .as_ref()
+                .map(|f| format!(" (fix: {f})"))
+                .unwrap_or_default();
+            format!("{}: {}{}", i.name, i.detail, fix)
+        })
+        .collect();
+    let json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".into());
+    tracing::info!(
+        total = items.len(),
+        failed = failures.len(),
+        "prerequisites checked"
+    );
+    let _ = qt.queue(move |mut q| {
+        q.as_mut().prereqs_checked(QString::from(&json));
+        if !failures.is_empty() {
+            q.prereq_warning(QString::from(&failures.join("\n")));
+        }
+    });
 }
 
 /// Parses the options a dialog built and merges the stored API key in. An
@@ -534,6 +683,7 @@ impl qobject::AppController {
             runtime().spawn(drain_events(events, router.clone(), qt.clone()));
 
             let version = hello.daemon_version.clone();
+            let capabilities = serde_json::to_string(&hello.capabilities).unwrap_or_default();
             // `None` under the test hook: there is no daemon process to own.
             let handle: Option<ProcessHandle> =
                 proc.map(|p| std::sync::Arc::new(tokio::sync::Mutex::new(Some(p))));
@@ -541,6 +691,7 @@ impl qobject::AppController {
             let _ = qt.queue(move |mut q| {
                 q.as_mut().rust_mut().client = Some(c2);
                 q.as_mut().rust_mut().process = handle;
+                q.as_mut().rust_mut().capabilities = QString::from(&capabilities);
                 // State first, then the version, so `apply_daemon_version`
                 // recomposes the text as "daemon: connected v<version>".
                 q.as_mut().set_state(ConnectionState::Connected);
@@ -565,28 +716,7 @@ impl qobject::AppController {
                 }
             });
 
-            if let Ok(res) = client
-                .request::<CheckPrereqsResult>(Request::SystemCheckPrereqs {})
-                .await
-            {
-                let bad: Vec<String> = res
-                    .items
-                    .iter()
-                    .filter(|i| !i.ok)
-                    .map(|i| {
-                        let fix = i
-                            .fix_hint
-                            .as_ref()
-                            .map(|f| format!(" (fix: {f})"))
-                            .unwrap_or_default();
-                        format!("{}: {}{}", i.name, i.detail, fix)
-                    })
-                    .collect();
-                if !bad.is_empty() {
-                    let msg = bad.join("\n");
-                    let _ = qt.queue(move |q| q.prereq_warning(QString::from(msg.as_str())));
-                }
-            }
+            check_prereqs(client, qt).await;
         });
     }
 
@@ -776,6 +906,105 @@ impl qobject::AppController {
 
     pub fn request_save_all(self: Pin<&mut Self>) {
         self.save_all_requested();
+    }
+
+    pub fn recheck_prereqs(self: Pin<&mut Self>) {
+        let qt = self.qt_thread();
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_failure(&qt, "system.check_prereqs", message.to_owned());
+                return;
+            }
+        };
+        runtime().spawn(check_prereqs(shared.client, qt));
+    }
+
+    pub fn open_setup_pty(self: Pin<&mut Self>, action: QString, cols: i32, rows: i32) {
+        let qt = self.qt_thread();
+        let name = action.to_string();
+        let Some(action) = parse_setup_action(&name) else {
+            report_failure(&qt, "setup", format!("unknown setup action: {name}"));
+            return;
+        };
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_failure(&qt, "setup", message.to_owned());
+                return;
+            }
+        };
+        // The daemon clamps these itself; clamping here too keeps a widget that
+        // has not been laid out yet from asking for a zero-column terminal.
+        let params = SetupPtyParams {
+            action,
+            cols: cols.clamp(2, u16::MAX as i32) as u16,
+            rows: rows.clamp(1, u16::MAX as i32) as u16,
+        };
+        runtime().spawn(async move {
+            match shared
+                .client
+                .request::<PtyOpenResult>(Request::SystemSetupPty(params))
+                .await
+            {
+                Ok(res) => {
+                    let id = res.pty_id.to_string();
+                    tracing::info!("setup terminal for {name} opened as {id}");
+                    let _ = qt.queue(move |q| {
+                        q.setup_pty_opened(QString::from(&name), QString::from(&id))
+                    });
+                }
+                Err(e) => report_failure(&qt, "setup", e.to_string()),
+            }
+        });
+    }
+
+    pub fn prereqs_block(&self, json: QString) -> bool {
+        match serde_json::from_str::<Vec<PrereqStatus>>(&json.to_string()) {
+            Ok(items) => prereqs_blocking(&items),
+            // Unreadable is not blocking: the list is the daemon's own output,
+            // so failing to parse it is this build's problem, and hiding the
+            // workbench over it would leave the user nothing at all.
+            Err(e) => {
+                tracing::warn!("prereqs_block: unparseable prerequisite list: {e}");
+                false
+            }
+        }
+    }
+
+    pub fn capabilities_json(&self) -> QString {
+        self.rust().capabilities.clone()
+    }
+
+    pub fn set_api_key(&self, key: QString) -> bool {
+        // `key` is moved straight into the credential store and dropped. It is
+        // deliberately not logged, not stored on this object, and not echoed
+        // back through any signal.
+        crate::qobjects::settings::set_api_key(&key.to_string())
+    }
+
+    pub fn clear_api_key(&self) -> bool {
+        crate::qobjects::settings::clear_api_key()
+    }
+
+    pub fn api_key_set(&self) -> bool {
+        crate::qobjects::settings::api_key_set()
+    }
+
+    pub fn default_permission_mode(&self) -> QString {
+        QString::from(&Settings::load().default_permission_mode)
+    }
+
+    pub fn set_default_permission_mode(&self, mode: QString) {
+        let mode = mode.to_string();
+        let mut settings = Settings::load();
+        if settings.default_permission_mode == mode {
+            return;
+        }
+        settings.default_permission_mode = mode;
+        if let Err(e) = settings.save() {
+            tracing::warn!("settings.json could not be written: {e}");
+        }
     }
 
     pub fn wsl_path(&self, windows_path: QString) -> QString {

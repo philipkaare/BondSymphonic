@@ -26,6 +26,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 directories = "5"
+# The Anthropic API key lives in the Windows credential store, never in
+# settings.json. Default features would pull in the Linux and macOS backends
+# as well; `windows-native` is the only one this build can use.
+keyring = { version = "3", default-features = false, features = [
+    "windows-native",
+] }
 thiserror.workspace = true
 alacritty_terminal = "0.26"
 base64 = "0.22"

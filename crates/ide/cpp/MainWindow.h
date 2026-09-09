@@ -22,7 +22,9 @@ class QLabel;
 class QMenu;
 class QPlainTextEdit;
 class QSplitter;
+class QStackedWidget;
 class QTabWidget;
+class SetupPage;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -52,6 +54,14 @@ private:
 
     void buildMenus();
     void buildCentral();
+    /// Puts the setup page in front of the workbench, or takes it away again.
+    /// Both directions go through here so the two are never both current.
+    void showSetupPage();
+    void showWorkbench();
+    void onSettings();
+    /// Decides, from the daemon's prerequisite list, between the setup page,
+    /// a status-bar warning with a way back to it, and neither.
+    void onPrereqsChecked(const QString& json);
     void buildDocks();
     void buildToolBar();
     void buildStatusBar();
@@ -98,6 +108,10 @@ private:
     /// The New Agent dialog while it is up, so daemon failures can be parented
     /// to it rather than to a window the modal dialog is blocking.
     QPointer<NewAgentDialog> m_newAgentDialog;
+    /// The central widget: the workbench, and the setup page in front of it.
+    QStackedWidget* m_stack = nullptr;
+    QWidget* m_workbench = nullptr;
+    SetupPage* m_setupPage = nullptr;
     QSplitter* m_centerSplitter = nullptr;
     /// The centre pane: one tab per open file.
     EditorArea* m_editorArea = nullptr;
@@ -112,6 +126,9 @@ private:
     QLabel* m_sandboxLabel = nullptr;
     QLabel* m_branchLabel = nullptr;
     QLabel* m_costLabel = nullptr;
+    /// The status bar's way back to the setup page, shown only while a
+    /// non-blocking prerequisite is failing.
+    QLabel* m_setupLabel = nullptr;
     /// What the sandbox label shows when no tab is selected: normally a dash,
     /// or the prerequisite warning once the controller has reported one.
     QString m_sandboxIdleText;

@@ -29,6 +29,17 @@ const char* kTerminalAdapter = "terminal";
 /// How many lines of opening prompt are visible before the box scrolls.
 constexpr int kPromptRows = 4;
 
+/// Whether the daemon said it has the Claude adapter, from the capabilities it
+/// reported in `hello`. Offering Claude Code by default against a daemon that
+/// cannot run it would make the dialog's first suggestion its only dead end.
+bool daemonHasClaude(AppController* controller) {
+    const QJsonArray adapters = QJsonDocument::fromJson(controller->capabilitiesJson().toUtf8())
+                                    .object()
+                                    .value("adapters")
+                                    .toArray();
+    return adapters.contains(QJsonValue(QString::fromUtf8(kClaudeAdapter)));
+}
+
 } // namespace
 
 NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWidget* parent)
@@ -65,6 +76,7 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWi
     // a terminal workspace is the fallback rather than the usual case.
     m_adapter->addItem("Claude Code", kClaudeAdapter);
     m_adapter->addItem("Terminal", kTerminalAdapter);
+    m_adapter->setCurrentIndex(daemonHasClaude(m_controller) ? 0 : 1);
     form->addRow("Adapter:", m_adapter);
 
     m_command = new QLineEdit(this);
@@ -81,6 +93,8 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWi
     for (const char* mode : { "default", "acceptEdits", "plan", "dontAsk" }) {
         m_permissionMode->addItem(QString::fromUtf8(mode), QString::fromUtf8(mode));
     }
+    m_permissionMode->setCurrentIndex(
+        qMax(0, m_permissionMode->findData(m_controller->defaultPermissionMode())));
     form->addRow("Permission mode:", m_permissionMode);
 
     m_initialPrompt = new QPlainTextEdit(this);

@@ -9,6 +9,9 @@ fn main() {
     let builder = unsafe {
         builder.cc_builder(move |cc| {
             cc.define("BS_IDE_VERSION", format!("\"{version}\"").as_str());
+            // MSVC otherwise reads these sources in the system code page, and
+            // the glyphs in the setup page's rows are UTF-8 in the file.
+            cc.flag_if_supported("/utf-8");
         })
     };
     builder
@@ -37,6 +40,10 @@ fn main() {
             "cpp/ExplorerDock.cpp",
             "cpp/NewAgentDialog.h",
             "cpp/NewAgentDialog.cpp",
+            "cpp/SetupPage.h",
+            "cpp/SetupPage.cpp",
+            "cpp/SettingsDialog.h",
+            "cpp/SettingsDialog.cpp",
             "cpp/PromptInput.h",
             "cpp/PromptInput.cpp",
             "cpp/ToolCard.h",

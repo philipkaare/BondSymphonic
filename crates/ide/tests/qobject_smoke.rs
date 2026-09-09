@@ -506,3 +506,204 @@ fn a_terminal_tab_still_takes_its_status_from_the_workspace() {
     assert!(model.apply_workspace_info(&ready).is_some());
     assert_eq!(model.groups[0].tabs[0].status, TabStatus::Idle);
 }
+
+// ---------------------------------------------------------------------------
+// Task 7: the setup page's pure-Rust half.
+// ---------------------------------------------------------------------------
+
+/// The two login URLs the setup terminals print. Everything else in the output
+/// stream is text, so only these two prefixes are recognised: an agent that
+/// prints a link must not make the IDE open a browser.
+#[test]
+fn find_links_picks_the_login_urls_out_of_terminal_text() {
+    use bondsymphonic_ide::qobjects::terminal_session::find_links;
+
+    assert_eq!(
+        find_links("open https://claude.ai/oauth/authorize?x=1 in a browser"),
+        ["https://claude.ai/oauth/authorize?x=1"]
+    );
+    assert_eq!(
+        find_links("go to https://github.com/login/device and enter ABCD-1234"),
+        ["https://github.com/login/device"]
+    );
+
+    // Not a login URL: no browser opens for it.
+    assert!(find_links("see https://example.com/x for details").is_empty());
+    // The right host, but not the device-login path.
+    assert!(find_links("https://github.com/philipkaare/BondSymphonic").is_empty());
+    assert!(find_links("nothing to see here").is_empty());
+
+    // Sentence punctuation is not part of the URL.
+    assert_eq!(
+        find_links("Visit https://claude.ai/oauth/authorize?x=1."),
+        ["https://claude.ai/oauth/authorize?x=1"]
+    );
+    assert_eq!(
+        find_links("(https://claude.ai/oauth/authorize?x=1),"),
+        ["https://claude.ai/oauth/authorize?x=1"]
+    );
+    // A quote ends it, as does an escape: `gh` wraps the URL in an OSC 8
+    // hyperlink, whose terminator is an ESC.
+    assert_eq!(
+        find_links("\"https://claude.ai/a\" and \u{1b}]8;;https://claude.ai/b\u{1b}\\"),
+        ["https://claude.ai/a", "https://claude.ai/b"]
+    );
+
+    // The same URL twice in one buffer is one link.
+    assert_eq!(
+        find_links("https://claude.ai/a https://claude.ai/a"),
+        ["https://claude.ai/a"]
+    );
+}
+
+/// `pty.output` arrives in whatever chunks the daemon batched, so a URL is
+/// routinely split down the middle. The scanner keeps a tail across chunks and
+/// still reports each distinct URL exactly once.
+#[test]
+fn a_link_split_across_two_chunks_is_found_once() {
+    use bondsymphonic_ide::qobjects::terminal_session::LinkScanner;
+
+    let mut scanner = LinkScanner::new();
+    assert!(scanner.push(b"please open https://cla").is_empty());
+    assert_eq!(
+        scanner.push(b"ude.ai/oauth/authorize?x=1\r\n"),
+        ["https://claude.ai/oauth/authorize?x=1"]
+    );
+    // Echoed again later: already opened, so nothing more happens.
+    assert!(scanner
+        .push(b"https://claude.ai/oauth/authorize?x=1\r\n")
+        .is_empty());
+
+    // A second, different URL still gets through.
+    assert_eq!(
+        scanner.push(b"or https://github.com/login/device\r\n"),
+        ["https://github.com/login/device"]
+    );
+}
+
+/// A URL that is still arriving must not be opened truncated: it is held back
+/// until something terminates it, and `flush` releases whatever is left when
+/// the terminal exits.
+#[test]
+fn an_unterminated_link_waits_for_the_rest_of_its_chunk() {
+    use bondsymphonic_ide::qobjects::terminal_session::LinkScanner;
+
+    let mut scanner = LinkScanner::new();
+    assert!(scanner.push(b"https://claude.ai/oauth?code=12").is_empty());
+    assert!(scanner.push(b"345").is_empty());
+    assert_eq!(
+        scanner.flush(),
+        ["https://claude.ai/oauth?code=12345"],
+        "the whole URL, not the prefix that had arrived first"
+    );
+    // Flushing again repeats nothing.
+    assert!(scanner.flush().is_empty());
+}
+
+/// The tail is bounded, so a chatty terminal cannot grow it without limit, and
+/// a URL is still found across the boundary of a chunk that fills it.
+#[test]
+fn the_scanner_tail_stays_bounded() {
+    use bondsymphonic_ide::qobjects::terminal_session::{LinkScanner, TAIL_BYTES};
+
+    let mut scanner = LinkScanner::new();
+    let noise = "x".repeat(TAIL_BYTES * 3);
+    assert!(scanner.push(noise.as_bytes()).is_empty());
+    assert!(scanner.tail_len() <= TAIL_BYTES);
+    assert_eq!(
+        scanner.push(b" https://claude.ai/late\n"),
+        ["https://claude.ai/late"]
+    );
+}
+
+/// Which prerequisites stop the IDE being usable at all. The four host ones do:
+/// without git, bubblewrap, user namespaces or a working sandbox there is no
+/// workspace to put an agent in. A missing CLI or login is a warning, because
+/// everything except Claude Code still works.
+#[test]
+fn only_the_four_host_prerequisites_block_the_workbench() {
+    use bondsymphonic_ide::qobjects::app_controller::prereqs_blocking;
+    use bondsymphonic_proto::PrereqStatus;
+
+    fn item(name: &str, ok: bool) -> PrereqStatus {
+        PrereqStatus {
+            name: name.to_owned(),
+            ok,
+            detail: String::new(),
+            fix_hint: None,
+        }
+    }
+    let all_ok = || {
+        vec![
+            item("git", true),
+            item("bwrap", true),
+            item("userns", true),
+            item("claude", true),
+            item("claude_auth", true),
+            item("gh", true),
+            item("gh_auth", true),
+            item("sandbox", true),
+        ]
+    };
+
+    assert!(!prereqs_blocking(&all_ok()));
+    // An empty list is not a reason to hide the workbench.
+    assert!(!prereqs_blocking(&[]));
+
+    for blocking in ["git", "bwrap", "userns", "sandbox"] {
+        let mut items = all_ok();
+        items.iter_mut().find(|i| i.name == blocking).unwrap().ok = false;
+        assert!(prereqs_blocking(&items), "{blocking} should block");
+    }
+    for warning in ["claude", "claude_auth", "gh", "gh_auth"] {
+        let mut items = all_ok();
+        items.iter_mut().find(|i| i.name == warning).unwrap().ok = false;
+        assert!(!prereqs_blocking(&items), "{warning} should not block");
+    }
+    // A name the daemon grew after this build: unknown, so not blocking.
+    assert!(!prereqs_blocking(&[item("something_new", false)]));
+}
+
+/// `settings.json` remembers that a key is in the credential store, and the
+/// permission mode the New Agent dialog should start on. Neither the key nor
+/// anything derived from it is ever written to the file.
+#[test]
+fn settings_round_trip_the_api_key_flag_and_permission_mode() {
+    use bondsymphonic_ide::qobjects::settings::{Settings, SETTINGS_PATH_ENV};
+
+    let dir = std::env::temp_dir().join(format!("bs-t7-settings-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("settings.json");
+    let _ = std::fs::remove_file(&path);
+    std::env::set_var(SETTINGS_PATH_ENV, &path);
+
+    // A file that is not there yet reads as the defaults.
+    let fresh = Settings::load();
+    assert!(!fresh.api_key_set);
+    assert_eq!(fresh.default_permission_mode, "default");
+
+    let mut settings = Settings::load();
+    settings.api_key_set = true;
+    settings.default_permission_mode = "acceptEdits".to_owned();
+    settings.save().expect("settings save");
+
+    let loaded = Settings::load();
+    assert!(loaded.api_key_set);
+    assert_eq!(loaded.default_permission_mode, "acceptEdits");
+    // Untouched fields survive the round trip.
+    assert_eq!(loaded.distro, fresh.distro);
+
+    let raw = std::fs::read_to_string(&path).expect("settings file");
+    assert!(raw.contains("\"api_key_set\": true"), "{raw}");
+    assert!(!raw.contains("sk-"), "no key material in settings.json");
+
+    // Settings written before these fields existed still load.
+    std::fs::write(&path, "{\"distro\":\"other\"}").expect("legacy settings");
+    let legacy = Settings::load();
+    assert_eq!(legacy.distro, "other");
+    assert!(!legacy.api_key_set);
+    assert_eq!(legacy.default_permission_mode, "default");
+
+    std::env::remove_var(SETTINGS_PATH_ENV);
+    let _ = std::fs::remove_dir_all(&dir);
+}

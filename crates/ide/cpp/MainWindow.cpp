@@ -7,6 +7,8 @@
 #include "ExplorerDock.h"
 #include "GroupBar.h"
 #include "NewAgentDialog.h"
+#include "SettingsDialog.h"
+#include "SetupPage.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
@@ -18,6 +20,7 @@
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QDockWidget>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
@@ -28,6 +31,7 @@
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QSplitter>
+#include <QStackedWidget>
 #include <QStatusBar>
 #include <QStyle>
 #include <QTabWidget>
@@ -135,6 +139,8 @@ void MainWindow::buildMenus() {
     auto* saveAll = file->addAction("Save A&ll", this, [this] { m_editorArea->saveAll(); });
     saveAll->setShortcut(QKeySequence("Ctrl+Shift+S"));
     file->addSeparator();
+    file->addAction("Se&ttings…", this, &MainWindow::onSettings);
+    file->addSeparator();
     file->addAction("E&xit", this, &QWidget::close);
 
     auto* edit = menuBar()->addMenu("&Edit");
@@ -161,6 +167,10 @@ void MainWindow::buildMenus() {
     menuBar()->addMenu("&Workspace");
     menuBar()->addMenu("&Run");
     auto* help = menuBar()->addMenu("&Help");
+    // Available whatever the prerequisites say: the page is also how a user
+    // logs in to Claude Code again after a token has expired.
+    help->addAction("&Setup…", this, &MainWindow::showSetupPage);
+    help->addSeparator();
     help->addAction("&About BondSymphonic…", this, &MainWindow::onAbout);
     help->addAction("About &Qt", qApp, &QApplication::aboutQt);
 }
@@ -183,7 +193,12 @@ void MainWindow::onAbout() {
 }
 
 void MainWindow::buildCentral() {
-    auto* central = new QWidget(this);
+    // The window shows one of two things: the workbench, or the setup page in
+    // front of it. A stack rather than a hidden workbench, so the panes, tabs
+    // and terminals behind the page keep their state while it is up.
+    m_stack = new QStackedWidget(this);
+    auto* central = new QWidget(m_stack);
+    m_workbench = central;
     auto* layout = new QVBoxLayout(central);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
@@ -207,10 +222,53 @@ void MainWindow::buildCentral() {
     // from the start; the splitter rescales the pair to the width it has.
     m_centerSplitter->setSizes({ 900, 600 });
     layout->addWidget(m_centerSplitter, 1);
-    setCentralWidget(central);
 
+    m_stack->addWidget(central);
+    m_setupPage = new SetupPage(m_controller, m_stack);
+    m_stack->addWidget(m_setupPage);
+    m_stack->setCurrentWidget(central);
+    setCentralWidget(m_stack);
+
+    QObject::connect(m_setupPage, &SetupPage::completed, this, &MainWindow::showWorkbench);
     QObject::connect(m_groupBar, &GroupBar::newAgentRequested, this, &MainWindow::onNewAgent);
     QObject::connect(m_groupBar, &GroupBar::destroyRequested, this, &MainWindow::onDestroyRequested);
+}
+
+void MainWindow::showSetupPage() {
+    m_stack->setCurrentWidget(m_setupPage);
+}
+
+void MainWindow::showWorkbench() {
+    m_stack->setCurrentWidget(m_workbench);
+}
+
+void MainWindow::onSettings() {
+    SettingsDialog dialog(m_controller, this);
+    dialog.exec();
+}
+
+void MainWindow::onPrereqsChecked(const QString& json) {
+    const QJsonArray items = QJsonDocument::fromJson(json.toUtf8()).array();
+    bool anyFailed = false;
+    for (const QJsonValue& value : items) {
+        anyFailed = anyFailed || !value.toObject().value("ok").toBool();
+    }
+    // Which of the failures they are is the controller's judgement, not this
+    // window's: it owns the list of prerequisites there is no working around.
+    const bool blocked = m_controller->prereqsBlock(json);
+
+    m_sandboxIdleText = anyFailed ? "sandbox: prerequisites missing" : "sandbox: -";
+    if (!anyFailed) {
+        m_sandboxLabel->setToolTip(QString());
+    }
+    // Only worth offering when the workbench is what is on screen. While the
+    // page is up, the link would point at the page the user is already on.
+    m_setupLabel->setVisible(anyFailed && !blocked);
+    updateWorkspaceStatus();
+
+    if (blocked) {
+        showSetupPage();
+    }
 }
 
 void MainWindow::buildDocks() {
@@ -250,8 +308,17 @@ void MainWindow::buildStatusBar() {
     m_sandboxLabel = new QLabel(m_sandboxIdleText, this);
     m_branchLabel = new QLabel("branch: -", this);
     m_costLabel = new QLabel(this);
+    // Rich text so the offer is a link rather than an instruction to go and
+    // find a menu item. The href is never followed by Qt itself.
+    m_setupLabel = new QLabel("<a href=\"#setup\">Set up…</a>", this);
+    m_setupLabel->setTextFormat(Qt::RichText);
+    m_setupLabel->setOpenExternalLinks(false);
+    m_setupLabel->setVisible(false);
+    QObject::connect(m_setupLabel, &QLabel::linkActivated, this,
+                     [this](const QString&) { showSetupPage(); });
     statusBar()->addWidget(m_daemonLabel);
     statusBar()->addWidget(m_sandboxLabel);
+    statusBar()->addWidget(m_setupLabel);
     statusBar()->addWidget(m_branchLabel);
     statusBar()->addPermanentWidget(m_costLabel);
     updateCostLabel();
@@ -268,6 +335,10 @@ void MainWindow::connectController() {
         m_sandboxLabel->setToolTip(msg);
         updateWorkspaceStatus();
     });
+    // Emitted just before the warning above, and after every re-check, so this
+    // is what decides which of the two views the window is in.
+    QObject::connect(m_controller, &AppController::prereqsChecked, this,
+                     &MainWindow::onPrereqsChecked);
 
     QObject::connect(m_controller, &AppController::workspacesListed, this,
                      [this](const QString& json) { m_groupModel->reconcile(json); });
