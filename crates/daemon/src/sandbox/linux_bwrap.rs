@@ -269,6 +269,12 @@ impl SandboxHandle for BwrapHandle {
             .await
     }
 
+    fn died(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        // The exec socket closes when init exits, whatever killed it: an OOM, a
+        // crash, bwrap being killed, or the whole sandbox being torn down.
+        Some(self.client.died())
+    }
+
     async fn shutdown(&self) -> Result<(), RpcError> {
         let _ = self.client.shutdown();
         let mut b = self.bwrap.lock().await;

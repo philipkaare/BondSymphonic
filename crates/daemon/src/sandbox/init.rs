@@ -32,6 +32,10 @@ type Conns = Arc<Mutex<Vec<(u64, UnixStream)>>>;
 /// How long a child gets between SIGTERM and SIGKILL during shutdown.
 const GRACE: Duration = Duration::from_secs(5);
 
+/// The connection id given to the first accepted connection, which is the
+/// daemon's: nothing inside the sandbox is running yet when it is accepted.
+const FIRST_CONN: u64 = 1;
+
 pub fn run(socket: &std::path::Path) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(socket);
     let listener = UnixListener::bind(socket)?;
@@ -55,7 +59,7 @@ pub fn run(socket: &std::path::Path) -> anyhow::Result<()> {
         });
     }
 
-    for (id, stream) in (1_u64..).zip(listener.incoming()) {
+    for (id, stream) in (FIRST_CONN..).zip(listener.incoming()) {
         let stream = match stream {
             Ok(s) => s,
             Err(_) => break,
@@ -135,6 +139,14 @@ fn serve(conn_id: u64, stream: UnixStream, children: Children, conns: Conns) {
                 }
             }
             InitRequest::Kill { pid, signal } => {
+                // Only a process this init started may be signalled. The exec
+                // socket is reachable from inside the sandbox, and an unchecked
+                // pid is a weapon there: `pid: 0` signals init's whole process
+                // group and `pid: 1` becomes `kill(-1, ...)`, which reaches
+                // every process in the namespace.
+                if !children.lock().unwrap().contains(&(pid as i32)) {
+                    continue;
+                }
                 // The process group first, so a shell takes everything it
                 // started down with it, then the leader itself in case it left
                 // its group.
@@ -143,6 +155,13 @@ fn serve(conn_id: u64, stream: UnixStream, children: Children, conns: Conns) {
                 let _ = kill(Pid::from_raw(pid as i32), sig);
             }
             InitRequest::Shutdown => {
+                // Connection 1 is the daemon's: it is accepted before the
+                // sandbox holds any process that could open a second one. Any
+                // other connection asking to shut down is a sandboxed process
+                // trying to tear its own workspace down.
+                if conn_id != FIRST_CONN {
+                    continue;
+                }
                 shutdown_all(&children);
                 let _ = (&stream).write_all(&encode(&InitReply::ShuttingDown));
                 std::process::exit(0);
@@ -193,6 +212,12 @@ fn spawn(
     }
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
+    // The daemon's own environment reaches init through bwrap, and it is the
+    // shell the user launched the daemon from: `ANTHROPIC_API_KEY`, `GH_TOKEN`,
+    // `SSH_AUTH_SOCK` and anything else that happened to be exported. A
+    // sandboxed process gets only what the backend passes in — `base_env`
+    // supplies PATH, HOME, USER, TERM and LANG — and nothing it was not given.
+    cmd.env_clear();
     for (k, v) in env {
         cmd.env(k, v);
     }

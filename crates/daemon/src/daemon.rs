@@ -77,7 +77,7 @@ impl Daemon {
     }
 
     /// On startup: validate every registered workspace and restart its sandbox.
-    pub async fn restore(&self) {
+    pub async fn restore(self: &Arc<Self>) {
         for ws in self.registry.list() {
             if !ws.worktree_path.exists() {
                 let _ = self.set_state(

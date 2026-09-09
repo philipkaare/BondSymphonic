@@ -308,3 +308,208 @@ async fn a_failed_create_emits_error_then_destroying() {
     assert!(daemon.registry.list().is_empty());
     cancel.cancel();
 }
+
+// ---------------------------------------------------------------------------
+// C1 regression: the worktree is bind-mounted read-write into the sandbox, so
+// every file git uses to discover a repository from the working directory is
+// agent-controlled. A daemon-side `git status` that lets git discover the
+// repository will read the agent's config and execute `core.fsmonitor` on the
+// host, outside the sandbox, as the daemon's user.
+// ---------------------------------------------------------------------------
+
+/// Runs a git command, asserting it succeeded.
+fn git_at(cwd: &std::path::Path, args: &[&str]) {
+    let st = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .status()
+        .unwrap();
+    assert!(st.success(), "git {args:?}");
+}
+
+/// Sets `core.fsmonitor` in `config_file` to a command that creates `marker`.
+///
+/// git runs the fsmonitor hook through a shell, so one string works on both
+/// platforms as long as the path has no backslashes in it.
+fn plant_fsmonitor(config_file: &std::path::Path, marker: &std::path::Path) {
+    let cmd = format!(
+        "printf pwned > '{}'",
+        marker.display().to_string().replace('\\', "/")
+    );
+    let st = std::process::Command::new("git")
+        .args([
+            "config",
+            "--file",
+            &config_file.to_string_lossy(),
+            "core.fsmonitor",
+            &cmd,
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success(), "planting core.fsmonitor");
+}
+
+/// Runs `git status` in the worktree the way the daemon used to — letting git
+/// discover the repository from the working directory — and reports whether the
+/// planted hook ran. Leaves no marker behind.
+fn attack_fires(worktree: &std::path::Path, marker: &std::path::Path) -> bool {
+    let _ = std::fs::remove_file(marker);
+    let _ = std::process::Command::new("git")
+        .args(["status", "--porcelain=v2", "--untracked-files=all"])
+        .current_dir(worktree)
+        .output();
+    let fired = marker.exists();
+    let _ = std::fs::remove_file(marker);
+    fired
+}
+
+/// `status` must still answer, or fail cleanly as a `GitError`; what it must
+/// never do is run the agent's command.
+fn assert_status_is_sane(r: Result<WorkspaceStatusResult, RpcError>) {
+    if let Err(e) = r {
+        assert_eq!(e.code, ErrorCode::GitError, "unexpected error: {e:?}");
+    }
+}
+
+/// Variant A: the agent replaces `<worktree>/.git` with a pointer to a gitdir
+/// of its own.
+#[tokio::test]
+async fn status_ignores_a_gitdir_redirect_planted_in_the_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "a").await;
+    let wt = std::path::PathBuf::from(&ws.worktree_path);
+
+    let evil_work = wt.join("evilrepo");
+    std::fs::create_dir_all(&evil_work).unwrap();
+    git_at(&evil_work, &["init", "-q"]);
+    let evil_gitdir = evil_work.join(".git");
+    let marker = dir.path().join("pwned-gitdir.txt");
+    plant_fsmonitor(&evil_gitdir.join("config"), &marker);
+    std::fs::write(
+        wt.join(".git"),
+        format!("gitdir: {}\n", evil_gitdir.display()),
+    )
+    .unwrap();
+
+    assert!(
+        attack_fires(&wt, &marker),
+        "the planted hook must run for a git that discovers the repo, or this test proves nothing"
+    );
+    assert_status_is_sane(lifecycle::status(&daemon, &ws.id).await);
+    assert!(
+        !marker.exists(),
+        "workspace.status executed agent-controlled git config"
+    );
+    cancel.cancel();
+}
+
+/// Variant B: the agent repoints `<git_common>/worktrees/<id>/commondir`, which
+/// is where git then reads `config` from.
+#[tokio::test]
+async fn status_ignores_a_commondir_redirect_in_the_worktree_gitdir() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "a").await;
+    let wt = std::path::PathBuf::from(&ws.worktree_path);
+    let layout = lifecycle::layout_for(&daemon, &daemon.registry.get(&ws.id).unwrap())
+        .await
+        .unwrap();
+
+    let evil_work = wt.join("evilcommon");
+    std::fs::create_dir_all(&evil_work).unwrap();
+    git_at(&evil_work, &["init", "-q"]);
+    let evil_common = evil_work.join(".git");
+    let marker = dir.path().join("pwned-commondir.txt");
+    plant_fsmonitor(&evil_common.join("config"), &marker);
+    std::fs::write(
+        layout.worktree_gitdir().join("commondir"),
+        format!("{}\n", evil_common.display()),
+    )
+    .unwrap();
+
+    assert!(
+        attack_fires(&wt, &marker),
+        "the planted hook must run for a git that discovers the repo, or this test proves nothing"
+    );
+    assert_status_is_sane(lifecycle::status(&daemon, &ws.id).await);
+    assert!(
+        !marker.exists(),
+        "workspace.status executed agent-controlled git config"
+    );
+    cancel.cancel();
+}
+
+/// Variant C: no redirect at all. On a repository that has
+/// `extensions.worktreeConfig` enabled, git reads `config.worktree` straight
+/// out of the per-worktree gitdir, which the agent can write. Pinning the
+/// repository does not close this one, and `-c extensions.worktreeConfig=false`
+/// does not either — git takes that extension from the repository format before
+/// command-line config exists.
+#[tokio::test]
+async fn status_ignores_a_config_worktree_planted_in_the_worktree_gitdir() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    git_at(&repo, &["config", "extensions.worktreeConfig", "true"]);
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "a").await;
+    let wt = std::path::PathBuf::from(&ws.worktree_path);
+    let layout = lifecycle::layout_for(&daemon, &daemon.registry.get(&ws.id).unwrap())
+        .await
+        .unwrap();
+
+    let marker = dir.path().join("pwned-worktree-config.txt");
+    plant_fsmonitor(&layout.worktree_gitdir().join("config.worktree"), &marker);
+
+    assert!(
+        attack_fires(&wt, &marker),
+        "the planted hook must run for a git that reads config.worktree, or this test proves nothing"
+    );
+    assert_status_is_sane(lifecycle::status(&daemon, &ws.id).await);
+    assert!(
+        !marker.exists(),
+        "workspace.status executed agent-controlled git config"
+    );
+    cancel.cancel();
+}
+
+/// I5: deleting or moving the source repository must not strand a workspace in
+/// the registry forever. `layout_for` asks the repository where its git
+/// directory is, so it fails first, before `destroy` has done anything — and it
+/// used to fail even with `force`, leaving an entry only a hand edit of
+/// `workspaces.json` could remove.
+#[tokio::test]
+async fn destroy_with_force_succeeds_after_the_repository_has_moved() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "a").await;
+    // The sandbox holds no handle on the repo directory, but the noop backend's
+    // children might, so the workspace is torn down to nothing first.
+    cancel.cancel();
+
+    std::fs::rename(&repo, dir.path().join("moved-repo")).unwrap();
+
+    let err = lifecycle::destroy(&daemon, &ws.id, false)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::GitError, "got {err:?}");
+    assert!(
+        daemon.registry.get(&ws.id).is_some(),
+        "a refused destroy keeps the entry"
+    );
+
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+    assert!(daemon.registry.get(&ws.id).is_none());
+    assert!(daemon.registry.list().is_empty());
+    assert!(
+        !std::path::Path::new(&ws.worktree_path).exists(),
+        "the worktree directory is removed even without git"
+    );
+}

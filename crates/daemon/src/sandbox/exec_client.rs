@@ -38,6 +38,9 @@ pub struct ExecClient {
     pending: Mutex<HashMap<u64, oneshot::Sender<SpawnReply>>>,
     exits: Mutex<ExitTable>,
     next_id: AtomicU64,
+    /// Flipped to `true` when the exec socket reaches EOF, which is the daemon's
+    /// only notice that init — and so the sandbox — is gone.
+    died: tokio::sync::watch::Sender<bool>,
 }
 
 impl ExecClient {
@@ -49,6 +52,7 @@ impl ExecClient {
             pending: Default::default(),
             exits: Default::default(),
             next_id: AtomicU64::new(1),
+            died: tokio::sync::watch::channel(false).0,
         });
         let c = client.clone();
         std::thread::spawn(move || c.read_loop(reader));
@@ -112,6 +116,15 @@ impl ExecClient {
         for (_, tx) in exits.waiters {
             let _ = tx.send(-1);
         }
+        // Last, so anything watching for the sandbox's death sees it only once
+        // the outstanding work has already been failed.
+        let _ = self.died.send(true);
+    }
+
+    /// Watches for the sandbox going away. The value is `false` while it is
+    /// alive and `true` once the exec socket has closed.
+    pub fn died(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.died.subscribe()
     }
 
     fn dispatch(&self, reply: InitReply, fds: &mut Vec<OwnedFd>) {

@@ -22,6 +22,9 @@ const MARKER: &str = "2477";
 /// Marker for the grandchild in the process-group kill test.
 const GROUP_MARKER: &str = "2478";
 
+/// Marker for the process a sandboxed attacker must not be able to kill.
+const HOSTILE_MARKER: &str = "2479";
+
 fn bwrap_available() -> bool {
     std::process::Command::new("bwrap")
         .args([
@@ -425,5 +428,197 @@ async fn killing_a_child_takes_its_process_group_with_it() {
         !pgrep(&grandchild),
         "the backgrounded grandchild outlived the kill"
     );
+    handle.shutdown().await.unwrap();
+}
+
+/// I1: the daemon's environment is the shell the user started it from, and it
+/// reaches init through bwrap. Nothing in it may reach a sandboxed process.
+#[tokio::test]
+async fn a_sandboxed_process_gets_only_the_environment_the_backend_gives_it() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    // Stands in for ANTHROPIC_API_KEY, GH_TOKEN, SSH_AUTH_SOCK and the rest.
+    std::env::set_var("BS_TEST_CANARY", "leaked-secret-2477");
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let spec = SandboxSpec {
+        id: "ws_env".into(),
+        rw_binds: vec![(work.clone(), work.clone())],
+        ro_binds: vec![],
+        home: dir.path().join("home"),
+        run_dir: dir.path().join("run"),
+        env: vec![("BS_WORKSPACE".into(), "ws_env".into())],
+        cwd: work.clone(),
+    };
+    let handle = backend_for("linux_bwrap").start(&spec).await.unwrap();
+    let (code, out) = run_argv(&handle, vec!["env".into()]).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        !out.contains("BS_TEST_CANARY") && !out.contains("leaked-secret-2477"),
+        "the daemon's environment reached the sandbox: {out}"
+    );
+    // What the backend does pass has to survive the clearing.
+    for expected in ["PATH=", "HOME=", "USER=", "BS_WORKSPACE=ws_env"] {
+        assert!(
+            out.lines().any(|l| l.starts_with(expected)),
+            "{expected} missing from the sandbox environment: {out}"
+        );
+    }
+    handle.shutdown().await.unwrap();
+}
+
+/// Pids whose command line matches `pattern`.
+fn pgrep_pids(pattern: &str) -> Vec<i32> {
+    std::process::Command::new("pgrep")
+        .arg("-f")
+        .arg(pattern)
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// I2: a sandbox that dies has to be reported. Killing bwrap takes its pid
+/// namespace, and with it init, so the exec socket closes exactly as it would
+/// on an OOM or a crash.
+#[tokio::test]
+async fn a_workspace_whose_sandbox_dies_is_reported_as_sandbox_down() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let daemon = Daemon::new(
+        DataDirs::new(dir.path().join("data")),
+        backend_for("linux_bwrap"),
+        server.event_bus(),
+    )
+    .unwrap();
+    let ws = lifecycle::create(
+        &daemon,
+        WorkspaceCreateParams {
+            repo_path: repo.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: "dies".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+
+    let mut events = server.event_bus().subscribe();
+    // bwrap's command line carries this run directory, so it names exactly this
+    // sandbox even while other tests run their own in parallel.
+    let run_dir = daemon.dirs.run(&ws.id).to_string_lossy().into_owned();
+    let pids = pgrep_pids(&run_dir);
+    assert!(!pids.is_empty(), "no bwrap process for {run_dir}");
+    for pid in pids {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+
+    let saw_event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Ok(msg) = events.recv().await {
+            if let bondsymphonic_proto::ServerMessage::Event {
+                event: bondsymphonic_proto::Event::WorkspaceStateChanged { info },
+                ..
+            } = msg
+            {
+                if info.id == ws.id && info.state == WorkspaceState::SandboxDown {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(saw_event, "no SandboxDown event within 5s");
+    assert_eq!(
+        daemon.registry.get(&ws.id).unwrap().state,
+        WorkspaceState::SandboxDown
+    );
+    assert!(
+        daemon.sandbox(&ws.id).is_err(),
+        "the dead sandbox must be dropped from the registry of live handles"
+    );
+}
+
+/// I3: the exec socket is bound in `/run/bs`, which is mounted read-write into
+/// the sandbox, so anything running inside can talk to init. It must not be
+/// able to shut the sandbox down or signal a pid init did not start.
+#[tokio::test]
+async fn a_sandboxed_process_cannot_shut_init_down_or_kill_arbitrary_pids() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let spec = SandboxSpec {
+        id: "ws_hostile".into(),
+        rw_binds: vec![(work.clone(), work.clone())],
+        ro_binds: vec![],
+        home: dir.path().join("home"),
+        run_dir: dir.path().join("run"),
+        env: vec![],
+        cwd: work.clone(),
+    };
+    let handle = backend_for("linux_bwrap").start(&spec).await.unwrap();
+
+    // A process the daemon started, which the hostile requests must not reach.
+    let victim = handle
+        .spawn(SandboxCommand {
+            argv: vec!["/bin/sleep".into(), HOSTILE_MARKER.into()],
+            env: vec![],
+            cwd: None,
+            pty: None,
+        })
+        .await
+        .unwrap();
+    let sleeper = format!("/bin/sleep {HOSTILE_MARKER}");
+    wait_until(std::time::Duration::from_secs(5), || pgrep(&sleeper)).await;
+    assert!(pgrep(&sleeper), "the victim never started");
+
+    // `pid: 1` becomes kill(-1, ...) — every process in the namespace — and
+    // `pid: 0` signals init's own process group.
+    let attack = r#"
+import json, socket, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/run/bs/exec.sock")
+for m in ({"op": "shutdown"},
+          {"op": "kill", "pid": 1, "signal": 15},
+          {"op": "kill", "pid": 0, "signal": 9},
+          {"op": "kill", "pid": 1, "signal": 9}):
+    s.sendall((json.dumps(m) + "\n").encode())
+time.sleep(1)
+print("sent")
+"#;
+    let (code, out) = run_argv(&handle, vec!["python3".into(), "-c".into(), attack.into()]).await;
+    assert_eq!(code, 0, "the attack script must run: {out}");
+    assert!(out.contains("sent"), "{out}");
+
+    // init is still serving, and the daemon's own process was untouched.
+    assert!(
+        pgrep(&sleeper),
+        "a sandboxed process killed the daemon's child"
+    );
+    let (code, out) = run_in(&handle, "echo still-alive").await;
+    assert_eq!(code, 0, "init stopped serving: {out}");
+    assert_eq!(out.trim(), "still-alive");
+
+    (victim.killer)();
+    wait_until(std::time::Duration::from_secs(8), || !pgrep(&sleeper)).await;
     handle.shutdown().await.unwrap();
 }

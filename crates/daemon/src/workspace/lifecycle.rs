@@ -11,6 +11,7 @@ use crate::sandbox::SandboxSpec;
 use crate::workspace::{now_rfc3339, Workspace};
 use bondsymphonic_proto::*;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The account whose `/home/<user>` the bwrap backend mounts the sandbox home at.
 ///
@@ -54,7 +55,7 @@ pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
     }
 }
 
-pub async fn start_sandbox(d: &Daemon, ws: &Workspace) -> Result<(), RpcError> {
+pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcError> {
     let layout = layout_for(d, ws).await?;
     for p in [
         d.dirs.cache(&ws.id),
@@ -64,8 +65,44 @@ pub async fn start_sandbox(d: &Daemon, ws: &Workspace) -> Result<(), RpcError> {
         std::fs::create_dir_all(p).map_err(|e| RpcError::io(&e))?;
     }
     let handle = d.backend.start(&spec_for(d, ws, &layout)).await?;
-    d.sandboxes.lock().insert(ws.id.clone(), handle);
+    d.sandboxes.lock().insert(ws.id.clone(), handle.clone());
+    watch_sandbox(d, &ws.id, handle);
     Ok(())
+}
+
+/// Reports a sandbox that dies on its own as `SandboxDown`.
+///
+/// Without this the workspace stays `Ready` in the registry after its sandbox
+/// is gone, and the first sign anyone gets is a `pty.open` failing with a raw
+/// broken pipe — which the plan's constraint that every workspace failure
+/// arrives as a `workspace.state` event or an `RpcError` does not allow.
+fn watch_sandbox(
+    d: &Arc<Daemon>,
+    id: &WorkspaceId,
+    handle: Arc<dyn crate::sandbox::SandboxHandle>,
+) {
+    let Some(mut died) = handle.died() else {
+        return;
+    };
+    let d = d.clone();
+    let id = id.clone();
+    tokio::spawn(async move {
+        // An error means the sender is gone, which is death by another name.
+        let _ = died.wait_for(|dead| *dead).await;
+        // A handle that is no longer the registered one belongs to a `destroy`
+        // or a restart that has already taken over this workspace's state.
+        let still_ours = d
+            .sandboxes
+            .lock()
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(current, &handle));
+        if !still_ours {
+            return;
+        }
+        d.sandboxes.lock().remove(&id);
+        tracing::warn!(ws = %id, "sandbox died");
+        let _ = d.set_state(&id, WorkspaceState::SandboxDown);
+    });
 }
 
 /// Gives the sandbox home a git identity, so commits made inside it are not
@@ -94,7 +131,7 @@ async fn seed_home(d: &Daemon, ws: &Workspace) {
     }
 }
 
-pub async fn create(d: &Daemon, p: WorkspaceCreateParams) -> Result<WorkspaceInfo, RpcError> {
+pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<WorkspaceInfo, RpcError> {
     let repo_path = PathBuf::from(&p.repo_path);
     if p.name.is_empty()
         || p.name.contains('/')
@@ -173,8 +210,26 @@ pub async fn create(d: &Daemon, p: WorkspaceCreateParams) -> Result<WorkspaceInf
 
 pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty, RpcError> {
     let ws = d.workspace(id)?;
-    let layout = layout_for(d, &ws).await?;
+    // `layout_for` asks the source repository where its git directory is, so a
+    // repository the user has since deleted or moved fails here. Without the
+    // `force` escape that failure is permanent: the registry entry can never be
+    // destroyed, `restore` brings it back every start, and the only way out is
+    // editing `workspaces.json` by hand.
+    let layout = match layout_for(d, &ws).await {
+        Ok(l) => Some(l),
+        Err(_) if force => {
+            tracing::warn!(
+                ws = %id,
+                repo = %ws.repo_path.display(),
+                "repository is gone; destroying without the git steps"
+            );
+            None
+        }
+        Err(e) => return Err(e),
+    };
     if !force {
+        // Always present here: `layout` is only `None` when `force` is set.
+        let layout = layout.as_ref().expect("a layout unless forced");
         // A missing worktree directory rules out the dirty check but not the unmerged
         // one. `restore` records that state as `Error("worktree directory is missing")`,
         // and the branch still points at commits whose objects live only in this
@@ -182,7 +237,7 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
         // would discard for good.
         let dirty = if ws.worktree_path.exists() {
             !layout
-                .daemon_git()
+                .worktree_git()
                 .run(&ws.worktree_path, &["status", "--porcelain"])
                 .await?
                 .stdout
@@ -221,14 +276,17 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
     if let Some(h) = handle {
         let _ = h.shutdown().await;
     }
-    if let Err(e) = worktree::remove(&d.git, &layout).await {
-        // The ptys are closed and the sandbox is down, so the workspace must not be left
-        // stranded in `Destroying`: a client would wait on a state that never arrives.
-        let _ = d.set_state(
-            id,
-            WorkspaceState::Error(format!("destroy failed: {}", e.message)),
-        );
-        return Err(e);
+    if let Some(layout) = layout.as_ref() {
+        if let Err(e) = worktree::remove(&d.git, layout).await {
+            // The ptys are closed and the sandbox is down, so the workspace must not be
+            // left stranded in `Destroying`: a client would wait on a state that never
+            // arrives.
+            let _ = d.set_state(
+                id,
+                WorkspaceState::Error(format!("destroy failed: {}", e.message)),
+            );
+            return Err(e);
+        }
     }
     d.dirs.remove_workspace(id);
     d.registry
@@ -240,8 +298,10 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
 pub async fn status(d: &Daemon, id: &WorkspaceId) -> Result<WorkspaceStatusResult, RpcError> {
     let ws = d.workspace(id)?;
     let layout = layout_for(d, &ws).await?;
+    // `worktree_git`, not `daemon_git`: the worktree is agent-writable, so git
+    // must not be allowed to discover its repository (and its config) from it.
     let out = layout
-        .daemon_git()
+        .worktree_git()
         .run(
             &ws.worktree_path,
             &["status", "--porcelain=v2", "--untracked-files=all"],

@@ -12,6 +12,10 @@ pub const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Default)]
 pub struct Git {
     env: Vec<(String, String)>,
+    /// `key=value` pairs passed as `-c key=value` before the subcommand on
+    /// every invocation. Command-line config outranks every config *file*,
+    /// which is what makes it usable against a config an agent can write.
+    config: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,10 +34,24 @@ impl Git {
         self
     }
 
+    /// Adds a `-c key=value` override applied to every command this `Git` runs.
+    pub fn with_config(mut self, key: &str, value: &str) -> Self {
+        self.config.push(format!("{key}={value}"));
+        self
+    }
+
     pub async fn run(&self, cwd: &Path, args: &[&str]) -> Result<GitOutput, RpcError> {
+        // The reported command names the subcommand only: the `-c` prefix is a
+        // fixed policy of this `Git`, not part of what the caller asked for.
         let command = format!("git {}", args.join(" "));
+        let mut argv: Vec<&str> = Vec::with_capacity(self.config.len() * 2 + args.len());
+        for c in &self.config {
+            argv.push("-c");
+            argv.push(c);
+        }
+        argv.extend_from_slice(args);
         let mut cmd = Command::new("git");
-        cmd.args(args)
+        cmd.args(&argv)
             .current_dir(cwd)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("LC_ALL", "C")

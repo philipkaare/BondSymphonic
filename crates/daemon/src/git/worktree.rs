@@ -45,10 +45,67 @@ impl Layout {
         ]
     }
     /// Git for the daemon side: main store primary, private objects as alternate.
+    ///
+    /// Only safe for commands that run in the *main* repository, which is never
+    /// bind-mounted into a sandbox. Anything that touches the worktree must use
+    /// [`Layout::worktree_git`].
     pub fn daemon_git(&self) -> Git {
         Git::new().with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", s(&self.objects_dir))
     }
+
+    /// Git for daemon-side commands that run *against a workspace worktree*.
+    ///
+    /// Every file git would use to discover its repository from the working
+    /// directory — `<worktree>/.git` and `<git_common>/worktrees/<id>/commondir`
+    /// — is bind-mounted read-write into the sandbox, so an agent can point
+    /// discovery at a gitdir of its own and have the daemon read that gitdir's
+    /// `config`. Pinning all four paths explicitly takes discovery out of the
+    /// agent's hands: the environment outranks anything in the worktree.
+    pub fn worktree_git(&self) -> Git {
+        let mut git = Git::new()
+            .with_env("GIT_DIR", s(&self.worktree_gitdir()))
+            .with_env("GIT_COMMON_DIR", s(&self.git_common))
+            .with_env("GIT_WORK_TREE", s(&self.worktree_path))
+            .with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", s(&self.objects_dir))
+            .with_config("extensions.worktreeConfig", "false");
+        for key in NEUTRALISED_CONFIG {
+            git = git.with_config(key, "");
+        }
+        git
+    }
 }
+
+/// Config keys whose value git executes as a command, cleared on the command
+/// line for every daemon-side worktree command.
+///
+/// Pinning the repository is not by itself enough. The per-worktree gitdir is
+/// writable by the agent, and git reads `config.worktree` from it whenever the
+/// repository has `extensions.worktreeConfig` enabled. `-c
+/// extensions.worktreeConfig=false` does **not** turn that off — git reads the
+/// extension out of the repository format during setup, before command-line
+/// config exists — so the keys themselves are emptied instead, which does win
+/// because `-c` outranks every config file. Measured against git 2.43 and 2.52:
+/// `core.fsmonitor` is the one `git status` reaches, and the rest are here so a
+/// future daemon-side worktree command does not quietly reopen the hole.
+///
+/// Any new key git learns to execute has to be added here; that is the cost of
+/// leaving the per-worktree gitdir writable, which the agent needs for `HEAD`,
+/// the index and its lock files.
+const NEUTRALISED_CONFIG: &[&str] = &[
+    "core.fsmonitor",
+    "core.hooksPath",
+    "core.sshCommand",
+    "core.gitProxy",
+    "core.askPass",
+    "core.editor",
+    "core.pager",
+    "core.alternateRefsCommand",
+    "sequence.editor",
+    "diff.external",
+    "credential.helper",
+    "gpg.program",
+    "uploadpack.packObjectsHook",
+];
 
 fn s(p: &Path) -> String {
     p.to_string_lossy().into_owned()

@@ -84,6 +84,17 @@ pub trait SandboxBackend: Send + Sync {
 pub trait SandboxHandle: Send + Sync {
     async fn spawn(&self, cmd: SandboxCommand) -> Result<SandboxChild, RpcError>;
     async fn shutdown(&self) -> Result<(), RpcError>;
+
+    /// A watch that flips to `true` when this sandbox stops being usable, so a
+    /// workspace whose sandbox dies underneath it can be reported rather than
+    /// left claiming to be `Ready` until the next `pty.open` fails.
+    ///
+    /// `None` from a backend whose sandbox has no independent life of its own:
+    /// `noop` runs processes as plain children of the daemon, so there is
+    /// nothing that can die separately.
+    fn died(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        None
+    }
 }
 
 /// Picks a backend by name. Unknown or unsupported names fall back to `noop`
