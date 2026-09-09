@@ -36,9 +36,41 @@ pub struct DiffRow {
     pub kind: RowKind,
 }
 
-/// Drops the line terminator, `\n` or `\r\n`, that the line splitter kept.
+/// Splits `text` into lines the way [`EditorBuffer`] and `QTextDocument` do:
+/// only `\n` and `\r\n` end a line, each slice keeps its terminator, and a
+/// final unterminated remainder is a line of its own. An empty text has no
+/// lines at all.
+///
+/// `similar`'s own line splitter also ends a line at a bare `\r`. Using it
+/// would give a file containing a lone carriage return more rows than the
+/// buffer has lines, and from there on every row's `left_no`/`right_no` would
+/// name the wrong buffer line when the view asked that line for its spans.
+///
+/// [`EditorBuffer`]: crate::model::editor_buffer::EditorBuffer
+fn split_lines(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (at, _) in text.match_indices('\n') {
+        lines.push(&text[start..=at]);
+        start = at + 1;
+    }
+    if start < text.len() {
+        lines.push(&text[start..]);
+    }
+    lines
+}
+
+/// Drops the line terminator, `\n` or `\r\n`, that [`split_lines`] kept.
+///
+/// Exactly one terminator, and the `\r` only where it precedes the `\n`: this
+/// has to agree character for character with what the buffer calls the visible
+/// part of a line, or a row's text and the line its number points at would
+/// differ.
 fn strip(line: &str) -> String {
-    line.trim_end_matches(['\n', '\r']).to_string()
+    match line.strip_suffix('\n') {
+        Some(rest) => rest.strip_suffix('\r').unwrap_or(rest).to_owned(),
+        None => line.to_owned(),
+    }
 }
 
 /// Aligns `base` against `work` into rows of the side-by-side view.
@@ -50,8 +82,9 @@ fn strip(line: &str) -> String {
 /// [`align_with_deadline`] instead: Myers' algorithm is O(n·d), and two
 /// megabyte-sized texts that share almost nothing can run for tens of seconds.
 pub fn align(base: &str, work: &str) -> Vec<DiffRow> {
-    let diff = TextDiff::from_lines(base, work);
-    rows_from(diff.old_slices(), diff.new_slices(), diff.ops())
+    let (old, new) = (split_lines(base), split_lines(work));
+    let diff = TextDiff::from_slices(&old, &new);
+    rows_from(&old, &new, diff.ops())
 }
 
 /// [`align`], but giving up on an exact diff after `budget` and approximating
@@ -62,17 +95,15 @@ pub fn align(base: &str, work: &str) -> Vec<DiffRow> {
 /// minimality is at stake. A budget that is not spent produces exactly what
 /// [`align`] produces.
 pub fn align_with_deadline(base: &str, work: &str, budget: Duration) -> (Vec<DiffRow>, bool) {
+    let (old, new) = (split_lines(base), split_lines(work));
     let started = Instant::now();
     let diff = TextDiff::configure()
         .deadline(started + budget)
-        .diff_lines(base, work);
+        .diff_slices(&old, &new);
     // Measured before the rows are built: turning ops into rows is linear and
     // has nothing to do with whether the algorithm approximated.
     let truncated = started.elapsed() >= budget;
-    (
-        rows_from(diff.old_slices(), diff.new_slices(), diff.ops()),
-        truncated,
-    )
+    (rows_from(&old, &new, diff.ops()), truncated)
 }
 
 /// Turns one diff's ops into side-by-side rows. Shared by both entry points so

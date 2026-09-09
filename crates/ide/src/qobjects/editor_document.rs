@@ -185,18 +185,42 @@ pub fn read_only_reason(res: &ReadFileResult) -> &'static str {
     }
 }
 
-/// Rewrites U+2029 (paragraph separator) and U+2028 (line separator) to `\n`,
+/// Rewrites every line break Qt recognises but the buffer does not into `\n`,
 /// reporting whether anything was rewritten.
 ///
-/// `QTextDocument` starts a block at both characters and [`EditorBuffer`] does
-/// not, so a file carrying either would have the view and the buffer disagree
-/// about which line is which. The common case allocates one copy of the text
-/// and scans it once.
+/// Three of them: U+2029 (paragraph separator), U+2028 (line separator), and a
+/// lone `\r`. `QTextCursor::insertText` starts a new block at each, while
+/// [`EditorBuffer`] and the diff splitter break only on `\n` and `\r\n`. A file
+/// carrying any of the three would leave the view and the buffer disagreeing
+/// about which line is which, so the disagreement is removed on load instead.
+/// A `\r\n` is a break both sides already agree on and is left alone.
+///
+/// The rewrite is real: saving such a file writes newlines back.
 pub fn normalise_line_separators(text: &str) -> (String, bool) {
-    if !text.contains(['\u{2029}', '\u{2028}']) {
+    if !text.contains(['\u{2029}', '\u{2028}', '\r']) {
         return (text.to_owned(), false);
     }
-    (text.replace(['\u{2029}', '\u{2028}'], "\n"), true)
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{2029}' | '\u{2028}' => {
+                out.push('\n');
+                changed = true;
+            }
+            '\r' if chars.peek() == Some(&'\n') => {
+                chars.next();
+                out.push_str("\r\n");
+            }
+            '\r' => {
+                out.push('\n');
+                changed = true;
+            }
+            _ => out.push(c),
+        }
+    }
+    (out, changed)
 }
 
 /// Builds the buffer for one loaded file: separators normalised, highlighting

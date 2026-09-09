@@ -1,6 +1,7 @@
 use bondsymphonic_ide::model::diff::{
     align, align_with_deadline, counts, rows_json, DiffRow, RowKind,
 };
+use bondsymphonic_ide::model::editor_buffer::EditorBuffer;
 use std::time::Duration;
 
 fn kinds(rows: &[DiffRow]) -> Vec<RowKind> {
@@ -147,4 +148,47 @@ fn a_budget_that_is_not_spent_yields_the_same_rows_as_align() {
     let (rows, truncated) = align_with_deadline(base, work, Duration::from_secs(2));
     assert!(!truncated);
     assert_eq!(rows, align(base, work));
+}
+
+/// A bare carriage return is an ordinary character, not a line break.
+///
+/// `similar`'s own line splitter ends a line at it; `EditorBuffer` and
+/// `QTextDocument` do not. If the two disagreed, a file containing a lone CR
+/// would produce more rows than the buffer has lines, and from that point on
+/// every row's `left_no`/`right_no` would fetch the wrong line's spans.
+#[test]
+fn a_lone_carriage_return_does_not_start_a_row() {
+    let text = "a\rb\n";
+    let rows = align(text, text);
+    assert_eq!(kinds(&rows), vec![RowKind::Equal]);
+    assert_eq!(rows[0].left_text, "a\rb");
+    assert_eq!(rows[0].right_text, "a\rb");
+    assert_eq!(rows[0].left_no, Some(1));
+    assert_eq!(rows[0].right_no, Some(1));
+
+    // The buffer counts a trailing newline as opening one more, empty line;
+    // the rows describe every line before it. Both therefore say "one line".
+    let buffer = EditorBuffer::new("x.txt", text);
+    assert_eq!(rows.len(), buffer.line_count() - 1);
+    assert_eq!(buffer.line(0), "a\rb");
+
+    // The same through the deadline form, which the diff view actually calls.
+    let (rows, truncated) = align_with_deadline(text, text, Duration::from_secs(2));
+    assert!(!truncated);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].left_text, "a\rb");
+}
+
+/// A carriage return that is not part of a `\r\n` and not at the end of the
+/// line survives into the row text, while the terminator itself is stripped.
+#[test]
+fn only_the_terminating_crlf_is_stripped_from_a_row() {
+    let rows = align("a\r\r\n", "b\r\r\n");
+    assert_eq!(kinds(&rows), vec![RowKind::Replace]);
+    assert_eq!(rows[0].left_text, "a\r");
+    assert_eq!(rows[0].right_text, "b\r");
+    assert_eq!(
+        rows[0].left_text,
+        EditorBuffer::new("x.txt", "a\r\r\n").line(0)
+    );
 }

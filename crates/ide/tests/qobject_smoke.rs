@@ -268,17 +268,33 @@ fn fs_changed_events_are_matched_by_workspace() {
     ));
 }
 
-/// A file whose text is only ever `\n`-separated survives normalisation
-/// untouched; the Unicode separators `QTextDocument` would turn into block
-/// breaks are rewritten so the buffer and the view agree on line numbers.
+/// Every break Qt starts a block at but the buffer does not is rewritten on
+/// load, so the view and the buffer agree on which line is which. The breaks
+/// both sides already agree on survive untouched.
 #[test]
-fn unicode_paragraph_separators_are_normalised_to_newlines() {
+fn qt_only_line_breaks_are_normalised_to_newlines() {
+    // A bare carriage return: a block break to Qt, an ordinary character to
+    // the buffer.
+    let (text, normalised) = normalise_line_separators("a\rb");
+    assert_eq!(text, "a\nb");
+    assert!(normalised);
+
+    // A carriage return that belongs to a `\r\n` is left where it is.
+    let (text, normalised) = normalise_line_separators("a\r\nb");
+    assert_eq!(text, "a\r\nb");
+    assert!(!normalised);
+
+    let (text, normalised) = normalise_line_separators("a\u{2029}b");
+    assert_eq!(text, "a\nb");
+    assert!(normalised);
+
+    // The ordinary file: nothing to do, and nothing claimed.
     let (text, normalised) = normalise_line_separators("a\nb\r\nc");
     assert_eq!(text, "a\nb\r\nc");
     assert!(!normalised);
 
-    let (text, normalised) = normalise_line_separators("a\u{2029}b\u{2028}c");
-    assert_eq!(text, "a\nb\nc");
+    let (text, normalised) = normalise_line_separators("a\u{2029}b\u{2028}c\rd\r\ne");
+    assert_eq!(text, "a\nb\nc\nd\r\ne");
     assert!(normalised);
 }
 
