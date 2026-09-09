@@ -158,3 +158,114 @@ fn file_tree_cache_paths_and_invalidation() {
     let json = FileTree::entries_json(&[e("a", true)]);
     assert!(json.contains("\"is_dir\":true"));
 }
+
+// --- Task 4: terminal grid ---------------------------------------------------
+
+use bondsymphonic_ide::model::terminal_grid::{key_to_bytes, qt, TerminalGrid};
+
+#[test]
+fn grid_renders_text_and_tracks_cursor() {
+    let mut g = TerminalGrid::new(20, 5);
+    g.feed(b"hello\r\nworld");
+    let rows = g.rows();
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0].text.trim_end(), "hello");
+    assert_eq!(rows[1].text.trim_end(), "world");
+    assert_eq!(g.cursor(), (5, 1, true));
+    g.resize(10, 3);
+    assert_eq!(g.size(), (10, 3));
+}
+
+#[test]
+fn grid_spans_carry_colors_and_bold() {
+    let mut g = TerminalGrid::new(20, 3);
+    g.feed(b"\x1b[1;31mred\x1b[0m plain");
+    let row = &g.rows()[0];
+    let red = row.spans.iter().find(|s| s.start == 0).unwrap();
+    assert!(red.bold);
+    assert!(
+        !red.fg.is_empty(),
+        "fg colour must be set for the red span: {red:?}"
+    );
+    let plain = row
+        .spans
+        .iter()
+        .find(|s| s.start >= 3 && s.len > 0 && !s.bold)
+        .unwrap();
+    assert!(plain.fg.is_empty() || plain.fg != red.fg);
+    let json = g.rows_json();
+    assert!(json.contains("\"spans\""));
+}
+
+#[test]
+fn grid_scrollback_and_marker() {
+    let mut g = TerminalGrid::new(10, 3);
+    for i in 0..10 {
+        g.feed(format!("line{i}\r\n").as_bytes());
+    }
+    assert!(g.rows()[0].text.starts_with("line8") || g.rows()[0].text.starts_with("line7"));
+    g.scroll(5);
+    assert!(g.rows()[0].text.starts_with("line"));
+    assert!(!g.cursor().2, "cursor hidden while scrolled into history");
+    g.scroll_to_bottom();
+    assert!(g.cursor().2);
+    g.insert_marker("[output dropped]");
+    // The marker is 16 characters wide and this terminal is 10 columns, so the
+    // parser wraps it over two physical rows; rows() renders physical rows, so
+    // the assertion is made against the joined visible text.
+    let visible: String = g.rows().iter().map(|r| r.text.as_str()).collect();
+    assert!(
+        visible.contains("[output dropped]"),
+        "marker missing from visible text: {visible:?}"
+    );
+}
+
+#[test]
+fn key_mapping() {
+    assert_eq!(key_to_bytes(qt::KEY_RETURN, 0, "\r", false), b"\r");
+    assert_eq!(key_to_bytes(qt::KEY_BACKSPACE, 0, "\x08", false), b"\x7f");
+    assert_eq!(key_to_bytes(qt::KEY_UP, 0, "", false), b"\x1b[A");
+    assert_eq!(key_to_bytes(qt::KEY_UP, 0, "", true), b"\x1bOA");
+    assert_eq!(key_to_bytes(qt::KEY_F1, 0, "", false), b"\x1bOP");
+    assert_eq!(key_to_bytes(qt::KEY_F1 + 4, 0, "", false), b"\x1b[15~");
+    assert_eq!(key_to_bytes('C' as i32, qt::MOD_CTRL, "", false), b"\x03");
+    assert_eq!(key_to_bytes(qt::KEY_TAB, 0, "\t", false), b"\t");
+    assert_eq!(key_to_bytes(qt::KEY_ESCAPE, 0, "", false), b"\x1b");
+    assert_eq!(key_to_bytes('a' as i32, 0, "a", false), b"a");
+    assert_eq!(key_to_bytes('a' as i32, qt::MOD_ALT, "a", false), b"\x1ba");
+    assert_eq!(key_to_bytes(qt::KEY_PAGEUP, 0, "", false), b"\x1b[5~");
+    assert!(key_to_bytes(
+        0x0100_0020, /* Shift key alone */
+        qt::MOD_SHIFT,
+        "",
+        false
+    )
+    .is_empty());
+}
+
+#[test]
+fn grid_tracks_title_and_application_cursor_keys() {
+    let mut g = TerminalGrid::new(20, 3);
+    assert_eq!(g.title(), None);
+    assert!(!g.app_cursor_keys());
+    g.feed(b"\x1b]0;my title\x07\x1b[?1h");
+    assert_eq!(g.title().as_deref(), Some("my title"));
+    assert!(g.app_cursor_keys());
+    assert_eq!(
+        key_to_bytes(qt::KEY_LEFT, 0, "", g.app_cursor_keys()),
+        b"\x1bOD"
+    );
+}
+
+#[test]
+fn grid_renders_indexed_and_named_colours() {
+    let mut g = TerminalGrid::new(10, 2);
+    g.feed(b"\x1b[44;38;5;208mx");
+    let rows = g.rows();
+    let span = &rows[0].spans[0];
+    assert_eq!(span.fg, "#ff8700", "256-colour cube entry 208");
+    assert_eq!(span.bg, "#0000ee", "default xterm blue");
+    // Cells past the written text fall back to the terminal defaults.
+    let plain = rows[0].spans.last().unwrap();
+    assert!(plain.fg.is_empty() && plain.bg.is_empty());
+}

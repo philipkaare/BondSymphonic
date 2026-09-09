@@ -27,6 +27,7 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 directories = "5"
 thiserror.workspace = true
+alacritty_terminal = "0.26"
 
 [build-dependencies]
 cxx-qt-build = "0.10"
