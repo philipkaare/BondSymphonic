@@ -1,13 +1,16 @@
 #include "AgentArea.h"
 #include "TerminalWidget.h"
+#include "TranscriptView.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
+#include "bondsymphonic-ide/src/qobjects/transcript_model.cxxqt.h"
 #include <QLabel>
 
 namespace {
 
-/// The one adapter with a terminal pane. Other adapters get the placeholder
-/// until they grow one.
+/// The two adapters with a pane. Anything else gets the placeholder until it
+/// grows one.
 const QString kTerminalAdapter = QStringLiteral("terminal");
+const QString kClaudeAdapter = QStringLiteral("claude");
 
 } // namespace
 
@@ -26,9 +29,14 @@ void AgentArea::setPlaceholderText(const QString& text) {
     }
 }
 
-void AgentArea::showWorkspace(const QString& workspaceId, const QString& adapter, const QString& command) {
+void AgentArea::showWorkspace(const QString& workspaceId, const QString& adapter, const QString& command,
+                              const QString& agentId) {
     if (workspaceId.isEmpty()) {
         showPlaceholder();
+        return;
+    }
+    if (adapter == kClaudeAdapter) {
+        setCurrentWidget(ensureTranscript(workspaceId, agentId));
         return;
     }
     if (adapter != kTerminalAdapter) {
@@ -49,26 +57,71 @@ void AgentArea::showWorkspace(const QString& workspaceId, const QString& adapter
     setCurrentWidget(terminal);
 }
 
+void AgentArea::setAgent(const QString& workspaceId, const QString& agentId) {
+    TranscriptView* view = m_transcripts.value(workspaceId);
+    if (view == nullptr || agentId.isEmpty()) {
+        // No pane yet: `showWorkspace` carries the id in when the tab is next
+        // shown, and the tab model is where it was recorded meanwhile.
+        return;
+    }
+    if (m_attached.value(workspaceId) == agentId) {
+        return;
+    }
+    m_attached.insert(workspaceId, agentId);
+    if (TranscriptModel* model = view->model()) {
+        model->attach(workspaceId, agentId);
+    }
+}
+
+TranscriptModel* AgentArea::transcriptModel(const QString& workspaceId) const {
+    TranscriptView* view = m_transcripts.value(workspaceId);
+    return view == nullptr ? nullptr : view->model();
+}
+
+TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QString& agentId) {
+    TranscriptView* view = m_transcripts.value(workspaceId);
+    if (view == nullptr) {
+        // Parented to the area for the same reason the terminal's session is:
+        // the view borrows the pointer and both die together.
+        auto* model = new TranscriptModel(this);
+        view = new TranscriptView(model, this);
+        m_transcripts.insert(workspaceId, view);
+        addWidget(view);
+    }
+    setAgent(workspaceId, agentId);
+    return view;
+}
+
 void AgentArea::showPlaceholder() {
     m_placeholder->setText(m_placeholderText);
     setCurrentWidget(m_placeholder);
 }
 
 void AgentArea::removeWorkspace(const QString& workspaceId) {
-    TerminalWidget* terminal = m_terminals.take(workspaceId);
-    if (terminal == nullptr) {
-        return;
+    m_attached.remove(workspaceId);
+    if (TranscriptView* view = m_transcripts.take(workspaceId)) {
+        TranscriptModel* model = view->model();
+        removeWidget(view);
+        // The view goes first, so it can never paint from a model that is gone;
+        // deferred deletion runs in the order it was asked for.
+        view->deleteLater();
+        if (model != nullptr) {
+            // Detaching, not stopping: the agent belongs to the workspace, and
+            // `workspace.destroy` is what reaps it.
+            model->attach(QString(), QString());
+            model->deleteLater();
+        }
     }
-    TerminalSession* session = terminal->session();
-    removeWidget(terminal);
-    // The widget goes first, so it can never paint from a session that is gone;
-    // deferred deletion runs in the order it was asked for.
-    terminal->deleteLater();
-    if (session != nullptr) {
-        session->close();
-        session->deleteLater();
+    if (TerminalWidget* terminal = m_terminals.take(workspaceId)) {
+        TerminalSession* session = terminal->session();
+        removeWidget(terminal);
+        terminal->deleteLater();
+        if (session != nullptr) {
+            session->close();
+            session->deleteLater();
+        }
     }
-    if (m_terminals.isEmpty() || currentWidget() == nullptr) {
+    if ((m_terminals.isEmpty() && m_transcripts.isEmpty()) || currentWidget() == nullptr) {
         showPlaceholder();
     }
 }

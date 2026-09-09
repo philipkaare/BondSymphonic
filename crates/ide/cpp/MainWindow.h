@@ -63,6 +63,13 @@ private:
     void onOperationFailed(const QString& op, const QString& message);
     void onActiveTabChanged();
     void onWorkspaceDestroyed(const QString& workspaceId);
+    /// Points the status bar's cost at the active tab's transcript, dropping
+    /// the watch on the tab before it. A tab with no transcript costs nothing.
+    void rebindCost();
+    /// Writes the transcript's running cost into the label, in the four
+    /// decimals a fraction of a cent needs. The number is the model's; this
+    /// only frames it.
+    void updateCostLabel();
     void updateWorkspaceStatus();
     /// The tab the group model has selected, or an empty object when none is.
     QJsonObject activeTab() const;
@@ -108,6 +115,9 @@ private:
     /// What the sandbox label shows when no tab is selected: normally a dash,
     /// or the prerequisite warning once the controller has reported one.
     QString m_sandboxIdleText;
+    /// The watch on the active transcript's cost, dropped and remade whenever
+    /// the active tab changes.
+    QMetaObject::Connection m_costWatch;
     CloseState m_closeState = CloseState::Idle;
     /// The two connections `armCloseAfterSaves` makes, so they can be dropped
     /// again whichever way the wait ends.

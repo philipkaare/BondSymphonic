@@ -5,6 +5,7 @@
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFileDialog>
+#include <QFontMetrics>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QJsonArray>
@@ -12,6 +13,7 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QVBoxLayout>
 
@@ -19,6 +21,13 @@ namespace {
 
 /// The entry that turns the group combo into a free-text field.
 const char* kNewGroupEntry = "New group…";
+
+/// The adapters as the daemon spells them.
+const char* kClaudeAdapter = "claude";
+const char* kTerminalAdapter = "terminal";
+
+/// How many lines of opening prompt are visible before the box scrolls.
+constexpr int kPromptRows = 4;
 
 } // namespace
 
@@ -28,7 +37,8 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWi
     setModal(true);
 
     auto* outer = new QVBoxLayout(this);
-    auto* form = new QFormLayout();
+    m_form = new QFormLayout();
+    QFormLayout* form = m_form;
     outer->addLayout(form);
 
     auto* repoRow = new QHBoxLayout();
@@ -51,13 +61,35 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWi
     form->addRow("Name:", m_name);
 
     m_adapter = new QComboBox(this);
-    // Claude Code arrives in Milestone 4; until then a workspace runs a shell.
-    m_adapter->addItem("Terminal", "terminal");
+    // Claude Code first, so it is the default: it is what the IDE is for, and
+    // a terminal workspace is the fallback rather than the usual case.
+    m_adapter->addItem("Claude Code", kClaudeAdapter);
+    m_adapter->addItem("Terminal", kTerminalAdapter);
     form->addRow("Adapter:", m_adapter);
 
     m_command = new QLineEdit(this);
     m_command->setPlaceholderText("default shell");
     form->addRow("Command:", m_command);
+
+    m_claudeModel = new QLineEdit(this);
+    m_claudeModel->setPlaceholderText("default");
+    form->addRow("Model:", m_claudeModel);
+
+    m_permissionMode = new QComboBox(this);
+    // The words the daemon validates `--permission-mode` against; it rejects
+    // anything else, so they are spelled exactly as the CLI spells them.
+    for (const char* mode : { "default", "acceptEdits", "plan", "dontAsk" }) {
+        m_permissionMode->addItem(QString::fromUtf8(mode), QString::fromUtf8(mode));
+    }
+    form->addRow("Permission mode:", m_permissionMode);
+
+    m_initialPrompt = new QPlainTextEdit(this);
+    m_initialPrompt->setPlaceholderText("What should the agent start on?");
+    const QFontMetrics promptMetrics(m_initialPrompt->font());
+    m_initialPrompt->setFixedHeight(kPromptRows * promptMetrics.lineSpacing() +
+                                    2 * static_cast<int>(m_initialPrompt->frameWidth()) +
+                                    2 * static_cast<int>(m_initialPrompt->document()->documentMargin()));
+    form->addRow("Initial prompt:", m_initialPrompt);
 
     m_group = new QComboBox(this);
     for (int g = 0; g < m_model->groupCount(); ++g) {
@@ -86,11 +118,13 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWi
     QObject::connect(m_baseBranch, &QComboBox::currentTextChanged, this, &NewAgentDialog::updateOkEnabled);
     QObject::connect(m_newGroup, &QLineEdit::textChanged, this, &NewAgentDialog::updateOkEnabled);
     QObject::connect(m_group, &QComboBox::currentIndexChanged, this, &NewAgentDialog::onGroupChanged);
+    QObject::connect(m_adapter, &QComboBox::currentIndexChanged, this, &NewAgentDialog::onAdapterChanged);
     QObject::connect(m_buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
     QObject::connect(m_buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     QObject::connect(m_controller, &AppController::repoInspected, this, &NewAgentDialog::onRepoInspected);
     QObject::connect(m_controller, &AppController::operationFailed, this, &NewAgentDialog::onInspectFailed);
 
+    onAdapterChanged();
     updateOkEnabled();
 }
 
@@ -114,7 +148,36 @@ QString NewAgentDialog::name() const { return m_name->text().trimmed(); }
 
 QString NewAgentDialog::adapter() const { return m_adapter->currentData().toString(); }
 
-QString NewAgentDialog::command() const { return m_command->text().trimmed(); }
+QString NewAgentDialog::command() const {
+    // A Claude workspace runs no command of its own; the adapter is the
+    // command, and sending a stale line edit would be a lie about the tab.
+    return adapter() == QString::fromUtf8(kTerminalAdapter) ? m_command->text().trimmed() : QString();
+}
+
+QString NewAgentDialog::optionsJson() const {
+    if (adapter() != QString::fromUtf8(kClaudeAdapter)) {
+        return QString();
+    }
+    QJsonObject options;
+    const QString model = m_claudeModel->text().trimmed();
+    if (!model.isEmpty()) {
+        // Left out rather than sent empty: the daemon's own default is what an
+        // untouched field means, and "" is not a model name.
+        options.insert("model", model);
+    }
+    const QString mode = m_permissionMode->currentData().toString();
+    if (!mode.isEmpty()) {
+        options.insert("permission_mode", mode);
+    }
+    return QString::fromUtf8(QJsonDocument(options).toJson(QJsonDocument::Compact));
+}
+
+QString NewAgentDialog::initialPrompt() const {
+    if (adapter() != QString::fromUtf8(kClaudeAdapter)) {
+        return QString();
+    }
+    return m_initialPrompt->toPlainText().trimmed();
+}
 
 QString NewAgentDialog::group() const {
     // Reading the combo text rather than the line edit's visibility keeps this
@@ -171,6 +234,14 @@ void NewAgentDialog::onInspectFailed(const QString& op, const QString& message) 
         m_pendingPath.clear();
         m_status->setText(message);
     }
+}
+
+void NewAgentDialog::onAdapterChanged() {
+    const bool claude = adapter() == QString::fromUtf8(kClaudeAdapter);
+    m_form->setRowVisible(m_command, !claude);
+    m_form->setRowVisible(m_claudeModel, claude);
+    m_form->setRowVisible(m_permissionMode, claude);
+    m_form->setRowVisible(m_initialPrompt, claude);
 }
 
 void NewAgentDialog::onGroupChanged(int index) {

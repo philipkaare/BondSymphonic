@@ -12,6 +12,7 @@
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
+#include "bondsymphonic-ide/src/qobjects/transcript_model.cxxqt.h"
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
@@ -248,11 +249,12 @@ void MainWindow::buildStatusBar() {
     m_daemonLabel = new QLabel(this);
     m_sandboxLabel = new QLabel(m_sandboxIdleText, this);
     m_branchLabel = new QLabel("branch: -", this);
-    m_costLabel = new QLabel("$0.00", this);
+    m_costLabel = new QLabel(this);
     statusBar()->addWidget(m_daemonLabel);
     statusBar()->addWidget(m_sandboxLabel);
     statusBar()->addWidget(m_branchLabel);
     statusBar()->addPermanentWidget(m_costLabel);
+    updateCostLabel();
 }
 
 void MainWindow::connectController() {
@@ -276,6 +278,19 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::workspaceChanged, this,
                      [this](const QString& info) { m_groupModel->applyWorkspaceInfo(info); });
     QObject::connect(m_controller, &AppController::workspaceDestroyed, this, &MainWindow::onWorkspaceDestroyed);
+    // The tab records the agent so a restored session finds it again, and the
+    // pane attaches to it. Both, in that order: `onActiveTabChanged` reads the
+    // id back out of the tab.
+    QObject::connect(m_controller, &AppController::agentStarted, this,
+                     [this](const QString& workspaceId, const QString& agentId) {
+                         m_groupModel->setAgent(workspaceId, agentId);
+                         m_agentArea->setAgent(workspaceId, agentId);
+                         rebindCost();
+                     });
+    QObject::connect(m_controller, &AppController::agentStateChanged, this,
+                     [this](const QString& agentId, const QString& state, const QString& detail) {
+                         m_groupModel->setAgentStatus(agentId, state, detail);
+                     });
     // The daemon discarded events, so every terminal has a hole in it and says so.
     QObject::connect(m_controller, &AppController::outputDropped, this, [this](::std::int64_t) {
         for (TerminalSession* session : m_agentArea->sessions()) {
@@ -346,6 +361,15 @@ void MainWindow::onNewAgent() {
     if (result != QDialog::Accepted) {
         return;
     }
+    if (dialog.adapter() == "claude") {
+        // One call: the workspace, the agent in it and its opening prompt. The
+        // controller emits `workspaceCreated` as soon as the workspace exists,
+        // so a slow `agent.start` happens in front of the user.
+        m_controller->createWorkspaceWithAgent(dialog.repoPath(), dialog.baseBranch(), dialog.name(),
+                                               dialog.group(), dialog.optionsJson(),
+                                               dialog.initialPrompt());
+        return;
+    }
     m_controller->createWorkspace(dialog.repoPath(), dialog.baseBranch(), dialog.name(), dialog.group(),
                                   dialog.adapter(), dialog.command());
 }
@@ -396,6 +420,7 @@ void MainWindow::onActiveTabChanged() {
         m_agentArea->showPlaceholder();
         m_shellArea->showPlaceholder();
         m_explorer->setWorkspace(QString());
+        rebindCost();
         return;
     }
     const QString workspaceId = active.value("workspace_id").toString();
@@ -403,11 +428,37 @@ void MainWindow::onActiveTabChanged() {
     // Both areas create their terminal on the workspace's first activation and
     // keep it afterwards, so this runs on every model change and is a no-op
     // once the pane exists.
+    // The agent id comes from the tab, so a workspace listed at start-up with
+    // an agent already running attaches without waiting for `agentStarted`.
     m_agentArea->showWorkspace(workspaceId, active.value("adapter").toString(),
-                               active.value("command").toString());
+                               active.value("command").toString(),
+                               active.value("agent_id").toString());
     // The shell tab is a plain login shell in the same sandbox, whatever the
     // tab's adapter is.
     m_shellArea->showWorkspace(workspaceId, "terminal", QString());
+    rebindCost();
+}
+
+void MainWindow::rebindCost() {
+    QObject::disconnect(m_costWatch);
+    const QString workspaceId = activeWorkspaceId();
+    TranscriptModel* model =
+        workspaceId.isEmpty() ? nullptr : m_agentArea->transcriptModel(workspaceId);
+    if (model != nullptr) {
+        m_costWatch = QObject::connect(model, &TranscriptModel::costUsdChanged, this,
+                                       &MainWindow::updateCostLabel);
+    }
+    updateCostLabel();
+}
+
+void MainWindow::updateCostLabel() {
+    const QString workspaceId = activeWorkspaceId();
+    TranscriptModel* model =
+        workspaceId.isEmpty() ? nullptr : m_agentArea->transcriptModel(workspaceId);
+    // A terminal tab has no transcript and so no cost; the label still shows a
+    // number, because a blank one reads as "unknown" rather than as "nothing".
+    const double cost = model == nullptr ? 0.0 : model->getCostUsd();
+    m_costLabel->setText(QString("$%1").arg(cost, 0, 'f', 4));
 }
 
 void MainWindow::onWorkspaceDestroyed(const QString& workspaceId) {
@@ -418,6 +469,9 @@ void MainWindow::onWorkspaceDestroyed(const QString& workspaceId) {
     m_shellArea->removeWorkspace(workspaceId);
     m_editorArea->closeWorkspace(workspaceId);
     m_groupModel->removeWorkspace(workspaceId);
+    // After the model change, so the tab this rebinds to is the one that
+    // survived rather than the one that has just gone.
+    rebindCost();
 }
 
 void MainWindow::updateWorkspaceStatus() {
