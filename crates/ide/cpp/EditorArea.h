@@ -1,6 +1,9 @@
 #pragma once
+#include <QHash>
+#include <QMetaObject>
 #include <QString>
 #include <QWidget>
+#include <functional>
 
 class EditorWidget;
 class QLabel;
@@ -42,10 +45,18 @@ public:
     /// there is nothing left to save to.
     void closeWorkspace(const QString& workspaceId);
 
+    /// What to do with a dirty editor whose tab is closing.
+    enum class Unsaved { Save, Discard, Cancel };
+
+    /// Replaces the question `closeTab` asks about a dirty editor. The default
+    /// puts a modal box in front of the user; this is the seam that lets the
+    /// answer come from somewhere else.
+    void setUnsavedPrompt(std::function<Unsaved(const QString& title)> ask);
+
     /// Closes the tab at `index`, asking first when it has unsaved edits.
     /// Returns whether the tab is gone: a cancelled prompt and a save still in
-    /// flight both answer false, and the save closes the tab when the daemon
-    /// confirms the write.
+    /// flight both answer false, and the save closes the tab once the write has
+    /// landed and nothing has been typed since.
     bool closeTab(int index);
 
 signals:
@@ -53,6 +64,20 @@ signals:
     void currentEditorChanged(EditorWidget* editor);
 
 private:
+    /// The two connections that close a tab once its save lands.
+    struct PendingClose {
+        QMetaObject::Connection saved;
+        QMetaObject::Connection failed;
+    };
+
+    /// The `saved` that answers the close: closes the tab, unless something was
+    /// typed while the write was out.
+    void onSavedForClose(QWidget* page);
+    /// Forgets the pending close for `page`, if there is one. Both the failure
+    /// path and the "typed during the save" path end here, so a later, ordinary
+    /// save can never close a tab nobody asked to close.
+    void abandonClose(QWidget* page);
+
     /// Removes `page` from the tabs and deletes it, showing the placeholder
     /// again when it was the last one.
     void removePage(QWidget* page);
@@ -64,4 +89,9 @@ private:
     QStackedWidget* m_stack = nullptr;
     QLabel* m_placeholder = nullptr;
     QTabWidget* m_tabs = nullptr;
+    /// Never null: the constructor installs the modal box.
+    std::function<Unsaved(const QString&)> m_ask;
+    /// Tabs whose close is waiting on a write. A second close request for one
+    /// of them is ignored rather than arming a second pair of connections.
+    QHash<QWidget*, PendingClose> m_closing;
 };

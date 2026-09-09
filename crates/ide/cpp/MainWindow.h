@@ -47,14 +47,17 @@ private:
     QJsonObject activeTab() const;
     /// The workspace the Explorer, the panes and a newly opened file belong to.
     QString activeWorkspaceId() const;
-    /// Adds one Edit menu item forwarding to the focused editor's view, and
+    /// Adds one Edit menu item forwarding to the current editor's view, and
     /// books it in for enabling and disabling together with its siblings.
+    ///
+    /// `shortcut` is printed beside the item and deliberately not registered:
+    /// `QPlainTextEdit` already implements all six itself while it has the
+    /// focus, and a window-wide copy of Ctrl+C would be taken out of the
+    /// terminal pane's keyboard before it ever got there.
     void addEditAction(QMenu* menu, const QString& text, QKeySequence::StandardKey shortcut,
                        void (QPlainTextEdit::*slot)());
     void forwardToEditor(void (QPlainTextEdit::*slot)());
-    /// The Edit items act on the editor, so they are live only while the editor
-    /// has the focus. That is not tidiness: their shortcuts are window-wide, and
-    /// an enabled Ctrl+C here would be taken from the terminal pane.
+    /// Greys the Edit items out when the current tab is not an editor.
     void updateEditActions();
 
     AppController* m_controller;

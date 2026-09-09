@@ -6,9 +6,23 @@
 #include <functional>
 
 class CodeView;
+class QEvent;
 class QPaintEvent;
 class QResizeEvent;
 class QSize;
+
+namespace codeview {
+/// `tint` mixed into `base` by `amount` (0..1).
+///
+/// A palette role picked for a *fill* is often far too strong to put behind
+/// text: on this machine's dark theme `AlternateBase` is a saturated navy over
+/// a near-black `Base`. Washing it into the background keeps the hint and the
+/// legibility, and degrades the same way on a light palette.
+QColor wash(const QColor& base, const QColor& tint, qreal amount);
+
+/// How much of a palette role a background wash keeps.
+inline constexpr qreal kWashAmount = 0.15;
+} // namespace codeview
 
 /// The gutter down the left edge of a `CodeView`.
 ///
@@ -27,14 +41,18 @@ private:
     CodeView* m_view;
 };
 
-/// A read-write code pane: monospaced, unwrapped, with a gutter, a current-line
-/// highlight and optional per-line background tints.
+/// A code pane: monospaced, unwrapped, with a gutter, a current-line band and
+/// optional per-line background tints.
 ///
 /// It knows nothing about files, documents or diffs. What the gutter says comes
 /// from a provider the owner installs, and the tints are a vector the owner
 /// hands over, so the same widget serves the editor and the side-by-side diff.
 /// Syntax colouring is not its business either: that is a `QSyntaxHighlighter`
 /// attached to its document.
+///
+/// A read-only pane gets no current-line band and no caret. The band would sit
+/// on top of the row tint of whichever row the invisible caret happened to be
+/// on, and there is nothing being typed for it to mark.
 class CodeView : public QPlainTextEdit {
     Q_OBJECT
 public:
@@ -46,7 +64,6 @@ public:
 
     /// A background colour per block, indexed by block number. An empty vector
     /// clears every tint, and an invalid colour leaves that one block untinted.
-    /// The tints sit behind the current-line highlight.
     void setRowTints(const QVector<QColor>& perBlock);
 
     /// The gutter's width in pixels, including its padding.
@@ -54,6 +71,11 @@ public:
 
 protected:
     void resizeEvent(QResizeEvent* event) override;
+    /// Watches for `QEvent::ReadOnlyChange`, which is how the pane learns that
+    /// its caret and its current-line band have just become someone else's
+    /// answer. Nothing else tells it: `setReadOnly` is not virtual and has no
+    /// signal, and an owner should not have to remember a second call.
+    bool event(QEvent* event) override;
 
 private:
     friend class LineNumberArea;

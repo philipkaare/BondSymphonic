@@ -1,31 +1,22 @@
 #include "EditorWidget.h"
 #include "CodeView.h"
 #include "RustHighlighter.h"
+#include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/editor_document.cxxqt.h"
 #include <QChar>
 #include <QColor>
 #include <QFrame>
 #include <QHBoxLayout>
-#include <QKeySequence>
 #include <QLabel>
 #include <QLatin1Char>
 #include <QMessageBox>
 #include <QPalette>
 #include <QPushButton>
 #include <QScrollBar>
-#include <QShortcut>
 #include <QTextCursor>
 #include <QTextDocument>
 #include <QVBoxLayout>
 #include <QtGlobal>
-
-namespace {
-
-/// Below this the pane is treated as dark, and the document picks the dark
-/// syntax theme.
-constexpr int kDarkLightnessCutoff = 128;
-
-} // namespace
 
 EditorWidget::EditorWidget(EditorDocument* doc, QWidget* parent) : QWidget(parent), m_doc(doc) {
     if (doc != nullptr) {
@@ -43,7 +34,12 @@ EditorWidget::EditorWidget(EditorDocument* doc, QWidget* parent) : QWidget(paren
     m_notice->setMargin(4);
     m_notice->setAutoFillBackground(true);
     QPalette noticePalette = m_notice->palette();
-    noticePalette.setColor(QPalette::Window, palette().alternateBase().color());
+    // Washed, not the raw role: `AlternateBase` is a saturated accent on some
+    // palettes and a bar in that colour shouts over the file it is about.
+    noticePalette.setColor(QPalette::Window,
+                           codeview::wash(palette().base().color(),
+                                          palette().alternateBase().color(),
+                                          codeview::kWashAmount));
     m_notice->setPalette(noticePalette);
     m_notice->hide();
     layout->addWidget(m_notice);
@@ -66,23 +62,23 @@ EditorWidget::EditorWidget(EditorDocument* doc, QWidget* parent) : QWidget(paren
     m_view = new CodeView(this);
     layout->addWidget(m_view, 1);
 
+    QObject::connect(m_view->document(), &QTextDocument::contentsChange, this,
+                     &EditorWidget::onContentsChange);
+    // After that connection, and the order is load-bearing. Both slots run on
+    // one `contentsChange`, in the order they were made: ours first, so
+    // `applyEdit` has updated the buffer before the highlighter asks it for the
+    // spans of the block that just changed. Attached first, the highlighter
+    // would colour every keystroke from the state before it.
     m_highlighter = new RustHighlighter(m_view->document(), [this](int block) {
         return m_doc.isNull() ? QString() : m_doc->spansForLine(block);
     });
-
-    QObject::connect(m_view->document(), &QTextDocument::contentsChange, this,
-                     &EditorWidget::onContentsChange);
-
-    auto* saveShortcut = new QShortcut(QKeySequence::Save, this);
-    saveShortcut->setContext(Qt::WidgetWithChildrenShortcut);
-    QObject::connect(saveShortcut, &QShortcut::activated, this, &EditorWidget::save);
 
     if (doc == nullptr) {
         return;
     }
     // Set before `open`, so the first highlight pass already uses the right
     // palette. The pane's own colours are the only theme signal there is.
-    doc->setDarkTheme(palette().base().color().lightness() < kDarkLightnessCutoff);
+    doc->setDarkTheme(theme::isDark(palette()));
 
     QObject::connect(doc, &EditorDocument::loaded, this, &EditorWidget::onLoaded);
     QObject::connect(doc, &EditorDocument::readOnlyReasonChanged, this, &EditorWidget::updateNotice);
@@ -175,6 +171,8 @@ void EditorWidget::onContentsChange(int position, int charsRemoved, int charsAdd
 
 void EditorWidget::updateNotice() {
     const QString reason = m_doc.isNull() ? QString() : m_doc->getReadOnlyReason();
+    // The view keeps its own caret and current-line band in step off the
+    // `ReadOnlyChange` event this sends.
     m_view->setReadOnly(!reason.isEmpty());
     const QString text = m_loadError.isEmpty() ? reason : m_loadError;
     m_notice->setText(text);

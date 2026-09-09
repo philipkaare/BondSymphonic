@@ -19,6 +19,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QLatin1Char>
+#include <QList>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -60,12 +62,10 @@ void MainWindow::buildMenus() {
             editor->save();
         }
     });
+    // The window's, at the default window scope, and the only Ctrl+S there is.
+    // One action for every pane means the shortcut works with the focus in the
+    // Explorer, in a terminal or in the text, and nothing competes with it.
     save->setShortcut(QKeySequence::Save);
-    // The working Ctrl+S is the one the focused editor pane owns. A second,
-    // window-wide shortcut on the same keys would make both ambiguous and
-    // neither would fire, so this one is scoped to the menu bar, where it can
-    // never match: it is here to print "Ctrl+S" beside the item.
-    save->setShortcutContext(Qt::WidgetShortcut);
     auto* saveAll = file->addAction("Save A&ll", this, [this] { m_editorArea->saveAll(); });
     saveAll->setShortcut(QKeySequence("Ctrl+Shift+S"));
     file->addSeparator();
@@ -82,8 +82,16 @@ void MainWindow::buildMenus() {
     addEditAction(edit, "Select &All", QKeySequence::SelectAll, &QPlainTextEdit::selectAll);
 
     auto* view = menuBar()->addMenu("&View");
-    view->addAction("&Swap editor and agent", this,
-                    [this] { m_centerSplitter->insertWidget(0, m_centerSplitter->widget(1)); });
+    view->addAction("&Swap editor and agent", this, [this] {
+        // `insertWidget` re-parents, and the splitter then re-derives its
+        // division from size hints -- losing the 3:2 `buildCentral` seeded
+        // precisely because the agent pane's hint is wrong.
+        const QList<int> sizes = m_centerSplitter->sizes();
+        m_centerSplitter->insertWidget(0, m_centerSplitter->widget(1));
+        if (sizes.size() == 2) {
+            m_centerSplitter->setSizes({ sizes.at(1), sizes.at(0) });
+        }
+    });
     menuBar()->addMenu("&Workspace");
     menuBar()->addMenu("&Run");
     auto* help = menuBar()->addMenu("&Help");
@@ -231,15 +239,17 @@ void MainWindow::connectController() {
 
     QObject::connect(m_editorArea, &EditorArea::currentEditorChanged, this,
                      [this](EditorWidget*) { updateEditActions(); });
-    QObject::connect(qApp, &QApplication::focusChanged, this,
-                     [this](QWidget*, QWidget*) { updateEditActions(); });
 }
 
 void MainWindow::addEditAction(QMenu* menu, const QString& text,
                                QKeySequence::StandardKey shortcut,
                                void (QPlainTextEdit::*slot)()) {
-    QAction* action = menu->addAction(text, this, [this, slot] { forwardToEditor(slot); });
-    action->setShortcut(shortcut);
+    // The sequence goes in the label after a tab, which the menu draws
+    // right-aligned exactly where a registered shortcut would appear. Setting
+    // it as the action's shortcut instead would register it window-wide.
+    QAction* action = menu->addAction(
+        text + QLatin1Char('\t') + QKeySequence(shortcut).toString(QKeySequence::NativeText), this,
+        [this, slot] { forwardToEditor(slot); });
     m_editActions.append(action);
 }
 
@@ -251,10 +261,7 @@ void MainWindow::forwardToEditor(void (QPlainTextEdit::*slot)()) {
 }
 
 void MainWindow::updateEditActions() {
-    EditorWidget* editor = m_editorArea->currentEditor();
-    const QWidget* focus = QApplication::focusWidget();
-    const bool live = editor != nullptr && focus != nullptr &&
-                      (focus == editor->view() || editor->view()->isAncestorOf(focus));
+    const bool live = m_editorArea->currentEditor() != nullptr;
     for (QAction* action : m_editActions) {
         action->setEnabled(live);
     }

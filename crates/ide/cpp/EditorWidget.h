@@ -26,8 +26,11 @@ public:
     EditorDocument* document() const;
     CodeView* view() const;
 
-    /// Asks the document to write itself back through the daemon. A no-op on a
-    /// document that reports a read-only reason.
+    /// Asks the document to write itself back through the daemon. A read-only
+    /// document answers with `saveFailed`, which this reports.
+    ///
+    /// There is no Ctrl+S here: the window owns one Save action for every pane,
+    /// so the shortcut works wherever the focus is.
     void save();
 
 private:

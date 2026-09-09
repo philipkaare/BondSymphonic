@@ -1,4 +1,5 @@
 #include "CodeView.h"
+#include <QEvent>
 #include <QFont>
 #include <QFontDatabase>
 #include <QFontMetrics>
@@ -25,6 +26,17 @@ constexpr int kGutterAlpha = 140;
 constexpr int kTabWidthInChars = 4;
 
 } // namespace
+
+namespace codeview {
+
+QColor wash(const QColor& base, const QColor& tint, qreal amount) {
+    const qreal keep = 1.0 - amount;
+    return QColor::fromRgbF(base.redF() * keep + tint.redF() * amount,
+                            base.greenF() * keep + tint.greenF() * amount,
+                            base.blueF() * keep + tint.blueF() * amount);
+}
+
+} // namespace codeview
 
 LineNumberArea::LineNumberArea(CodeView* view) : QWidget(view), m_view(view) {}
 
@@ -87,6 +99,14 @@ void CodeView::setRowTints(const QVector<QColor>& perBlock) {
     updateExtraSelections();
 }
 
+bool CodeView::event(QEvent* event) {
+    const bool handled = QPlainTextEdit::event(event);
+    if (event->type() == QEvent::ReadOnlyChange) {
+        updateExtraSelections();
+    }
+    return handled;
+}
+
 int CodeView::gutterWidth() const {
     // The provider is monotone in width for both numbering schemes it is used
     // with (one column of line numbers, or a diff's two), so the first and last
@@ -133,9 +153,16 @@ void CodeView::paintGutter(QPaintEvent* event) {
 }
 
 void CodeView::updateExtraSelections() {
+    // A pane nobody can type into shows no caret; Qt keeps drawing one for the
+    // keyboard selection a read-only text edit still supports.
+    const int caret = isReadOnly() ? 0 : 1;
+    if (cursorWidth() != caret) {
+        setCursorWidth(caret);
+    }
+
     QList<QTextEdit::ExtraSelection> selections;
     // Tints first: extra selections are painted in order, so the current-line
-    // highlight appended last is the one on top.
+    // band appended last is the one on top.
     for (int n = 0; n < m_rowTints.size(); ++n) {
         const QColor tint = m_rowTints.at(n);
         if (!tint.isValid()) {
@@ -153,12 +180,18 @@ void CodeView::updateExtraSelections() {
         selections.append(row);
     }
 
-    QTextEdit::ExtraSelection current;
-    current.format.setBackground(palette().alternateBase());
-    current.format.setProperty(QTextFormat::FullWidthSelection, true);
-    current.cursor = textCursor();
-    current.cursor.clearSelection();
-    selections.append(current);
+    // Last, so it wins over a tint on the same row -- and only on a pane that
+    // is being typed into, so the diff's tints are never covered.
+    if (!isReadOnly()) {
+        QTextEdit::ExtraSelection current;
+        current.format.setBackground(codeview::wash(palette().base().color(),
+                                                    palette().alternateBase().color(),
+                                                    codeview::kWashAmount));
+        current.format.setProperty(QTextFormat::FullWidthSelection, true);
+        current.cursor = textCursor();
+        current.cursor.clearSelection();
+        selections.append(current);
+    }
 
     setExtraSelections(selections);
 }
