@@ -3,6 +3,7 @@
 //! shapes; like `model` and `client`, it must never import Qt types.
 
 use anyhow::{anyhow, Context, Result};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -25,6 +26,36 @@ pub struct DaemonProcess {
     pub stdin: Option<ChildStdin>,
     pub port: u16,
     pub token: String,
+}
+
+/// Test hook: a `host:port` to connect to instead of starting a daemon.
+pub const TEST_ADDR_ENV: &str = "BS_DAEMON_ADDR";
+/// Test hook: the handshake token used with [`TEST_ADDR_ENV`].
+pub const TEST_TOKEN_ENV: &str = "BS_DAEMON_TOKEN";
+
+/// **Test-only.** The daemon endpoint named in the environment, if there is one.
+///
+/// With `BS_DAEMON_ADDR` set to a `host:port`, the IDE connects straight to that
+/// address using the token in `BS_DAEMON_TOKEN` and never runs `wsl.exe`. It
+/// exists so `tests/smoke.rs` can run the real IDE binary against an in-process
+/// fake daemon. Every ordinary run leaves the variable unset, this returns
+/// `None`, and the launch path is exactly what it would be without the hook.
+///
+/// An unparseable address is reported and ignored rather than guessed at, so a
+/// typo does not silently become a normal WSL launch failure.
+pub fn test_endpoint() -> Option<(SocketAddr, String)> {
+    let raw = std::env::var(TEST_ADDR_ENV).ok()?;
+    let Some(addr) = parse_endpoint(&raw) else {
+        tracing::error!("{TEST_ADDR_ENV}={raw:?} is not a host:port; ignoring the test hook");
+        return None;
+    };
+    Some((addr, std::env::var(TEST_TOKEN_ENV).unwrap_or_default()))
+}
+
+/// The parsing half of [`test_endpoint`], split out so it is testable without
+/// mutating the process environment.
+fn parse_endpoint(raw: &str) -> Option<SocketAddr> {
+    raw.trim().parse().ok()
 }
 
 /// Reads the daemon's first stdout line, `{"port":N,"token":"..."}`.
@@ -219,6 +250,23 @@ mod tests {
         );
         assert_eq!(parse_port_line("garbage"), None);
         assert_eq!(parse_port_line(r#"{"port":"x"}"#), None);
+    }
+
+    #[test]
+    fn parses_test_hook_endpoints() {
+        assert_eq!(
+            parse_endpoint("127.0.0.1:41234"),
+            Some(([127, 0, 0, 1], 41234).into())
+        );
+        // Whitespace is what a shell leaves behind; a bare port or a hostname
+        // is not an address and must not be guessed at.
+        assert_eq!(
+            parse_endpoint("  127.0.0.1:1  "),
+            Some(([127, 0, 0, 1], 1).into())
+        );
+        assert_eq!(parse_endpoint("41234"), None);
+        assert_eq!(parse_endpoint("localhost:41234"), None);
+        assert_eq!(parse_endpoint(""), None);
     }
 
     #[test]

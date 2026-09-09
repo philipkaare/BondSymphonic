@@ -275,6 +275,23 @@ not in any group land in an "Unsorted" group.
 - The `model_tests` suite includes a benchmark-style test that loads a 50k-line
   file and asserts highlight of a single line stays under 5 ms.
 
+**Measured, Milestone 2b (2026-09-09).** Debug IDE build on Windows 11 against the
+daemon in the `bondsymphonic` WSL2 distro. Two workspaces open on one repository,
+four live PTYs (each workspace's agent pane, plus a second shell per workspace
+standing in for the bottom Terminal tab, which opens its PTY only once that tab is
+shown), left idle for 60 s:
+
+| | measured | target |
+|---|---|---|
+| `bondsymphonic-ide.exe` working set | 55.6 MB | < 150 MB |
+| `bondsymphonic-ide.exe` private bytes | 21.9 MB | — |
+| `bondsymphonic-daemon` RSS | 9.8 MB | < 30 MB |
+
+The daemon figure is the daemon process alone, as the target says. The sandboxed
+processes it supervises (`bwrap`, its init helper and the PTY shells) accounted for
+roughly 35 MB more inside the distro. Both numbers are comfortably inside the
+targets, so no profiling pass was needed.
+
 ## 14. Testing (IDE-specific)
 
 - `model/` unit tests: transcript delta coalescing and tool-result matching; diff
