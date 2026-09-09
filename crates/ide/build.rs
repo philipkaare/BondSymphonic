@@ -1,7 +1,17 @@
 use cxx_qt_build::CxxQtBuilder;
 
 fn main() {
-    CxxQtBuilder::new()
+    embed_windows_icon();
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let builder = CxxQtBuilder::new();
+    // SAFETY: the closure only adds a preprocessor define; it does not change
+    // include paths, flags or files in a way that could conflict with cxx-qt.
+    let builder = unsafe {
+        builder.cc_builder(move |cc| {
+            cc.define("BS_IDE_VERSION", format!("\"{version}\"").as_str());
+        })
+    };
+    builder
         // Widgets only. Gui is a hard dependency of Widgets (QAction, QMetaObject
         // for QAction, ...) and is not linked implicitly by cxx-qt-build.
         .qt_module("Gui")
@@ -26,6 +36,23 @@ fn main() {
             "cpp/MainWindow.h",
             "cpp/MainWindow.cpp",
             "cpp/app.cpp",
+            "cpp/Branding.cpp",
         ])
         .build();
 }
+
+/// Stamp the logo into the executable's resources so Explorer and the taskbar
+/// show it. A missing resource compiler must not break the build: the window
+/// icon set at runtime still works, only the .exe file icon is lost.
+#[cfg(target_os = "windows")]
+fn embed_windows_icon() {
+    println!("cargo:rerun-if-changed=../../assets/logo.ico");
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon("../../assets/logo.ico");
+    if let Err(err) = res.compile() {
+        println!("cargo:warning=executable icon not embedded: {err}");
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn embed_windows_icon() {}

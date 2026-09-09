@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "AgentArea.h"
+#include "Branding.h"
 #include "ExplorerDock.h"
 #include "GroupBar.h"
 #include "NewAgentDialog.h"
@@ -8,6 +9,7 @@
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
 #include <QAction>
+#include <QApplication>
 #include <QCheckBox>
 #include <QDockWidget>
 #include <QJsonDocument>
@@ -49,7 +51,26 @@ void MainWindow::buildMenus() {
     menuBar()->addMenu("&View");
     menuBar()->addMenu("&Workspace");
     menuBar()->addMenu("&Run");
-    menuBar()->addMenu("&Help");
+    auto* help = menuBar()->addMenu("&Help");
+    help->addAction("&About BondSymphonic…", this, &MainWindow::onAbout);
+    help->addAction("About &Qt", qApp, &QApplication::aboutQt);
+}
+
+void MainWindow::onAbout() {
+    QMessageBox box(this);
+    box.setWindowTitle("About BondSymphonic");
+    box.setIconPixmap(branding::logo(96));
+    box.setTextFormat(Qt::RichText);
+    box.setText(QStringLiteral("<h2 style=\"margin-bottom:0\">BondSymphonic</h2>"
+                               "<p style=\"margin-top:2px\">Version %1</p>"
+                               "<p>An IDE for orchestrating coding agents: every agent works in its own "
+                               "git worktree inside a sandbox, and you conduct from here.</p>"
+                               "<p><a href=\"https://github.com/philipkaare/BondSymphonic\">"
+                               "github.com/philipkaare/BondSymphonic</a></p>"
+                               "<p style=\"color:gray\">Rust + Qt %2</p>")
+                    .arg(branding::version(), QString::fromLatin1(qVersion())));
+    box.setStandardButtons(QMessageBox::Ok);
+    box.exec();
 }
 
 void MainWindow::buildCentral() {

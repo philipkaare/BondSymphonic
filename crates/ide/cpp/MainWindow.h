@@ -30,6 +30,7 @@ private:
     void connectController();
     void onConnectionStateChanged();
     void onNewAgent();
+    void onAbout();
     void onDestroyRequested(const QString& workspaceId);
     void onOperationFailed(const QString& op, const QString& message);
     void onActiveTabChanged();
