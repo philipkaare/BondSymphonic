@@ -282,6 +282,9 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
         }
     }
     d.set_state(id, WorkspaceState::Destroying)?;
+    // Before the worktree goes away, so the teardown itself is not reported as a
+    // burst of `fs.changed` for a workspace that is on its way out.
+    d.watchers.disable(id);
     d.ptys.close_workspace(id).await;
     // The guard is dropped before the await: a `parking_lot` guard held across one
     // would deadlock any handler that touches `sandboxes` in the meantime.

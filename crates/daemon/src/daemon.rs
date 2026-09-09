@@ -4,6 +4,7 @@
 //! Everything here is cheap to clone or shared behind an `Arc`, so request
 //! handlers can run concurrently against one `Daemon`.
 
+use crate::fs_watch::Watchers;
 use crate::git::Git;
 use crate::pty::PtyManager;
 use crate::sandbox::{SandboxBackend, SandboxHandle};
@@ -23,6 +24,8 @@ pub struct Daemon {
     pub sandboxes: Mutex<HashMap<WorkspaceId, Arc<dyn SandboxHandle>>>,
     pub events: EventBus,
     pub ptys: PtyManager,
+    /// Live `fs.watch` subscriptions, one per workspace worktree.
+    pub watchers: Watchers,
 }
 
 impl Daemon {
@@ -41,6 +44,7 @@ impl Daemon {
             sandboxes: Mutex::new(HashMap::new()),
             events: events.clone(),
             ptys: PtyManager::new(events),
+            watchers: Watchers::default(),
         }))
     }
 

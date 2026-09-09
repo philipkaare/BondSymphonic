@@ -1,5 +1,6 @@
 pub mod daemon;
 pub mod fs;
+pub mod fs_watch;
 pub mod git;
 pub mod ids;
 pub mod prereqs;

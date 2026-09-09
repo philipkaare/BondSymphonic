@@ -77,7 +77,16 @@ impl Handler for WorkspaceHandler {
                 .await
                 .map_err(|e| RpcError::internal(e.to_string()))??)
             }
-            // `fs.watch` stays not-implemented until Milestone 3.
+            Request::FsWatch(p) => {
+                if p.enable {
+                    let root = d.workspace(&p.workspace_id)?.worktree_path;
+                    d.watchers
+                        .enable(p.workspace_id.clone(), root, d.events.clone())?;
+                } else {
+                    d.watchers.disable(&p.workspace_id);
+                }
+                ok(Empty {})
+            }
             other => self.system.handle(other, ctx).await,
         }
     }
