@@ -109,7 +109,11 @@ async fn serve(args: Args) -> Result<()> {
         "{}",
         serde_json::json!({ "port": server.port(), "token": server.token() })
     );
-    daemon.restore().await;
+    // `restore` runs alongside the accept loop rather than ahead of it, so `hello` is
+    // answered at once and each workspace flips to Ready or SandboxDown through the
+    // `workspace.state` events `restore` publishes as its sandboxes come up.
+    let restoring = daemon.clone();
+    tokio::spawn(async move { restoring.restore().await });
 
     let shutdown = CancellationToken::new();
     // Exit when stdin closes (IDE died) or on ctrl-c.
