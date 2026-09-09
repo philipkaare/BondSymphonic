@@ -1,12 +1,13 @@
 //! `fs.watch` end to end: enabling a watch turns worktree writes into a single
-//! coalesced `fs.changed` with repo-relative paths, a burst of writes is one
-//! event and not one per file, ignored directories stay silent, and disabling
-//! the watch stops the events.
+//! coalesced `fs.changed` with repo-relative paths, reading the worktree
+//! reports nothing at all, a burst of writes is one event and not one per file,
+//! ignored directories stay silent, and disabling the watch stops the events.
 
 mod common;
 
 use bondsymphonic_proto::*;
 use common::{create_ws, init_repo, start_daemon, Client};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Waits up to `limit` for an `fs.changed` for `ws`, pumping the connection so
@@ -30,6 +31,61 @@ async fn wait_for_fs_changed(
         let _ = c.call(Request::WorkspaceList {}).await;
     }
     None
+}
+
+/// Reading the worktree must not publish `fs.changed`. inotify reports reads as
+/// `Access` events, so without a kind filter a client that answers `fs.changed`
+/// by asking for `workspace.changes` makes the daemon run git, git reads every
+/// file in the worktree, and those reads publish again: an idle workspace that
+/// refreshes itself forever. On Windows this passes trivially, since
+/// `ReadDirectoryChangesW` does not report reads at all; the WSL run is the one
+/// that exercises the fix.
+#[tokio::test]
+async fn reading_the_worktree_is_not_a_change_but_writing_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let (port, token, _daemon, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "reads").await;
+    let worktree = std::path::Path::new(&ws.worktree_path).to_path_buf();
+
+    c.call(Request::FsWatch(FsWatchParams {
+        workspace_id: ws.id.clone(),
+        enable: true,
+    }))
+    .await
+    .unwrap();
+
+    // A plain read, then the two ways git reads the whole worktree: directly,
+    // and through the `workspace.changes` request that closed the loop.
+    std::fs::read(worktree.join("README.md")).unwrap();
+    let st = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&worktree)
+        .status()
+        .unwrap();
+    assert!(st.success(), "git status runs inside the worktree");
+    c.call(Request::WorkspaceChanges(WorkspaceIdParams {
+        workspace_id: ws.id.clone(),
+    }))
+    .await
+    .unwrap();
+
+    assert!(
+        wait_for_fs_changed(&mut c, &ws.id, Duration::from_secs(1))
+            .await
+            .is_none(),
+        "reading the worktree is not a change"
+    );
+
+    // The watch is still armed, so this is a real filter and not a dead watcher.
+    std::fs::write(worktree.join("touched.txt"), "x\n").unwrap();
+    let paths = wait_for_fs_changed(&mut c, &ws.id, Duration::from_secs(5))
+        .await
+        .expect("a write is still reported");
+    assert_eq!(paths, vec!["touched.txt".to_string()]);
+
+    cancel.cancel();
 }
 
 /// The headline behaviour: two files written inside one [`DEBOUNCE`] window

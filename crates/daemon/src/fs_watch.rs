@@ -1,11 +1,12 @@
 //! `fs.watch`: one `notify` watcher per workspace worktree. Raw events are
-//! converted to repo-relative paths and filtered in the watcher callback,
-//! coalesced for [`DEBOUNCE`] after the first surviving one, then published as
-//! a single `fs.changed` carrying sorted, de-duplicated paths.
+//! filtered in the watcher callback, by kind and then by path, coalesced for
+//! [`DEBOUNCE`] after the first surviving one, then published as a single
+//! `fs.changed` carrying sorted, de-duplicated repo-relative paths.
 
 use crate::server::broadcast::EventBus;
 use bondsymphonic_proto::{Event, RpcError, WorkspaceId};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -70,12 +71,14 @@ impl Watchers {
         let cb_id = id.clone();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             match res {
-                Ok(ev) => {
+                Ok(ev) if is_change(&ev.kind) => {
                     let paths = relative_paths(&cb_root, &ev.paths);
                     if !paths.is_empty() {
                         let _ = tx.send(paths);
                     }
                 }
+                // Something only read the worktree. See [`is_change`].
+                Ok(_) => {}
                 // Most consequentially an inotify queue overflow, which means events
                 // were lost and the client's view is now stale. There is no resync
                 // protocol yet, so the log is the only signal there is.
@@ -165,6 +168,38 @@ pub fn relative_paths(root: &Path, paths: &[PathBuf]) -> Vec<String> {
     out
 }
 
+/// Whether an event kind reports that something *changed*, as opposed to
+/// something merely having read the worktree.
+///
+/// This is load-bearing, not a nicety. inotify reports reads as `Access`
+/// events, and a client that reacts to `fs.changed` by asking for
+/// `workspace.changes` makes the daemon run git, git reads every file in the
+/// worktree, and those reads publish another `fs.changed`. The loop sustains
+/// itself at roughly 1.7 Hz per open workspace with nobody touching anything: a
+/// 10 s probe on an idle worktree saw 691 events, every one of them
+/// `OPEN` / `ACCESS` / `CLOSE_NOWRITE`, and not a single write.
+///
+/// Kept, deliberately:
+///
+/// - `Modify(Metadata(_))` other than access time, because `git status` reports
+///   a mode change and the client needs to hear about a `chmod`.
+/// - `Access(Close(Write))`, the one access that follows a write rather than a
+///   read. A writer using `mmap` may produce no `Modify` at all, and the close
+///   is then the only notification there is. It cannot re-open the loop: a
+///   reader closes with `Close(Read)`, which is what the probe above saw.
+/// - `Any` and `Other`. An unrecognised kind from an unfamiliar backend fails
+///   open, costing a spurious refresh, rather than failing closed and silently
+///   disabling the watch.
+fn is_change(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Access(access) => matches!(access, AccessKind::Close(AccessMode::Write)),
+        // Definitionally a read, and it would sustain exactly the same loop on
+        // any backend that reports it.
+        EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => false,
+        _ => true,
+    }
+}
+
 /// Whether a worktree-relative path is one no client wants to hear about: it
 /// runs through an [`IGNORED`] directory at any depth, or it is one of
 /// `fs::write_file`'s `<name>.<pid>.<counter>.bs-tmp` temporaries, which is
@@ -180,7 +215,50 @@ fn is_ignored(rel: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify::event::{CreateKind, DataChange, RemoveKind, RenameMode};
     use std::path::PathBuf;
+
+    #[test]
+    fn reads_are_not_changes_but_writes_creations_and_removals_are() {
+        // What `git status` does to every file in a worktree, and what made an
+        // idle workspace refresh itself twice a second.
+        assert!(!is_change(&EventKind::Access(AccessKind::Read)));
+        assert!(!is_change(&EventKind::Access(AccessKind::Open(
+            AccessMode::Read
+        ))));
+        assert!(!is_change(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(!is_change(&EventKind::Access(AccessKind::Any)));
+        assert!(!is_change(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime
+        ))));
+
+        // The one access that follows a write rather than a read: for an `mmap`
+        // writer it can be the only notification there is.
+        assert!(is_change(&EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+
+        assert!(is_change(&EventKind::Create(CreateKind::File)));
+        assert!(is_change(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Content
+        ))));
+        assert!(is_change(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::To
+        ))));
+        // git reports a mode change, so the client has to hear about a chmod.
+        assert!(is_change(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::Permissions
+        ))));
+        // What ReadDirectoryChangesW reports for every content change.
+        assert!(is_change(&EventKind::Modify(ModifyKind::Any)));
+        assert!(is_change(&EventKind::Remove(RemoveKind::File)));
+
+        // Unknown kinds fail open rather than silencing the watch.
+        assert!(is_change(&EventKind::Any));
+        assert!(is_change(&EventKind::Other));
+    }
 
     #[test]
     fn relative_paths_filter_ignored_dirs_at_any_depth_temp_files_and_dedup() {
