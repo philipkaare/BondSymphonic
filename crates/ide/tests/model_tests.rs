@@ -244,6 +244,25 @@ fn key_mapping() {
 }
 
 #[test]
+fn altgr_characters_pass_through_as_text() {
+    // Windows reports AltGr as Ctrl+Alt; on a Danish layout that is how @ and
+    // the brackets are typed, and the composed character arrives in the text.
+    let altgr = qt::MOD_CTRL | qt::MOD_ALT;
+    assert_eq!(key_to_bytes('@' as i32, altgr, "@", false), b"@");
+    assert_eq!(key_to_bytes('{' as i32, altgr, "{", false), b"{");
+    assert_eq!(key_to_bytes('}' as i32, altgr, "}", false), b"}");
+    assert_eq!(key_to_bytes('[' as i32, altgr, "[", false), b"[");
+    assert_eq!(key_to_bytes(']' as i32, altgr, "]", false), b"]");
+    // Ctrl+Alt with no composed character keeps the control-code behaviour.
+    assert_eq!(key_to_bytes('C' as i32, altgr, "", false), b"\x1b\x03");
+    // Plain Ctrl and plain Alt are unchanged.
+    assert_eq!(key_to_bytes('C' as i32, qt::MOD_CTRL, "", false), b"\x03");
+    assert_eq!(key_to_bytes('a' as i32, qt::MOD_ALT, "a", false), b"\x1ba");
+    // Special keys carry no text, so Ctrl+Alt+arrow still maps as an arrow.
+    assert_eq!(key_to_bytes(qt::KEY_LEFT, altgr, "", false), b"\x1b[D");
+}
+
+#[test]
 fn grid_tracks_title_and_application_cursor_keys() {
     let mut g = TerminalGrid::new(20, 3);
     assert_eq!(g.title(), None);

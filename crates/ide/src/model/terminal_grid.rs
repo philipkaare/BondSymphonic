@@ -218,6 +218,9 @@ impl TerminalGrid {
 
     /// Write an inverse-video marker line into the output stream, used for
     /// notices such as `[output dropped]`.
+    ///
+    /// Deliberately does not scroll to the bottom: a reader who has scrolled up
+    /// into history keeps their position.
     pub fn insert_marker(&mut self, text: &str) {
         self.feed(format!("\r\n\x1b[7m{text}\x1b[0m\r\n").as_bytes());
     }
@@ -347,6 +350,16 @@ pub fn key_to_bytes(qt_key: i32, modifiers: u32, text: &str, app_cursor_keys: bo
     let ctrl = modifiers & qt::MOD_CTRL != 0;
     let alt = modifiers & qt::MOD_ALT != 0;
     let shift = modifiers & qt::MOD_SHIFT != 0;
+
+    // Windows reports AltGr as Ctrl+Alt, and on layouts such as Danish or
+    // German that is how @ { } [ ] are typed. When both modifiers are set and
+    // the event carries a printable character, the keyboard layout has already
+    // composed it, so send that character rather than folding it into a
+    // control code. Plain Ctrl and plain Alt are unaffected.
+    if ctrl && alt && starts_with_printable(text) {
+        return text.as_bytes().to_vec();
+    }
+
     // Cursor and edit keys use SS3 (`ESC O`) in application mode, CSI otherwise.
     let intro = if app_cursor_keys { b'O' } else { b'[' };
 
@@ -388,6 +401,15 @@ pub fn key_to_bytes(qt_key: i32, modifiers: u32, text: &str, app_cursor_keys: bo
         out.insert(0, 0x1b);
     }
     out
+}
+
+/// Whether the event's text begins with a printable character rather than a
+/// C0 control code or DEL.
+fn starts_with_printable(text: &str) -> bool {
+    match text.as_bytes().first() {
+        Some(&byte) => byte >= 0x20 && byte != 0x7f,
+        None => false,
+    }
 }
 
 /// F1-F12, as sent by xterm.
