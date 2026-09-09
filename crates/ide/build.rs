@@ -12,6 +12,14 @@ fn main() {
         .file("src/qobjects/file_tree.rs")
         .file("src/qobjects/terminal_session.rs")
         // Headers are run through moc, sources are compiled.
-        .cpp_files(["cpp/MainWindow.h", "cpp/MainWindow.cpp", "cpp/app.cpp"])
+        .cpp_files([
+            "cpp/GroupBar.h",
+            "cpp/GroupBar.cpp",
+            "cpp/NewAgentDialog.h",
+            "cpp/NewAgentDialog.cpp",
+            "cpp/MainWindow.h",
+            "cpp/MainWindow.cpp",
+            "cpp/app.cpp",
+        ])
         .build();
 }
