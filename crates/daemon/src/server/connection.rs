@@ -66,15 +66,22 @@ pub async fn serve_connection(
     // the events a request published on its way out are written before its response.
     // See `pending` below.
     let (resp_tx, mut resp_rx) = mpsc::channel::<ServerMessage>(256);
-    let mut pending: Option<ServerMessage> = None;
+    // A reply waiting to be written, with the number of events that were already queued
+    // for this connection when it was parked. See the flush at the top of the loop.
+    let mut pending: Option<(ServerMessage, usize)> = None;
 
     loop {
         // A handler publishes its events (`workspace.state` Ready, say) before it
         // returns, so by the time its reply reaches this loop they are already in this
         // connection's broadcast queue. Flushing that queue first turns "the event
         // arrives before the response" from a scheduling race into a guarantee.
-        if let Some(resp) = pending.take() {
-            if !forward_events(&mut event_rx, &ctx, &out_tx).await {
+        //
+        // Only those events go out first, though: the flush can block on a full writer
+        // channel, and an event a background task publishes meanwhile (a `pty.output`
+        // from the reader `pty.open` spawned, say) must not overtake the reply that
+        // carries the id it refers to.
+        if let Some((resp, queued)) = pending.take() {
+            if !forward_events(&mut event_rx, &ctx, &out_tx, queued).await {
                 break;
             }
             if out_tx.send(codec::encode(&resp)).await.is_err() {
@@ -86,7 +93,7 @@ pub async fn serve_connection(
             // Reaps finished request tasks. On an empty set `join_next` yields `None`, the
             // pattern fails to match and the branch is simply disabled for this iteration.
             Some(_) = inflight.join_next() => {}
-            Some(resp) = resp_rx.recv() => { pending = Some(resp); }
+            Some(resp) = resp_rx.recv() => { pending = Some((resp, event_rx.len())); }
             ev = event_rx.recv() => {
                 if let Ok(msg) = ev {
                     if ctx.is_authenticated() && out_tx.send(codec::encode(&msg)).await.is_err() {
@@ -139,7 +146,7 @@ pub async fn serve_connection(
 
     reader.abort();
     // A reply the loop had in hand when it stopped is still owed to the caller.
-    if let Some(resp) = pending.take() {
+    if let Some((resp, _)) = pending.take() {
         let _ = out_tx.send(codec::encode(&resp)).await;
     }
     // Let in-flight handlers finish queueing their replies, then stop waiting on the slow
@@ -156,15 +163,19 @@ pub async fn serve_connection(
     let _ = writer.await;
 }
 
-/// Writes every event already queued for this connection. Returns false when the
+/// Writes up to `max` events already queued for this connection. Returns false when the
 /// writer is gone and the connection should be torn down.
+///
+/// The bound is what keeps a reply ahead of events published after it was parked: those
+/// are written by the connection loop's own event branch on a later iteration, in order.
 async fn forward_events(
     event_rx: &mut tokio::sync::broadcast::Receiver<ServerMessage>,
     ctx: &ConnCtx,
     out_tx: &mpsc::Sender<String>,
+    max: usize,
 ) -> bool {
     use tokio::sync::broadcast::error::TryRecvError;
-    loop {
+    for _ in 0..max {
         match event_rx.try_recv() {
             Ok(msg) => {
                 if ctx.is_authenticated() && out_tx.send(codec::encode(&msg)).await.is_err() {
@@ -172,11 +183,13 @@ async fn forward_events(
                 }
             }
             // `Lagged` is reported once and then reception resumes, so it is skipped
-            // rather than ending the flush.
+            // rather than ending the flush. It consumes one of `max`: the dropped events
+            // it stands for were among the ones counted.
             Err(TryRecvError::Lagged(_)) => {}
             Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => return true,
         }
     }
+    true
 }
 
 /// Writes replies that landed after the connection loop stopped.

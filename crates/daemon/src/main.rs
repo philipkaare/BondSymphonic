@@ -94,7 +94,6 @@ async fn serve(args: Args) -> Result<()> {
     })
     .await?;
     let daemon = Daemon::new(DataDirs::new(&data_dir), backend, server.event_bus())?;
-    daemon.restore().await;
     let system = SystemHandler {
         token: server.token().to_string(),
         capabilities,
@@ -103,11 +102,14 @@ async fn serve(args: Args) -> Result<()> {
         system,
         daemon: daemon.clone(),
     }));
-    // The one and only stdout line: the IDE parses it.
+    // The one and only stdout line: the IDE parses it. It goes out before `restore`,
+    // which starts a sandbox per registered workspace and can take seconds; the IDE
+    // should not wait on that to learn the port.
     println!(
         "{}",
         serde_json::json!({ "port": server.port(), "token": server.token() })
     );
+    daemon.restore().await;
 
     let shutdown = CancellationToken::new();
     // Exit when stdin closes (IDE died) or on ctrl-c.

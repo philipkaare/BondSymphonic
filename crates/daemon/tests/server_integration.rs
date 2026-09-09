@@ -1,4 +1,4 @@
-use bondsymphonic_daemon::server::dispatch::{DelayingHandler, SystemHandler};
+use bondsymphonic_daemon::server::dispatch::{ConnCtx, DelayingHandler, Handler, SystemHandler};
 use bondsymphonic_daemon::server::{Server, ServerConfig};
 use bondsymphonic_proto::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -311,6 +311,116 @@ async fn undecodable_line_is_answered_with_the_recovered_id() {
             error: Some(e),
             ..
         } => assert_eq!(e.code, ErrorCode::InvalidParams),
+        other => panic!("unexpected {other:?}"),
+    }
+    cancel.cancel();
+}
+
+/// A reply must not be overtaken by an event a background task publishes *after* the
+/// reply was already queued for writing: `pty.open`'s reader starts producing
+/// `pty.output` the moment the pty exists, and those events name a `pty_id` the client
+/// only learns from the reply.
+///
+/// The handler publishes a burst large enough to fill the connection's writer channel
+/// (256 messages) and both socket buffers, so the flush that runs ahead of the reply is
+/// still blocked when the spawned task publishes `late`; the client deliberately reads
+/// nothing until well after that. Without the bound, the flush drains whatever has
+/// arrived by then and `late` jumps the reply.
+#[tokio::test]
+async fn an_event_published_after_a_reply_is_queued_is_written_after_it() {
+    const BURST: usize = 600;
+    const PAYLOAD: usize = 16 * 1024;
+
+    fn log(message: String) -> Event {
+        Event::DaemonLog {
+            level: LogLevel::Info,
+            message,
+            host: None,
+        }
+    }
+
+    struct BurstThenLate {
+        inner: std::sync::Arc<dyn Handler>,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for BurstThenLate {
+        async fn handle(&self, req: Request, ctx: &ConnCtx) -> Result<serde_json::Value, RpcError> {
+            match req {
+                Request::WorkspaceList {} => {
+                    let pad = "x".repeat(PAYLOAD);
+                    for i in 0..BURST {
+                        ctx.events.publish(None, log(format!("burst-{i}-{pad}")));
+                    }
+                    let bus = ctx.events.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        bus.publish(None, log("late".into()));
+                    });
+                    Ok(serde_json::json!({ "workspaces": [] }))
+                }
+                other => self.inner.handle(other, ctx).await,
+            }
+        }
+    }
+
+    let cfg = ServerConfig::default();
+    let capabilities = cfg.capabilities.clone();
+    let server = Server::bind(cfg).await.unwrap();
+    let port = server.port();
+    let token = server.token().to_string();
+    let server = server.with_handler(std::sync::Arc::new(BurstThenLate {
+        inner: std::sync::Arc::new(SystemHandler {
+            token: token.clone(),
+            capabilities,
+        }),
+    }));
+    let cancel = CancellationToken::new();
+    let c2 = cancel.clone();
+    tokio::spawn(async move { server.run(c2).await.unwrap() });
+
+    let (mut r, mut w) = connect(port).await;
+    send(
+        &mut w,
+        1,
+        Request::Hello(HelloParams {
+            token,
+            client_version: "0.1.0".into(),
+        }),
+    )
+    .await;
+    recv(&mut r).await.unwrap();
+
+    send(&mut w, 2, Request::WorkspaceList {}).await;
+    // Read nothing while the burst piles up, so the flush is still running when the
+    // spawned task publishes at 50ms.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let mut before = Vec::new();
+    loop {
+        match recv(&mut r).await.unwrap() {
+            ServerMessage::Event {
+                event: Event::DaemonLog { message, .. },
+                ..
+            } => before.push(message),
+            ServerMessage::Response { id: 2, .. } => break,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(
+        before.len(),
+        BURST,
+        "only the events queued when the reply was parked may precede it; last was {:?}",
+        before
+            .last()
+            .map(|m| m.chars().take(16).collect::<String>())
+    );
+    assert!(before.iter().all(|m| m.starts_with("burst-")));
+    match recv(&mut r).await.unwrap() {
+        ServerMessage::Event {
+            event: Event::DaemonLog { message, .. },
+            ..
+        } => assert_eq!(message, "late"),
         other => panic!("unexpected {other:?}"),
     }
     cancel.cancel();

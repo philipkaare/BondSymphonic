@@ -149,6 +149,11 @@ pub async fn create(d: &Daemon, p: WorkspaceCreateParams) -> Result<WorkspaceInf
         if e.code != ErrorCode::Conflict {
             let _ = worktree::remove(&d.git, &layout).await;
         }
+        // The client has already seen `Creating`. Tell it why the workspace failed, then
+        // send the terminal `Destroying` event a real destroy ends on, so the workspace
+        // disappears from the client's list instead of hanging there forever.
+        let _ = d.set_state(&id, WorkspaceState::Error(e.message.clone()));
+        let _ = d.set_state(&id, WorkspaceState::Destroying);
         let _ = d.registry.remove(&id);
         d.dirs.remove_workspace(&id);
         return Err(e);
@@ -169,24 +174,37 @@ pub async fn create(d: &Daemon, p: WorkspaceCreateParams) -> Result<WorkspaceInf
 pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty, RpcError> {
     let ws = d.workspace(id)?;
     let layout = layout_for(d, &ws).await?;
-    if !force && ws.worktree_path.exists() {
-        let dirty = !layout
-            .daemon_git()
-            .run(&ws.worktree_path, &["status", "--porcelain"])
-            .await?
-            .stdout
-            .trim()
-            .is_empty();
-        let unmerged = !layout
-            .daemon_git()
-            .run(
-                &ws.repo_path,
-                &["rev-list", &format!("{}..{}", ws.base_branch, ws.branch)],
-            )
-            .await?
-            .stdout
-            .trim()
-            .is_empty();
+    if !force {
+        // A missing worktree directory rules out the dirty check but not the unmerged
+        // one. `restore` records that state as `Error("worktree directory is missing")`,
+        // and the branch still points at commits whose objects live only in this
+        // workspace's private object dir, which the `git branch -D` in `worktree::remove`
+        // would discard for good.
+        let dirty = if ws.worktree_path.exists() {
+            !layout
+                .daemon_git()
+                .run(&ws.worktree_path, &["status", "--porcelain"])
+                .await?
+                .stdout
+                .trim()
+                .is_empty()
+        } else {
+            false
+        };
+        let unmerged = if repo::branch_exists(&d.git, &ws.repo_path, &ws.branch).await? {
+            !layout
+                .daemon_git()
+                .run(
+                    &ws.repo_path,
+                    &["rev-list", &format!("{}..{}", ws.base_branch, ws.branch)],
+                )
+                .await?
+                .stdout
+                .trim()
+                .is_empty()
+        } else {
+            false
+        };
         if dirty || unmerged {
             return Err(RpcError::new(
                 ErrorCode::Conflict,
@@ -203,7 +221,15 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
     if let Some(h) = handle {
         let _ = h.shutdown().await;
     }
-    worktree::remove(&d.git, &layout).await?;
+    if let Err(e) = worktree::remove(&d.git, &layout).await {
+        // The ptys are closed and the sandbox is down, so the workspace must not be left
+        // stranded in `Destroying`: a client would wait on a state that never arrives.
+        let _ = d.set_state(
+            id,
+            WorkspaceState::Error(format!("destroy failed: {}", e.message)),
+        );
+        return Err(e);
+    }
     d.dirs.remove_workspace(id);
     d.registry
         .remove(id)
