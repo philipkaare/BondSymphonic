@@ -88,12 +88,19 @@ pub fn align(base: &str, work: &str) -> Vec<DiffRow> {
 }
 
 /// [`align`], but giving up on an exact diff after `budget` and approximating
-/// the rest. The flag says whether the budget ran out, so a view can tell the
-/// user the diff it is showing is coarser than the file deserves.
+/// the rest, so a view can tell the user the diff it is showing may be coarser
+/// than the file deserves.
 ///
 /// The rows are always a valid alignment of the two texts; only their
 /// minimality is at stake. A budget that is not spent produces exactly what
 /// [`align`] produces.
+///
+/// The flag is a conservative signal, not a report from the algorithm:
+/// `similar` does not say whether it approximated, so what is measured is
+/// whether the alignment used up its budget. A diff that lands exactly on the
+/// budget having stayed exact is reported as truncated too. Erring that way
+/// costs a line of header text; erring the other way would tell the user a
+/// coarse diff is exact.
 pub fn align_with_deadline(base: &str, work: &str, budget: Duration) -> (Vec<DiffRow>, bool) {
     let (old, new) = (split_lines(base), split_lines(work));
     let started = Instant::now();

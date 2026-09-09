@@ -12,7 +12,8 @@ use bondsymphonic_ide::model::app_state::{AgentTab, TabStatus, Workspaces};
 use bondsymphonic_ide::model::file_tree::FileTree;
 use bondsymphonic_ide::qobjects::changes_model::touches_workspace;
 use bondsymphonic_ide::qobjects::editor_document::{
-    build_buffer, normalise_line_separators, read_only_reason, HIGHLIGHT_MAX_BYTES,
+    build_buffer, may_install_disk_text, normalise_line_separators, read_only_reason,
+    HIGHLIGHT_MAX_BYTES,
 };
 use bondsymphonic_proto::{
     AgentAdapterKind, Event, FileEntry, FileStatus, PtyId, ReadFileResult, WorkspaceId,
@@ -313,4 +314,23 @@ fn very_large_files_open_with_highlighting_off() {
     assert!(!buffer.highlighting());
     assert_eq!(buffer.language().map(|l| l.name()), Some("rust"));
     assert_eq!(buffer.spans_json(0, Theme::for_dark(false)), "[]");
+}
+
+/// The rule that keeps a keystroke typed during a save, and a save that
+/// overtakes a reload, from being undone by the read they raced.
+#[test]
+fn a_reload_installs_disk_text_only_over_an_untouched_document() {
+    // Nothing happened while the read was in flight: install it.
+    assert!(may_install_disk_text(false, 7, 7));
+
+    // The user typed while the read was in flight: their edits would be lost.
+    assert!(!may_install_disk_text(true, 7, 8));
+
+    // Clean again, but only because a save of newer text landed first.
+    // Installing the older read would undo that save.
+    assert!(!may_install_disk_text(false, 7, 8));
+
+    // Dirty without the counter having moved cannot happen in practice, and
+    // refusing is the safe answer either way.
+    assert!(!may_install_disk_text(true, 7, 7));
 }

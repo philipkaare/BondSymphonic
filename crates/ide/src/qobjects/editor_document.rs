@@ -18,6 +18,16 @@
 //! path. A change while the document is clean reloads it silently; a change
 //! while it is dirty raises `externalChange` and waits for `acceptExternal` or
 //! `keepLocal`.
+//!
+//! Writes and reads overlap with typing, so both are decided twice: once when
+//! they are issued and again when they land. Every edit bumps
+//! `content_generation`, and each request captures it. A write clears `dirty`
+//! only if the value is unchanged when it returns, so a keystroke typed during
+//! a save leaves the document dirty rather than looking saved. A silent reload
+//! installs disk text only if [`may_install_disk_text`] still allows it, so it
+//! can neither overwrite fresh edits nor undo a save that overtook it. The one
+//! exception is `acceptExternal`, which is the user asking for exactly that
+//! overwrite.
 
 use crate::highlight::languages::Language;
 use crate::highlight::theme::Theme;
@@ -131,6 +141,11 @@ type QtHandle = cxx_qt::CxxQtThread<qobject::EditorDocument>;
 /// about where re-parsing stops being free on a keypress.
 pub const HIGHLIGHT_MAX_BYTES: usize = 512 * 1024;
 
+/// Why `save` refuses a document that has never finished loading. Reported
+/// through `saveFailed` rather than swallowed, so a save-all can tell the two
+/// apart.
+pub const NOT_LOADED: &str = "no file is open";
+
 pub struct EditorDocumentRust {
     workspace_id: QString,
     path: QString,
@@ -146,6 +161,12 @@ pub struct EditorDocumentRust {
     external_pending: bool,
     /// Bumped on every `open` so a late read for an earlier file is dropped.
     generation: u64,
+    /// Bumped on every edit that changes the text. A write and a read each
+    /// capture it when they are issued and compare it when they land, so
+    /// neither can act on a buffer the user has changed in the meantime.
+    /// Monotonic across `open`s, so a value captured for an earlier file can
+    /// never match by accident.
+    content_generation: u64,
 }
 
 impl Default for EditorDocumentRust {
@@ -162,6 +183,7 @@ impl Default for EditorDocumentRust {
             watch_task: None,
             external_pending: false,
             generation: 0,
+            content_generation: 0,
         }
     }
 }
@@ -172,6 +194,22 @@ impl Drop for EditorDocumentRust {
             task.abort();
         }
     }
+}
+
+/// Whether a read issued when the content stood at `at_read` may still install
+/// its text, given the document's state now.
+///
+/// Both halves are load-bearing, and neither implies the other:
+///
+/// * A document that has become dirty has edits the disk text would erase.
+/// * A document that is clean again may have been made clean by a *save* of
+///   newer text than the read is carrying, and installing it would undo the
+///   save. The content generation is what catches that one.
+///
+/// Not consulted by `acceptExternal`, where discarding local edits is the
+/// whole point of the call.
+pub fn may_install_disk_text(dirty: bool, at_read: u64, now: u64) -> bool {
+    !dirty && at_read == now
 }
 
 /// Why a file opens read-only, or empty when it is editable.
@@ -242,19 +280,28 @@ pub fn build_buffer(path: &str, content: &str) -> (EditorBuffer, bool) {
     (buffer, normalised)
 }
 
+/// What a completed read may do with the text it brings back.
+#[derive(Clone, Copy)]
+enum Install {
+    /// An `open` or an `acceptExternal`: replace the text and emit `loaded`
+    /// whatever the document has done while the read was in flight, because
+    /// discarding local state is what the caller asked for.
+    Always,
+    /// The watch task's silent reload, carrying the content generation the
+    /// read was issued at. Installs only while [`may_install_disk_text`]
+    /// allows it, and then only if the file actually differs.
+    IfUnchangedSince(u64),
+}
+
 /// Reads one file and installs it over the buffer on the Qt thread, dropping
 /// the reply if the document has been re-opened since.
-///
-/// `force` distinguishes the two callers: an open or an `acceptExternal`
-/// always replaces the text and emits `loaded`, while the watch task's reload
-/// leaves an unchanged file alone.
 async fn read_into(
     shared: Shared,
     qt: QtHandle,
     workspace: String,
     path: String,
     generation: u64,
-    force: bool,
+    install: Install,
 ) {
     let params = FsPathParams {
         workspace_id: WorkspaceId(workspace),
@@ -271,7 +318,7 @@ async fn read_into(
                     tracing::debug!("fs.read_file: dropping stale read of {path}");
                     return;
                 }
-                replace_from_disk(q, res, force);
+                replace_from_disk(q, res, install);
             });
         }
         Err(e) => {
@@ -305,7 +352,7 @@ async fn open_and_watch(
         workspace.clone(),
         path.clone(),
         generation,
-        true,
+        Install::Always,
     )
     .await;
     // Enabled even when the read failed: the file may be about to appear, and
@@ -337,7 +384,10 @@ async fn open_and_watch(
                 q.external_change();
                 return;
             }
-            q.reload(false);
+            // Captured here, on the Qt thread, so the read that goes out is
+            // pinned to the buffer as it stands at this instant.
+            let at_read = q.as_ref().rust().content_generation;
+            q.reload(Install::IfUnchangedSince(at_read));
         });
         if queued.is_err() {
             return;
@@ -392,6 +442,12 @@ impl qobject::EditorDocument {
             return;
         }
         let inserted = inserted.to_string();
+        // `QTextDocument::contentsChange` also fires for changes that alter no
+        // text at all. Marking the document dirty for one of those would make
+        // a save button light up over a file nobody has touched.
+        if utf16_removed <= 0 && inserted.is_empty() {
+            return;
+        }
         let range = {
             let mut rust = self.as_mut().rust_mut();
             let Some(buffer) = rust.buffer.as_mut() else {
@@ -404,7 +460,12 @@ impl qobject::EditorDocument {
             // pair is two UTF-16 units and one char, so the two ends have to be
             // mapped separately.
             let to = buffer.utf16_to_char(pos.saturating_add(removed));
-            buffer.apply_edit(from, to.saturating_sub(from), &inserted)
+            let range = buffer.apply_edit(from, to.saturating_sub(from), &inserted);
+            // Every request in flight captured this counter when it was
+            // issued; moving it is what tells them the buffer is no longer
+            // the one they were sent for.
+            rust.content_generation = rust.content_generation.wrapping_add(1);
+            range
         };
         self.as_mut().set_dirty(true);
         self.highlight_changed(clamp_line(range.0), clamp_line(range.1));
@@ -436,13 +497,23 @@ impl qobject::EditorDocument {
     }
 
     pub fn save(mut self: Pin<&mut Self>) {
-        if !self.as_ref().read_only_reason().to_string().is_empty() {
+        // Refusals answer, rather than returning in silence: under
+        // `requestSaveAll` the window has no other way to tell a document that
+        // was written from one that was never going to be.
+        let reason = self.as_ref().read_only_reason().to_string();
+        if !reason.is_empty() {
+            self.save_failed(QString::from(&reason));
             return;
         }
         let Some(content) = self.as_ref().rust().buffer.as_ref().map(EditorBuffer::text) else {
+            self.save_failed(QString::from(NOT_LOADED));
             return;
         };
         let generation = self.as_ref().rust().generation;
+        // Captured with the content that is about to be written, and compared
+        // when the write returns: a keystroke landing in between must not be
+        // erased by a `dirty = false` describing older text.
+        let content_at_write = self.as_ref().rust().content_generation;
         let params = FsWriteParams {
             workspace_id: WorkspaceId(self.as_ref().workspace_id().to_string()),
             path: self.as_ref().path().to_string(),
@@ -468,12 +539,19 @@ impl qobject::EditorDocument {
                         if q.as_ref().rust().generation != generation {
                             return;
                         }
-                        q.as_mut().set_dirty(false);
+                        // The bytes on disk are the ones this write carried.
+                        // If the user has typed since, the buffer is already
+                        // past them and the document stays dirty: `saved` is
+                        // still emitted, because the write did happen.
+                        if q.as_ref().rust().content_generation == content_at_write {
+                            q.as_mut().set_dirty(false);
+                        }
                         // The write itself produces an `fs.changed`; the watch
                         // then re-reads, finds identical content and does
                         // nothing. That is how our own writes are ignored,
                         // without any bookkeeping to get wrong.
                         q.as_mut().rust_mut().external_pending = false;
+                        q.as_mut().set_error(QString::from(""));
                         q.saved();
                     });
                 }
@@ -493,20 +571,21 @@ impl qobject::EditorDocument {
     }
 
     pub fn accept_external(self: Pin<&mut Self>) {
-        self.reload(true);
+        self.reload(Install::Always);
     }
 
     pub fn keep_local(mut self: Pin<&mut Self>) {
         self.as_mut().rust_mut().external_pending = false;
     }
 
-    /// Re-reads the file and replaces the buffer with what is on disk.
+    /// Re-reads the file and offers what is on disk to `replace_from_disk`.
     ///
-    /// `force` is the user answering `externalChange`: the text is replaced
-    /// and `loaded` emitted whatever the file now holds. Without it the
-    /// reload is the watch task's, and identical content is left alone so a
-    /// save of our own does not reset the view's cursor and selection.
-    fn reload(mut self: Pin<&mut Self>, force: bool) {
+    /// [`Install::Always`] is the user answering `externalChange`: the text is
+    /// replaced and `loaded` emitted whatever the file now holds. The watch
+    /// task passes [`Install::IfUnchangedSince`] instead, so an unchanged file
+    /// is left alone (which is what makes our own `save` a no-op here) and a
+    /// document the user has moved on from is not overwritten.
+    fn reload(mut self: Pin<&mut Self>, install: Install) {
         let generation = self.as_ref().rust().generation;
         let workspace = self.as_ref().workspace_id().to_string();
         let path = self.as_ref().path().to_string();
@@ -522,14 +601,30 @@ impl qobject::EditorDocument {
             }
         };
         let qt = self.as_ref().qt_thread();
-        runtime().spawn(read_into(shared, qt, workspace, path, generation, force));
+        runtime().spawn(read_into(shared, qt, workspace, path, generation, install));
     }
 }
 
-/// Installs a freshly read file over the buffer. With `force` false an
-/// unchanged file is left alone, which is what makes the `fs.changed` our own
-/// `save` triggers a no-op.
-fn replace_from_disk(mut q: Pin<&mut qobject::EditorDocument>, res: ReadFileResult, force: bool) {
+/// Installs a freshly read file over the buffer, if this read is still allowed
+/// to and the file actually differs.
+fn replace_from_disk(
+    mut q: Pin<&mut qobject::EditorDocument>,
+    res: ReadFileResult,
+    install: Install,
+) {
+    let force = match install {
+        Install::Always => true,
+        Install::IfUnchangedSince(at_read) => {
+            let now = q.as_ref().rust().content_generation;
+            if !may_install_disk_text(*q.as_ref().dirty(), at_read, now) {
+                // The user typed, or saved newer text, while this read was in
+                // flight. Installing now would erase either one.
+                tracing::debug!("fs.read_file: the document moved on; dropping the reload");
+                return;
+            }
+            false
+        }
+    };
     let path = q.as_ref().path().to_string();
     let (text, _) = normalise_line_separators(&res.content);
     let unchanged = q
@@ -549,6 +644,9 @@ fn replace_from_disk(mut q: Pin<&mut qobject::EditorDocument>, res: ReadFileResu
         .set_read_only_reason(QString::from(read_only_reason(&res)));
     q.as_mut().set_dirty(false);
     q.as_mut().rust_mut().external_pending = false;
+    // The document now matches disk, so whatever the last failure said about
+    // it is history.
+    q.as_mut().set_error(QString::from(""));
     q.loaded();
 }
 

@@ -192,3 +192,25 @@ fn only_the_terminating_crlf_is_stripped_from_a_row() {
         EditorBuffer::new("x.txt", "a\r\r\n").line(0)
     );
 }
+
+/// A budget of nothing is spent before the first comparison, so the flag
+/// reaches the caller. The rows still describe both texts in full: the
+/// deadline costs minimality, never correctness.
+#[test]
+fn a_spent_budget_is_reported_and_still_yields_every_line() {
+    let (rows, truncated) = align_with_deadline("a\nb\n", "c\nd\n", Duration::ZERO);
+    assert!(truncated);
+
+    let left: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.left_no.is_some())
+        .map(|r| r.left_text.as_str())
+        .collect();
+    let right: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.right_no.is_some())
+        .map(|r| r.right_text.as_str())
+        .collect();
+    assert_eq!(left, ["a", "b"]);
+    assert_eq!(right, ["c", "d"]);
+}
