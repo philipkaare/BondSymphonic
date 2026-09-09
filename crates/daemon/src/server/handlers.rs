@@ -42,7 +42,11 @@ impl Handler for WorkspaceHandler {
                 ok(lifecycle::destroy(d, &p.workspace_id, p.force).await?)
             }
             Request::WorkspaceStatus(p) => ok(lifecycle::status(d, &p.workspace_id).await?),
-            // Task 7 and Task 8 add Pty* and Fs* arms here.
+            Request::PtyOpen(p) => ok(d.ptys.open(d, p).await?),
+            Request::PtyWrite(p) => ok(d.ptys.write(p).await?),
+            Request::PtyResize(p) => ok(d.ptys.resize(p).await?),
+            Request::PtyClose(p) => ok(d.ptys.close(&p.pty_id).await?),
+            // Task 8 adds the Fs* arms here.
             other => self.system.handle(other, ctx).await,
         }
     }

@@ -46,6 +46,11 @@ pub struct Client {
     r: BufReader<tokio::net::tcp::OwnedReadHalf>,
     w: tokio::net::tcp::OwnedWriteHalf,
     next: u64,
+    /// Events that arrived while `call` was waiting for a response. They are
+    /// kept rather than dropped: the daemon delivers everything queued for a
+    /// connection ahead of the reply, so a test that only used `call` would
+    /// otherwise lose events published while its request was in flight.
+    pending: Vec<(Option<WorkspaceId>, Event)>,
 }
 
 impl Client {
@@ -56,6 +61,7 @@ impl Client {
             r: BufReader::new(r),
             w,
             next: 1,
+            pending: Vec::new(),
         };
         let v = c
             .call(Request::Hello(HelloParams {
@@ -113,7 +119,14 @@ impl Client {
     pub async fn call(&mut self, req: Request) -> Result<serde_json::Value, RpcError> {
         let id = self.send(req).await;
         let mut ev = Vec::new();
-        self.recv_response(id, &mut ev).await
+        let out = self.recv_response(id, &mut ev).await;
+        self.pending.extend(ev);
+        out
+    }
+
+    /// Takes the events `call` has buffered since the last drain.
+    pub fn drain_events(&mut self) -> Vec<(Option<WorkspaceId>, Event)> {
+        std::mem::take(&mut self.pending)
     }
 }
 
