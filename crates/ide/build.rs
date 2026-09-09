@@ -19,6 +19,8 @@ fn main() {
             "cpp/TerminalWidget.cpp",
             "cpp/AgentArea.h",
             "cpp/AgentArea.cpp",
+            "cpp/ExplorerDock.h",
+            "cpp/ExplorerDock.cpp",
             "cpp/NewAgentDialog.h",
             "cpp/NewAgentDialog.cpp",
             "cpp/MainWindow.h",

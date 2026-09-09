@@ -5,6 +5,7 @@
 
 class AgentArea;
 class AppController;
+class ExplorerDock;
 class FileTreeModel;
 class GroupBar;
 class GroupModel;
@@ -24,6 +25,7 @@ private:
     void buildMenus();
     void buildCentral();
     void buildDocks();
+    void buildToolBar();
     void buildStatusBar();
     void connectController();
     void onConnectionStateChanged();
@@ -38,6 +40,8 @@ private:
     GroupModel* m_groupModel;
     FileTreeModel* m_fileTreeModel;
     GroupBar* m_groupBar = nullptr;
+    /// The left dock: the active workspace's worktree.
+    ExplorerDock* m_explorer = nullptr;
     /// The New Agent dialog while it is up, so daemon failures can be parented
     /// to it rather than to a window the modal dialog is blocking.
     QPointer<NewAgentDialog> m_newAgentDialog;

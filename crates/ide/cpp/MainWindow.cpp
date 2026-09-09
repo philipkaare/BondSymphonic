@@ -1,11 +1,13 @@
 #include "MainWindow.h"
 #include "AgentArea.h"
+#include "ExplorerDock.h"
 #include "GroupBar.h"
 #include "NewAgentDialog.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
+#include <QAction>
 #include <QCheckBox>
 #include <QDockWidget>
 #include <QJsonDocument>
@@ -16,8 +18,9 @@
 #include <QPlainTextEdit>
 #include <QSplitter>
 #include <QStatusBar>
+#include <QStyle>
 #include <QTabWidget>
-#include <QTreeView>
+#include <QToolBar>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -29,6 +32,7 @@ MainWindow::MainWindow(AppController* controller, GroupModel* groupModel, FileTr
     buildMenus();
     buildCentral();
     buildDocks();
+    buildToolBar();
     buildStatusBar();
     connectController();
     onConnectionStateChanged();
@@ -82,13 +86,8 @@ void MainWindow::buildCentral() {
 }
 
 void MainWindow::buildDocks() {
-    auto* explorer = new QDockWidget("Explorer", this);
-    explorer->setObjectName("ExplorerDock");
-    auto* tabs = new QTabWidget(explorer);
-    tabs->addTab(new QTreeView(tabs), "Files");
-    tabs->addTab(new QTreeView(tabs), "Changes");
-    explorer->setWidget(tabs);
-    addDockWidget(Qt::LeftDockWidgetArea, explorer);
+    m_explorer = new ExplorerDock(m_fileTreeModel, this);
+    addDockWidget(Qt::LeftDockWidgetArea, m_explorer);
 
     auto* bottom = new QDockWidget("Output", this);
     bottom->setObjectName("BottomDock");
@@ -99,6 +98,16 @@ void MainWindow::buildDocks() {
     m_bottomTabs->addTab(m_shellArea, "Terminal");
     bottom->setWidget(m_bottomTabs);
     addDockWidget(Qt::BottomDockWidgetArea, bottom);
+}
+
+void MainWindow::buildToolBar() {
+    auto* toolBar = addToolBar("Main");
+    toolBar->setObjectName("MainToolBar");
+    toolBar->setMovable(false);
+    toolBar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    auto* refresh = toolBar->addAction(style()->standardIcon(QStyle::SP_BrowserReload), "Refresh");
+    refresh->setToolTip("Reload the Explorer file tree");
+    QObject::connect(refresh, &QAction::triggered, this, [this] { m_explorer->refresh(); });
 }
 
 void MainWindow::buildStatusBar() {
@@ -199,10 +208,12 @@ void MainWindow::onActiveTabChanged() {
     if (tabJson.isEmpty()) {
         m_agentArea->showPlaceholder();
         m_shellArea->showPlaceholder();
+        m_explorer->setWorkspace(QString());
         return;
     }
     const QJsonObject active = QJsonDocument::fromJson(tabJson.toUtf8()).object();
     const QString workspaceId = active.value("workspace_id").toString();
+    m_explorer->setWorkspace(workspaceId);
     // Both areas create their terminal on the workspace's first activation and
     // keep it afterwards, so this runs on every model change and is a no-op
     // once the pane exists.
