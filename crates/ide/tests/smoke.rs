@@ -91,6 +91,20 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
         contains_in_order(&seen, &EXPECTED),
         "the fake daemon did not see {EXPECTED:?} in order\n{context}"
     );
+    // The script issues one of each; the window issues its own for the tab the
+    // script created — the Explorer dock lists the new workspace's root and the
+    // agent pane opens and sizes its terminal. Without these the run would still
+    // be green while covering none of the C++ widgets, which is exactly what
+    // happened when the script raced the connect-time `workspace.list` and the
+    // reconcile dropped the tab out from under them.
+    for method in ["fs.list_dir", "pty.open"] {
+        let count = seen.iter().filter(|m| *m == method).count();
+        assert!(
+            count >= 2,
+            "expected the window to issue its own {method} as well as the script's, saw \
+             {count}\n{context}"
+        );
+    }
 }
 
 /// Whether `wanted` appears in `seen` in order, other requests in between

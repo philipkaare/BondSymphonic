@@ -28,34 +28,45 @@ pub struct DaemonProcess {
     pub token: String,
 }
 
-/// Test hook: a `host:port` to connect to instead of starting a daemon.
+/// Test hook: a loopback `host:port` to connect to instead of starting a daemon.
 pub const TEST_ADDR_ENV: &str = "BS_DAEMON_ADDR";
 /// Test hook: the handshake token used with [`TEST_ADDR_ENV`].
 pub const TEST_TOKEN_ENV: &str = "BS_DAEMON_TOKEN";
 
 /// **Test-only.** The daemon endpoint named in the environment, if there is one.
 ///
-/// With `BS_DAEMON_ADDR` set to a `host:port`, the IDE connects straight to that
-/// address using the token in `BS_DAEMON_TOKEN` and never runs `wsl.exe`. It
-/// exists so `tests/smoke.rs` can run the real IDE binary against an in-process
-/// fake daemon. Every ordinary run leaves the variable unset, this returns
-/// `None`, and the launch path is exactly what it would be without the hook.
+/// With `BS_DAEMON_ADDR` set to a loopback `host:port`, the IDE connects
+/// straight to that address using the token in `BS_DAEMON_TOKEN` and never runs
+/// `wsl.exe`. It exists so `tests/smoke.rs` can run the real IDE binary against
+/// an in-process fake daemon. Every ordinary run leaves the variable unset, this
+/// returns `None`, and the launch path is exactly what it would be without the
+/// hook.
 ///
-/// An unparseable address is reported and ignored rather than guessed at, so a
-/// typo does not silently become a normal WSL launch failure.
+/// A rejected address is reported and ignored rather than guessed at, so a typo
+/// does not silently become a normal WSL launch failure.
 pub fn test_endpoint() -> Option<(SocketAddr, String)> {
     let raw = std::env::var(TEST_ADDR_ENV).ok()?;
-    let Some(addr) = parse_endpoint(&raw) else {
-        tracing::error!("{TEST_ADDR_ENV}={raw:?} is not a host:port; ignoring the test hook");
-        return None;
-    };
-    Some((addr, std::env::var(TEST_TOKEN_ENV).unwrap_or_default()))
+    match parse_endpoint(&raw) {
+        Ok(addr) => Some((addr, std::env::var(TEST_TOKEN_ENV).unwrap_or_default())),
+        Err(why) => {
+            tracing::error!("{TEST_ADDR_ENV}={raw:?} {why}; ignoring the test hook");
+            None
+        }
+    }
 }
 
 /// The parsing half of [`test_endpoint`], split out so it is testable without
-/// mutating the process environment.
-fn parse_endpoint(raw: &str) -> Option<SocketAddr> {
-    raw.trim().parse().ok()
+/// mutating the process environment. The error is the reason, for the log.
+///
+/// Loopback only. The hook's whole purpose is a fake daemon in the same test
+/// run, and the daemon protocol carries file listings, file writes and PTY
+/// traffic, so an off-host address is never what was meant.
+fn parse_endpoint(raw: &str) -> Result<SocketAddr, &'static str> {
+    let addr: SocketAddr = raw.trim().parse().map_err(|_| "is not a host:port")?;
+    if !addr.ip().is_loopback() {
+        return Err("is not a loopback address");
+    }
+    Ok(addr)
 }
 
 /// Reads the daemon's first stdout line, `{"port":N,"token":"..."}`.
@@ -256,17 +267,31 @@ mod tests {
     fn parses_test_hook_endpoints() {
         assert_eq!(
             parse_endpoint("127.0.0.1:41234"),
-            Some(([127, 0, 0, 1], 41234).into())
+            Ok(([127, 0, 0, 1], 41234).into())
         );
-        // Whitespace is what a shell leaves behind; a bare port or a hostname
-        // is not an address and must not be guessed at.
+        // Whitespace is what a shell leaves behind. The whole 127.0.0.0/8 block
+        // and IPv6 `::1` are loopback too.
         assert_eq!(
             parse_endpoint("  127.0.0.1:1  "),
-            Some(([127, 0, 0, 1], 1).into())
+            Ok(([127, 0, 0, 1], 1).into())
         );
-        assert_eq!(parse_endpoint("41234"), None);
-        assert_eq!(parse_endpoint("localhost:41234"), None);
-        assert_eq!(parse_endpoint(""), None);
+        assert_eq!(
+            parse_endpoint("127.9.9.9:41234"),
+            Ok(([127, 9, 9, 9], 41234).into())
+        );
+        assert!(parse_endpoint("[::1]:41234").is_ok());
+
+        // A bare port or a hostname is not an address and must not be guessed at.
+        assert_eq!(parse_endpoint("41234"), Err("is not a host:port"));
+        assert_eq!(parse_endpoint("localhost:41234"), Err("is not a host:port"));
+        assert_eq!(parse_endpoint(""), Err("is not a host:port"));
+
+        // Parseable but off-host: refused, so the hook can never point the IDE
+        // at a daemon on another machine.
+        let off_host = "is not a loopback address";
+        assert_eq!(parse_endpoint("10.0.0.5:9000"), Err(off_host));
+        assert_eq!(parse_endpoint("0.0.0.0:9000"), Err(off_host));
+        assert_eq!(parse_endpoint("[2001:db8::1]:9000"), Err(off_host));
     }
 
     #[test]

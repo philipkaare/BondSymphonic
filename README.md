@@ -117,9 +117,11 @@ The IDE carries two environment-gated hooks for `crates/ide/tests/smoke.rs`, whi
 the real binary with `QT_QPA_PLATFORM=offscreen` against an in-process fake daemon. Both
 are read once at startup and do nothing at all when unset, which is every ordinary run.
 
-- `BS_DAEMON_ADDR` (a `host:port`) and `BS_DAEMON_TOKEN`: connect straight to that address
-  with that handshake token instead of starting a daemon through `wsl.exe`. An address
-  that is not a `host:port` is reported and ignored rather than guessed at.
+- `BS_DAEMON_ADDR` (a loopback `host:port`) and `BS_DAEMON_TOKEN`: connect straight to that
+  address with that handshake token instead of starting a daemon through `wsl.exe`. Only
+  loopback addresses are accepted, since the protocol carries file contents and PTY
+  traffic; anything else, and anything that is not a `host:port` at all, is reported and
+  ignored rather than guessed at.
 - `BS_SMOKE_SCRIPT`: a comma-separated list of steps the controller performs once the
   connection is up — `create` (a workspace over `BS_SMOKE_REPO`, announced with the same
   signal New Agent produces), `open` (a PTY in it), `tree` (its root listing), `quit` (end
