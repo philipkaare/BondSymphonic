@@ -1,5 +1,6 @@
 use bondsymphonic_daemon::fs;
 use bondsymphonic_proto::ErrorCode;
+use std::sync::Arc;
 
 #[test]
 fn resolve_contains_paths_and_rejects_escapes() {
@@ -65,4 +66,72 @@ fn list_read_write_roundtrip() {
         fs::list_dir(&root, "b.txt").unwrap_err().code,
         ErrorCode::InvalidParams
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn list_dir_follows_symlinks_to_directories_and_handles_dangling_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("wt");
+    std::fs::create_dir_all(root.join("real_dir")).unwrap();
+    std::fs::write(root.join("z.txt"), "z").unwrap();
+    std::os::unix::fs::symlink(root.join("real_dir"), root.join("link_dir")).unwrap();
+    std::os::unix::fs::symlink(root.join("does_not_exist"), root.join("dangling")).unwrap();
+
+    let l = fs::list_dir(&root, "").unwrap();
+
+    let link = l.entries.iter().find(|e| e.name == "link_dir").unwrap();
+    assert!(
+        link.is_dir,
+        "a symlink to a directory must be listed as a directory"
+    );
+    assert_eq!(link.size, 0);
+
+    let dangling = l.entries.iter().find(|e| e.name == "dangling").unwrap();
+    assert!(
+        !dangling.is_dir,
+        "a dangling symlink must still be listed, as a file"
+    );
+    assert_eq!(dangling.size, 0);
+
+    // Directories sort before regular files: link_dir (a directory) must
+    // come before z.txt (a plain file).
+    let idx = |n: &str| l.entries.iter().position(|e| e.name == n).unwrap();
+    assert!(idx("link_dir") < idx("z.txt"));
+}
+
+#[test]
+fn concurrent_writes_to_the_same_path_never_interleave_and_leave_no_temp_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = Arc::new(dir.path().join("wt"));
+    std::fs::create_dir_all(&*root).unwrap();
+
+    let contents: Vec<String> = (0..8)
+        .map(|i| format!("payload-from-writer-{i}-").repeat(2000))
+        .collect();
+    let handles: Vec<_> = contents
+        .iter()
+        .cloned()
+        .map(|content| {
+            let root = Arc::clone(&root);
+            std::thread::spawn(move || fs::write_file(&root, "shared.txt", &content).unwrap())
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let final_content = std::fs::read_to_string(root.join("shared.txt")).unwrap();
+    assert!(
+        contents.contains(&final_content),
+        "final content (len {}) was not one of the writes, so writes interleaved",
+        final_content.len()
+    );
+
+    let leftover: Vec<_> = std::fs::read_dir(&*root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".bs-tmp"))
+        .collect();
+    assert!(leftover.is_empty(), "leftover temp files: {leftover:?}");
 }

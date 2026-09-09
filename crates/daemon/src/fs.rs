@@ -4,6 +4,7 @@
 
 use bondsymphonic_proto::*;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const MAX_READ: usize = 4 * 1024 * 1024;
 
@@ -70,11 +71,23 @@ pub fn list_dir(root: &Path, rel: &str) -> Result<ListDirResult, RpcError> {
             if name == ".git" {
                 return None;
             }
-            let md = e.metadata().ok()?;
+            // `DirEntry::metadata` does not follow symlinks (it is `lstat`
+            // under the hood), so a symlinked directory would otherwise be
+            // reported as a file sized by the link itself. Follow the link
+            // with `std::fs::metadata`; if the target is missing (a
+            // dangling symlink), fall back to the link's own metadata just
+            // to confirm it exists, and list it as a zero-size file.
+            let (is_dir, size) = match std::fs::metadata(e.path()) {
+                Ok(md) => (md.is_dir(), if md.is_dir() { 0 } else { md.len() }),
+                Err(_) => {
+                    e.metadata().ok()?;
+                    (false, 0)
+                }
+            };
             Some(FileEntry {
                 name,
-                is_dir: md.is_dir(),
-                size: if md.is_dir() { 0 } else { md.len() },
+                is_dir,
+                size,
                 status: FileStatus::Unchanged,
             })
         })
@@ -129,18 +142,28 @@ pub fn read_file(root: &Path, rel: &str) -> Result<ReadFileResult, RpcError> {
     }
 }
 
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Writes `content` to `rel` via a temp file + rename, creating parent
 /// directories as needed and preserving the existing file's mode on unix.
+///
+/// The temp file name is unique per call (pid + a process-wide counter) so
+/// concurrent writers to the same path never share one temp file and race
+/// on its rename; the temp file is removed if anything fails after it is
+/// created.
 pub fn write_file(root: &Path, rel: &str, content: &str) -> Result<Empty, RpcError> {
     let path = resolve(root, rel)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| RpcError::io(&e))?;
     }
-    let tmp = path.with_extension(format!(
-        "{}.bs-tmp",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("")
-    ));
-    std::fs::write(&tmp, content).map_err(|e| RpcError::io(&e))?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!("{name}.{}.{counter}.bs-tmp", std::process::id()));
+
+    if let Err(e) = std::fs::write(&tmp, content) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(RpcError::io(&e));
+    }
     #[cfg(unix)]
     if let Ok(md) = std::fs::metadata(&path) {
         use std::os::unix::fs::PermissionsExt;
@@ -149,6 +172,9 @@ pub fn write_file(root: &Path, rel: &str, content: &str) -> Result<Empty, RpcErr
             std::fs::Permissions::from_mode(md.permissions().mode()),
         );
     }
-    std::fs::rename(&tmp, &path).map_err(|e| RpcError::io(&e))?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(RpcError::io(&e));
+    }
     Ok(Empty {})
 }
