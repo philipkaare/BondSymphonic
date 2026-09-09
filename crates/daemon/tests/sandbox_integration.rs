@@ -878,6 +878,10 @@ async fn a_claude_agent_streams_a_turn_from_inside_the_sandbox() {
         worktree.join("fixture.ndjson"),
     )
     .unwrap();
+    // Process-wide, and deliberately unguarded: this is the only test in this
+    // binary that reads or writes `BS_CLAUDE_BIN`, so there is nothing to
+    // serialise against. `agent_integration.rs` does take a lock, because every
+    // test in that binary points the variable somewhere different.
     std::env::set_var(
         "BS_CLAUDE_BIN",
         format!("/usr/bin/python3 {}", fake.display()),

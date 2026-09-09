@@ -260,11 +260,14 @@ impl ClaudeAdapter {
         let stdin = guard
             .as_mut()
             .ok_or_else(|| agent_error("agent stdin is closed"))?;
-        match stdin.write_all(line.as_bytes()).await {
-            Ok(()) => stdin
-                .flush()
-                .await
-                .map_err(|e| agent_error(format!("writing to the agent: {e}"))),
+        // The flush is as likely to be where a broken pipe surfaces as the
+        // write, so both failures take the same path.
+        let outcome = match stdin.write_all(line.as_bytes()).await {
+            Ok(()) => stdin.flush().await,
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(()) => Ok(()),
             Err(e) => {
                 // The process is gone; drop the writer so later calls fail
                 // quickly and the descriptor is not held open.
@@ -444,17 +447,31 @@ impl AgentAdapter for ClaudeAdapter {
     /// Asks the CLI to abandon the turn, and follows up with SIGINT if it does
     /// not. The control request is the polite path and keeps the session usable;
     /// the signal is for a CLI that is wedged in a tool and not reading stdin.
+    ///
+    /// The fallback belongs to the turn it was armed for and to no other. The
+    /// CLI normally answers in milliseconds and the user's next move is to type
+    /// the corrected prompt, so two seconds later the agent is usually busy
+    /// again on a different turn; a check of the state alone cannot tell the two
+    /// apart, and the signal reaches the whole process group, so firing into the
+    /// new turn kills the agent outright. The epoch is what distinguishes them:
+    /// any state change at all -- the acknowledgement, the new prompt, an error
+    /// -- retires this timer.
     async fn interrupt(&mut self) -> Result<(), RpcError> {
         let signal = self.running()?.signal.clone();
         self.write_line(interrupt_line(&new_id("req_"))).await?;
         let entry = self.sink.entry().clone();
         let agent_id = self.sink.agent_id().clone();
+        // Snapshotted after the write, so a state change the CLI makes in
+        // response to this very request already counts as an answer.
+        let armed_at = entry.epoch();
         tokio::spawn(async move {
             tokio::time::sleep(INTERRUPT_GRACE).await;
-            if matches!(
-                entry.state().0,
-                AgentState::Working | AgentState::WaitingPermission
-            ) {
+            let unanswered = entry.epoch() == armed_at
+                && matches!(
+                    entry.state().0,
+                    AgentState::Working | AgentState::WaitingPermission
+                );
+            if unanswered {
                 warn!(agent = %agent_id, "interrupt was not acknowledged; sending SIGINT");
                 (signal)(SIGINT);
             }

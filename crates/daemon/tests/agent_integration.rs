@@ -67,6 +67,9 @@ fn use_fake_claude(py: &str, fixture: &str) {
         "FAKE_CLAUDE_FIXTURE",
         fixture_dir().join("claude-stream").join(fixture),
     );
+    // Only the test that wants a slow turn sets this; clear whatever the
+    // previous test left behind.
+    std::env::remove_var("FAKE_CLAUDE_ECHO_DELAY");
 }
 
 fn agent_of(ev: &Event) -> Option<&AgentId> {
@@ -515,6 +518,85 @@ async fn interrupting_a_turn_ends_it_without_an_error() {
         ),
         "{more:?}"
     );
+
+    c.call(Request::AgentStop(AgentIdParams { agent_id: ag }))
+        .await
+        .unwrap();
+    cancel.cancel();
+}
+
+/// The SIGINT fallback belongs to the turn it was armed for.
+///
+/// `interrupt` writes a control request and arms a two-second SIGINT in case the
+/// CLI never answers. The CLI usually answers in milliseconds, and the user's
+/// next move is to type the corrected prompt straight away -- so two seconds
+/// later the agent is busy again, on a *different* turn. A fallback that only
+/// asks "is it working now?" fires into that new turn, and because the signal
+/// goes to the whole process group a real `claude -p` dies rather than merely
+/// abandoning the turn.
+///
+/// The kill is only reproducible where signals exist, so on Windows (whose noop
+/// backend maps SIGTERM and SIGKILL and drops everything else) this asserts the
+/// same thing trivially. The WSL run is the one that would have caught it.
+#[tokio::test]
+async fn an_interrupt_does_not_kill_the_turn_that_follows_it() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    use_fake_claude(py, "simple_turn.ndjson");
+    // Longer than the adapter's two-second interrupt grace, so the stale timer
+    // has something live to fire into.
+    std::env::set_var("FAKE_CLAUDE_ECHO_DELAY", "3");
+    let (port, token, _d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "epoch").await;
+
+    let ag = start_agent(&mut c, &ws.id).await;
+    // init, Working, the assistant text, the result, Idle.
+    next_agent_events(&mut c, &ag, 5, Duration::from_secs(20)).await;
+
+    c.call(Request::AgentInterrupt(AgentIdParams {
+        agent_id: ag.clone(),
+    }))
+    .await
+    .unwrap();
+    // The acknowledgement, which is what puts the agent back to Idle and ends
+    // the turn the timer was armed for.
+    let acked = next_agent_events(&mut c, &ag, 2, Duration::from_secs(20)).await;
+    assert_eq!(states(&acked).last(), Some(&AgentState::Idle), "{acked:?}");
+
+    // The corrected prompt, typed immediately, as a user would.
+    c.call(Request::AgentSend(AgentSendParams {
+        agent_id: ag.clone(),
+        text: "slow".into(),
+    }))
+    .await
+    .unwrap();
+
+    // UserText, Working, the echo, the result, Idle -- and nothing else. The
+    // stale timer fires somewhere in the middle of this wait.
+    let after = next_agent_events(&mut c, &ag, 5, Duration::from_secs(30)).await;
+    assert!(
+        bodies(&after).iter().any(
+            |b| matches!(b, AgentMessageBody::AssistantText { text } if text.contains("echo: slow"))
+        ),
+        "the new turn must finish: {after:?}"
+    );
+    assert!(
+        !after.iter().any(|e| matches!(
+            e,
+            Event::AgentStateChanged {
+                state: AgentState::Exited,
+                ..
+            }
+        )),
+        "the interrupt must not kill the turn that followed it: {after:?}"
+    );
+    assert_eq!(states(&after).last(), Some(&AgentState::Idle), "{after:?}");
 
     c.call(Request::AgentStop(AgentIdParams { agent_id: ag }))
         .await

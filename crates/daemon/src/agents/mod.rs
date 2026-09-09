@@ -109,6 +109,12 @@ pub struct AgentEntry {
     pub state: Mutex<(AgentState, Option<String>)>,
     pub session_id: Mutex<Option<String>>,
     pub seq: AtomicU64,
+    /// Bumped on every state change, so a caller can tell "still `Working`"
+    /// from "`Working` again". The state alone cannot: an agent that finished
+    /// one turn and started another looks identical to one that never left the
+    /// first, and something armed against the first turn must not act on the
+    /// second.
+    epoch: AtomicU64,
 }
 
 impl AgentEntry {
@@ -120,12 +126,19 @@ impl AgentEntry {
             state: Mutex::new((AgentState::Idle, None)),
             session_id: Mutex::new(None),
             seq: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
         }
     }
 
     /// The current state and its detail.
     pub fn state(&self) -> (AgentState, Option<String>) {
         self.state.lock().clone()
+    }
+
+    /// How many state changes this agent has been through. Only comparisons
+    /// between two readings mean anything.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
     }
 }
 
@@ -203,6 +216,9 @@ impl AgentSink {
     /// status never sees the older value.
     pub async fn state(&self, state: AgentState, detail: Option<String>) {
         *self.entry.state.lock() = (state, detail.clone());
+        // After the state itself, so anyone who sees a new epoch also sees the
+        // state that goes with it.
+        self.entry.epoch.fetch_add(1, Ordering::SeqCst);
         self.events.publish(
             Some(self.workspace_id.clone()),
             Event::AgentStateChanged {

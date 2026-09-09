@@ -20,7 +20,8 @@ Behaviour:
   for a permission answer.
 * After the fixture, every `user` line on stdin is answered with an assistant
   message echoing its text and a `result` line, so a turn can be driven from
-  the test.
+  the test. `FAKE_CLAUDE_ECHO_DELAY` (seconds, default 0) holds that turn open
+  for a while, which is how a test gets an agent that is genuinely busy.
 * An `interrupt` control request is acknowledged and ends the turn cleanly.
 * SIGINT exits 130; end of input on stdin exits 0.
 """
@@ -32,6 +33,14 @@ import sys
 import time
 
 LINE_DELAY = 0.02
+
+
+def echo_delay():
+    """How long an echoed turn takes before it answers."""
+    try:
+        return float(os.environ.get("FAKE_CLAUDE_ECHO_DELAY", "0"))
+    except ValueError:
+        return 0.0
 
 
 def emit(obj):
@@ -113,6 +122,7 @@ def replay(path, resumed):
 
 
 def echo_turn(session, text):
+    time.sleep(echo_delay())
     emit(
         {
             "type": "assistant",
