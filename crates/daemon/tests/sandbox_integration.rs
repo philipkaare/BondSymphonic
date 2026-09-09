@@ -332,6 +332,7 @@ async fn init_tears_down_when_the_exec_socket_closes() {
         &spec,
         std::path::Path::new("/run/bs/exec.sock"),
         &backend.self_exe,
+        &backend.user,
     );
     let mut bwrap = std::process::Command::new(&backend.bwrap_path)
         .args(&args)

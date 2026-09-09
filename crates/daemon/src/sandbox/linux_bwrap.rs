@@ -70,9 +70,16 @@ fn exe_is_hidden(self_exe: &Path) -> bool {
 ///
 /// Read-only binds are emitted before read-write ones so a writable subpath of
 /// a read-only tree wins.
-pub fn bwrap_args(spec: &SandboxSpec, socket_in_sandbox: &Path, self_exe: &Path) -> Vec<String> {
+pub fn bwrap_args(
+    spec: &SandboxSpec,
+    socket_in_sandbox: &Path,
+    self_exe: &Path,
+    user: &str,
+) -> Vec<String> {
     let s = |p: &Path| p.to_string_lossy().into_owned();
-    let home_in = format!("/home/{}", whoami());
+    // The caller's user, not the ambient `$USER`: the two differ on CI runners and
+    // whenever the daemon is started under a different account than it was configured for.
+    let home_in = format!("/home/{user}");
     // `/run` is a tmpfs because the root is bound read-only: without it bwrap
     // cannot create the `/run/bs` mount point.
     let mut a: Vec<String> = [
@@ -196,7 +203,12 @@ impl SandboxBackend for BwrapBackend {
         std::fs::create_dir_all(&spec.run_dir).map_err(|e| RpcError::io(&e))?;
         let host_sock = spec.run_dir.join("exec.sock");
         let _ = std::fs::remove_file(&host_sock);
-        let args = bwrap_args(spec, Path::new("/run/bs/exec.sock"), &self.self_exe);
+        let args = bwrap_args(
+            spec,
+            Path::new("/run/bs/exec.sock"),
+            &self.self_exe,
+            &self.user,
+        );
         let mut child = tokio::process::Command::new(&self.bwrap_path)
             .args(&args)
             .stdin(Stdio::null())
@@ -312,6 +324,7 @@ mod tests {
             &spec,
             Path::new("/run/bs/exec.sock"),
             Path::new("/usr/bin/bondsymphonic-daemon"),
+            "bs",
         );
         let s = args.join(" ");
         assert!(s.starts_with("--ro-bind / / --tmpfs /tmp --proc /proc --dev /dev"));
@@ -348,7 +361,7 @@ mod tests {
             cwd: "/data/worktrees/ws_1".into(),
         };
         let exe = Path::new("/home/bs/.bondsymphonic/target/debug/bondsymphonic-daemon");
-        let s = bwrap_args(&spec, Path::new("/run/bs/exec.sock"), exe).join(" ");
+        let s = bwrap_args(&spec, Path::new("/run/bs/exec.sock"), exe, "bs").join(" ");
         assert!(s.contains(&format!(
             "--ro-bind {} {INIT_EXE_IN_SANDBOX}",
             exe.display()
