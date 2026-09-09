@@ -233,23 +233,39 @@ impl qobject::GroupModel {
             tracing::warn!("add_tab: unparseable workspace info");
             return false;
         };
-        // A workspace the model already tracks (typically because `reconcile`
-        // filed it into "Unsorted" first) is refreshed and selected rather
-        // than added a second time.
+        let name = group_name.to_string();
+        // A workspace the model already tracks (because `reconcile` filed it
+        // into "Unsorted" as a plain terminal before the create call answered)
+        // is refreshed, moved into the group the user asked for, and given the
+        // adapter and command they chose, rather than added a second time.
         if self.as_ref().rust().workspaces.find(&info.id).is_some() {
-            if let Some((g, t)) = self
-                .as_mut()
-                .rust_mut()
-                .workspaces
-                .apply_workspace_info(&info)
+            let adapter = adapter.to_string();
+            let command = command.to_string();
             {
-                self.as_mut().rust_mut().workspaces.set_active(g, t);
+                let mut rust = self.as_mut().rust_mut();
+                rust.workspaces.apply_workspace_info(&info);
+                if !name.is_empty() {
+                    rust.workspaces.move_tab_to_group(&info.id, &name);
+                }
+                if let Some((g, t)) = rust.workspaces.find(&info.id) {
+                    {
+                        let tab = &mut rust.workspaces.groups[g].tabs[t];
+                        // Empty means "not supplied": the caller is echoing a
+                        // signal that carries no adapter or command.
+                        if !adapter.is_empty() {
+                            tab.adapter = parse_adapter(&adapter);
+                        }
+                        if !command.is_empty() {
+                            tab.command = Some(command);
+                        }
+                    }
+                    rust.workspaces.set_active(g, t);
+                }
             }
             self.publish();
             return true;
         }
 
-        let name = group_name.to_string();
         let existing = self
             .as_ref()
             .rust()

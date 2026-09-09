@@ -121,6 +121,58 @@ fn reconcile_accepts_a_serialised_workspace_list() {
     assert!(model.active().is_none());
 }
 
+/// The flow `add_tab` has to survive: `reconcile` files a brand new workspace
+/// into "Unsorted" as a plain terminal, and the `workspace_created` signal
+/// then arrives carrying the group the user actually picked.
+#[test]
+fn a_reconciled_workspace_moves_into_the_group_the_user_asked_for() {
+    let created = info("ws_9", "gamma", WorkspaceState::Creating);
+    let mut model = Workspaces::new_default();
+    model.add_tab(0, tab(&info("ws_1", "alpha", WorkspaceState::Ready)));
+    model.reconcile(&[
+        info("ws_1", "alpha", WorkspaceState::Ready),
+        created.clone(),
+    ]);
+
+    let (group, _) = model.find(&created.id).expect("reconcile filed it");
+    assert_eq!(model.groups[group].name, "Unsorted");
+
+    assert!(model.move_tab_to_group(&created.id, "Backend"));
+    let (group, idx) = model.find(&created.id).expect("still tracked");
+    assert_eq!(model.groups[group].name, "Backend");
+    assert_eq!(model.groups[group].tabs[idx].name, "gamma");
+    // The tab it was filed next to is untouched.
+    assert!(model.find(&WorkspaceId("ws_1".into())).is_some());
+
+    // Moving it again to where it already is changes nothing.
+    assert!(!model.move_tab_to_group(&created.id, "Backend"));
+    // An unknown workspace is not a move.
+    assert!(!model.move_tab_to_group(&WorkspaceId("ws_nope".into()), "Backend"));
+}
+
+/// Moving the active tab keeps it active, and moving another tab out from
+/// under the selection does not leave it pointing at the wrong row.
+#[test]
+fn moving_a_tab_keeps_the_selection_pointing_at_the_same_workspace() {
+    let one = info("ws_1", "alpha", WorkspaceState::Ready);
+    let two = info("ws_2", "beta", WorkspaceState::Ready);
+    let three = info("ws_3", "delta", WorkspaceState::Ready);
+    let mut model = Workspaces::new_default();
+    model.add_tab(0, tab(&one));
+    model.add_tab(0, tab(&two));
+    model.add_tab(0, tab(&three));
+
+    // The active tab follows the move.
+    assert!(model.set_active(0, 2));
+    assert!(model.move_tab_to_group(&three.id, "Backend"));
+    assert_eq!(model.active().map(|t| t.name.as_str()), Some("delta"));
+
+    // A tab moving out of the group ahead of the selection does not shift it.
+    assert!(model.set_active(0, 1));
+    assert!(model.move_tab_to_group(&one.id, "Backend"));
+    assert_eq!(model.active().map(|t| t.name.as_str()), Some("beta"));
+}
+
 /// `active_tab_json` hands one tab to the widgets; it has to parse back.
 #[test]
 fn active_tab_json_round_trips() {

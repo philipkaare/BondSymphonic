@@ -185,12 +185,36 @@ impl Default for TerminalSessionRust {
 
 impl Drop for TerminalSessionRust {
     fn drop(&mut self) {
-        // The widget went away; stop the router from holding output for a PTY
-        // nobody will paint.
+        // The widget went away. `Drop` runs on the Rust struct, not the
+        // QObject, so it repeats what `teardown` does rather than calling it.
         if let Some(unsubscribe) = self.unsubscribe.take() {
             unsubscribe();
         }
+        if !self.exited {
+            close_pty(self.pty_id.to_string());
+        }
     }
+}
+
+/// Asks the daemon to close a PTY and forgets about it. Used when a session
+/// goes away without anyone calling `close`: a destroyed pane, or a session
+/// re-opened onto a new PTY. Without this the shell keeps running in the
+/// sandbox with nothing reading it.
+fn close_pty(pty_id: String) {
+    if pty_id.is_empty() {
+        return;
+    }
+    let Some(shared) = shared() else {
+        return;
+    };
+    runtime().spawn(async move {
+        let params = PtyIdParams {
+            pty_id: PtyId(pty_id.clone()),
+        };
+        if let Err(e) = shared.client.request_raw(Request::PtyClose(params)).await {
+            tracing::warn!("pty.close for {pty_id} during teardown failed: {e}");
+        }
+    });
 }
 
 /// Clamps a requested size into what a terminal grid accepts.
@@ -565,11 +589,18 @@ impl qobject::TerminalSession {
         });
     }
 
-    /// Ends the router subscription, if this session still holds one.
+    /// Ends the router subscription and closes the PTY behind it, if this
+    /// session still holds one that has not exited. Called before `open`
+    /// replaces the session, and mirrored by `Drop` when the pane is
+    /// destroyed, so a shell never outlives the thing that was showing it.
     fn teardown(mut self: Pin<&mut Self>) {
         if let Some(unsubscribe) = self.as_mut().rust_mut().unsubscribe.take() {
             unsubscribe();
         }
+        if !*self.exited() {
+            close_pty(self.pty_id().to_string());
+        }
+        self.set_pty_id(QString::from(""));
     }
 }
 

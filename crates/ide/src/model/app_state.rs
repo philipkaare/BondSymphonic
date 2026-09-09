@@ -211,6 +211,46 @@ impl Workspaces {
         true
     }
 
+    /// Moves the tab for `id` into the group named `group_name`, creating that
+    /// group at the end if it does not exist yet. Returns false when the
+    /// workspace is not tracked or is already in that group.
+    ///
+    /// This is how a workspace filed into "Unsorted" by [`Workspaces::reconcile`]
+    /// reaches the group the user actually asked for once the create call
+    /// answers. A tab that was active stays active in its new home, and the
+    /// selection is repaired if removing the tab shifted it.
+    pub fn move_tab_to_group(&mut self, id: &WorkspaceId, group_name: &str) -> bool {
+        let Some((from, idx)) = self.find(id) else {
+            return false;
+        };
+        if self.groups[from].name == group_name {
+            return false;
+        }
+        let was_active = self.active_group == from && self.active_tab == idx;
+        let tab = self.groups[from].tabs.remove(idx);
+        if self.active_group == from && self.active_tab > idx {
+            self.active_tab -= 1;
+        }
+        let to = match self.groups.iter().position(|g| g.name == group_name) {
+            Some(existing) => existing,
+            None => self.add_group(group_name),
+        };
+        self.groups[to].tabs.push(tab);
+        if was_active {
+            self.active_group = to;
+            self.active_tab = self.groups[to].tabs.len() - 1;
+            return true;
+        }
+        let active_valid = self
+            .groups
+            .get(self.active_group)
+            .is_some_and(|grp| self.active_tab < grp.tabs.len());
+        if !active_valid {
+            self.fallback_active();
+        }
+        true
+    }
+
     /// Points the active selection at the first non-empty group, or leaves it
     /// at `(0, 0)` if every group is empty.
     fn fallback_active(&mut self) {

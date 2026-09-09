@@ -105,11 +105,14 @@ impl qobject::FileTreeModel {
                     let json = FileTree::entries_json(&res.entries);
                     let _ = qt.queue(move |mut q| {
                         // The model may have moved to another workspace while
-                        // this was in flight; the listing is then stale and
-                        // must not poison the new cache.
-                        if q.as_ref().rust().workspace_id == workspace {
-                            q.as_mut().rust_mut().tree.set_dir(&path, res.entries);
+                        // this was in flight. The listing is then stale: it
+                        // must neither poison the new cache nor reach the view,
+                        // which would show one workspace's files under another.
+                        if q.as_ref().rust().workspace_id != workspace {
+                            tracing::debug!("fs.list_dir: dropping listing for {workspace}");
+                            return;
                         }
+                        q.as_mut().rust_mut().tree.set_dir(&path, res.entries);
                         q.entries_loaded(QString::from(&path), QString::from(&json));
                     });
                 }
@@ -117,6 +120,12 @@ impl qobject::FileTreeModel {
                     let message = e.to_string();
                     tracing::warn!("fs.list_dir failed: {message}");
                     let _ = qt.queue(move |q| {
+                        // Stale for the same reason, and an error banner for a
+                        // workspace nobody is looking at is worse than silence.
+                        if q.as_ref().rust().workspace_id != workspace {
+                            tracing::debug!("fs.list_dir: dropping failure for {workspace}");
+                            return;
+                        }
                         q.load_failed(QString::from(&path), QString::from(&message))
                     });
                 }
