@@ -29,7 +29,11 @@ directories = "5"
 thiserror.workspace = true
 alacritty_terminal = "0.26"
 base64 = "0.22"
-ropey = "1"
+# No `unicode_lines`: QTextDocument starts a block only on a newline, so the
+# rope must not count a form feed, vertical tab or NEL as one. LF and CRLF are
+# recognised without any feature; `cr_lines` would add a bare CR, which Qt does
+# not treat as a break either.
+ropey = { version = "1", default-features = false, features = ["simd"] }
 similar = "2"
 tree-sitter = "0.25"
 tree-sitter-highlight = "0.25"
