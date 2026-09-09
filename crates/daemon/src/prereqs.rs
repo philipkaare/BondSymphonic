@@ -84,13 +84,20 @@ pub async fn check_all() -> Vec<PrereqStatus> {
 /// The credentials file and `ANTHROPIC_API_KEY` remain the fallback, for a
 /// `claude` that is missing, too old to have the subcommand, or slow enough to
 /// hit the probe timeout.
+/// Reads `loggedIn` out of what `claude auth status --json` printed.
+///
+/// `None` means the text was not that JSON — an unknown subcommand's usage
+/// message, an error on stderr, a future version that renamed the field — and is
+/// the signal to fall back rather than to report "not logged in".
+fn logged_in_from_json(out: &str) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_str(out).ok()?;
+    v.get("loggedIn")?.as_bool()
+}
+
 async fn claude_auth(claude_bin: &str) -> PrereqStatus {
     const FIX: &str = "run `claude auth login` in the distro, or set ANTHROPIC_API_KEY";
     if let Ok((_, out)) = run(claude_bin, &["auth", "status", "--json"]).await {
-        if let Some(logged_in) = serde_json::from_str::<serde_json::Value>(&out)
-            .ok()
-            .and_then(|v| v.get("loggedIn").and_then(|b| b.as_bool()))
-        {
+        if let Some(logged_in) = logged_in_from_json(&out) {
             return status(
                 "claude_auth",
                 logged_in,
@@ -228,6 +235,29 @@ pub async fn check_all_with_backend(backend: &dyn SandboxBackend) -> Vec<PrereqS
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reads_logged_in_out_of_the_auth_status_json() {
+        assert_eq!(
+            logged_in_from_json(r#"{"loggedIn": true, "authMethod": "oauth"}"#),
+            Some(true)
+        );
+        assert_eq!(
+            logged_in_from_json(r#"{"loggedIn": false, "authMethod": "none"}"#),
+            Some(false)
+        );
+    }
+
+    /// Anything that is not that JSON has to be `None`, which is what sends
+    /// `claude_auth` to the credentials-file fallback. Reporting "not logged in"
+    /// for a usage message or an error would be worse than not knowing.
+    #[test]
+    fn unrecognised_auth_status_output_is_not_an_answer() {
+        assert_eq!(logged_in_from_json("Usage: claude auth status"), None);
+        assert_eq!(logged_in_from_json(""), None);
+        assert_eq!(logged_in_from_json(r#"{"authMethod": "none"}"#), None);
+        assert_eq!(logged_in_from_json(r#"{"loggedIn": "yes"}"#), None);
+    }
+
     #[test]
     fn parses_git_version() {
         assert_eq!(

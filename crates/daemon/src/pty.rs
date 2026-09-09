@@ -43,6 +43,17 @@ const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 /// How long `close` waits for a terminal to end on its own before escalating.
 const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How long each rung of the signal ladder gets before the next one: the
+/// backend's killer, then SIGTERM, then SIGKILL. See [`escalate`].
+const SIGNAL_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// SIGTERM and SIGKILL as plain numbers. `libc`, and signals at all, exist only
+/// on Unix, while [`crate::sandbox::Signaller`] is cross-platform and the
+/// Windows implementation recognises exactly these two, so spelling them out
+/// keeps this one code path instead of two.
+const SIGTERM: i32 = 15;
+const SIGKILL: i32 = 9;
+
 /// Ctrl-C: clears any half-typed line at an interactive prompt.
 const INTERRUPT: &[u8] = b"\x03";
 
@@ -73,22 +84,49 @@ struct Session {
     writer: Mutex<crate::sandbox::ChildWriter>,
     resizer: Box<dyn Fn(PtySize) -> std::io::Result<()> + Send + Sync>,
     killer: Box<dyn Fn() + Send + Sync>,
-    /// Delivers one signal to the terminal's process group, for the callers
-    /// that want to interrupt the running command rather than end the session.
-    /// Carried here so it outlives the spawn; nothing on the close path uses it,
-    /// which still goes through `killer`.
-    #[allow(dead_code, reason = "the interrupt path that reads it lands next")]
+    /// Delivers one signal to the terminal's process group. `killer` remains the
+    /// ordinary way to end a session; this is for the callers that need a
+    /// specific signal — an interrupt, or the escalation in [`escalate`] that a
+    /// backend's own killer cannot express.
     signaller: crate::sandbox::Signaller,
 }
 
-/// `sessions` is an `Arc` so the per-PTY pump task can remove its own entry on exit.
+/// The live sessions. An `Arc` so the per-PTY pump task can remove its own
+/// entry on exit, and so the detached task `close` spawns can outlive the call.
+type Sessions = Arc<Mutex<HashMap<PtyId, Arc<Session>>>>;
+
 pub struct PtyManager {
     events: EventBus,
-    sessions: Arc<Mutex<HashMap<PtyId, Arc<Session>>>>,
+    sessions: Sessions,
 }
 
 fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Ends a session that survived its backend's killer: SIGTERM to the terminal's
+/// process group, then SIGKILL to whatever is still there.
+///
+/// This exists because the no-sandbox backend cannot do it itself. Its killer
+/// ends a PTY child through `portable_pty`, whose cloned killer is a
+/// `ProcessSignaller` that sends a bare SIGHUP and never escalates. A command
+/// that traps or ignores SIGHUP therefore survives both the killer and the
+/// retry, never reaches the pump with an exit code, never publishes `pty.exit`,
+/// and leaves its session registered forever — and a client waiting on
+/// `pty.exit` before re-checking its prerequisites would wait forever with it.
+///
+/// That matters most on the host path, which is the no-sandbox backend on every
+/// machine: `install_claude` runs a non-interactive `bash -lc "curl … | bash"`,
+/// which neither dies on SIGHUP nor passes it to the installer it started.
+///
+/// Each rung is skipped if the session has already retired, so a process that
+/// goes down politely is never signalled twice.
+async fn escalate(sessions: &Sessions, id: &PtyId, s: &Session) {
+    (s.signaller)(SIGTERM);
+    tokio::time::sleep(SIGNAL_GRACE).await;
+    if sessions.lock().await.contains_key(id) {
+        (s.signaller)(SIGKILL);
+    }
 }
 
 impl PtyManager {
@@ -149,21 +187,26 @@ impl PtyManager {
     ///
     /// The caller passes an argv rather than a command string on purpose: the
     /// only argv that ever reaches here comes from [`crate::setup::setup_argv`],
-    /// so no client can name the program that runs unsandboxed. The one thing
-    /// added to the environment is a `PATH` that leads with `~/.local/bin`,
-    /// which is where `claude` installs itself and need not be on a daemon's
-    /// inherited path.
+    /// so no client can name the program that runs unsandboxed.
+    ///
+    /// The command inherits the daemon's whole environment, with `HOME` and
+    /// `PATH` overridden — `HOME` by the handle, to the home the handle was
+    /// built with, and `PATH` here, to lead with that home's `.local/bin`, which
+    /// is where `claude` installs itself and need not be on a daemon's inherited
+    /// path. Inheriting the rest is deliberate: a setup terminal should behave
+    /// like the user's own shell, and it runs as that same user.
     pub async fn open_host(
         &self,
         d: &Daemon,
         argv: Vec<String>,
         size: PtySize,
     ) -> Result<PtyOpenResult, RpcError> {
-        let handle = d.host().await?;
-        let child = handle
+        let host = d.host().await?;
+        let child = host
+            .handle
             .spawn(SandboxCommand {
                 argv,
-                env: vec![crate::setup::path_with_local_bin(&crate::setup::host_home())],
+                env: vec![crate::setup::path_with_local_bin(&host.home)],
                 cwd: None,
                 pty: Some(size),
             })
@@ -303,18 +346,22 @@ impl PtyManager {
     /// Terminates the session. The `pty.exit` event and the removal of the
     /// session follow from the pump task once the child is actually gone.
     ///
-    /// The killer on its own is not always enough. On the bubblewrap backend it
-    /// sends SIGTERM to the sandboxed process group, and an interactive shell,
-    /// which is the default command, ignores SIGTERM: the session would never
-    /// end and never publish `pty.exit`. So a session still registered after
-    /// [`CLOSE_GRACE`] is asked a second time, by typing Ctrl-C then Ctrl-D into
-    /// its terminal, which an interactive shell reads as end of input, and then
-    /// killing again for whatever the shell left behind.
+    /// The killer on its own is not always enough, and how it falls short
+    /// differs by backend, so a session still registered after [`CLOSE_GRACE`]
+    /// is asked a second time in the way that backend needs.
     ///
-    /// A genuine hard kill belongs one layer down: the sandbox init protocol's
-    /// `Kill` request already carries a signal number, so the exec client could
-    /// offer a SIGKILL path instead of hardcoding SIGTERM. That change spans the
-    /// sandbox backends and is ledgered for Milestone 2b.
+    /// On bubblewrap the killer sends SIGTERM to the sandboxed process group,
+    /// and an interactive shell — the default command — ignores SIGTERM. So it
+    /// is typed at instead: Ctrl-C then Ctrl-D, which an interactive shell reads
+    /// as end of input, and then killed again for whatever the shell left
+    /// behind. A genuine hard kill belongs one layer down there: the sandbox
+    /// init protocol's `Kill` request already carries a signal number, so the
+    /// exec client could offer a SIGKILL path instead of hardcoding SIGTERM.
+    /// That change spans the sandbox backends and is ledgered for Milestone 2b.
+    ///
+    /// Everywhere else the backend is the no-sandbox one, whose killer is a bare
+    /// SIGHUP; sending it a second time would change nothing, so the signal
+    /// ladder in [`escalate`] runs instead.
     pub async fn close(&self, id: &PtyId) -> Result<Empty, RpcError> {
         let s = self.session(id).await?;
         (s.killer)();
@@ -335,10 +382,49 @@ impl PtyManager {
                 let _ = s.writer.lock().await.write_all(INTERRUPT).await;
                 tokio::time::sleep(SETTLE).await;
                 let _ = s.writer.lock().await.write_all(END_OF_INPUT).await;
+                (s.killer)();
+            } else {
+                escalate(&sessions, &id, &s).await;
             }
-            (s.killer)();
         });
         Ok(Empty {})
+    }
+
+    /// Ends every host setup terminal and waits, within a bounded budget, for
+    /// them to actually go.
+    ///
+    /// Daemon shutdown calls this before the host handle's own `shutdown`,
+    /// because that handle's killers are the same un-escalating SIGHUP: without
+    /// this, "a login left open does not outlive the daemon" would hold only for
+    /// commands that happen to honour SIGHUP, and an installer mid-write would
+    /// be left running with nothing left to stop it.
+    ///
+    /// The terminals are escalated concurrently, so the wait is one ladder long
+    /// however many are open.
+    pub async fn close_host(&self) {
+        let victims: Vec<(PtyId, Arc<Session>)> = self
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, s)| s.workspace_id.is_none())
+            .map(|(id, s)| (id.clone(), s.clone()))
+            .collect();
+        if victims.is_empty() {
+            return;
+        }
+        for (_, s) in &victims {
+            (s.killer)();
+        }
+        // The polite signal first: an interactive login sitting at a prompt is
+        // gone by the time this elapses and is never signalled again.
+        tokio::time::sleep(SIGNAL_GRACE).await;
+        futures::future::join_all(victims.iter().map(|(id, s)| async move {
+            if self.sessions.lock().await.contains_key(id) {
+                escalate(&self.sessions, id, s).await;
+            }
+        }))
+        .await;
     }
 
     /// Closes every PTY belonging to `ws`, used when the workspace goes away.

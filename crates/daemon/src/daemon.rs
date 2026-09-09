@@ -15,7 +15,18 @@ use crate::workspace::{lifecycle, DataDirs, Workspace};
 use bondsymphonic_proto::*;
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// The handle the setup terminals run under, with the home it was built with.
+///
+/// The home is captured here rather than recomputed per spawn so that a `$HOME`
+/// that changes underneath the daemon cannot make a terminal's `HOME` and its
+/// `PATH` prefix point at two different places.
+pub struct HostHandle {
+    pub handle: Arc<dyn SandboxHandle>,
+    pub home: PathBuf,
+}
 
 pub struct Daemon {
     pub dirs: DataDirs,
@@ -33,7 +44,7 @@ pub struct Daemon {
     /// sandbox at all, but the daemon user's own home and environment. See
     /// [`Daemon::host`]. Built on first use, because most daemons never open a
     /// setup terminal and building it creates directories.
-    pub host: tokio::sync::OnceCell<Arc<dyn SandboxHandle>>,
+    pub host: tokio::sync::OnceCell<HostHandle>,
 }
 
 impl Daemon {
@@ -70,33 +81,40 @@ impl Daemon {
     ///
     /// `OnceCell::get_or_try_init` leaves the cell empty when the build fails,
     /// so a transient failure does not poison every later attempt.
-    pub async fn host(&self) -> Result<Arc<dyn SandboxHandle>, RpcError> {
+    pub async fn host(&self) -> Result<&HostHandle, RpcError> {
         self.host
             .get_or_try_init(|| async {
                 let home = crate::setup::host_home();
-                crate::sandbox::backend_for(crate::setup::HOST_BACKEND)
+                let handle = crate::sandbox::backend_for(crate::setup::HOST_BACKEND)
                     .start(&SandboxSpec {
                         id: "host".into(),
                         rw_binds: vec![],
                         ro_binds: vec![],
                         late_ro_binds: vec![],
                         cwd: home.clone(),
-                        home,
+                        home: home.clone(),
                         run_dir: self.dirs.run.join("host"),
                         env: vec![],
                     })
-                    .await
+                    .await?;
+                Ok(HostHandle { handle, home })
             })
             .await
-            .cloned()
     }
 
     /// Ends every setup terminal, so a half-finished login does not outlive the
     /// daemon that opened it. A daemon that never opened one has nothing to do.
+    ///
+    /// The terminals are closed through the PTY manager before the handle's own
+    /// `shutdown`, because that shutdown is the same bare SIGHUP its killers
+    /// send: only the manager holds the signaller that can escalate past a
+    /// command which ignores it.
     pub async fn shutdown_host(&self) {
-        if let Some(host) = self.host.get() {
-            let _ = host.shutdown().await;
-        }
+        let Some(host) = self.host.get() else {
+            return;
+        };
+        self.ptys.close_host().await;
+        let _ = host.handle.shutdown().await;
     }
 
     pub fn workspace(&self, id: &WorkspaceId) -> Result<Workspace, RpcError> {

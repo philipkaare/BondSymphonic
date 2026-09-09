@@ -25,55 +25,111 @@ fn b64(s: &str) -> String {
 #[cfg(unix)]
 const DEVICE_CODE_LINE: &str = "Open https://github.com/login/device and enter code ABCD-1234";
 
-/// Gives the daemon a throwaway home whose `.local/bin` holds a stub `gh`, and
-/// returns it.
+/// What the stub prints once it has stopped listening to SIGHUP and SIGTERM.
+#[cfg(unix)]
+const DEAF_LINE: &str = "ignoring hangups now";
+
+/// Exit code of the tripwire programs on `PATH`. Distinctive enough that it
+/// cannot be confused with a real failure. See [`fake_home`].
+#[cfg(unix)]
+const TRIPWIRE_EXIT: i32 = 97;
+
+/// The two temp directories `isolate()` builds, parked for the life of the
+/// process so the environment it points at stays on disk.
+#[cfg(unix)]
+struct Isolation {
+    home: tempfile::TempDir,
+    #[allow(dead_code, reason = "held only to keep the tripwire directory alive")]
+    tripwire: tempfile::TempDir,
+}
+
+/// Puts the whole test binary somewhere a real login cannot be reached, and
+/// returns the throwaway home.
 ///
-/// A real login must never run from this suite: `gh auth login` would open a
-/// device-code flow against GitHub and `claude auth login` would write
-/// credentials into the developer's home. Shadowing the real programs by
-/// prepending a directory to `PATH` is *not* enough to guarantee that, because
-/// the code under test prepends `$HOME/.local/bin` ahead of whatever it
-/// inherited — which is exactly where `claude` installs itself, so the real one
-/// would win. Moving `HOME` moves that prefix, so the stub is first by
-/// construction and no real program can be reached under either name.
+/// A real login must never run from this suite: `gh auth login` opens a
+/// device-code flow against GitHub and `claude auth login` writes credentials
+/// into the developer's home. Two independent things keep that from happening,
+/// because either one alone has failed before.
 ///
-/// It also means the assertions cover the `PATH` prefix itself: the stub is
-/// only ever found because `open_host` put `$HOME/.local/bin` in front.
+/// **`HOME` is moved.** The code under test prepends `$HOME/.local/bin` ahead of
+/// whatever `PATH` it inherited — which is exactly where the real `claude`
+/// lives, so merely prepending a stub directory to `PATH` loses to it. Moving
+/// `HOME` moves that prefix, so the stub `gh` in *this* home's `.local/bin` is
+/// first by construction. It also means the assertions cover the prefix itself:
+/// the device-code line can only come from a stub that the prefix found.
 ///
-/// `HOME` is process-global and the daemon under test runs in this process, so
-/// it is set once; the temp directory is parked in the `OnceLock` so it lives as
-/// long as the process. Nothing else in this binary spawns a program or reads a
-/// home directory.
+/// **`PATH` is replaced with a tripwire.** If that prefix ever stops being
+/// prepended, the search falls through to `PATH` — so `PATH` no longer contains
+/// the real `gh` or `claude` at all. It holds a directory whose `gh` and
+/// `claude` announce themselves and exit [`TRIPWIRE_EXIT`], followed by the
+/// system directories the stubs' own `sleep` needs. A regression then fails
+/// loudly on an exit code instead of quietly contacting GitHub or Anthropic.
+///
+/// Both variables are process-global and the daemon under test runs in this
+/// process, so they are written once, from a `OnceLock` that every test in the
+/// file enters before it starts a daemon.
 #[cfg(unix)]
 fn fake_home() -> std::path::PathBuf {
-    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    HOME.get_or_init(|| {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join(".local").join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        // Prints a device code, then stays at a prompt: enough for one test to
-        // watch it exit on command and another to type into it and close it.
-        let gh = bin.join("gh");
-        std::fs::write(
-            &gh,
-            format!(
-                "#!/bin/sh\n\
-                 echo '{DEVICE_CODE_LINE}'\n\
-                 while IFS= read -r line; do\n\
-                   if [ \"$line\" = quit ]; then exit 0; fi\n\
-                   echo \"got $line\"\n\
-                 done\n\
-                 exit 0\n"
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::env::set_var("HOME", dir.path());
-        dir
-    })
-    .path()
-    .to_path_buf()
+    static ISOLATION: std::sync::OnceLock<Isolation> = std::sync::OnceLock::new();
+    ISOLATION
+        .get_or_init(|| {
+            let home = tempfile::tempdir().unwrap();
+            let tripwire = tempfile::tempdir().unwrap();
+
+            let bin = home.path().join(".local").join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            // Prints a device code and then stays at a prompt, taking three
+            // words: `quit` to leave, `deaf` to stop listening to signals, and
+            // anything else to be echoed back.
+            write_program(
+                &bin.join("gh"),
+                &format!(
+                    "#!/bin/sh\n\
+                     echo '{DEVICE_CODE_LINE}'\n\
+                     while IFS= read -r line; do\n\
+                       case \"$line\" in\n\
+                         quit) exit 0 ;;\n\
+                         deaf) trap '' HUP TERM; echo '{DEAF_LINE}'\n\
+                               while true; do sleep 1; done ;;\n\
+                         *) echo \"got $line\" ;;\n\
+                       esac\n\
+                     done\n\
+                     exit 0\n"
+                ),
+            );
+
+            for name in ["gh", "claude"] {
+                write_program(
+                    &tripwire.path().join(name),
+                    &format!(
+                        "#!/bin/sh\n\
+                         echo 'TRIPWIRE: the real {name} was reached from a test'\n\
+                         exit {TRIPWIRE_EXIT}\n"
+                    ),
+                );
+            }
+
+            std::env::set_var("HOME", home.path());
+            // The system directories stay on the path because the stubs are
+            // shell scripts that call `sleep`; nothing that a setup action names
+            // resolves through them any more.
+            std::env::set_var(
+                "PATH",
+                format!("{}:/usr/bin:/bin", tripwire.path().display()),
+            );
+            Isolation { home, tripwire }
+        })
+        .home
+        .path()
+        .to_path_buf()
+}
+
+/// Writes an executable shell script.
+#[cfg(unix)]
+fn write_program(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[cfg(unix)]
@@ -258,11 +314,163 @@ async fn a_setup_terminal_takes_writes_resizes_and_closes() {
     cancel.cancel();
 }
 
+/// `pty.close` has to end a setup command that ignores the signal the backend's
+/// killer sends.
+///
+/// A host terminal always runs on the no-sandbox backend, whose PTY killer goes
+/// through `portable_pty` and is a bare SIGHUP with no escalation, sent twice.
+/// A command that ignores SIGHUP would survive both, never reach the pump with
+/// an exit code and never publish `pty.exit` — and the IDE waits on `pty.exit`
+/// before re-checking prerequisites, so it would wait forever. This is not
+/// hypothetical for the real actions: `install_claude` is a non-interactive
+/// `bash -lc "curl … | bash"`.
+///
+/// The stub ignores SIGTERM as well, so only the last rung of the ladder can end
+/// it and the whole escalation is exercised rather than just its first step.
+#[cfg(unix)]
+#[tokio::test]
+async fn closing_a_terminal_that_ignores_hangups_still_publishes_an_exit() {
+    let _home = fake_home();
+    let dir = tempfile::tempdir().unwrap();
+    let (port, token, _daemon, cancel) = common::start_daemon(&dir.path().join("data")).await;
+    let mut c = common::Client::connect(port, &token).await;
+
+    let pty = open_setup(&mut c, SetupAction::GhLogin).await.unwrap();
+    let mut out = String::new();
+    pump_until(
+        &mut c,
+        &mut out,
+        &pty,
+        std::time::Duration::from_secs(20),
+        |o, _| o.contains(DEVICE_CODE_LINE),
+    )
+    .await;
+    // Told after it is running, so the handlers are certainly installed before
+    // anything is sent to it.
+    c.call(Request::PtyWrite(PtyWriteParams {
+        pty_id: pty.clone(),
+        data_b64: b64("deaf\r"),
+    }))
+    .await
+    .unwrap();
+    pump_until(
+        &mut c,
+        &mut out,
+        &pty,
+        std::time::Duration::from_secs(20),
+        |o, _| o.contains(DEAF_LINE),
+    )
+    .await;
+    assert!(out.contains(DEAF_LINE), "collected: {out}");
+
+    c.call(Request::PtyClose(PtyIdParams {
+        pty_id: pty.clone(),
+    }))
+    .await
+    .unwrap();
+    let exit = pump_until(
+        &mut c,
+        &mut out,
+        &pty,
+        std::time::Duration::from_secs(30),
+        |_, exit| exit.is_some(),
+    )
+    .await;
+    assert!(
+        exit.is_some(),
+        "pty.close must escalate past a signal the command ignores: {out}"
+    );
+
+    // And the session is retired, so the id is not left writable forever.
+    let err = c
+        .call(Request::PtyWrite(PtyWriteParams {
+            pty_id: pty.clone(),
+            data_b64: String::new(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
+    cancel.cancel();
+}
+
+/// Daemon shutdown has to end a setup terminal that ignores hangups, and within
+/// a bounded time.
+///
+/// The host handle's own `shutdown` is the same bare SIGHUP its killers send, so
+/// a command that ignores it would outlive the daemon that started it — an
+/// unsandboxed login or half-finished installer with nothing left to stop it.
+/// The brief's "a login left open does not outlive the daemon" is this.
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_shutdown_ends_a_terminal_that_ignores_hangups() {
+    let _home = fake_home();
+    let dir = tempfile::tempdir().unwrap();
+    let (port, token, daemon, cancel) = common::start_daemon(&dir.path().join("data")).await;
+    let mut c = common::Client::connect(port, &token).await;
+
+    let pty = open_setup(&mut c, SetupAction::GhLogin).await.unwrap();
+    let mut out = String::new();
+    pump_until(
+        &mut c,
+        &mut out,
+        &pty,
+        std::time::Duration::from_secs(20),
+        |o, _| o.contains(DEVICE_CODE_LINE),
+    )
+    .await;
+    c.call(Request::PtyWrite(PtyWriteParams {
+        pty_id: pty.clone(),
+        data_b64: b64("deaf\r"),
+    }))
+    .await
+    .unwrap();
+    pump_until(
+        &mut c,
+        &mut out,
+        &pty,
+        std::time::Duration::from_secs(20),
+        |o, _| o.contains(DEAF_LINE),
+    )
+    .await;
+    assert!(out.contains(DEAF_LINE), "collected: {out}");
+
+    let started = tokio::time::Instant::now();
+    daemon.shutdown_host().await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "shutdown must not wait on a process that will never go"
+    );
+
+    // The session retires as soon as the pump sees the child exit, so a write
+    // that faults is proof the process is really gone rather than merely asked.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut gone = false;
+    while !gone && tokio::time::Instant::now() < deadline {
+        gone = matches!(
+            c.call(Request::PtyWrite(PtyWriteParams {
+                pty_id: pty.clone(),
+                data_b64: String::new(),
+            }))
+            .await,
+            Err(e) if e.code == ErrorCode::NotFound
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(gone, "the setup terminal must not outlive the daemon");
+    cancel.cancel();
+}
+
 /// A setup terminal runs a command on the host with no sandbox around it, so it
 /// must be behind the same authentication as everything else.
 #[tokio::test]
 async fn setup_pty_before_hello_is_unauthorized() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    // This test spawns nothing, but it does start a daemon, and `fake_home`
+    // writes process-global environment variables. Entering the isolation here
+    // too means every test in this file has passed through it before any daemon
+    // exists, so the writes can never race a running one.
+    #[cfg(unix)]
+    fake_home();
     let dir = tempfile::tempdir().unwrap();
     let (port, _token, _daemon, cancel) = common::start_daemon(&dir.path().join("data")).await;
     let s = tokio::net::TcpStream::connect(("127.0.0.1", port))
