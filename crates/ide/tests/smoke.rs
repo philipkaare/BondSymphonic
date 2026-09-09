@@ -7,11 +7,14 @@
 //! (perform these steps once connected). Both are inert when unset.
 //!
 //! What it proves: the window builds, the daemon connection comes up, the
-//! workspace/PTY/file-tree requests reach the daemon in the right order, panes
-//! whose process has exited are torn down without talking to the daemon about
-//! the PTYs it has already reaped, the Qt event loop is still responsive at the
-//! end (the `quit` step runs on it), and the process ends with status 0 well
-//! inside the time limit.
+//! workspace/PTY/file-tree requests reach the daemon in the right order, an
+//! editor tab and a diff tab open through the same controller signals the
+//! Explorer emits and fetch their contents (`fs.read_file`, `workspace.diff`)
+//! and their live-update watches (`fs.watch`, `workspace.changes`), panes whose
+//! process has exited are torn down without talking to the daemon about the
+//! PTYs it has already reaped, the Qt event loop is still responsive at the end
+//! (the `quit` step runs on it), and the process ends with status 0 well inside
+//! the time limit.
 
 use base64::Engine as _;
 use bondsymphonic_proto::*;
@@ -28,18 +31,50 @@ const BASE64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
 
 const TOKEN: &str = "smoke-token";
-const SCRIPT: &str = "create,open,tree,close,destroy,quit";
-/// The `quit` step alone waits 2 s and `close` another 0.75 s; the rest is a Qt
-/// startup on a cold cache.
-const RUN_LIMIT: Duration = Duration::from_secs(30);
-/// The methods the script must produce, in this order.
-const EXPECTED: [&str; 6] = [
+const SCRIPT: &str = "create,open,tree,open_file,open_diff,close,destroy,quit";
+/// The file `open_file` and `open_diff` act on, and the one entry of the fake
+/// `fs.list_dir` listing that is not a directory.
+const OPEN_PATH: &str = "README.md";
+/// The `quit` step alone waits 2 s, `close` another 0.75 s and each of
+/// `open_file` and `open_diff` another 0.75 s; the rest is a Qt startup on a
+/// cold cache.
+const RUN_LIMIT: Duration = Duration::from_secs(40);
+/// The methods the script must produce, in this order. `fs.read_file` is the
+/// editor tab loading its file and `workspace.diff` the diff tab loading its
+/// alignment, so their place in the sequence is what shows the two tabs opened
+/// in the order the script asked for them.
+const EXPECTED: [&str; 8] = [
     "hello",
     "workspace.create",
     "pty.open",
     "fs.list_dir",
+    "fs.read_file",
+    "workspace.diff",
     "pty.close",
     "workspace.destroy",
+];
+/// Requests the window must have made after `workspace.create` on its own
+/// account: the Changes tab lists the new workspace and turns on the file
+/// watch. Neither is in the script, so seeing them proves the window wired the
+/// workspace up rather than the script standing in for it.
+const AFTER_CREATE: [&str; 2] = ["fs.watch", "workspace.changes"];
+/// What `fs.read_file` returns and the base side of the diff.
+const BASE_TEXT: &str = "hello\n";
+/// The work side of the diff: one line added to [`BASE_TEXT`].
+const WORK_TEXT: &str = "hello\nworld\n";
+/// The warnings `EditorDocument`, `DiffDocument` and `ChangesModel` log when
+/// one of their requests fails, matched as their exact prefixes. A run in which
+/// the fake daemon answered but the reply was rejected — a body the IDE could
+/// not deserialise, say — still reaches the journal, so the journal alone
+/// cannot tell a served request from a served-and-refused one. These can.
+/// `fs.write_file` is not among them: no step saves, so asserting on its
+/// warning would assert nothing. The fake daemon answers it anyway, so a future
+/// step that does save needs no change on the daemon side.
+const NO_WARNINGS: [&str; 4] = [
+    "fs.read_file failed",
+    "workspace.diff failed",
+    "workspace.changes failed",
+    "fs.watch enable",
 ];
 
 /// Every request method the fake daemon answered, in arrival order.
@@ -85,6 +120,12 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
     );
     let seen = journal.lock().expect("journal mutex").clone();
     let context = format!("requests: {seen:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+    // Both pipes together. `tracing_subscriber::fmt()` writes to *stdout* by
+    // default and `main` does not override the writer, so every warning the IDE
+    // logs arrives on stdout; only a panic message comes out on stderr. An
+    // assertion that read stderr alone would pass whatever was logged, which is
+    // what the three terminal-warning assertions below used to do.
+    let logs = format!("{out}\n{err}");
     eprintln!("smoke: the fake daemon answered {seen:?}");
 
     let status =
@@ -94,7 +135,7 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
         "the IDE exited with {status}, expected 0\n{context}"
     );
     assert!(
-        !err.contains("panicked at"),
+        !logs.contains("panicked at"),
         "the IDE logged a panic\n{context}"
     );
     assert!(
@@ -113,6 +154,22 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
             count >= 2,
             "expected the window to issue its own {method} as well as the script's, saw \
              {count}\n{context}"
+        );
+    }
+    // The Changes tab and the editor's watch are the window's own doing, and
+    // both only make sense once there is a workspace: `set_workspace` on the
+    // changes model issues `workspace.changes` and turns `fs.watch` on, and
+    // `EditorDocument::open` turns it on again for the file it just read. A
+    // `fs.watch` before the create would be for a workspace that does not
+    // exist yet, so the position in the journal is part of the claim.
+    let after_create: Vec<&String> = seen
+        .iter()
+        .skip_while(|m| *m != "workspace.create")
+        .collect();
+    for method in AFTER_CREATE {
+        assert!(
+            after_create.iter().any(|m| *m == method),
+            "the window never sent {method} after workspace.create\n{context}"
         );
     }
     // The `close` step ended every PTY the fake daemon had open, so by the time
@@ -134,8 +191,18 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
     // `error` property the terminal paints its banner from.
     for warning in ["pty.close failed", "pty.resize failed", "pty.write failed"] {
         assert!(
-            !err.contains(warning),
+            !logs.contains(warning),
             "a terminal recorded {warning:?} after its process exited\n{context}"
+        );
+    }
+    // The fake daemon answered every editor, diff and changes request, so none
+    // of their documents may have logged a failure. This catches the case the
+    // journal cannot: a request that arrived and was answered with something
+    // the IDE then refused.
+    for warning in NO_WARNINGS {
+        assert!(
+            !logs.contains(warning),
+            "the IDE logged {warning:?} even though the fake daemon answered\n{context}"
         );
     }
 }
@@ -327,7 +394,46 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                 Request::FsListDir(_) => Some(ServerMessage::ok(
                     id,
                     &ListDirResult {
-                        entries: vec![entry("src", true, 0), entry("README.md", false, 42)],
+                        entries: vec![entry("src", true, 0), entry(OPEN_PATH, false, 42)],
+                    },
+                )),
+                // The editor tab's load. Small, valid UTF-8 and not truncated,
+                // so the document opens editable rather than as a notice.
+                Request::FsReadFile(_) => Some(ServerMessage::ok(
+                    id,
+                    &ReadFileResult {
+                        content: BASE_TEXT.to_owned(),
+                        encoding: "utf-8".to_owned(),
+                        truncated: false,
+                    },
+                )),
+                // Ctrl+S and the watch the editor and the Changes tab both ask
+                // for. Nothing here has to do anything: the assertions are that
+                // the requests were made and that neither was reported failed.
+                Request::FsWriteFile(_) | Request::FsWatch(_) => {
+                    Some(ServerMessage::ok(id, &Empty {}))
+                }
+                // One modified file, so the Changes tab has a row to build and
+                // the counts have somewhere to land.
+                Request::WorkspaceChanges(_) => Some(ServerMessage::ok(
+                    id,
+                    &ChangesResult {
+                        files: vec![ChangedFile {
+                            path: OPEN_PATH.to_owned(),
+                            status: FileStatus::Modified,
+                            additions: 1,
+                            deletions: 0,
+                        }],
+                    },
+                )),
+                // One added line, which aligns to one equal row and one insert
+                // row: enough for `DiffWidget` to build both panes, tint a row
+                // and size its gutter from two different line-number columns.
+                Request::WorkspaceDiff(_) => Some(ServerMessage::ok(
+                    id,
+                    &DiffResult {
+                        base_text: BASE_TEXT.to_owned(),
+                        work_text: WORK_TEXT.to_owned(),
                     },
                 )),
                 other => Some(ServerMessage::err(
@@ -372,7 +478,11 @@ fn request_order_is_checked_as_a_subsequence() {
         "workspace.create",
         "fs.list_dir",
         "pty.open",
+        "fs.watch",
+        "workspace.changes",
         "fs.list_dir",
+        "fs.read_file",
+        "workspace.diff",
         "pty.close",
         "workspace.destroy",
     ]
@@ -386,6 +496,8 @@ fn request_order_is_checked_as_a_subsequence() {
         "pty.open",
         "workspace.create",
         "fs.list_dir",
+        "fs.read_file",
+        "workspace.diff",
         "pty.close",
         "workspace.destroy",
     ]
@@ -393,6 +505,22 @@ fn request_order_is_checked_as_a_subsequence() {
     .map(|s| (*s).to_owned())
     .collect();
     assert!(!contains_in_order(&reordered, &EXPECTED));
+    // Nor does the diff count as the file's own load: a run that opened the
+    // diff first would put `workspace.diff` ahead of `fs.read_file`.
+    let diff_first: Vec<String> = [
+        "hello",
+        "workspace.create",
+        "pty.open",
+        "fs.list_dir",
+        "workspace.diff",
+        "fs.read_file",
+        "pty.close",
+        "workspace.destroy",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    assert!(!contains_in_order(&diff_first, &EXPECTED));
     // A missing step is not a match either.
     let short: Vec<String> = ["hello", "workspace.create", "pty.open", "fs.list_dir"]
         .iter()

@@ -9,8 +9,8 @@ Design: `docs/superpowers/specs/`. Plans: `docs/superpowers/plans/`.
 
 ## What works now
 
-Milestone 2b: the IDE drives the daemon end to end, on real worktrees inside real
-sandboxes.
+Milestone 3: the IDE drives the daemon end to end on real worktrees inside real
+sandboxes, and edits, saves and diffs the files in them.
 
 - **Workspaces.** New Agent creates a workspace on a chosen repository and files its tab
   under a group; the tab's status word follows the daemon's `workspace.state` events, and
@@ -24,9 +24,34 @@ sandboxes.
   an `[output dropped]` marker instead of quietly losing bytes.
 - **Explorer.** The Files tab lists the workspace's worktree one directory at a time, as
   they are expanded, and the toolbar's Refresh reloads it in place.
+- **Editing.** Double-clicking a file in the Files tab opens it in a tab of the centre
+  pane, with tree-sitter syntax highlighting for Rust, JavaScript, TypeScript, TSX,
+  Python, JSON, TOML, YAML, HTML, CSS, Markdown, Bash, C, C++ and Go. Other extensions
+  open as plain text. Typing marks the tab with a dot; File > Save (Ctrl+S) writes the
+  file back through the daemon into the sandboxed worktree, and Save All writes every
+  dirty tab. A binary file, or one over 4 MiB, opens as a read-only notice instead.
+- **External changes.** While a file is open the IDE watches it. A change made on disk by
+  an agent or a shell reloads an unmodified tab silently, keeping the caret and the scroll
+  position; on a tab with unsaved edits a bar offers reload or keep.
+- **Changes and diffs.** The Explorer's Changes tab lists the files that differ from the
+  workspace's base branch with their status and +/- counts, and follows the worktree
+  without pressing Refresh. Double-clicking a row opens a side-by-side diff: aligned rows,
+  green and red tints, two line-number columns, synchronised scrolling in both axes and
+  the same syntax highlighting as the editor.
 
-Still placeholders: the editor and the diff/Changes views, run configurations, and every
-agent adapter other than a plain terminal.
+Known limits in this milestone:
+
+- A file over 512 KiB opens without highlighting, because highlighting re-runs over the
+  whole buffer after every edit rather than incrementally.
+- Highlighting is that same full re-pass per edit, computed lazily on the next span query.
+- An open diff does not reload when the file changes on disk. Close and re-open it.
+- Closing the window does not prompt about editors with unsaved edits. That prompt comes
+  with the persistence work in Milestone 6.
+- Languages embedded in another (`<script>` in HTML, fenced code in Markdown) are not
+  highlighted: tree-sitter injections are not wired up.
+
+Still placeholders: run configurations, the transcript view, and every agent adapter other
+than a plain terminal.
 
 ## Quick start (Windows 11)
 
@@ -92,7 +117,7 @@ The daemon keeps its state under its data directory (default `~/.bondsymphonic`,
   homes/<id>/        # $HOME inside the sandbox
   caches/<id>/       # writable cache, mounted at $HOME/.cache inside the sandbox
   run/<id>/          # the sandbox's exec socket and other runtime files
-  transcripts/        # agent transcripts (from Milestone 3)
+  transcripts/        # agent transcripts (from Milestone 4)
   bin/                # daemon binaries installed into the distro
 ```
 
@@ -105,9 +130,9 @@ find the Qt DLLs:
 
 ```powershell
 . .\scripts\env.ps1
-cargo test -p bondsymphonic-proto -p bondsymphonic-ide   # Windows; ide suites: lib, client, model, qobject_smoke, router, smoke
-.\scripts\test-daemon.ps1                                 # daemon tests inside WSL (10 integration test files; unit tests: 15 on Windows, 18 on Linux)
-cargo clippy --workspace -- -D warnings
+cargo test --workspace                                    # Windows; ide suites: lib, client, connection, diff, editor, model, qobject_smoke, router, smoke
+.\scripts\test-daemon.ps1                                 # daemon tests inside WSL (12 integration test files; unit tests: 20 on Windows, 23 on Linux)
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
@@ -124,8 +149,11 @@ are read once at startup and do nothing at all when unset, which is every ordina
   ignored rather than guessed at.
 - `BS_SMOKE_SCRIPT`: a comma-separated list of steps the controller performs once the
   connection is up — `create` (a workspace over `BS_SMOKE_REPO`, announced with the same
-  signal New Agent produces), `open` (a PTY in it), `tree` (its root listing), `quit` (end
-  the process with status 0 after letting the window settle).
+  signal New Agent produces), `open` (a PTY in it), `tree` (its root listing), `open_file`
+  and `open_diff` (ask the window to open `README.md` as an editor tab and as a diff tab,
+  through the same controller signals the Explorer's double-click emits), `close` (close
+  the script's PTY), `destroy` (destroy the workspace), `quit` (end the process with
+  status 0 after letting the window settle).
 
 The smoke test skips itself with a message when `QMAKE` is unset, since the IDE cannot
 start without the Qt runtime on PATH.

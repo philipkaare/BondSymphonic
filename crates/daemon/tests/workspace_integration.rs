@@ -5,7 +5,7 @@ use bondsymphonic_daemon::sandbox::backend_for;
 use bondsymphonic_daemon::server::{Server, ServerConfig};
 use bondsymphonic_daemon::workspace::{lifecycle, DataDirs};
 use bondsymphonic_proto::*;
-use common::{start_daemon, Client};
+use common::{commit_all, create_ws, start_daemon, Client};
 
 #[tokio::test]
 async fn create_list_get_status_destroy_roundtrip_with_events() {
@@ -152,29 +152,6 @@ async fn restore_marks_missing_worktree_as_error() {
     );
 }
 
-/// Commits inside a workspace worktree the way the sandbox does: new objects land in
-/// the workspace's private object directory, so the commit is only reachable from the
-/// main store through that directory.
-fn commit_in_worktree(worktree: &std::path::Path, env: &[(String, String)], file: &str) {
-    std::fs::write(worktree.join(file), "x\n").unwrap();
-    for args in [
-        ["add", "-A"].as_slice(),
-        ["commit", "-q", "-m", "work"].as_slice(),
-    ] {
-        let mut cmd = std::process::Command::new("git");
-        cmd.args(args)
-            .current_dir(worktree)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t");
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        assert!(cmd.status().unwrap().success(), "git {args:?}");
-    }
-}
-
 fn state_name(s: &WorkspaceState) -> &'static str {
     match s {
         WorkspaceState::Creating => "Creating",
@@ -195,19 +172,6 @@ fn state_names(events: &[(Option<WorkspaceId>, Event)]) -> Vec<&'static str> {
         .collect()
 }
 
-async fn create_ws(c: &mut Client, repo: &std::path::Path, name: &str) -> WorkspaceInfo {
-    serde_json::from_value(
-        c.call(Request::WorkspaceCreate(WorkspaceCreateParams {
-            repo_path: repo.to_string_lossy().into(),
-            base_branch: "main".into(),
-            name: name.into(),
-        }))
-        .await
-        .unwrap(),
-    )
-    .unwrap()
-}
-
 /// A worktree directory that has gone missing (the state `restore` records as
 /// `Error("worktree directory is missing")`) must not turn `destroy` into a silent
 /// `git branch -D` of commits that live only in the workspace's private object dir.
@@ -222,7 +186,8 @@ async fn destroy_refuses_unmerged_commits_when_the_worktree_directory_is_gone() 
 
     let w = daemon.registry.get(&ws.id).unwrap();
     let layout = lifecycle::layout_for(&daemon, &w).await.unwrap();
-    commit_in_worktree(&w.worktree_path, &layout.sandbox_git_env(), "work.txt");
+    std::fs::write(w.worktree_path.join("work.txt"), "x\n").unwrap();
+    commit_all(&w.worktree_path, &layout.sandbox_git_env(), "work");
 
     cancel.cancel();
     std::fs::remove_dir_all(&w.worktree_path).unwrap();

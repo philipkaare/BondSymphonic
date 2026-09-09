@@ -4,14 +4,20 @@
 //!
 //! The variable holds a comma-separated step list, run in order once the daemon
 //! connection is up. `tests/smoke.rs` runs the real IDE binary offscreen against
-//! an in-process fake daemon with `create,open,tree,close,destroy,quit`. The
-//! steps are:
+//! an in-process fake daemon with
+//! `create,open,tree,open_file,open_diff,close,destroy,quit`. The steps are:
 //!
 //! * `create` — create a workspace over the repository in `BS_SMOKE_REPO` and
 //!   emit `workspace_created`, so the window builds its tab, its terminal pane
 //!   and its file tree from the same signal a user's New Agent would produce.
 //! * `open` — open a PTY in the workspace the last `create` made.
 //! * `tree` — list that workspace's root directory.
+//! * `open_file` — ask the window to open [`OPEN_PATH`] in an editor tab, by
+//!   emitting the same `open_file_requested` signal the Explorer's double-click
+//!   produces. The requests that follow (`fs.read_file`, `fs.watch`) come from
+//!   the `EditorDocument` the window builds, not from this module.
+//! * `open_diff` — the same for `open_diff_requested`, which builds a
+//!   `DiffWidget` and makes it call `workspace.diff`.
 //! * `close` — close the PTY the last `open` made. The fake daemon answers by
 //!   ending every PTY it has handed out, including the ones the window opened
 //!   for its own panes, so the steps after this one run against terminals whose
@@ -43,6 +49,14 @@ const QUIT_DELAY: Duration = Duration::from_secs(2);
 /// How long `close` waits for the `pty.exit` events it triggers to reach the
 /// window's terminals, so the steps after it act on exited sessions.
 const EXIT_SETTLE: Duration = Duration::from_millis(750);
+/// The file `open_file` and `open_diff` ask for. It is one of the two entries
+/// the fake daemon's `fs.list_dir` reports, so the Explorer lists it too.
+const OPEN_PATH: &str = "README.md";
+/// How long `open_file` and `open_diff` wait after emitting their signal. The
+/// widget is built, and its document's request issued, on the Qt thread; a step
+/// that returned at once would let the next one race it, and the order the test
+/// asserts on would depend on scheduling.
+const OPEN_SETTLE: Duration = Duration::from_millis(750);
 const PTY_COLS: u16 = 80;
 const PTY_ROWS: u16 = 24;
 
@@ -76,6 +90,8 @@ pub(crate) async fn run(steps: Vec<String>, client: DaemonClient, qt: QtHandle) 
                 .await
                 .map(|id| pty = Some(id)),
             "tree" => tree(&client, workspace.as_ref()).await,
+            "open_file" => open_editor(&qt, workspace.as_ref(), Pane::File).await,
+            "open_diff" => open_editor(&qt, workspace.as_ref(), Pane::Diff).await,
             "close" => close(&client, pty.take()).await,
             "destroy" => destroy(&client, &qt, workspace.take()).await,
             "quit" => quit(&qt).await,
@@ -171,6 +187,51 @@ async fn destroy(
     let id = workspace_id.to_string();
     qt.queue(move |q| q.workspace_destroyed(QString::from(&id)))
         .map_err(|_| "the Qt thread is gone".to_owned())?;
+    Ok(())
+}
+
+/// Which of the two open requests [`open_editor`] makes.
+#[derive(Clone, Copy)]
+enum Pane {
+    File,
+    Diff,
+}
+
+impl Pane {
+    fn step(self) -> &'static str {
+        match self {
+            Pane::File => "open_file",
+            Pane::Diff => "open_diff",
+        }
+    }
+}
+
+/// Asks the window to open [`OPEN_PATH`] as an editor tab or as a diff tab.
+///
+/// This goes through `AppController::request_open_file`/`request_open_diff`,
+/// which is the production path: the Explorer's double-click calls the same
+/// invokable, `MainWindow` is connected to the same signal, and everything
+/// after the signal — building the widget, creating the `EditorDocument` or
+/// `DiffDocument`, and the `fs.read_file`, `fs.watch` and `workspace.diff`
+/// requests those make — happens because the window reacted, not because this
+/// module asked the daemon for anything itself.
+async fn open_editor(
+    qt: &QtHandle,
+    workspace: Option<&WorkspaceId>,
+    pane: Pane,
+) -> Result<(), String> {
+    let workspace_id = need(workspace, pane.step())?.to_string();
+    qt.queue(move |q| {
+        let workspace_id = QString::from(&workspace_id);
+        let path = QString::from(OPEN_PATH);
+        match pane {
+            Pane::File => q.request_open_file(workspace_id, path),
+            Pane::Diff => q.request_open_diff(workspace_id, path),
+        }
+    })
+    .map_err(|_| "the Qt thread is gone".to_owned())?;
+    tokio::time::sleep(OPEN_SETTLE).await;
+    tracing::info!(target: "smoke", "{} requested for {OPEN_PATH}", pane.step());
     Ok(())
 }
 

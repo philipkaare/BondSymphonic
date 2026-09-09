@@ -174,6 +174,15 @@ the only place with `cfg(windows)` branches in the IDE.
 - Save: Ctrl+S → `fs.write_file`. If a `fs.changed` event arrives for an open,
   unmodified file, it reloads silently; if modified, a bar offers reload/keep.
 - Files over 4 MiB or binary open as a read-only notice.
+- **As built (Milestone 3):** highlighting re-runs over the *whole* buffer after
+  an edit, lazily on the next span query, rather than applying the edit to the
+  tree-sitter tree incrementally. That is why `EditorBuffer::set_highlighting`
+  exists and why a document over 512 KiB (`HIGHLIGHT_MAX_BYTES`) opens with
+  highlighting switched off: a full re-pass per keystroke does not scale past
+  that. The incremental form described above is deferred until profiling asks
+  for it. Injections are also not wired up — `highlight()` is called with an
+  injection callback that always answers `None` — so a `<script>` block in HTML
+  and a fenced code block in Markdown are not highlighted as their own language.
 - Line numbers, current-line highlight, monospace font from settings, tab width
   4, no autocomplete, no folding in v1.
 
@@ -295,6 +304,30 @@ processes it supervises (`bwrap`, its init helper and the PTY shells) accounted 
 roughly 35 MB more inside the distro. Both numbers are comfortably inside the
 targets, so no profiling pass was needed.
 
+**Measured, Milestone 3 (2026-09-09).** The same machine and the same debug build
+against the real daemon in WSL. The 2b scenario plus three open editor tabs
+(`src/main.rs`, `README.md`, `src/lib.rs`) and one open diff, left idle for 60 s:
+
+| | measured | 2b | target |
+|---|---|---|---|
+| `bondsymphonic-ide.exe` working set | 108.9 MB | 55.6 MB | < 150 MB |
+| `bondsymphonic-ide.exe` private bytes | 56.6 MB | 21.9 MB | — |
+| `bondsymphonic-daemon` RSS | 9.2 MB | 9.8 MB | < 30 MB |
+
+Both are inside the targets, but the IDE grew by 53 MB, so the growth was traced
+before it was accepted. It is **not** the fifteen `HighlightConfiguration`s being
+built eagerly. Each is behind its own `OnceLock` in `highlight::languages`, and
+the same build measured with the 2b scenario exactly — two workspaces, four PTYs,
+no editor or diff tab, so no configuration built at all — already holds 100.6 MB
+working set and 54.4 MB private. Opening three files and a diff, which does build
+the Rust and Markdown configurations, adds the remaining 8.3 MB.
+
+The remaining 45 MB is carried by the M3 build before any file is opened, and the
+fifteen tree-sitter grammars are *linked in* whether or not a configuration is
+built from them: the debug executable is 24.6 MB. A release build and pruning the
+grammar list are the levers if this ever approaches the target; at 109 MB against
+150 MB it does not, so no profiling pass was made.
+
 ## 14. Testing (IDE-specific)
 
 - `model/` unit tests: transcript delta coalescing and tool-result matching; diff
@@ -304,7 +337,19 @@ targets, so no profiling pass was needed.
 - `client/` tests: codec framing, request/response correlation, event routing,
   reconnect backoff, against an in-process fake daemon (a tokio TCP server
   implementing the proto types).
-- `smoke.rs`: start the fake daemon, launch the app with
-  `QT_QPA_PLATFORM=offscreen`, create a group and workspace, open a file, feed a
-  recorded transcript, assert widget counts and the status bar text. Runs in
-  `cargo test` on Windows when Qt is present; skipped with a message otherwise.
+- `smoke.rs`: start the fake daemon, launch the real binary with
+  `QT_QPA_PLATFORM=offscreen`, and drive it through `BS_SMOKE_SCRIPT` —
+  `create,open,tree,open_file,open_diff,close,destroy,quit`. `open_file` and
+  `open_diff` emit `AppController::openFileRequested`/`openDiffRequested`, the
+  same signals the Explorer's double-click produces, so the window builds the
+  editor and diff tabs itself. The assertions are on the requests the fake daemon
+  received and on what the IDE logged: `hello`, `workspace.create`, `pty.open`,
+  `fs.list_dir`, `fs.read_file`, `workspace.diff`, `pty.close`,
+  `workspace.destroy` in that order; `fs.watch` and `workspace.changes` each seen
+  after `workspace.create`; two `fs.list_dir` and two `pty.open`, since the
+  window issues its own beside the script's; no `pty.close`, `pty.resize` or
+  `pty.write` after `workspace.destroy`, because those PTYs have already exited;
+  and no failure warning logged for any of `fs.read_file`, `workspace.diff`,
+  `workspace.changes` or `fs.watch`. Runs in `cargo test` on Windows when Qt is
+  present; skipped with a message otherwise. Feeding a recorded transcript joins
+  this test when the transcript view lands in Milestone 4.
