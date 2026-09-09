@@ -187,6 +187,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "base64",
  "bondsymphonic-proto",
  "cxx",
  "cxx-qt",

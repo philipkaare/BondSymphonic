@@ -8,6 +8,9 @@ fn main() {
         .qt_module("Widgets")
         .file("src/ffi.rs")
         .file("src/qobjects/app_controller.rs")
+        .file("src/qobjects/group_model.rs")
+        .file("src/qobjects/file_tree.rs")
+        .file("src/qobjects/terminal_session.rs")
         // Headers are run through moc, sources are compiled.
         .cpp_files(["cpp/MainWindow.h", "cpp/MainWindow.cpp", "cpp/app.cpp"])
         .build();
