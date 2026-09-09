@@ -30,6 +30,7 @@ thiserror.workspace = true
 alacritty_terminal = "0.26"
 base64 = "0.22"
 ropey = "1"
+similar = "2"
 tree-sitter = "0.25"
 tree-sitter-highlight = "0.25"
 tree-sitter-rust = "0.24"
