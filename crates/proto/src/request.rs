@@ -14,6 +14,11 @@ params!(HelloParams {
     token: String,
     client_version: String
 });
+params!(SetupPtyParams {
+    action: SetupAction,
+    cols: u16,
+    rows: u16
+});
 params!(RepoPathParams { path: String });
 params!(WorkspaceCreateParams {
     repo_path: String,
@@ -89,6 +94,8 @@ pub enum Request {
     SystemCheckPrereqs {},
     #[serde(rename = "system.shutdown")]
     SystemShutdown {},
+    #[serde(rename = "system.setup_pty")]
+    SystemSetupPty(SetupPtyParams),
     #[serde(rename = "repo.inspect")]
     RepoInspect(RepoPathParams),
     #[serde(rename = "repo.detect_run_configs")]
@@ -156,6 +163,7 @@ impl Request {
             Hello(_) => "hello",
             SystemCheckPrereqs {} => "system.check_prereqs",
             SystemShutdown {} => "system.shutdown",
+            SystemSetupPty(_) => "system.setup_pty",
             RepoInspect(_) => "repo.inspect",
             RepoDetectRunConfigs(_) => "repo.detect_run_configs",
             WorkspaceCreate(_) => "workspace.create",
@@ -202,6 +210,11 @@ impl Request {
             }),
             SystemCheckPrereqs {},
             SystemShutdown {},
+            SystemSetupPty(SetupPtyParams {
+                action: SetupAction::GhLogin,
+                cols: 80,
+                rows: 24,
+            }),
             RepoInspect(RepoPathParams { path: "/r".into() }),
             RepoDetectRunConfigs(RepoPathParams { path: "/r".into() }),
             WorkspaceCreate(WorkspaceCreateParams {

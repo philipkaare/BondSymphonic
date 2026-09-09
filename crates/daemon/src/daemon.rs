@@ -8,7 +8,7 @@ use crate::agents::AgentManager;
 use crate::fs_watch::Watchers;
 use crate::git::Git;
 use crate::pty::PtyManager;
-use crate::sandbox::{SandboxBackend, SandboxHandle};
+use crate::sandbox::{SandboxBackend, SandboxHandle, SandboxSpec};
 use crate::server::broadcast::EventBus;
 use crate::workspace::registry::Registry;
 use crate::workspace::{lifecycle, DataDirs, Workspace};
@@ -29,6 +29,11 @@ pub struct Daemon {
     pub watchers: Watchers,
     /// The running agents, which is where `WorkspaceInfo.agents` comes from.
     pub agents: AgentManager,
+    /// The handle the setup terminals (`system.setup_pty`) run under: not a
+    /// sandbox at all, but the daemon user's own home and environment. See
+    /// [`Daemon::host`]. Built on first use, because most daemons never open a
+    /// setup terminal and building it creates directories.
+    pub host: tokio::sync::OnceCell<Arc<dyn SandboxHandle>>,
 }
 
 impl Daemon {
@@ -50,7 +55,48 @@ impl Daemon {
             ptys: PtyManager::new(events),
             watchers: Watchers::default(),
             agents,
+            host: tokio::sync::OnceCell::new(),
         }))
+    }
+
+    /// The host handle, built on first use and then shared.
+    ///
+    /// It is deliberately *not* `self.backend`: a setup command logs in or
+    /// installs software, so it needs the daemon user's real home, the real
+    /// network and the real filesystem — everything a workspace sandbox exists
+    /// to take away. The no-sandbox backend gives exactly that, on every host,
+    /// and going through a `SandboxHandle` at all is what lets the PTY manager
+    /// treat a setup terminal like any other.
+    ///
+    /// `OnceCell::get_or_try_init` leaves the cell empty when the build fails,
+    /// so a transient failure does not poison every later attempt.
+    pub async fn host(&self) -> Result<Arc<dyn SandboxHandle>, RpcError> {
+        self.host
+            .get_or_try_init(|| async {
+                let home = crate::setup::host_home();
+                crate::sandbox::backend_for(crate::setup::HOST_BACKEND)
+                    .start(&SandboxSpec {
+                        id: "host".into(),
+                        rw_binds: vec![],
+                        ro_binds: vec![],
+                        late_ro_binds: vec![],
+                        cwd: home.clone(),
+                        home,
+                        run_dir: self.dirs.run.join("host"),
+                        env: vec![],
+                    })
+                    .await
+            })
+            .await
+            .cloned()
+    }
+
+    /// Ends every setup terminal, so a half-finished login does not outlive the
+    /// daemon that opened it. A daemon that never opened one has nothing to do.
+    pub async fn shutdown_host(&self) {
+        if let Some(host) = self.host.get() {
+            let _ = host.shutdown().await;
+        }
     }
 
     pub fn workspace(&self, id: &WorkspaceId) -> Result<Workspace, RpcError> {

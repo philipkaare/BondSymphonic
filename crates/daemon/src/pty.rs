@@ -1,16 +1,22 @@
-//! Terminal sessions attached to a workspace sandbox.
+//! Terminal sessions: a process with a pseudo-terminal attached, run either
+//! inside a workspace sandbox or on the host.
 //!
-//! A PTY session is a process started inside the workspace's sandbox with a
-//! pseudo-terminal attached. The manager owns the live sessions: `open` starts
-//! one and spawns a pump task that turns terminal output into `pty.output`
-//! events, `write`/`resize` reach the running session, and `close` terminates
-//! it. Every session ends with exactly one `pty.exit` event, published by the
-//! pump task, which then forgets the session; a request naming a session that
-//! has ended is a `NotFound`.
+//! [`PtyManager::open`] starts one inside a workspace's sandbox;
+//! [`PtyManager::open_host`] starts one of the fixed setup commands outside
+//! every sandbox (see [`crate::setup`]). From there the two are the same kind
+//! of session: both are registered by `adopt`, both stream through one pump
+//! task that turns terminal output into `pty.output` events, and
+//! `write`/`resize`/`close` reach either by id. The only visible difference is
+//! the event envelope, which carries a workspace id for the first kind and none
+//! for the second.
+//!
+//! Every session ends with exactly one `pty.exit` event, published by the pump
+//! task, which then forgets the session; a request naming a session that has
+//! ended is a `NotFound`.
 
 use crate::daemon::Daemon;
 use crate::ids::new_id;
-use crate::sandbox::{PtySize, SandboxCommand};
+use crate::sandbox::{PtySize, SandboxChild, SandboxCommand};
 use crate::server::broadcast::EventBus;
 use base64::Engine;
 use bondsymphonic_proto::*;
@@ -56,7 +62,10 @@ const CHUNK: usize = 4096;
 /// One live terminal. The reader half lives in the pump task instead, so
 /// nothing here is held across a read.
 struct Session {
-    workspace_id: WorkspaceId,
+    /// The workspace this terminal belongs to, or `None` for a host setup
+    /// terminal, which belongs to no workspace. It is what the event envelope
+    /// carries, and what `close_workspace` matches on.
+    workspace_id: Option<WorkspaceId>,
     /// Name of the backend that started this terminal. `close` needs it because
     /// how far a killer goes differs between backends.
     backend: &'static str,
@@ -124,7 +133,7 @@ impl PtyManager {
             cols: p.cols.max(2),
             rows: p.rows.max(1),
         };
-        let mut child = handle
+        let child = handle
             .spawn(SandboxCommand {
                 argv,
                 env: vec![],
@@ -132,6 +141,49 @@ impl PtyManager {
                 pty: Some(size),
             })
             .await?;
+        self.adopt(child, Some(ws.id), d.backend.name()).await
+    }
+
+    /// Opens a terminal on the host, outside every sandbox, running one of the
+    /// fixed setup commands from [`crate::setup`].
+    ///
+    /// The caller passes an argv rather than a command string on purpose: the
+    /// only argv that ever reaches here comes from [`crate::setup::setup_argv`],
+    /// so no client can name the program that runs unsandboxed. The one thing
+    /// added to the environment is a `PATH` that leads with `~/.local/bin`,
+    /// which is where `claude` installs itself and need not be on a daemon's
+    /// inherited path.
+    pub async fn open_host(
+        &self,
+        d: &Daemon,
+        argv: Vec<String>,
+        size: PtySize,
+    ) -> Result<PtyOpenResult, RpcError> {
+        let handle = d.host().await?;
+        let child = handle
+            .spawn(SandboxCommand {
+                argv,
+                env: vec![crate::setup::path_with_local_bin(&crate::setup::host_home())],
+                cwd: None,
+                pty: Some(size),
+            })
+            .await?;
+        self.adopt(child, None, crate::setup::HOST_BACKEND).await
+    }
+
+    /// Takes ownership of a freshly spawned child: registers it as a session
+    /// and starts the pump task that publishes its output and its one exit.
+    ///
+    /// `backend` is the name of the backend that started `child`, which is not
+    /// always the daemon's own: a host terminal runs on the no-sandbox backend
+    /// whatever the daemon uses for workspaces. [`PtyManager::close`] needs it,
+    /// because how far a killer goes differs between backends.
+    async fn adopt(
+        &self,
+        mut child: SandboxChild,
+        workspace_id: Option<WorkspaceId>,
+        backend: &'static str,
+    ) -> Result<PtyOpenResult, RpcError> {
         let Some(pty) = child.pty.take() else {
             // The child is running but there is no terminal to reach it by, so
             // it would keep running with nobody able to stop it. Kill it here
@@ -141,8 +193,8 @@ impl PtyManager {
         };
         let id: PtyId = new_id(PtyId::PREFIX).as_str().into();
         let session = Arc::new(Session {
-            workspace_id: ws.id.clone(),
-            backend: d.backend.name(),
+            workspace_id: workspace_id.clone(),
+            backend,
             writer: Mutex::new(pty.writer),
             resizer: pty.resizer,
             killer: child.killer,
@@ -152,7 +204,7 @@ impl PtyManager {
 
         // Output pump + exit watcher.
         let events = self.events.clone();
-        let (pid, wsid) = (id.clone(), ws.id.clone());
+        let pid = id.clone();
         let mut reader = pty.reader;
         let exit = child.exit;
         let sessions = self.sessions.clone();
@@ -190,7 +242,7 @@ impl PtyManager {
                 match read {
                     Ok(0) | Err(_) => break,
                     Ok(n) => events.publish(
-                        Some(wsid.clone()),
+                        workspace_id.clone(),
                         Event::PtyOutput {
                             pty_id: pid.clone(),
                             data_b64: b64(&buf[..n]),
@@ -210,7 +262,7 @@ impl PtyManager {
             // Retire the session before announcing the exit, so a client that
             // reacts to `pty.exit` never finds the id still writable.
             sessions.lock().await.remove(&pid);
-            events.publish(Some(wsid), Event::PtyExit { pty_id: pid, code });
+            events.publish(workspace_id, Event::PtyExit { pty_id: pid, code });
         });
         Ok(PtyOpenResult { pty_id: id })
     }
@@ -296,7 +348,7 @@ impl PtyManager {
             .lock()
             .await
             .values()
-            .filter(|s| &s.workspace_id == ws)
+            .filter(|s| s.workspace_id.as_ref() == Some(ws))
             .cloned()
             .collect();
         for s in victims {

@@ -26,6 +26,27 @@ pub struct PrereqStatus {
     pub fix_hint: Option<String>,
 }
 
+/// The setup commands a client may ask the daemon to run in a host terminal,
+/// one per prerequisite that a person has to fix interactively. Each names a
+/// command the daemon already knows; the request never carries a command line.
+///
+/// That is the whole point of the enum. A setup terminal runs on the host,
+/// outside every sandbox, with the daemon user's own home and network, so a
+/// free-form command there would hand any client that got through `hello` a
+/// shell on the developer's machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupAction {
+    /// Log in to Claude, fixing the `claude_auth` prerequisite.
+    ClaudeLogin,
+    /// Log in to GitHub, fixing `gh_auth`.
+    GhLogin,
+    /// Install the Claude Code CLI, fixing `claude`.
+    InstallClaude,
+    /// Install the GitHub CLI, fixing `gh`.
+    InstallGh,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RepoInfo {
     pub default_branch: String,

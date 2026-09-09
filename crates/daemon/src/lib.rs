@@ -8,4 +8,5 @@ pub mod prereqs;
 pub mod pty;
 pub mod sandbox;
 pub mod server;
+pub mod setup;
 pub mod workspace;

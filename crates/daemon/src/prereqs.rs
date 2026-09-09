@@ -60,9 +60,7 @@ pub async fn check_binary(bin: &str, args: &[&str], fix: &str) -> PrereqStatus {
 }
 
 fn home() -> std::path::PathBuf {
-    directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .unwrap_or_default()
+    crate::setup::host_home()
 }
 
 /// The seven host-level prerequisites, in their spec order, with the noop
@@ -71,6 +69,56 @@ fn home() -> std::path::PathBuf {
 /// before it knows which backend it will run.
 pub async fn check_all() -> Vec<PrereqStatus> {
     check_all_with_backend(&*sandbox::backend_for("noop")).await
+}
+
+/// Whether Claude Code is logged in.
+///
+/// `claude auth status --json` is the authority when it answers: it knows about
+/// every way of being logged in, including ones that leave nothing in
+/// `~/.claude/.credentials.json`. Its **exit code is not** the answer, though —
+/// it is 0 whether or not there is a session (checked against Claude Code in the
+/// `bondsymphonic` distro on 2026-09-09, which printed
+/// `{"loggedIn": false, "authMethod": "none", ...}` and exited 0) — so the
+/// `loggedIn` field is what gets read.
+///
+/// The credentials file and `ANTHROPIC_API_KEY` remain the fallback, for a
+/// `claude` that is missing, too old to have the subcommand, or slow enough to
+/// hit the probe timeout.
+async fn claude_auth(claude_bin: &str) -> PrereqStatus {
+    const FIX: &str = "run `claude auth login` in the distro, or set ANTHROPIC_API_KEY";
+    if let Ok((_, out)) = run(claude_bin, &["auth", "status", "--json"]).await {
+        if let Some(logged_in) = serde_json::from_str::<serde_json::Value>(&out)
+            .ok()
+            .and_then(|v| v.get("loggedIn").and_then(|b| b.as_bool()))
+        {
+            return status(
+                "claude_auth",
+                logged_in,
+                if logged_in {
+                    "logged in to Claude"
+                } else {
+                    "not logged in"
+                },
+                FIX,
+            );
+        }
+    }
+    let creds = home().join(".claude/.credentials.json");
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map(|k| !k.is_empty())
+        .unwrap_or(false);
+    status(
+        "claude_auth",
+        creds.exists() || api_key,
+        if api_key {
+            "ANTHROPIC_API_KEY set"
+        } else if creds.exists() {
+            "OAuth credentials present"
+        } else {
+            "no credentials"
+        },
+        FIX,
+    )
 }
 
 /// The seven host-level prerequisites, in their spec order, followed by
@@ -146,22 +194,7 @@ pub async fn check_all_with_backend(backend: &dyn SandboxBackend) -> Vec<PrereqS
     claude.name = "claude".into();
     v.push(claude);
 
-    let creds = home().join(".claude/.credentials.json");
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map(|k| !k.is_empty())
-        .unwrap_or(false);
-    v.push(status(
-        "claude_auth",
-        creds.exists() || api_key,
-        if api_key {
-            "ANTHROPIC_API_KEY set"
-        } else if creds.exists() {
-            "OAuth credentials present"
-        } else {
-            "no credentials"
-        },
-        "run `claude` once in the distro and log in, or set ANTHROPIC_API_KEY",
-    ));
+    v.push(claude_auth(&claude_bin).await);
 
     let mut gh = check_binary("gh", &["--version"], "sudo apt-get install -y gh").await;
     gh.name = "gh".into();

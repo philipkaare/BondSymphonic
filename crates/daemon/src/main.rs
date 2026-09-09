@@ -137,6 +137,9 @@ async fn serve(args: Args) -> Result<()> {
     });
 
     server.run(shutdown).await?;
+    // A setup terminal is an unsandboxed login or install waiting on a person,
+    // so it must not outlive the daemon that opened it.
+    daemon.shutdown_host().await;
     // Take the handles out under the lock, then shut them down: a `parking_lot`
     // guard must never be held across an await.
     let sandboxes: Vec<_> = daemon.sandboxes.lock().drain().map(|(_, h)| h).collect();
