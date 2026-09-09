@@ -10,6 +10,77 @@ fn b64(s: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(s)
 }
 
+/// Drives one harmless request so the connection's queued events are delivered,
+/// and returns them together with anything `call` buffered earlier.
+#[cfg(unix)]
+async fn poll_events(
+    c: &mut common::Client,
+    ws: &WorkspaceId,
+) -> Vec<(Option<WorkspaceId>, Event)> {
+    let mut events = c.drain_events();
+    let id = c
+        .send(Request::WorkspaceGet(WorkspaceIdParams {
+            workspace_id: ws.clone(),
+        }))
+        .await;
+    c.recv_response(id, &mut events).await.unwrap();
+    events
+}
+
+#[cfg(unix)]
+async fn create_workspace(
+    c: &mut common::Client,
+    repo: &std::path::Path,
+    name: &str,
+) -> WorkspaceInfo {
+    serde_json::from_value(
+        c.call(Request::WorkspaceCreate(WorkspaceCreateParams {
+            repo_path: repo.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: name.into(),
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+#[cfg(unix)]
+async fn open_pty(c: &mut common::Client, ws: &WorkspaceId, command: Option<String>) -> PtyId {
+    let opened: PtyOpenResult = serde_json::from_value(
+        c.call(Request::PtyOpen(PtyOpenParams {
+            workspace_id: ws.clone(),
+            cols: 80,
+            rows: 24,
+            command,
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    opened.pty_id
+}
+
+/// Polls until `pty.exit` for `pty` arrives, or `limit` elapses.
+#[cfg(unix)]
+async fn wait_for_exit(
+    c: &mut common::Client,
+    ws: &WorkspaceId,
+    pty: &PtyId,
+    limit: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < deadline {
+        for (_, e) in poll_events(c, ws).await {
+            if matches!(&e, Event::PtyExit { pty_id, .. } if pty_id == pty) {
+                return true;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
 #[tokio::test]
 async fn pty_open_echo_resize_close_over_protocol() {
     let dir = tempfile::tempdir().unwrap();
@@ -205,4 +276,147 @@ async fn destroying_a_workspace_closes_its_ptys() {
     }
     assert!(gone, "the workspace's pty should be closed and forgotten");
     cancel.cancel();
+}
+
+/// A grandchild that keeps the terminal open must not hold the pump open with it.
+///
+/// `sh` exits at once while the backgrounded loop inherits the terminal and
+/// keeps printing, so the pump has the exit code in hand but never sees end of
+/// file and never sees a quiet gap either. Draining has to stop on an absolute
+/// budget, not on a per-chunk timeout that every tick restarts.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_chattering_grandchild_does_not_hold_the_exit_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, _daemon, cancel) = common::start_daemon(&dir.path().join("data")).await;
+    let mut c = common::Client::connect(port, &token).await;
+    let ws = create_workspace(&mut c, &repo, "chatty").await;
+
+    // Ten seconds of ticks at 100 ms, comfortably longer than the assertion
+    // window, so the loop cannot end the test by finishing on its own. SIGHUP
+    // is ignored first: the kernel sends it to the foreground process group
+    // when the session leader exits, and an ignored disposition is inherited,
+    // so the loop outlives its parent instead of dying with it.
+    let command = r#"sh -c "trap '' HUP; (n=0; while [ $n -lt 100 ]; do echo tick; sleep 0.1; n=$((n+1)); done) & exit 0""#;
+    let pty = open_pty(&mut c, &ws.id, Some(command.to_string())).await;
+
+    let saw_exit = wait_for_exit(&mut c, &ws.id, &pty, std::time::Duration::from_secs(4)).await;
+    assert!(
+        saw_exit,
+        "pty.exit must arrive on the drain budget even while output keeps coming"
+    );
+    cancel.cancel();
+}
+
+/// `pty.close` has to end a shell that ignores SIGTERM.
+///
+/// The sandbox backend's killer sends SIGTERM to the sandboxed process group,
+/// and an interactive `bash -l` (the default command) ignores it. Without an
+/// escalation path the session would never publish `pty.exit` and would leak.
+/// This runs against the real sandbox on purpose: the noop backend's killer is
+/// a hard kill, so the same test would pass there for the wrong reason.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn closing_a_sandboxed_login_shell_publishes_an_exit() {
+    if !bwrap_available() {
+        eprintln!("skipping: bwrap cannot create user namespaces here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, cancel) = start_bwrap_daemon(&dir.path().join("data")).await;
+    let mut c = common::Client::connect(port, &token).await;
+    let ws = create_workspace(&mut c, &repo, "shell").await;
+
+    // No command, so the default login shell runs inside the sandbox.
+    let pty = open_pty(&mut c, &ws.id, None).await;
+
+    // Wait for the shell to reach a prompt; killing it before it has installed
+    // its signal handlers would not exercise the case under test.
+    let mut collected = String::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline && !collected.contains('$') {
+        for (_, e) in poll_events(&mut c, &ws.id).await {
+            if let Event::PtyOutput { data_b64, .. } = e {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data_b64)
+                    .unwrap();
+                collected.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        collected.contains('$'),
+        "the login shell never reached a prompt: {collected}"
+    );
+
+    c.call(Request::PtyClose(PtyIdParams {
+        pty_id: pty.clone(),
+    }))
+    .await
+    .unwrap();
+    let saw_exit = wait_for_exit(&mut c, &ws.id, &pty, std::time::Duration::from_secs(8)).await;
+
+    // Tear the workspace down either way, so a failure does not leave a sandbox
+    // and a live shell behind.
+    let destroyed = c
+        .call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+            workspace_id: ws.id.clone(),
+            force: true,
+        }))
+        .await;
+    cancel.cancel();
+    assert!(saw_exit, "pty.close must end a shell that ignores SIGTERM");
+    destroyed.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn bwrap_available() -> bool {
+    std::process::Command::new("bwrap")
+        .args([
+            "--ro-bind",
+            "/",
+            "/",
+            "--unshare-all",
+            "--die-with-parent",
+            "true",
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// A daemon on an ephemeral port backed by the real bubblewrap sandbox.
+/// `common::start_daemon` is wired to the noop backend, whose killer is a hard
+/// kill, so it cannot show the SIGTERM-ignoring shell this test is about.
+#[cfg(target_os = "linux")]
+async fn start_bwrap_daemon(
+    root: &std::path::Path,
+) -> (u16, String, tokio_util::sync::CancellationToken) {
+    use bondsymphonic_daemon::daemon::Daemon;
+    use bondsymphonic_daemon::sandbox::backend_for;
+    use bondsymphonic_daemon::server::dispatch::SystemHandler;
+    use bondsymphonic_daemon::server::handlers::WorkspaceHandler;
+    use bondsymphonic_daemon::server::{Server, ServerConfig};
+    use bondsymphonic_daemon::workspace::DataDirs;
+
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let daemon = Daemon::new(
+        DataDirs::new(root),
+        backend_for("linux_bwrap"),
+        server.event_bus(),
+    )
+    .unwrap();
+    let system = SystemHandler {
+        token: server.token().to_string(),
+        capabilities: ServerConfig::default().capabilities,
+    };
+    let handler = std::sync::Arc::new(WorkspaceHandler { system, daemon });
+    let (port, token) = (server.port(), server.token().to_string());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let c2 = cancel.clone();
+    tokio::spawn(async move { server.with_handler(handler).run(c2).await.unwrap() });
+    (port, token, cancel)
 }

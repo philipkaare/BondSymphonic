@@ -28,6 +28,28 @@ const EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// with the window restarting on every chunk that still arrives.
 const DRAIN: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// The whole draining phase is capped at this, measured from the child's exit.
+/// [`DRAIN`] alone is a per-read timeout, so a grandchild that inherited the
+/// terminal and chatters faster than that would restart it forever and the
+/// session would never publish its exit.
+const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long `close` waits for a terminal to end on its own before escalating.
+const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Ctrl-C: clears any half-typed line at an interactive prompt.
+const INTERRUPT: &[u8] = b"\x03";
+
+/// Ctrl-D: end of input, which makes an interactive shell at an empty prompt
+/// log out. See [`PtyManager::close`].
+const END_OF_INPUT: &[u8] = b"\x04";
+
+/// Gap between those two bytes. The terminal discards everything still queued
+/// for the shell when it sees Ctrl-C, so an end-of-input byte written in the
+/// same breath is thrown away with the rest; it has to arrive after the shell
+/// has taken the interrupt and redrawn its prompt.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Terminal output is published in chunks of at most this many bytes.
 const CHUNK: usize = 4096;
 
@@ -35,6 +57,9 @@ const CHUNK: usize = 4096;
 /// nothing here is held across a read.
 struct Session {
     workspace_id: WorkspaceId,
+    /// Name of the backend that started this terminal. `close` needs it because
+    /// how far a killer goes differs between backends.
+    backend: &'static str,
     /// Serialises concurrent `pty.write` calls on one terminal.
     writer: Mutex<crate::sandbox::ChildWriter>,
     resizer: Box<dyn Fn(PtySize) -> std::io::Result<()> + Send + Sync>,
@@ -111,6 +136,7 @@ impl PtyManager {
         let id: PtyId = new_id(PtyId::PREFIX).as_str().into();
         let session = Arc::new(Session {
             workspace_id: ws.id.clone(),
+            backend: d.backend.name(),
             writer: Mutex::new(pty.writer),
             resizer: pty.resizer,
             killer: child.killer,
@@ -126,25 +152,33 @@ impl PtyManager {
         tokio::spawn(async move {
             let mut buf = [0u8; CHUNK];
             let mut exit = exit;
-            let mut code: Option<i32> = None;
+            // The exit code, once known, with the instant draining must stop by.
+            let mut ended: Option<(i32, tokio::time::Instant)> = None;
             loop {
-                let read = match code {
+                let read = match ended {
                     // Still running: whichever comes first, output or the exit.
                     None => tokio::select! {
                         r = reader.read(&mut buf) => r,
                         c = &mut exit => {
-                            code = Some(c.unwrap_or(-1));
+                            let until = tokio::time::Instant::now() + DRAIN_BUDGET;
+                            ended = Some((c.unwrap_or(-1), until));
                             continue;
                         }
                     },
                     // The child is gone. Anything it left in the terminal is
-                    // still worth publishing, but the wait is time-boxed: a
-                    // Windows ConPTY master stays readable while its handle
-                    // lives, so end of file may never arrive.
-                    Some(_) => match tokio::time::timeout(DRAIN, reader.read(&mut buf)).await {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    },
+                    // still worth publishing, but the wait is time-boxed twice
+                    // over: a Windows ConPTY master stays readable while its
+                    // handle lives, so end of file may never arrive, and a
+                    // grandchild still holding the terminal can keep every
+                    // single read inside `DRAIN` indefinitely.
+                    Some((_, until)) => {
+                        let quiet = tokio::time::Instant::now() + DRAIN;
+                        match tokio::time::timeout_at(quiet.min(until), reader.read(&mut buf)).await
+                        {
+                            Ok(r) => r,
+                            Err(_) => break,
+                        }
+                    }
                 };
                 match read {
                     Ok(0) | Err(_) => break,
@@ -157,8 +191,8 @@ impl PtyManager {
                     ),
                 }
             }
-            let code = match code {
-                Some(code) => code,
+            let code = match ended {
+                Some((code, _)) => code,
                 // The terminal ended first; give the child a moment to be reaped.
                 None => tokio::time::timeout(EXIT_GRACE, exit)
                     .await
@@ -209,9 +243,42 @@ impl PtyManager {
 
     /// Terminates the session. The `pty.exit` event and the removal of the
     /// session follow from the pump task once the child is actually gone.
+    ///
+    /// The killer on its own is not always enough. On the bubblewrap backend it
+    /// sends SIGTERM to the sandboxed process group, and an interactive shell,
+    /// which is the default command, ignores SIGTERM: the session would never
+    /// end and never publish `pty.exit`. So a session still registered after
+    /// [`CLOSE_GRACE`] is asked a second time, by typing Ctrl-C then Ctrl-D into
+    /// its terminal, which an interactive shell reads as end of input, and then
+    /// killing again for whatever the shell left behind.
+    ///
+    /// A genuine hard kill belongs one layer down: the sandbox init protocol's
+    /// `Kill` request already carries a signal number, so the exec client could
+    /// offer a SIGKILL path instead of hardcoding SIGTERM. That change spans the
+    /// sandbox backends and is ledgered for Milestone 2b.
     pub async fn close(&self, id: &PtyId) -> Result<Empty, RpcError> {
         let s = self.session(id).await?;
         (s.killer)();
+
+        let sessions = self.sessions.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CLOSE_GRACE).await;
+            // The pump retires the session as soon as it has an exit code, so a
+            // session still present here did not take the hint.
+            let still_live = sessions.lock().await.get(&id).cloned();
+            let Some(s) = still_live else {
+                return;
+            };
+            if s.backend == "linux_bwrap" {
+                // The lock is released between the two writes: holding it across
+                // the settle would stall any concurrent `pty.write`.
+                let _ = s.writer.lock().await.write_all(INTERRUPT).await;
+                tokio::time::sleep(SETTLE).await;
+                let _ = s.writer.lock().await.write_all(END_OF_INPUT).await;
+            }
+            (s.killer)();
+        });
         Ok(Empty {})
     }
 
