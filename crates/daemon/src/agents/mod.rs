@@ -141,6 +141,12 @@ pub struct AgentSink {
     agent_id: AgentId,
     workspace_id: WorkspaceId,
     entry: Arc<AgentEntry>,
+    /// Serialises [`message`](AgentSink::message) across every clone of this
+    /// sink, so numbering, persistence and publication are one indivisible
+    /// step. Shared through the `Arc` rather than owned, because the clones are
+    /// the concurrent callers: the adapter's stdout reader and the request task
+    /// recording the user's prompt.
+    order: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AgentSink {
@@ -157,6 +163,7 @@ impl AgentSink {
             agent_id,
             workspace_id,
             entry,
+            order: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -166,7 +173,15 @@ impl AgentSink {
     /// client that reads the transcript and then subscribes sees each `seq`
     /// once. A failed append is logged rather than propagated: losing a
     /// transcript line is not a reason to stop relaying the agent's output.
+    ///
+    /// The whole of that is under one lock. Four await points sit between the
+    /// sequence number and the publish, so without it two callers interleave
+    /// and the message numbered 2 can reach the file, and the bus, ahead of the
+    /// one numbered 1 -- and the transcript is read back in file order.
+    /// Contention costs nothing: the lock is per agent, and one agent's output
+    /// is a single stream anyway.
     pub async fn message(&self, body: AgentMessageBody) -> AgentMessage {
+        let _order = self.order.lock().await;
         let seq = self.entry.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let msg = AgentMessage { seq, ts, body };
@@ -479,5 +494,81 @@ mod tests {
         // What was published is what was persisted.
         let stored = sink.store.read(sink.agent_id()).await.unwrap();
         assert_eq!(stored, vec![first, second]);
+    }
+
+    /// Two callers is the real shape: the adapter's stdout reader records what
+    /// the agent said while the request task records the prompt the user just
+    /// typed. Taking the sequence number and then awaiting the append would let
+    /// the two interleave, and the transcript is read back in file order, so a
+    /// user's own message would appear below the reply to it.
+    #[tokio::test]
+    async fn concurrent_messages_share_one_order_on_the_bus_and_on_disk() {
+        const EACH: usize = 25;
+
+        let dir = tempfile::tempdir().unwrap();
+        let events = EventBus::new(256);
+        let mut rx = events.subscribe();
+        let ws: WorkspaceId = "ws_c".into();
+        let entry = Arc::new(AgentEntry::new(ws.clone(), AgentAdapterKind::Claude));
+        let sink = AgentSink::new(
+            events,
+            Arc::new(TranscriptStore::new(dir.path().join("t"))),
+            "ag_c".into(),
+            ws,
+            entry,
+        );
+
+        let reader = {
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                for i in 0..EACH {
+                    sink.message(AgentMessageBody::AssistantText {
+                        text: format!("a{i}"),
+                    })
+                    .await;
+                }
+            })
+        };
+        let writer = {
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                for i in 0..EACH {
+                    sink.message(AgentMessageBody::UserText {
+                        text: format!("u{i}"),
+                    })
+                    .await;
+                }
+            })
+        };
+        reader.await.unwrap();
+        writer.await.unwrap();
+
+        let published: Vec<u64> = (0..EACH * 2)
+            .map(|_| match rx.try_recv().unwrap() {
+                ServerMessage::Event {
+                    event: Event::AgentMessage { message, .. },
+                    ..
+                } => message.seq,
+                other => panic!("expected an agent message, got {other:?}"),
+            })
+            .collect();
+        let stored: Vec<u64> = sink
+            .store
+            .read(sink.agent_id())
+            .await
+            .unwrap()
+            .iter()
+            .map(|m| m.seq)
+            .collect();
+
+        assert_eq!(published.first(), Some(&1), "{published:?}");
+        assert!(
+            published.windows(2).all(|w| w[0] + 1 == w[1]),
+            "the bus must see 1..n in order: {published:?}"
+        );
+        assert_eq!(
+            stored, published,
+            "the file must hold the same order the bus saw"
+        );
     }
 }

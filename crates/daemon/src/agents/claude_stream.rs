@@ -53,14 +53,31 @@ fn owned_at(v: &Value, key: &str) -> Value {
 /// A `tool_result` block's `content` as flat text. The CLI sends a string for
 /// simple output and an array of content blocks when the tool returned
 /// structured parts, so both are flattened here rather than in every consumer.
+///
+/// Nothing is dropped. A tool that returns an image -- reading a screenshot is
+/// the everyday case -- would otherwise flatten to the empty string and render
+/// as a blank result with no sign anything was there, which is exactly the
+/// quiet loss this module promises not to do. Blocks are keyed by their own
+/// `type`, so one that happens to carry an unrelated `text` field is not
+/// mistaken for text, and they are separated by newlines rather than run
+/// together.
 fn tool_result_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
         Value::Array(items) => items
             .iter()
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .map(|item| match str_at(item, "type") {
+                "text" => str_at(item, "text").to_owned(),
+                "image" => "[image]".to_owned(),
+                // Verbatim rather than a bare `[type]`: a block we do not know
+                // how to render is still worth keeping in full.
+                _ => item.to_string(),
+            })
             .collect::<Vec<_>>()
-            .join(""),
+            .join(
+                "
+",
+            ),
         Value::Null => String::new(),
         other => other.to_string(),
     }
@@ -420,6 +437,37 @@ mod tests {
                 .iter()
                 .any(|p| matches!(p, Parsed::State(S::Error, Some(d)) if d.contains("boom"))),
             "an error result becomes state Error with the detail"
+        );
+    }
+
+    /// A tool that returns anything but plain text -- reading a screenshot is
+    /// the everyday case -- must not vanish from the transcript. Each block is
+    /// keyed by its own `type`, so a future block carrying an unrelated `text`
+    /// field is not mistaken for text, and the blocks are separated rather than
+    /// run together.
+    #[test]
+    fn a_tool_result_with_mixed_blocks_keeps_every_block() {
+        let line = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","#,
+            r#""tool_use_id":"toolu_9","content":[{"type":"text","text":"before"},"#,
+            r#"{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBOR"}},"#,
+            r#"{"type":"text","text":"after"},{"kind":"unlabelled"}],"is_error":false}]},"#,
+            r#""session_id":"sess-9"}"#
+        );
+        let items = parse_line(line);
+        let output = items
+            .iter()
+            .find_map(|p| match p {
+                Parsed::Message(B::ToolResult { output, .. }) => Some(output.clone()),
+                _ => None,
+            })
+            .expect("a tool result");
+        assert_eq!(
+            output,
+            "before
+[image]
+after
+{\"kind\":\"unlabelled\"}"
         );
     }
 
