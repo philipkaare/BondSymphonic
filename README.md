@@ -41,6 +41,39 @@ The IDE side (`crates/ide`) uses [cxx-qt](https://github.com/KDAB/cxx-qt) 0.10 t
 Qt Widgets; the code that installs, starts, and connects to the daemon over WSL lives in
 `crates/ide/src/launcher.rs`.
 
+## Daemon
+
+Milestone 2a: the daemon manages real git worktrees and bubblewrap sandboxes, not just
+protocol scaffolding. `workspace.create` adds a worktree on branch `bs/<name>/work` and starts
+a sandbox in front of it: the sandbox's root filesystem is read-only, only the worktree, the
+workspace's own object directory and its cache are writable, the shared `refs/heads` and object
+store stay read-only, the sandbox gets its own PID namespace, and it has no network access.
+Commits made inside the sandbox land in that private object directory and reach the daemon
+through a git alternate, so the agent's own branch is isolated without the daemon losing sight
+of it. `workspace.list/get/status/destroy` manage that lifecycle (destroying a dirty workspace
+needs `force`), and `pty.open/write/resize/close` and `fs.list_dir/read_file/write_file` run
+inside the sandbox once it exists. Pass `--no-sandbox` to `bondsymphonic-daemon` to run every
+workspace's processes directly on the host instead of in bubblewrap (development only; the
+daemon also falls back to this automatically on a host without bubblewrap, i.e. anywhere but
+Linux).
+
+The daemon keeps its state under its data directory (default `~/.bondsymphonic`, override with
+`--data-dir`):
+
+```
+~/.bondsymphonic/
+  workspaces.json   # the workspace registry
+  worktrees/<id>/    # one git worktree per workspace
+  objects/<id>/      # that workspace's private git object directory
+  homes/<id>/        # $HOME inside the sandbox
+  caches/<id>/       # writable cache, mounted at $HOME/.cache inside the sandbox
+  run/<id>/          # the sandbox's exec socket and other runtime files
+  transcripts/        # agent transcripts (from Milestone 3)
+  bin/                # daemon binaries installed into the distro
+```
+
+See `docs/daemon-protocol-notes.md` for driving the protocol by hand, outside the IDE.
+
 ## Tests
 
 `scripts\env.ps1` must be dot-sourced first so the `bondsymphonic-ide` build and its tests can

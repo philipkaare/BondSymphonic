@@ -1,3 +1,4 @@
+use crate::sandbox::{self, SandboxBackend};
 use bondsymphonic_proto::PrereqStatus;
 use std::process::Stdio;
 use std::time::Duration;
@@ -64,7 +65,19 @@ fn home() -> std::path::PathBuf {
         .unwrap_or_default()
 }
 
+/// The seven host-level prerequisites, in their spec order, with the noop
+/// sandbox backend's own (always-ok) check appended as an eighth item. Used
+/// where no real backend is at hand, such as the CLI's own startup check
+/// before it knows which backend it will run.
 pub async fn check_all() -> Vec<PrereqStatus> {
+    check_all_with_backend(&*sandbox::backend_for("noop")).await
+}
+
+/// The seven host-level prerequisites, in their spec order, followed by
+/// `backend`'s own [`SandboxBackend::check`] result as the eighth item
+/// (named `sandbox`). This is what `system.check_prereqs` reports: the daemon
+/// knows its running backend and reports on that one, not a hypothetical one.
+pub async fn check_all_with_backend(backend: &dyn SandboxBackend) -> Vec<PrereqStatus> {
     let mut v = Vec::new();
 
     let git = match run("git", &["--version"]).await {
@@ -175,6 +188,7 @@ pub async fn check_all() -> Vec<PrereqStatus> {
         )
     };
     v.push(gh_auth);
+    v.extend(backend.check().await);
     v
 }
 
@@ -213,7 +227,8 @@ mod tests {
                 "claude",
                 "claude_auth",
                 "gh",
-                "gh_auth"
+                "gh_auth",
+                "sandbox",
             ]
         );
     }

@@ -2,9 +2,15 @@
 //! Proves the bubblewrap backend really isolates a workspace. Skipped when
 //! `bwrap` cannot create user namespaces (see `scripts/setup-wsl.sh`).
 
+mod common;
+
+use bondsymphonic_daemon::daemon::Daemon;
 use bondsymphonic_daemon::sandbox::linux_bwrap::{bwrap_args, BwrapBackend};
 use bondsymphonic_daemon::sandbox::protocol::{encode, InitRequest};
 use bondsymphonic_daemon::sandbox::{backend_for, PtySize, SandboxCommand, SandboxSpec};
+use bondsymphonic_daemon::server::{Server, ServerConfig};
+use bondsymphonic_daemon::workspace::{lifecycle, DataDirs};
+use bondsymphonic_proto::{WorkspaceCreateParams, WorkspaceState};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -156,7 +162,7 @@ async fn bwrap_isolates_filesystem_pids_and_network() {
     assert!(interfaces.contains(&"lo"), "loopback expected: {out}");
     for name in &interfaces {
         assert!(
-            !["eth", "en", "wl", "docker"]
+            !["eth", "en", "wl", "docker", "veth"]
                 .iter()
                 .any(|p| name.starts_with(p)),
             "real network interface {name} must not exist inside the sandbox: {out}"
@@ -203,6 +209,88 @@ async fn bwrap_isolates_filesystem_pids_and_network() {
     );
     assert_eq!(child.exit.await.unwrap(), 0);
     handle.shutdown().await.unwrap();
+}
+
+/// End-to-end through the real workspace lifecycle (not a hand-built
+/// `SandboxSpec`): a bwrap-backed workspace lets the agent commit on its own
+/// branch, but the shared ref store and object database stay read-only, and
+/// the daemon still sees the commit through the object alternate.
+#[tokio::test]
+async fn bwrap_workspace_protects_main_branch_and_shared_objects() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let daemon = Daemon::new(
+        DataDirs::new(dir.path().join("data")),
+        backend_for("linux_bwrap"),
+        server.event_bus(),
+    )
+    .unwrap();
+    let ws = lifecycle::create(
+        &daemon,
+        WorkspaceCreateParams {
+            repo_path: repo.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: "sb".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ws.state,
+        WorkspaceState::Ready,
+        "sandbox must come up: {:?}",
+        ws.state
+    );
+    let handle = daemon.sandbox(&ws.id).unwrap();
+    let wt = ws.worktree_path.clone();
+
+    // Agent commits on its own branch: allowed.
+    let (code, out) = run_in(
+        &handle,
+        &format!(
+            "cd '{wt}' && git -c user.name=a -c user.email=a@a commit -q --allow-empty -m sandboxed && git rev-parse --abbrev-ref HEAD"
+        ),
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.trim(), "bs/sb/work");
+
+    // Moving main: denied (refs/heads is read-only).
+    let (code, out) = run_in(
+        &handle,
+        &format!("cd '{wt}' && git update-ref refs/heads/main HEAD 2>&1"),
+    )
+    .await;
+    assert_ne!(code, 0, "main must be protected: {out}");
+
+    // Writing into the shared object store: denied.
+    let git_common = bondsymphonic_daemon::git::repo::common_dir(&daemon.git, &repo)
+        .await
+        .unwrap();
+    let (code, _) = run_in(
+        &handle,
+        &format!("touch '{}/objects/should-fail'", git_common.display()),
+    )
+    .await;
+    assert_ne!(code, 0);
+
+    // The daemon sees the commit through alternates.
+    let layout = lifecycle::layout_for(&daemon, &daemon.workspace(&ws.id).unwrap())
+        .await
+        .unwrap();
+    let subject = layout
+        .daemon_git()
+        .run(&repo, &["log", "-1", "--format=%s", "bs/sb/work"])
+        .await
+        .unwrap();
+    assert_eq!(subject.stdout.trim(), "sandboxed");
+
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
 }
 
 /// Proves init tears its sandbox down when the daemon's connection closes.

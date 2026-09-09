@@ -30,6 +30,11 @@ impl Handler for WorkspaceHandler {
         }
         let d = &self.daemon;
         match req {
+            // Overrides `SystemHandler`'s default (noop-backend) check: the daemon
+            // knows which backend it actually started with.
+            Request::SystemCheckPrereqs {} => ok(CheckPrereqsResult {
+                items: crate::prereqs::check_all_with_backend(d.backend.as_ref()).await,
+            }),
             Request::RepoInspect(p) => {
                 ok(crate::git::repo::inspect(&d.git, std::path::Path::new(&p.path)).await?)
             }
