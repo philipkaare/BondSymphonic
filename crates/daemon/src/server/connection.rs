@@ -95,14 +95,7 @@ pub async fn serve_connection(
                     "client lagged during pre-reply flush; events dropped"
                 );
                 if ctx.is_authenticated() {
-                    let notice = ServerMessage::event(
-                        None,
-                        Event::DaemonLog {
-                            level: LogLevel::Warn,
-                            message: format!("events dropped: {dropped}"),
-                            host: None,
-                        },
-                    );
+                    let notice = ServerMessage::event(None, Event::events_dropped(dropped));
                     if out_tx.send(codec::encode(&notice)).await.is_err() {
                         break;
                     }
@@ -132,14 +125,7 @@ pub async fn serve_connection(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(dropped = n, "client lagged; events dropped");
                         if ctx.is_authenticated() {
-                            let notice = ServerMessage::event(
-                                None,
-                                Event::DaemonLog {
-                                    level: LogLevel::Warn,
-                                    message: format!("events dropped: {n}"),
-                                    host: None,
-                                },
-                            );
+                            let notice = ServerMessage::event(None, Event::events_dropped(n));
                             if out_tx.send(codec::encode(&notice)).await.is_err() {
                                 break;
                             }

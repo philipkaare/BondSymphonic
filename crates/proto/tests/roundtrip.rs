@@ -131,3 +131,49 @@ fn every_event_variant_roundtrips() {
         assert_eq!(back, ev);
     }
 }
+
+/// The drop notice is a cross-crate contract: the daemon builds it, the IDE
+/// reads it back off the wire, and neither of them writes the wording down.
+/// The pair has to survive the serialisation in between, and has to refuse
+/// anything that is not the notice.
+#[test]
+fn the_drop_notice_round_trips_through_the_wire_form() {
+    let json = serde_json::to_string(&Event::events_dropped(37)).unwrap();
+    let back: Event = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.dropped_event_count(), Some(37));
+    // The wire text is what a human reads in the log, so it is asserted once,
+    // here, rather than in each crate that handles the notice.
+    assert!(
+        json.contains("events dropped: 37"),
+        "unexpected wire text: {json}"
+    );
+
+    // An ordinary log line at the same level is not a drop notice, whatever it
+    // says, and neither is the same text at another level.
+    assert_eq!(
+        Event::DaemonLog {
+            level: LogLevel::Warn,
+            message: "sandbox is down".into(),
+            host: None,
+        }
+        .dropped_event_count(),
+        None
+    );
+    assert_eq!(
+        Event::DaemonLog {
+            level: LogLevel::Info,
+            message: format!("{EVENT_DROP_PREFIX}5"),
+            host: None,
+        }
+        .dropped_event_count(),
+        None
+    );
+    assert_eq!(
+        Event::PtyExit {
+            pty_id: "pty_1".into(),
+            code: 0,
+        }
+        .dropped_event_count(),
+        None
+    );
+}

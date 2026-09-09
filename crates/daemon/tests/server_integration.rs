@@ -460,8 +460,9 @@ async fn a_lagging_client_is_told_how_many_events_it_missed() {
         );
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    // Drain: somewhere in the stream there must be exactly one "events dropped: N" with N > 0,
-    // and the messages after it must be in order.
+    // Drain: somewhere in the stream there must be exactly one drop notice with N > 0,
+    // and the messages after it must be in order. The notice is recognised with the
+    // proto helper the IDE uses, not with a copy of its wording.
     let mut dropped: Option<u64> = None;
     let mut last_seen: Option<u64> = None;
     for _ in 0..(bondsymphonic_daemon::server::broadcast::EVENT_BUS_CAPACITY * 3 + 5) {
@@ -472,23 +473,20 @@ async fn a_lagging_client_is_told_how_many_events_it_missed() {
         else {
             break;
         };
-        if let ServerMessage::Event {
-            event: Event::DaemonLog { message, level, .. },
-            ..
-        } = msg
-        {
-            if let Some(n) = message.strip_prefix("events dropped: ") {
-                assert_eq!(level, LogLevel::Warn);
+        if let ServerMessage::Event { event, .. } = msg {
+            if let Some(n) = event.dropped_event_count() {
                 assert!(
-                    dropped.replace(n.parse().unwrap()).is_none(),
+                    dropped.replace(n).is_none(),
                     "only one drop notice expected"
                 );
-            } else if let Some(i) = message.strip_prefix('m') {
-                let i: u64 = i.parse().unwrap();
-                if let Some(prev) = last_seen {
-                    assert!(i > prev, "events after a drop must stay ordered");
+            } else if let Event::DaemonLog { message, .. } = event {
+                if let Some(i) = message.strip_prefix('m') {
+                    let i: u64 = i.parse().unwrap();
+                    if let Some(prev) = last_seen {
+                        assert!(i > prev, "events after a drop must stay ordered");
+                    }
+                    last_seen = Some(i);
                 }
-                last_seen = Some(i);
             }
         }
     }
@@ -586,14 +584,10 @@ async fn a_lag_that_happens_during_the_pre_reply_flush_is_still_reported() {
             break;
         };
         match msg {
-            ServerMessage::Event {
-                event: Event::DaemonLog { message, level, .. },
-                ..
-            } => {
-                if let Some(n) = message.strip_prefix("events dropped: ") {
-                    assert_eq!(level, LogLevel::Warn);
+            ServerMessage::Event { event, .. } => {
+                if let Some(n) = event.dropped_event_count() {
                     assert!(
-                        dropped.replace(n.parse().unwrap()).is_none(),
+                        dropped.replace(n).is_none(),
                         "only one drop notice expected"
                     );
                     assert!(

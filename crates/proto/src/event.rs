@@ -43,7 +43,42 @@ pub enum Event {
     FsChanged { paths: Vec<String> },
 }
 
+/// Prefix of the `daemon.log` message the daemon sends when a client's event
+/// queue overflowed and events were discarded.
+///
+/// The wording is a contract between the daemon (which emits the notice) and
+/// every client that reacts to it (the IDE marks the gap in each open
+/// terminal). Neither side spells it out: both go through
+/// [`Event::events_dropped`] and [`Event::dropped_event_count`], so rewording
+/// the line here cannot leave one end matching on text the other no longer
+/// sends.
+pub const EVENT_DROP_PREFIX: &str = "events dropped: ";
+
 impl Event {
+    /// The warn-level `daemon.log` event announcing that `count` events were
+    /// discarded for a lagging client.
+    pub fn events_dropped(count: u64) -> Event {
+        Event::DaemonLog {
+            level: LogLevel::Warn,
+            message: format!("{EVENT_DROP_PREFIX}{count}"),
+            host: None,
+        }
+    }
+
+    /// How many events this notice says were discarded, or `None` when the
+    /// event is not a drop notice at all. The inverse of
+    /// [`Event::events_dropped`].
+    pub fn dropped_event_count(&self) -> Option<u64> {
+        match self {
+            Event::DaemonLog {
+                level: LogLevel::Warn,
+                message,
+                ..
+            } => message.strip_prefix(EVENT_DROP_PREFIX)?.trim().parse().ok(),
+            _ => None,
+        }
+    }
+
     pub fn examples() -> Vec<Event> {
         use Event::*;
         vec![
