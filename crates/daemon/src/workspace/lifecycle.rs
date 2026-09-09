@@ -35,6 +35,10 @@ pub async fn layout_for(d: &Daemon, ws: &Workspace) -> Result<Layout, RpcError> 
     })
 }
 
+/// The backend whose sandbox needs host binaries bound in. Compared by name so
+/// this module does not have to be conditional on the target OS.
+const BWRAP_BACKEND: &str = "linux_bwrap";
+
 pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
     let same = |p: &Path| (p.to_path_buf(), p.to_path_buf());
     let mut rw_binds = vec![same(&ws.worktree_path), same(&layout.objects_dir)];
@@ -42,7 +46,17 @@ pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
     let cache = d.dirs.cache(&ws.id);
     let home_in_sandbox = PathBuf::from(format!("/home/{}", sandbox_user()));
     rw_binds.push((cache, home_in_sandbox.join(".cache")));
-    let ro_binds = vec![same(&layout.git_common)];
+    let mut ro_binds = vec![same(&layout.git_common)];
+    // The Claude Code CLI, bound in at a fixed path. A bwrap sandbox has its
+    // own `/home`, so the daemon user's install is not reachable from inside it
+    // and `claude_argv` names the bound path instead. Only where the backend
+    // has mounts: `noop` runs processes as plain children of the daemon, which
+    // already see the host binary at its own path. Absent Claude Code adds no
+    // bind, and `agent.start` refuses with `PrereqMissing` rather than starting
+    // a workspace that cannot host an agent.
+    if d.backend.name() == BWRAP_BACKEND {
+        ro_binds.extend(crate::agents::claude::claude_ro_bind());
+    }
     // Read-only *after* the read-write bind of its parent gitdir, or the parent
     // would put the writable original straight back on top of it.
     let late_ro_binds = vec![same(&layout.config_worktree())];

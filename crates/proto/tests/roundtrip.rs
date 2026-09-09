@@ -196,3 +196,34 @@ fn diff_result_defaults_truncated_to_false() {
     let back: DiffResult = serde_json::from_value(v).unwrap();
     assert_eq!(back, cut);
 }
+
+/// The one struct in the protocol that carries the user's Anthropic API key
+/// must not be able to print it. Nothing formats these options today, which is
+/// exactly why this test exists: a `#[derive(Debug)]` added back here would
+/// leak the key the first time anyone put the request in a tracing field.
+#[test]
+fn agent_start_options_debug_redacts_the_api_key() {
+    let options = AgentStartOptions {
+        command: None,
+        resume_session: Some("sess-9".into()),
+        model: Some("sonnet".into()),
+        permission_mode: Some("default".into()),
+        api_key: Some("sk-ant-secret-value".into()),
+    };
+    let printed = format!("{options:?}");
+    assert!(
+        !printed.contains("sk-ant-secret-value"),
+        "the key must not survive Debug: {printed}"
+    );
+    assert!(printed.contains("api_key: Some(<redacted>)"), "{printed}");
+    // The rest is still legible, and whether a key is set is still visible.
+    assert!(printed.contains("sonnet"), "{printed}");
+    let without = AgentStartOptions {
+        api_key: None,
+        ..options.clone()
+    };
+    assert!(format!("{without:?}").contains("api_key: None"));
+    // Serialisation is untouched: only the human-readable form is redacted.
+    let v = serde_json::to_value(&options).unwrap();
+    assert_eq!(v["api_key"], "sk-ant-secret-value");
+}

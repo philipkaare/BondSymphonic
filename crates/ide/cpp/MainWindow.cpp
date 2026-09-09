@@ -343,8 +343,20 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::workspacesListed, this,
                      [this](const QString& json) { m_groupModel->reconcile(json); });
     QObject::connect(m_controller, &AppController::workspaceCreated, this,
-                     [this](const QString& info, const QString& group, const QString& adapter, const QString& command) {
-                         m_groupModel->addTab(info, group, adapter, command);
+                     [this](const QString& info, const QString& group, const QString& adapter,
+                            const QString& command, const QString& options) {
+                         m_groupModel->addTab(info, group, adapter, command, options);
+                         // A Claude workspace is created with an agent start
+                         // already on its way, and the tab is shown before that
+                         // answers. The pane has to know, or it offers a Start
+                         // button for a start that is already running.
+                         if (adapter == QLatin1String("claude")) {
+                             const QString workspaceId = QJsonDocument::fromJson(info.toUtf8())
+                                                             .object()
+                                                             .value("id")
+                                                             .toString();
+                             m_agentArea->setStarting(workspaceId, true);
+                         }
                      });
     QObject::connect(m_controller, &AppController::workspaceChanged, this,
                      [this](const QString& info) { m_groupModel->applyWorkspaceInfo(info); });
@@ -354,10 +366,16 @@ void MainWindow::connectController() {
     // id back out of the tab.
     QObject::connect(m_controller, &AppController::agentStarted, this,
                      [this](const QString& workspaceId, const QString& agentId) {
+                         m_agentArea->setStarting(workspaceId, false);
                          m_groupModel->setAgent(workspaceId, agentId);
                          m_agentArea->setAgent(workspaceId, agentId);
                          rebindCost();
                      });
+    // A transcript pane with no agent -- a restored session, or one whose agent
+    // exited -- offers to start one. The options are the tab's own, so a
+    // restarted agent gets the model and permission mode the user chose.
+    QObject::connect(m_agentArea, &AgentArea::startAgentRequested, this,
+                     &MainWindow::onStartAgentRequested);
     QObject::connect(m_controller, &AppController::agentStateChanged, this,
                      [this](const QString& agentId, const QString& state, const QString& detail) {
                          m_groupModel->setAgentStatus(agentId, state, detail);
@@ -387,6 +405,22 @@ void MainWindow::connectController() {
                      });
     QObject::connect(m_controller, &AppController::saveAllRequested, this,
                      [this] { m_editorArea->saveAll(); });
+    // Sending and stopping from outside the pane, through the same model calls
+    // the prompt box and the Stop button use. Only the pane attached to that
+    // agent may be driven: a prompt routed elsewhere would land in a
+    // conversation the caller never named.
+    QObject::connect(m_controller, &AppController::agentSendRequested, this,
+                     [this](const QString& agentId, const QString& text) {
+                         if (TranscriptModel* model = activeAgentModel(agentId, "send")) {
+                             model->send(text);
+                         }
+                     });
+    QObject::connect(m_controller, &AppController::agentStopRequested, this,
+                     [this](const QString& agentId) {
+                         if (TranscriptModel* model = activeAgentModel(agentId, "stop")) {
+                             model->stop();
+                         }
+                     });
     // Answering a permission request from outside the transcript view. Only the
     // view that is actually showing `requestId` may answer it: an answer routed
     // to any other pane would allow a tool the user never saw.
@@ -482,7 +516,37 @@ void MainWindow::onDestroyRequested(const QString& workspaceId) {
     m_controller->destroyWorkspace(workspaceId, force->isChecked());
 }
 
+TranscriptModel* MainWindow::activeAgentModel(const QString& agentId, const char* what) {
+    const QString workspaceId = activeWorkspaceId();
+    TranscriptModel* model =
+        workspaceId.isEmpty() ? nullptr : m_agentArea->transcriptModel(workspaceId);
+    if (model == nullptr || model->getAgentId() != agentId) {
+        qWarning("agent %s not routed: no visible transcript is attached to agent %s", what,
+                 qUtf8Printable(agentId));
+        return nullptr;
+    }
+    return model;
+}
+
+void MainWindow::onStartAgentRequested(const QString& workspaceId) {
+    const QJsonObject tab = activeTab();
+    // The Start button lives on the visible pane, so the active tab is the one
+    // that asked; anything else means the model moved under the click.
+    if (workspaceId.isEmpty() || tab.value("workspace_id").toString() != workspaceId) {
+        m_agentArea->setStarting(workspaceId, false);
+        return;
+    }
+    m_agentArea->setStarting(workspaceId, true);
+    m_controller->startAgent(workspaceId, tab.value("options_json").toString());
+}
+
 void MainWindow::onOperationFailed(const QString& op, const QString& message) {
+    if (op == QLatin1String("agent.start")) {
+        // The pane must stop saying it is starting something. The signal names
+        // the operation and not the workspace, and only one start is ever in
+        // flight, so every mark comes down.
+        m_agentArea->clearStarting();
+    }
     // The New Agent dialog reports its own inspection failures inline, and while
     // it is up it is modal, so a box parented to this window could not be closed.
     if (!m_newAgentDialog.isNull()) {

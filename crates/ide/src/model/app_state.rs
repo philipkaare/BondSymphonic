@@ -162,6 +162,14 @@ pub struct AgentTab {
     /// The detail belonging to `agent_status`, restored with it.
     #[serde(default)]
     pub agent_detail: String,
+    /// The `AgentStartOptions` this tab's agent was started with, as JSON, or
+    /// empty for a tab that never asked for one. Kept so restarting an agent --
+    /// after it exited, or after a daemon restart left the workspace with none
+    /// -- uses the model and permission mode the user chose rather than the
+    /// defaults. Never carries the API key: the controller merges that in at
+    /// call time and this is written to `session.json`.
+    #[serde(default)]
+    pub options_json: String,
 }
 
 /// A user-defined collection of agent tabs, shown as a section in the sidebar.
@@ -429,6 +437,7 @@ impl Workspaces {
                 agent_id: None,
                 agent_status: None,
                 agent_detail: String::new(),
+                options_json: String::new(),
             });
         }
 

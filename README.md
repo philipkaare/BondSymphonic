@@ -79,9 +79,13 @@ Known limits in Milestone 4:
   adapter passes was verified accepted by Claude Code 2.1.263, but no line in the fixtures
   came out of a real `claude`. `scripts/record-claude-stream.sh` records a real turn beside
   them; it needs someone logged in, and it will not log you in itself.
-- An agent does not survive a daemon restart. The session id `claude --resume` would need
-  is kept in memory only, and the IDE never sends one, so a restarted daemon starts a fresh
-  conversation. Resume lands in Milestone 6.
+- An agent does not survive a daemon restart, and the IDE does not start one for you. The
+  restored tab has no agent and offers a **Start agent** button; pressing it starts a
+  fresh conversation with the options the tab was created with. The session id
+  `claude --resume` would need is kept in memory only and the IDE never sends one, so
+  the old conversation is not continued. Resume lands in Milestone 6.
+- An agent that exits — including one that dies at start-up because nobody is logged in —
+  puts the reason in a banner above the prompt and offers **Restart agent**.
 - "Always allow this tool for this session" lives in the tab's transcript in the IDE. It is
   never sent to the daemon and never written to disk, and it is forgotten when that pane
   re-attaches — reopening the workspace, or pointing the tab at another agent.
@@ -202,9 +206,10 @@ are read once at startup and do nothing at all when unset, which is every ordina
 - `BS_SMOKE_SCRIPT`: a comma-separated list of steps the controller performs once the
   connection is up. `create` and `create_claude` make a workspace over `BS_SMOKE_REPO`,
   announced with the same signal New Agent produces, as a terminal tab or a Claude tab;
-  `open_agent` starts a Claude agent in it and announces that; `send` puts a prompt to the
-  agent; `allow` allows the pending tool call through the window, the same way a
-  notification will; `stop` stops the agent; `open` opens a PTY; `tree` lists the
+  `open_agent` starts a Claude agent in it and announces that; `send`, `allow` and `stop`
+  all go through the window — the prompt, the permission answer and the stop leave the
+  same `TranscriptModel` calls a person's typing and clicking would, the way a desktop
+  notification will; `open` opens a PTY; `tree` lists the
   workspace root; `open_file` and `open_diff` ask the window to open `README.md` as an
   editor tab and as a diff tab, through the same controller signals the Explorer's
   double-click emits; `close` closes the script's PTY; `destroy` destroys the workspace;
@@ -216,10 +221,12 @@ start without the Qt runtime on PATH.
 The daemon carries three, all read from its own environment, all inert when unset. No test
 needs a Claude login or a network.
 
-- `BS_CLAUDE_BIN`: the command to run instead of `claude`, split the way a shell would, so
-  a stand-in can be an interpreter plus a script
-  (`python3 /opt/fake/fake_claude.py`). It also suppresses the "untested Claude Code
-  version" warning, since a stand-in's version says nothing about the protocol.
+- `BS_CLAUDE_BIN`: the command to run instead of the real `claude`, split the way a shell
+  would, so a stand-in can be an interpreter plus a script
+  (`python3 <worktree>/fake_claude.py`). Unset, the daemon resolves the real binary from
+  `~/.local/bin/claude` and binds it into the sandbox at `/opt/bs/claude`. It also
+  suppresses the "untested Claude Code version" warning, since a stand-in's version says
+  nothing about the protocol.
 - `FAKE_CLAUDE_FIXTURE`: which NDJSON stream `crates/daemon/tests/fixtures/fake_claude.py`
   replays. Inside a bubblewrap sandbox this never arrives — the sandbox builds the agent's
   environment from the spec alone — so the fake also falls back to `fixture.ndjson` beside
@@ -230,8 +237,10 @@ needs a Claude login or a network.
 The daemon reads these where it spawns an agent, so they have to be in the *daemon's*
 environment. When the IDE launches it through `wsl.exe`, name them in `WSLENV`
 (`WSLENV=BS_CLAUDE_BIN/u:FAKE_CLAUDE_FIXTURE/u`) before starting the IDE, and put the fake
-somewhere the sandbox can see — `/opt/...`, not under `/home`, which the workspace's own
-home is mounted over.
+somewhere the sandbox can see. The workspace's **worktree** is the reliable place: it is
+bound read-write at its own path. `/home` is a tmpfs with the workspace's own home
+mounted over it, `/tmp` is a fresh tmpfs, and `/opt` is a tmpfs holding only the bound
+`claude`, so a fake under any of those is invisible from inside.
 
 ## Layout
 

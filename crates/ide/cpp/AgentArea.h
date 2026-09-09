@@ -1,6 +1,7 @@
 #pragma once
 #include <QHash>
 #include <QList>
+#include <QSet>
 #include <QStackedWidget>
 #include <QString>
 
@@ -26,6 +27,13 @@ class AgentArea : public QStackedWidget {
 public:
     explicit AgentArea(QWidget* parent = nullptr);
 
+signals:
+    /// A transcript pane asked for an agent to be started (or restarted) in
+    /// `workspaceId`. The window is what knows the options the tab was created
+    /// with and how to reach the controller.
+    void startAgentRequested(const QString& workspaceId);
+
+public:
     /// What the placeholder page says while nothing is showing.
     void setPlaceholderText(const QString& text);
 
@@ -52,6 +60,17 @@ public:
     /// Shows the placeholder without disturbing any existing pane.
     void showPlaceholder();
 
+    /// Records whether an `agent.start` for `workspaceId` is in flight, so its
+    /// transcript pane can say "starting" rather than offering a Start button.
+    /// Remembered even for a workspace whose pane does not exist yet, because a
+    /// Claude workspace is created before its tab is first shown.
+    void setStarting(const QString& workspaceId, bool starting);
+
+    /// Clears every in-flight mark. Used when an `agent.start` fails: the
+    /// failure signal names the operation, not the workspace, and only one
+    /// start is ever in flight.
+    void clearStarting();
+
     /// Closes the workspace's PTY or transcript and drops its pane.
     void removeWorkspace(const QString& workspaceId);
 
@@ -73,4 +92,7 @@ private:
     /// The agent id each transcript is attached to, so re-showing a tab does
     /// not replay its history again.
     QHash<QString, QString> m_attached;
+    /// Workspaces with an `agent.start` in flight, kept here rather than only
+    /// on the pane because the start begins before the pane exists.
+    QSet<QString> m_starting;
 };

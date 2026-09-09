@@ -25,7 +25,10 @@ impl Default for ServerConfig {
             capabilities: Capabilities {
                 sandbox_backend: "noop".into(),
                 git_protect: false,
-                adapters: vec![AgentAdapterKind::Terminal],
+                // Both, as `main.rs` advertises them: this default is what the
+                // tests connect to, and a client that trusted it would conclude
+                // the daemon cannot run a Claude agent.
+                adapters: vec![AgentAdapterKind::Claude, AgentAdapterKind::Terminal],
             },
         }
     }

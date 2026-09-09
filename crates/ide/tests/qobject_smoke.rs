@@ -46,6 +46,7 @@ fn tab(info: &WorkspaceInfo) -> AgentTab {
         detail: String::new(),
         adapter: AgentAdapterKind::Terminal,
         command: None,
+        options_json: String::new(),
         agent_id: None,
         agent_status: None,
         agent_detail: String::new(),

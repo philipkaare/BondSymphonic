@@ -306,7 +306,11 @@ impl AgentManager {
             )));
         }
         let handle = d.sandbox(&ws.id)?;
-        let argv = claude::claude_argv(&p.options)?;
+        // The backend decides how the CLI is named: bound into the sandbox at a
+        // fixed path under bwrap, and at its host path where there are no
+        // mounts. Resolved before anything is spawned, so a missing install is
+        // a `PrereqMissing` naming the path rather than an exec failure.
+        let argv = claude::claude_argv(&p.options, d.backend.name())?;
 
         // Again at start, not only at creation: the user may have logged in
         // since this workspace was made, and a workspace that was created
@@ -384,13 +388,19 @@ impl AgentManager {
     pub async fn history(&self, p: AgentIdParams) -> Result<HistoryResult, RpcError> {
         // Through the map, so an id nobody ever minted is a `NotFound` rather
         // than an empty transcript.
-        self.get(&p.agent_id)?;
+        let agent = self.get(&p.agent_id)?;
+        let messages = self
+            .store
+            .read(&p.agent_id)
+            .await
+            .map_err(|e| RpcError::io(&e))?;
+        // Read after the messages, so the state a client is given is never
+        // older than the transcript it is given with it.
+        let (state, detail) = agent.entry.state();
         Ok(HistoryResult {
-            messages: self
-                .store
-                .read(&p.agent_id)
-                .await
-                .map_err(|e| RpcError::io(&e))?,
+            messages,
+            state,
+            detail,
         })
     }
 

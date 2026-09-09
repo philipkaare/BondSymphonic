@@ -128,9 +128,9 @@ pub(crate) async fn run(steps: Vec<String>, client: DaemonClient, qt: QtHandle) 
             "open_agent" => open_agent(&client, &qt, workspace.as_ref())
                 .await
                 .map(|id| agent = Some(id)),
-            "send" => send(&client, agent.as_ref()).await,
+            "send" => send(&qt, agent.as_ref()).await,
             "allow" => allow(&qt, agent.as_ref()).await,
-            "stop" => stop(&client, agent.take()).await,
+            "stop" => stop(&qt, agent.take()).await,
             "open" => open(&client, workspace.as_ref())
                 .await
                 .map(|id| pty = Some(id)),
@@ -184,6 +184,7 @@ async fn create(
             QString::from(GROUP),
             QString::from(adapter),
             QString::from(""),
+            QString::from(""),
         )
     });
     tokio::time::sleep(CREATE_SETTLE).await;
@@ -229,17 +230,17 @@ async fn open_agent(
     Ok(res.agent_id)
 }
 
-/// Sends a prompt, then waits for the permission request the fake daemon
-/// answers with to reach the transcript.
-async fn send(client: &DaemonClient, agent: Option<&AgentId>) -> Result<(), String> {
-    let agent_id = need_agent(agent, "send")?;
-    client
-        .request_raw(Request::AgentSend(AgentSendParams {
-            agent_id,
-            text: PROMPT.to_owned(),
-        }))
-        .await
-        .map_err(|e| e.to_string())?;
+/// Sends a prompt through the window, then waits for the permission request
+/// the fake daemon answers with to reach the transcript.
+///
+/// Through the window, not on this module's own client: `agent.send` has to
+/// leave `TranscriptModel::send`, or the run proves only that the fake daemon
+/// answers a request the IDE never made and the suite's "no `agent.send`
+/// failed" guard can never fire.
+async fn send(qt: &QtHandle, agent: Option<&AgentId>) -> Result<(), String> {
+    let agent_id = need_agent(agent, "send")?.to_string();
+    qt.queue(move |q| q.request_agent_send(QString::from(&agent_id), QString::from(PROMPT)))
+        .map_err(|_| "the Qt thread is gone".to_owned())?;
     tokio::time::sleep(AGENT_SETTLE).await;
     Ok(())
 }
@@ -266,14 +267,14 @@ async fn allow(qt: &QtHandle, agent: Option<&AgentId>) -> Result<(), String> {
     Ok(())
 }
 
-/// Stops the agent. `destroy` would reap it daemon-side without the IDE saying
-/// anything, so this is the step that exercises `agent.stop`.
-async fn stop(client: &DaemonClient, agent: Option<AgentId>) -> Result<(), String> {
-    let agent_id = need_agent(agent.as_ref(), "stop")?;
-    client
-        .request_raw(Request::AgentStop(AgentIdParams { agent_id }))
-        .await
-        .map_err(|e| e.to_string())?;
+/// Stops the agent through the window. `destroy` would reap it daemon-side
+/// without the IDE saying anything, so this is the step that exercises
+/// `agent.stop` -- and it goes through `TranscriptModel::stop` for the same
+/// reason [`send`] does.
+async fn stop(qt: &QtHandle, agent: Option<AgentId>) -> Result<(), String> {
+    let agent_id = need_agent(agent.as_ref(), "stop")?.to_string();
+    qt.queue(move |q| q.request_agent_stop(QString::from(&agent_id)))
+        .map_err(|_| "the Qt thread is gone".to_owned())?;
     tokio::time::sleep(EXIT_SETTLE).await;
     Ok(())
 }

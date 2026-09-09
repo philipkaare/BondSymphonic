@@ -226,6 +226,13 @@ pub fn parse_line(line: &str) -> Vec<Parsed> {
 
 /// What to show beside an errored turn: the CLI's own error list when it sent
 /// one, else the result subtype, which at least names the failure mode.
+///
+/// A subtype that says nothing is dropped rather than shown. Claude Code
+/// 2.1.263 answers a logged-out turn with `is_error: true` and
+/// `subtype: "success"` and no `errors` array (recorded against the real CLI on
+/// 2026-09-09), and a banner reading "success" over a failed turn is worse than
+/// no banner at all -- the transcript itself carries the assistant's "Not logged
+/// in" line, which is the thing to read.
 fn error_detail(result: &Value) -> String {
     let joined = result
         .get("errors")
@@ -241,10 +248,12 @@ fn error_detail(result: &Value) -> String {
                 .join("; ")
         })
         .unwrap_or_default();
-    if joined.is_empty() {
-        str_at(result, "subtype").to_owned()
-    } else {
-        joined
+    if !joined.is_empty() {
+        return joined;
+    }
+    match str_at(result, "subtype") {
+        "" | "success" => "the agent ended the turn with an error".to_owned(),
+        subtype => subtype.to_owned(),
     }
 }
 
@@ -435,6 +444,41 @@ mod tests {
                 .any(|p| matches!(p, Parsed::State(S::Error, Some(d)) if d.contains("boom"))),
             "an error result becomes state Error with the detail"
         );
+    }
+
+    /// The detail beside an errored turn has to say something. Claude Code
+    /// 2.1.263 answers a logged-out turn with `is_error: true`, no `errors`
+    /// array and `subtype: "success"` (recorded from the real CLI inside a
+    /// sandbox on 2026-09-09), and the IDE puts this string in the pane's
+    /// banner, where the word "success" over a failed turn is a lie.
+    #[test]
+    fn an_errored_result_never_reports_itself_as_a_success() {
+        let detail = |line: Value| match parse_line(&line.to_string())
+            .into_iter()
+            .find(|p| matches!(p, Parsed::State(S::Error, _)))
+        {
+            Some(Parsed::State(_, detail)) => detail.unwrap_or_default(),
+            other => panic!("expected an error state, got {other:?}"),
+        };
+        let base = |subtype: &str| {
+            json!({
+                "type": "result",
+                "subtype": subtype,
+                "is_error": true,
+                "session_id": "s",
+                "total_cost_usd": 0.0,
+                "duration_ms": 50,
+                "num_turns": 1,
+            })
+        };
+        assert_eq!(
+            detail(base("success")),
+            "the agent ended the turn with an error"
+        );
+        assert_eq!(detail(base("error_max_turns")), "error_max_turns");
+        let mut with_errors = base("success");
+        with_errors["errors"] = json!(["Not logged in", "run /login"]);
+        assert_eq!(detail(with_errors), "Not logged in; run /login");
     }
 
     /// A tool that returns anything but plain text -- reading a screenshot is

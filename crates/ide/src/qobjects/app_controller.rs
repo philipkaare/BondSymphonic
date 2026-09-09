@@ -126,9 +126,12 @@ pub mod qobject {
         #[qsignal]
         fn workspace_changed(self: Pin<&mut AppController>, info_json: QString);
 
-        /// A `create_workspace` call succeeded. `group`, `adapter` and `command`
-        /// are echoed back from the call so the UI can place the new tab without
-        /// tracking the in-flight request itself.
+        /// A `create_workspace` call succeeded. `group`, `adapter`, `command`
+        /// and `options_json` are echoed back from the call so the UI can place
+        /// the new tab without tracking the in-flight request itself.
+        /// `options_json` is the agent's `AgentStartOptions` for a Claude
+        /// workspace and empty otherwise; it never carries the API key, which
+        /// the controller merges in when it builds the request.
         #[qsignal]
         fn workspace_created(
             self: Pin<&mut AppController>,
@@ -136,6 +139,7 @@ pub mod qobject {
             group: QString,
             adapter: QString,
             command: QString,
+            options_json: QString,
         );
 
         /// A `destroy_workspace` call succeeded, for the workspace with this id.
@@ -303,13 +307,22 @@ pub mod qobject {
             allow: bool,
         );
 
+        /// Someone in Rust asked the window to send `text` as a prompt to
+        /// `agent_id`'s transcript.
+        #[qsignal]
+        fn agent_send_requested(self: Pin<&mut AppController>, agent_id: QString, text: QString);
+
+        /// Someone in Rust asked the window to stop `agent_id`.
+        #[qsignal]
+        fn agent_stop_requested(self: Pin<&mut AppController>, agent_id: QString);
+
         /// Someone in Rust asked the window to save every dirty editor.
         #[qsignal]
         fn save_all_requested(self: Pin<&mut AppController>);
 
         /// Asks the window to open `path` of `workspace_id` in an editor tab.
         ///
-        /// These four `request_*` invokables are the one path by which anything
+        /// These six `request_*` invokables are the one path by which anything
         /// on the Rust side reaches the window: the controller has no pointer
         /// to it, and the window is the only thing that knows which tabs exist.
         /// The smoke script drives them today; the transcript's tool cards will
@@ -337,6 +350,23 @@ pub mod qobject {
             request_id: QString,
             allow: bool,
         );
+
+        /// Asks the window to send `text` to `agent_id`, as if the user had
+        /// typed it into that pane's prompt box.
+        ///
+        /// Like `request_permission_reply` this goes through the window because
+        /// only the window knows which pane is attached to which agent, and it
+        /// travels the production path: `TranscriptModel::send`, which is what
+        /// turns a failed `agent.send` into a warning and an error banner. A
+        /// request built here instead would reach the daemon without any of
+        /// that.
+        #[qinvokable]
+        fn request_agent_send(self: Pin<&mut AppController>, agent_id: QString, text: QString);
+
+        /// Asks the window to stop `agent_id`, as if the user had pressed Stop
+        /// on that pane. Routed for the same reason as `request_agent_send`.
+        #[qinvokable]
+        fn request_agent_stop(self: Pin<&mut AppController>, agent_id: QString);
 
         /// Asks the window to save every dirty editor.
         #[qinvokable]
@@ -786,6 +816,7 @@ impl qobject::AppController {
                             QString::from(&group),
                             QString::from(&adapter),
                             QString::from(&command),
+                            QString::from(""),
                         )
                     });
                 }
@@ -811,6 +842,11 @@ impl qobject::AppController {
         };
         let group = group.to_string();
         let options = start_options(&options_json.to_string());
+        // Echoed back to the window verbatim, so the tab keeps what the user
+        // asked for and can start the agent again with it. The API key is not
+        // in it: `start_options` merges the key into the request it builds and
+        // never into this string.
+        let echoed_options = options_json.to_string();
         let prompt = initial_prompt.to_string();
         let shared = match require_connection() {
             Ok(shared) => shared,
@@ -841,6 +877,7 @@ impl qobject::AppController {
                     QString::from(&group),
                     QString::from("claude"),
                     QString::from(""),
+                    QString::from(&echoed_options),
                 )
             });
             start_agent_and_prompt(shared, qt, info.id, options, prompt).await;
@@ -938,6 +975,14 @@ impl qobject::AppController {
         allow: bool,
     ) {
         self.permission_reply_requested(agent_id, request_id, allow);
+    }
+
+    pub fn request_agent_send(self: Pin<&mut Self>, agent_id: QString, text: QString) {
+        self.agent_send_requested(agent_id, text);
+    }
+
+    pub fn request_agent_stop(self: Pin<&mut Self>, agent_id: QString) {
+        self.agent_stop_requested(agent_id);
     }
 
     pub fn request_save_all(self: Pin<&mut Self>) {

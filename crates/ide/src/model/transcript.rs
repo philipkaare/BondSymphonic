@@ -32,6 +32,12 @@ const BASH_SUMMARY_MAX: usize = 80;
 /// Longest rendering of an unrecognised system message's data, in characters.
 const SYSTEM_DATA_MAX: usize = 200;
 
+/// The `System` subtype the daemon records an answered permission request
+/// under. Wire format, shared with `crates/daemon/src/agents/claude.rs` by
+/// value: the two crates share `bondsymphonic-proto`, not this string's
+/// meaning.
+const PERMISSION_REPLY: &str = "permission_reply";
+
 /// One frame in the transcript. Serialised with a `kind` tag because the view
 /// dispatches on it to decide which widget to build.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -140,6 +146,14 @@ impl Transcript {
         self.last_seq = Some(msg.seq);
         match &msg.body {
             AgentMessageBody::UserText { text } => {
+                // Deliberately does *not* answer a pending request. Only what
+                // the agent produced after a request proves it was let through;
+                // a prompt is the user's, and it can reach the transcript while
+                // the CLI is still blocked on the question -- an adapter that
+                // replayed its opening turn before the first prompt does
+                // exactly that. Clearing here took the bar down over a request
+                // the daemon was still holding, and the answer then had nowhere
+                // to go.
                 self.push(TranscriptItem::User { text: text.clone() })
             }
             AgentMessageBody::AssistantDelta { text } => match self.streaming_assistant() {
@@ -168,15 +182,19 @@ impl Transcript {
                     streaming: false,
                 }),
             },
-            AgentMessageBody::ToolUse { id, name, input } => self.push(TranscriptItem::ToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                summary: tool_summary(name, input),
-                input_json: compact(input),
-                result: None,
-                is_error: false,
-                collapsed: true,
-            }),
+            AgentMessageBody::ToolUse { id, name, input } => {
+                // The call is running, so it was allowed.
+                self.answer_permission("");
+                self.push(TranscriptItem::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    summary: tool_summary(name, input),
+                    input_json: compact(input),
+                    result: None,
+                    is_error: false,
+                    collapsed: true,
+                })
+            }
             AgentMessageBody::ToolResult {
                 id,
                 output,
@@ -222,6 +240,9 @@ impl Transcript {
                 num_turns,
                 session_id,
             } => {
+                // The turn is over; nothing in it is still waiting to be
+                // allowed.
+                self.answer_permission("");
                 self.cost_usd += cost_usd;
                 self.turns += num_turns;
                 self.session_id = Some(session_id.clone());
@@ -245,6 +266,25 @@ impl Transcript {
                 }
                 self.push(TranscriptItem::System {
                     text: format!("session {session}, model {model}"),
+                })
+            }
+            // The daemon's record of an answer it accepted. This is what makes
+            // a replayed transcript agree with the live one: the request is a
+            // message and comes back from disk, so without the answer beside it
+            // a re-attached tab raises a bar over a settled question -- and the
+            // reply it sends names a request the adapter has already forgotten.
+            AgentMessageBody::System { subtype, data } if subtype == PERMISSION_REPLY => {
+                let request_id = data
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let decision = data
+                    .get("decision")
+                    .and_then(Value::as_str)
+                    .unwrap_or("answered");
+                self.answer_permission(request_id);
+                self.push(TranscriptItem::System {
+                    text: format!("permission {decision}"),
                 })
             }
             AgentMessageBody::System { subtype, data } => self.push(TranscriptItem::System {
@@ -271,6 +311,24 @@ impl Transcript {
         if leaving_wait {
             self.pending = None;
         }
+        self.record_state(state, detail);
+    }
+
+    /// The state `agent.history` came back with, applied before the fold in
+    /// [`replay`](Transcript::replay).
+    ///
+    /// It does not clear the pending request, and neither do the state changes
+    /// *inside* a replay: during a replay the order of the two sources cannot be
+    /// trusted the way it can live. State changes carry no sequence number, so a
+    /// buffered `Working` from before the history snapshot arrives after it, and
+    /// treating that as "the daemon left the question behind" takes down a bar
+    /// the daemon is still holding up. Inside a replay the last word belongs to
+    /// the fold and to the single check at the end of it.
+    pub fn set_state_from_history(&mut self, state: AgentState, detail: Option<String>) {
+        self.record_state(state, detail);
+    }
+
+    fn record_state(&mut self, state: AgentState, detail: Option<String>) {
         self.state = state;
         self.state_detail = detail.unwrap_or_default();
     }
@@ -278,6 +336,10 @@ impl Transcript {
     /// Folds a history snapshot and everything that arrived while it was being
     /// fetched into this transcript, in that order, and reports what each
     /// input did.
+    ///
+    /// The caller sets the agent's state from the same `agent.history` reply
+    /// *before* calling this, so the fold ends on the daemon's view of the
+    /// agent rather than on this transcript's `Idle` default.
     ///
     /// This is the whole of the replay decision, kept here rather than in the
     /// QObject so it can be tested without a Qt event loop. The two halves
@@ -293,12 +355,41 @@ impl Transcript {
             applied.push(match event {
                 LiveEvent::Message(message) => self.apply(message),
                 LiveEvent::State(state, detail) => {
-                    self.set_state(*state, detail.clone());
+                    // See `set_state_from_history`: inside a replay a state
+                    // change records the state and decides nothing.
+                    self.set_state_from_history(*state, detail.clone());
                     Applied::Nothing
                 }
             });
         }
+        // The last word on whether a bar goes up. The fold above answers a
+        // request that something later in the transcript settled; this covers
+        // the rest -- a daemon that has moved on without recording an answer,
+        // an agent that exited while a question was open, or a history whose
+        // answer predates this daemon. The state is the daemon's own, carried
+        // back by `agent.history` and applied before the fold, so `Idle` here
+        // means the agent really is idle rather than that nothing has been
+        // heard yet.
+        if self.state != AgentState::WaitingPermission {
+            self.pending = None;
+        }
         applied
+    }
+
+    /// Marks the pending permission request answered.
+    ///
+    /// An empty `request_id` answers whatever is pending, which is what the
+    /// defensive arms want: a tool call that is running, or a turn that has
+    /// finished, says the question is settled without naming it. A
+    /// `request_id` that names some *other* request leaves the bar alone.
+    fn answer_permission(&mut self, request_id: &str) {
+        let answered = self
+            .pending
+            .as_ref()
+            .is_some_and(|p| request_id.is_empty() || p.request_id == request_id);
+        if answered {
+            self.pending = None;
+        }
     }
 
     /// Takes the pending request when the session has already been told to

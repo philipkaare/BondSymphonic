@@ -251,8 +251,10 @@ network namespace (so the forwarder can reach the dev server), one PID namespace
   then the rw binds on top).
 - `--bind caches/<id> /home/<user>/.cache`.
 - `--bind ~/.bondsymphonic/run/<id> /run/bs` (exec, proxy, and forward sockets).
-- Claude Code and gh binaries: `--ro-bind ~/.local/share/claude`,
-  `--ro-bind ~/.local/bin`.
+- `--tmpfs /opt`, then `--ro-bind <resolved claude> /opt/bs/claude`: the mount
+  point cannot be created under the read-only root, and an empty `/opt` also
+  keeps host-installed third-party software out of a workspace. See 8.2 for how
+  the host path is resolved.
 - `--unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup`
   and `--unshare-net` (6.3). `--die-with-parent`, `--new-session`.
 - No `/mnt/c` visibility unless the repo lives there, in which case only the
@@ -356,10 +358,21 @@ Spawns inside the sandbox, as built by `claude_argv` in
 `crates/daemon/src/agents/claude.rs`:
 
 ```
-claude -p --input-format stream-json --output-format stream-json --verbose \
+<claude> -p --input-format stream-json --output-format stream-json --verbose \
        --include-partial-messages --permission-prompts host \
        [--resume <session_id>] [--model M] [--permission-mode MODE]
 ```
+
+`<claude>` is always an absolute path, never the bare name. Under `linux_bwrap`
+it is `/opt/bs/claude`, where `workspace::lifecycle::spec_for` binds the daemon
+user's own install read-only; under a backend with no mounts it is that
+install's own path. Claude Code is a single native executable, so one bind of
+one file is the whole of it, and nothing is created on the host. The binary is
+resolved from `~/.local/bin/claude`, canonicalised because it is a symlink into
+`~/.local/share/claude/versions/<v>`, falling back to a `PATH` search that
+refuses anything under `/mnt/`. A host with no install makes `agent.start` fail
+with `PrereqMissing` naming the path it looked at, rather than an exec failure a
+second later.
 
 `--permission-prompts host` is what routes a tool prompt back over stdout as a
 `control_request` for the IDE to answer, instead of the CLI asking at a terminal
@@ -375,13 +388,20 @@ installed `claude --version` differs. Every flag above was verified accepted by
 2.1.263 — a wrong flag makes `claude` exit with "unknown option" before any login
 check, so this is testable without being logged in. Two traps found in practice:
 
-- Under WSL a *non-login* shell inherits the Windows PATH, so `claude` can
-  resolve to a Windows npm install of a different version. 2.1.177 rejects
-  `--permission-prompts` outright. The daemon puts `$HOME/.local/bin` first for
-  this reason, and `scripts/record-claude-stream.sh` refuses a `/mnt/...` binary.
+- Under WSL a *non-login* shell inherits the Windows PATH, so a bare `claude`
+  can resolve to a Windows npm install of a different version. 2.1.177 rejects
+  `--permission-prompts` outright. This is why the daemon never spawns the bare
+  name: the version check, the prerequisite check and the agent spawn all go
+  through the one resolver above, which prefers `~/.local/bin/claude` and refuses
+  `/mnt/...`. `scripts/record-claude-stream.sh` refuses a `/mnt/...` binary for
+  the same reason. The setup terminals still put `$HOME/.local/bin` first on
+  their `PATH`, because those run `claude auth login` by name on the host.
 - `BS_CLAUDE_BIN` replaces the program (split with `shell_words`, so an
   interpreter plus a script works) and suppresses the version warning, because a
-  stand-in's version says nothing about the protocol.
+  stand-in's version says nothing about the protocol. It wins on every backend,
+  so under `linux_bwrap` whatever it names has to be reachable *inside* the
+  sandbox -- under the worktree, or another bound path -- because the sandbox has
+  its own `/home` and `/tmp`.
 
 Input: each `agent.send` is first recorded as a `user_text` transcript event
 (so history replay shows the user's side), then becomes a
@@ -398,7 +418,12 @@ line on stdin. Output lines are parsed into `AgentEvent`:
 | `result` | `result {cost, duration, turns}`; state → `idle` |
 
 `permission_reply` writes a `control_response` line carrying allow (with optional
-updated input) or deny (with message). `interrupt` writes a `control_request`
+updated input) or deny (with message), and then records the answer in the
+transcript as `system {subtype:"permission_reply", data:{request_id, decision}}`.
+That record is what makes a replayed transcript agree with a live one: the
+request is a message and comes back from disk, so without the answer beside it a
+client that re-attaches raises its permission bar over a settled question and the
+reply it then sends is a `NotFound`. `interrupt` writes a `control_request`
 `interrupt` line if supported by the pinned version, otherwise sends SIGINT.
 `stop` closes stdin, waits 5 s, then kills the process group.
 

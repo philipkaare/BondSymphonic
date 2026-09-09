@@ -65,27 +65,116 @@ const READER_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
 /// login prompt or a stack trace, not enough to fill an event.
 const STDERR_TAIL: usize = 20;
 
+/// The `System` subtype under which an answered permission request is recorded.
+/// Shared with the IDE by value, not by type: it is wire format.
+pub const PERMISSION_REPLY_SUBTYPE: &str = "permission_reply";
+
 const SIGINT: i32 = 2;
 const SIGKILL: i32 = 9;
 
-/// The program to run, from `$BS_CLAUDE_BIN` when it is set.
+/// The backend whose sandbox has mounts of its own, and so needs the CLI bound
+/// in rather than found on a path.
+const SANDBOXED_BACKEND: &str = "linux_bwrap";
+
+/// Where the daemon binds the host's `claude` inside a bubblewrap sandbox.
+///
+/// It has to be bound in because the sandbox replaces `/home` with a tmpfs and
+/// mounts the *workspace's* home at `/home/<user>`: the daemon user's own
+/// `~/.local/bin/claude` is not there to be found, whatever the sandbox `PATH`
+/// says. One read-only bind of one file is the whole of what has to come in --
+/// Claude Code installs as a single native executable, with no runtime or
+/// library directory beside it.
+///
+/// `/opt/bs` rather than a path under `/usr`: `bwrap_args` gives the sandbox its
+/// own empty `/opt`, so the mount point can be created inside the sandbox and
+/// nothing is created on the host, and nothing the distribution installs is
+/// shadowed.
+pub const CLAUDE_IN_SANDBOX: &str = "/opt/bs/claude";
+
+/// The path Claude Code installs itself at, which is the one the daemon trusts.
+///
+/// Not `PATH`: under WSL the Windows `PATH` is appended to the Linux one, so a
+/// bare `claude` can resolve to a `/mnt/c/...` Windows build -- slow to start,
+/// and the wrong answer for a binary that has to run inside a Linux sandbox.
+pub fn pinned_claude_path() -> PathBuf {
+    crate::setup::host_home()
+        .join(".local")
+        .join("bin")
+        .join("claude")
+}
+
+/// The daemon user's real `claude`, resolved to the file a bind can point at.
+///
+/// `~/.local/bin/claude` is a symlink into `~/.local/share/claude/versions/`,
+/// and a read-only bind has to name the file the symlink resolves to, so the
+/// answer is always canonicalised. `PATH` is the fallback for an install that
+/// put the binary somewhere else, with anything under `/mnt/` refused for the
+/// reason [`pinned_claude_path`] gives.
+pub fn host_claude_bin() -> Option<PathBuf> {
+    let usable = |p: &std::path::Path| p.is_file() && !p.starts_with("/mnt/");
+    if let Ok(real) = std::fs::canonicalize(pinned_claude_path()) {
+        if usable(&real) {
+            return Some(real);
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty() && !dir.starts_with("/mnt/"))
+        .filter_map(|dir| std::fs::canonicalize(dir.join("claude")).ok())
+        .find(|real| usable(real))
+}
+
+/// The read-only bind that makes [`host_claude_bin`] reachable at
+/// [`CLAUDE_IN_SANDBOX`], or `None` when Claude Code is not installed.
+///
+/// `workspace::lifecycle::spec_for` puts this in every bwrap workspace's spec,
+/// and the bwrap integration test builds the same pair, so the path the adapter
+/// spawns and the path the sandbox binds cannot drift apart.
+pub fn claude_ro_bind() -> Option<(PathBuf, PathBuf)> {
+    Some((host_claude_bin()?, PathBuf::from(CLAUDE_IN_SANDBOX)))
+}
+
+fn claude_not_installed() -> RpcError {
+    RpcError::new(
+        ErrorCode::PrereqMissing,
+        format!(
+            "Claude Code is not installed: no executable at {} and none on the daemon's PATH.              Install it from the setup page, or point BS_CLAUDE_BIN at a stand-in.",
+            pinned_claude_path().display()
+        ),
+    )
+}
+
+/// The program to run: the stand-in named by `$BS_CLAUDE_BIN`, or the real CLI.
 ///
 /// `BS_CLAUDE_BIN` is a test and development hook: it names the command to run
 /// instead of `claude`, parsed the way a shell would (`"python" "fake.py"`
 /// becomes two argv entries), so a stand-in can be an interpreter plus a
-/// script. The daemon reads it when it spawns an agent, so it has to be set in
-/// the daemon's own environment — when the IDE launches the daemon through
-/// `wsl.exe`, that means passing it through on the command line.
-fn claude_bin() -> Result<Vec<String>, RpcError> {
-    let Ok(raw) = std::env::var("BS_CLAUDE_BIN") else {
-        return Ok(vec!["claude".to_owned()]);
-    };
-    let argv = shell_words::split(&raw)
-        .map_err(|e| RpcError::invalid_params(format!("BS_CLAUDE_BIN: {e}")))?;
-    if argv.is_empty() {
-        return Err(RpcError::invalid_params("BS_CLAUDE_BIN: no program to run"));
+/// script. It wins on every backend; under `linux_bwrap` whatever it names has
+/// to be reachable *inside* the sandbox, which means under the worktree or
+/// another bound path. The daemon reads it when it spawns an agent, so it has
+/// to be set in the daemon's own environment -- when the IDE launches the
+/// daemon through `wsl.exe`, that means passing it through on the command line.
+///
+/// Without the hook the answer is an absolute path, never a bare `claude`:
+/// under `linux_bwrap` the fixed path the binary is bound to, and otherwise the
+/// host path it was resolved to. Nothing depends on the sandbox `PATH`, and a
+/// missing install is a `PrereqMissing` naming the path rather than an exec
+/// failure a second later.
+fn claude_bin(backend: &str) -> Result<Vec<String>, RpcError> {
+    if let Ok(raw) = std::env::var("BS_CLAUDE_BIN") {
+        let argv = shell_words::split(&raw)
+            .map_err(|e| RpcError::invalid_params(format!("BS_CLAUDE_BIN: {e}")))?;
+        if argv.is_empty() {
+            return Err(RpcError::invalid_params("BS_CLAUDE_BIN: no program to run"));
+        }
+        return Ok(argv);
     }
-    Ok(argv)
+    let host = host_claude_bin().ok_or_else(claude_not_installed)?;
+    if backend == SANDBOXED_BACKEND {
+        Ok(vec![CLAUDE_IN_SANDBOX.to_owned()])
+    } else {
+        Ok(vec![host.to_string_lossy().into_owned()])
+    }
 }
 
 /// The full command line for one agent.
@@ -96,8 +185,11 @@ fn claude_bin() -> Result<Vec<String>, RpcError> {
 /// result, `--include-partial-messages` is what makes text deltas arrive at
 /// all, and `--permission-prompts host` is what makes the CLI ask us
 /// (`control_request`) instead of denying anything that would prompt.
-pub fn claude_argv(options: &AgentStartOptions) -> Result<Vec<String>, RpcError> {
-    let mut argv = claude_bin()?;
+/// `backend` is the sandbox backend's [`name`](crate::sandbox::SandboxBackend::name),
+/// which is what decides whether the program is named by its host path or by
+/// the path it is bound to inside the sandbox.
+pub fn claude_argv(options: &AgentStartOptions, backend: &str) -> Result<Vec<String>, RpcError> {
+    let mut argv = claude_bin(backend)?;
     argv.extend(
         [
             "-p",
@@ -147,7 +239,14 @@ async fn warn_on_untested_version() {
             if std::env::var_os("BS_CLAUDE_BIN").is_some() {
                 return;
             }
-            let out = tokio::process::Command::new("claude")
+            let Some(bin) = host_claude_bin() else {
+                warn!(
+                    path = %pinned_claude_path().display(),
+                    "claude is not installed; agents cannot start"
+                );
+                return;
+            };
+            let out = tokio::process::Command::new(&bin)
                 .arg("--version")
                 .stdin(std::process::Stdio::null())
                 .output()
@@ -164,7 +263,9 @@ async fn warn_on_untested_version() {
                         );
                     }
                 }
-                Err(e) => warn!(error = %e, "could not run `claude --version`"),
+                Err(e) => {
+                    warn!(bin = %bin.display(), error = %e, "could not run `claude --version`")
+                }
             }
         })
         .await;
@@ -277,15 +378,21 @@ impl ClaudeAdapter {
         }
     }
 
-    /// "exit code 1: <last stderr lines>", with the tail left off when the
-    /// process said nothing.
+    /// What the agent said on its way out, with the exit code after it; just
+    /// the code when it said nothing.
+    ///
+    /// The stderr tail leads because it is the part a person can act on. The
+    /// commonest way for a Claude agent to die is dying immediately -- not
+    /// logged in, no API key, a bad flag -- and this string is what the
+    /// transcript's banner shows, so "Invalid API key" has to be the first
+    /// thing in it rather than the tail of a sentence about an exit code.
     fn exit_detail(code: i32, tail: &StderrTail) -> String {
         let tail = tail.lock();
         if tail.is_empty() {
             format!("exit code {code}")
         } else {
             format!(
-                "exit code {code}: {}",
+                "{} (exit code {code})",
                 tail.iter().cloned().collect::<Vec<_>>().join("\n")
             )
         }
@@ -440,6 +547,20 @@ impl AgentAdapter for ClaudeAdapter {
         // Only once the answer is really on its way: a failed write leaves the
         // request pending so the IDE can try again.
         self.pending_request_ids.lock().remove(&request_id);
+        // The answer goes into the transcript, because the question did. A
+        // permission request is a message and is replayed from disk; without a
+        // matching answer beside it, a client that re-attaches folds the
+        // request back up and raises a bar over a settled question -- and the
+        // reply it then sends names a request this adapter has just forgotten.
+        self.sink
+            .message(AgentMessageBody::System {
+                subtype: PERMISSION_REPLY_SUBTYPE.to_owned(),
+                data: serde_json::json!({
+                    "request_id": request_id,
+                    "decision": decision,
+                }),
+            })
+            .await;
         self.sink.state(AgentState::Working, None).await;
         Ok(())
     }
@@ -531,7 +652,9 @@ mod tests {
     /// `BS_CLAUDE_BIN` is process-wide, so every case that touches it lives in
     /// one test.
     #[test]
-    fn claude_argv_pins_the_flags_and_validates_the_permission_mode() {
+    fn claude_argv_pins_the_flags_the_program_and_the_permission_mode() {
+        const BWRAP: &str = SANDBOXED_BACKEND;
+        const NOOP: &str = "noop";
         let plain = AgentStartOptions {
             command: None,
             resume_session: None,
@@ -539,9 +662,11 @@ mod tests {
             permission_mode: None,
             api_key: None,
         };
-        std::env::remove_var("BS_CLAUDE_BIN");
+        // The flag assertions run under the hook, so they say nothing about
+        // whether this host has Claude Code installed.
+        std::env::set_var("BS_CLAUDE_BIN", "claude");
         assert_eq!(
-            claude_argv(&plain).unwrap(),
+            claude_argv(&plain, NOOP).unwrap(),
             [
                 "claude",
                 "-p",
@@ -562,7 +687,7 @@ mod tests {
             permission_mode: Some("acceptEdits".into()),
             ..plain.clone()
         };
-        let argv = claude_argv(&full).unwrap();
+        let argv = claude_argv(&full, NOOP).unwrap();
         assert_eq!(
             &argv[argv.len() - 6..],
             [
@@ -580,7 +705,7 @@ mod tests {
             ..plain.clone()
         };
         assert_eq!(
-            claude_argv(&bad).unwrap_err().code,
+            claude_argv(&bad, NOOP).unwrap_err().code,
             ErrorCode::InvalidParams
         );
         // Every mode the CLI documents, plus `default`, is accepted.
@@ -589,19 +714,70 @@ mod tests {
                 permission_mode: Some(mode.into()),
                 ..plain.clone()
             };
-            assert!(claude_argv(&opts).is_ok(), "{mode} must be accepted");
+            assert!(claude_argv(&opts, NOOP).is_ok(), "{mode} must be accepted");
         }
 
-        // The hook replaces the program, and is split the way a shell would.
+        // The hook replaces the program, is split the way a shell would, and
+        // wins on every backend -- including the sandboxed one, where what it
+        // names has to be reachable from inside.
         std::env::set_var("BS_CLAUDE_BIN", "\"python\" \"/tmp/fake claude.py\"");
-        let argv = claude_argv(&plain).unwrap();
-        assert_eq!(&argv[..3], ["python", "/tmp/fake claude.py", "-p"]);
+        for backend in [NOOP, BWRAP] {
+            let argv = claude_argv(&plain, backend).unwrap();
+            assert_eq!(
+                &argv[..3],
+                ["python", "/tmp/fake claude.py", "-p"],
+                "the hook must win on {backend}"
+            );
+        }
         std::env::set_var("BS_CLAUDE_BIN", "   ");
         assert_eq!(
-            claude_argv(&plain).unwrap_err().code,
+            claude_argv(&plain, NOOP).unwrap_err().code,
             ErrorCode::InvalidParams
         );
+
+        // Without the hook the program is always an absolute path, never a bare
+        // `claude`: the sandbox `PATH` leads with the *workspace's* home, so a
+        // bare name does not resolve there at all.
         std::env::remove_var("BS_CLAUDE_BIN");
+        match host_claude_bin() {
+            Some(host) => {
+                assert_eq!(claude_argv(&plain, BWRAP).unwrap()[0], CLAUDE_IN_SANDBOX);
+                assert_eq!(
+                    claude_argv(&plain, NOOP).unwrap()[0],
+                    host.to_string_lossy()
+                );
+                assert!(host.is_absolute(), "{host:?}");
+            }
+            // A host without Claude Code -- every Windows developer machine,
+            // and CI -- must refuse the start with a prerequisite error naming
+            // the path, not spawn something that cannot exist.
+            None => {
+                for backend in [NOOP, BWRAP] {
+                    let e = claude_argv(&plain, backend).unwrap_err();
+                    assert_eq!(e.code, ErrorCode::PrereqMissing, "{backend}");
+                    assert!(
+                        e.message
+                            .contains(&pinned_claude_path().display().to_string()),
+                        "the error must name the path it looked at: {}",
+                        e.message
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bind and the argv agree by construction: whatever
+    /// `workspace::lifecycle::spec_for` mounts is exactly what the adapter
+    /// spawns, so the two cannot drift apart.
+    #[test]
+    fn the_sandbox_bind_lands_where_the_argv_points() {
+        match claude_ro_bind() {
+            Some((host, in_sandbox)) => {
+                assert_eq!(in_sandbox, PathBuf::from(CLAUDE_IN_SANDBOX));
+                assert_eq!(Some(host), host_claude_bin());
+            }
+            None => assert!(host_claude_bin().is_none()),
+        }
     }
 
     #[test]
@@ -609,9 +785,11 @@ mod tests {
         let tail: StderrTail = Arc::new(Mutex::new(VecDeque::new()));
         assert_eq!(ClaudeAdapter::exit_detail(1, &tail), "exit code 1");
         tail.lock().push_back("Invalid API key".to_owned());
+        // The tail leads: this is what the transcript banner shows, and the
+        // reason is more use than the number.
         assert_eq!(
             ClaudeAdapter::exit_detail(1, &tail),
-            "exit code 1: Invalid API key"
+            "Invalid API key (exit code 1)"
         );
     }
 }

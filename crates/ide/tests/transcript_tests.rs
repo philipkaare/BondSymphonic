@@ -469,6 +469,10 @@ fn replay_applies_history_then_live_and_de_duplicates_the_overlap() {
 fn replay_leaves_an_always_allowed_request_to_be_auto_answered() {
     let mut t = Transcript::default();
     t.always_allow.insert("Read".to_owned());
+    // The state `agent.history` came back with, applied before the fold the way
+    // the model does it. Without it the request would be folded and then
+    // dropped: an agent that is not waiting has nothing to be answered.
+    t.set_state(AgentState::WaitingPermission, None);
     let history = vec![msg(
         1,
         AgentMessageBody::PermissionRequest {
@@ -505,4 +509,179 @@ fn replay_leaves_an_always_allowed_request_to_be_auto_answered() {
     ));
     assert!(other.take_auto_allowed().is_none());
     assert!(other.pending.is_some(), "an unlisted tool still asks");
+}
+
+/// One permission request, and everything that can answer it.
+fn request(seq: u64, request_id: &str) -> AgentMessage {
+    msg(
+        seq,
+        AgentMessageBody::PermissionRequest {
+            request_id: request_id.to_owned(),
+            tool_name: "Bash".to_owned(),
+            input: json!({ "command": "ls -la" }),
+            suggestions: Vec::new(),
+        },
+    )
+}
+
+fn reply(seq: u64, request_id: &str, decision: &str) -> AgentMessage {
+    msg(
+        seq,
+        AgentMessageBody::System {
+            subtype: "permission_reply".to_owned(),
+            data: json!({ "request_id": request_id, "decision": decision }),
+        },
+    )
+}
+
+/// The defect this fixes: a tab that re-attaches replays the request out of
+/// `agent.history`, raises the bar again, and the answer it sends names a
+/// request the adapter has already forgotten -- an error banner over a settled
+/// question. The daemon now records the answer as a transcript message, and
+/// replaying the two together must leave nothing pending.
+#[test]
+fn a_replayed_request_that_was_answered_does_not_ask_again() {
+    let mut t = Transcript::default();
+    t.replay(&[request(1, "req_1"), reply(2, "req_1", "allow")], &[]);
+    assert!(
+        t.pending.is_none(),
+        "an answered request must not come back up"
+    );
+    // The answer is visible in the conversation, not merely absorbed.
+    assert!(
+        matches!(t.items.last(), Some(TranscriptItem::System { text }) if text == "permission allow"),
+        "{:?}",
+        t.items
+    );
+}
+
+/// The defensive half: a history whose answer predates this daemon, or whose
+/// marker was lost, still must not raise a bar over a question the agent
+/// plainly moved on from. Anything after the request that only a *running*
+/// agent could have produced settles it.
+///
+/// A user prompt is not on that list, and the case below says why: the prompt
+/// is the user's, not the agent's, and it can reach the transcript while the
+/// CLI is still blocked on the question.
+#[test]
+fn what_the_agent_produced_after_a_request_settles_it_and_a_prompt_does_not() {
+    let after: [(&str, AgentMessage); 2] = [
+        (
+            "a tool that ran",
+            msg(
+                2,
+                AgentMessageBody::ToolUse {
+                    id: "t1".to_owned(),
+                    name: "Bash".to_owned(),
+                    input: json!({ "command": "ls -la" }),
+                },
+            ),
+        ),
+        (
+            "a finished turn",
+            msg(
+                2,
+                AgentMessageBody::Result {
+                    cost_usd: 0.01,
+                    duration_ms: 10,
+                    num_turns: 1,
+                    session_id: "s".to_owned(),
+                },
+            ),
+        ),
+    ];
+    for (what, message) in after {
+        let mut t = Transcript::default();
+        // Even claiming to wait: the transcript says otherwise.
+        t.set_state(AgentState::WaitingPermission, None);
+        t.replay(&[request(1, "req_1"), message], &[]);
+        assert!(t.pending.is_none(), "{what} must answer the request");
+    }
+
+    // A prompt typed while the question is open leaves the bar exactly where it
+    // was: the daemon is still holding that request, and taking the bar down
+    // would leave the user no way to answer it.
+    let mut typing = Transcript::default();
+    typing.set_state(AgentState::WaitingPermission, None);
+    typing.replay(
+        &[
+            request(1, "req_1"),
+            msg(
+                2,
+                AgentMessageBody::UserText {
+                    text: "carry on".to_owned(),
+                },
+            ),
+        ],
+        &[],
+    );
+    assert_eq!(
+        typing.pending.as_ref().map(|p| p.request_id.as_str()),
+        Some("req_1"),
+        "a prompt must not answer a permission request"
+    );
+}
+
+/// The other direction: a request nothing answered, on an agent the daemon says
+/// is waiting, is exactly the case the bar exists for.
+#[test]
+fn an_unanswered_request_on_a_waiting_agent_still_asks() {
+    let mut t = Transcript::default();
+    t.set_state(AgentState::WaitingPermission, None);
+    t.replay(&[request(1, "req_1")], &[]);
+    let pending = t.pending.as_ref().expect("the bar must be up");
+    assert_eq!(pending.request_id, "req_1");
+    assert_eq!(pending.summary, "ls -la");
+
+    // And a daemon that is not waiting is the case it must not: the state comes
+    // back with the history, so `Idle` here means the agent really is idle.
+    let mut moved_on = Transcript::default();
+    moved_on.replay(&[request(1, "req_1")], &[]);
+    assert!(moved_on.pending.is_none());
+}
+
+/// An answer that names some other request leaves the open one alone: two
+/// requests can be in the same transcript, and only the one that was answered
+/// is settled.
+#[test]
+fn a_reply_for_another_request_leaves_the_open_one_up() {
+    let mut t = Transcript::default();
+    t.set_state(AgentState::WaitingPermission, None);
+    t.replay(&[request(1, "req_2"), reply(2, "req_1", "deny")], &[]);
+    assert_eq!(
+        t.pending.as_ref().map(|p| p.request_id.as_str()),
+        Some("req_2")
+    );
+}
+
+/// The trap that made the first fix wrong: `agent.history` carries the daemon's
+/// state, but the events buffered while it was in flight can *predate* it --
+/// state changes carry no sequence number, so a `Working` from before the
+/// snapshot arrives after it. Treating that as "the daemon left the question
+/// behind" took the bar down over a request the daemon was still holding, and
+/// the answer the user then pressed had nowhere to go.
+#[test]
+fn a_buffered_state_older_than_the_history_does_not_take_the_bar_down() {
+    let mut t = Transcript::default();
+    t.set_state_from_history(AgentState::WaitingPermission, Some("Bash".to_owned()));
+    t.replay(
+        &[request(1, "req_1")],
+        &[
+            // Both of these were on the bus before the history was read.
+            LiveEvent::State(AgentState::Working, None),
+            LiveEvent::Message(request(1, "req_1")),
+            LiveEvent::State(AgentState::WaitingPermission, Some("Bash".to_owned())),
+        ],
+    );
+    assert_eq!(
+        t.pending.as_ref().map(|p| p.request_id.as_str()),
+        Some("req_1"),
+        "the bar must survive a replay that folds the state backwards"
+    );
+    assert_eq!(t.state, AgentState::WaitingPermission);
+
+    // And the live path still clears on the way out of the wait, which is what
+    // takes the bar down when the daemon moves on.
+    t.set_state(AgentState::Working, None);
+    assert!(t.pending.is_none());
 }

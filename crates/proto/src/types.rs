@@ -183,7 +183,7 @@ pub enum PermissionDecision {
     Deny,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentStartOptions {
     #[serde(default)]
     pub command: Option<String>, // terminal adapter
@@ -195,6 +195,35 @@ pub struct AgentStartOptions {
     pub permission_mode: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+/// Written by hand so the key cannot be formatted into a log line by accident.
+///
+/// Nothing prints these options today, but this is the one struct in the
+/// protocol that carries the user's Anthropic API key, and a `#[derive(Debug)]`
+/// here would put the key one `{:?}` away from a tracing field. The presence of
+/// a key is worth knowing, so it is reported as `Some(<redacted>)` rather than
+/// dropped.
+impl std::fmt::Debug for AgentStartOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentStartOptions")
+            .field("command", &self.command)
+            .field("resume_session", &self.resume_session)
+            .field("model", &self.model)
+            .field("permission_mode", &self.permission_mode)
+            .field("api_key", &self.api_key.as_ref().map(|_| RedactedApiKey))
+            .finish()
+    }
+}
+
+/// Stands in for the key in [`AgentStartOptions`]'s `Debug`, so the field reads
+/// `Some(<redacted>)` rather than `Some("<redacted>")`.
+struct RedactedApiKey;
+
+impl std::fmt::Debug for RedactedApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 /// One transcript item. `seq` is assigned by the daemon and is monotonic per agent.

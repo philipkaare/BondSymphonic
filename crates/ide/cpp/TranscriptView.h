@@ -35,6 +35,17 @@ public:
 
     TranscriptModel* model() const;
 
+    /// Whether an `agent.start` for this pane is in flight. The pane says
+    /// "starting the agent" only while this is true; with no agent and nothing
+    /// in flight it offers the Start button instead, because the alternative is
+    /// a pane that waits for something nobody asked for.
+    void setStarting(bool starting);
+
+signals:
+    /// The user pressed Start (or Restart). The area turns this into the
+    /// workspace id the window needs; this view knows only its model.
+    void startAgentRequested();
+
 private:
     void rebuild();
     void onItemAppended(int index);
@@ -70,6 +81,14 @@ private:
     PromptInput* m_input = nullptr;
     QPushButton* m_interrupt = nullptr;
     QPushButton* m_stop = nullptr;
+    /// Starts an agent for a pane that has none, or restarts one that exited.
+    QPushButton* m_start = nullptr;
+    /// See [`setStarting`].
+    bool m_starting = false;
+    /// The agent id the pane had when the start was asked for. A different one
+    /// arriving is the start answering, whether the pane had none before or was
+    /// restarting one that exited.
+    QString m_startFromAgentId;
     /// Whether the next range change should jump to the foot. Recomputed from
     /// the scroll position before every append, so a user who has scrolled up
     /// to read is left where they are.

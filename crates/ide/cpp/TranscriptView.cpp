@@ -151,9 +151,15 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     m_interrupt->setToolTip(QStringLiteral("End this turn; the agent stays alive"));
     m_stop = new QPushButton(QStringLiteral("Stop"), this);
     m_stop->setToolTip(QStringLiteral("Stop the agent process"));
+    m_start = new QPushButton(QStringLiteral("Start agent"), this);
+    // Named so a test can find it without the view growing an accessor for it.
+    m_start->setObjectName(QStringLiteral("bsStartAgent"));
+    m_start->setToolTip(QStringLiteral("Start a Claude agent in this workspace"));
+    m_start->hide();
     bottom->addWidget(m_input, 1);
     auto* buttons = new QVBoxLayout();
     buttons->setSpacing(4);
+    buttons->addWidget(m_start);
     buttons->addWidget(m_interrupt);
     buttons->addWidget(m_stop);
     bottom->addLayout(buttons, 0);
@@ -219,6 +225,13 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
         if (!m_model.isNull()) {
             m_model->stop();
         }
+    });
+    QObject::connect(m_start, &QPushButton::clicked, this, [this] {
+        // The view neither knows the workspace nor talks to the controller: it
+        // says what the user asked for and the area routes it.
+        m_requestError.clear();
+        setStarting(true);
+        emit startAgentRequested();
     });
 
     rebuild();
@@ -301,6 +314,18 @@ void TranscriptView::onBusyChanged() {
     onStateChanged();
 }
 
+void TranscriptView::setStarting(bool starting) {
+    const QString agentId = m_model.isNull() ? QString() : m_model->getAgentId();
+    if (m_starting == starting && (!starting || m_startFromAgentId == agentId)) {
+        return;
+    }
+    m_starting = starting;
+    if (starting) {
+        m_startFromAgentId = agentId;
+    }
+    onStateChanged();
+}
+
 void TranscriptView::onStateChanged() {
     if (m_model.isNull()) {
         return;
@@ -308,33 +333,56 @@ void TranscriptView::onStateChanged() {
     const bool busy = m_model->getBusy();
     const QString state = m_model->getState();
     const bool working = state == QString::fromUtf8(kStateWorking);
+    const bool exited = state == QString::fromUtf8(kStateExited);
     // A model that has never been attached answers `idle` and `not busy`, which
     // would leave the box live in the seconds `agent.start` takes. `send` then
     // drops the text, because there is no agent to send it to, and the prompt
     // the user typed while waiting disappears without a word. Waiting for the
     // id is the one condition that covers the box and both buttons.
-    const bool starting = m_model->getAgentId().isEmpty();
-    if (starting) {
+    const QString agentId = m_model->getAgentId();
+    // The start answered: a different agent is attached than the one the pane
+    // had when it was asked for. Self-correcting, so a lost `operationFailed`
+    // cannot strand the pane on "starting" forever.
+    if (m_starting && agentId != m_startFromAgentId) {
+        m_starting = false;
+    }
+    const bool noAgent = agentId.isEmpty();
+    // A pane with no agent and no start in flight is not starting -- it is
+    // empty, which is what a restored session or a stopped agent leaves, and
+    // saying "starting the agent" there is a promise nothing will keep.
+    const bool startable = (noAgent || exited) && !m_starting;
+    m_start->setVisible(startable);
+    m_start->setText(exited ? QStringLiteral("Restart agent") : QStringLiteral("Start agent"));
+    if (m_starting) {
         m_input->setBusy(true, QStringLiteral("starting the agent") + QChar(kEllipsis));
+    } else if (noAgent) {
+        m_input->setBusy(true, QStringLiteral("no agent is running in this workspace"));
     } else if (busy) {
         m_input->setBusy(true, QStringLiteral("replaying history") + QChar(kEllipsis));
     } else {
         m_input->setBusy(working);
     }
-    m_interrupt->setEnabled(!starting && !busy && working);
+    m_interrupt->setEnabled(!noAgent && !m_starting && !busy && working);
     // Nothing left to stop once the process is gone, and nothing yet to stop
     // before it exists.
-    m_stop->setEnabled(!starting && !busy && state != QString::fromUtf8(kStateExited) &&
-                       !state.isEmpty());
+    m_stop->setEnabled(!noAgent && !m_starting && !busy && !exited && !state.isEmpty());
     refreshBanner();
 }
 
 void TranscriptView::refreshBanner() {
     QString text = m_requestError;
-    if (text.isEmpty() && !m_model.isNull() &&
-        m_model->getState() == QString::fromUtf8(kStateError)) {
+    if (text.isEmpty() && !m_model.isNull()) {
+        const QString state = m_model->getState();
         const QString detail = m_model->getStateDetail();
-        text = detail.isEmpty() ? QStringLiteral("The agent reported an error.") : detail;
+        if (state == QString::fromUtf8(kStateError)) {
+            text = detail.isEmpty() ? QStringLiteral("The agent reported an error.") : detail;
+        } else if (state == QString::fromUtf8(kStateExited) && !detail.isEmpty()) {
+            // An agent that dies at start-up -- not logged in, no API key, a
+            // bad flag -- exits rather than erroring, and the daemon puts the
+            // reason in this detail. Without the banner the tab simply goes
+            // quiet and the user is told nothing at all.
+            text = QStringLiteral("agent exited: ") + detail;
+        }
     }
     m_banner->setText(text);
     m_banner->setVisible(!text.isEmpty());

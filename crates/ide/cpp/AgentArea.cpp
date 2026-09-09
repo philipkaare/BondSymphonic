@@ -57,6 +57,27 @@ void AgentArea::showWorkspace(const QString& workspaceId, const QString& adapter
     setCurrentWidget(terminal);
 }
 
+void AgentArea::setStarting(const QString& workspaceId, bool starting) {
+    if (workspaceId.isEmpty()) {
+        return;
+    }
+    if (starting) {
+        m_starting.insert(workspaceId);
+    } else {
+        m_starting.remove(workspaceId);
+    }
+    if (TranscriptView* view = m_transcripts.value(workspaceId)) {
+        view->setStarting(starting);
+    }
+}
+
+void AgentArea::clearStarting() {
+    const QList<QString> pending = m_starting.values();
+    for (const QString& workspaceId : pending) {
+        setStarting(workspaceId, false);
+    }
+}
+
 void AgentArea::setAgent(const QString& workspaceId, const QString& agentId) {
     TranscriptView* view = m_transcripts.value(workspaceId);
     if (view == nullptr || agentId.isEmpty()) {
@@ -87,6 +108,11 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
         view = new TranscriptView(model, this);
         m_transcripts.insert(workspaceId, view);
         addWidget(view);
+        QObject::connect(view, &TranscriptView::startAgentRequested, this,
+                         [this, workspaceId] { emit startAgentRequested(workspaceId); });
+        // A start that began before this pane existed -- which is every
+        // workspace created with an agent, since the tab is shown first.
+        view->setStarting(m_starting.contains(workspaceId));
     }
     setAgent(workspaceId, agentId);
     return view;
@@ -99,6 +125,7 @@ void AgentArea::showPlaceholder() {
 
 void AgentArea::removeWorkspace(const QString& workspaceId) {
     m_attached.remove(workspaceId);
+    m_starting.remove(workspaceId);
     if (TranscriptView* view = m_transcripts.take(workspaceId)) {
         TranscriptModel* model = view->model();
         removeWidget(view);

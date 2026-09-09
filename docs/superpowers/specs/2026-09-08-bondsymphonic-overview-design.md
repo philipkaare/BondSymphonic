@@ -182,7 +182,12 @@ crate.
   updated_input?, message?}`
 - `agent.interrupt {agent_id}`
 - `agent.stop {agent_id}`
-- `agent.history {agent_id}` → stored transcript events for replay
+- `agent.history {agent_id}` → `{messages, state, detail?}`: the stored
+  transcript events for replay, plus the agent's state as of the read. The
+  state travels with the history because state changes are events, not
+  transcript entries, so a client attaching to an agent that is already
+  running has missed every one of them. Both extra fields default, so an
+  older daemon's reply still deserialises.
 
 **pty**
 - `pty.open {workspace_id, cols, rows, command?}` → `{pty_id}`

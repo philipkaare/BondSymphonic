@@ -83,8 +83,13 @@ SetupPage::SetupPage(AppController* controller, QWidget* parent)
     auto* buttons = new QHBoxLayout();
     m_recheckButton = new QPushButton("Re-check", this);
     m_continueButton = new QPushButton("Continue anyway", this);
-    // Nothing has been checked yet, so nothing is known to pass.
-    m_continueButton->setEnabled(false);
+    // The rule is "no blocking failure has been reported", not "a check
+    // succeeded". A check that never answers -- a daemon that is down, which is
+    // exactly when someone opens this page from the Help menu -- reports no
+    // failure, and the page must not become a room with no door. Nothing is
+    // lost by being wrong here: continuing with a broken sandbox fails loudly
+    // at the first workspace, whereas a window that cannot be dismissed has to
+    // be restarted.
     buttons->addWidget(m_recheckButton);
     buttons->addStretch(1);
     buttons->addWidget(m_continueButton);
@@ -96,6 +101,8 @@ SetupPage::SetupPage(AppController* controller, QWidget* parent)
     QObject::connect(m_controller, &AppController::prereqsChecked, this, &SetupPage::applyPrereqs);
     QObject::connect(m_controller, &AppController::setupPtyOpened, this,
                      &SetupPage::onSetupPtyOpened);
+    QObject::connect(m_controller, &AppController::operationFailed, this,
+                     &SetupPage::onOperationFailed);
     QObject::connect(m_session, &TerminalSession::linkDetected, this, &SetupPage::onLinkDetected);
     QObject::connect(m_session, &TerminalSession::exitedSignal, this, &SetupPage::onTerminalExited);
 }
@@ -121,7 +128,16 @@ void SetupPage::applyPrereqs(const QString& json) {
     }
 }
 
+void SetupPage::setActionsEnabled(bool enabled) {
+    for (QPushButton* button : m_actionButtons) {
+        if (button != nullptr) {
+            button->setEnabled(enabled);
+        }
+    }
+}
+
 void SetupPage::clearRows() {
+    m_actionButtons.clear();
     QLayoutItem* item = nullptr;
     while ((item = m_rowsLayout->takeAt(0)) != nullptr) {
         if (QWidget* widget = item->widget()) {
@@ -207,13 +223,30 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
     }
     auto* button = new QPushButton(buttonTextFor(action), row);
     QObject::connect(button, &QPushButton::clicked, this, [this, action] { runAction(action); });
+    // A re-check can rebuild the rows while a request is still in flight, and
+    // the new buttons must be as dead as the ones they replaced.
+    button->setEnabled(m_pendingAction.isEmpty());
+    m_actionButtons.append(button);
     layout->addWidget(button);
     m_rowsLayout->addWidget(row);
 }
 
 void SetupPage::runAction(const QString& action) {
+    if (!m_pendingAction.isEmpty()) {
+        // A second request while the first is being answered would orphan the
+        // first one's process: `setupPtyOpened` carries the pty id, so until it
+        // arrives there is nothing to close.
+        return;
+    }
     m_pendingAction = action;
+    setActionsEnabled(false);
+    // The previous action's terminal, if there is one, is released by the
+    // `attach` below: `TerminalSession::begin` tears the old subscription down
+    // and closes the PTY it held. What that cannot cover is a *second* request
+    // made before the first is answered, because the reply is the only thing
+    // that names the pty id -- which is what the guard above refuses.
     m_terminalLabel->setText(QString("Running %1. Answer its questions here.").arg(action));
+    m_terminal->setVisible(true);
     m_terminalHost->setVisible(true);
     // Deferred by one turn of the event loop: the pane has only just been
     // shown, so the layout that gives its terminal a real width and height has
@@ -229,8 +262,23 @@ void SetupPage::onSetupPtyOpened(const QString& action, const QString& ptyId) {
         return;
     }
     m_pendingAction.clear();
+    setActionsEnabled(true);
     m_session->attach(ptyId, terminalCols(), terminalRows());
     m_terminal->setFocus();
+}
+
+void SetupPage::onOperationFailed(const QString& op, const QString& message) {
+    if (op != QLatin1String("setup") || m_pendingAction.isEmpty()) {
+        return;
+    }
+    const QString action = m_pendingAction;
+    m_pendingAction.clear();
+    setActionsEnabled(true);
+    // The pane header says what went wrong, over a hidden terminal: nothing was
+    // opened, so an empty black rectangle would only read as a hang.
+    m_terminalLabel->setText(QString("%1 could not start: %2").arg(action, message));
+    m_terminal->setVisible(false);
+    m_terminalHost->setVisible(true);
 }
 
 void SetupPage::onLinkDetected(const QString& url) {

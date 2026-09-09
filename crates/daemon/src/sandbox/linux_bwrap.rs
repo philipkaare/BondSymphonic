@@ -81,7 +81,12 @@ pub fn bwrap_args(
     // whenever the daemon is started under a different account than it was configured for.
     let home_in = format!("/home/{user}");
     // `/run` is a tmpfs because the root is bound read-only: without it bwrap
-    // cannot create the `/run/bs` mount point.
+    // cannot create the `/run/bs` mount point. `/opt` is a tmpfs for the same
+    // reason -- it is where the daemon's own `claude` is bound in, at
+    // `agents::claude::CLAUDE_IN_SANDBOX` -- and because `/opt` is where
+    // third-party software is installed on the host, which a workspace has no
+    // business reaching. Both are emitted before the spec's binds, so a bind
+    // into either has its parent directory to be created in.
     let mut a: Vec<String> = [
         "--ro-bind",
         "/",
@@ -96,6 +101,8 @@ pub fn bwrap_args(
         "/home",
         "--tmpfs",
         "/run",
+        "--tmpfs",
+        "/opt",
     ]
     .into_iter()
     .map(String::from)

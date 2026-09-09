@@ -372,10 +372,18 @@ and the collapse is the fix when it does.
   `create_claude,open_agent,send,allow,tree,open_file,open_diff,stop,create,open,close,destroy,quit`.
   Two workspaces, because the two halves need different panes: the first is a
   Claude tab and carries one whole agent turn, the second a terminal tab whose
-  PTY the `close`/`destroy` pair tears down. `open_file` and `open_diff` emit
-  `AppController::openFileRequested`/`openDiffRequested` and `allow` emits
-  `permissionReplyRequested`, all signals a person's click produces, so the
-  window builds the editor and diff tabs and answers the permission bar itself.
+  PTY the `close`/`destroy` pair tears down. Every step that touches the agent
+  goes through the window rather than through the script's own client:
+  `open_file` and `open_diff` emit
+  `AppController::openFileRequested`/`openDiffRequested`, `allow` emits
+  `permissionReplyRequested`, `send` emits `agentSendRequested` and `stop`
+  emits `agentStopRequested` — all signals a person's click produces. So the
+  window builds the editor and diff tabs, answers the permission bar, and the
+  prompt and the stop leave `TranscriptModel::send`/`::stop`, which is what
+  makes the "no failure warning" guards below able to fire at all. Only
+  `create*`, `open_agent`, `open`, `close` and `destroy` are the script's own
+  requests, because they stand in for a dialog rather than for a click on a
+  pane.
 
   The assertions are on the requests the fake daemon received, on the one
   permission reply it received, and on what the IDE logged.
@@ -403,7 +411,9 @@ and the collapse is the fix when it does.
   - No failure warning logged for any of `fs.read_file`, `workspace.diff`,
     `workspace.changes`, `fs.watch`, `agent.history`, `agent.send`,
     `agent.permission_reply` or `agent.stop` — the journal shows a request
-    arrived, these show its reply was accepted.
+    arrived, these show its reply was accepted. Each of these warnings is
+    logged by the IDE code that issued the request, so each is reachable only
+    because the corresponding step travels the production path.
 
   Runs in `cargo test` on Windows when Qt is present; skipped with a message
   otherwise.

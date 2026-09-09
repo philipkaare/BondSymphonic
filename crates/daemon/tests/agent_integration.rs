@@ -349,7 +349,7 @@ async fn permission_request_waits_for_the_reply() {
     let e = c
         .call(Request::AgentPermissionReply(AgentPermissionReplyParams {
             agent_id: ag.clone(),
-            request_id,
+            request_id: request_id.clone(),
             decision: PermissionDecision::Allow,
             updated_input: None,
             message: None,
@@ -357,6 +357,46 @@ async fn permission_request_waits_for_the_reply() {
         .await
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
+
+    // The answer is in the transcript, beside the question. This is what lets a
+    // client that replays the history know the request was settled: without it
+    // the request is the last word on disk, the bar goes back up on re-attach,
+    // and the reply the user then sends is the `NotFound` just asserted above.
+    let history = c
+        .call(Request::AgentHistory(AgentIdParams {
+            agent_id: ag.clone(),
+        }))
+        .await
+        .unwrap();
+    let history: HistoryResult = serde_json::from_value(history).unwrap();
+    let marker = history
+        .messages
+        .iter()
+        .find_map(|m| match &m.body {
+            AgentMessageBody::System { subtype, data } if subtype == "permission_reply" => {
+                Some(data.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no permission_reply in {:?}", history.messages));
+    assert_eq!(marker["request_id"], serde_json::json!(request_id));
+    assert_eq!(marker["decision"], serde_json::json!("allow"));
+    // It comes after the request it answers, which is what makes a fold that
+    // reads the transcript in order arrive at "answered".
+    let position = |want: fn(&AgentMessageBody) -> bool| {
+        history.messages.iter().position(|m| want(&m.body)).unwrap()
+    };
+    assert!(
+        position(|b| matches!(b, AgentMessageBody::PermissionRequest { .. }))
+            < position(
+                |b| matches!(b, AgentMessageBody::System { subtype, .. } if subtype == "permission_reply")
+            ),
+        "{:?}",
+        history.messages
+    );
+    // And the history carries the agent's live state, so a re-attaching client
+    // does not start from `Idle` and paint a working agent as finished.
+    assert_eq!(history.state, AgentState::Idle, "{history:?}");
 
     c.call(Request::AgentStop(AgentIdParams { agent_id: ag }))
         .await

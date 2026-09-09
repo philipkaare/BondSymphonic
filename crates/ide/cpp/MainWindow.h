@@ -25,6 +25,7 @@ class QSplitter;
 class QStackedWidget;
 class QTabWidget;
 class SetupPage;
+class TranscriptModel;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -85,6 +86,13 @@ private:
     QJsonObject activeTab() const;
     /// The workspace the Explorer, the panes and a newly opened file belong to.
     QString activeWorkspaceId() const;
+    /// The transcript model of the visible pane when it is attached to
+    /// `agentId`, or null after warning that the request was not routed.
+    /// `what` names the request, for that warning.
+    TranscriptModel* activeAgentModel(const QString& agentId, const char* what);
+    /// Starts (or restarts) an agent for `workspaceId` with the options its tab
+    /// was created with.
+    void onStartAgentRequested(const QString& workspaceId);
     /// Adds one Edit menu item forwarding to the current editor's view, and
     /// books it in for enabling and disabling together with its siblings.
     ///

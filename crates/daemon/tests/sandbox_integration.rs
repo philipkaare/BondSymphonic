@@ -300,6 +300,96 @@ async fn bwrap_workspace_protects_main_branch_and_shared_objects() {
     lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
 }
 
+/// The real Claude Code binary has to be reachable *inside* a workspace
+/// sandbox, which is the one thing the fake `claude` the rest of the suite runs
+/// can never show.
+///
+/// The sandbox mounts a tmpfs over `/home` and the workspace's own home over
+/// `/home/<user>`, so the daemon user's `~/.local/bin/claude` is not there
+/// however the `PATH` is arranged; `spec_for` binds the resolved binary in at
+/// `CLAUDE_IN_SANDBOX` and `claude_argv` names that path. This runs the real
+/// binary through the real workspace lifecycle and asserts the version it
+/// prints, so a bind that is missing, masked or pointed at the wrong file fails
+/// here rather than at a user's first `agent.start`.
+///
+/// `--version` is the only invocation this suite makes of the real CLI: it
+/// prints and exits, contacts nothing, and cannot log anyone in or out.
+#[tokio::test]
+async fn the_real_claude_binary_runs_inside_a_bwrap_workspace() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let Some(host_claude) = bondsymphonic_daemon::agents::claude::host_claude_bin() else {
+        eprintln!("SKIP: Claude Code is not installed for this user");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let daemon = Daemon::new(
+        DataDirs::new(dir.path().join("data")),
+        backend_for("linux_bwrap"),
+        server.event_bus(),
+    )
+    .unwrap();
+    let ws = lifecycle::create(
+        &daemon,
+        WorkspaceCreateParams {
+            repo_path: repo.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: "claudebin".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+    let handle = daemon.sandbox(&ws.id).unwrap();
+
+    // The daemon user's own install is masked, whatever the sandbox `PATH`
+    // says: this is the failure the bind exists to fix.
+    let (code, _) = run_in(&handle, &format!("test -e '{}'", host_claude.display())).await;
+    assert_ne!(
+        code, 0,
+        "the daemon user's home must not be visible inside the sandbox"
+    );
+
+    // The bind the workspace spec was built from, which is also what
+    // `claude_argv` names for this backend (pinned by the unit test in
+    // `agents::claude`, where `BS_CLAUDE_BIN` can be controlled -- it is
+    // process-wide, and another test in this binary sets it).
+    let (bound_host, bound_in_sandbox) =
+        bondsymphonic_daemon::agents::claude::claude_ro_bind().unwrap();
+    assert_eq!(bound_host, host_claude);
+    assert_eq!(
+        bound_in_sandbox,
+        std::path::Path::new(bondsymphonic_daemon::agents::claude::CLAUDE_IN_SANDBOX)
+    );
+    // Spawned by absolute path, not by name, so nothing here depends on the
+    // sandbox `PATH` either.
+    let (code, out) = run_argv(
+        &handle,
+        vec![
+            bondsymphonic_daemon::agents::claude::CLAUDE_IN_SANDBOX.to_owned(),
+            "--version".into(),
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "`claude --version` inside the sandbox: {out}");
+    let printed = out.trim();
+    assert!(
+        printed.starts_with(bondsymphonic_daemon::agents::claude::TESTED_CLAUDE_VERSION)
+            || printed
+                .split_whitespace()
+                .next()
+                .is_some_and(|v| v.chars().next().is_some_and(|c| c.is_ascii_digit())),
+        "expected a version from inside the sandbox, got {printed:?}"
+    );
+    eprintln!("claude inside the sandbox: {printed}");
+
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+}
+
 /// Proves init tears its sandbox down when the daemon's connection closes.
 ///
 /// bwrap is started directly here, without `kill_on_drop` and without an
@@ -880,8 +970,13 @@ async fn a_claude_agent_streams_a_turn_from_inside_the_sandbox() {
     .unwrap();
     // Process-wide, and deliberately unguarded: this is the only test in this
     // binary that reads or writes `BS_CLAUDE_BIN`, so there is nothing to
-    // serialise against. `agent_integration.rs` does take a lock, because every
-    // test in that binary points the variable somewhere different.
+    // serialise against -- `the_real_claude_binary_runs_inside_a_bwrap_workspace`
+    // deliberately does not consult it. `agent_integration.rs` does take a lock,
+    // because every test in that binary points the variable somewhere different.
+    //
+    // The fake lives *inside the worktree*, which is what makes it reachable:
+    // under bwrap the hook has to name something bound into the sandbox, and the
+    // worktree is bound read-write.
     std::env::set_var(
         "BS_CLAUDE_BIN",
         format!("/usr/bin/python3 {}", fake.display()),

@@ -22,8 +22,8 @@ use crate::model::app_state::agent_state_word;
 use crate::model::transcript::{Applied, LiveEvent, Transcript};
 use crate::qobjects::app_controller::{require_connection, runtime, Shared};
 use bondsymphonic_proto::{
-    AgentId, AgentIdParams, AgentMessage, AgentPermissionReplyParams, AgentSendParams, Event,
-    HistoryResult, PermissionDecision, Request,
+    AgentId, AgentIdParams, AgentMessage, AgentPermissionReplyParams, AgentSendParams, AgentState,
+    Event, HistoryResult, PermissionDecision, Request,
 };
 
 #[cxx_qt::bridge]
@@ -213,7 +213,7 @@ async fn replay_and_follow(
         .request::<HistoryResult>(Request::AgentHistory(params))
         .await
     {
-        Ok(res) => res.messages,
+        Ok(res) => res,
         Err(e) => {
             // The live stream is still worth following: a history that could
             // not be read costs the tab its scrollback, not its agent. Only
@@ -228,7 +228,11 @@ async fn replay_and_follow(
                 }
                 q.fail(&message);
             });
-            Vec::new()
+            HistoryResult {
+                messages: Vec::new(),
+                state: AgentState::Idle,
+                detail: None,
+            }
         }
     };
 
@@ -244,7 +248,18 @@ async fn replay_and_follow(
         if q.as_ref().rust().generation != generation {
             return;
         }
-        q.as_mut().rust_mut().transcript.replay(&history, &buffered);
+        {
+            let mut rust = q.as_mut().rust_mut();
+            // The daemon's state first, then the fold. State changes are events
+            // rather than transcript entries, so every one of them predates
+            // this attachment; without this the fold would end on `Idle` and a
+            // running agent would paint as finished, an exited one would say
+            // nothing, and a genuinely open permission request would have its
+            // bar taken down by the guard at the end of `replay`.
+            rust.transcript
+                .set_state_from_history(history.state, history.detail.clone());
+            rust.transcript.replay(&history.messages, &buffered);
+        }
         // Once, at the end: replaying a long history through the per-message
         // path would emit four property notifications per item.
         q.as_mut().publish_totals();

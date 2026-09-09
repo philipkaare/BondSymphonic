@@ -97,24 +97,29 @@ const WORK_TEXT: &str = "hello\nworld\n";
 /// `fs.write_file` is not among them: no step saves, so asserting on its
 /// warning would assert nothing. The fake daemon answers it anyway, so a future
 /// step that does save needs no change on the daemon side.
-const NO_WARNINGS: [&str; 9] = [
+const NO_WARNINGS: [&str; 11] = [
     "fs.read_file failed",
     "workspace.diff failed",
     "workspace.changes failed",
     "fs.watch enable",
-    // The transcript's own four. The fake daemon answers every one of them, so
-    // any of these means the IDE refused a reply it was given -- a body it
-    // could not deserialise, say -- which the journal alone cannot show.
+    // The transcript's own four. Each is logged by the `TranscriptModel` call
+    // that issued the request, and the script drives all four of those calls
+    // through the window, so every one of these is reachable: it means the IDE
+    // refused a reply it was given -- a body it could not deserialise, say --
+    // which the journal alone cannot show.
     "agent.history failed",
     "agent.send failed",
     "agent.permission_reply failed",
     "agent.stop failed",
-    // The window's, when an answer arrives for a request no visible transcript
-    // is showing. This is what makes the `allow` step an assertion rather than
-    // a wish: `agent.permission_reply` reaches the daemon only through
-    // `TranscriptModel::reply`, and the window calls that only after it has
-    // found the pane attached to the agent with this request on its bar.
+    // The window's three, when a request arrives for an agent no visible
+    // transcript is attached to. These are what make `send`, `allow` and `stop`
+    // assertions rather than wishes: each reaches the daemon only through
+    // `TranscriptModel`, and the window calls that only after it has found the
+    // pane attached to the named agent -- with the request on its bar, for the
+    // permission reply.
     "permission reply not routed",
+    "agent send not routed",
+    "agent stop not routed",
 ];
 
 /// Every request method the fake daemon answered, in arrival order.
@@ -538,6 +543,8 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal) {
                     id,
                     &HistoryResult {
                         messages: transcript.clone(),
+                        state: AgentState::Idle,
+                        detail: None,
                     },
                 )),
                 // The prompt, then the turn stalling on a tool the user has to

@@ -49,7 +49,9 @@ pub mod qobject {
         /// `group_name`, creating that group if it does not exist, and makes it
         /// active. A workspace that is already tracked is refreshed in place
         /// instead of being duplicated. `adapter` is "claude" or "terminal";
-        /// an empty `command` means the adapter default.
+        /// an empty `command` means the adapter default. `options_json` is the
+        /// `AgentStartOptions` a Claude tab was started with, kept on the tab so
+        /// the agent can be started again with them; empty for anything else.
         #[qinvokable]
         fn add_tab(
             self: Pin<&mut GroupModel>,
@@ -57,6 +59,7 @@ pub mod qobject {
             group_name: QString,
             adapter: QString,
             command: QString,
+            options_json: QString,
         ) -> bool;
 
         /// Refreshes status, branch and detail from a `WorkspaceInfo`. False
@@ -252,6 +255,7 @@ impl qobject::GroupModel {
         group_name: QString,
         adapter: QString,
         command: QString,
+        options_json: QString,
     ) -> bool {
         let Ok(info) = serde_json::from_str::<WorkspaceInfo>(&info_json.to_string()) else {
             tracing::warn!("add_tab: unparseable workspace info");
@@ -265,6 +269,7 @@ impl qobject::GroupModel {
         if self.as_ref().rust().workspaces.find(&info.id).is_some() {
             let adapter = adapter.to_string();
             let command = command.to_string();
+            let options = options_json.to_string();
             {
                 let mut rust = self.as_mut().rust_mut();
                 rust.workspaces.apply_workspace_info(&info);
@@ -281,6 +286,9 @@ impl qobject::GroupModel {
                         }
                         if !command.is_empty() {
                             tab.command = Some(command);
+                        }
+                        if !options.is_empty() {
+                            tab.options_json = options;
                         }
                     }
                     rust.workspaces.set_active(g, t);
@@ -314,6 +322,7 @@ impl qobject::GroupModel {
             agent_id: None,
             agent_status: None,
             agent_detail: String::new(),
+            options_json: options_json.to_string(),
         };
         self.as_mut().rust_mut().workspaces.add_tab(group_idx, tab);
         self.publish();

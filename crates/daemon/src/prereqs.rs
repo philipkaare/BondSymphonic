@@ -186,11 +186,14 @@ pub async fn check_all_with_backend(backend: &dyn SandboxBackend) -> Vec<PrereqS
     };
     v.push(userns);
 
-    let claude_path = home().join(".local/bin/claude");
-    let claude_bin = if claude_path.exists() {
-        claude_path.to_string_lossy().to_string()
-    } else {
-        "claude".into()
+    // The same resolver the adapter spawns with, so the version this reports
+    // and the binary an agent runs are the same file. Never a bare `claude`:
+    // under WSL that can resolve to a Windows build on `/mnt/c`.
+    let claude_bin = match crate::agents::claude::host_claude_bin() {
+        Some(p) => p.to_string_lossy().to_string(),
+        None => crate::agents::claude::pinned_claude_path()
+            .to_string_lossy()
+            .to_string(),
     };
     let mut claude = check_binary(
         &claude_bin,

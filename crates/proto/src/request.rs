@@ -398,9 +398,26 @@ pub struct ReadFileResult {
 pub struct AgentStartResult {
     pub agent_id: AgentId,
 }
+/// What `agent.history` answers: the transcript, and the agent's state as of
+/// the moment the transcript was read.
+///
+/// The state travels with the history because state changes are events, not
+/// transcript entries: a client attaching to an agent that is already running
+/// has missed every one of them, and without this it would start from `Idle`
+/// and paint a live agent as finished -- or leave a permission bar up over a
+/// request that has already been answered. Both fields default, so a daemon
+/// that predates them still deserialises.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HistoryResult {
     pub messages: Vec<AgentMessage>,
+    #[serde(default = "idle_state")]
+    pub state: AgentState,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+fn idle_state() -> AgentState {
+    AgentState::Idle
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PtyOpenResult {
