@@ -4,6 +4,7 @@
 //! Everything here is cheap to clone or shared behind an `Arc`, so request
 //! handlers can run concurrently against one `Daemon`.
 
+use crate::agents::AgentManager;
 use crate::fs_watch::Watchers;
 use crate::git::Git;
 use crate::pty::PtyManager;
@@ -26,6 +27,8 @@ pub struct Daemon {
     pub ptys: PtyManager,
     /// Live `fs.watch` subscriptions, one per workspace worktree.
     pub watchers: Watchers,
+    /// The running agents, which is where `WorkspaceInfo.agents` comes from.
+    pub agents: AgentManager,
 }
 
 impl Daemon {
@@ -36,6 +39,7 @@ impl Daemon {
     ) -> anyhow::Result<Arc<Self>> {
         dirs.ensure()?;
         let registry = Registry::load(&dirs.registry_file())?;
+        let agents = AgentManager::new(events.clone(), dirs.transcripts.clone());
         Ok(Arc::new(Self {
             dirs,
             registry,
@@ -45,6 +49,7 @@ impl Daemon {
             events: events.clone(),
             ptys: PtyManager::new(events),
             watchers: Watchers::default(),
+            agents,
         }))
     }
 
@@ -63,10 +68,22 @@ impl Daemon {
         })
     }
 
+    /// A workspace as clients see it. `Workspace::info` cannot fill `agents`:
+    /// the registry is a file that outlives the daemon and the agents are live
+    /// processes, so the list comes from the manager here instead. Every path
+    /// that hands a `WorkspaceInfo` to a client goes through this.
+    pub fn workspace_info(&self, ws: &Workspace) -> WorkspaceInfo {
+        let mut info = ws.info();
+        info.agents = self.agents.agents_of(&ws.id);
+        info
+    }
+
     pub fn emit_state(&self, ws: &Workspace) {
         self.events.publish(
             Some(ws.id.clone()),
-            Event::WorkspaceStateChanged { info: ws.info() },
+            Event::WorkspaceStateChanged {
+                info: self.workspace_info(ws),
+            },
         );
     }
 

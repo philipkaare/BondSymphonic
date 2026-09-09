@@ -5,18 +5,22 @@
 //! The [`AgentManager`] that owns processes lives alongside this; what is here
 //! is the part that has no process in it, so it can be tested on its own.
 
+pub mod claude;
 pub mod claude_stream;
+pub mod credentials;
 
+use crate::daemon::Daemon;
+use crate::ids::new_id;
 use crate::server::broadcast::EventBus;
-use bondsymphonic_proto::{
-    AgentAdapterKind, AgentId, AgentMessage, AgentMessageBody, AgentState, Event, WorkspaceId,
-};
+use bondsymphonic_proto::*;
+use claude::{AgentAdapter, ClaudeAdapter};
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Transcripts on disk: one newline-delimited JSON file per agent, appended to
 /// as messages arrive.
@@ -203,10 +207,198 @@ impl AgentSink {
     }
 }
 
+/// One live agent: what the daemon knows about it, and the adapter that drives
+/// it.
+struct LiveAgent {
+    entry: Arc<AgentEntry>,
+    /// Insertion order, so `agents_of` reports agents in the order they were
+    /// started rather than in whatever order the map happens to hold them.
+    ordinal: u64,
+    /// One request at a time per agent: the adapter methods take `&mut self`,
+    /// and two turns written into the same stdin at once would interleave.
+    adapter: tokio::sync::Mutex<Box<dyn AgentAdapter>>,
+}
+
+/// Every agent the daemon is running, and the requests that reach them.
+///
+/// The manager owns the list, not the workspace registry: an agent is a live
+/// process, and the registry is a file that survives restarts. `agents_of` is
+/// what puts them back into [`WorkspaceInfo`].
+pub struct AgentManager {
+    events: EventBus,
+    store: Arc<TranscriptStore>,
+    agents: Mutex<HashMap<AgentId, Arc<LiveAgent>>>,
+    next_ordinal: AtomicU64,
+}
+
+impl AgentManager {
+    pub fn new(events: EventBus, transcripts: PathBuf) -> Self {
+        Self {
+            events,
+            store: Arc::new(TranscriptStore::new(transcripts)),
+            agents: Mutex::new(HashMap::new()),
+            next_ordinal: AtomicU64::new(0),
+        }
+    }
+
+    fn get(&self, id: &AgentId) -> Result<Arc<LiveAgent>, RpcError> {
+        self.agents
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| RpcError::not_found(format!("agent {id}")))
+    }
+
+    /// Starts a Claude Code agent in a ready workspace's sandbox.
+    ///
+    /// The `Terminal` adapter kind is refused here on purpose: a terminal is a
+    /// PTY the IDE drives directly through `pty.open`, not a process the daemon
+    /// pumps a protocol through. The kind stays in the protocol so the IDE can
+    /// name what a pane is; starting one as an agent is a client mistake.
+    pub async fn start(
+        &self,
+        d: &Daemon,
+        p: AgentStartParams,
+    ) -> Result<AgentStartResult, RpcError> {
+        if p.adapter == AgentAdapterKind::Terminal {
+            return Err(RpcError::invalid_params("terminal agents use pty.open"));
+        }
+        let ws = d.workspace(&p.workspace_id)?;
+        if ws.state != WorkspaceState::Ready {
+            return Err(RpcError::invalid_params(format!(
+                "workspace {} is not ready",
+                ws.id
+            )));
+        }
+        let handle = d.sandbox(&ws.id)?;
+        let argv = claude::claude_argv(&p.options)?;
+
+        // Again at start, not only at creation: the user may have logged in
+        // since this workspace was made, and a workspace that was created
+        // logged out would otherwise stay that way forever.
+        let home = d.dirs.home(&ws.id);
+        let seeded = credentials::seed_claude_files(&home);
+        if !seeded.is_empty() {
+            info!(ws = %ws.id, files = ?seeded, "seeded claude credentials");
+        }
+
+        // The key is given to this one command, never written into the sandbox
+        // spec: the spec's environment reaches every process in the workspace,
+        // including terminals the user opens.
+        let env = match p.options.api_key.as_deref().filter(|k| !k.is_empty()) {
+            Some(key) => vec![("ANTHROPIC_API_KEY".to_owned(), key.to_owned())],
+            None => vec![],
+        };
+
+        let id: AgentId = new_id(AgentId::PREFIX).as_str().into();
+        let entry = Arc::new(AgentEntry::new(ws.id.clone(), p.adapter));
+        let sink = AgentSink::new(
+            self.events.clone(),
+            self.store.clone(),
+            id.clone(),
+            ws.id.clone(),
+            entry.clone(),
+        );
+        let mut adapter = ClaudeAdapter::new(sink, handle, argv, env, ws.worktree_path.clone());
+        // Registered only once it is really running, so a failed start leaves
+        // no agent behind for the IDE to find.
+        adapter.start().await?;
+        self.agents.lock().insert(
+            id.clone(),
+            Arc::new(LiveAgent {
+                entry,
+                ordinal: self.next_ordinal.fetch_add(1, Ordering::SeqCst),
+                adapter: tokio::sync::Mutex::new(Box::new(adapter)),
+            }),
+        );
+        Ok(AgentStartResult { agent_id: id })
+    }
+
+    pub async fn send(&self, p: AgentSendParams) -> Result<Empty, RpcError> {
+        let agent = self.get(&p.agent_id)?;
+        agent.adapter.lock().await.send(p.text).await?;
+        Ok(Empty {})
+    }
+
+    pub async fn permission_reply(&self, p: AgentPermissionReplyParams) -> Result<Empty, RpcError> {
+        let agent = self.get(&p.agent_id)?;
+        agent
+            .adapter
+            .lock()
+            .await
+            .permission_reply(p.request_id, p.decision, p.updated_input, p.message)
+            .await?;
+        Ok(Empty {})
+    }
+
+    pub async fn interrupt(&self, p: AgentIdParams) -> Result<Empty, RpcError> {
+        let agent = self.get(&p.agent_id)?;
+        agent.adapter.lock().await.interrupt().await?;
+        Ok(Empty {})
+    }
+
+    /// Ends the process but keeps the agent, so its transcript is still
+    /// readable. Only the workspace going away removes it (see
+    /// [`stop_all_in`](AgentManager::stop_all_in)).
+    pub async fn stop(&self, p: AgentIdParams) -> Result<Empty, RpcError> {
+        let agent = self.get(&p.agent_id)?;
+        agent.adapter.lock().await.stop().await?;
+        Ok(Empty {})
+    }
+
+    pub async fn history(&self, p: AgentIdParams) -> Result<HistoryResult, RpcError> {
+        // Through the map, so an id nobody ever minted is a `NotFound` rather
+        // than an empty transcript.
+        self.get(&p.agent_id)?;
+        Ok(HistoryResult {
+            messages: self
+                .store
+                .read(&p.agent_id)
+                .await
+                .map_err(|e| RpcError::io(&e))?,
+        })
+    }
+
+    /// The agents belonging to `ws`, oldest first.
+    pub fn agents_of(&self, ws: &WorkspaceId) -> Vec<AgentId> {
+        let mut found: Vec<(u64, AgentId)> = self
+            .agents
+            .lock()
+            .iter()
+            .filter(|(_, a)| &a.entry.workspace_id == ws)
+            .map(|(id, a)| (a.ordinal, id.clone()))
+            .collect();
+        found.sort_by_key(|(ordinal, _)| *ordinal);
+        found.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Stops and forgets every agent in `ws`. Called before a workspace's
+    /// sandbox is torn down, so the agents end through their own `stop` path
+    /// (stdin closed, exit awaited, `Exited` announced) instead of vanishing
+    /// with the sandbox.
+    pub async fn stop_all_in(&self, ws: &WorkspaceId) {
+        let victims: Vec<(AgentId, Arc<LiveAgent>)> = {
+            let mut agents = self.agents.lock();
+            let ids: Vec<AgentId> = agents
+                .iter()
+                .filter(|(_, a)| &a.entry.workspace_id == ws)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| agents.remove(&id).map(|a| (id, a)))
+                .collect()
+        };
+        for (id, agent) in victims {
+            if let Err(e) = agent.adapter.lock().await.stop().await {
+                warn!(agent = %id, error = %e, "stopping agent failed");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bondsymphonic_proto::*;
 
     #[tokio::test]
     async fn transcript_store_round_trips_and_skips_corrupt_lines() {

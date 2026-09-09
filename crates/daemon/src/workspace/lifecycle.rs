@@ -119,7 +119,9 @@ fn watch_sandbox(
 
 /// Gives the sandbox home a git identity, so commits made inside it are not
 /// rejected for a missing `user.email`. Best effort: a repo without an
-/// effective identity simply gets no `.gitconfig`.
+/// effective identity simply gets no `.gitconfig`. The daemon user's Claude
+/// Code login is copied in here too, so an agent started in this workspace is
+/// not logged out; a user who has not logged in simply gets no credentials.
 async fn seed_home(d: &Daemon, ws: &Workspace) {
     let home = d.dirs.home(&ws.id);
     let _ = std::fs::create_dir_all(&home);
@@ -140,6 +142,10 @@ async fn seed_home(d: &Daemon, ws: &Workspace) {
             home.join(".gitconfig"),
             format!("[user]\n\tname = {name}\n\temail = {email}\n[safe]\n\tdirectory = *\n"),
         );
+    }
+    let seeded = crate::agents::credentials::seed_claude_files(&home);
+    if !seeded.is_empty() {
+        tracing::info!(ws = %ws.id, files = ?seeded, "seeded claude credentials");
     }
 }
 
@@ -210,13 +216,13 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
     }
     seed_home(d, &ws).await;
     match start_sandbox(d, &ws).await {
-        Ok(()) => Ok(d.set_state(&id, WorkspaceState::Ready)?.info()),
+        Ok(()) => Ok(d.workspace_info(&d.set_state(&id, WorkspaceState::Ready)?)),
         Err(e) => {
             let ws = d.set_state(
                 &id,
                 WorkspaceState::Error(format!("sandbox failed: {}", e.message)),
             )?;
-            Ok(ws.info())
+            Ok(d.workspace_info(&ws))
         }
     }
 }
@@ -282,6 +288,11 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
         }
     }
     d.set_state(id, WorkspaceState::Destroying)?;
+    // Agents first: each one ends through its own `stop` (stdin closed, exit
+    // awaited, `Exited` announced), so the IDE learns the agent is gone. Left
+    // until after the sandbox went down they would simply vanish with it, and a
+    // client would go on showing an agent that no longer exists.
+    d.agents.stop_all_in(id).await;
     // Before the worktree goes away, so the teardown itself is not reported as a
     // burst of `fs.changed` for a workspace that is on its way out.
     d.watchers.disable(id);

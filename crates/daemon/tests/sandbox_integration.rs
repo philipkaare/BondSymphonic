@@ -10,7 +10,10 @@ use bondsymphonic_daemon::sandbox::protocol::{encode, InitRequest};
 use bondsymphonic_daemon::sandbox::{backend_for, PtySize, SandboxCommand, SandboxSpec};
 use bondsymphonic_daemon::server::{Server, ServerConfig};
 use bondsymphonic_daemon::workspace::{lifecycle, DataDirs};
-use bondsymphonic_proto::{WorkspaceCreateParams, WorkspaceState};
+use bondsymphonic_proto::{
+    AgentAdapterKind, AgentMessageBody, AgentStartOptions, AgentStartParams, AgentState, Event,
+    ServerMessage, WorkspaceCreateParams, WorkspaceState,
+};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -824,4 +827,133 @@ async fn signal_delivers_the_requested_signal_in_the_sandbox() {
         .expect("exit code is delivered");
     assert_eq!(code, 42, "SIGINT reached the sandboxed shell's trap");
     handle.shutdown().await.unwrap();
+}
+
+/// The Claude adapter over the real sandbox rather than the noop backend.
+///
+/// The fake `claude` is copied into the worktree, which is the one directory
+/// bound read-write at its own path, so it is visible from inside; its fixture
+/// goes beside it under the name the fake falls back to when
+/// `FAKE_CLAUDE_FIXTURE` is not in its environment, which it cannot be here —
+/// bwrap gives a sandboxed process only the environment the backend built.
+#[tokio::test]
+async fn a_claude_agent_streams_a_turn_from_inside_the_sandbox() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let python = std::path::Path::new("/usr/bin/python3");
+    if !python.exists() {
+        eprintln!("SKIP: /usr/bin/python3 is missing");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let mut events = server.event_bus().subscribe();
+    let daemon = Daemon::new(
+        DataDirs::new(dir.path().join("data")),
+        backend_for("linux_bwrap"),
+        server.event_bus(),
+    )
+    .unwrap();
+    let ws = lifecycle::create(
+        &daemon,
+        WorkspaceCreateParams {
+            repo_path: repo.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: "agent".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let worktree = std::path::PathBuf::from(&ws.worktree_path);
+    let fake = worktree.join("fake_claude.py");
+    std::fs::copy(fixtures.join("fake_claude.py"), &fake).unwrap();
+    std::fs::copy(
+        fixtures.join("claude-stream/tool_use_turn.ndjson"),
+        worktree.join("fixture.ndjson"),
+    )
+    .unwrap();
+    std::env::set_var(
+        "BS_CLAUDE_BIN",
+        format!("/usr/bin/python3 {}", fake.display()),
+    );
+
+    let started = daemon
+        .agents
+        .start(
+            &daemon,
+            AgentStartParams {
+                workspace_id: ws.id.clone(),
+                adapter: AgentAdapterKind::Claude,
+                options: AgentStartOptions {
+                    command: None,
+                    resume_session: None,
+                    model: None,
+                    permission_mode: None,
+                    api_key: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let ag = started.agent_id;
+
+    // init, Working, two assistant texts, tool_use, tool_result, result, Idle.
+    let mut seen: Vec<Event> = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while seen.len() < 8 && tokio::time::Instant::now() < deadline {
+        let Ok(Ok(msg)) = tokio::time::timeout_at(deadline, events.recv()).await else {
+            break;
+        };
+        if let ServerMessage::Event { event, .. } = msg {
+            let mine = match &event {
+                Event::AgentMessage { agent_id, .. }
+                | Event::AgentStateChanged { agent_id, .. } => agent_id == &ag,
+                _ => false,
+            };
+            if mine {
+                seen.push(event);
+            }
+        }
+    }
+    let bodies: Vec<&AgentMessageBody> = seen
+        .iter()
+        .filter_map(|e| match e {
+            Event::AgentMessage { message, .. } => Some(&message.body),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        bodies
+            .iter()
+            .any(|b| matches!(b, AgentMessageBody::ToolUse { name, .. } if name == "Bash")),
+        "the sandboxed agent must stream its tool call: {bodies:?}"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|b| matches!(b, AgentMessageBody::Result { .. })),
+        "the turn must finish: {bodies:?}"
+    );
+    let states: Vec<AgentState> = seen
+        .iter()
+        .filter_map(|e| match e {
+            Event::AgentStateChanged { state, .. } => Some(*state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(states.first(), Some(&AgentState::Working), "{states:?}");
+    assert_eq!(states.last(), Some(&AgentState::Idle), "{states:?}");
+
+    assert_eq!(daemon.agents.agents_of(&ws.id), vec![ag]);
+    // `destroy` stops the agent before the sandbox goes; the worktree carries
+    // the copied fake, so it needs the forced path.
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+    assert!(daemon.agents.agents_of(&ws.id).is_empty());
+    std::env::remove_var("BS_CLAUDE_BIN");
 }

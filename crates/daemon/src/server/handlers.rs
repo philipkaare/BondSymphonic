@@ -40,15 +40,26 @@ impl Handler for WorkspaceHandler {
             }
             Request::WorkspaceCreate(p) => ok(lifecycle::create(d, p).await?),
             Request::WorkspaceList {} => ok(WorkspaceListResult {
-                workspaces: d.registry.list().iter().map(|w| w.info()).collect(),
+                workspaces: d
+                    .registry
+                    .list()
+                    .iter()
+                    .map(|w| d.workspace_info(w))
+                    .collect(),
             }),
-            Request::WorkspaceGet(p) => ok(d.workspace(&p.workspace_id)?.info()),
+            Request::WorkspaceGet(p) => ok(d.workspace_info(&d.workspace(&p.workspace_id)?)),
             Request::WorkspaceDestroy(p) => {
                 ok(lifecycle::destroy(d, &p.workspace_id, p.force).await?)
             }
             Request::WorkspaceStatus(p) => ok(lifecycle::status(d, &p.workspace_id).await?),
             Request::WorkspaceChanges(p) => ok(changes::changes(d, &p.workspace_id).await?),
             Request::WorkspaceDiff(p) => ok(changes::diff(d, &p.workspace_id, &p.path).await?),
+            Request::AgentStart(p) => ok(d.agents.start(d, p).await?),
+            Request::AgentSend(p) => ok(d.agents.send(p).await?),
+            Request::AgentPermissionReply(p) => ok(d.agents.permission_reply(p).await?),
+            Request::AgentInterrupt(p) => ok(d.agents.interrupt(p).await?),
+            Request::AgentStop(p) => ok(d.agents.stop(p).await?),
+            Request::AgentHistory(p) => ok(d.agents.history(p).await?),
             Request::PtyOpen(p) => ok(d.ptys.open(d, p).await?),
             Request::PtyWrite(p) => ok(d.ptys.write(p).await?),
             Request::PtyResize(p) => ok(d.ptys.resize(p).await?),

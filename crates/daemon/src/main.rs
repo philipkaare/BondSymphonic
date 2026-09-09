@@ -85,7 +85,7 @@ async fn serve(args: Args) -> Result<()> {
     let capabilities = Capabilities {
         sandbox_backend: backend.name().into(),
         git_protect: backend.name() == "linux_bwrap",
-        adapters: vec![AgentAdapterKind::Terminal],
+        adapters: vec![AgentAdapterKind::Claude, AgentAdapterKind::Terminal],
     };
 
     let server = Server::bind(ServerConfig {
