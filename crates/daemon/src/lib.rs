@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod daemon;
 pub mod fs;
 pub mod fs_watch;
