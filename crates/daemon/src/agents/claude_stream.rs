@@ -74,10 +74,7 @@ fn tool_result_text(content: &Value) -> String {
                 _ => item.to_string(),
             })
             .collect::<Vec<_>>()
-            .join(
-                "
-",
-            ),
+            .join("\n"),
         Value::Null => String::new(),
         other => other.to_string(),
     }
@@ -462,13 +459,7 @@ mod tests {
                 _ => None,
             })
             .expect("a tool result");
-        assert_eq!(
-            output,
-            "before
-[image]
-after
-{\"kind\":\"unlabelled\"}"
-        );
+        assert_eq!(output, "before\n[image]\nafter\n{\"kind\":\"unlabelled\"}");
     }
 
     #[test]

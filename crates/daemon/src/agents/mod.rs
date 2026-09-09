@@ -163,6 +163,10 @@ pub struct AgentSink {
 }
 
 impl AgentSink {
+    /// One sink per agent, then cloned for every task that reports through it:
+    /// the ordering lock lives behind this sink's `Arc`, so a second `new` for
+    /// the same agent would make a second lock and the two would interleave
+    /// exactly as they did before there was one.
     pub fn new(
         events: EventBus,
         store: Arc<TranscriptStore>,
@@ -517,7 +521,9 @@ mod tests {
     /// typed. Taking the sequence number and then awaiting the append would let
     /// the two interleave, and the transcript is read back in file order, so a
     /// user's own message would appear below the reply to it.
-    #[tokio::test]
+    /// On the multi-threaded runtime, so the two tasks really run at once
+    /// rather than only interleaving at await points.
+    #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_messages_share_one_order_on_the_bus_and_on_disk() {
         const EACH: usize = 25;
 
