@@ -498,3 +498,129 @@ async fn a_lagging_client_is_told_how_many_events_it_missed() {
     );
     cancel.cancel();
 }
+
+/// A lag can happen inside the bounded pre-reply flush (`forward_events`), not just in
+/// the main loop's `event_rx.recv()` branch: a burst that overflows `EVENT_BUS_CAPACITY`
+/// before the reply is even parked lags this connection's receiver before the flush ever
+/// runs. That loss must still be reported once, ahead of the reply, exactly like a
+/// main-loop lag is.
+///
+/// `FloodOnList` publishes `EVENT_BUS_CAPACITY + 50` events synchronously (no `.await`
+/// between them) from inside the request handler, before returning its reply. On the
+/// default current-thread test runtime only one task runs at a time, and a future only
+/// yields at an `.await` point; since the publish loop and the reply's journey back to
+/// the connection loop (via `resp_tx`) contain no other `.await` that would block, they
+/// run to completion in the same scheduling turn, so the connection loop's own
+/// `event_rx.recv()` branch has no opportunity to interleave and drain any of the burst
+/// first. By the time the reply is parked, the receiver has already lagged by 50 events,
+/// and that lag is only discovered later, inside the flush.
+#[tokio::test]
+async fn a_lag_that_happens_during_the_pre_reply_flush_is_still_reported() {
+    fn log(message: String) -> Event {
+        Event::DaemonLog {
+            level: LogLevel::Info,
+            message,
+            host: None,
+        }
+    }
+
+    struct FloodOnList {
+        inner: std::sync::Arc<dyn Handler>,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for FloodOnList {
+        async fn handle(&self, req: Request, ctx: &ConnCtx) -> Result<serde_json::Value, RpcError> {
+            match req {
+                Request::WorkspaceList {} => {
+                    for i in 0..(bondsymphonic_daemon::server::broadcast::EVENT_BUS_CAPACITY + 50) {
+                        ctx.events.publish(None, log(format!("m{i}")));
+                    }
+                    Ok(serde_json::json!({ "workspaces": [] }))
+                }
+                other => self.inner.handle(other, ctx).await,
+            }
+        }
+    }
+
+    let cfg = ServerConfig::default();
+    let capabilities = cfg.capabilities.clone();
+    let server = Server::bind(cfg).await.unwrap();
+    let port = server.port();
+    let token = server.token().to_string();
+    let server = server.with_handler(std::sync::Arc::new(FloodOnList {
+        inner: std::sync::Arc::new(SystemHandler {
+            token: token.clone(),
+            capabilities,
+        }),
+    }));
+    let cancel = CancellationToken::new();
+    let c2 = cancel.clone();
+    tokio::spawn(async move { server.run(c2).await.unwrap() });
+
+    let (mut r, mut w) = connect(port).await;
+    send(
+        &mut w,
+        1,
+        Request::Hello(HelloParams {
+            token,
+            client_version: "0.1.0".into(),
+        }),
+    )
+    .await;
+    recv(&mut r).await.unwrap();
+
+    send(&mut w, 2, Request::WorkspaceList {}).await;
+    // Read nothing while the flood piles up, so draining below starts only once the
+    // flush has already run to completion.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let mut dropped: Option<u64> = None;
+    let mut got_response = false;
+    loop {
+        let Some(msg) = tokio::time::timeout(std::time::Duration::from_millis(2000), recv(&mut r))
+            .await
+            .ok()
+            .flatten()
+        else {
+            break;
+        };
+        match msg {
+            ServerMessage::Event {
+                event: Event::DaemonLog { message, level, .. },
+                ..
+            } => {
+                if let Some(n) = message.strip_prefix("events dropped: ") {
+                    assert_eq!(level, LogLevel::Warn);
+                    assert!(
+                        dropped.replace(n.parse().unwrap()).is_none(),
+                        "only one drop notice expected"
+                    );
+                    assert!(
+                        !got_response,
+                        "the drop notice must precede the reply it was queued ahead of"
+                    );
+                }
+            }
+            ServerMessage::Response { id: 2, .. } => {
+                got_response = true;
+                break;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(got_response, "the parked reply must still arrive");
+    assert!(
+        dropped.unwrap_or(0) >= 50,
+        "expected a drop notice for the flush overflow, got {dropped:?}"
+    );
+
+    // The connection must still be healthy after a flush-time lag: a later request gets
+    // its own reply, with nothing silently missing in between.
+    send(&mut w, 3, Request::SystemCheckPrereqs {}).await;
+    match recv(&mut r).await.unwrap() {
+        ServerMessage::Response { id: 3, .. } => {}
+        other => panic!("unexpected {other:?}"),
+    }
+    cancel.cancel();
+}

@@ -81,8 +81,32 @@ pub async fn serve_connection(
         // from the reader `pty.open` spawned, say) must not overtake the reply that
         // carries the id it refers to.
         if let Some((resp, queued)) = pending.take() {
-            if !forward_events(&mut event_rx, &ctx, &out_tx, queued).await {
-                break;
+            let dropped = match forward_events(&mut event_rx, &ctx, &out_tx, queued).await {
+                Some(dropped) => dropped,
+                None => break,
+            };
+            // A lag can happen inside this bounded flush too (a burst that overflows
+            // `EVENT_BUS_CAPACITY` before the reply was even parked, say), not just in
+            // the main loop's `event_rx.recv()` branch below. Report it the same way,
+            // once, ahead of the reply it was queued alongside.
+            if dropped > 0 {
+                tracing::warn!(
+                    dropped,
+                    "client lagged during pre-reply flush; events dropped"
+                );
+                if ctx.is_authenticated() {
+                    let notice = ServerMessage::event(
+                        None,
+                        Event::DaemonLog {
+                            level: LogLevel::Warn,
+                            message: format!("events dropped: {dropped}"),
+                            host: None,
+                        },
+                    );
+                    if out_tx.send(codec::encode(&notice)).await.is_err() {
+                        break;
+                    }
+                }
             }
             if out_tx.send(codec::encode(&resp)).await.is_err() {
                 break;
@@ -185,8 +209,10 @@ pub async fn serve_connection(
     let _ = writer.await;
 }
 
-/// Writes up to `max` events already queued for this connection. Returns false when the
-/// writer is gone and the connection should be torn down.
+/// Writes up to `max` events already queued for this connection, and returns how many
+/// were dropped by a lag encountered along the way (the caller reports that count to the
+/// client as a single notice). Returns `None` when the writer is gone and the connection
+/// should be torn down.
 ///
 /// The bound is what keeps a reply ahead of events published after it was parked: those
 /// are written by the connection loop's own event branch on a later iteration, in order.
@@ -195,23 +221,25 @@ async fn forward_events(
     ctx: &ConnCtx,
     out_tx: &mpsc::Sender<String>,
     max: usize,
-) -> bool {
+) -> Option<u64> {
     use tokio::sync::broadcast::error::TryRecvError;
+    let mut dropped: u64 = 0;
     for _ in 0..max {
         match event_rx.try_recv() {
             Ok(msg) => {
                 if ctx.is_authenticated() && out_tx.send(codec::encode(&msg)).await.is_err() {
-                    return false;
+                    return None;
                 }
             }
             // `Lagged` is reported once and then reception resumes, so it is skipped
-            // rather than ending the flush. It consumes one of `max`: the dropped events
-            // it stands for were among the ones counted.
-            Err(TryRecvError::Lagged(_)) => {}
-            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => return true,
+            // rather than ending the flush; the loss is accumulated and reported by the
+            // caller instead. It still consumes one of `max`: the dropped events it
+            // stands for were among the ones counted.
+            Err(TryRecvError::Lagged(n)) => dropped += n,
+            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => return Some(dropped),
         }
     }
-    true
+    Some(dropped)
 }
 
 /// Writes replies that landed after the connection loop stopped.
