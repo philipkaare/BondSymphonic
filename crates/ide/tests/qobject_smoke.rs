@@ -7,10 +7,16 @@
 //! boundary survives the round trip, including the state the widgets read back
 //! out of `state_json`.
 
+use bondsymphonic_ide::highlight::theme::Theme;
 use bondsymphonic_ide::model::app_state::{AgentTab, TabStatus, Workspaces};
 use bondsymphonic_ide::model::file_tree::FileTree;
+use bondsymphonic_ide::qobjects::changes_model::touches_workspace;
+use bondsymphonic_ide::qobjects::editor_document::{
+    build_buffer, normalise_line_separators, read_only_reason, HIGHLIGHT_MAX_BYTES,
+};
 use bondsymphonic_proto::{
-    AgentAdapterKind, FileEntry, FileStatus, WorkspaceId, WorkspaceInfo, WorkspaceState,
+    AgentAdapterKind, Event, FileEntry, FileStatus, PtyId, ReadFileResult, WorkspaceId,
+    WorkspaceInfo, WorkspaceState,
 };
 
 fn info(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
@@ -215,4 +221,80 @@ fn file_entries_json_round_trips() {
     assert!(tree.get_dir("src").is_none());
     let empty: Vec<FileEntry> = serde_json::from_str("[]").expect("empty entries parse");
     assert!(empty.is_empty());
+}
+
+/// `EditorDocument::open` turns a `fs.read_file` result into the sentence the
+/// header shows when a file cannot be edited.
+#[test]
+fn read_only_reason_names_binary_and_truncated_files() {
+    let ok = ReadFileResult {
+        content: "x".into(),
+        encoding: "utf-8".into(),
+        truncated: false,
+    };
+    assert_eq!(read_only_reason(&ok), "");
+    let bin = ReadFileResult {
+        content: String::new(),
+        encoding: "binary".into(),
+        truncated: false,
+    };
+    assert_eq!(read_only_reason(&bin), "binary file");
+    let big = ReadFileResult {
+        content: "x".into(),
+        encoding: "utf-8".into(),
+        truncated: true,
+    };
+    assert_eq!(read_only_reason(&big), "file larger than 4 MiB (truncated)");
+}
+
+/// The filter both the editor's watch task and `ChangesModel` run over the
+/// router's stream: only `fs.changed`, only for the workspace in question.
+#[test]
+fn fs_changed_events_are_matched_by_workspace() {
+    let ws = WorkspaceId("ws_1".into());
+    let ev = Event::FsChanged {
+        paths: vec!["a.rs".into()],
+    };
+    assert!(touches_workspace(&Some(ws.clone()), &ev, "ws_1"));
+    assert!(!touches_workspace(&Some(ws), &ev, "ws_2"));
+    assert!(!touches_workspace(&None, &ev, "ws_1"));
+    assert!(!touches_workspace(
+        &Some(WorkspaceId("ws_1".into())),
+        &Event::PtyExit {
+            pty_id: PtyId("p".into()),
+            code: 0
+        },
+        "ws_1"
+    ));
+}
+
+/// A file whose text is only ever `\n`-separated survives normalisation
+/// untouched; the Unicode separators `QTextDocument` would turn into block
+/// breaks are rewritten so the buffer and the view agree on line numbers.
+#[test]
+fn unicode_paragraph_separators_are_normalised_to_newlines() {
+    let (text, normalised) = normalise_line_separators("a\nb\r\nc");
+    assert_eq!(text, "a\nb\r\nc");
+    assert!(!normalised);
+
+    let (text, normalised) = normalise_line_separators("a\u{2029}b\u{2028}c");
+    assert_eq!(text, "a\nb\nc");
+    assert!(normalised);
+}
+
+/// Files past [`HIGHLIGHT_MAX_BYTES`] open without a highlight pass but keep
+/// reporting their language, so the header is right and typing stays cheap.
+#[test]
+fn very_large_files_open_with_highlighting_off() {
+    let small = "fn main() {}\n";
+    let (buffer, _) = build_buffer("a.rs", small);
+    assert!(buffer.highlighting());
+    assert_eq!(buffer.language().map(|l| l.name()), Some("rust"));
+
+    let big = "fn main() {}\n".repeat(HIGHLIGHT_MAX_BYTES / 8);
+    assert!(big.len() > HIGHLIGHT_MAX_BYTES);
+    let (mut buffer, _) = build_buffer("a.rs", &big);
+    assert!(!buffer.highlighting());
+    assert_eq!(buffer.language().map(|l| l.name()), Some("rust"));
+    assert_eq!(buffer.spans_json(0, Theme::for_dark(false)), "[]");
 }

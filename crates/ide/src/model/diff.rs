@@ -6,7 +6,8 @@
 //! new lines one for one and spills the longer side into Delete or Insert rows.
 
 use serde::Serialize;
-use similar::{DiffTag, TextDiff};
+use similar::{DiffOp, DiffTag, TextDiff};
+use std::time::{Duration, Instant};
 
 /// What one row of the side-by-side view represents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -44,12 +45,41 @@ fn strip(line: &str) -> String {
 ///
 /// Two empty texts yield no rows; a missing trailing newline is immaterial,
 /// the final line is a row like any other.
+///
+/// Takes as long as it takes. Anything driven by a UI wants
+/// [`align_with_deadline`] instead: Myers' algorithm is O(n·d), and two
+/// megabyte-sized texts that share almost nothing can run for tens of seconds.
 pub fn align(base: &str, work: &str) -> Vec<DiffRow> {
     let diff = TextDiff::from_lines(base, work);
-    let old: Vec<&str> = diff.old_slices().to_vec();
-    let new: Vec<&str> = diff.new_slices().to_vec();
+    rows_from(diff.old_slices(), diff.new_slices(), diff.ops())
+}
+
+/// [`align`], but giving up on an exact diff after `budget` and approximating
+/// the rest. The flag says whether the budget ran out, so a view can tell the
+/// user the diff it is showing is coarser than the file deserves.
+///
+/// The rows are always a valid alignment of the two texts; only their
+/// minimality is at stake. A budget that is not spent produces exactly what
+/// [`align`] produces.
+pub fn align_with_deadline(base: &str, work: &str, budget: Duration) -> (Vec<DiffRow>, bool) {
+    let started = Instant::now();
+    let diff = TextDiff::configure()
+        .deadline(started + budget)
+        .diff_lines(base, work);
+    // Measured before the rows are built: turning ops into rows is linear and
+    // has nothing to do with whether the algorithm approximated.
+    let truncated = started.elapsed() >= budget;
+    (
+        rows_from(diff.old_slices(), diff.new_slices(), diff.ops()),
+        truncated,
+    )
+}
+
+/// Turns one diff's ops into side-by-side rows. Shared by both entry points so
+/// the deadline can never change the shape of the result, only its minimality.
+fn rows_from(old: &[&str], new: &[&str], ops: &[DiffOp]) -> Vec<DiffRow> {
     let mut rows = Vec::new();
-    for op in diff.ops() {
+    for op in ops {
         let (tag, old_range, new_range) = (op.tag(), op.old_range(), op.new_range());
         match tag {
             DiffTag::Equal => {

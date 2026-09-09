@@ -177,6 +177,36 @@ pub mod qobject {
         /// returns an empty string if it is not a translatable path.
         #[qinvokable]
         fn wsl_path(self: &AppController, windows_path: QString) -> QString;
+
+        /// Someone in Rust asked the window to open a file in an editor tab.
+        #[qsignal]
+        fn open_file_requested(self: Pin<&mut AppController>, workspace_id: QString, path: QString);
+
+        /// Someone in Rust asked the window to open a file's diff.
+        #[qsignal]
+        fn open_diff_requested(self: Pin<&mut AppController>, workspace_id: QString, path: QString);
+
+        /// Someone in Rust asked the window to save every dirty editor.
+        #[qsignal]
+        fn save_all_requested(self: Pin<&mut AppController>);
+
+        /// Asks the window to open `path` of `workspace_id` in an editor tab.
+        ///
+        /// These three are the one path by which anything on the Rust side
+        /// reaches the window: the controller has no pointer to it, and the
+        /// window is the only thing that knows which tabs exist. The smoke
+        /// script drives them today; the transcript's tool cards will drive
+        /// them next.
+        #[qinvokable]
+        fn request_open_file(self: Pin<&mut AppController>, workspace_id: QString, path: QString);
+
+        /// Asks the window to open the diff for `path` of `workspace_id`.
+        #[qinvokable]
+        fn request_open_diff(self: Pin<&mut AppController>, workspace_id: QString, path: QString);
+
+        /// Asks the window to save every dirty editor.
+        #[qinvokable]
+        fn request_save_all(self: Pin<&mut AppController>);
     }
 
     impl cxx_qt::Threading for AppController {}
@@ -523,6 +553,18 @@ impl qobject::AppController {
                 Err(e) => report_failure(&qt, "repo.inspect", e.to_string()),
             }
         });
+    }
+
+    pub fn request_open_file(self: Pin<&mut Self>, workspace_id: QString, path: QString) {
+        self.open_file_requested(workspace_id, path);
+    }
+
+    pub fn request_open_diff(self: Pin<&mut Self>, workspace_id: QString, path: QString) {
+        self.open_diff_requested(workspace_id, path);
+    }
+
+    pub fn request_save_all(self: Pin<&mut Self>) {
+        self.save_all_requested();
     }
 
     pub fn wsl_path(&self, windows_path: QString) -> QString {

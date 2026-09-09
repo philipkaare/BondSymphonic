@@ -1,4 +1,7 @@
-use bondsymphonic_ide::model::diff::{align, counts, rows_json, DiffRow, RowKind};
+use bondsymphonic_ide::model::diff::{
+    align, align_with_deadline, counts, rows_json, DiffRow, RowKind,
+};
+use std::time::Duration;
 
 fn kinds(rows: &[DiffRow]) -> Vec<RowKind> {
     rows.iter().map(|r| r.kind).collect()
@@ -127,4 +130,21 @@ fn replace_spills_the_remainder_as_deletes_when_the_base_is_longer() {
     assert_eq!(rows[3].left_text, "old3");
     assert_eq!(rows[3].right_text, "");
     assert_eq!(counts(&rows), (2, 3));
+}
+
+/// The deadline form is what `DiffDocument` runs, so it has to agree with
+/// `align` whenever the budget is not actually spent: same rows, and nothing
+/// reported as cut short.
+#[test]
+fn a_budget_that_is_not_spent_yields_the_same_rows_as_align() {
+    let base = "a\nb\nc\nd\n";
+    let (rows, truncated) = align_with_deadline(base, base, Duration::from_secs(2));
+    assert!(!truncated);
+    assert_eq!(rows, align(base, base));
+    assert_eq!(counts(&rows), (0, 0));
+
+    let work = "a\nB\nc\ne\nd\n";
+    let (rows, truncated) = align_with_deadline(base, work, Duration::from_secs(2));
+    assert!(!truncated);
+    assert_eq!(rows, align(base, work));
 }
