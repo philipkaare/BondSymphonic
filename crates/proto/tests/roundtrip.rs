@@ -177,3 +177,22 @@ fn the_drop_notice_round_trips_through_the_wire_form() {
         None
     );
 }
+
+#[test]
+fn diff_result_defaults_truncated_to_false() {
+    // The field was added after the first daemons shipped, so a reply without
+    // it has to keep deserialising rather than failing the whole diff.
+    let old: DiffResult = serde_json::from_str(r#"{"base_text":"a\n","work_text":"b\n"}"#).unwrap();
+    assert_eq!(old.base_text, "a\n");
+    assert!(!old.truncated);
+
+    let cut = DiffResult {
+        base_text: "a\n".into(),
+        work_text: "b\n".into(),
+        truncated: true,
+    };
+    let v = serde_json::to_value(&cut).unwrap();
+    assert_eq!(v["truncated"], true);
+    let back: DiffResult = serde_json::from_value(v).unwrap();
+    assert_eq!(back, cut);
+}

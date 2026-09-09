@@ -30,6 +30,8 @@ sandboxes, and edits, saves and diffs the files in them.
   open as plain text. Typing marks the tab with a dot; File > Save (Ctrl+S) writes the
   file back through the daemon into the sandboxed worktree, and Save All writes every
   dirty tab. A binary file, or one over 4 MiB, opens as a read-only notice instead.
+  Closing a tab with unsaved edits asks first, and so does closing the window: save all,
+  discard, or stay.
 - **External changes.** While a file is open the IDE watches it. A change made on disk by
   an agent or a shell reloads an unmodified tab silently, keeping the caret and the scroll
   position; on a tab with unsaved edits a bar offers reload or keep.
@@ -45,8 +47,8 @@ Known limits in this milestone:
   whole buffer after every edit rather than incrementally.
 - Highlighting is that same full re-pass per edit, computed lazily on the next span query.
 - An open diff does not reload when the file changes on disk. Close and re-open it.
-- Closing the window does not prompt about editors with unsaved edits. That prompt comes
-  with the persistence work in Milestone 6.
+- A diff of a file over 4 MiB compares the first 4 MiB of each side; the pane's header
+  says so, separately from the note it shows when the alignment runs out of time.
 - Languages embedded in another (`<script>` in HTML, fenced code in Markdown) are not
   highlighted: tree-sitter injections are not wired up.
 

@@ -2,6 +2,7 @@
 #include <QKeySequence>
 #include <QList>
 #include <QMainWindow>
+#include <QMetaObject>
 #include <QPointer>
 #include <QString>
 
@@ -15,6 +16,7 @@ class GroupBar;
 class GroupModel;
 class NewAgentDialog;
 class QAction;
+class QCloseEvent;
 class QJsonObject;
 class QLabel;
 class QMenu;
@@ -28,7 +30,26 @@ public:
     MainWindow(AppController* controller, GroupModel* groupModel, FileTreeModel* fileTreeModel,
                ChangesModel* changesModel, QWidget* parent = nullptr);
 
+protected:
+    /// Refuses to close over unsaved editors without asking. Both ways out of
+    /// the application arrive here -- the title bar's close button and File >
+    /// Exit, which calls `close()` -- so this is the one place the question has
+    /// to be put.
+    void closeEvent(QCloseEvent* event) override;
+
 private:
+    /// Where a close request has got to. `Idle` is the ordinary state; the
+    /// window is `WaitingForSaves` between a "Save All" answer and the last
+    /// write landing, and `Confirmed` once it may close without asking again.
+    enum class CloseState { Idle, WaitingForSaves, Confirmed };
+
+    /// Watches the editor area until nothing is dirty, then closes the window.
+    /// A failed write cancels the wait instead: the edit is still only in the
+    /// pane, which is what the prompt was protecting.
+    void armCloseAfterSaves();
+    /// Drops those watches and returns to `Idle`.
+    void disarmCloseAfterSaves();
+
     void buildMenus();
     void buildCentral();
     void buildDocks();
@@ -87,4 +108,8 @@ private:
     /// What the sandbox label shows when no tab is selected: normally a dash,
     /// or the prerequisite warning once the controller has reported one.
     QString m_sandboxIdleText;
+    CloseState m_closeState = CloseState::Idle;
+    /// The two connections `armCloseAfterSaves` makes, so they can be dropped
+    /// again whichever way the wait ends.
+    QList<QMetaObject::Connection> m_closeWatch;
 };

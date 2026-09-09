@@ -48,10 +48,21 @@ public:
     /// What to do with a dirty editor whose tab is closing.
     enum class Unsaved { Save, Discard, Cancel };
 
-    /// Replaces the question `closeTab` asks about a dirty editor. The default
-    /// puts a modal box in front of the user; this is the seam that lets the
-    /// answer come from somewhere else.
-    void setUnsavedPrompt(std::function<Unsaved(const QString& title)> ask);
+    /// Whether any open tab is an editor with unsaved edits. What the window
+    /// asks before it lets itself be closed.
+    bool hasUnsavedEditors() const;
+
+    /// Asks the unsaved question once for the whole area, naming the file when
+    /// there is one and counting them when there are several. Answers `Discard`
+    /// without asking anything when nothing is dirty.
+    Unsaved askUnsavedAll();
+
+    /// Replaces the question `closeTab` and `askUnsavedAll` put to the user.
+    /// The default puts a modal box in front of them; this is the seam that lets
+    /// the answer come from somewhere else. `closingAll` is false for one tab
+    /// and true for the whole window, which is the difference between a Save
+    /// button and a Save All one.
+    void setUnsavedPrompt(std::function<Unsaved(const QString& title, bool closingAll)> ask);
 
     /// Closes the tab at `index`, asking first when it has unsaved edits.
     /// Returns whether the tab is gone: a cancelled prompt and a save still in
@@ -62,6 +73,16 @@ public:
 signals:
     /// The current tab changed. `editor` is null when no editor is showing.
     void currentEditorChanged(EditorWidget* editor);
+
+    /// Some editor became dirty or clean, or a tab holding one went away, so
+    /// the answer to `hasUnsavedEditors` may have changed. The window waits on
+    /// this while a close-triggered save-all is in flight.
+    void unsavedStateChanged();
+
+    /// An editor's write failed. Carried up because a window that is waiting
+    /// for saves to land has to stop waiting, and the pane has already told the
+    /// user what went wrong.
+    void saveFailed(const QString& message);
 
 private:
     /// The two connections that close a tab once its save lands.
@@ -90,7 +111,7 @@ private:
     QLabel* m_placeholder = nullptr;
     QTabWidget* m_tabs = nullptr;
     /// Never null: the constructor installs the modal box.
-    std::function<Unsaved(const QString&)> m_ask;
+    std::function<Unsaved(const QString&, bool)> m_ask;
     /// Tabs whose close is waiting on a write. A second close request for one
     /// of them is ignored rather than arming a second pair of connections.
     QHash<QWidget*, PendingClose> m_closing;

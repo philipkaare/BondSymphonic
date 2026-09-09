@@ -114,7 +114,7 @@ async fn a_burst_of_writes_is_one_event_with_sorted_paths() {
     // arrival order.
     let worktree = std::path::Path::new(&ws.worktree_path).to_path_buf();
     std::fs::write(worktree.join("zebra.txt"), "z\n").unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
     std::fs::write(worktree.join("alpha.txt"), "a\n").unwrap();
 
     let paths = wait_for_fs_changed(&mut c, &ws.id, Duration::from_secs(5))

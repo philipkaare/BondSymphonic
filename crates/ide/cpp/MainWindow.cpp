@@ -15,6 +15,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QDockWidget>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -51,6 +52,70 @@ MainWindow::MainWindow(AppController* controller, GroupModel* groupModel, FileTr
     updateWorkspaceStatus();
     onActiveTabChanged();
     updateEditActions();
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+    // Already answered, or there is nothing to lose. `hasUnsavedEditors` is the
+    // whole test: a clean editor and a diff pane have nothing on them that the
+    // file on disk does not.
+    if (m_closeState == CloseState::Confirmed || !m_editorArea->hasUnsavedEditors()) {
+        QMainWindow::closeEvent(event);
+        return;
+    }
+    if (m_closeState == CloseState::WaitingForSaves) {
+        // The writes this close already started are still out. Asking again
+        // would put a second box over a question that has been answered.
+        event->ignore();
+        return;
+    }
+    switch (m_editorArea->askUnsavedAll()) {
+    case EditorArea::Unsaved::Discard:
+        m_closeState = CloseState::Confirmed;
+        QMainWindow::closeEvent(event);
+        return;
+    case EditorArea::Unsaved::Save:
+        // Armed before the writes go out, not after: a save that lands while
+        // this function is still running would otherwise be missed and the
+        // window would sit open waiting for something that had happened.
+        armCloseAfterSaves();
+        m_editorArea->saveAll();
+        event->ignore();
+        return;
+    case EditorArea::Unsaved::Cancel:
+    default:
+        event->ignore();
+        return;
+    }
+}
+
+void MainWindow::armCloseAfterSaves() {
+    m_closeState = CloseState::WaitingForSaves;
+    m_closeWatch.append(
+        QObject::connect(m_editorArea, &EditorArea::unsavedStateChanged, this, [this] {
+            if (m_closeState != CloseState::WaitingForSaves || m_editorArea->hasUnsavedEditors()) {
+                return;
+            }
+            // Every write has landed and nothing has been typed since, so the
+            // second `closeEvent` this provokes has nothing left to ask about.
+            disarmCloseAfterSaves();
+            m_closeState = CloseState::Confirmed;
+            close();
+        }));
+    m_closeWatch.append(QObject::connect(m_editorArea, &EditorArea::saveFailed, this,
+                                         [this](const QString&) {
+                                             // The edit is still only in the pane and the pane has
+                                             // said why. Closing now would throw it away, which is
+                                             // exactly what the prompt was for.
+                                             disarmCloseAfterSaves();
+                                         }));
+}
+
+void MainWindow::disarmCloseAfterSaves() {
+    for (const QMetaObject::Connection& c : m_closeWatch) {
+        QObject::disconnect(c);
+    }
+    m_closeWatch.clear();
+    m_closeState = CloseState::Idle;
 }
 
 void MainWindow::buildMenus() {

@@ -112,36 +112,68 @@ pub async fn diff(d: &Daemon, id: &WorkspaceId, path: &str) -> Result<DiffResult
         path.to_owned()
     };
     let spec = format!("{}:{}", merge_base(&git, &ws).await?, spec_path);
-    // A missing path at the merge-base is a normal "added" file, not an error.
+    // "Does this path exist at the merge-base" asked as its own question, before
+    // anything is read. A missing path is a normal "added" file and its base side
+    // is empty; every other failure — a lock conflict, a damaged object store, the
+    // 60 s timeout — has to stay an error, because an empty base side is
+    // indistinguishable from a new file and would report every line as added.
+    // Reading the answer off the *read* would conflate the two, which is what this
+    // used to do.
+    let base_exists = match git.run(&cwd, &["cat-file", "-e", &spec]).await {
+        Ok(_) => true,
+        Err(e) if absent_at_rev(&e) => false,
+        Err(e) => return Err(e),
+    };
     // Read as bytes and classified like any other file the daemon serves: a
     // binary blob is empty rather than mojibake, and an oversized one is cut at
     // the same cap `fs::read_file` uses instead of crossing the wire whole.
-    let base_text = match git
-        .run_bytes(&cwd, &["show", &spec], crate::fs::MAX_READ)
-        .await
-    {
-        Ok(out) => {
-            let r = crate::fs::classify(&out.stdout);
-            if r.encoding == "binary" {
-                String::new()
-            } else {
-                r.content
-            }
-        }
-        Err(_) => String::new(),
+    let (base_text, base_cut) = if base_exists {
+        let out = git
+            .run_bytes(&cwd, &["show", &spec], crate::fs::MAX_READ)
+            .await?;
+        let r = crate::fs::classify(&out.stdout);
+        let text = if r.encoding == "binary" {
+            String::new()
+        } else {
+            r.content
+        };
+        (text, r.truncated)
+    } else {
+        (String::new(), false)
     };
     let root = cwd.clone();
     let rel = path.to_owned();
-    let work_text = tokio::task::spawn_blocking(move || match crate::fs::read_file(&root, &rel) {
-        Ok(r) if r.encoding != "binary" => r.content,
-        _ => String::new(),
-    })
-    .await
-    .map_err(|e| RpcError::internal(e.to_string()))?;
+    let (work_text, work_cut) =
+        tokio::task::spawn_blocking(move || match crate::fs::read_file(&root, &rel) {
+            Ok(r) if r.encoding != "binary" => (r.content, r.truncated),
+            _ => (String::new(), false),
+        })
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?;
     Ok(DiffResult {
         base_text: normalise_eol(base_text),
         work_text: normalise_eol(work_text),
+        truncated: base_cut || work_cut,
     })
+}
+
+/// Whether a failed `git cat-file -e <rev>:<path>` means the path is simply not
+/// in that revision.
+///
+/// The exit code cannot answer this: git reports an absent path as `fatal:`,
+/// exit 128, the same code it uses for a malformed revision or an unreadable
+/// object store. The two messages below are the ones it prints for absence, and
+/// `LC_ALL=C` on every invocation is what makes matching them safe.
+fn absent_at_rev(e: &RpcError) -> bool {
+    let stderr = e
+        .data
+        .as_ref()
+        .and_then(|d| d.get("stderr"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    // "does not exist in '<rev>'" for a path git has never seen; "exists on
+    // disk, but not in '<rev>'" for one that is only in the working tree.
+    stderr.contains("does not exist in") || stderr.contains("exists on disk, but not in")
 }
 
 /// `git diff --name-status -M -z` → (status, path). Renames yield the new path.
@@ -269,6 +301,51 @@ mod tests {
         let m = parse_numstat_z(text);
         assert_eq!(m["renamed.rs"], (2, 0));
         assert!(!m.contains_key("old.rs"));
+    }
+
+    /// The two messages git prints for "not in that revision", verbatim from
+    /// `git cat-file -e` under `LC_ALL=C`.
+    #[test]
+    fn absent_at_rev_recognises_gits_two_absence_messages() {
+        let never_seen = crate::git::git_error(
+            "git cat-file -e abc123:gone.txt",
+            Some(128),
+            "fatal: path 'gone.txt' does not exist in 'abc123'",
+        );
+        assert!(absent_at_rev(&never_seen));
+
+        let untracked = crate::git::git_error(
+            "git cat-file -e abc123:new.txt",
+            Some(128),
+            "fatal: path 'new.txt' exists on disk, but not in 'abc123'",
+        );
+        assert!(absent_at_rev(&untracked));
+    }
+
+    /// Everything else is a real failure and must not be read as "the file is
+    /// new" — that is the bug this predicate exists to prevent.
+    #[test]
+    fn absent_at_rev_rejects_real_failures() {
+        let timeout =
+            crate::git::git_error("git cat-file -e abc123:a.rs", None, "timed out after 60s");
+        assert!(!absent_at_rev(&timeout));
+
+        let broken = crate::git::git_error(
+            "git cat-file -e abc123:a.rs",
+            Some(128),
+            "fatal: loose object 0f2c is corrupt",
+        );
+        assert!(!absent_at_rev(&broken));
+
+        let locked = crate::git::git_error(
+            "git cat-file -e abc123:a.rs",
+            Some(128),
+            "fatal: Unable to create '.git/index.lock': File exists.",
+        );
+        assert!(!absent_at_rev(&locked));
+
+        // No data at all: an error whose shape is unknown is not absence.
+        assert!(!absent_at_rev(&RpcError::internal("no data")));
     }
 
     #[test]

@@ -8,7 +8,6 @@
 #include <QLatin1Char>
 #include <QMessageBox>
 #include <QStackedWidget>
-#include <QStringList>
 #include <QTabWidget>
 #include <QVBoxLayout>
 #include <QtGlobal>
@@ -30,26 +29,46 @@ QString tabKey(const QString& kind, const QString& workspaceId, const QString& p
     return kind + QLatin1Char('\n') + workspaceId + QLatin1Char('\n') + path;
 }
 
+/// The page's document when it is an editor with unsaved edits, else null.
+/// Six callers ask the same three-part question -- is it an editor, does it
+/// have a document, is that document dirty -- and getting one part of it wrong
+/// is how a dirty editor gets closed without a prompt.
+EditorDocument* dirtyDocument(QWidget* page) {
+    auto* editor = qobject_cast<EditorWidget*>(page);
+    EditorDocument* doc = editor == nullptr ? nullptr : editor->document();
+    return (doc != nullptr && doc->getDirty()) ? doc : nullptr;
+}
+
 /// The workspace a tab key names, empty for a page that has no key. Reading it
 /// back off the key is what lets a workspace be closed without knowing what
 /// kinds of page it has open.
 QString workspaceOfKey(const QString& key) {
-    const QStringList parts = key.split(QLatin1Char('\n'));
-    return parts.size() == 3 ? parts.at(1) : QString();
+    // The second field, however many follow it: a path may contain a newline,
+    // and a key counted field by field would then have four and be skipped,
+    // leaving that tab open over a workspace that no longer exists. The kind and
+    // the workspace id are both newline-free, so the second field is the id
+    // whatever the path looks like.
+    return key.section(QLatin1Char('\n'), 1, 1);
 }
 
 } // namespace
 
 EditorArea::EditorArea(QWidget* parent) : QWidget(parent) {
-    m_ask = [this](const QString& title) {
+    m_ask = [this](const QString& title, bool closingAll) {
+        // `SaveAll` rather than `Save` for the whole window, so the button says
+        // what pressing it does: every dirty editor is written, not just the one
+        // in front.
+        const QMessageBox::StandardButton accept =
+            closingAll ? QMessageBox::SaveAll : QMessageBox::Save;
         QMessageBox box(this);
         box.setIcon(QMessageBox::Question);
         box.setWindowTitle(QStringLiteral("Unsaved changes"));
         box.setText(QStringLiteral("Save changes to %1 before closing?").arg(title));
-        box.setStandardButtons(QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel);
-        box.setDefaultButton(QMessageBox::Save);
+        box.setStandardButtons(accept | QMessageBox::Discard | QMessageBox::Cancel);
+        box.setDefaultButton(accept);
         switch (box.exec()) {
         case QMessageBox::Save:
+        case QMessageBox::SaveAll:
             return Unsaved::Save;
         case QMessageBox::Discard:
             return Unsaved::Discard;
@@ -103,8 +122,14 @@ void EditorArea::openFile(const QString& workspaceId, const QString& path) {
 
     const int index = m_tabs->addTab(editor, title);
     m_tabs->setTabToolTip(index, workspaceId + QLatin1Char(':') + path);
-    QObject::connect(doc, &EditorDocument::dirtyChanged, this,
-                     [this, editor] { updateTabTitle(editor); });
+    QObject::connect(doc, &EditorDocument::dirtyChanged, this, [this, editor] {
+        updateTabTitle(editor);
+        emit unsavedStateChanged();
+    });
+    // Carried up for the window: a close waiting on a save-all has to stop
+    // waiting when one of the writes comes back a failure.
+    QObject::connect(doc, &EditorDocument::saveFailed, this,
+                     [this](const QString& message) { emit saveFailed(message); });
     m_tabs->setCurrentIndex(index);
     m_stack->setCurrentWidget(m_tabs);
     // A file you just opened takes the caret. Without this the focus stays in
@@ -145,7 +170,40 @@ void EditorArea::openDiff(const QString& workspaceId, const QString& path) {
     doc->load(workspaceId, path);
 }
 
-void EditorArea::setUnsavedPrompt(std::function<Unsaved(const QString&)> ask) {
+bool EditorArea::hasUnsavedEditors() const {
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        if (dirtyDocument(m_tabs->widget(i)) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+EditorArea::Unsaved EditorArea::askUnsavedAll() {
+    QString title;
+    int dirty = 0;
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        QWidget* page = m_tabs->widget(i);
+        if (dirtyDocument(page) == nullptr) {
+            continue;
+        }
+        if (dirty == 0) {
+            title = page->property(kTabTitle).toString();
+        }
+        ++dirty;
+    }
+    // Nothing to lose, so nothing to ask. `Discard` and not `Save`: a save-all
+    // here would arm a wait for writes that are never going to happen.
+    if (dirty == 0) {
+        return Unsaved::Discard;
+    }
+    if (dirty > 1) {
+        title = QStringLiteral("%1 files").arg(dirty);
+    }
+    return m_ask(title, true);
+}
+
+void EditorArea::setUnsavedPrompt(std::function<Unsaved(const QString&, bool)> ask) {
     if (ask) {
         m_ask = std::move(ask);
     }
@@ -157,9 +215,11 @@ EditorWidget* EditorArea::currentEditor() const {
 
 void EditorArea::saveAll() {
     for (int i = 0; i < m_tabs->count(); ++i) {
-        auto* editor = qobject_cast<EditorWidget*>(m_tabs->widget(i));
-        if (editor != nullptr && editor->document() != nullptr && editor->document()->getDirty()) {
-            editor->save();
+        QWidget* page = m_tabs->widget(i);
+        // A page with a dirty document is an `EditorWidget` by construction:
+        // that is the only kind of page `dirtyDocument` answers for.
+        if (dirtyDocument(page) != nullptr) {
+            qobject_cast<EditorWidget*>(page)->save();
         }
     }
 }
@@ -187,14 +247,13 @@ bool EditorArea::closeTab(int index) {
         return false;
     }
     auto* editor = qobject_cast<EditorWidget*>(page);
-    EditorDocument* doc = editor == nullptr ? nullptr : editor->document();
-    if (doc != nullptr && doc->getDirty()) {
+    if (EditorDocument* doc = dirtyDocument(page)) {
         // Asked once. A second close request while the write is out would only
         // put the same question up again over a tab that is already leaving.
         if (m_closing.contains(page)) {
             return false;
         }
-        const Unsaved answer = m_ask(page->property(kTabTitle).toString());
+        const Unsaved answer = m_ask(page->property(kTabTitle).toString(), false);
         if (answer == Unsaved::Cancel) {
             return false;
         }
@@ -217,12 +276,10 @@ bool EditorArea::closeTab(int index) {
 }
 
 void EditorArea::onSavedForClose(QWidget* page) {
-    auto* editor = qobject_cast<EditorWidget*>(page);
-    EditorDocument* doc = editor == nullptr ? nullptr : editor->document();
     // `saved` does not mean the buffer is clean: a keystroke that landed while
     // the write was in flight leaves the file on disk older than the pane, and
     // closing now would throw that edit away.
-    if (doc != nullptr && doc->getDirty()) {
+    if (dirtyDocument(page) != nullptr) {
         abandonClose(page);
         return;
     }
@@ -255,6 +312,9 @@ void EditorArea::removePage(QWidget* page) {
     if (m_tabs->count() == 0) {
         m_stack->setCurrentWidget(m_placeholder);
     }
+    // A dirty editor can leave this way -- `Discard`, or a workspace that is
+    // gone -- so what the window is waiting on may have just become nothing.
+    emit unsavedStateChanged();
 }
 
 void EditorArea::updateTabTitle(QWidget* page) {
@@ -262,9 +322,7 @@ void EditorArea::updateTabTitle(QWidget* page) {
     if (index < 0) {
         return;
     }
-    auto* editor = qobject_cast<EditorWidget*>(page);
-    const bool dirty =
-        editor != nullptr && editor->document() != nullptr && editor->document()->getDirty();
+    const bool dirty = dirtyDocument(page) != nullptr;
     const QString title = page->property(kTabTitle).toString();
     m_tabs->setTabText(index, dirty ? QString::fromUtf8(kDirtyMarker) + title : title);
 }

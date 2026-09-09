@@ -352,6 +352,15 @@ pub struct ChangesResult {
 pub struct DiffResult {
     pub base_text: String,
     pub work_text: String,
+    /// Either side was cut at the daemon's read cap (4 MiB), so the diff is of
+    /// the beginning of the file rather than of the file. Distinct from the
+    /// IDE's own alignment budget, which also runs out on large inputs but
+    /// leaves both texts whole.
+    ///
+    /// `serde(default)` so a reply from a daemon that predates the field still
+    /// deserialises, as "not truncated".
+    #[serde(default)]
+    pub truncated: bool,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MergeResult {

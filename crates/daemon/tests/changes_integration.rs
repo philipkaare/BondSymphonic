@@ -1,5 +1,6 @@
 mod common;
 
+use bondsymphonic_daemon::fs::MAX_READ;
 use bondsymphonic_daemon::workspace::lifecycle;
 use bondsymphonic_proto::*;
 use common::{commit_all, create_ws, init_repo, start_daemon, Client};
@@ -25,6 +26,11 @@ async fn changes_and_diff_report_committed_uncommitted_and_untracked_files() {
     std::fs::write(repo.join("crlf.txt"), "a\nb\n").unwrap();
     std::fs::create_dir(repo.join("sub")).unwrap();
     std::fs::write(repo.join("sub/deep.txt"), "deep\n").unwrap();
+    // One byte over the daemon's 4 MiB read cap, committed so both sides of its
+    // diff — the blob `git show` streams and the working file — are cut. Built
+    // once and left untouched in the workspace: what is being tested is the cap,
+    // not a change, and a second 4 MiB copy would only cost time.
+    std::fs::write(repo.join("big.txt"), big_text()).unwrap();
     commit_all(&repo, &[], "base files");
 
     let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
@@ -102,6 +108,7 @@ async fn changes_and_diff_report_committed_uncommitted_and_untracked_files() {
     let d = diff(&mut c, &ws.id, "README.md").await;
     assert_eq!(d.base_text, "hello\n");
     assert_eq!(d.work_text, "hello\nworld\nagain\n");
+    assert!(!d.truncated, "a two-line file is not truncated");
 
     // A file that does not exist at the merge-base has an empty base side.
     let d = diff(&mut c, &ws.id, "notes.txt").await;
@@ -124,6 +131,23 @@ async fn changes_and_diff_report_committed_uncommitted_and_untracked_files() {
     let d = diff(&mut c, &ws.id, "crlf.txt").await;
     assert_eq!(d.base_text, "a\nb\n");
     assert_eq!(d.work_text, "a\nb\nc\n");
+
+    // Over the read cap: both sides stop at 4 MiB and the reply says so, which
+    // is a different claim from the IDE's alignment budget running out.
+    let d = diff(&mut c, &ws.id, "big.txt").await;
+    assert!(
+        d.truncated,
+        "a file over the 4 MiB cap is reported truncated"
+    );
+    // The base side is the blob as git stores it, so it is cut at exactly the cap.
+    assert_eq!(d.base_text.len(), MAX_READ);
+    // The work side is the checkout, which on a machine with `core.autocrlf` on
+    // holds CRLF: still cut at the cap, then shortened again by the normalise.
+    assert!(
+        !d.work_text.is_empty() && d.work_text.len() <= MAX_READ,
+        "the work side is cut at the cap, got {} bytes",
+        d.work_text.len()
+    );
 
     // A path in a subdirectory, in the separator git speaks.
     let d = diff(&mut c, &ws.id, "sub/deep.txt").await;
@@ -202,6 +226,73 @@ async fn run_bytes_caps_the_stream_without_calling_the_cut_off_a_failure() {
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::GitError);
+}
+
+/// The base side of `workspace.diff` decides "absent at the merge-base" from
+/// what git says, because the exit code cannot tell absence from a broken
+/// object store — both are `fatal:`, exit 128. So what git says for each case
+/// is part of the contract and is pinned here.
+#[tokio::test]
+async fn cat_file_tells_an_absent_path_from_an_invalid_revision() {
+    use bondsymphonic_daemon::git::Git;
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    commit_all(&repo, &[], "one file");
+
+    let git = Git::new();
+    let head = git
+        .run(&repo, &["rev-parse", "HEAD"])
+        .await
+        .unwrap()
+        .stdout
+        .trim()
+        .to_owned();
+    let stderr_of = |e: &RpcError| {
+        e.data
+            .as_ref()
+            .and_then(|d| d.get("stderr"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+
+    // Present at the revision: exit 0, so the read that follows is a real read.
+    git.run(&repo, &["cat-file", "-e", &format!("{head}:a.txt")])
+        .await
+        .unwrap();
+
+    // Absent: the message the daemon reads as "this file is new".
+    let err = git
+        .run(&repo, &["cat-file", "-e", &format!("{head}:gone.txt")])
+        .await
+        .unwrap_err();
+    assert!(
+        stderr_of(&err).contains("does not exist in"),
+        "git changed its absence message: {err:?}"
+    );
+
+    // An invalid revision says something else entirely, so it surfaces as an
+    // error instead of being reported as a file with no base side.
+    let err = git
+        .run(&repo, &["cat-file", "-e", "not-a-rev:a.txt"])
+        .await
+        .unwrap_err();
+    let stderr = stderr_of(&err);
+    assert_eq!(err.code, ErrorCode::GitError);
+    assert!(
+        !stderr.contains("does not exist in") && !stderr.contains("exists on disk, but not in"),
+        "an invalid revision must not look like absence: {stderr:?}"
+    );
+}
+
+/// 4 MiB + 1 byte of `a\n` lines: one byte over the daemon's read cap, which is
+/// exactly what makes `classify` cut the content and set `truncated`.
+fn big_text() -> String {
+    let mut s = "a\n".repeat(MAX_READ / 2);
+    s.push('a');
+    s
 }
 
 /// One `workspace.diff` round trip.

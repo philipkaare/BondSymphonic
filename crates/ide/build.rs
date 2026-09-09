@@ -52,6 +52,18 @@ fn main() {
             "cpp/Branding.cpp",
         ])
         .build();
+    // cxx-qt-build emits a rerun line for every file it is handed, which covers
+    // `cpp_files` and the bridges above. These four are included by those files
+    // but named in no list, so without this a change to the one header that
+    // defines every accent colour would leave the build stale.
+    for header in [
+        "cpp/Theme.h",
+        "cpp/Branding.h",
+        "cpp/LogoData.h",
+        "cpp/app.h",
+    ] {
+        println!("cargo:rerun-if-changed={header}");
+    }
 }
 
 /// Stamp the logo into the executable's resources so Explorer and the taskbar

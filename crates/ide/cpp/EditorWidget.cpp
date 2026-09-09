@@ -32,6 +32,11 @@ EditorWidget::EditorWidget(EditorDocument* doc, QWidget* parent) : QWidget(paren
     m_notice = new QLabel(this);
     m_notice->setWordWrap(true);
     m_notice->setMargin(4);
+    // What goes in here is a daemon error or a file path, both of them text.
+    // Left at `AutoText` an error containing angle brackets would be guessed to
+    // be HTML and rendered as markup, which is what `DiffWidget` sets
+    // `PlainText` on its own notice to avoid.
+    m_notice->setTextFormat(Qt::PlainText);
     m_notice->setAutoFillBackground(true);
     QPalette noticePalette = m_notice->palette();
     // Washed, not the raw role: `AlternateBase` is a saturated accent on some

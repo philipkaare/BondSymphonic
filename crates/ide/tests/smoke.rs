@@ -114,9 +114,12 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
     let err = drain(child.stderr.take().expect("stderr is piped"));
 
     let status = wait_for(&mut child, RUN_LIMIT);
+    // `expect`, not a default: an empty string here would vacate the panic
+    // assertion and all four `NO_WARNINGS` assertions, turning a dead drain
+    // thread into a green run.
     let (out, err) = (
-        out.recv().unwrap_or_default(),
-        err.recv().unwrap_or_default(),
+        out.recv().expect("the stdout drain thread is alive"),
+        err.recv().expect("the stderr drain thread is alive"),
     );
     let seen = journal.lock().expect("journal mutex").clone();
     let context = format!("requests: {seen:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
@@ -434,6 +437,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                     &DiffResult {
                         base_text: BASE_TEXT.to_owned(),
                         work_text: WORK_TEXT.to_owned(),
+                        truncated: false,
                     },
                 )),
                 other => Some(ServerMessage::err(

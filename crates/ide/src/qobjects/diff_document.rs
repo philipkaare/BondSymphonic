@@ -6,9 +6,15 @@
 //!
 //! Alignment is Myers' algorithm, which is O(n·d): two large files that share
 //! almost nothing can run for tens of seconds. So it runs on the tokio side,
-//! never on the Qt thread, and under [`DIFF_BUDGET`]. When the budget runs out
+//! never on the Qt thread, on the blocking pool rather than on one of the
+//! runtime's two workers, and under [`DIFF_BUDGET`]. When the budget runs out
 //! the rows are still a valid alignment, only a coarser one, and `truncated`
 //! is set so the header can say so.
+//!
+//! `size_truncated` is the other, unrelated loss: the daemon cut one of the two
+//! texts at its 4 MiB read cap, so the rows describe the beginning of the file
+//! and stop. Kept apart from `truncated` because the two mean different things
+//! to whoever is reading the pane.
 //!
 //! Both texts are put through
 //! [`normalise_line_separators`](crate::qobjects::editor_document::normalise_line_separators)
@@ -35,7 +41,11 @@ pub mod qobject {
     #[auto_cxx_name]
     unsafe extern "RustQt" {
         // `additions`/`deletions` are the diff stat, counting a replaced line
-        // as both; `truncated` says the alignment gave up on being minimal.
+        // as both; `truncated` says the alignment gave up on being minimal, and
+        // `size_truncated` that the daemon cut one of the two texts at its 4 MiB
+        // read cap. Two different losses, so two different flags: one means the
+        // rows are coarse, the other that the file does not end where it looks
+        // like it does.
         #[qobject]
         #[qproperty(QString, workspace_id)]
         #[qproperty(QString, path)]
@@ -43,6 +53,7 @@ pub mod qobject {
         #[qproperty(i32, additions)]
         #[qproperty(i32, deletions)]
         #[qproperty(bool, truncated)]
+        #[qproperty(bool, size_truncated)]
         #[qproperty(QString, error)]
         type DiffDocument = super::DiffDocumentRust;
 
@@ -91,6 +102,7 @@ pub struct DiffDocumentRust {
     additions: i32,
     deletions: i32,
     truncated: bool,
+    size_truncated: bool,
     error: QString,
     rows_json: String,
     /// The base text, for spans on the left side.
@@ -110,6 +122,7 @@ impl Default for DiffDocumentRust {
             additions: 0,
             deletions: 0,
             truncated: false,
+            size_truncated: false,
             error: QString::from(""),
             rows_json: "[]".to_owned(),
             left: None,
@@ -125,6 +138,9 @@ struct Aligned {
     additions: i32,
     deletions: i32,
     truncated: bool,
+    /// The daemon's flag, carried through untouched: one of the two texts was
+    /// cut at its read cap before the alignment ever saw it.
+    size_truncated: bool,
     left: EditorBuffer,
     right: EditorBuffer,
 }
@@ -133,6 +149,10 @@ struct Aligned {
 /// alignment and building the two ropes are proportional to the file, and
 /// neither may happen while the Qt thread is trying to paint.
 fn build(path: &str, res: DiffResult) -> Aligned {
+    let size_truncated = res.truncated;
+    if size_truncated {
+        tracing::warn!("workspace.diff: {path} was cut at the daemon's read cap");
+    }
     let (base, _) = crate::qobjects::editor_document::normalise_line_separators(&res.base_text);
     let (work, _) = crate::qobjects::editor_document::normalise_line_separators(&res.work_text);
     let (rows, truncated) = align_with_deadline(&base, &work, DIFF_BUDGET);
@@ -147,6 +167,7 @@ fn build(path: &str, res: DiffResult) -> Aligned {
         additions: clamp(additions),
         deletions: clamp(deletions),
         truncated,
+        size_truncated,
         left,
         right,
     }
@@ -169,6 +190,7 @@ impl qobject::DiffDocument {
         self.as_mut().set_additions(0);
         self.as_mut().set_deletions(0);
         self.as_mut().set_truncated(false);
+        self.as_mut().set_size_truncated(false);
         self.as_mut().set_error(QString::from(""));
 
         let shared = match require_connection() {
@@ -191,7 +213,32 @@ impl qobject::DiffDocument {
                 .await
             {
                 Ok(res) => {
-                    let aligned = build(&file, res);
+                    // On the blocking pool, not on a worker: the alignment is
+                    // CPU-bound for up to `DIFF_BUDGET`, and the runtime has two
+                    // worker threads that the daemon connection, the event drain
+                    // and every PTY pump also share. Two pathological diffs
+                    // opened together would otherwise stall all of them.
+                    let owned = file.clone();
+                    let aligned =
+                        match tokio::task::spawn_blocking(move || build(&owned, res)).await {
+                            Ok(aligned) => aligned,
+                            Err(e) => {
+                                // The pool only fails this way if the task
+                                // panicked or the runtime is shutting down;
+                                // either way the pane gets an error rather than
+                                // rows that never arrive.
+                                let message = format!("workspace.diff failed: {e}");
+                                tracing::warn!("{message}");
+                                let _ = qt.queue(move |mut q| {
+                                    if q.as_ref().rust().generation != generation {
+                                        return;
+                                    }
+                                    q.as_mut().set_error(QString::from(&message));
+                                    q.load_failed(QString::from(&message));
+                                });
+                                return;
+                            }
+                        };
                     let _ = qt.queue(move |mut q| {
                         if q.as_ref().rust().generation != generation {
                             tracing::debug!("workspace.diff: dropping stale rows for {file}");
@@ -200,6 +247,7 @@ impl qobject::DiffDocument {
                         q.as_mut().set_additions(aligned.additions);
                         q.as_mut().set_deletions(aligned.deletions);
                         q.as_mut().set_truncated(aligned.truncated);
+                        q.as_mut().set_size_truncated(aligned.size_truncated);
                         {
                             let mut rust = q.as_mut().rust_mut();
                             rust.rows_json = aligned.rows_json;

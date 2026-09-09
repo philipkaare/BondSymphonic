@@ -139,6 +139,7 @@ DiffWidget::DiffWidget(DiffDocument* doc, QWidget* parent) : QWidget(parent), m_
     QObject::connect(doc, &DiffDocument::additionsChanged, this, &DiffWidget::updateHeader);
     QObject::connect(doc, &DiffDocument::deletionsChanged, this, &DiffWidget::updateHeader);
     QObject::connect(doc, &DiffDocument::truncatedChanged, this, &DiffWidget::updateHeader);
+    QObject::connect(doc, &DiffDocument::sizeTruncatedChanged, this, &DiffWidget::updateHeader);
 }
 
 void DiffWidget::link(QScrollBar* from, QScrollBar* to, bool* guard) {
@@ -255,6 +256,13 @@ void DiffWidget::updateHeader() {
 
     QString notice = m_loadError;
     QColor colour = theme::ink(theme::removed(), dark);
+    // The two losses are different facts and get different sentences: the file
+    // was cut before the diff was computed, or the alignment ran out of time on
+    // a whole file. Size first -- it is the one that changes what the rows mean.
+    if (notice.isEmpty() && m_doc->getSizeTruncated()) {
+        notice = QStringLiteral("diff truncated (file over 4 MiB)");
+        colour = theme::ink(theme::changed(), dark);
+    }
     if (notice.isEmpty() && m_doc->getTruncated()) {
         notice = QStringLiteral("diff truncated (time budget)");
         colour = theme::ink(theme::changed(), dark);
