@@ -1,6 +1,8 @@
 //! Pure-Rust application state. This module must never import Qt types.
 
-use bondsymphonic_proto::{AgentAdapterKind, WorkspaceId, WorkspaceInfo, WorkspaceState};
+use bondsymphonic_proto::{
+    AgentAdapterKind, AgentId, AgentState, WorkspaceId, WorkspaceInfo, WorkspaceState,
+};
 use serde::{Deserialize, Serialize};
 
 /// Lifecycle of the IDE's connection to the daemon.
@@ -106,6 +108,20 @@ impl TabStatus {
         }
     }
 
+    /// Maps an agent's state onto a tab status. A Claude tab's status comes
+    /// from here for the whole session: its workspace stays `Ready` while the
+    /// agent moves between working, waiting on a permission and idle. An agent
+    /// that has exited leaves a finished tab, not a broken one.
+    pub fn from_agent_state(s: &AgentState) -> TabStatus {
+        match s {
+            AgentState::Idle => Self::Idle,
+            AgentState::Working => Self::Working,
+            AgentState::WaitingPermission => Self::WaitingPermission,
+            AgentState::Error => Self::Error,
+            AgentState::Exited => Self::Done,
+        }
+    }
+
     /// Stable numeric code exposed to C++/QML.
     pub fn as_i32(self) -> i32 {
         match self {
@@ -132,6 +148,11 @@ pub struct AgentTab {
     pub detail: String,
     pub adapter: AgentAdapterKind,
     pub command: Option<String>,
+    /// The agent running in this tab, once `agent.start` has answered.
+    /// Defaulted rather than required so a session saved before agent tabs
+    /// existed still loads.
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
 }
 
 /// A user-defined collection of agent tabs, shown as a section in the sidebar.
@@ -279,16 +300,67 @@ impl Workspaces {
 
     /// Updates the tab's status, branch and detail from a daemon `WorkspaceInfo`.
     /// Returns `None` without modifying anything if `info.id` is not tracked.
+    ///
+    /// A tab running an agent keeps its agent-driven status while its
+    /// workspace is `Ready`: the daemon emits `workspace.state` for reasons
+    /// that have nothing to do with the agent (a sandbox restart, a branch
+    /// change), and letting one of those overwrite "working" with "idle" would
+    /// blank the tab's indicator mid-turn. Anything other than `Ready` is news
+    /// about the workspace the agent runs in, and does win.
     pub fn apply_workspace_info(&mut self, info: &WorkspaceInfo) -> Option<(usize, usize)> {
         let (g, t) = self.find(&info.id)?;
         let tab = &mut self.groups[g].tabs[t];
-        tab.status = TabStatus::from_workspace_state(&info.state);
+        let agent_owns_status =
+            tab.agent_id.is_some() && matches!(info.state, WorkspaceState::Ready);
+        if !agent_owns_status {
+            tab.status = TabStatus::from_workspace_state(&info.state);
+            tab.detail = match &info.state {
+                WorkspaceState::Error(detail) => detail.clone(),
+                _ => String::new(),
+            };
+        }
         tab.branch = info.branch.clone();
-        tab.detail = match &info.state {
-            WorkspaceState::Error(detail) => detail.clone(),
-            _ => String::new(),
-        };
         Some((g, t))
+    }
+
+    /// Records the agent running in the tab for `ws`. False when that
+    /// workspace is not tracked.
+    pub fn set_agent(&mut self, ws: &WorkspaceId, agent_id: AgentId) -> bool {
+        let Some((g, t)) = self.find(ws) else {
+            return false;
+        };
+        self.groups[g].tabs[t].agent_id = Some(agent_id);
+        true
+    }
+
+    /// Applies an `agent.state` event. Those carry an agent id and no
+    /// workspace id, so the tab is found by the id recorded in
+    /// [`Workspaces::set_agent`]. `None` when no tab is running that agent.
+    pub fn set_agent_status(
+        &mut self,
+        agent_id: &AgentId,
+        status: TabStatus,
+        detail: &str,
+    ) -> Option<(usize, usize)> {
+        let (g, t) = self.find_agent(agent_id)?;
+        let tab = &mut self.groups[g].tabs[t];
+        tab.status = status;
+        tab.detail = detail.to_owned();
+        Some((g, t))
+    }
+
+    /// The tab running `agent_id`, if any.
+    pub fn find_agent(&self, agent_id: &AgentId) -> Option<(usize, usize)> {
+        for (gi, g) in self.groups.iter().enumerate() {
+            if let Some(ti) = g
+                .tabs
+                .iter()
+                .position(|t| t.agent_id.as_ref() == Some(agent_id))
+            {
+                return Some((gi, ti));
+            }
+        }
+        None
     }
 
     /// Syncs against the daemon's authoritative workspace list: tabs for
@@ -332,6 +404,7 @@ impl Workspaces {
                 },
                 adapter: AgentAdapterKind::Terminal,
                 command: None,
+                agent_id: None,
             });
         }
 
@@ -381,6 +454,32 @@ impl Workspaces {
 
     pub fn from_json(s: &str) -> Option<Self> {
         serde_json::from_str(s).ok()
+    }
+}
+
+/// The daemon's snake_case spelling of an agent state. The `TranscriptModel`
+/// publishes this as its `state` property, and `GroupModel::setAgentStatus`
+/// parses it back, so the word crossing the boundary is defined once here.
+pub fn agent_state_word(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Idle => "idle",
+        AgentState::Working => "working",
+        AgentState::WaitingPermission => "waiting_permission",
+        AgentState::Error => "error",
+        AgentState::Exited => "exited",
+    }
+}
+
+/// Inverse of [`agent_state_word`]. `None` for anything else, so a caller
+/// decides what an unrecognised word means rather than being handed a guess.
+pub fn parse_agent_state(word: &str) -> Option<AgentState> {
+    match word {
+        "idle" => Some(AgentState::Idle),
+        "working" => Some(AgentState::Working),
+        "waiting_permission" => Some(AgentState::WaitingPermission),
+        "error" => Some(AgentState::Error),
+        "exited" => Some(AgentState::Exited),
+        _ => None,
     }
 }
 

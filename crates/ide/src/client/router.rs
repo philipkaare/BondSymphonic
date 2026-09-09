@@ -7,16 +7,22 @@
 //! * [`EventRouter::subscribe_all`] — every event, in order. Used for
 //!   workspace-state and daemon-log handling.
 //! * [`EventRouter::subscribe_pty`] — only `pty.output`/`pty.exit` for one PTY.
+//! * [`EventRouter::subscribe_agent`] — only `agent.message`/`agent.state` for
+//!   one agent.
 //!
-//! A PTY's first output usually arrives before the widget that will display it
-//! has finished being constructed and subscribed, so unclaimed PTY events are
-//! parked in a short-lived per-id *early buffer* and replayed on subscription.
+//! Both per-id kinds share one table keyed by `StreamKey`, so a PTY and an
+//! agent whose ids collide as strings still get separate streams.
+//!
+//! A PTY's first output, and an agent's first messages, usually arrive before
+//! the widget that will display them has finished being constructed and
+//! subscribed, so unclaimed per-id events are parked in a short-lived *early
+//! buffer* and replayed on subscription.
 //!
 //! This module must never import Qt types.
 //!
 //! [`EventStream`]: crate::client::EventStream
 
-use bondsymphonic_proto::{Event, PtyId, WorkspaceId};
+use bondsymphonic_proto::{AgentId, Event, PtyId, WorkspaceId};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,18 +34,28 @@ use tokio::sync::mpsc;
 pub type EventRx = mpsc::UnboundedReceiver<(Option<WorkspaceId>, Event)>;
 type EventTx = mpsc::UnboundedSender<(Option<WorkspaceId>, Event)>;
 
-/// How long PTY output that arrives before anyone subscribes is kept.
+/// How long output that arrives before anyone subscribes is kept.
 pub const EARLY_BUFFER_TTL: Duration = Duration::from_secs(5);
 
-/// Most events parked for one not-yet-subscribed PTY. Older events are dropped
-/// first, so what survives is the tail the terminal would have shown anyway.
+/// Most events parked for one not-yet-subscribed stream. Older events are
+/// dropped first, so what survives is the tail the view would have shown
+/// anyway.
 pub const EARLY_BUFFER_CAP: usize = 256;
+
+/// What a per-id subscription is for. Two id spaces, one table: the daemon's
+/// prefixes make a collision unlikely, but nothing in the protocol forbids one
+/// and a terminal fed an agent's messages would be a mystery to debug.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum StreamKey {
+    Pty(PtyId),
+    Agent(AgentId),
+}
 
 #[derive(Default)]
 struct Inner {
     all: Vec<EventTx>,
-    pty: HashMap<PtyId, EventTx>,
-    early: HashMap<PtyId, Vec<(Instant, Option<WorkspaceId>, Event)>>,
+    streams: HashMap<StreamKey, EventTx>,
+    early: HashMap<StreamKey, Vec<(Instant, Option<WorkspaceId>, Event)>>,
 }
 
 impl Inner {
@@ -77,15 +93,7 @@ impl EventRouter {
     /// close), which keeps a re-opened terminal from being shadowed by a stale
     /// consumer.
     pub fn subscribe_pty(&self, id: &PtyId) -> EventRx {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut inner = self.lock();
-        if let Some(buf) = inner.early.remove(id) {
-            for (_, ws, ev) in buf {
-                let _ = tx.send((ws, ev));
-            }
-        }
-        inner.pty.insert(id.clone(), tx);
-        rx
+        self.subscribe_stream(StreamKey::Pty(id.clone()))
     }
 
     /// Ends the subscription for `id`: dropping the sender closes the
@@ -93,9 +101,40 @@ impl EventRouter {
     /// still parked for that id is discarded too, since a closed PTY's output
     /// must not be replayed onto a later terminal reusing the id.
     pub fn unsubscribe_pty(&self, id: &PtyId) {
+        self.unsubscribe_stream(&StreamKey::Pty(id.clone()));
+    }
+
+    /// Only `agent.message`/`agent.state` for `id`, with the same early-buffer
+    /// replay as [`EventRouter::subscribe_pty`]: an agent starts talking as
+    /// soon as `agent.start` returns, which is before the transcript model has
+    /// the id it needs in order to subscribe. Subscribing twice for the same
+    /// id replaces the earlier subscription.
+    pub fn subscribe_agent(&self, id: &AgentId) -> EventRx {
+        self.subscribe_stream(StreamKey::Agent(id.clone()))
+    }
+
+    /// Ends the subscription for `id` and discards anything parked for it, so
+    /// a stopped agent's tail is not replayed onto a later transcript.
+    pub fn unsubscribe_agent(&self, id: &AgentId) {
+        self.unsubscribe_stream(&StreamKey::Agent(id.clone()));
+    }
+
+    fn subscribe_stream(&self, key: StreamKey) -> EventRx {
+        let (tx, rx) = mpsc::unbounded_channel();
         let mut inner = self.lock();
-        inner.pty.remove(id);
-        inner.early.remove(id);
+        if let Some(buf) = inner.early.remove(&key) {
+            for (_, ws, ev) in buf {
+                let _ = tx.send((ws, ev));
+            }
+        }
+        inner.streams.insert(key, tx);
+        rx
+    }
+
+    fn unsubscribe_stream(&self, key: &StreamKey) {
+        let mut inner = self.lock();
+        inner.streams.remove(key);
+        inner.early.remove(key);
     }
 
     /// Called by the reader loop for every event received from the daemon.
@@ -106,12 +145,12 @@ impl EventRouter {
             .all
             .retain(|tx| tx.send((workspace_id.clone(), event.clone())).is_ok());
 
-        if let Some(id) = pty_id_of(&event).cloned() {
+        if let Some(key) = stream_key_of(&event) {
             // Carried in an `Option` so the payload moves at most once: if the
             // registered subscriber has gone away, the send hands it back and
             // the event falls through into the early buffer.
             let mut undelivered = Some((workspace_id, event));
-            if let Entry::Occupied(slot) = inner.pty.entry(id.clone()) {
+            if let Entry::Occupied(slot) = inner.streams.entry(key.clone()) {
                 let item = undelivered.take().expect("payload not yet delivered");
                 if let Err(returned) = slot.get().send(item) {
                     slot.remove();
@@ -119,7 +158,7 @@ impl EventRouter {
                 }
             }
             if let Some((ws, ev)) = undelivered {
-                let buf = inner.early.entry(id).or_default();
+                let buf = inner.early.entry(key).or_default();
                 if buf.len() >= EARLY_BUFFER_CAP {
                     buf.remove(0);
                 }
@@ -142,10 +181,15 @@ impl EventRouter {
     }
 }
 
-/// The PTY an event belongs to, for the events that belong to one.
-fn pty_id_of(event: &Event) -> Option<&PtyId> {
+/// The per-id stream an event belongs to, for the events that belong to one.
+fn stream_key_of(event: &Event) -> Option<StreamKey> {
     match event {
-        Event::PtyOutput { pty_id, .. } | Event::PtyExit { pty_id, .. } => Some(pty_id),
+        Event::PtyOutput { pty_id, .. } | Event::PtyExit { pty_id, .. } => {
+            Some(StreamKey::Pty(pty_id.clone()))
+        }
+        Event::AgentMessage { agent_id, .. } | Event::AgentStateChanged { agent_id, .. } => {
+            Some(StreamKey::Agent(agent_id.clone()))
+        }
         _ => None,
     }
 }

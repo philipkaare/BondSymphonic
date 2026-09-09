@@ -46,6 +46,7 @@ fn tab(info: &WorkspaceInfo) -> AgentTab {
         detail: String::new(),
         adapter: AgentAdapterKind::Terminal,
         command: None,
+        agent_id: None,
     }
 }
 
@@ -333,4 +334,97 @@ fn a_reload_installs_disk_text_only_over_an_untouched_document() {
     // Dirty without the counter having moved cannot happen in practice, and
     // refusing is the safe answer either way.
     assert!(!may_install_disk_text(true, 7, 7));
+}
+
+/// A Claude tab's status comes from the agent, not the workspace: the
+/// workspace stays `Ready` for the whole session while the agent moves
+/// between working, waiting on a permission and idle.
+#[test]
+fn agent_state_maps_onto_a_tab_status() {
+    use bondsymphonic_proto::AgentState;
+    let pairs = [
+        (AgentState::Idle, TabStatus::Idle),
+        (AgentState::Working, TabStatus::Working),
+        (AgentState::WaitingPermission, TabStatus::WaitingPermission),
+        (AgentState::Error, TabStatus::Error),
+        // A finished agent is a finished tab, not a broken one.
+        (AgentState::Exited, TabStatus::Done),
+    ];
+    for (state, expected) in pairs {
+        assert_eq!(TabStatus::from_agent_state(&state), expected, "{state:?}");
+    }
+}
+
+/// `agent.state` events carry an agent id and no workspace id, so the model
+/// has to find the tab by the id it was told about when the agent started.
+#[test]
+fn set_agent_records_the_id_and_set_agent_status_finds_the_tab_by_it() {
+    let mut model = Workspaces::new_default();
+    let one = info("ws_1", "alpha", WorkspaceState::Ready);
+    let two = info("ws_2", "beta", WorkspaceState::Ready);
+    model.add_tab(0, tab(&one));
+    model.add_tab(0, tab(&two));
+
+    // Unknown agent ids change nothing.
+    assert_eq!(
+        model.set_agent_status(&"ag_1".into(), TabStatus::Working, ""),
+        None
+    );
+    assert!(!model.set_agent(&"ws_missing".into(), "ag_1".into()));
+
+    assert!(model.set_agent(&two.id, "ag_1".into()));
+    assert_eq!(
+        model.groups[0].tabs[1]
+            .agent_id
+            .as_ref()
+            .map(|a| a.as_str()),
+        Some("ag_1")
+    );
+    assert_eq!(
+        model.set_agent_status(&"ag_1".into(), TabStatus::WaitingPermission, "Bash"),
+        Some((0, 1))
+    );
+    assert_eq!(model.groups[0].tabs[1].status, TabStatus::WaitingPermission);
+    assert_eq!(model.groups[0].tabs[1].detail, "Bash");
+    // The other tab is untouched.
+    assert_eq!(model.groups[0].tabs[0].status, TabStatus::Idle);
+
+    // The id survives the round trip through `state_json`.
+    let restored = Workspaces::from_json(&model.to_json()).expect("state_json parses");
+    assert_eq!(restored.groups[0].tabs[1].agent_id, Some("ag_1".into()));
+}
+
+/// Sessions saved before agent tabs existed have no `agent_id` field.
+#[test]
+fn state_json_without_an_agent_id_still_loads() {
+    let mut model = Workspaces::new_default();
+    model.add_tab(0, tab(&info("ws_1", "alpha", WorkspaceState::Ready)));
+    let json = model.to_json();
+    let stripped = json.replace(",\"agent_id\":null", "");
+    assert!(!stripped.contains("agent_id"), "{stripped}");
+    let restored = Workspaces::from_json(&stripped).expect("legacy state_json parses");
+    assert_eq!(restored.groups[0].tabs[0].agent_id, None);
+}
+
+/// The two directions the `state` string crosses the boundary: the daemon's
+/// `agent.state` word in, and the `TranscriptModel::state` property out.
+#[test]
+fn agent_state_words_round_trip() {
+    use bondsymphonic_ide::model::app_state::{agent_state_word, parse_agent_state};
+    use bondsymphonic_proto::AgentState;
+    for state in [
+        AgentState::Idle,
+        AgentState::Working,
+        AgentState::WaitingPermission,
+        AgentState::Error,
+        AgentState::Exited,
+    ] {
+        assert_eq!(parse_agent_state(agent_state_word(state)), Some(state));
+    }
+    assert_eq!(
+        agent_state_word(AgentState::WaitingPermission),
+        "waiting_permission"
+    );
+    assert_eq!(parse_agent_state("nonsense"), None);
+    assert_eq!(parse_agent_state(""), None);
 }

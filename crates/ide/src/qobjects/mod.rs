@@ -8,3 +8,4 @@ pub mod settings;
 /// Test-only; see the module docs. Nothing outside the crate uses it.
 pub(crate) mod smoke;
 pub mod terminal_session;
+pub mod transcript_model;

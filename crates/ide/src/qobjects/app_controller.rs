@@ -1,7 +1,7 @@
 use crate::client::router::EventRouter;
 use crate::client::DaemonClient;
 use crate::launcher::{self, LaunchSpec};
-use crate::model::app_state::{compose_status, ConnectionState};
+use crate::model::app_state::{agent_state_word, compose_status, ConnectionState};
 use crate::qobjects::settings::Settings;
 use crate::qobjects::smoke;
 use bondsymphonic_proto::*;
@@ -128,6 +128,23 @@ pub mod qobject {
         #[qsignal]
         fn workspace_destroyed(self: Pin<&mut AppController>, id: QString);
 
+        /// `agent.start` succeeded: `workspace_id` is now running `agent_id`.
+        /// Emitted before any initial prompt is sent, so the transcript is
+        /// attached and subscribed before the first answer arrives.
+        #[qsignal]
+        fn agent_started(self: Pin<&mut AppController>, workspace_id: QString, agent_id: QString);
+
+        /// An agent changed state. `state` is the daemon's snake_case word
+        /// ("idle", "working", "waiting_permission", "error", "exited") and
+        /// `detail` its explanation, or empty.
+        #[qsignal]
+        fn agent_state_changed(
+            self: Pin<&mut AppController>,
+            agent_id: QString,
+            state: QString,
+            detail: QString,
+        );
+
         /// An `inspect_repo` call succeeded: a JSON `RepoInfo` for `path`.
         #[qsignal]
         fn repo_inspected(self: Pin<&mut AppController>, path: QString, info_json: QString);
@@ -162,6 +179,27 @@ pub mod qobject {
             adapter: QString,
             command: QString,
         );
+
+        /// Create a workspace and start a Claude agent in it. Answers with
+        /// `workspace_created` (adapter "claude"), then `agent_started`, then
+        /// sends `initial_prompt` if it is not empty; any step can answer with
+        /// `operation_failed` instead. `options_json` is an `AgentStartOptions`
+        /// object without the API key, which the controller merges in.
+        #[qinvokable]
+        fn create_workspace_with_agent(
+            self: Pin<&mut AppController>,
+            repo_path: QString,
+            base_branch: QString,
+            name: QString,
+            group: QString,
+            options_json: QString,
+            initial_prompt: QString,
+        );
+
+        /// Start a Claude agent in an existing workspace. Answers with
+        /// `agent_started` or `operation_failed("agent.start", ...)`.
+        #[qinvokable]
+        fn start_agent(self: Pin<&mut AppController>, workspace_id: QString, options_json: QString);
 
         /// Destroy a workspace. Answers with `workspace_destroyed` or
         /// `operation_failed`.
@@ -277,6 +315,24 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
                 let json = serde_json::to_string(&info).unwrap_or_default();
                 let _ = qt.queue(move |q| q.workspace_changed(QString::from(&json)));
             }
+            // Routed to the transcript model by id above; this arm is what
+            // moves the tab's own indicator, which no transcript owns.
+            Event::AgentStateChanged {
+                agent_id,
+                state,
+                detail,
+            } => {
+                let id = agent_id.to_string();
+                let word = agent_state_word(state);
+                let detail = detail.unwrap_or_default();
+                let _ = qt.queue(move |q| {
+                    q.agent_state_changed(
+                        QString::from(&id),
+                        QString::from(word),
+                        QString::from(&detail),
+                    )
+                });
+            }
             Event::DaemonLog { level, message, .. } => tracing::info!(?level, "{message}"),
             _ => {}
         }
@@ -290,6 +346,84 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
         q.as_mut().rust_mut().client = None;
         q.set_state(ConnectionState::Lost);
     });
+}
+
+/// The Anthropic API key to put in `agent.start`'s options.
+///
+/// Always `None` today: Task 7 fills this in from the OS credential store
+/// (`keyring`, service `BondSymphonic`, user `anthropic_api_key`). It lives
+/// here, and is merged in [`start_options`], because the key must never cross
+/// into C++, never reach a signal, and never be logged: the dialog builds the
+/// options without it and the controller is the only thing that adds it.
+pub fn api_key_for_start() -> Option<String> {
+    None
+}
+
+/// Parses the options a dialog built and merges the stored API key in. An
+/// unparseable string is not fatal: the daemon's defaults are a working agent,
+/// which is a better answer than refusing to start one.
+fn start_options(options_json: &str) -> AgentStartOptions {
+    // Every field of `AgentStartOptions` is `#[serde(default)]`, so an empty
+    // object is exactly the "nothing chosen" set, and stays so as the daemon
+    // grows options. `AgentStartOptions` itself derives no `Default`.
+    let unset = || {
+        serde_json::from_str::<AgentStartOptions>("{}")
+            .expect("AgentStartOptions defaults every field")
+    };
+    let mut options = if options_json.trim().is_empty() {
+        unset()
+    } else {
+        serde_json::from_str(options_json).unwrap_or_else(|e| {
+            tracing::warn!("agent.start: unparseable options ({e}); using defaults");
+            unset()
+        })
+    };
+    // The credential store wins over anything the caller supplied: C++ has no
+    // business setting this field, and a stale value must not shadow the key.
+    options.api_key = api_key_for_start().or(options.api_key);
+    options
+}
+
+/// Starts a Claude agent, announces it, and sends the initial prompt if there
+/// is one. Announcing first is what lets the transcript attach and subscribe
+/// before the agent's first message arrives; anything said in between is
+/// replayed out of the router's early buffer.
+async fn start_agent_and_prompt(
+    shared: Shared,
+    qt: QtHandle,
+    workspace: WorkspaceId,
+    options: AgentStartOptions,
+    initial_prompt: String,
+) {
+    let params = AgentStartParams {
+        workspace_id: workspace.clone(),
+        adapter: AgentAdapterKind::Claude,
+        options,
+    };
+    let agent_id = match shared
+        .client
+        .request::<AgentStartResult>(Request::AgentStart(params))
+        .await
+    {
+        Ok(res) => res.agent_id,
+        Err(e) => {
+            report_failure(&qt, "agent.start", e.to_string());
+            return;
+        }
+    };
+    let (ws, id) = (workspace.to_string(), agent_id.to_string());
+    let _ = qt.queue(move |q| q.agent_started(QString::from(&ws), QString::from(&id)));
+
+    if initial_prompt.is_empty() {
+        return;
+    }
+    let params = AgentSendParams {
+        agent_id,
+        text: initial_prompt,
+    };
+    if let Err(e) = shared.client.request_raw(Request::AgentSend(params)).await {
+        report_failure(&qt, "agent.send", e.to_string());
+    }
 }
 
 /// How long to wait before the single `workspace.list` retry.
@@ -497,6 +631,79 @@ impl qobject::AppController {
                 Err(e) => report_failure(&qt, "workspace.create", e.to_string()),
             }
         });
+    }
+
+    pub fn create_workspace_with_agent(
+        self: Pin<&mut Self>,
+        repo_path: QString,
+        base_branch: QString,
+        name: QString,
+        group: QString,
+        options_json: QString,
+        initial_prompt: QString,
+    ) {
+        let qt = self.qt_thread();
+        let params = WorkspaceCreateParams {
+            repo_path: repo_path.to_string(),
+            base_branch: base_branch.to_string(),
+            name: name.to_string(),
+        };
+        let group = group.to_string();
+        let options = start_options(&options_json.to_string());
+        let prompt = initial_prompt.to_string();
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_failure(&qt, "workspace.create", message.to_owned());
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            let info = match shared
+                .client
+                .request::<WorkspaceInfo>(Request::WorkspaceCreate(params))
+                .await
+            {
+                Ok(info) => info,
+                Err(e) => {
+                    report_failure(&qt, "workspace.create", e.to_string());
+                    return;
+                }
+            };
+            let json = serde_json::to_string(&info).unwrap_or_default();
+            // The tab appears as soon as the workspace exists, so a slow
+            // `agent.start` happens in front of the user rather than behind a
+            // dialog that has not closed yet.
+            let _ = qt.queue(move |q| {
+                q.workspace_created(
+                    QString::from(&json),
+                    QString::from(&group),
+                    QString::from("claude"),
+                    QString::from(""),
+                )
+            });
+            start_agent_and_prompt(shared, qt, info.id, options, prompt).await;
+        });
+    }
+
+    pub fn start_agent(self: Pin<&mut Self>, workspace_id: QString, options_json: QString) {
+        let qt = self.qt_thread();
+        let workspace = WorkspaceId(workspace_id.to_string());
+        let options = start_options(&options_json.to_string());
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_failure(&qt, "agent.start", message.to_owned());
+                return;
+            }
+        };
+        runtime().spawn(start_agent_and_prompt(
+            shared,
+            qt,
+            workspace,
+            options,
+            String::new(),
+        ));
     }
 
     pub fn destroy_workspace(self: Pin<&mut Self>, id: QString, force: bool) {

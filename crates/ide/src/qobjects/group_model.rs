@@ -7,8 +7,8 @@
 //! the C++ side never has to parse that JSON just to paint a tab: it asks for
 //! the label, the tooltip, the status word and the counts directly.
 
-use crate::model::app_state::{AgentTab, TabStatus, Workspaces};
-use bondsymphonic_proto::{AgentAdapterKind, WorkspaceId, WorkspaceInfo, WorkspaceState};
+use crate::model::app_state::{parse_agent_state, AgentTab, TabStatus, Workspaces};
+use bondsymphonic_proto::{AgentAdapterKind, AgentId, WorkspaceId, WorkspaceInfo, WorkspaceState};
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -70,6 +70,24 @@ pub mod qobject {
         #[qinvokable]
         fn reconcile(self: Pin<&mut GroupModel>, list_json: QString);
 
+        /// Records the agent now running in the tab for `workspace_id`, so
+        /// later `agent.state` events can find that tab. False when the
+        /// workspace is not tracked.
+        #[qinvokable]
+        fn set_agent(self: Pin<&mut GroupModel>, workspace_id: QString, agent_id: QString) -> bool;
+
+        /// Applies an `agent.state` event. `state` is the daemon's snake_case
+        /// word ("idle", "working", "waiting_permission", "error", "exited")
+        /// and `detail` its explanation, or empty. False when no tab is
+        /// running that agent or the word is not one of the five.
+        #[qinvokable]
+        fn set_agent_status(
+            self: Pin<&mut GroupModel>,
+            agent_id: QString,
+            state: QString,
+            detail: QString,
+        ) -> bool;
+
         #[qinvokable]
         fn remove_workspace(self: Pin<&mut GroupModel>, id: QString) -> bool;
 
@@ -123,6 +141,12 @@ pub mod qobject {
         /// The workspace id of one tab, or empty for an unknown tab.
         #[qinvokable]
         fn tab_workspace_id(self: &GroupModel, group_idx: i32, tab_idx: i32) -> QString;
+
+        /// The agent id of one tab, or empty when it is not running an agent.
+        /// This is how a restored session re-attaches a transcript to an agent
+        /// that is still alive in the daemon.
+        #[qinvokable]
+        fn tab_agent_id(self: &GroupModel, group_idx: i32, tab_idx: i32) -> QString;
     }
 }
 
@@ -287,6 +311,7 @@ impl qobject::GroupModel {
             detail: state_detail(&info.state),
             adapter: parse_adapter(&adapter.to_string()),
             command: (!command.is_empty()).then_some(command),
+            agent_id: None,
         };
         self.as_mut().rust_mut().workspaces.add_tab(group_idx, tab);
         self.publish();
@@ -317,6 +342,41 @@ impl qobject::GroupModel {
         };
         self.as_mut().rust_mut().workspaces.reconcile(&list);
         self.publish();
+    }
+
+    pub fn set_agent(mut self: Pin<&mut Self>, workspace_id: QString, agent_id: QString) -> bool {
+        let ws = WorkspaceId(workspace_id.to_string());
+        let agent = AgentId(agent_id.to_string());
+        let ok = self.as_mut().rust_mut().workspaces.set_agent(&ws, agent);
+        if ok {
+            self.publish();
+        }
+        ok
+    }
+
+    pub fn set_agent_status(
+        mut self: Pin<&mut Self>,
+        agent_id: QString,
+        state: QString,
+        detail: QString,
+    ) -> bool {
+        let word = state.to_string();
+        let Some(agent_state) = parse_agent_state(&word) else {
+            tracing::warn!("set_agent_status: unknown agent state {word:?}");
+            return false;
+        };
+        let agent = AgentId(agent_id.to_string());
+        let status = TabStatus::from_agent_state(&agent_state);
+        let applied = self
+            .as_mut()
+            .rust_mut()
+            .workspaces
+            .set_agent_status(&agent, status, &detail.to_string())
+            .is_some();
+        if applied {
+            self.publish();
+        }
+        applied
     }
 
     pub fn remove_workspace(mut self: Pin<&mut Self>, id: QString) -> bool {
@@ -421,6 +481,16 @@ impl qobject::GroupModel {
     pub fn tab_workspace_id(&self, group_idx: i32, tab_idx: i32) -> QString {
         match self.tab_at(group_idx, tab_idx) {
             Some(tab) => QString::from(tab.workspace_id.as_str()),
+            None => QString::from(""),
+        }
+    }
+
+    pub fn tab_agent_id(&self, group_idx: i32, tab_idx: i32) -> QString {
+        match self
+            .tab_at(group_idx, tab_idx)
+            .and_then(|t| t.agent_id.as_ref())
+        {
+            Some(id) => QString::from(id.as_str()),
             None => QString::from(""),
         }
     }

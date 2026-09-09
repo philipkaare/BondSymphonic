@@ -27,6 +27,7 @@ fn tab(id: &str, name: &str) -> AgentTab {
         detail: String::new(),
         adapter: AgentAdapterKind::Terminal,
         command: None,
+        agent_id: None,
     }
 }
 

@@ -54,3 +54,86 @@ async fn early_output_buffer_expires() {
     r.dispatch(None, out("pty_x", "after"));
     assert!(x.recv().await.is_none(), "channel closed after unsubscribe");
 }
+
+fn agent_msg(agent: &str, seq: u64, text: &str) -> Event {
+    Event::AgentMessage {
+        agent_id: agent.into(),
+        message: AgentMessage {
+            seq,
+            ts: "2026-09-09T10:00:00Z".into(),
+            body: AgentMessageBody::AssistantText { text: text.into() },
+        },
+    }
+}
+
+/// The transcript view subscribes only once `agent.start` has answered, by
+/// which time the agent has usually already said something. Those events are
+/// parked exactly as a PTY's are, and replayed on subscription.
+#[tokio::test]
+async fn routes_by_agent_and_replays_early_messages() {
+    let r = EventRouter::new();
+    r.dispatch(Some("ws_1".into()), agent_msg("ag_a", 1, "early"));
+    r.dispatch(Some("ws_1".into()), agent_msg("ag_b", 1, "other agent"));
+    r.dispatch(None, out("pty_a", "not an agent"));
+
+    let mut a = r.subscribe_agent(&"ag_a".into());
+    r.dispatch(
+        Some("ws_1".into()),
+        Event::AgentStateChanged {
+            agent_id: "ag_a".into(),
+            state: AgentState::Working,
+            detail: None,
+        },
+    );
+    r.dispatch(Some("ws_1".into()), agent_msg("ag_a", 2, "live"));
+
+    let got: Vec<String> = [a.recv().await, a.recv().await, a.recv().await]
+        .into_iter()
+        .flatten()
+        .map(|(_, e)| match e {
+            Event::AgentMessage { message, .. } => format!("{:?}", message.body),
+            Event::AgentStateChanged { state, .. } => format!("{state:?}"),
+            _ => "?".into(),
+        })
+        .collect();
+    assert_eq!(got.len(), 3);
+    assert!(got[0].contains("early"), "{got:?}");
+    assert_eq!(got[1], "Working");
+    assert!(got[2].contains("live"), "{got:?}");
+    assert!(
+        a.try_recv().is_err(),
+        "another agent's and a PTY's events must not reach ag_a"
+    );
+}
+
+#[tokio::test]
+async fn unsubscribing_an_agent_closes_the_receiver_and_drops_its_buffer() {
+    let r = EventRouter::new();
+    r.dispatch(None, agent_msg("ag_x", 1, "stale"));
+    r.unsubscribe_agent(&"ag_x".into());
+    let mut x = r.subscribe_agent(&"ag_x".into());
+    assert!(
+        x.try_recv().is_err(),
+        "unsubscribe discards the early buffer"
+    );
+    r.unsubscribe_agent(&"ag_x".into());
+    r.dispatch(None, agent_msg("ag_x", 2, "after"));
+    assert!(x.recv().await.is_none(), "channel closed after unsubscribe");
+}
+
+/// A PTY and an agent that happen to share an id string are different streams.
+#[tokio::test]
+async fn pty_and_agent_keys_do_not_collide() {
+    let r = EventRouter::new();
+    let mut pty = r.subscribe_pty(&"x".into());
+    let mut agent = r.subscribe_agent(&"x".into());
+    r.dispatch(None, out("x", "pty bytes"));
+    r.dispatch(None, agent_msg("x", 1, "agent words"));
+    assert!(matches!(pty.try_recv(), Ok((_, Event::PtyOutput { .. }))));
+    assert!(pty.try_recv().is_err());
+    assert!(matches!(
+        agent.try_recv(),
+        Ok((_, Event::AgentMessage { .. }))
+    ));
+    assert!(agent.try_recv().is_err());
+}
