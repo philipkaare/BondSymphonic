@@ -64,6 +64,12 @@ struct Session {
     writer: Mutex<crate::sandbox::ChildWriter>,
     resizer: Box<dyn Fn(PtySize) -> std::io::Result<()> + Send + Sync>,
     killer: Box<dyn Fn() + Send + Sync>,
+    /// Delivers one signal to the terminal's process group, for the callers
+    /// that want to interrupt the running command rather than end the session.
+    /// Carried here so it outlives the spawn; nothing on the close path uses it,
+    /// which still goes through `killer`.
+    #[allow(dead_code, reason = "the interrupt path that reads it lands next")]
+    signaller: crate::sandbox::Signaller,
 }
 
 /// `sessions` is an `Arc` so the per-PTY pump task can remove its own entry on exit.
@@ -140,6 +146,7 @@ impl PtyManager {
             writer: Mutex::new(pty.writer),
             resizer: pty.resizer,
             killer: child.killer,
+            signaller: child.signal,
         });
         self.sessions.lock().await.insert(id.clone(), session);
 

@@ -69,6 +69,10 @@ pub struct PtyIo {
     pub resizer: Box<dyn Fn(PtySize) -> std::io::Result<()> + Send + Sync>,
 }
 
+/// Delivers a signal number to a child's process group. See
+/// [`SandboxChild::signal`].
+pub type Signaller = Box<dyn Fn(i32) + Send + Sync>;
+
 pub struct SandboxChild {
     pub pid: u32,
     pub stdin: Option<ChildWriter>,
@@ -78,6 +82,16 @@ pub struct SandboxChild {
     pub exit: tokio::sync::oneshot::Receiver<i32>,
     /// Terminates the process (group).
     pub killer: Box<dyn Fn() + Send + Sync>,
+    /// Delivers signal `n` to the process (group), for callers that need
+    /// something other than termination — an interrupt, say. `killer` remains
+    /// the way to end a child, because a backend may wrap termination in an
+    /// escalation this cannot express.
+    ///
+    /// A backend on a platform without signals maps what it can: the noop
+    /// backend on Windows terminates the child for SIGTERM and SIGKILL and
+    /// ignores every other number. Signalling a child that has already exited
+    /// does nothing, so a recycled pid is never hit.
+    pub signal: Signaller,
 }
 
 #[async_trait]

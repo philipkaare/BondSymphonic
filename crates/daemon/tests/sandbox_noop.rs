@@ -174,3 +174,67 @@ async fn shutdown_terminates_every_running_child() {
             .expect("exit code is delivered");
     }
 }
+
+/// The signal path has to carry a real signal number, not just "terminate": a
+/// shell that traps SIGINT must see SIGINT and run its trap.
+#[cfg(unix)]
+#[tokio::test]
+async fn signal_delivers_the_requested_signal() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = backend_for("noop");
+    let handle = backend.start(&spec(dir.path())).await.unwrap();
+    let child = handle
+        .spawn(SandboxCommand {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "trap 'exit 42' INT; sleep 30".into(),
+            ],
+            env: vec![],
+            cwd: None,
+            pty: None,
+        })
+        .await
+        .unwrap();
+    // The trap has to be installed before the signal arrives, or the shell dies
+    // of the default action instead of running it.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    (child.signal)(libc::SIGINT);
+
+    let code = tokio::time::timeout(std::time::Duration::from_secs(10), child.exit)
+        .await
+        .expect("the interrupted shell reports its exit")
+        .expect("exit code is delivered");
+    assert_eq!(code, 42, "SIGINT reached the shell's trap");
+    handle.shutdown().await.unwrap();
+}
+
+/// Windows has no signals. The noop backend honours the two numbers that mean
+/// "terminate" and drops anything else, rather than panicking or guessing that
+/// every signal is a kill.
+#[cfg(windows)]
+#[tokio::test]
+async fn on_windows_only_terminating_signals_reach_the_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = backend_for("noop");
+    let handle = backend.start(&spec(dir.path())).await.unwrap();
+    let mut child = handle.spawn(sleeping_command()).await.unwrap();
+
+    // SIGINT: nothing here to map it onto, so the child keeps running.
+    (child.signal)(2);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut child.exit)
+            .await
+            .is_err(),
+        "an unmappable signal must not terminate the child"
+    );
+
+    // SIGTERM: terminates, exactly as the killer does.
+    (child.signal)(15);
+    tokio::time::timeout(std::time::Duration::from_secs(10), child.exit)
+        .await
+        .expect("a terminating signal ends the child")
+        .expect("exit code is delivered");
+    handle.shutdown().await.unwrap();
+}

@@ -26,6 +26,12 @@ type Children = Mutex<HashMap<u64, Killer>>;
 #[cfg(unix)]
 const TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The signal numbers that mean "end this process". Spelled out because `libc`,
+/// and signals at all, exist only on Unix, and the Windows path still has to
+/// recognise the two numbers it can act on.
+#[cfg(not(unix))]
+const TERMINATING_SIGNALS: [i32; 2] = [9 /* SIGKILL */, 15 /* SIGTERM */];
+
 fn next_child_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
@@ -178,6 +184,10 @@ fn spawn_piped(
     });
 
     let killer = make_pipe_killer(kill.clone(), exited.clone());
+    #[cfg(unix)]
+    let signal = make_group_signaller(pid, exited.clone());
+    #[cfg(not(unix))]
+    let signal = signaller_from_killer(make_pipe_killer(kill.clone(), exited.clone()));
     children
         .lock()
         .unwrap()
@@ -190,6 +200,7 @@ fn spawn_piped(
         pty: None,
         exit: rx,
         killer,
+        signal,
     })
 }
 
@@ -212,6 +223,40 @@ fn make_pipe_killer(kill: Arc<tokio::sync::Notify>, exited: Arc<AtomicBool>) -> 
             return;
         }
         kill.notify_one();
+    })
+}
+
+/// Builds a signaller that delivers whatever signal it is given to the child's
+/// process group — the same group [`make_pipe_killer`] terminates, and the same
+/// group a PTY child leads.
+///
+/// Unlike the killer this does not escalate: the caller asked for one specific
+/// signal, so one signal is what the child gets. Inert once the child has
+/// exited, because the pid may already belong to somebody else.
+#[cfg(unix)]
+fn make_group_signaller(pid: u32, exited: Arc<AtomicBool>) -> Signaller {
+    Box::new(move |n| {
+        if exited.load(Ordering::SeqCst) {
+            return;
+        }
+        signal_group(pid, n);
+    })
+}
+
+/// Builds a signaller for a platform without signals, out of the killer for the
+/// same child.
+///
+/// SIGTERM and SIGKILL both mean "end this process", which Windows can do. There
+/// is nothing honest to map any other number onto, and terminating on all of
+/// them would turn an interrupt into a kill, so the rest are dropped.
+#[cfg(not(unix))]
+fn signaller_from_killer(killer: Killer) -> Signaller {
+    Box::new(move |n| {
+        if TERMINATING_SIGNALS.contains(&n) {
+            killer();
+        } else {
+            tracing::debug!(signal = n, "no signals on this platform; ignored");
+        }
     })
 }
 
@@ -397,6 +442,12 @@ async fn spawn_pty(
     });
 
     let killer = make_pty_killer(killer_child.clone(), exited.clone());
+    // `portable-pty` makes the child a session leader, so it leads its own
+    // process group and a group signal reaches the terminal's foreground job.
+    #[cfg(unix)]
+    let signal = make_group_signaller(pid, exited.clone());
+    #[cfg(not(unix))]
+    let signal = signaller_from_killer(make_pty_killer(killer_child.clone(), exited.clone()));
     children
         .lock()
         .unwrap()
@@ -413,6 +464,7 @@ async fn spawn_pty(
         }),
         exit: rx,
         killer,
+        signal,
     })
 }
 

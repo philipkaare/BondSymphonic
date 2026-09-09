@@ -220,6 +220,12 @@ impl ExecClient {
                 signal: libc::SIGTERM,
             });
         });
+        // init only signals pids it started, and sends to the process group
+        // before the leader, so this reaches a shell's whole foreground job.
+        let me = Arc::clone(self);
+        let signal: Signaller = Box::new(move |n| {
+            let _ = me.send(&InitRequest::Kill { pid, signal: n });
+        });
 
         if has_pty {
             let master = fds
@@ -265,6 +271,7 @@ impl ExecClient {
                 }),
                 exit: exit_rx,
                 killer,
+                signal,
             });
         }
         if fds.len() != 3 {
@@ -281,6 +288,7 @@ impl ExecClient {
             pty: None,
             exit: exit_rx,
             killer,
+            signal,
         })
     }
 

@@ -775,3 +775,53 @@ if printf '[filter "evil"]\n\tclean = sh -c "printf pwned > @MARKER@; cat"\n' > 
 if printf '* filter=evil\n' > "$wt/.gitattributes" 2>/dev/null; then echo "attrs: written"; else echo "attrs: REFUSED"; fi
 if touch "$wt/README.md" 2>/dev/null; then echo "touched"; else echo "TOUCH-REFUSED"; fi
 "#;
+
+/// The same signal-number path over the real sandbox: `InitRequest::Kill`
+/// carries the number the caller asked for, and init delivers it to the
+/// sandboxed process group rather than substituting a termination.
+#[tokio::test]
+async fn signal_delivers_the_requested_signal_in_the_sandbox() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let spec = SandboxSpec {
+        id: "ws_signal".into(),
+        rw_binds: vec![(work.clone(), work.clone())],
+        ro_binds: vec![],
+        late_ro_binds: vec![],
+        home: dir.path().join("home"),
+        run_dir: dir.path().join("run"),
+        env: vec![],
+        cwd: work.clone(),
+    };
+    let handle = backend_for("linux_bwrap").start(&spec).await.unwrap();
+    let child = handle
+        .spawn(SandboxCommand {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "trap 'exit 42' INT; sleep 30".into(),
+            ],
+            env: vec![],
+            cwd: None,
+            pty: None,
+        })
+        .await
+        .unwrap();
+    // The trap has to be installed before the signal arrives, or the shell dies
+    // of the default action instead of running it.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    (child.signal)(libc::SIGINT);
+
+    let code = tokio::time::timeout(std::time::Duration::from_secs(10), child.exit)
+        .await
+        .expect("the interrupted shell reports its exit")
+        .expect("exit code is delivered");
+    assert_eq!(code, 42, "SIGINT reached the sandboxed shell's trap");
+    handle.shutdown().await.unwrap();
+}
