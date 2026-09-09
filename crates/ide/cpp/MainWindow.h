@@ -3,6 +3,7 @@
 #include <QPointer>
 #include <QString>
 
+class AgentArea;
 class AppController;
 class FileTreeModel;
 class GroupBar;
@@ -11,6 +12,7 @@ class NewAgentDialog;
 class QLabel;
 class QSplitter;
 class QPlainTextEdit;
+class QTabWidget;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -28,6 +30,8 @@ private:
     void onNewAgent();
     void onDestroyRequested(const QString& workspaceId);
     void onOperationFailed(const QString& op, const QString& message);
+    void onActiveTabChanged();
+    void onWorkspaceDestroyed(const QString& workspaceId);
     void updateWorkspaceStatus();
 
     AppController* m_controller;
@@ -39,7 +43,11 @@ private:
     QPointer<NewAgentDialog> m_newAgentDialog;
     QSplitter* m_centerSplitter = nullptr;
     QPlainTextEdit* m_editorPlaceholder = nullptr;
-    QPlainTextEdit* m_agentPlaceholder = nullptr;
+    /// The per-workspace agent pane beside the editor.
+    AgentArea* m_agentArea = nullptr;
+    QTabWidget* m_bottomTabs = nullptr;
+    /// The bottom dock's Terminal tab: one shell per workspace.
+    AgentArea* m_shellArea = nullptr;
     QLabel* m_daemonLabel = nullptr;
     QLabel* m_sandboxLabel = nullptr;
     QLabel* m_branchLabel = nullptr;

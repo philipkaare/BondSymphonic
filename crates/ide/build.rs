@@ -15,6 +15,10 @@ fn main() {
         .cpp_files([
             "cpp/GroupBar.h",
             "cpp/GroupBar.cpp",
+            "cpp/TerminalWidget.h",
+            "cpp/TerminalWidget.cpp",
+            "cpp/AgentArea.h",
+            "cpp/AgentArea.cpp",
             "cpp/NewAgentDialog.h",
             "cpp/NewAgentDialog.cpp",
             "cpp/MainWindow.h",
