@@ -3,7 +3,7 @@
 //! transcript view's behaviour actually rests on.
 
 use bondsymphonic_ide::model::transcript::{
-    tool_summary, Applied, PendingPermission, Transcript, TranscriptItem,
+    tool_summary, Applied, LiveEvent, PendingPermission, Transcript, TranscriptItem,
 };
 use bondsymphonic_proto::{AgentMessage, AgentMessageBody, AgentState, PermissionDecision};
 use serde_json::json;
@@ -367,4 +367,142 @@ fn items_json_tags_every_item_with_its_kind() {
     assert_eq!(one["text"], "done");
     // Out of range is empty rather than a panic: the view asks by index.
     assert!(t.item_json(99).is_empty());
+}
+
+/// The bug the replay design walks straight into: history ends on an
+/// unanswered permission request, and a `Working` state buffered from *before*
+/// that snapshot is applied after it. Clearing `pending` on the arriving state
+/// would drop the request, and `seq` de-duplication means the same request can
+/// never set it again, so the tab would say it is waiting with no bar and the
+/// agent would block forever.
+#[test]
+fn a_stale_state_event_does_not_drop_a_pending_permission() {
+    let mut t = Transcript::default();
+    let request = msg(
+        5,
+        AgentMessageBody::PermissionRequest {
+            request_id: "req_1".to_owned(),
+            tool_name: "Bash".to_owned(),
+            input: json!({ "command": "ls" }),
+            suggestions: Vec::new(),
+        },
+    );
+    t.apply(&request);
+    assert!(t.pending.is_some());
+
+    // A state the agent was in before the request. It is not leaving
+    // WaitingPermission, because it never got there.
+    t.set_state(AgentState::Working, None);
+    assert!(
+        t.pending.is_some(),
+        "a state the agent left before the request must not clear it"
+    );
+    // The same request again is a duplicate and cannot restore it.
+    assert_eq!(t.apply(&request), Applied::Nothing);
+    assert!(t.pending.is_some());
+
+    // Only actually leaving WaitingPermission clears it.
+    t.set_state(AgentState::WaitingPermission, None);
+    assert!(t.pending.is_some());
+    t.set_state(AgentState::Idle, None);
+    assert!(t.pending.is_none());
+}
+
+/// The whole replay decision in one call: history first, then whatever arrived
+/// while the history request was in flight, with the overlap de-duplicated.
+#[test]
+fn replay_applies_history_then_live_and_de_duplicates_the_overlap() {
+    let mut t = Transcript::default();
+    let history = vec![
+        msg(
+            1,
+            AgentMessageBody::UserText {
+                text: "go".to_owned(),
+            },
+        ),
+        msg(
+            2,
+            AgentMessageBody::AssistantText {
+                text: "on it".to_owned(),
+            },
+        ),
+    ];
+    let live = vec![
+        // Already in the history snapshot: seq at or below its last.
+        LiveEvent::Message(msg(
+            2,
+            AgentMessageBody::AssistantText {
+                text: "on it".to_owned(),
+            },
+        )),
+        LiveEvent::State(AgentState::Working, None),
+        LiveEvent::Message(msg(
+            3,
+            AgentMessageBody::AssistantText {
+                text: "done".to_owned(),
+            },
+        )),
+        LiveEvent::State(AgentState::Idle, Some("finished".to_owned())),
+    ];
+    let applied = t.replay(&history, &live);
+    assert_eq!(
+        applied,
+        vec![
+            Applied::Appended(0),
+            Applied::Appended(1),
+            // The overlap.
+            Applied::Nothing,
+            // A state change moves no item.
+            Applied::Nothing,
+            Applied::Appended(2),
+            Applied::Nothing,
+        ]
+    );
+    assert_eq!(t.items.len(), 3, "{:?}", t.items);
+    assert_eq!(t.state, AgentState::Idle);
+    assert_eq!(t.state_detail, "finished");
+}
+
+/// A request for a tool the user pre-approved is taken, not published: the
+/// permission bar must never show one the session has already answered.
+#[test]
+fn replay_leaves_an_always_allowed_request_to_be_auto_answered() {
+    let mut t = Transcript::default();
+    t.always_allow.insert("Read".to_owned());
+    let history = vec![msg(
+        1,
+        AgentMessageBody::PermissionRequest {
+            request_id: "req_7".to_owned(),
+            tool_name: "Read".to_owned(),
+            input: json!({ "file_path": "/repo/a.rs" }),
+            suggestions: Vec::new(),
+        },
+    )];
+    t.replay(&history, &[]);
+    // Still pending at this point: `replay` folds, the caller decides.
+    assert!(t.pending.is_some());
+
+    let (taken, decision) = t.take_auto_allowed().expect("auto-answered");
+    assert_eq!(taken.request_id, "req_7");
+    assert_eq!(taken.summary, "/repo/a.rs");
+    assert_eq!(decision, PermissionDecision::Allow);
+    assert!(
+        t.pending.is_none(),
+        "an auto-answered request must not reach the bar"
+    );
+    // Nothing left to take, and a tool that is not on the list is left alone.
+    assert!(t.take_auto_allowed().is_none());
+
+    let mut other = Transcript::default();
+    other.apply(&msg(
+        1,
+        AgentMessageBody::PermissionRequest {
+            request_id: "req_8".to_owned(),
+            tool_name: "Bash".to_owned(),
+            input: json!({ "command": "rm -rf /" }),
+            suggestions: Vec::new(),
+        },
+    ));
+    assert!(other.take_auto_allowed().is_none());
+    assert!(other.pending.is_some(), "an unlisted tool still asks");
 }

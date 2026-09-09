@@ -8,16 +8,18 @@
 //! closure on the Qt thread, and only then does the live loop start. `seq`
 //! de-duplication in [`Transcript::apply`] makes the overlap harmless.
 //!
-//! Signals during that replay would have the view build and throw away a widget
-//! per item, so they are suppressed while `busy` is true and the view rebuilds
-//! once from `resetItems()`. After that, one signal per applied message.
+//! The replay itself is [`Transcript::replay`], a pure fold that this object
+//! only drives, so the ordering and the de-duplication are testable without a
+//! Qt event loop. It emits no per-item signal at all: the view rebuilds once
+//! from `resetItems()`, and the properties are published once at the end.
+//! After that, one signal per applied message.
 //!
 //! Permissions are decided here, not in C++: a request the session has already
 //! been told to always allow is answered by this model without ever reaching
 //! the permission bar.
 
 use crate::model::app_state::agent_state_word;
-use crate::model::transcript::{Applied, Transcript};
+use crate::model::transcript::{Applied, LiveEvent, Transcript};
 use crate::qobjects::app_controller::{require_connection, runtime, Shared};
 use bondsymphonic_proto::{
     AgentId, AgentIdParams, AgentMessage, AgentPermissionReplyParams, AgentSendParams, Event,
@@ -230,26 +232,26 @@ async fn replay_and_follow(
         }
     };
 
-    // Everything that arrived while the history request was in flight, applied
+    // Everything that arrived while the history request was in flight, folded
     // in the same closure as the history itself so the view rebuilds once.
     let mut buffered = Vec::new();
-    while let Ok(item) = rx.try_recv() {
-        buffered.push(item.1);
+    while let Ok((_, event)) = rx.try_recv() {
+        if let Some(live) = live_event(event, &agent) {
+            buffered.push(live);
+        }
     }
     let queued = qt.queue(move |mut q| {
         if q.as_ref().rust().generation != generation {
             return;
         }
-        for message in &history {
-            q.as_mut().apply_message(message);
-        }
-        for event in buffered {
-            q.as_mut().apply_event(event);
-        }
+        q.as_mut().rust_mut().transcript.replay(&history, &buffered);
+        // Once, at the end: replaying a long history through the per-message
+        // path would emit four property notifications per item.
+        q.as_mut().publish_totals();
         q.as_mut().set_busy(false);
         q.as_mut().reset_items();
-        // Suppressed while `busy`, so a history ending on an unanswered
-        // request raises the bar (or auto-answers it) here instead.
+        // The fold raises nothing itself, so a history ending on an unanswered
+        // request reaches the bar (or is auto-answered) here.
         q.sync_pending();
     });
     if queued.is_err() {
@@ -349,17 +351,27 @@ impl qobject::TranscriptModel {
         message: QString,
     ) {
         let request_id = request_id.to_string();
-        // The tool name is only known from the request the bar is showing, and
-        // only if it is still the one being answered: a stale Allow click must
-        // not put an unrelated tool on the always-allow list.
-        let tool = self
+        // Only the request the bar is actually showing may be taken down by
+        // this click. A late answer to a superseded request still goes to the
+        // daemon, which knows the id, but must not hide a newer request that
+        // is still waiting, nor allowlist that newer request's tool.
+        let answers_pending = self
             .as_ref()
             .rust()
             .transcript
             .pending
             .as_ref()
-            .filter(|p| p.request_id == request_id)
-            .map(|p| p.tool_name.clone());
+            .is_some_and(|p| p.request_id == request_id);
+        let tool = answers_pending
+            .then(|| {
+                self.as_ref()
+                    .rust()
+                    .transcript
+                    .pending
+                    .as_ref()
+                    .map(|p| p.tool_name.clone())
+            })
+            .flatten();
         // "Always allow" only means anything alongside Allow: there is no
         // "always deny" in the permission bar.
         if allow && always_allow {
@@ -371,8 +383,10 @@ impl qobject::TranscriptModel {
                     .insert(name);
             }
         }
-        self.as_mut().rust_mut().transcript.pending = None;
-        self.as_mut().sync_pending();
+        if answers_pending {
+            self.as_mut().rust_mut().transcript.pending = None;
+            self.as_mut().sync_pending();
+        }
         let decision = if allow {
             PermissionDecision::Allow
         } else {
@@ -419,15 +433,12 @@ impl qobject::TranscriptModel {
         }
     }
 
-    /// Folds one message in and announces what changed. Signals are held back
-    /// while `busy`: the replay closure ends with `resetItems()`, which is one
-    /// rebuild instead of one per historical item.
+    /// Folds one live message in and announces what changed. Only the live
+    /// path comes through here: replay goes through [`Transcript::replay`] and
+    /// ends in a single `resetItems()`, so this never runs while `busy`.
     fn apply_message(mut self: Pin<&mut Self>, message: &AgentMessage) {
         let applied = self.as_mut().rust_mut().transcript.apply(message);
         self.as_mut().publish_totals();
-        if *self.as_ref().busy() {
-            return;
-        }
         match applied {
             Applied::Appended(i) => self.as_mut().item_appended(index_of(i)),
             Applied::Changed(i) => self.as_mut().item_changed(index_of(i)),
@@ -440,23 +451,17 @@ impl qobject::TranscriptModel {
     /// ignored rather than trusted: the router filters by id, but the model is
     /// the thing that would be corrupted by a mistake there.
     fn apply_event(mut self: Pin<&mut Self>, event: Event) {
-        let agent = self.as_ref().agent_id().to_string();
-        match event {
-            Event::AgentMessage { agent_id, message } if agent_id.as_str() == agent => {
-                self.apply_message(&message);
-            }
-            Event::AgentStateChanged {
-                agent_id,
-                state,
-                detail,
-            } if agent_id.as_str() == agent => {
+        let agent = AgentId(self.as_ref().agent_id().to_string());
+        let Some(live) = live_event(event, &agent) else {
+            return;
+        };
+        match live {
+            LiveEvent::Message(message) => self.apply_message(&message),
+            LiveEvent::State(state, detail) => {
                 self.as_mut().rust_mut().transcript.set_state(state, detail);
                 self.as_mut().publish_totals();
-                if !*self.as_ref().busy() {
-                    self.sync_pending();
-                }
+                self.sync_pending();
             }
-            _ => {}
         }
     }
 
@@ -485,22 +490,9 @@ impl qobject::TranscriptModel {
     /// decision is Rust's, not the view's. Idempotent, so it can be called
     /// after every applied message without re-raising the same request.
     fn sync_pending(mut self: Pin<&mut Self>) {
-        let pending = self.as_ref().rust().transcript.pending.clone();
+        let auto = self.as_mut().rust_mut().transcript.take_auto_allowed();
         let current = self.as_ref().pending_json().to_string();
-        let Some(pending) = pending else {
-            if !current.is_empty() {
-                self.as_mut().set_pending_json(QString::from(""));
-                self.permission_cleared();
-            }
-            return;
-        };
-        if let Some(decision) = self
-            .as_ref()
-            .rust()
-            .transcript
-            .decide_permission(&pending.tool_name)
-        {
-            self.as_mut().rust_mut().transcript.pending = None;
+        if let Some((pending, decision)) = auto {
             if !current.is_empty() {
                 self.as_mut().set_pending_json(QString::from(""));
                 self.as_mut().permission_cleared();
@@ -508,6 +500,13 @@ impl qobject::TranscriptModel {
             self.send_permission_reply(pending.request_id, decision, None);
             return;
         }
+        let Some(pending) = self.as_ref().rust().transcript.pending.clone() else {
+            if !current.is_empty() {
+                self.as_mut().set_pending_json(QString::from(""));
+                self.permission_cleared();
+            }
+            return;
+        };
         let json = serde_json::to_string(&pending).unwrap_or_default();
         if json != current {
             self.as_mut().set_pending_json(QString::from(&json));
@@ -591,6 +590,23 @@ impl qobject::TranscriptModel {
     /// an error is news about the request, not about the conversation.
     fn fail(self: Pin<&mut Self>, message: &str) {
         self.error_occurred(QString::from(message));
+    }
+}
+
+/// This agent's half of one routed event, or `None` for anything else. The
+/// router filters by id, but the model is the thing a mistake there would
+/// corrupt, so the id is checked again here.
+fn live_event(event: Event, agent: &AgentId) -> Option<LiveEvent> {
+    match event {
+        Event::AgentMessage { agent_id, message } if &agent_id == agent => {
+            Some(LiveEvent::Message(message))
+        }
+        Event::AgentStateChanged {
+            agent_id,
+            state,
+            detail,
+        } if &agent_id == agent => Some(LiveEvent::State(state, detail)),
+        _ => None,
     }
 }
 

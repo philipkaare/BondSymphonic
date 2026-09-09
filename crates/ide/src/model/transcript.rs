@@ -75,6 +75,15 @@ pub struct PendingPermission {
     pub input_json: String,
 }
 
+/// One thing that reached the transcript from the live event stream. The
+/// QObject maps the daemon's `Event` onto this, so [`Transcript::replay`] never
+/// has to know about the event envelope and stays testable on its own.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LiveEvent {
+    Message(AgentMessage),
+    State(AgentState, Option<String>),
+}
+
 /// What [`Transcript::apply`] did, so the view can append or repaint one row
 /// instead of rebuilding the list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,15 +253,65 @@ impl Transcript {
         }
     }
 
-    /// Records the daemon's state. Leaving `WaitingPermission` clears the
+    /// Records the daemon's state. *Leaving* `WaitingPermission` clears the
     /// pending request: the daemon has moved on, so an answer would be for a
-    /// request nobody is waiting on, and the bar must come down.
+    /// request nobody is waiting on and the bar must come down.
+    ///
+    /// The guard is on the state being left, not on the state arriving, and
+    /// the difference is the whole point. `pending` is set by a *message*,
+    /// while the state is still whatever it was: during a replay the history's
+    /// unanswered request lands with the state at its `Idle` default, and a
+    /// buffered `Working` from before the snapshot follows it. Clearing on the
+    /// arriving state alone would drop that request, and `seq` de-duplication
+    /// means the same request can never set it again — a tab that says it is
+    /// waiting, with no bar, and an agent that blocks forever.
     pub fn set_state(&mut self, state: AgentState, detail: Option<String>) {
-        if state != AgentState::WaitingPermission {
+        let leaving_wait =
+            self.state == AgentState::WaitingPermission && state != AgentState::WaitingPermission;
+        if leaving_wait {
             self.pending = None;
         }
         self.state = state;
         self.state_detail = detail.unwrap_or_default();
+    }
+
+    /// Folds a history snapshot and everything that arrived while it was being
+    /// fetched into this transcript, in that order, and reports what each
+    /// input did.
+    ///
+    /// This is the whole of the replay decision, kept here rather than in the
+    /// QObject so it can be tested without a Qt event loop. The two halves
+    /// overlap by design: a live message whose `seq` the history already
+    /// carried yields [`Applied::Nothing`], which is what makes subscribing
+    /// before the history request safe rather than merely early.
+    pub fn replay(&mut self, history: &[AgentMessage], live: &[LiveEvent]) -> Vec<Applied> {
+        let mut applied = Vec::with_capacity(history.len() + live.len());
+        for message in history {
+            applied.push(self.apply(message));
+        }
+        for event in live {
+            applied.push(match event {
+                LiveEvent::Message(message) => self.apply(message),
+                LiveEvent::State(state, detail) => {
+                    self.set_state(*state, detail.clone());
+                    Applied::Nothing
+                }
+            });
+        }
+        applied
+    }
+
+    /// Takes the pending request when the session has already been told to
+    /// always allow its tool, leaving nothing pending.
+    ///
+    /// This is the auto-answer: the caller sends the reply, and because the
+    /// request was taken rather than published, the permission bar never shows
+    /// one the user has already pre-answered. `None` leaves `pending` alone.
+    pub fn take_auto_allowed(&mut self) -> Option<(PendingPermission, PermissionDecision)> {
+        let tool = self.pending.as_ref().map(|p| p.tool_name.clone())?;
+        let decision = self.decide_permission(&tool)?;
+        let pending = self.pending.take()?;
+        Some((pending, decision))
     }
 
     /// The answer to give without asking the user, if there is one.

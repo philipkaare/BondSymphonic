@@ -363,12 +363,15 @@ pub fn api_key_for_start() -> Option<String> {
 /// unparseable string is not fatal: the daemon's defaults are a working agent,
 /// which is a better answer than refusing to start one.
 fn start_options(options_json: &str) -> AgentStartOptions {
-    // Every field of `AgentStartOptions` is `#[serde(default)]`, so an empty
-    // object is exactly the "nothing chosen" set, and stays so as the daemon
-    // grows options. `AgentStartOptions` itself derives no `Default`.
-    let unset = || {
-        serde_json::from_str::<AgentStartOptions>("{}")
-            .expect("AgentStartOptions defaults every field")
+    // Written out rather than parsed from `{}`: `AgentStartOptions` derives no
+    // `Default`, and a literal turns a future proto change into a compile
+    // error here instead of a panic in the running IDE.
+    let unset = || AgentStartOptions {
+        command: None,
+        resume_session: None,
+        model: None,
+        permission_mode: None,
+        api_key: None,
     };
     let mut options = if options_json.trim().is_empty() {
         unset()
@@ -378,9 +381,10 @@ fn start_options(options_json: &str) -> AgentStartOptions {
             unset()
         })
     };
-    // The credential store wins over anything the caller supplied: C++ has no
-    // business setting this field, and a stale value must not shadow the key.
-    options.api_key = api_key_for_start().or(options.api_key);
+    // Unconditional, not a fallback: the credential store is the only source
+    // of this field. C++ has no business setting it, and a value that arrived
+    // in `options_json` must be dropped rather than passed through.
+    options.api_key = api_key_for_start();
     options
 }
 

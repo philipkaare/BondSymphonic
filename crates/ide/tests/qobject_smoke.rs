@@ -47,6 +47,8 @@ fn tab(info: &WorkspaceInfo) -> AgentTab {
         adapter: AgentAdapterKind::Terminal,
         command: None,
         agent_id: None,
+        agent_status: None,
+        agent_detail: String::new(),
     }
 }
 
@@ -427,4 +429,80 @@ fn agent_state_words_round_trip() {
     );
     assert_eq!(parse_agent_state("nonsense"), None);
     assert_eq!(parse_agent_state(""), None);
+}
+
+/// The badge changes hands between the workspace and the agent. A sandbox
+/// outage takes it; recovery must hand it back, because an idle agent emits no
+/// state of its own and would otherwise leave "sandbox down" on screen for the
+/// rest of the session.
+#[test]
+fn an_agent_tab_gets_its_status_back_when_the_workspace_recovers() {
+    let mut model = Workspaces::new_default();
+    let ready = info("ws_1", "alpha", WorkspaceState::Ready);
+    model.add_tab(0, tab(&ready));
+    assert!(model.set_agent(&ready.id, "ag_1".into()));
+    model.set_agent_status(&"ag_1".into(), TabStatus::Working, "");
+    assert_eq!(model.groups[0].tabs[0].status, TabStatus::Working);
+
+    // A `workspace.state` for a healthy workspace must not blank a live turn.
+    assert!(model.apply_workspace_info(&ready).is_some());
+    assert_eq!(model.groups[0].tabs[0].status, TabStatus::Working);
+
+    // The sandbox goes down: that is the workspace's news, and it wins.
+    let down = info("ws_1", "alpha", WorkspaceState::SandboxDown);
+    assert!(model.apply_workspace_info(&down).is_some());
+    assert_eq!(model.groups[0].tabs[0].status, TabStatus::SandboxDown);
+
+    // Recovery hands the badge back to what the agent last reported.
+    assert!(model.apply_workspace_info(&ready).is_some());
+    assert_eq!(model.groups[0].tabs[0].status, TabStatus::Working);
+}
+
+/// The agent's detail travels with its status, so a workspace error's text
+/// does not outlive the workspace error.
+#[test]
+fn a_recovering_agent_tab_restores_the_agent_detail_not_the_workspace_error() {
+    let mut model = Workspaces::new_default();
+    let ready = info("ws_1", "alpha", WorkspaceState::Ready);
+    model.add_tab(0, tab(&ready));
+    assert!(model.set_agent(&ready.id, "ag_1".into()));
+    model.set_agent_status(&"ag_1".into(), TabStatus::Error, "exit code 1");
+
+    let broken = info("ws_1", "alpha", WorkspaceState::Error("disk full".into()));
+    assert!(model.apply_workspace_info(&broken).is_some());
+    assert_eq!(model.groups[0].tabs[0].detail, "disk full");
+
+    assert!(model.apply_workspace_info(&ready).is_some());
+    assert_eq!(model.groups[0].tabs[0].status, TabStatus::Error);
+    assert_eq!(model.groups[0].tabs[0].detail, "exit code 1");
+}
+
+/// An agent that has not reported yet: the tab is idle, not stuck on whatever
+/// the workspace last said.
+#[test]
+fn an_agent_tab_with_no_reported_status_yet_becomes_idle_on_ready() {
+    let mut model = Workspaces::new_default();
+    let creating = info("ws_1", "alpha", WorkspaceState::Creating);
+    model.add_tab(0, tab(&creating));
+    assert!(model.set_agent(&creating.id, "ag_1".into()));
+    assert!(model.apply_workspace_info(&creating).is_some());
+    assert_eq!(model.groups[0].tabs[0].status, TabStatus::Creating);
+
+    let ready = info("ws_1", "alpha", WorkspaceState::Ready);
+    assert!(model.apply_workspace_info(&ready).is_some());
+    assert_eq!(model.groups[0].tabs[0].status, TabStatus::Idle);
+    assert!(model.groups[0].tabs[0].detail.is_empty());
+}
+
+/// A tab with no agent is unaffected by any of the above.
+#[test]
+fn a_terminal_tab_still_takes_its_status_from_the_workspace() {
+    let mut model = Workspaces::new_default();
+    let ready = info("ws_1", "alpha", WorkspaceState::Ready);
+    model.add_tab(0, tab(&ready));
+    let down = info("ws_1", "alpha", WorkspaceState::SandboxDown);
+    assert!(model.apply_workspace_info(&down).is_some());
+    assert_eq!(model.groups[0].tabs[0].status, TabStatus::SandboxDown);
+    assert!(model.apply_workspace_info(&ready).is_some());
+    assert_eq!(model.groups[0].tabs[0].status, TabStatus::Idle);
 }

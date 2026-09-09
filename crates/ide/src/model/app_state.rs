@@ -153,6 +153,15 @@ pub struct AgentTab {
     /// existed still loads.
     #[serde(default)]
     pub agent_id: Option<AgentId>,
+    /// The last status the agent itself reported, kept separately from
+    /// `status` so a workspace event can take the badge for the duration of a
+    /// sandbox outage and hand it back on recovery. `None` until the agent has
+    /// reported anything.
+    #[serde(default)]
+    pub agent_status: Option<TabStatus>,
+    /// The detail belonging to `agent_status`, restored with it.
+    #[serde(default)]
+    pub agent_detail: String,
 }
 
 /// A user-defined collection of agent tabs, shown as a section in the sidebar.
@@ -301,18 +310,27 @@ impl Workspaces {
     /// Updates the tab's status, branch and detail from a daemon `WorkspaceInfo`.
     /// Returns `None` without modifying anything if `info.id` is not tracked.
     ///
-    /// A tab running an agent keeps its agent-driven status while its
-    /// workspace is `Ready`: the daemon emits `workspace.state` for reasons
-    /// that have nothing to do with the agent (a sandbox restart, a branch
-    /// change), and letting one of those overwrite "working" with "idle" would
-    /// blank the tab's indicator mid-turn. Anything other than `Ready` is news
-    /// about the workspace the agent runs in, and does win.
+    /// On a tab running an agent the badge changes hands rather than being
+    /// overwritten. While the workspace is anything but `Ready` it is the
+    /// workspace's news that matters, so that wins; when the workspace goes
+    /// `Ready` the agent owns the badge again and whatever it last reported is
+    /// restored (`Idle` if it has not reported yet).
+    ///
+    /// Both halves are needed. Letting a `Ready` event overwrite "working"
+    /// with "idle" blanks the indicator mid-turn, because the daemon emits
+    /// `workspace.state` for reasons that have nothing to do with the agent.
+    /// Ignoring the `Ready` event instead would be worse: recovery is exactly
+    /// the event that would then be dropped, leaving a "sandbox down" badge
+    /// that an idle agent, which emits no state of its own, never clears.
     pub fn apply_workspace_info(&mut self, info: &WorkspaceInfo) -> Option<(usize, usize)> {
         let (g, t) = self.find(&info.id)?;
         let tab = &mut self.groups[g].tabs[t];
         let agent_owns_status =
             tab.agent_id.is_some() && matches!(info.state, WorkspaceState::Ready);
-        if !agent_owns_status {
+        if agent_owns_status {
+            tab.status = tab.agent_status.unwrap_or(TabStatus::Idle);
+            tab.detail = tab.agent_detail.clone();
+        } else {
             tab.status = TabStatus::from_workspace_state(&info.state);
             tab.detail = match &info.state {
                 WorkspaceState::Error(detail) => detail.clone(),
@@ -344,6 +362,10 @@ impl Workspaces {
     ) -> Option<(usize, usize)> {
         let (g, t) = self.find_agent(agent_id)?;
         let tab = &mut self.groups[g].tabs[t];
+        // Recorded as well as shown, so a sandbox outage that takes the badge
+        // hands this back when the workspace recovers.
+        tab.agent_status = Some(status);
+        tab.agent_detail = detail.to_owned();
         tab.status = status;
         tab.detail = detail.to_owned();
         Some((g, t))
@@ -405,6 +427,8 @@ impl Workspaces {
                 adapter: AgentAdapterKind::Terminal,
                 command: None,
                 agent_id: None,
+                agent_status: None,
+                agent_detail: String::new(),
             });
         }
 

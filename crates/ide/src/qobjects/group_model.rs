@@ -312,6 +312,8 @@ impl qobject::GroupModel {
             adapter: parse_adapter(&adapter.to_string()),
             command: (!command.is_empty()).then_some(command),
             agent_id: None,
+            agent_status: None,
+            agent_detail: String::new(),
         };
         self.as_mut().rust_mut().workspaces.add_tab(group_idx, tab);
         self.publish();

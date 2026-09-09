@@ -28,6 +28,8 @@ fn tab(id: &str, name: &str) -> AgentTab {
         adapter: AgentAdapterKind::Terminal,
         command: None,
         agent_id: None,
+        agent_status: None,
+        agent_detail: String::new(),
     }
 }
 
