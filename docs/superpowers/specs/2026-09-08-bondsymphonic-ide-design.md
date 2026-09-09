@@ -151,7 +151,10 @@ show" belongs in Rust.
    item fails, show `SetupPage` with the fix hints but keep the window usable.
 5. On process exit or connection loss: state `reconnecting`, retry launch with
    backoff (1, 2, 4, 8 s, max 30 s), then re-sync (`workspace.list`, then
-   `agent.history` for each open agent tab).
+   `agent.history` for each open agent tab). *Status (Milestone 2b): the IDE
+   enters a `lost` state ("daemon: connection lost"), drops the dead client so
+   every action fails fast, and does not retry; relaunch with backoff and
+   re-sync land in Milestone 6.*
 
 On Linux/macOS the launcher spawns the daemon binary directly. The launcher is
 the only place with `cfg(windows)` branches in the IDE.

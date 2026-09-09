@@ -225,7 +225,8 @@ code, stderr; for `PrereqMissing` the same shape as `check_prereqs`).
 - **Reconnection.** If the IDE loses the daemon, it enters a read-only
   "reconnecting" state, relaunches the daemon if the process died, and re-syncs
   from `workspace.list` and `agent.history`. Agent sessions resume via Claude
-  Code's `--resume`.
+  Code's `--resume`. (Not yet implemented: as of Milestone 2b the IDE only
+  reports the loss and fails fast; reconnection is scheduled for Milestone 6.)
 - **No hidden shell-outs from the IDE.** The IDE only ever spawns `wsl.exe` to
   start the daemon and the system browser to open a URL.
 - **Prerequisite messages are specific.** Each missing prerequisite names the
