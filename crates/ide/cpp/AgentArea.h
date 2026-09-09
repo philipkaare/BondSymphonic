@@ -39,9 +39,6 @@ public:
     /// as the daemon's "output dropped" notice.
     QList<TerminalSession*> sessions() const;
 
-    /// The session showing `workspaceId`, or null.
-    TerminalSession* sessionFor(const QString& workspaceId) const;
-
 private:
     QLabel* m_placeholder = nullptr;
     /// What the placeholder says when nothing is showing, kept so the message

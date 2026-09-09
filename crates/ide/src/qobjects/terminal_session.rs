@@ -12,7 +12,7 @@
 
 use crate::client::router::{EventRouter, EventRx};
 use crate::model::terminal_grid::{key_to_bytes, TerminalGrid};
-use crate::qobjects::app_controller::{runtime, shared};
+use crate::qobjects::app_controller::{require_connection, runtime, shared};
 use base64::Engine as _;
 use bondsymphonic_proto::{
     Event, PtyId, PtyIdParams, PtyOpenParams, PtyOpenResult, PtyResizeParams, PtyWriteParams,
@@ -86,7 +86,8 @@ pub mod qobject {
         #[qinvokable]
         fn write_key(self: Pin<&mut TerminalSession>, qt_key: i32, modifiers: i32, text: QString);
 
-        /// Resizes the screen now and tells the daemon.
+        /// Resizes the screen now and tells the daemon. After the process has
+        /// exited only the screen is resized.
         #[qinvokable]
         fn resize(self: Pin<&mut TerminalSession>, cols: i32, rows: i32);
 
@@ -98,7 +99,9 @@ pub mod qobject {
         fn scroll_to_bottom(self: Pin<&mut TerminalSession>);
 
         /// Asks the daemon to close the PTY. The session tears itself down
-        /// when the resulting `pty.exit` arrives.
+        /// when the resulting `pty.exit` arrives. A no-op once the process has
+        /// exited, beyond releasing the router subscription: there is no PTY
+        /// left to close.
         #[qinvokable]
         fn close(self: Pin<&mut TerminalSession>);
 
@@ -129,9 +132,6 @@ const BASE64: base64::engine::general_purpose::GeneralPurpose =
 /// long enough to coalesce a burst, short enough to feel immediate.
 const BATCH_WINDOW: Duration = Duration::from_millis(16);
 
-/// Reported when an operation runs before the daemon connection exists.
-const NOT_CONNECTED: &str = "not connected to the daemon";
-
 /// The banner written into the screen when the daemon drops events.
 const DROP_MARKER: &str = "[output dropped]";
 
@@ -153,6 +153,9 @@ pub struct TerminalSessionRust {
     error: QString,
     /// The screen. Absent until `open` creates it at the requested size.
     grid: Option<TerminalGrid>,
+    /// Set when `close` runs before `pty.open` has answered: the reply then
+    /// closes the PTY it just learned about instead of adopting it.
+    close_requested: bool,
     /// True while a frame closure is queued but not yet applied. Owned here
     /// and cloned into the pump so the two agree on how many frames are in
     /// flight; replaced on every `open` so an older pump cannot gate the new
@@ -177,6 +180,7 @@ impl Default for TerminalSessionRust {
             title: QString::from(""),
             error: QString::from(""),
             grid: None,
+            close_requested: false,
             frame_pending: Arc::new(AtomicBool::new(false)),
             unsubscribe: None,
         }
@@ -351,6 +355,12 @@ async fn pump(
         if let Some(code) = exit {
             q.as_mut().set_exited(true);
             q.as_mut().set_exit_code(code);
+            // The daemon has reaped this PTY, so its id no longer names
+            // anything. Clearing it is what makes every later `resize`,
+            // `write` and `close` a local no-op instead of a request the
+            // daemon answers with `NotFound`, which would raise an error
+            // banner over a pane whose only news is that the process ended.
+            q.as_mut().set_pty_id(QString::from(""));
         }
         q.as_mut().apply_frame();
         if exit.is_some() {
@@ -379,6 +389,7 @@ impl qobject::TerminalSession {
         self.as_mut().set_error(QString::from(""));
         {
             let mut rust = self.as_mut().rust_mut();
+            rust.close_requested = false;
             rust.grid = Some(TerminalGrid::new(cols, rows));
             // A fresh flag: any closure still queued by an older pump clears
             // that pump's flag, not this session's.
@@ -387,9 +398,12 @@ impl qobject::TerminalSession {
         let pending = self.as_ref().rust().frame_pending.clone();
         self.as_mut().apply_frame();
 
-        let Some(shared) = shared() else {
-            self.fail(NOT_CONNECTED);
-            return;
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                self.fail(message);
+                return;
+            }
         };
         let qt = self.qt_thread();
         let workspace = workspace_id.to_string();
@@ -425,12 +439,24 @@ impl qobject::TerminalSession {
             };
             let id_text = pty_id.to_string();
             let queued = qt.queue(move |mut q| {
+                // `close` ran while this `pty.open` was in flight, so the
+                // session never learned an id it could close. It exists now:
+                // close it here, rather than leaving a shell running in the
+                // sandbox with nothing reading it.
+                if q.as_ref().rust().close_requested {
+                    q.as_mut().rust_mut().close_requested = false;
+                    close_pty(id_text);
+                    return;
+                }
                 q.as_mut().set_pty_id(QString::from(&id_text));
                 q.as_mut().rust_mut().unsubscribe = Some(Box::new(unsubscribe));
                 q.opened();
             });
             if queued.is_err() {
+                // The QObject went away before the id reached it: the same
+                // orphan, from the other direction.
                 router.unsubscribe_pty(&pty_id);
+                close_pty(pty_id.to_string());
                 return;
             }
             pump(rx, pty_id, router, qt, pending).await;
@@ -462,13 +488,19 @@ impl qobject::TerminalSession {
         // Repainted from the new geometry immediately; the daemon catches up.
         self.as_mut().apply_frame();
 
+        // No PTY: either `pty.open` has not answered yet, or the process has
+        // exited and the id was cleared. The screen still resizes; there is
+        // just nothing on the daemon side left to tell.
         let pty_id = self.pty_id().to_string();
         if pty_id.is_empty() {
             return;
         }
-        let Some(shared) = shared() else {
-            self.fail(NOT_CONNECTED);
-            return;
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                self.fail(message);
+                return;
+            }
         };
         let qt = self.qt_thread();
         runtime().spawn(async move {
@@ -497,14 +529,26 @@ impl qobject::TerminalSession {
         self.apply_frame();
     }
 
-    pub fn close(self: Pin<&mut Self>) {
+    pub fn close(mut self: Pin<&mut Self>) {
         let pty_id = self.pty_id().to_string();
         if pty_id.is_empty() {
+            // Nothing to close: the process has already exited, or the id has
+            // not arrived yet. Either way the router subscription goes, and a
+            // reply still in flight is told to close the PTY it brings back.
+            if let Some(unsubscribe) = self.as_mut().rust_mut().unsubscribe.take() {
+                unsubscribe();
+            }
+            if !*self.exited() {
+                self.as_mut().rust_mut().close_requested = true;
+            }
             return;
         }
-        let Some(shared) = shared() else {
-            self.fail(NOT_CONNECTED);
-            return;
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                self.fail(message);
+                return;
+            }
         };
         let qt = self.qt_thread();
         runtime().spawn(async move {
@@ -563,8 +607,8 @@ impl qobject::TerminalSession {
         self.frame();
     }
 
-    /// Sends bytes to the PTY. Input before `pty.open` has answered is
-    /// dropped: there is nowhere to put it, and the shell has not prompted.
+    /// Sends bytes to the PTY. Input before `pty.open` has answered, or after
+    /// the process has exited, is dropped: there is nowhere to put it.
     fn send(self: Pin<&mut Self>, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
@@ -573,9 +617,12 @@ impl qobject::TerminalSession {
         if pty_id.is_empty() {
             return;
         }
-        let Some(shared) = shared() else {
-            self.fail(NOT_CONNECTED);
-            return;
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                self.fail(message);
+                return;
+            }
         };
         let qt = self.qt_thread();
         runtime().spawn(async move {

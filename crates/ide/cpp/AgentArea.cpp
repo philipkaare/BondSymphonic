@@ -83,8 +83,3 @@ QList<TerminalSession*> AgentArea::sessions() const {
     }
     return result;
 }
-
-TerminalSession* AgentArea::sessionFor(const QString& workspaceId) const {
-    TerminalWidget* terminal = m_terminals.value(workspaceId);
-    return terminal != nullptr ? terminal->session() : nullptr;
-}

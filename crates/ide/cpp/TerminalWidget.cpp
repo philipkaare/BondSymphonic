@@ -90,7 +90,12 @@ TerminalWidget::TerminalWidget(TerminalSession* session, QWidget* parent)
         // `frame` means "repaint now": it fires on output, scroll, resize and
         // error alike.
         QObject::connect(m_session, &TerminalSession::frame, this, [this] { update(); });
-        QObject::connect(m_session, &TerminalSession::exitedSignal, this, [this] { update(); });
+        QObject::connect(m_session, &TerminalSession::exitedSignal, this, [this] {
+            // Remembered so `paintError` can tell an error that predates the
+            // exit from one that arrived after it.
+            m_errorAtExit = m_session->getError();
+            update();
+        });
         QObject::connect(m_session, &TerminalSession::errorChanged, this, [this] { update(); });
         // A resize between `open` and its answer updates the grid but cannot
         // reach a PTY that does not exist yet, and the session's own `cols`
@@ -253,15 +258,15 @@ void TerminalWidget::paintExitLine(QPainter& painter) {
 }
 
 void TerminalWidget::paintError(QPainter& painter) {
-    // A finished process has nothing left to fail at, and the session still
-    // sends `pty.resize` for a PTY the daemon has already reaped, so every
-    // resize of a dead pane would raise a banner. The exit line says what
-    // happened; that is the whole story once `exited` is set.
-    if (m_session->getExited()) {
-        return;
-    }
     const QString message = m_session->getError();
     if (message.isEmpty()) {
+        return;
+    }
+    // A failure the session already carried when the process exited is real
+    // and stays on screen. One that appears afterwards is not: a reply to a
+    // request issued just before the daemon reaped the PTY can still come back
+    // as an error, and the exit line already says what happened.
+    if (m_session->getExited() && message != m_errorAtExit) {
         return;
     }
     QFont font = m_font;

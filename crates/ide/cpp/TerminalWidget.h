@@ -70,6 +70,9 @@ private:
     int m_rows = 24;
     QTimer* m_blinkTimer = nullptr;
     bool m_blinkOn = true;
+    /// The session's `error` at the moment the process exited, so a later one
+    /// (a reply that lost its race with the exit) can be told apart from it.
+    QString m_errorAtExit;
     /// An `openSession` that has not run yet, with its arguments.
     bool m_pendingOpen = false;
     QString m_pendingWorkspace;

@@ -7,9 +7,11 @@
 //! (perform these steps once connected). Both are inert when unset.
 //!
 //! What it proves: the window builds, the daemon connection comes up, the
-//! workspace/PTY/file-tree requests reach the daemon in the right order, the Qt
-//! event loop is still responsive at the end (the `quit` step runs on it), and
-//! the process ends with status 0 well inside the time limit.
+//! workspace/PTY/file-tree requests reach the daemon in the right order, panes
+//! whose process has exited are torn down without talking to the daemon about
+//! the PTYs it has already reaped, the Qt event loop is still responsive at the
+//! end (the `quit` step runs on it), and the process ends with status 0 well
+//! inside the time limit.
 
 use base64::Engine as _;
 use bondsymphonic_proto::*;
@@ -26,11 +28,19 @@ const BASE64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
 
 const TOKEN: &str = "smoke-token";
-const SCRIPT: &str = "create,open,tree,quit";
-/// The `quit` step alone waits 2 s; the rest is a Qt startup on a cold cache.
+const SCRIPT: &str = "create,open,tree,close,destroy,quit";
+/// The `quit` step alone waits 2 s and `close` another 0.75 s; the rest is a Qt
+/// startup on a cold cache.
 const RUN_LIMIT: Duration = Duration::from_secs(30);
 /// The methods the script must produce, in this order.
-const EXPECTED: [&str; 4] = ["hello", "workspace.create", "pty.open", "fs.list_dir"];
+const EXPECTED: [&str; 6] = [
+    "hello",
+    "workspace.create",
+    "pty.open",
+    "fs.list_dir",
+    "pty.close",
+    "workspace.destroy",
+];
 
 /// Every request method the fake daemon answered, in arrival order.
 type Journal = Arc<Mutex<Vec<String>>>;
@@ -105,6 +115,29 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
              {count}\n{context}"
         );
     }
+    // The `close` step ended every PTY the fake daemon had open, so by the time
+    // `destroy` tears the panes down their processes have exited. A pane in that
+    // state must not send `pty.close` or `pty.resize`: the daemon has reaped
+    // those PTYs and answers `NotFound`, which used to put an error banner over
+    // a pane whose only news was that its process had finished.
+    let after_destroy: Vec<&String> = seen
+        .iter()
+        .skip_while(|m| *m != "workspace.destroy")
+        .collect();
+    for method in ["pty.close", "pty.resize", "pty.write"] {
+        assert!(
+            !after_destroy.iter().any(|m| *m == method),
+            "the window sent {method} for a PTY that had already exited\n{context}"
+        );
+    }
+    // The same thing from the session's side: those failures are what set the
+    // `error` property the terminal paints its banner from.
+    for warning in ["pty.close failed", "pty.resize failed", "pty.write failed"] {
+        assert!(
+            !err.contains(warning),
+            "a terminal recorded {warning:?} after its process exited\n{context}"
+        );
+    }
 }
 
 /// Whether `wanted` appears in `seen` in order, other requests in between
@@ -175,10 +208,11 @@ fn entry(name: &str, is_dir: bool, size: u64) -> FileEntry {
 }
 
 /// A daemon just real enough for one IDE session: it answers the handshake, the
-/// connect-time calls, and the four the script makes, and it emits the events a
+/// connect-time calls, and the ones the script makes, and it emits the events a
 /// real daemon would (Creating then Ready for the new workspace, one line of
-/// output for each PTY). Everything else is an explicit error, so an unexpected
-/// request shows up in the journal rather than hanging the IDE.
+/// output for each PTY, an exit for each PTY it ends). Everything else is an
+/// explicit error, so an unexpected request shows up in the journal rather than
+/// hanging the IDE.
 async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
@@ -194,6 +228,11 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
         // consistently and `pty.open` can be checked against a known workspace.
         let mut workspaces: HashMap<String, String> = HashMap::new();
         let mut ptys = 0usize;
+        // Every PTY handed out and the workspace it belongs to, so `pty.close`
+        // can end all of them at once.
+        let mut open_ptys: Vec<(WorkspaceId, PtyId)> = Vec::new();
+        // The id of a `pty.close` whose reply is being held; see the arm below.
+        let mut held_close: Option<u64> = None;
         loop {
             line.clear();
             // The `quit` step ends the process, which resets this socket rather
@@ -210,8 +249,8 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                 .push(request.method_name().to_owned());
 
             let mut follow_ups: Vec<ServerMessage> = Vec::new();
-            let reply = match request {
-                Request::Hello(p) if p.token == TOKEN => ServerMessage::ok(
+            let reply: Option<ServerMessage> = match request {
+                Request::Hello(p) if p.token == TOKEN => Some(ServerMessage::ok(
                     id,
                     &HelloResult {
                         daemon_version: "0.0.0-fake".into(),
@@ -221,9 +260,9 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                             adapters: vec![],
                         },
                     },
-                ),
-                Request::Hello(_) => ServerMessage::err(id, RpcError::unauthorized()),
-                Request::SystemCheckPrereqs {} => ServerMessage::ok(
+                )),
+                Request::Hello(_) => Some(ServerMessage::err(id, RpcError::unauthorized())),
+                Request::SystemCheckPrereqs {} => Some(ServerMessage::ok(
                     id,
                     &CheckPrereqsResult {
                         items: vec![PrereqStatus {
@@ -233,10 +272,11 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                             fix_hint: None,
                         }],
                     },
-                ),
-                Request::WorkspaceList {} => {
-                    ServerMessage::ok(id, &WorkspaceListResult { workspaces: vec![] })
-                }
+                )),
+                Request::WorkspaceList {} => Some(ServerMessage::ok(
+                    id,
+                    &WorkspaceListResult { workspaces: vec![] },
+                )),
                 Request::WorkspaceCreate(p) => {
                     let ws_id = format!("ws_smoke{}", workspaces.len() + 1);
                     workspaces.insert(p.name.clone(), ws_id.clone());
@@ -250,11 +290,12 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                             Event::WorkspaceStateChanged { info },
                         ));
                     }
-                    ServerMessage::ok(id, &creating)
+                    Some(ServerMessage::ok(id, &creating))
                 }
                 Request::PtyOpen(p) => {
                     ptys += 1;
                     let pty_id = PtyId(format!("pty_smoke{ptys}"));
+                    open_ptys.push((p.workspace_id.clone(), pty_id.clone()));
                     follow_ups.push(ServerMessage::event(
                         Some(p.workspace_id.clone()),
                         Event::PtyOutput {
@@ -262,23 +303,55 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                             data_b64: BASE64.encode("prompt$ "),
                         },
                     ));
-                    ServerMessage::ok(id, &PtyOpenResult { pty_id })
+                    Some(ServerMessage::ok(id, &PtyOpenResult { pty_id }))
                 }
+                // A real daemon would exit only the PTY named here. This one
+                // ends every PTY it has handed out, because the script closes
+                // its own and has no way to name the ones the window opened for
+                // its panes — and those are the ones the steps after this have
+                // to find already exited.
+                //
+                // The reply is held until such a pane exists: the window opens
+                // its terminal only once Qt has laid it out, which is later
+                // than the script's first steps, so answering straight away
+                // would end the script's PTY and leave the window's untouched.
+                Request::PtyClose(_) => {
+                    held_close = Some(id);
+                    None
+                }
+                Request::WorkspaceDestroy(_) => Some(ServerMessage::ok(id, &Empty {})),
                 // The terminal widget restates its size once the PTY exists.
-                Request::PtyResize(_) | Request::PtyWrite(_) => ServerMessage::ok(id, &Empty {}),
-                Request::FsListDir(_) => ServerMessage::ok(
+                Request::PtyResize(_) | Request::PtyWrite(_) => {
+                    Some(ServerMessage::ok(id, &Empty {}))
+                }
+                Request::FsListDir(_) => Some(ServerMessage::ok(
                     id,
                     &ListDirResult {
                         entries: vec![entry("src", true, 0), entry("README.md", false, 42)],
                     },
-                ),
-                other => ServerMessage::err(
+                )),
+                other => Some(ServerMessage::err(
                     id,
                     RpcError::internal(format!("not implemented: {}", other.method_name())),
-                ),
+                )),
             };
 
-            let mut batch = codec::encode(&reply);
+            // The held `pty.close` is answered as soon as the window has a pane
+            // of its own, and every PTY ends with it.
+            if let Some(close_id) = held_close {
+                if open_ptys.len() >= 2 {
+                    held_close = None;
+                    for (workspace_id, pty_id) in open_ptys.drain(..) {
+                        follow_ups.push(ServerMessage::event(
+                            Some(workspace_id),
+                            Event::PtyExit { pty_id, code: 0 },
+                        ));
+                    }
+                    follow_ups.push(ServerMessage::ok(close_id, &Empty {}));
+                }
+            }
+
+            let mut batch = reply.as_ref().map(codec::encode).unwrap_or_default();
             for message in &follow_ups {
                 batch.push_str(&codec::encode(message));
             }
@@ -300,19 +373,28 @@ fn request_order_is_checked_as_a_subsequence() {
         "fs.list_dir",
         "pty.open",
         "fs.list_dir",
+        "pty.close",
+        "workspace.destroy",
     ]
     .iter()
     .map(|s| (*s).to_owned())
     .collect();
     assert!(contains_in_order(&seen, &EXPECTED));
     // Order still matters: a `pty.open` before the create is not a match.
-    let reordered: Vec<String> = ["hello", "pty.open", "workspace.create", "fs.list_dir"]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
+    let reordered: Vec<String> = [
+        "hello",
+        "pty.open",
+        "workspace.create",
+        "fs.list_dir",
+        "pty.close",
+        "workspace.destroy",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
     assert!(!contains_in_order(&reordered, &EXPECTED));
     // A missing step is not a match either.
-    let short: Vec<String> = ["hello", "workspace.create", "pty.open"]
+    let short: Vec<String> = ["hello", "workspace.create", "pty.open", "fs.list_dir"]
         .iter()
         .map(|s| (*s).to_owned())
         .collect();

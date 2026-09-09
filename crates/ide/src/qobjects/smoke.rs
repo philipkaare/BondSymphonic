@@ -4,13 +4,20 @@
 //!
 //! The variable holds a comma-separated step list, run in order once the daemon
 //! connection is up. `tests/smoke.rs` runs the real IDE binary offscreen against
-//! an in-process fake daemon with `create,open,tree,quit`. The steps are:
+//! an in-process fake daemon with `create,open,tree,close,destroy,quit`. The
+//! steps are:
 //!
 //! * `create` — create a workspace over the repository in `BS_SMOKE_REPO` and
 //!   emit `workspace_created`, so the window builds its tab, its terminal pane
 //!   and its file tree from the same signal a user's New Agent would produce.
 //! * `open` — open a PTY in the workspace the last `create` made.
 //! * `tree` — list that workspace's root directory.
+//! * `close` — close the PTY the last `open` made. The fake daemon answers by
+//!   ending every PTY it has handed out, including the ones the window opened
+//!   for its own panes, so the steps after this one run against terminals whose
+//!   process has exited.
+//! * `destroy` — destroy the workspace and emit `workspace_destroyed`, which is
+//!   what makes the window tear its panes down.
 //! * `quit` — let the window settle, then end the process with status 0.
 //!
 //! A failing step logs and stops the script *without* quitting, so a broken run
@@ -33,6 +40,9 @@ const BASE_BRANCH: &str = "main";
 const GROUP: &str = "Default";
 /// How long `quit` leaves the window running before ending the process.
 const QUIT_DELAY: Duration = Duration::from_secs(2);
+/// How long `close` waits for the `pty.exit` events it triggers to reach the
+/// window's terminals, so the steps after it act on exited sessions.
+const EXIT_SETTLE: Duration = Duration::from_millis(750);
 const PTY_COLS: u16 = 80;
 const PTY_ROWS: u16 = 24;
 
@@ -51,6 +61,7 @@ pub(crate) fn script() -> Option<Vec<String>> {
 pub(crate) async fn run(steps: Vec<String>, client: DaemonClient, qt: QtHandle) {
     let repo = std::env::var(REPO_ENV).unwrap_or_else(|_| DEFAULT_REPO.to_owned());
     let mut workspace: Option<WorkspaceId> = None;
+    let mut pty: Option<PtyId> = None;
     let mut created = 0usize;
     for step in steps {
         tracing::info!(target: "smoke", "step: {step}");
@@ -61,8 +72,12 @@ pub(crate) async fn run(steps: Vec<String>, client: DaemonClient, qt: QtHandle) 
                     .await
                     .map(|id| workspace = Some(id))
             }
-            "open" => open(&client, workspace.as_ref()).await,
+            "open" => open(&client, workspace.as_ref())
+                .await
+                .map(|id| pty = Some(id)),
             "tree" => tree(&client, workspace.as_ref()).await,
+            "close" => close(&client, pty.take()).await,
+            "destroy" => destroy(&client, &qt, workspace.take()).await,
             "quit" => quit(&qt).await,
             other => Err(format!("unknown step {other:?}")),
         };
@@ -107,7 +122,7 @@ async fn create(
     Ok(info.id)
 }
 
-async fn open(client: &DaemonClient, workspace: Option<&WorkspaceId>) -> Result<(), String> {
+async fn open(client: &DaemonClient, workspace: Option<&WorkspaceId>) -> Result<PtyId, String> {
     let workspace_id = need(workspace, "open")?;
     let res = client
         .request::<PtyOpenResult>(Request::PtyOpen(PtyOpenParams {
@@ -119,6 +134,43 @@ async fn open(client: &DaemonClient, workspace: Option<&WorkspaceId>) -> Result<
         .await
         .map_err(|e| e.to_string())?;
     tracing::info!(target: "smoke", "opened {:?}", res.pty_id);
+    Ok(res.pty_id)
+}
+
+/// Closes the script's own PTY. The fake daemon takes that as the cue to end
+/// every PTY it has open, which is the only way a script that never sees the
+/// window's pane ids can make their processes exit.
+async fn close(client: &DaemonClient, pty: Option<PtyId>) -> Result<(), String> {
+    let pty_id = pty.ok_or_else(|| "`close` needs an `open` before it".to_owned())?;
+    client
+        .request_raw(Request::PtyClose(PtyIdParams { pty_id }))
+        .await
+        .map_err(|e| e.to_string())?;
+    // The exits travel as events, so give them time to reach the terminals
+    // before the next step tears their panes down.
+    tokio::time::sleep(EXIT_SETTLE).await;
+    Ok(())
+}
+
+/// Destroys the workspace and announces it with the signal the
+/// `destroy_workspace` invokable emits, which is what makes the window drop the
+/// tab and close its terminals.
+async fn destroy(
+    client: &DaemonClient,
+    qt: &QtHandle,
+    workspace: Option<WorkspaceId>,
+) -> Result<(), String> {
+    let workspace_id = need(workspace.as_ref(), "destroy")?;
+    client
+        .request_raw(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+            workspace_id: workspace_id.clone(),
+            force: true,
+        }))
+        .await
+        .map_err(|e| e.to_string())?;
+    let id = workspace_id.to_string();
+    qt.queue(move |q| q.workspace_destroyed(QString::from(&id)))
+        .map_err(|_| "the Qt thread is gone".to_owned())?;
     Ok(())
 }
 

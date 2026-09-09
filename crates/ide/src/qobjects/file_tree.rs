@@ -7,7 +7,7 @@
 //! model at another workspace drops it.
 
 use crate::model::file_tree::FileTree;
-use crate::qobjects::app_controller::{runtime, shared};
+use crate::qobjects::app_controller::{require_connection, runtime};
 use bondsymphonic_proto::{FsPathParams, ListDirResult, Request, WorkspaceId};
 
 #[cxx_qt::bridge]
@@ -70,9 +70,6 @@ use cxx_qt::CxxQtType;
 use cxx_qt::Threading;
 use cxx_qt_lib::QString;
 
-/// Reported when a listing is asked for before the daemon connection exists.
-const NOT_CONNECTED: &str = "not connected to the daemon";
-
 #[derive(Default)]
 pub struct FileTreeModelRust {
     workspace_id: String,
@@ -85,10 +82,13 @@ impl qobject::FileTreeModel {
         let path = path.to_string();
         self.as_mut().adopt_workspace(&workspace);
 
-        let Some(shared) = shared() else {
-            // Already on the Qt thread, so the failure is reported directly.
-            self.load_failed(QString::from(&path), QString::from(NOT_CONNECTED));
-            return;
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                // Already on the Qt thread, so the failure is reported directly.
+                self.load_failed(QString::from(&path), QString::from(message));
+                return;
+            }
         };
         let qt = self.qt_thread();
         runtime().spawn(async move {

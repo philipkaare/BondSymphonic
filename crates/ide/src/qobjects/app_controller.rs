@@ -35,19 +35,52 @@ pub struct Shared {
 
 static SHARED: OnceLock<std::sync::Mutex<Option<Shared>>> = OnceLock::new();
 
+/// Set once the connection has ended, so an operation attempted afterwards can
+/// say the connection was lost rather than that it never started.
+static CONNECTION_WAS_LOST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn shared_slot() -> &'static std::sync::Mutex<Option<Shared>> {
     SHARED.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 /// The live daemon connection and event router, or `None` before `start` has
-/// connected. The returned clone keeps working across reconnects only until the
-/// next successful connect replaces it, so callers should fetch it per operation
-/// rather than caching it.
+/// connected and again once the connection has been lost. The returned clone
+/// keeps working only until the slot is replaced, so callers fetch it per
+/// operation rather than caching it.
 pub fn shared() -> Option<Shared> {
     shared_slot()
         .lock()
         .expect("shared handle mutex poisoned")
         .clone()
+}
+
+/// Publishes a fresh connection for every QObject to use.
+pub fn publish_shared(shared: Shared) {
+    CONNECTION_WAS_LOST.store(false, std::sync::atomic::Ordering::SeqCst);
+    *shared_slot().lock().expect("shared handle mutex poisoned") = Some(shared);
+}
+
+/// Drops the process-wide connection handle because the daemon connection has
+/// ended. Nothing reconnects in this milestone, so leaving the dead client in
+/// the slot would only mean every later operation issues a request on it and
+/// fails with a protocol error instead of a sentence the user can act on.
+pub fn on_connection_lost() {
+    CONNECTION_WAS_LOST.store(true, std::sync::atomic::Ordering::SeqCst);
+    *shared_slot().lock().expect("shared handle mutex poisoned") = None;
+}
+
+/// The live connection, or the message an operation should fail with. Every
+/// invokable goes through this, so once the connection is gone each of them
+/// fails immediately, with a reason, instead of talking to a dead client.
+pub fn require_connection() -> Result<Shared, &'static str> {
+    match shared() {
+        Some(shared) => Ok(shared),
+        None if CONNECTION_WAS_LOST.load(std::sync::atomic::Ordering::SeqCst) => {
+            Err(CONNECTION_LOST)
+        }
+        None => Err(NOT_CONNECTED),
+    }
 }
 
 #[cxx_qt::bridge]
@@ -159,12 +192,13 @@ pub(crate) type QtHandle = cxx_qt::CxxQtThread<qobject::AppController>;
 /// Shared handle to the running daemon so a later "Exit" action can shut it down.
 type ProcessHandle = std::sync::Arc<tokio::sync::Mutex<Option<launcher::DaemonProcess>>>;
 
-/// Warn-level daemon logs starting with this are the event-queue overflow
-/// notice, which the UI surfaces as a terminal banner rather than a log line.
-const DROP_NOTICE_PREFIX: &str = "events dropped: ";
-
 /// Reported when an invokable runs before `start` has connected.
-const NOT_CONNECTED: &str = "not connected to the daemon";
+pub const NOT_CONNECTED: &str = "not connected to the daemon";
+
+/// Reported once the daemon connection has ended. Distinct from
+/// [`NOT_CONNECTED`] because the two need different answers from the user:
+/// one is "wait", the other is "restart the IDE".
+pub const CONNECTION_LOST: &str = "daemon connection lost";
 
 pub struct AppControllerRust {
     connection_state: i32,
@@ -200,26 +234,32 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
         // Every consumer sees the event before the controller acts on it, so a
         // terminal's output is never delayed behind UI work.
         router.dispatch(ws, ev.clone());
+        // The daemon discarded events for this connection: every terminal has
+        // a hole in it and says so. Recognised through the proto helper the
+        // daemon builds the notice with, so the wording lives in one place.
+        if let Some(count) = ev.dropped_event_count() {
+            let count = i64::try_from(count).unwrap_or(i64::MAX);
+            let _ = qt.queue(move |q| q.output_dropped(count));
+            continue;
+        }
         match ev {
             Event::WorkspaceStateChanged { info } => {
                 let json = serde_json::to_string(&info).unwrap_or_default();
                 let _ = qt.queue(move |q| q.workspace_changed(QString::from(&json)));
             }
-            Event::DaemonLog {
-                level, ref message, ..
-            } if level == LogLevel::Warn && message.starts_with(DROP_NOTICE_PREFIX) => {
-                let count = message[DROP_NOTICE_PREFIX.len()..]
-                    .trim()
-                    .parse::<i64>()
-                    .unwrap_or(0);
-                let _ = qt.queue(move |q| q.output_dropped(count));
-            }
             Event::DaemonLog { level, message, .. } => tracing::info!(?level, "{message}"),
             _ => {}
         }
     }
-    // The stream only ends when the connection does.
-    let _ = qt.queue(|q| q.set_state(ConnectionState::Reconnecting));
+    // The stream only ends when the connection does. Drop the shared handle
+    // first: the state change below is what the status bar shows, but it is the
+    // empty slot that makes the next operation fail at once instead of issuing
+    // a request nobody will answer.
+    on_connection_lost();
+    let _ = qt.queue(|mut q| {
+        q.as_mut().rust_mut().client = None;
+        q.set_state(ConnectionState::Lost);
+    });
 }
 
 /// How long to wait before the single `workspace.list` retry.
@@ -313,7 +353,7 @@ impl qobject::AppController {
             // Published before any event is dispatched, so a QObject woken by the
             // first `workspaces_listed` can already reach the daemon.
             let router = EventRouter::new();
-            *shared_slot().lock().expect("shared handle mutex poisoned") = Some(Shared {
+            publish_shared(Shared {
                 client: client.clone(),
                 router: router.clone(),
             });
@@ -400,9 +440,12 @@ impl qobject::AppController {
         // Echoed straight back on success: the controller keeps no tab state.
         let (group, adapter, command) =
             (group.to_string(), adapter.to_string(), command.to_string());
-        let Some(shared) = shared() else {
-            report_failure(&qt, "workspace.create", NOT_CONNECTED.to_owned());
-            return;
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_failure(&qt, "workspace.create", message.to_owned());
+                return;
+            }
         };
         runtime().spawn(async move {
             match shared
@@ -429,9 +472,12 @@ impl qobject::AppController {
     pub fn destroy_workspace(self: Pin<&mut Self>, id: QString, force: bool) {
         let qt = self.qt_thread();
         let id = id.to_string();
-        let Some(shared) = shared() else {
-            report_failure(&qt, "workspace.destroy", NOT_CONNECTED.to_owned());
-            return;
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_failure(&qt, "workspace.destroy", message.to_owned());
+                return;
+            }
         };
         runtime().spawn(async move {
             let params = WorkspaceDestroyParams {
@@ -454,9 +500,12 @@ impl qobject::AppController {
     pub fn inspect_repo(self: Pin<&mut Self>, path: QString) {
         let qt = self.qt_thread();
         let path = path.to_string();
-        let Some(shared) = shared() else {
-            report_failure(&qt, "repo.inspect", NOT_CONNECTED.to_owned());
-            return;
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_failure(&qt, "repo.inspect", message.to_owned());
+                return;
+            }
         };
         runtime().spawn(async move {
             let params = RepoPathParams { path: path.clone() };

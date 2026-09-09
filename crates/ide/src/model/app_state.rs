@@ -10,7 +10,10 @@ pub enum ConnectionState {
     Launching,
     Connecting,
     Connected,
-    Reconnecting,
+    /// The connection ended. Nothing reconnects in this milestone, so this is
+    /// a terminal state: every operation fails immediately until the IDE is
+    /// restarted.
+    Lost,
     Error,
 }
 
@@ -22,7 +25,7 @@ impl ConnectionState {
             Self::Launching => 1,
             Self::Connecting => 2,
             Self::Connected => 3,
-            Self::Reconnecting => 4,
+            Self::Lost => 4,
             Self::Error => 5,
         }
     }
@@ -36,7 +39,7 @@ impl ConnectionState {
             1 => Self::Launching,
             2 => Self::Connecting,
             3 => Self::Connected,
-            4 => Self::Reconnecting,
+            4 => Self::Lost,
             _ => Self::Error,
         }
     }
@@ -48,7 +51,7 @@ impl ConnectionState {
             Self::Launching => "daemon: launching",
             Self::Connecting => "daemon: connecting",
             Self::Connected => "daemon: connected",
-            Self::Reconnecting => "daemon: reconnecting",
+            Self::Lost => "daemon: connection lost",
             Self::Error => "daemon: error",
         }
     }
@@ -390,7 +393,7 @@ mod tests {
         ConnectionState::Launching,
         ConnectionState::Connecting,
         ConnectionState::Connected,
-        ConnectionState::Reconnecting,
+        ConnectionState::Lost,
         ConnectionState::Error,
     ];
 
@@ -399,6 +402,14 @@ mod tests {
         let codes: std::collections::HashSet<i32> = ALL_STATES.iter().map(|s| s.as_i32()).collect();
         assert_eq!(codes.len(), ALL_STATES.len());
         assert_eq!(ConnectionState::Connected.label(), "daemon: connected");
+        // The state the controller lands in when the event stream ends. It has
+        // to say the connection is gone: nothing reconnects, so a status bar
+        // promising a reconnect would be a lie the user waits on.
+        assert_eq!(ConnectionState::Lost.label(), "daemon: connection lost");
+        assert_eq!(
+            compose_status(ConnectionState::Lost.label(), "0.1.0"),
+            "daemon: connection lost v0.1.0"
+        );
     }
 
     #[test]
