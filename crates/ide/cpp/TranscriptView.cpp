@@ -36,6 +36,12 @@ const char* kBodyName = "bsTranscriptBody";
 /// system code page would mangle it.
 constexpr char16_t kMiddleDot = 0x00B7;
 
+/// HORIZONTAL ELLIPSIS, for the placeholders that say the box is waiting. A
+/// code point for the same reason as the dot above: written as a literal, its
+/// UTF-8 bytes are re-read in the system code page and the word ends in
+/// mojibake, with no compiler warning because each byte happens to map.
+constexpr char16_t kEllipsis = 0x2026;
+
 /// How much smaller than the pane's font the result and system lines are.
 constexpr qreal kSmallTextScale = 0.85;
 
@@ -180,6 +186,9 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     });
     QObject::connect(model, &TranscriptModel::busyChanged, this, &TranscriptView::onBusyChanged);
     QObject::connect(model, &TranscriptModel::stateChanged, this, &TranscriptView::onStateChanged);
+    // Attaching is what opens the box: until the id lands there is no agent to
+    // send a prompt to.
+    QObject::connect(model, &TranscriptModel::agentIdChanged, this, &TranscriptView::onStateChanged);
     QObject::connect(model, &TranscriptModel::stateDetailChanged, this, &TranscriptView::refreshBanner);
 
     QObject::connect(m_input, &PromptInput::submitted, this, [this](const QString& text) {
@@ -234,6 +243,14 @@ void TranscriptView::rebuild() {
     // A rebuild is a fresh look at the conversation, and the foot of it is
     // where the newest message is.
     m_stickToBottom = true;
+    // `attach` clears the pending request without emitting `permissionCleared`,
+    // so a bar left up from a previous attach would answer for a request nobody
+    // is waiting on. Re-reading the property here shows or hides it either way.
+    onPermissionRequested();
+    // The last failed request belonged to the transcript that has just been
+    // replaced.
+    m_requestError.clear();
+    refreshBanner();
 }
 
 void TranscriptView::onItemAppended(int index) {
@@ -291,14 +308,24 @@ void TranscriptView::onStateChanged() {
     const bool busy = m_model->getBusy();
     const QString state = m_model->getState();
     const bool working = state == QString::fromUtf8(kStateWorking);
-    if (busy) {
-        m_input->setBusy(true, QStringLiteral("replaying history…"));
+    // A model that has never been attached answers `idle` and `not busy`, which
+    // would leave the box live in the seconds `agent.start` takes. `send` then
+    // drops the text, because there is no agent to send it to, and the prompt
+    // the user typed while waiting disappears without a word. Waiting for the
+    // id is the one condition that covers the box and both buttons.
+    const bool starting = m_model->getAgentId().isEmpty();
+    if (starting) {
+        m_input->setBusy(true, QStringLiteral("starting the agent") + QChar(kEllipsis));
+    } else if (busy) {
+        m_input->setBusy(true, QStringLiteral("replaying history") + QChar(kEllipsis));
     } else {
         m_input->setBusy(working);
     }
-    m_interrupt->setEnabled(!busy && working);
-    // Nothing left to stop once the process is gone.
-    m_stop->setEnabled(!busy && state != QString::fromUtf8(kStateExited) && !state.isEmpty());
+    m_interrupt->setEnabled(!starting && !busy && working);
+    // Nothing left to stop once the process is gone, and nothing yet to stop
+    // before it exists.
+    m_stop->setEnabled(!starting && !busy && state != QString::fromUtf8(kStateExited) &&
+                       !state.isEmpty());
     refreshBanner();
 }
 
