@@ -141,36 +141,43 @@ pub fn read_file(root: &Path, rel: &str) -> Result<ReadFileResult, RpcError> {
     file.take(MAX_READ as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| RpcError::io(&e))?;
+    Ok(classify(&bytes))
+}
+
+/// Applies [`read_file`]'s content policy to bytes that came from somewhere else
+/// — a git blob, say — so every text the daemon hands a client is classified the
+/// same way, whichever side of a diff it came from.
+///
+/// `bytes` is expected to hold at most `MAX_READ + 1` bytes, the extra byte being
+/// what distinguishes content that is exactly `MAX_READ` long from longer content;
+/// anything past the cap is dropped here rather than sent.
+pub fn classify(bytes: &[u8]) -> ReadFileResult {
     let truncated = bytes.len() > MAX_READ;
-    let slice = if truncated {
-        &bytes[..MAX_READ]
-    } else {
-        &bytes[..]
-    };
+    let slice = if truncated { &bytes[..MAX_READ] } else { bytes };
     match std::str::from_utf8(slice) {
-        Ok(s) => Ok(ReadFileResult {
+        Ok(s) => ReadFileResult {
             content: s.to_string(),
             encoding: "utf-8".into(),
             truncated,
-        }),
+        },
         Err(e)
             if truncated
                 && e.valid_up_to() > 0
                 && slice[..e.valid_up_to()].len() + 4 >= slice.len() =>
         {
-            Ok(ReadFileResult {
+            ReadFileResult {
                 content: std::str::from_utf8(&slice[..e.valid_up_to()])
                     .unwrap()
                     .to_string(),
                 encoding: "utf-8".into(),
                 truncated: true,
-            })
+            }
         }
-        Err(_) => Ok(ReadFileResult {
+        Err(_) => ReadFileResult {
             content: String::new(),
             encoding: "binary".into(),
             truncated,
-        }),
+        },
     }
 }
 

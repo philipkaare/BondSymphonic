@@ -3,11 +3,33 @@
 //! pinned `worktree_git` so an agent-writable worktree cannot steer git.
 
 use crate::daemon::Daemon;
+use crate::git::Git;
 use crate::workspace::lifecycle::layout_for;
+use crate::workspace::Workspace;
 use bondsymphonic_proto::{
     ChangedFile, ChangesResult, DiffResult, FileStatus, RpcError, WorkspaceId,
 };
 use std::collections::HashMap;
+
+/// The commit a workspace is measured against: where its branch left the base.
+async fn merge_base(git: &Git, ws: &Workspace) -> Result<String, RpcError> {
+    let out = git
+        .run(&ws.worktree_path, &["merge-base", &ws.base_branch, "HEAD"])
+        .await?;
+    Ok(out.stdout.trim().to_string())
+}
+
+/// Line endings belong to the checkout, not to the change: git stores blobs with
+/// LF and hands the worktree whatever `core.eol` and `core.autocrlf` say, so
+/// comparing the two sides raw would report every line of an untouched file as
+/// changed. Both sides are normalised to LF before they go out.
+fn normalise_eol(s: String) -> String {
+    if s.contains('\r') {
+        s.replace("\r\n", "\n")
+    } else {
+        s
+    }
+}
 
 /// Changed files vs the merge-base, committed and uncommitted alike, one entry
 /// per path, sorted by path.
@@ -16,10 +38,7 @@ pub async fn changes(d: &Daemon, id: &WorkspaceId) -> Result<ChangesResult, RpcE
     let layout = layout_for(d, &ws).await?;
     let git = layout.worktree_git();
     let cwd = ws.worktree_path.clone();
-    let base = git
-        .run(&cwd, &["merge-base", &ws.base_branch, "HEAD"])
-        .await?;
-    let base = base.stdout.trim().to_string();
+    let base = merge_base(&git, &ws).await?;
 
     let name_status = git
         .run(&cwd, &["diff", "--name-status", "-M", "-z", &base, "--"])
@@ -74,17 +93,41 @@ pub async fn changes(d: &Daemon, id: &WorkspaceId) -> Result<ChangesResult, RpcE
 pub async fn diff(d: &Daemon, id: &WorkspaceId, path: &str) -> Result<DiffResult, RpcError> {
     let ws = d.workspace(id)?;
     // Containment first: git would happily show any path in the object store.
-    crate::fs::resolve(&ws.worktree_path, path)?;
+    let resolved = crate::fs::resolve(&ws.worktree_path, path)?;
+    if resolved.is_dir() {
+        // `git show <sha>:<dir>` answers with a tree listing, which is not a
+        // side of a diff and would reach the editor looking like file content.
+        return Err(RpcError::invalid_params("path is a directory"));
+    }
     let layout = layout_for(d, &ws).await?;
     let git = layout.worktree_git();
     let cwd = ws.worktree_path.clone();
-    let base = git
-        .run(&cwd, &["merge-base", &ws.base_branch, "HEAD"])
-        .await?;
-    let spec = format!("{}:{}", base.stdout.trim(), path);
+    // Git speaks `/` in every pathspec, on every platform. `resolve` accepts the
+    // separator the client's platform uses, so on Windows it has to be converted
+    // rather than passed through; on unix `\` is an ordinary filename character
+    // and converting it would ask git for a path that does not exist.
+    let spec_path = if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path.to_owned()
+    };
+    let spec = format!("{}:{}", merge_base(&git, &ws).await?, spec_path);
     // A missing path at the merge-base is a normal "added" file, not an error.
-    let base_text = match git.run(&cwd, &["show", &spec]).await {
-        Ok(out) => out.stdout,
+    // Read as bytes and classified like any other file the daemon serves: a
+    // binary blob is empty rather than mojibake, and an oversized one is cut at
+    // the same cap `fs::read_file` uses instead of crossing the wire whole.
+    let base_text = match git
+        .run_bytes(&cwd, &["show", &spec], crate::fs::MAX_READ)
+        .await
+    {
+        Ok(out) => {
+            let r = crate::fs::classify(&out.stdout);
+            if r.encoding == "binary" {
+                String::new()
+            } else {
+                r.content
+            }
+        }
         Err(_) => String::new(),
     };
     let root = cwd.clone();
@@ -96,8 +139,8 @@ pub async fn diff(d: &Daemon, id: &WorkspaceId, path: &str) -> Result<DiffResult
     .await
     .map_err(|e| RpcError::internal(e.to_string()))?;
     Ok(DiffResult {
-        base_text,
-        work_text,
+        base_text: normalise_eol(base_text),
+        work_text: normalise_eol(work_text),
     })
 }
 
@@ -183,6 +226,10 @@ pub fn merge_changes(
         deletions: 0,
     }));
     files.sort_by(|a, b| a.path.cmp(&b.path));
+    // The two sources are disjoint by construction — git does not report a path as
+    // both tracked-changed and untracked — so this only ever fires if a third
+    // source is added later, and it *drops* rather than merges. Anything that adds
+    // one has to decide how the counts combine here.
     files.dedup_by(|a, b| a.path == b.path);
     files
 }

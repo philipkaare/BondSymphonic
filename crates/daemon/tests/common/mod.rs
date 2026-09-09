@@ -163,10 +163,11 @@ pub async fn create_ws(c: &mut Client, repo: &std::path::Path, name: &str) -> Wo
     .unwrap()
 }
 
-/// Commits whatever is in a workspace worktree the way the sandbox does: new
-/// objects land in the workspace's private object directory, so the commit is
-/// only reachable from the main store through that directory. `env` is
-/// `Layout::sandbox_git_env()`.
+/// Commits whatever is in a working tree. With `env` set to
+/// `Layout::sandbox_git_env()` this commits inside a workspace worktree the way
+/// the sandbox does — new objects land in the workspace's private object
+/// directory, so the commit is only reachable from the main store through that
+/// directory. With an empty `env` it is a plain commit in an ordinary repo.
 pub fn commit_all(worktree: &Path, env: &[(String, String)], message: &str) {
     for args in [
         ["add", "-A"].as_slice(),
