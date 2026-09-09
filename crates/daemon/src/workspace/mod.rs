@@ -1,3 +1,4 @@
+pub mod changes;
 pub mod lifecycle;
 pub mod registry;
 

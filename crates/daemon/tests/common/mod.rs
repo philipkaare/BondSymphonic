@@ -148,3 +148,40 @@ pub async fn start_daemon(root: &std::path::Path) -> (u16, String, Arc<Daemon>, 
     tokio::spawn(async move { server.with_handler(handler).run(c2).await.unwrap() });
     (port, token, daemon, cancel)
 }
+
+/// Creates a workspace on `main` and returns its info.
+pub async fn create_ws(c: &mut Client, repo: &std::path::Path, name: &str) -> WorkspaceInfo {
+    serde_json::from_value(
+        c.call(Request::WorkspaceCreate(WorkspaceCreateParams {
+            repo_path: repo.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: name.into(),
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+/// Commits whatever is in a workspace worktree the way the sandbox does: new
+/// objects land in the workspace's private object directory, so the commit is
+/// only reachable from the main store through that directory. `env` is
+/// `Layout::sandbox_git_env()`.
+pub fn commit_all(worktree: &Path, env: &[(String, String)], message: &str) {
+    for args in [
+        ["add", "-A"].as_slice(),
+        ["commit", "-q", "-m", message].as_slice(),
+    ] {
+        let mut cmd = Command::new("git");
+        cmd.args(args)
+            .current_dir(worktree)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        assert!(cmd.status().unwrap().success(), "git {args:?}");
+    }
+}

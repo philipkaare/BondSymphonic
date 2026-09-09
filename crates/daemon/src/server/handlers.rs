@@ -3,7 +3,7 @@
 
 use crate::daemon::Daemon;
 use crate::server::dispatch::{ConnCtx, Handler, SystemHandler};
-use crate::workspace::lifecycle;
+use crate::workspace::{changes, lifecycle};
 use async_trait::async_trait;
 use bondsymphonic_proto::*;
 use serde_json::Value;
@@ -47,6 +47,8 @@ impl Handler for WorkspaceHandler {
                 ok(lifecycle::destroy(d, &p.workspace_id, p.force).await?)
             }
             Request::WorkspaceStatus(p) => ok(lifecycle::status(d, &p.workspace_id).await?),
+            Request::WorkspaceChanges(p) => ok(changes::changes(d, &p.workspace_id).await?),
+            Request::WorkspaceDiff(p) => ok(changes::diff(d, &p.workspace_id, &p.path).await?),
             Request::PtyOpen(p) => ok(d.ptys.open(d, p).await?),
             Request::PtyWrite(p) => ok(d.ptys.write(p).await?),
             Request::PtyResize(p) => ok(d.ptys.resize(p).await?),
