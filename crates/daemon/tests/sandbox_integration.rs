@@ -125,6 +125,7 @@ async fn bwrap_isolates_filesystem_pids_and_network() {
         id: "ws_t".into(),
         rw_binds: vec![(work.clone(), work.clone())],
         ro_binds: vec![],
+        late_ro_binds: vec![],
         home: dir.path().join("home"),
         run_dir: dir.path().join("run"),
         env: vec![],
@@ -319,6 +320,7 @@ async fn init_tears_down_when_the_exec_socket_closes() {
         id: "ws_teardown".into(),
         rw_binds: vec![(work.clone(), work.clone())],
         ro_binds: vec![],
+        late_ro_binds: vec![],
         home: dir.path().join("home"),
         run_dir: run_dir.clone(),
         env: vec![],
@@ -394,6 +396,7 @@ async fn killing_a_child_takes_its_process_group_with_it() {
         id: "ws_kill".into(),
         rw_binds: vec![(work.clone(), work.clone())],
         ro_binds: vec![],
+        late_ro_binds: vec![],
         home: dir.path().join("home"),
         run_dir: dir.path().join("run"),
         env: vec![],
@@ -448,6 +451,7 @@ async fn a_sandboxed_process_gets_only_the_environment_the_backend_gives_it() {
         id: "ws_env".into(),
         rw_binds: vec![(work.clone(), work.clone())],
         ro_binds: vec![],
+        late_ro_binds: vec![],
         home: dir.path().join("home"),
         run_dir: dir.path().join("run"),
         env: vec![("BS_WORKSPACE".into(), "ws_env".into())],
@@ -570,6 +574,7 @@ async fn a_sandboxed_process_cannot_shut_init_down_or_kill_arbitrary_pids() {
         id: "ws_hostile".into(),
         rw_binds: vec![(work.clone(), work.clone())],
         ro_binds: vec![],
+        late_ro_binds: vec![],
         home: dir.path().join("home"),
         run_dir: dir.path().join("run"),
         env: vec![],
@@ -622,3 +627,150 @@ print("sent")
     wait_until(std::time::Duration::from_secs(8), || !pgrep(&sleeper)).await;
     handle.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// C1 round 2: `config.worktree` is repository config, and repository config is
+// arbitrary code. It lives in the per-worktree gitdir, which the agent needs
+// write access to for `HEAD`, the index and their locks, so the single file is
+// bound read-only over the writable directory instead.
+// ---------------------------------------------------------------------------
+
+/// Creates a bwrap-backed workspace and returns the daemon, its info and the
+/// layout.
+async fn bwrap_workspace(
+    dir: &std::path::Path,
+    repo: &std::path::Path,
+    name: &str,
+) -> (
+    std::sync::Arc<Daemon>,
+    bondsymphonic_proto::WorkspaceInfo,
+    bondsymphonic_daemon::git::worktree::Layout,
+) {
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let daemon = Daemon::new(
+        DataDirs::new(dir.join("data")),
+        backend_for("linux_bwrap"),
+        server.event_bus(),
+    )
+    .unwrap();
+    let ws = lifecycle::create(
+        &daemon,
+        WorkspaceCreateParams {
+            repo_path: repo.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: name.into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+    let layout = lifecycle::layout_for(&daemon, &daemon.workspace(&ws.id).unwrap())
+        .await
+        .unwrap();
+    (daemon, ws, layout)
+}
+
+/// The read-only bind has to hold against every way of replacing a file, while
+/// leaving the rest of the gitdir writable — git cannot work otherwise.
+#[tokio::test]
+async fn a_sandboxed_process_cannot_write_the_worktree_config() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (daemon, ws, layout) = bwrap_workspace(dir.path(), &repo, "roconf").await;
+    let handle = daemon.sandbox(&ws.id).unwrap();
+
+    let probe = PROBE_SCRIPT.replace("@GD@", &layout.worktree_gitdir().to_string_lossy());
+    let (_, out) = run_in(&handle, &probe).await;
+    for expected in [
+        "write: refused",
+        "unlink: refused",
+        "rename-over: refused",
+        "sibling: written",
+        "index: writable",
+    ] {
+        assert!(
+            out.lines().any(|l| l == expected),
+            "expected {expected:?} in:\n{out}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(layout.config_worktree()).unwrap(),
+        Vec::<u8>::new(),
+        "the daemon's empty config.worktree must survive the sandbox"
+    );
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+}
+
+const PROBE_SCRIPT: &str = r#"
+gd='@GD@'
+if printf x > "$gd/config.worktree" 2>/dev/null; then echo "write: SUCCEEDED"; else echo "write: refused"; fi
+if rm -f "$gd/config.worktree" 2>/dev/null; then echo "unlink: SUCCEEDED"; else echo "unlink: refused"; fi
+if mv "$gd/gitdir" "$gd/config.worktree" 2>/dev/null; then echo "rename-over: SUCCEEDED"; else echo "rename-over: refused"; fi
+if printf x > "$gd/sibling" 2>/dev/null; then echo "sibling: written"; else echo "sibling: REFUSED"; fi
+if [ -w "$gd/index" ]; then echo "index: writable"; else echo "index: READ-ONLY"; fi
+"#;
+
+/// The attack the read-only bind exists for, run end to end: a sandboxed agent
+/// plants a `clean` filter in `config.worktree`, marks every file as using it,
+/// and touches a tracked file so the daemon's next `status` has to re-hash it.
+/// No key deny-list can stop this one — the driver name is the agent's to pick
+/// — so the write itself has to fail.
+///
+/// Linux only: `noop` has no mounts and therefore no defence here. It is a
+/// development and test backend and does not sandbox anything.
+#[tokio::test]
+async fn a_sandboxed_agent_cannot_make_status_run_a_filter_driver() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    // The extension is what makes git read config.worktree at all. Enabling it
+    // is an ordinary thing for a repository owner to have done.
+    assert!(std::process::Command::new("git")
+        .args(["config", "extensions.worktreeConfig", "true"])
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success());
+    let (daemon, ws, layout) = bwrap_workspace(dir.path(), &repo, "filter").await;
+    let handle = daemon.sandbox(&ws.id).unwrap();
+    let marker = dir.path().join("pwned-filter.txt");
+
+    let attack = FILTER_ATTACK
+        .replace("@GD@", &layout.worktree_gitdir().to_string_lossy())
+        .replace("@WT@", &ws.worktree_path)
+        .replace("@MARKER@", &marker.to_string_lossy());
+    let (_, out) = run_in(&handle, &attack).await;
+    assert!(
+        out.lines().any(|l| l == "config: refused"),
+        "the agent wrote config.worktree:\n{out}"
+    );
+    // The rest of the attack must still have worked, or the test would pass for
+    // the wrong reason.
+    for expected in ["attrs: written", "touched"] {
+        assert!(
+            out.lines().any(|l| l == expected),
+            "expected {expected:?} in:\n{out}"
+        );
+    }
+
+    lifecycle::status(&daemon, &ws.id).await.unwrap();
+    assert!(
+        !marker.exists(),
+        "workspace.status ran a filter driver the agent planted"
+    );
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+}
+
+const FILTER_ATTACK: &str = r#"
+gd='@GD@'; wt='@WT@'
+if printf '[filter "evil"]\n\tclean = sh -c "printf pwned > @MARKER@; cat"\n' > "$gd/config.worktree" 2>/dev/null; then echo "config: WRITTEN"; else echo "config: refused"; fi
+if printf '* filter=evil\n' > "$wt/.gitattributes" 2>/dev/null; then echo "attrs: written"; else echo "attrs: REFUSED"; fi
+if touch "$wt/README.md" 2>/dev/null; then echo "touched"; else echo "TOUCH-REFUSED"; fi
+"#;

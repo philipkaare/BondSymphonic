@@ -42,12 +42,16 @@ pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
     let home_in_sandbox = PathBuf::from(format!("/home/{}", sandbox_user()));
     rw_binds.push((cache, home_in_sandbox.join(".cache")));
     let ro_binds = vec![same(&layout.git_common)];
+    // Read-only *after* the read-write bind of its parent gitdir, or the parent
+    // would put the writable original straight back on top of it.
+    let late_ro_binds = vec![same(&layout.config_worktree())];
     let mut env = layout.sandbox_git_env();
     env.push(("BS_WORKSPACE".into(), ws.id.to_string()));
     SandboxSpec {
         id: ws.id.clone(),
         rw_binds,
         ro_binds,
+        late_ro_binds,
         home: d.dirs.home(&ws.id),
         run_dir: d.dirs.run(&ws.id),
         env,
@@ -64,6 +68,13 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
     ] {
         std::fs::create_dir_all(p).map_err(|e| RpcError::io(&e))?;
     }
+    // The daemon owns `config.worktree`, empty, and the sandbox gets it
+    // read-only. Written on every start rather than only at creation, so that a
+    // workspace made before this existed — or one whose file an agent managed to
+    // write — starts from a file the daemon put there. Nothing legitimate is
+    // lost: git only writes this file for features (sparse-checkout) the
+    // read-only bind rules out inside the sandbox anyway.
+    std::fs::write(layout.config_worktree(), b"").map_err(|e| RpcError::io(&e))?;
     let handle = d.backend.start(&spec_for(d, ws, &layout)).await?;
     d.sandboxes.lock().insert(ws.id.clone(), handle.clone());
     watch_sandbox(d, &ws.id, handle);

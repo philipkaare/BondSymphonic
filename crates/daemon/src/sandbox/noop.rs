@@ -542,6 +542,7 @@ mod tests {
                 id: "ws_unit".into(),
                 rw_binds: vec![],
                 ro_binds: vec![],
+                late_ro_binds: vec![],
                 home: dir.join("home"),
                 run_dir: dir.join("run"),
                 env: vec![("FROM_SPEC".into(), "1".into())],

@@ -34,6 +34,17 @@ impl Layout {
     pub fn rw_git_paths(&self) -> Vec<PathBuf> {
         vec![self.worktree_gitdir(), self.ref_dir(), self.reflog_dir()]
     }
+    /// The one file inside the read-write worktree gitdir that the agent must
+    /// not be able to write.
+    ///
+    /// On a repository with `extensions.worktreeConfig` enabled, git reads this
+    /// as repository config for the worktree, and repository config is arbitrary
+    /// code: a `filter.<anything>.clean` driver runs whenever `git status` has to
+    /// re-hash a file the agent has touched. The daemon owns the file and the
+    /// sandbox gets it read-only.
+    pub fn config_worktree(&self) -> PathBuf {
+        self.worktree_gitdir().join("config.worktree")
+    }
     /// Env for git *inside* the sandbox: new objects go to the private dir.
     pub fn sandbox_git_env(&self) -> Vec<(String, String)> {
         vec![
@@ -78,19 +89,22 @@ impl Layout {
 /// Config keys whose value git executes as a command, cleared on the command
 /// line for every daemon-side worktree command.
 ///
-/// Pinning the repository is not by itself enough. The per-worktree gitdir is
-/// writable by the agent, and git reads `config.worktree` from it whenever the
-/// repository has `extensions.worktreeConfig` enabled. `-c
-/// extensions.worktreeConfig=false` does **not** turn that off — git reads the
-/// extension out of the repository format during setup, before command-line
-/// config exists — so the keys themselves are emptied instead, which does win
-/// because `-c` outranks every config file. Measured against git 2.43 and 2.52:
-/// `core.fsmonitor` is the one `git status` reaches, and the rest are here so a
-/// future daemon-side worktree command does not quietly reopen the hole.
+/// **Defence in depth, not the primary control.** The primary control is the
+/// read-only bind of [`Layout::config_worktree`], because a key list cannot
+/// close this class of hole: `filter.<any name>.clean` is a command git runs
+/// whenever it re-hashes a file, and the driver name is chosen by whoever wrote
+/// the config. This list only shortens the reach of the keys with fixed names,
+/// for a repository whose `config.worktree` somehow became writable anyway and
+/// for the `noop` backend, which has no mounts and therefore no protection at
+/// all — it is a development and test backend and does not sandbox anything.
 ///
-/// Any new key git learns to execute has to be added here; that is the cost of
-/// leaving the per-worktree gitdir writable, which the agent needs for `HEAD`,
-/// the index and its lock files.
+/// Pinning the repository is not enough by itself either. The per-worktree
+/// gitdir is writable by the agent (it needs `HEAD`, the index and their lock
+/// files), and git reads `config.worktree` from it whenever the repository has
+/// `extensions.worktreeConfig` enabled. `-c extensions.worktreeConfig=false`
+/// does **not** turn that off — git takes the extension from the repository
+/// format during setup, before command-line config exists. Measured against git
+/// 2.43 and 2.52: `core.fsmonitor` is the one `git status` reaches by name.
 const NEUTRALISED_CONFIG: &[&str] = &[
     "core.fsmonitor",
     "core.hooksPath",

@@ -110,6 +110,11 @@ pub fn bwrap_args(spec: &SandboxSpec, socket_in_sandbox: &Path, self_exe: &Path)
     for (h, sb) in &spec.rw_binds {
         a.extend(["--bind".into(), s(h), s(sb)]);
     }
+    // After the read-write binds, or the bind of the containing directory would
+    // put the writable original back on top of them.
+    for (h, sb) in &spec.late_ro_binds {
+        a.extend(["--ro-bind".into(), s(h), s(sb)]);
+    }
     a.extend(["--bind".into(), s(&spec.run_dir), "/run/bs".into()]);
     a.extend(
         [
@@ -294,6 +299,10 @@ mod tests {
             id: "ws_1".into(),
             rw_binds: vec![("/data/worktrees/ws_1".into(), "/data/worktrees/ws_1".into())],
             ro_binds: vec![("/repo/.git".into(), "/repo/.git".into())],
+            late_ro_binds: vec![(
+                "/repo/.git/worktrees/ws_1/config.worktree".into(),
+                "/repo/.git/worktrees/ws_1/config.worktree".into(),
+            )],
             home: "/data/homes/ws_1".into(),
             run_dir: "/data/run/ws_1".into(),
             env: vec![],
@@ -332,6 +341,7 @@ mod tests {
             id: "ws_1".into(),
             rw_binds: vec![],
             ro_binds: vec![],
+            late_ro_binds: vec![],
             home: "/data/homes/ws_1".into(),
             run_dir: "/data/run/ws_1".into(),
             env: vec![],

@@ -6,6 +6,7 @@ fn spec(dir: &std::path::Path) -> SandboxSpec {
         id: "ws_test".into(),
         rw_binds: vec![],
         ro_binds: vec![],
+        late_ro_binds: vec![],
         home: dir.join("home"),
         run_dir: dir.join("run"),
         env: vec![("BS_TEST_VAR".into(), "from-spec".into())],

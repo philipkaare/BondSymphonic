@@ -35,6 +35,13 @@ pub struct SandboxSpec {
     pub rw_binds: Vec<(PathBuf, PathBuf)>,
     /// `(host, sandbox)` paths bound read-only.
     pub ro_binds: Vec<(PathBuf, PathBuf)>,
+    /// `(host, sandbox)` paths bound read-only *after* the read-write binds.
+    ///
+    /// bwrap applies binds in order, so a read-write bind of a directory
+    /// re-exposes anything already bound read-only inside it. These are for the
+    /// individual files that must stay read-only within an otherwise writable
+    /// tree, and they only mean anything to a backend that has mounts at all.
+    pub late_ro_binds: Vec<(PathBuf, PathBuf)>,
     /// Host dir mounted at `/home/<user>` (bwrap) or used as `HOME` (noop).
     pub home: PathBuf,
     /// Host dir for sockets, mounted at `/run/bs` (bwrap).
