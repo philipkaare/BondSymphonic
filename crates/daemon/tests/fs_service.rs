@@ -135,3 +135,48 @@ fn concurrent_writes_to_the_same_path_never_interleave_and_leave_no_temp_files()
         .collect();
     assert!(leftover.is_empty(), "leftover temp files: {leftover:?}");
 }
+
+/// A file longer than `MAX_READ` comes back truncated at the cap, and the
+/// caller is told so.
+#[test]
+fn read_file_truncates_above_the_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("wt");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("big.txt"), vec![b'x'; fs::MAX_READ + 10]).unwrap();
+    let r = fs::read_file(&root, "big.txt").unwrap();
+    assert!(r.truncated, "a file above the cap must report truncated");
+    assert_eq!(r.encoding, "utf-8");
+    assert_eq!(r.content.len(), fs::MAX_READ);
+    // Exactly at the cap is not truncated.
+    std::fs::write(root.join("edge.txt"), vec![b'x'; fs::MAX_READ]).unwrap();
+    let r = fs::read_file(&root, "edge.txt").unwrap();
+    assert!(!r.truncated);
+    assert_eq!(r.content.len(), fs::MAX_READ);
+}
+
+/// `read_file` must never allocate the whole file. Ignored by default because
+/// it needs an 8 GiB sparse file; run it with
+/// `cargo test -p bondsymphonic-daemon --test fs_service -- --ignored`.
+///
+/// The time bound is the assertion that matters: reading the cap takes
+/// milliseconds, while pulling 8 GiB through memory cannot.
+#[test]
+#[ignore = "creates an 8 GiB sparse file"]
+fn read_file_does_not_load_a_huge_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("wt");
+    std::fs::create_dir_all(&root).unwrap();
+    let f = std::fs::File::create(root.join("huge.bin")).unwrap();
+    f.set_len(8 * 1024 * 1024 * 1024).unwrap();
+    drop(f);
+    let started = std::time::Instant::now();
+    let r = fs::read_file(&root, "huge.bin").unwrap();
+    let elapsed = started.elapsed();
+    assert!(r.truncated);
+    assert!(r.content.len() <= fs::MAX_READ);
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "read_file took {elapsed:?}: it is still reading the whole file"
+    );
+}

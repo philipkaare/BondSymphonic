@@ -103,12 +103,22 @@ pub fn list_dir(root: &Path, rel: &str) -> Result<ListDirResult, RpcError> {
 /// Reads the file at `rel`. UTF-8 content above [`MAX_READ`] is truncated at
 /// the last valid char boundary; non-UTF-8 content is reported as binary
 /// with empty content.
+///
+/// At most `MAX_READ + 1` bytes ever reach memory: the extra byte is what
+/// distinguishes a file that is exactly `MAX_READ` long from a longer one.
+/// Reading the whole file first would let one multi-gigabyte build artifact or
+/// core dump in a worktree take the daemon, and every other workspace with it.
 pub fn read_file(root: &Path, rel: &str) -> Result<ReadFileResult, RpcError> {
+    use std::io::Read;
     let path = resolve(root, rel)?;
     if !path.exists() {
         return Err(RpcError::not_found(rel));
     }
-    let bytes = std::fs::read(&path).map_err(|e| RpcError::io(&e))?;
+    let file = std::fs::File::open(&path).map_err(|e| RpcError::io(&e))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_READ as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| RpcError::io(&e))?;
     let truncated = bytes.len() > MAX_READ;
     let slice = if truncated {
         &bytes[..MAX_READ]
