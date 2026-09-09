@@ -8,6 +8,7 @@
 #include "GroupBar.h"
 #include "NewAgentDialog.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
+#include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
@@ -31,8 +32,9 @@
 #include <QWidget>
 
 MainWindow::MainWindow(AppController* controller, GroupModel* groupModel, FileTreeModel* fileTreeModel,
-                       QWidget* parent)
-    : QMainWindow(parent), m_controller(controller), m_groupModel(groupModel), m_fileTreeModel(fileTreeModel) {
+                       ChangesModel* changesModel, QWidget* parent)
+    : QMainWindow(parent), m_controller(controller), m_groupModel(groupModel),
+      m_fileTreeModel(fileTreeModel), m_changesModel(changesModel) {
     setWindowTitle("BondSymphonic");
     resize(1400, 900);
     // Central first: the File, Edit and View items act on the editor area, so
@@ -138,10 +140,13 @@ void MainWindow::buildCentral() {
 }
 
 void MainWindow::buildDocks() {
-    m_explorer = new ExplorerDock(m_fileTreeModel, this);
+    m_explorer = new ExplorerDock(m_fileTreeModel, m_changesModel, this);
     addDockWidget(Qt::LeftDockWidgetArea, m_explorer);
     QObject::connect(m_explorer, &ExplorerDock::fileActivated, this, [this](const QString& path) {
         m_editorArea->openFile(activeWorkspaceId(), path);
+    });
+    QObject::connect(m_explorer, &ExplorerDock::diffActivated, this, [this](const QString& path) {
+        m_editorArea->openDiff(activeWorkspaceId(), path);
     });
 
     auto* bottom = new QDockWidget("Output", this);

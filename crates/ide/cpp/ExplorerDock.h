@@ -5,14 +5,15 @@
 #include <QSet>
 #include <QString>
 
+class ChangesModel;
 class FileTreeModel;
 class QModelIndex;
 class QStandardItem;
 class QStandardItemModel;
 class QTreeView;
 
-/// The left dock: the workspace's worktree as a lazily-loaded tree, beside a
-/// Changes tab that Milestone 3 fills in.
+/// The left dock: the workspace's worktree as a lazily-loaded tree, beside the
+/// list of files that differ from the base.
 ///
 /// The widget holds no listing of its own. A directory is asked for when it is
 /// expanded and the answer arrives as `entriesLoaded`, which replaces that
@@ -20,6 +21,10 @@ class QTreeView;
 /// `FileTreeModel`, so nothing here sorts, filters or stats a path. Each
 /// directory item carries a placeholder child so it can be expanded before its
 /// contents are known.
+///
+/// The Changes tab holds no listing of its own either: `ChangesModel` keeps
+/// itself current from the daemon's `fs.changed` events, and every list it
+/// publishes replaces the tab's rows wholesale.
 class ExplorerDock : public QDockWidget {
     Q_OBJECT
 public:
@@ -35,27 +40,37 @@ public:
     /// claim a directory is loaded whose children are still the placeholder.
     static constexpr int kLoadedRole = Qt::UserRole + 2;
 
-    explicit ExplorerDock(FileTreeModel* model, QWidget* parent = nullptr);
+    ExplorerDock(FileTreeModel* model, ChangesModel* changes, QWidget* parent = nullptr);
 
-    /// Shows `workspaceId`'s worktree: the tree is emptied and its root asked
-    /// for. An empty id leaves the tree empty.
+    /// Shows `workspaceId`'s worktree and changed files: the tree is emptied
+    /// and its root asked for, and the changes model is pointed at the same
+    /// workspace. An empty id leaves both empty.
     void setWorkspace(const QString& workspaceId);
 
-    /// Drops every cached listing and loads the root again. Directories that
-    /// were expanded, at any depth, are expanded again as their parent's
-    /// listing arrives, which asks for them in turn, so the shape of the tree
-    /// survives the reload.
+    /// Drops every cached listing and loads the root again, and re-fetches the
+    /// changed files. Directories that were expanded, at any depth, are
+    /// expanded again as their parent's listing arrives, which asks for them in
+    /// turn, so the shape of the tree survives the reload.
     void refresh();
 
 signals:
-    /// A file was double-clicked. Unused until the editor exists.
+    /// A file was double-clicked in the Files tree.
     void fileActivated(const QString& path);
+
+    /// A changed file was double-clicked. The window answers by opening the
+    /// file's diff.
+    void diffActivated(const QString& path);
 
 private:
     void onExpanded(const QModelIndex& index);
     void onDoubleClicked(const QModelIndex& index);
     void onEntriesLoaded(const QString& path, const QString& entriesJson);
     void onLoadFailed(const QString& path, const QString& message);
+    /// Replaces every row of the Changes tab from one `workspace.changes`
+    /// answer. The list is always complete, never an increment.
+    void onChangesLoaded(const QString& json);
+    void onChangesFailed(const QString& message);
+    void onChangeActivated(const QModelIndex& index);
 
     /// Asks the model for `path`. Unless `force` is set, a request already out
     /// for that directory suppresses this one.
@@ -68,14 +83,18 @@ private:
     QStandardItem* itemForPath(const QString& path) const;
     /// Records every expanded directory under `parent` in `m_expandedToRestore`.
     void collectExpanded(QStandardItem* parent);
-    QStandardItem* makeEntry(const QString& path, const QString& name, bool isDir, qint64 size) const;
+    QStandardItem* makeEntry(const QString& path, const QString& name, bool isDir, qint64 size,
+                             const QString& status) const;
     /// The "Loading…" child that makes an unread directory expandable.
     static QStandardItem* makePlaceholder();
     static QStandardItem* makeError(const QString& message);
 
     FileTreeModel* m_model;
+    ChangesModel* m_changes;
     QTreeView* m_files = nullptr;
     QStandardItemModel* m_items = nullptr;
+    QTreeView* m_changesView = nullptr;
+    QStandardItemModel* m_changeItems = nullptr;
     QIcon m_dirIcon;
     QIcon m_fileIcon;
     /// The workspace the tree shows, empty when none is selected.

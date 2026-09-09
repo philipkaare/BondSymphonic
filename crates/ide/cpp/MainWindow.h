@@ -7,6 +7,7 @@
 
 class AgentArea;
 class AppController;
+class ChangesModel;
 class EditorArea;
 class ExplorerDock;
 class FileTreeModel;
@@ -25,7 +26,7 @@ class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
     MainWindow(AppController* controller, GroupModel* groupModel, FileTreeModel* fileTreeModel,
-               QWidget* parent = nullptr);
+               ChangesModel* changesModel, QWidget* parent = nullptr);
 
 private:
     void buildMenus();
@@ -59,6 +60,7 @@ private:
     AppController* m_controller;
     GroupModel* m_groupModel;
     FileTreeModel* m_fileTreeModel;
+    ChangesModel* m_changesModel;
     GroupBar* m_groupBar = nullptr;
     /// The left dock: the active workspace's worktree.
     ExplorerDock* m_explorer = nullptr;

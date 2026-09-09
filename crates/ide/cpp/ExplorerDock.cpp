@@ -1,9 +1,15 @@
 #include "ExplorerDock.h"
+#include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
+#include <QChar>
+#include <QColor>
 #include <QFont>
+#include <QHeaderView>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QList>
+#include <QPalette>
 #include <QStandardItem>
 #include <QStandardItemModel>
 #include <QStyle>
@@ -12,15 +18,42 @@
 
 namespace {
 
+/// Below this the dock is treated as dark, and the status colours are lifted.
+constexpr int kDarkLightnessCutoff = 128;
+
 /// Joins a directory path and a child name the way the daemon addresses it.
 QString childPath(const QString& dir, const QString& name) {
     return dir.isEmpty() ? name : dir + QLatin1Char('/') + name;
 }
 
+/// The colour a git status is drawn in, or an invalid colour for a status that
+/// is not a change, `unchanged` among them. Lifted on a dark palette, where the
+/// flat accents sit too close to the background to read.
+QColor statusColour(const QString& status, bool dark) {
+    QColor colour;
+    if (status == QLatin1String("added") || status == QLatin1String("untracked")) {
+        colour = QColor(0x2e, 0xa0, 0x43);
+    } else if (status == QLatin1String("modified")) {
+        colour = QColor(0xc9, 0x96, 0x2a);
+    } else if (status == QLatin1String("deleted")) {
+        colour = QColor(0xd0, 0x39, 0x33);
+    } else if (status == QLatin1String("renamed")) {
+        colour = QColor(0x3b, 0x7d, 0xd8);
+    }
+    return colour.isValid() && dark ? colour.lighter(135) : colour;
+}
+
+/// One right-aligned count for the `+` and `−` columns.
+QStandardItem* makeCount(int n) {
+    auto* item = new QStandardItem(QString::number(n));
+    item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    return item;
+}
+
 } // namespace
 
-ExplorerDock::ExplorerDock(FileTreeModel* model, QWidget* parent)
-    : QDockWidget(QStringLiteral("Explorer"), parent), m_model(model) {
+ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, QWidget* parent)
+    : QDockWidget(QStringLiteral("Explorer"), parent), m_model(model), m_changes(changes) {
     setObjectName(QStringLiteral("ExplorerDock"));
     m_dirIcon = style()->standardIcon(QStyle::SP_DirIcon);
     m_fileIcon = style()->standardIcon(QStyle::SP_FileIcon);
@@ -34,14 +67,36 @@ ExplorerDock::ExplorerDock(FileTreeModel* model, QWidget* parent)
     m_files->setUniformRowHeights(true);
     m_files->setEditTriggers(QAbstractItemView::NoEditTriggers);
     tabs->addTab(m_files, QStringLiteral("Files"));
-    // Milestone 3 fills this in from the daemon's diff.
-    tabs->addTab(new QTreeView(tabs), QStringLiteral("Changes"));
+
+    m_changeItems = new QStandardItemModel(this);
+    // U+2212, the minus sign, written as a code point: the file is compiled
+    // without a byte order mark and MSVC would read a literal as the ANSI code
+    // page.
+    m_changeItems->setHorizontalHeaderLabels({ QStringLiteral("Path"), QStringLiteral("Status"),
+                                               QStringLiteral("+"), QString(QChar(0x2212)) });
+    m_changesView = new QTreeView(tabs);
+    m_changesView->setModel(m_changeItems);
+    m_changesView->setRootIsDecorated(false);
+    m_changesView->setUniformRowHeights(true);
+    m_changesView->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_changesView->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+    for (int column = 1; column < m_changeItems->columnCount(); ++column) {
+        m_changesView->header()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
+    }
+    tabs->addTab(m_changesView, QStringLiteral("Changes"));
     setWidget(tabs);
 
     QObject::connect(m_files, &QTreeView::expanded, this, &ExplorerDock::onExpanded);
     QObject::connect(m_files, &QTreeView::doubleClicked, this, &ExplorerDock::onDoubleClicked);
     QObject::connect(m_model, &FileTreeModel::entriesLoaded, this, &ExplorerDock::onEntriesLoaded);
     QObject::connect(m_model, &FileTreeModel::loadFailed, this, &ExplorerDock::onLoadFailed);
+    QObject::connect(m_changesView, &QTreeView::doubleClicked, this,
+                     &ExplorerDock::onChangeActivated);
+    // The model refreshes itself from `fs.changed`, so the tab follows the
+    // worktree without anyone pressing Refresh.
+    QObject::connect(m_changes, &ChangesModel::changesLoaded, this,
+                     &ExplorerDock::onChangesLoaded);
+    QObject::connect(m_changes, &ChangesModel::loadFailed, this, &ExplorerDock::onChangesFailed);
 }
 
 void ExplorerDock::setWorkspace(const QString& workspaceId) {
@@ -58,6 +113,9 @@ void ExplorerDock::setWorkspace(const QString& workspaceId) {
     // Listings still in flight are dropped by the model, which checks the
     // workspace an answer belongs to before it emits.
     m_model->setWorkspace(workspaceId);
+    // Answers with the new list, the empty one included, so the tab needs no
+    // clearing of its own.
+    m_changes->setWorkspace(workspaceId);
     if (workspaceId.isEmpty()) {
         return;
     }
@@ -68,6 +126,7 @@ void ExplorerDock::refresh() {
     if (m_workspaceId.isEmpty()) {
         return;
     }
+    m_changes->refresh();
     m_model->invalidate(QString());
     m_expandedToRestore.clear();
     collectExpanded(m_items->invisibleRootItem());
@@ -115,8 +174,9 @@ void ExplorerDock::onEntriesLoaded(const QString& path, const QString& entriesJs
         }
         const bool isDir = entry.value(QStringLiteral("is_dir")).toBool();
         const QString entryPath = childPath(path, name);
-        QStandardItem* item =
-            makeEntry(entryPath, name, isDir, entry.value(QStringLiteral("size")).toInteger());
+        QStandardItem* item = makeEntry(entryPath, name, isDir,
+                                        entry.value(QStringLiteral("size")).toInteger(),
+                                        entry.value(QStringLiteral("status")).toString());
         if (isDir) {
             item->appendRow(makePlaceholder());
         }
@@ -145,6 +205,45 @@ void ExplorerDock::onLoadFailed(const QString& path, const QString& message) {
     }
     dir->appendRow(makeError(message));
     noteAnswered(path);
+}
+
+void ExplorerDock::onChangesLoaded(const QString& json) {
+    m_changeItems->removeRows(0, m_changeItems->rowCount());
+    const bool dark = palette().base().color().lightness() < kDarkLightnessCutoff;
+    const QJsonArray files = QJsonDocument::fromJson(json.toUtf8()).array();
+    for (const QJsonValue value : files) {
+        const QJsonObject file = value.toObject();
+        const QString path = file.value(QStringLiteral("path")).toString();
+        if (path.isEmpty()) {
+            continue;
+        }
+        auto* pathItem = new QStandardItem(path);
+        pathItem->setData(path, kPathRole);
+        pathItem->setToolTip(path);
+        // The daemon's own word for the status, lower case as it sends it.
+        const QString status = file.value(QStringLiteral("status")).toString();
+        auto* statusItem = new QStandardItem(status);
+        const QColor colour = statusColour(status, dark);
+        if (colour.isValid()) {
+            statusItem->setForeground(colour);
+        }
+        m_changeItems->appendRow({ pathItem, statusItem,
+                                   makeCount(file.value(QStringLiteral("additions")).toInt()),
+                                   makeCount(file.value(QStringLiteral("deletions")).toInt()) });
+    }
+}
+
+void ExplorerDock::onChangesFailed(const QString& message) {
+    m_changeItems->removeRows(0, m_changeItems->rowCount());
+    m_changeItems->appendRow(makeError(message));
+}
+
+void ExplorerDock::onChangeActivated(const QModelIndex& index) {
+    // Any column of the row: the path is on the first one.
+    const QString path = index.siblingAtColumn(0).data(kPathRole).toString();
+    if (!path.isEmpty()) {
+        emit diffActivated(path);
+    }
 }
 
 void ExplorerDock::requestDir(const QString& path, bool force) {
@@ -204,11 +303,18 @@ void ExplorerDock::collectExpanded(QStandardItem* parent) {
 }
 
 QStandardItem* ExplorerDock::makeEntry(const QString& path, const QString& name, bool isDir,
-                                       qint64 size) const {
+                                       qint64 size, const QString& status) const {
     auto* item = new QStandardItem(isDir ? m_dirIcon : m_fileIcon, name);
     item->setData(path, kPathRole);
     item->setData(isDir, kIsDirRole);
     item->setToolTip(isDir ? path : QStringLiteral("%1\n%2 bytes").arg(path).arg(size));
+    // `fs.list_dir` reports every entry as `unchanged` today, so this lights up
+    // the day the daemon fills the field in; nothing here goes looking for it.
+    const QColor colour =
+        statusColour(status, palette().base().color().lightness() < kDarkLightnessCutoff);
+    if (colour.isValid()) {
+        item->setForeground(colour);
+    }
     return item;
 }
 

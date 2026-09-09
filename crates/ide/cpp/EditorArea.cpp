@@ -1,10 +1,13 @@
 #include "EditorArea.h"
+#include "DiffWidget.h"
 #include "EditorWidget.h"
+#include "bondsymphonic-ide/src/qobjects/diff_document.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/editor_document.cxxqt.h"
 #include <QLabel>
 #include <QLatin1Char>
 #include <QMessageBox>
 #include <QStackedWidget>
+#include <QStringList>
 #include <QTabWidget>
 #include <QVBoxLayout>
 #include <QtGlobal>
@@ -23,6 +26,14 @@ const char* const kDirtyMarker = "\xe2\x97\x8f ";
 
 QString tabKey(const QString& kind, const QString& workspaceId, const QString& path) {
     return kind + QLatin1Char('\n') + workspaceId + QLatin1Char('\n') + path;
+}
+
+/// The workspace a tab key names, empty for a page that has no key. Reading it
+/// back off the key is what lets a workspace be closed without knowing what
+/// kinds of page it has open.
+QString workspaceOfKey(const QString& key) {
+    const QStringList parts = key.split(QLatin1Char('\n'));
+    return parts.size() == 3 ? parts.at(1) : QString();
 }
 
 } // namespace
@@ -80,8 +91,32 @@ void EditorArea::openFile(const QString& workspaceId, const QString& path) {
 }
 
 void EditorArea::openDiff(const QString& workspaceId, const QString& path) {
-    qWarning("EditorArea::openDiff: diff view not yet available (%s:%s)",
-             qUtf8Printable(workspaceId), qUtf8Printable(path));
+    if (workspaceId.isEmpty() || path.isEmpty()) {
+        return;
+    }
+    // A different kind from the file tab on the same path, so opening a diff
+    // does not take the place of the file the user is editing.
+    const QString key = tabKey(QStringLiteral("diff"), workspaceId, path);
+    const int existing = indexOfKey(key);
+    if (existing >= 0) {
+        m_tabs->setCurrentIndex(existing);
+        m_stack->setCurrentWidget(m_tabs);
+        return;
+    }
+
+    auto* doc = new DiffDocument(this);
+    auto* widget = new DiffWidget(doc, this);
+    const QString title = path.section(QLatin1Char('/'), -1) + QStringLiteral(" (diff)");
+    widget->setProperty(kTabKey, key);
+    widget->setProperty(kTabTitle, title);
+
+    const int index = m_tabs->addTab(widget, title);
+    m_tabs->setTabToolTip(index, workspaceId + QLatin1Char(':') + path);
+    m_tabs->setCurrentIndex(index);
+    m_stack->setCurrentWidget(m_tabs);
+    // Last: `load` is asynchronous, and the pane has to be wired up before its
+    // answer arrives.
+    doc->load(workspaceId, path);
 }
 
 EditorWidget* EditorArea::currentEditor() const {
@@ -98,16 +133,19 @@ void EditorArea::saveAll() {
 }
 
 void EditorArea::closeWorkspace(const QString& workspaceId) {
+    if (workspaceId.isEmpty()) {
+        return;
+    }
     // Backwards: removing a tab renumbers everything after it.
     for (int i = m_tabs->count() - 1; i >= 0; --i) {
-        auto* editor = qobject_cast<EditorWidget*>(m_tabs->widget(i));
-        if (editor == nullptr || editor->document() == nullptr) {
+        QWidget* page = m_tabs->widget(i);
+        // By the key rather than by the page's document, so a diff tab on a
+        // dead workspace goes with the editors rather than being left showing a
+        // worktree that no longer exists.
+        if (workspaceOfKey(page->property(kTabKey).toString()) != workspaceId) {
             continue;
         }
-        if (editor->document()->getWorkspaceId() != workspaceId) {
-            continue;
-        }
-        removePage(editor);
+        removePage(page);
     }
 }
 

@@ -24,21 +24,22 @@ public:
     /// opening a new one.
     void openFile(const QString& workspaceId, const QString& path);
 
-    /// Shows `path`'s diff against the base branch. Milestone 3's diff task
-    /// fills this in; until then it only says so.
+    /// Shows `path`'s working copy against its base, side by side, activating
+    /// the tab that already has it or opening a new one. A diff is its own kind
+    /// of tab, so it sits beside the file's editor rather than replacing it.
     void openDiff(const QString& workspaceId, const QString& path);
 
     /// The editor in the current tab, or null when there is none or the tab
-    /// holds something that is not an editor.
+    /// holds something that is not an editor, a diff among them.
     EditorWidget* currentEditor() const;
 
     /// Saves every dirty editor. Clean ones are left alone, so a save-all does
     /// not rewrite files nothing has touched.
     void saveAll();
 
-    /// Closes every tab belonging to `workspaceId`, discarding unsaved edits.
-    /// Used when the workspace itself is gone and there is nothing left to save
-    /// to.
+    /// Closes every tab belonging to `workspaceId`, of whatever kind,
+    /// discarding unsaved edits. Used when the workspace itself is gone and
+    /// there is nothing left to save to.
     void closeWorkspace(const QString& workspaceId);
 
     /// Closes the tab at `index`, asking first when it has unsaved edits.

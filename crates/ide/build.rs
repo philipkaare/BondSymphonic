@@ -44,6 +44,8 @@ fn main() {
             "cpp/EditorWidget.cpp",
             "cpp/EditorArea.h",
             "cpp/EditorArea.cpp",
+            "cpp/DiffWidget.h",
+            "cpp/DiffWidget.cpp",
             "cpp/MainWindow.h",
             "cpp/MainWindow.cpp",
             "cpp/app.cpp",
