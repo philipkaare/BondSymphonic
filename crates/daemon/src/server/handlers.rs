@@ -46,7 +46,31 @@ impl Handler for WorkspaceHandler {
             Request::PtyWrite(p) => ok(d.ptys.write(p).await?),
             Request::PtyResize(p) => ok(d.ptys.resize(p).await?),
             Request::PtyClose(p) => ok(d.ptys.close(&p.pty_id).await?),
-            // Task 8 adds the Fs* arms here.
+            Request::FsListDir(p) => {
+                let root = d.workspace(&p.workspace_id)?.worktree_path;
+                ok(
+                    tokio::task::spawn_blocking(move || crate::fs::list_dir(&root, &p.path))
+                        .await
+                        .map_err(|e| RpcError::internal(e.to_string()))??,
+                )
+            }
+            Request::FsReadFile(p) => {
+                let root = d.workspace(&p.workspace_id)?.worktree_path;
+                ok(
+                    tokio::task::spawn_blocking(move || crate::fs::read_file(&root, &p.path))
+                        .await
+                        .map_err(|e| RpcError::internal(e.to_string()))??,
+                )
+            }
+            Request::FsWriteFile(p) => {
+                let root = d.workspace(&p.workspace_id)?.worktree_path;
+                ok(tokio::task::spawn_blocking(move || {
+                    crate::fs::write_file(&root, &p.path, &p.content)
+                })
+                .await
+                .map_err(|e| RpcError::internal(e.to_string()))??)
+            }
+            // `fs.watch` stays not-implemented until Milestone 3.
             other => self.system.handle(other, ctx).await,
         }
     }

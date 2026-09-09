@@ -1,4 +1,5 @@
 pub mod daemon;
+pub mod fs;
 pub mod git;
 pub mod ids;
 pub mod prereqs;
