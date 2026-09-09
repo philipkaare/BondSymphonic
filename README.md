@@ -53,9 +53,12 @@ through a git alternate, so the agent's own branch is isolated without the daemo
 of it. `workspace.list/get/status/destroy` manage that lifecycle (destroying a dirty workspace
 needs `force`), and `pty.open/write/resize/close` and `fs.list_dir/read_file/write_file` run
 inside the sandbox once it exists. Pass `--no-sandbox` to `bondsymphonic-daemon` to run every
-workspace's processes directly on the host instead of in bubblewrap (development only; the
-daemon also falls back to this automatically on a host without bubblewrap, i.e. anywhere but
-Linux).
+workspace's processes directly on the host instead of in bubblewrap (development only). The
+backend choice itself is a compile-time OS check, not a probe: on any non-Linux host the daemon
+always uses the unsandboxed noop backend, and on Linux it always uses bubblewrap unless
+`--no-sandbox` is given. A Linux host whose bubblewrap doesn't actually work (missing binary,
+unprivileged user namespaces disabled, ...) fails at sandbox start rather than silently falling
+back; the `sandbox` item of `system.check_prereqs` explains why.
 
 The daemon keeps its state under its data directory (default `~/.bondsymphonic`, override with
 `--data-dir`):
@@ -82,7 +85,7 @@ find the Qt DLLs:
 ```powershell
 . .\scripts\env.ps1
 cargo test -p bondsymphonic-proto -p bondsymphonic-ide   # Windows; ide crate is 6 lib + 5 client tests
-.\scripts\test-daemon.ps1                                 # daemon tests inside WSL (7 integration + 3/4 unit, platform-dependent)
+.\scripts\test-daemon.ps1                                 # daemon tests inside WSL (10 integration test files; unit tests: 15 on Windows, 18 on Linux)
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ```
