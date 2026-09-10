@@ -19,6 +19,7 @@
 #include "bondsymphonic-ide/src/qobjects/transcript_model.cxxqt.h"
 #include <QAction>
 #include <QApplication>
+#include <QChar>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QDockWidget>
@@ -35,9 +36,7 @@
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QStatusBar>
-#include <QStyle>
 #include <QTabWidget>
-#include <QToolBar>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -52,7 +51,6 @@ MainWindow::MainWindow(AppController* controller, GroupModel* groupModel, FileTr
     buildCentral();
     buildMenus();
     buildDocks();
-    buildToolBar();
     buildStatusBar();
     connectController();
     onConnectionStateChanged();
@@ -293,16 +291,6 @@ void MainWindow::buildDocks() {
     m_bottomTabs->addTab(m_shellArea, "Terminal");
     bottom->setWidget(m_bottomTabs);
     addDockWidget(Qt::BottomDockWidgetArea, bottom);
-}
-
-void MainWindow::buildToolBar() {
-    auto* toolBar = addToolBar("Main");
-    toolBar->setObjectName("MainToolBar");
-    toolBar->setMovable(false);
-    toolBar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-    auto* refresh = toolBar->addAction(style()->standardIcon(QStyle::SP_BrowserReload), "Refresh");
-    refresh->setToolTip("Reload the Explorer file tree");
-    QObject::connect(refresh, &QAction::triggered, this, [this] { m_explorer->refresh(); });
 }
 
 void MainWindow::buildStatusBar() {
@@ -624,6 +612,7 @@ QString MainWindow::activeWorkspaceId() const {
 
 void MainWindow::onActiveTabChanged() {
     const QJsonObject active = activeTab();
+    updateWindowTitle(active);
     if (active.isEmpty()) {
         m_agentArea->showPlaceholder();
         m_shellArea->showPlaceholder();
@@ -635,6 +624,12 @@ void MainWindow::onActiveTabChanged() {
     }
     const QString workspaceId = active.value("workspace_id").toString();
     m_explorer->setWorkspace(workspaceId);
+    // After `setWorkspace`, which clears the header when it is handed an empty
+    // id, and on every model change rather than only on a switch, so a branch
+    // the daemon renamed reaches the strip.
+    m_explorer->setWorkspaceHeader(active.value("name").toString(),
+                                   active.value("branch").toString(),
+                                   active.value("repo_path").toString());
     // The tab's choice first, because `setWorkspace` publishes the list it
     // already has synchronously and the `configsChanged` slot above applies
     // this to it; the worktree path is the daemon's, from `WorkspaceInfo`.
@@ -652,6 +647,20 @@ void MainWindow::onActiveTabChanged() {
     // tab's adapter is.
     m_shellArea->showWorkspace(workspaceId, "terminal", QString());
     rebindCost();
+}
+
+void MainWindow::updateWindowTitle(const QJsonObject& active) {
+    const QString name = active.value("name").toString();
+    if (name.isEmpty()) {
+        setWindowTitle(QStringLiteral("BondSymphonic"));
+        return;
+    }
+    // U+2014, the em dash, as a code point rather than as a character in a
+    // literal, so no compiler's idea of this file's source encoding can change
+    // what it means.
+    const QString dash = QStringLiteral(" ") + QString(QChar(0x2014)) + QStringLiteral(" ");
+    setWindowTitle(name + dash + active.value("branch").toString() + dash +
+                   QStringLiteral("BondSymphonic"));
 }
 
 void MainWindow::rebindCost() {

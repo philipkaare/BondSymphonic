@@ -1,11 +1,20 @@
 #include "GroupBar.h"
+#include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
 #include <QAction>
+#include <QChar>
 #include <QColor>
+#include <QFont>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
+#include <QPalette>
+#include <QStyle>
 #include <QTabBar>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -36,32 +45,88 @@ QColor statusColour(int status) {
     }
 }
 
+/// The two spaces, middle dot and two spaces between a name and its branch.
+/// U+00B7 as a code point rather than as a character in a literal, so no
+/// compiler's idea of this file's source encoding can change what it means.
+QString separator() {
+    return QStringLiteral("  ") + QString(QChar(0x00B7)) + QStringLiteral("  ");
+}
+
+/// U+25CF, the black circle, at the head of an agent tab. It is painted in the
+/// tab's text colour, which is the one `statusColour` gives the status.
+QString statusDot() {
+    return QString(QChar(0x25CF));
+}
+
 } // namespace
 
 GroupBar::GroupBar(GroupModel* model, QWidget* parent) : QWidget(parent), m_model(model) {
+    // A fill of its own, so the two rows read as one band of agents rather than
+    // as whatever happens to sit above the editor.
+    setAutoFillBackground(true);
+    QPalette barPalette = palette();
+    barPalette.setColor(QPalette::Window, theme::band(palette()));
+    setPalette(barPalette);
+
     auto* layout = new QVBoxLayout(this);
-    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setContentsMargins(8, 2, 8, 2);
     layout->setSpacing(0);
 
+    auto* captionRow = new QHBoxLayout();
+    captionRow->setContentsMargins(0, 0, 0, 0);
+    captionRow->setSpacing(8);
+    auto* caption = new QLabel(QStringLiteral("Agents"), this);
+    caption->setObjectName(QStringLiteral("GroupBarCaption"));
+    QFont captionFont = caption->font();
+    captionFont.setCapitalization(QFont::SmallCaps);
+    captionFont.setBold(true);
+    caption->setFont(captionFont);
+    QPalette captionPalette = caption->palette();
+    captionPalette.setColor(QPalette::WindowText, theme::muted(palette()));
+    caption->setPalette(captionPalette);
+    captionRow->addWidget(caption, 0, Qt::AlignVCenter);
+
     m_groupTabs = new QTabBar(this);
+    m_groupTabs->setObjectName(QStringLiteral("GroupBarGroupTabs"));
     m_groupTabs->setExpanding(false);
     m_groupTabs->setContextMenuPolicy(Qt::CustomContextMenu);
-    layout->addWidget(m_groupTabs);
+    captionRow->addWidget(m_groupTabs, 0, Qt::AlignBottom);
+    captionRow->addStretch(1);
+    layout->addLayout(captionRow);
 
     auto* agentRow = new QHBoxLayout();
     agentRow->setContentsMargins(0, 0, 0, 0);
-    agentRow->setSpacing(0);
+    agentRow->setSpacing(6);
     m_agentTabs = new QTabBar(this);
+    m_agentTabs->setObjectName(QStringLiteral("GroupBarAgentTabs"));
     m_agentTabs->setExpanding(false);
     m_agentTabs->setDocumentMode(true);
     m_agentTabs->setContextMenuPolicy(Qt::CustomContextMenu);
-    agentRow->addWidget(m_agentTabs, 1);
+    // Taller and wider than a document tab: this is the row the user is meant
+    // to find first, and a dot with a name and a branch behind it needs the
+    // room. A stylesheet, because QTabBar takes its tab metrics from the style
+    // rather than from the widget.
+    m_agentTabs->setStyleSheet(
+        QStringLiteral("QTabBar::tab { padding: 6px 14px; min-height: 32px; }"));
+    agentRow->addWidget(m_agentTabs, 0);
+
+    m_emptyLabel = new QLabel(QStringLiteral("No agents in this group yet"), this);
+    m_emptyLabel->setObjectName(QStringLiteral("GroupBarEmptyLabel"));
+    QPalette emptyPalette = m_emptyLabel->palette();
+    emptyPalette.setColor(QPalette::WindowText, theme::muted(palette()));
+    m_emptyLabel->setPalette(emptyPalette);
+    m_emptyLabel->setVisible(false);
+    agentRow->addWidget(m_emptyLabel, 0, Qt::AlignVCenter);
 
     m_addButton = new QToolButton(this);
-    m_addButton->setText("+");
-    m_addButton->setToolTip("New agent");
+    m_addButton->setObjectName(QStringLiteral("GroupBarNewAgentButton"));
+    m_addButton->setText(QStringLiteral("New agent"));
+    m_addButton->setIcon(style()->standardIcon(QStyle::SP_FileDialogNewFolder));
+    m_addButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_addButton->setToolTip(QStringLiteral("Create a workspace and start an agent in it"));
     m_addButton->setAutoRaise(true);
-    agentRow->addWidget(m_addButton, 0);
+    agentRow->addWidget(m_addButton, 0, Qt::AlignVCenter);
+    agentRow->addStretch(1);
     layout->addLayout(agentRow);
 
     QObject::connect(m_addButton, &QToolButton::clicked, this, &GroupBar::newAgentRequested);
@@ -115,11 +180,27 @@ void GroupBar::rebuild() {
     while (m_agentTabs->count() < tabs) {
         m_agentTabs->addTab(QString());
     }
+    const QJsonArray tabsJson = displayedTabsJson();
     for (int i = 0; i < tabs; ++i) {
-        m_agentTabs->setTabText(i, m_model->tabLabel(m_displayGroup, i));
+        const QJsonObject tabJson = i < tabsJson.size() ? tabsJson.at(i).toObject() : QJsonObject();
+        const QString name = tabJson.value(QStringLiteral("name")).toString();
+        const QString branch = tabJson.value(QStringLiteral("branch")).toString();
+        // `tabLabel` is the fallback, not the source: it already carries the
+        // model's own glyph and name, so a state JSON that does not describe
+        // this tab still leaves the tab named.
+        QString label = name.isEmpty() ? m_model->tabLabel(m_displayGroup, i)
+                                       : statusDot() + QLatin1Char(' ') + name;
+        if (!name.isEmpty() && !branch.isEmpty()) {
+            label += separator() + branch;
+        }
+        m_agentTabs->setTabText(i, label);
         m_agentTabs->setTabToolTip(i, m_model->tabTooltip(m_displayGroup, i));
         m_agentTabs->setTabTextColor(i, statusColour(m_model->tabStatus(m_displayGroup, i)));
     }
+    // An empty group is a strip with nothing on it; the label says which of the
+    // two it is, where the tabs would have been.
+    m_agentTabs->setVisible(tabs > 0);
+    m_emptyLabel->setVisible(tabs == 0);
 
     const int activeTab = m_model->activeTabIndex();
     if (m_displayGroup == modelGroup && activeTab >= 0 && activeTab < tabs) {
@@ -127,6 +208,15 @@ void GroupBar::rebuild() {
     }
 
     m_rebuilding = false;
+}
+
+QJsonArray GroupBar::displayedTabsJson() const {
+    const QJsonObject state = QJsonDocument::fromJson(m_model->getStateJson().toUtf8()).object();
+    const QJsonArray groups = state.value(QStringLiteral("groups")).toArray();
+    if (m_displayGroup < 0 || m_displayGroup >= groups.size()) {
+        return QJsonArray();
+    }
+    return groups.at(m_displayGroup).toObject().value(QStringLiteral("tabs")).toArray();
 }
 
 void GroupBar::onGroupCurrentChanged(int index) {

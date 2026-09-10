@@ -3,11 +3,14 @@
 #include <QWidget>
 
 class GroupModel;
+class QJsonArray;
+class QLabel;
 class QTabBar;
 class QToolButton;
 
-/// The two stacked tab bars above the editor: groups on top, the displayed
-/// group's agent tabs below, with a `+` button that asks for a new agent.
+/// The two stacked rows above the editor: the "Agents" caption and the group
+/// tabs on top, the displayed group's agent tabs below, with a "New agent"
+/// button beside them.
 ///
 /// The widget holds no application state. Every rebuild reads labels, tooltips
 /// and status codes back out of `GroupModel`; the only thing decided here is
@@ -29,6 +32,12 @@ signals:
 
 private:
     void rebuild();
+    /// The displayed group's tabs, as the model's `stateJson` describes them.
+    /// Neither a tab's name nor its branch is an invokable of its own, and the
+    /// label is assembled here rather than in Rust, so the one JSON the model
+    /// already publishes is where both come from. Empty when the state does not
+    /// describe that group.
+    QJsonArray displayedTabsJson() const;
     void onGroupCurrentChanged(int index);
     void onAgentCurrentChanged(int index);
     void showGroupMenu(const QPoint& pos);
@@ -38,6 +47,9 @@ private:
     QTabBar* m_groupTabs = nullptr;
     QTabBar* m_agentTabs = nullptr;
     QToolButton* m_addButton = nullptr;
+    /// Says so, in the agent row, while the displayed group has no tabs. An
+    /// empty group is otherwise a bare strip with a button on it.
+    QLabel* m_emptyLabel = nullptr;
     /// Which group's tabs the agent row shows. Usually the model's active
     /// group; it differs only while an empty group is selected, which the model
     /// cannot represent because it has no tab to make active.

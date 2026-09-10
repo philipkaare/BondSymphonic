@@ -5,17 +5,24 @@
 #include <QChar>
 #include <QColor>
 #include <QFont>
+#include <QHBoxLayout>
 #include <QHeaderView>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLabel>
 #include <QList>
 #include <QPalette>
+#include <QSizePolicy>
 #include <QStandardItem>
 #include <QStandardItemModel>
+#include <QStringList>
 #include <QStyle>
 #include <QTabWidget>
+#include <QToolButton>
 #include <QTreeView>
+#include <QVBoxLayout>
+#include <QWidget>
 
 namespace {
 
@@ -42,6 +49,21 @@ QColor statusColour(const QString& status, bool dark) {
     return colour.isValid() ? theme::ink(colour, dark) : colour;
 }
 
+/// The tail of a repository path -- its last two components -- which is what
+/// tells two checkouts apart without spending the strip's width on the prefix.
+/// Both separators, because the daemon reports POSIX paths and the New Agent
+/// dialog takes Windows ones. The whole path stays in the tooltip.
+QString pathTail(const QString& repoPath) {
+    QString normalised = repoPath;
+    normalised.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    const QStringList parts = normalised.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+    if (parts.isEmpty()) {
+        return repoPath;
+    }
+    const int from = parts.size() > 2 ? parts.size() - 2 : 0;
+    return QStringList(parts.mid(from)).join(QLatin1Char('/'));
+}
+
 /// One right-aligned count for the `+` and `−` columns.
 QStandardItem* makeCount(int n) {
     auto* item = new QStandardItem(QString::number(n));
@@ -57,7 +79,13 @@ ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, QWidget*
     m_dirIcon = style()->standardIcon(QStyle::SP_DirIcon);
     m_fileIcon = style()->standardIcon(QStyle::SP_FileIcon);
 
-    auto* tabs = new QTabWidget(this);
+    auto* body = new QWidget(this);
+    auto* bodyLayout = new QVBoxLayout(body);
+    bodyLayout->setContentsMargins(0, 0, 0, 0);
+    bodyLayout->setSpacing(0);
+    bodyLayout->addWidget(buildHeader());
+
+    auto* tabs = new QTabWidget(body);
     m_items = new QStandardItemModel(this);
     m_items->setColumnCount(1);
     m_files = new QTreeView(tabs);
@@ -83,7 +111,8 @@ ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, QWidget*
         m_changesView->header()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
     }
     tabs->addTab(m_changesView, QStringLiteral("Changes"));
-    setWidget(tabs);
+    bodyLayout->addWidget(tabs, 1);
+    setWidget(body);
 
     QObject::connect(m_files, &QTreeView::expanded, this, &ExplorerDock::onExpanded);
     QObject::connect(m_files, &QTreeView::doubleClicked, this, &ExplorerDock::onDoubleClicked);
@@ -96,6 +125,83 @@ ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, QWidget*
     QObject::connect(m_changes, &ChangesModel::changesLoaded, this,
                      &ExplorerDock::onChangesLoaded);
     QObject::connect(m_changes, &ChangesModel::loadFailed, this, &ExplorerDock::onChangesFailed);
+
+    // The empty state, so the strip is never blank before the first tab.
+    setWorkspaceHeader(QString(), QString(), QString());
+}
+
+QWidget* ExplorerDock::buildHeader() {
+    auto* header = new QWidget(this);
+    header->setObjectName(QStringLiteral("ExplorerHeader"));
+    // Its own fill, so the strip reads as a band naming what is below it rather
+    // than as the first row of the Files tab.
+    header->setAutoFillBackground(true);
+    QPalette headerPalette = header->palette();
+    headerPalette.setColor(QPalette::Window, theme::band(palette()));
+    header->setPalette(headerPalette);
+
+    auto* layout = new QHBoxLayout(header);
+    layout->setContentsMargins(8, 6, 4, 6);
+    layout->setSpacing(6);
+
+    auto* lines = new QVBoxLayout();
+    lines->setContentsMargins(0, 0, 0, 0);
+    lines->setSpacing(0);
+    m_headerName = new QLabel(header);
+    m_headerName->setObjectName(QStringLiteral("ExplorerHeaderName"));
+    QFont nameFont = m_headerName->font();
+    nameFont.setBold(true);
+    m_headerName->setFont(nameFont);
+    // The dock is narrow and a workspace name is not; the tooltip carries the
+    // whole of it either way.
+    m_headerName->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    // Ignored, not Preferred: a long workspace name must not push the dock
+    // wider than the user sized it. What does not fit is clipped, and the
+    // tooltip has all of it.
+    m_headerName->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    lines->addWidget(m_headerName);
+
+    m_headerDetail = new QLabel(header);
+    m_headerDetail->setObjectName(QStringLiteral("ExplorerHeaderDetail"));
+    QPalette detailPalette = m_headerDetail->palette();
+    detailPalette.setColor(QPalette::WindowText, theme::muted(palette()));
+    m_headerDetail->setPalette(detailPalette);
+    m_headerDetail->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_headerDetail->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    lines->addWidget(m_headerDetail);
+    layout->addLayout(lines, 1);
+
+    m_refreshButton = new QToolButton(header);
+    m_refreshButton->setIcon(style()->standardIcon(QStyle::SP_BrowserReload));
+    m_refreshButton->setToolTip(QStringLiteral("Reload the file tree and changes"));
+    m_refreshButton->setAutoRaise(true);
+    // Named so the verification hook, and anyone reading the widget tree, can
+    // find the one button that reloads the dock.
+    m_refreshButton->setObjectName(QStringLiteral("ExplorerRefreshButton"));
+    QObject::connect(m_refreshButton, &QToolButton::clicked, this, &ExplorerDock::refresh);
+    layout->addWidget(m_refreshButton, 0, Qt::AlignTop);
+    return header;
+}
+
+void ExplorerDock::setWorkspaceHeader(const QString& name, const QString& branch,
+                                      const QString& repoPath) {
+    if (name.isEmpty()) {
+        m_headerName->setText(QStringLiteral("No workspace selected"));
+        m_headerName->setToolTip(QString());
+        m_headerDetail->clear();
+        m_headerDetail->setToolTip(QString());
+        m_refreshButton->setEnabled(false);
+        return;
+    }
+    m_headerName->setText(name);
+    m_headerName->setToolTip(name);
+    // U+00B7, the middle dot, as a code point rather than as a character in a
+    // literal, so no compiler's idea of this file's source encoding can change
+    // what it means.
+    const QString separator = QStringLiteral("  ") + QString(QChar(0x00B7)) + QStringLiteral("  ");
+    m_headerDetail->setText(branch + separator + pathTail(repoPath));
+    m_headerDetail->setToolTip(repoPath);
+    m_refreshButton->setEnabled(true);
 }
 
 void ExplorerDock::setWorkspace(const QString& workspaceId) {
@@ -116,6 +222,7 @@ void ExplorerDock::setWorkspace(const QString& workspaceId) {
     // clearing of its own.
     m_changes->setWorkspace(workspaceId);
     if (workspaceId.isEmpty()) {
+        setWorkspaceHeader(QString(), QString(), QString());
         return;
     }
     requestDir(QString());

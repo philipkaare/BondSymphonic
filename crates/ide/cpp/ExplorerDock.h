@@ -7,10 +7,13 @@
 
 class ChangesModel;
 class FileTreeModel;
+class QLabel;
 class QModelIndex;
 class QStandardItem;
 class QStandardItemModel;
+class QToolButton;
 class QTreeView;
+class QWidget;
 
 /// The left dock: the workspace's worktree as a lazily-loaded tree, beside the
 /// list of files that differ from the base.
@@ -46,6 +49,15 @@ public:
     /// and its root asked for, and the changes model is pointed at the same
     /// workspace. An empty id leaves both empty.
     void setWorkspace(const QString& workspaceId);
+
+    /// Names the workspace the two tabs are showing, in the strip above them:
+    /// `name` on its own line, then the branch and the tail of `repoPath`, with
+    /// the whole path in the tooltip. An empty `name` is the no-workspace
+    /// state: the strip says so and the Refresh button is disabled.
+    ///
+    /// The three strings are the active tab's, passed straight through from the
+    /// window; nothing here looks a workspace up or shortens a branch.
+    void setWorkspaceHeader(const QString& name, const QString& branch, const QString& repoPath);
 
     /// Drops every cached listing and loads the root again, and re-fetches the
     /// changed files. Directories that were expanded, at any depth, are
@@ -89,12 +101,22 @@ private:
     static QStandardItem* makePlaceholder();
     static QStandardItem* makeError(const QString& message);
 
+    /// Builds the header strip -- the two labels and the Refresh button -- and
+    /// returns it for the dock's layout.
+    QWidget* buildHeader();
+
     FileTreeModel* m_model;
     ChangesModel* m_changes;
     QTreeView* m_files = nullptr;
     QStandardItemModel* m_items = nullptr;
     QTreeView* m_changesView = nullptr;
     QStandardItemModel* m_changeItems = nullptr;
+    /// The header strip's first line: the workspace name, or the empty state.
+    QLabel* m_headerName = nullptr;
+    /// Its second line: branch and the tail of the repository path.
+    QLabel* m_headerDetail = nullptr;
+    /// Reload, beside the two labels. Disabled while no workspace is shown.
+    QToolButton* m_refreshButton = nullptr;
     QIcon m_dirIcon;
     QIcon m_fileIcon;
     /// The workspace the tree shows, empty when none is selected.

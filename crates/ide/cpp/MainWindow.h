@@ -66,7 +66,6 @@ private:
     /// a status-bar warning with a way back to it, and neither.
     void onPrereqsChecked(const QString& json);
     void buildDocks();
-    void buildToolBar();
     void buildStatusBar();
     void connectController();
     void onConnectionStateChanged();
@@ -75,6 +74,11 @@ private:
     void onDestroyRequested(const QString& workspaceId);
     void onOperationFailed(const QString& op, const QString& message);
     void onActiveTabChanged();
+    /// Names the active workspace in the title bar: `<name> -- <branch> --
+    /// BondSymphonic`, with em dashes, or the plain application name when no
+    /// tab is selected. `active` is the tab JSON `onActiveTabChanged` already
+    /// read, so the title and the Explorer's header cannot disagree.
+    void updateWindowTitle(const QJsonObject& active);
     void onWorkspaceDestroyed(const QString& workspaceId);
     /// Points the status bar's cost at the active tab's transcript, dropping
     /// the watch on the tab before it. A tab with no transcript costs nothing.

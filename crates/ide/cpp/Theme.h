@@ -53,4 +53,30 @@ inline QColor ink(const QColor& accent, bool dark) {
     return dark ? accent.lighter(kDarkLift) : accent;
 }
 
+/// How far a band's fill is lifted off a dark window, and pushed under a light
+/// one, as `QColor::lighter`/`darker` percentages. Two different numbers
+/// because the same step reads much louder going up from near-black than it
+/// does going down from near-white.
+inline constexpr int kBandLift = 132;
+inline constexpr int kBandSink = 108;
+
+/// The fill of a strip that has to read as its own band -- the Explorer's
+/// workspace header, the agent bar -- rather than as more of the window behind
+/// it. A wash of the window colour itself, so it follows whatever palette Qt
+/// hands the application and never becomes a colour of its own.
+inline QColor band(const QPalette& palette) {
+    const QColor window = palette.window().color();
+    return isDark(palette) ? window.lighter(kBandLift) : window.darker(kBandSink);
+}
+
+/// Text that labels a band rather than saying anything -- the "Agents" caption,
+/// the Explorer's branch line. The window's own foreground, faded towards the
+/// band it sits on, so it recedes on either palette.
+inline QColor muted(const QPalette& palette) {
+    const QColor text = palette.windowText().color();
+    const QColor fill = band(palette);
+    return QColor((text.red() + fill.red()) / 2, (text.green() + fill.green()) / 2,
+                  (text.blue() + fill.blue()) / 2);
+}
+
 } // namespace theme
