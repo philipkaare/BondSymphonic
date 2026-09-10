@@ -57,11 +57,12 @@
 //!   what makes the window tear its panes down.
 //! * `reconnect` — ask the daemon to drop the connection with
 //!   [`TEST_DROP_METHOD`], then wait for the controller's reconnect loop to
-//!   publish a new one and re-sync. **Only a fake daemon answers this**: the
-//!   method is not in `Request`, the real daemon has never heard of it and
-//!   replies "not implemented", so nothing but a test can make this step do
-//!   anything. Every step after it runs on the new connection, because this is
-//!   the one step that hands the script a fresh client.
+//!   publish a new one and re-sync. **Only a fake daemon acts on this**: the
+//!   method is not in `Request`, so to the real daemon's decoder it is an
+//!   unknown enum variant — it answers `invalid_params` and stays connected,
+//!   and the step then fails on its own timeout rather than dropping anything.
+//!   Every step after it runs on the new connection, because this is the one
+//!   step that hands the script a fresh client.
 //! * `quit` — let the window settle, then end the process with status 0.
 //!
 //! A failing step logs and stops the script *without* quitting, so a broken run
@@ -134,8 +135,8 @@ const PERMISSION_REQUEST_ID: &str = "req-1";
 const AGENT_SETTLE: Duration = Duration::from_millis(1_500);
 /// The control method `reconnect` sends. **Fake daemons only.** It is not a
 /// `Request` variant, so it can only be built by hand and only a daemon written
-/// to recognise it does anything with it; the real daemon answers "not
-/// implemented" and stays connected.
+/// to recognise it does anything with it; to the real daemon it is an
+/// undecodable request, answered `invalid_params` with the connection left up.
 pub const TEST_DROP_METHOD: &str = "system.test_drop";
 /// How long `reconnect` waits for the connection generation to move. The first
 /// backoff is one second, so this covers several attempts of a fake daemon that

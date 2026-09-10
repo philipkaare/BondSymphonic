@@ -10,11 +10,12 @@
 //! panes are talking to the *new* connection afterwards, because the `tree`
 //! step that follows the reconnect reaches the daemon at all.
 //!
-//! `system.test_drop` is a method of the *fake* daemon only. The real daemon
-//! has never heard of it and answers "not implemented", which is why the drop
-//! can only ever happen in a test.
+//! `system.test_drop` is a method of the *fake* daemon only. It is not a
+//! `Request` variant, so the real daemon's decoder sees an unknown enum
+//! variant and answers `invalid_params` with the connection left up, which is
+//! why the drop can only ever happen in a test.
 
-use bondsymphonic_ide::qobjects::app_controller::backoff_delay;
+use bondsymphonic_ide::qobjects::app_controller::{backoff_delay, next_attempt, HELD_LONG_ENOUGH};
 use bondsymphonic_proto::*;
 use std::collections::HashMap;
 use std::io::Read;
@@ -46,6 +47,40 @@ fn backoff_never_overflows_or_returns_zero() {
     // There is no attempt 0, but a caller that passes one must still wait
     // rather than spin.
     assert_eq!(backoff_delay(0), Duration::from_secs(1));
+}
+
+#[test]
+fn a_connection_that_held_resets_the_schedule() {
+    // An ordinary daemon restart: the connection had been up for a while, so
+    // the next loss starts at one second again rather than at whatever the
+    // counter had climbed to hours earlier.
+    assert_eq!(next_attempt(6, Duration::from_secs(3600)), 1);
+    assert_eq!(next_attempt(1, HELD_LONG_ENOUGH), 1);
+    // The first loss of a run: `attempt` is still 0 and the answer is 1 either
+    // way, because there is no earlier attempt to climb from.
+    assert_eq!(next_attempt(0, Duration::from_secs(3600)), 1);
+    assert_eq!(next_attempt(0, Duration::ZERO), 1);
+}
+
+#[test]
+fn a_crash_looping_daemon_keeps_the_backoff_climbing() {
+    // `hello` answered and the process gone a moment later is not a recovery.
+    // Without this the bar would sit on "attempt 1" and the IDE would relaunch
+    // the daemon every second for as long as the window is open.
+    assert_eq!(next_attempt(1, Duration::from_millis(200)), 2);
+    assert_eq!(next_attempt(2, Duration::from_secs(1)), 3);
+    assert_eq!(
+        next_attempt(5, HELD_LONG_ENOUGH - Duration::from_millis(1)),
+        6
+    );
+    // Which is what turns the delay into the cap rather than leaving it at one
+    // second forever.
+    assert_eq!(
+        backoff_delay(next_attempt(5, Duration::ZERO)),
+        Duration::from_secs(30)
+    );
+    // Unbounded attempts must not wrap.
+    assert_eq!(next_attempt(u32::MAX, Duration::ZERO), u32::MAX);
 }
 
 // ---------------------------------------------------------------------------
@@ -420,9 +455,9 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
     (addr, journal)
 }
 
-/// The fake daemon's own control method. Not in `Request`: the real daemon does
-/// not have it and answers "not implemented", so a drop can only be asked for
-/// where a fake is listening.
+/// The fake daemon's own control method. Not in `Request`: the real daemon
+/// cannot decode it and answers `invalid_params` without dropping anything, so
+/// a drop can only be asked for where a fake is listening.
 const TEST_DROP: &str = "system.test_drop";
 
 fn workspace(id: &str, name: &str) -> WorkspaceInfo {

@@ -192,9 +192,9 @@ const NO_WARNINGS: [&str; 16] = [
 /// so the IDE's reconnect loop has something to reconnect from.
 ///
 /// **Test-only, and fake-daemon-only.** It is not a `Request` variant, so it
-/// can only be built by hand; the real daemon has never heard of it and answers
-/// "not implemented" without dropping anything. `crates/ide/tests/reconnect_tests.rs`
-/// is where it is exercised end to end.
+/// can only be built by hand; to the real daemon's decoder it is an unknown
+/// enum variant, answered `invalid_params` with nothing dropped.
+/// `crates/ide/tests/reconnect_tests.rs` is where it is exercised end to end.
 const TEST_DROP: &str = "system.test_drop";
 
 /// A recorder the fake daemon appends to: every request method it answered in

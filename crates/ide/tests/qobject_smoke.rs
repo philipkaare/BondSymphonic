@@ -880,9 +880,11 @@ fn restart_options_carry_the_tab_options_and_the_last_session() {
     let value: serde_json::Value = serde_json::from_str(&merged).expect("an object");
     assert_eq!(value["model"], "opus");
     assert_eq!(value["resume_session"], "sess-3");
-    // A field a newer daemon understands and this build does not survives,
-    // because the options are merged as JSON rather than parsed into the
-    // struct this build happens to have.
+    // An unrecognised key survives the merge: this step copies through what it
+    // is not changing rather than round-tripping the options via a struct.
+    // (It does not survive the whole trip -- `start_options` parses into
+    // `AgentStartOptions` before building the request -- but a merge that
+    // silently dropped keys would be lossy in a place nobody would look.)
     assert_eq!(value["future_field"], 7);
 }
 

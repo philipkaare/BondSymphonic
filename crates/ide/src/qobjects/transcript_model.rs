@@ -680,9 +680,13 @@ impl qobject::TranscriptModel {
 ///
 /// Pure, so the merge is testable without an agent or a Qt event loop. The
 /// options travel as JSON rather than as `AgentStartOptions` because that is
-/// what the tab holds and what `AppController::startAgent` takes back: parsing
-/// them into the struct here would drop any field a newer daemon understands
-/// and this build does not.
+/// what the tab holds and what `AppController::startAgent` takes back, so the
+/// merge stays a merge: it changes one key and copies the rest through
+/// verbatim. A key this build has never heard of survives *this* step, though
+/// not the whole trip -- `AppController::start_options` parses the string into
+/// `AgentStartOptions` before it builds the request, and that is where an
+/// unknown field is dropped. Widening what a tab can carry is a proto change,
+/// not something to work around here.
 ///
 /// A string that is not a JSON object is replaced by one rather than refused:
 /// the point of the call is to produce options that can start an agent, and

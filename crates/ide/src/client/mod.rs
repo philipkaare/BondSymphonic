@@ -220,9 +220,10 @@ impl DaemonClient {
     ///
     /// It exists for exactly one caller: the smoke script's `reconnect` step,
     /// which asks an in-process *fake* daemon to drop the connection with
-    /// `system.test_drop`. A real daemon has never heard of that method and
-    /// answers "not implemented", so nothing this sends can make a real daemon
-    /// do anything it would not do for a typo.
+    /// `system.test_drop`. A method the real daemon does not have is an unknown
+    /// enum variant to its decoder, so it answers `invalid_params` and stays
+    /// connected: nothing this sends can make a real daemon do anything it
+    /// would not do for a typo.
     ///
     /// Not waiting is the point rather than a shortcut: the method this is for
     /// is answered by the socket closing, so there is no reply to wait for and

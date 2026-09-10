@@ -17,7 +17,7 @@ use crate::qobjects::settings::Settings;
 use crate::qobjects::smoke;
 use bondsymphonic_proto::*;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One process-wide multi-threaded runtime drives the daemon connection. It is
 /// intentionally never dropped: the Qt event loop owns the main thread, and the
@@ -189,6 +189,30 @@ pub fn backoff_delay(attempt: u32) -> Duration {
     // must still get a wait rather than a spin.
     let steps = attempt.saturating_sub(1).min(5);
     Duration::from_secs((1u64 << steps).min(MAX_SECS))
+}
+
+/// How long a connection has to last before it counts as having worked.
+///
+/// A daemon that starts, answers `hello`, and dies a second later has not
+/// recovered; it is crash-looping. Below this, a handshake is not evidence of
+/// anything and the backoff keeps climbing.
+pub const HELD_LONG_ENOUGH: Duration = Duration::from_secs(5);
+
+/// The attempt number to use for the next reconnect, given the one that was
+/// just made and how long the connection it produced lasted.
+///
+/// A connection that held resets the schedule, so an ordinary daemon restart
+/// costs the user one second rather than the thirty a long-running IDE would
+/// otherwise have climbed to. A connection that did not reset nothing: a daemon
+/// crash-looping at start-up would otherwise be relaunched every couple of
+/// seconds for as long as the IDE is open, with the status bar frozen on
+/// "attempt 1" and no sign that anything is wrong.
+pub fn next_attempt(prev: u32, held: Duration) -> u32 {
+    if held >= HELD_LONG_ENOUGH {
+        1
+    } else {
+        prev.saturating_add(1).max(1)
+    }
 }
 
 /// The live connection, or the message an operation should fail with. Every
@@ -428,10 +452,13 @@ pub mod qobject {
         fn operation_failed(self: Pin<&mut AppController>, op: QString, message: QString);
 
         /// The IDE is talking to a daemon again after a connection loss, and
-        /// has already re-run `system.check_prereqs` and `workspace.list`:
-        /// `prereqsChecked` and `workspacesListed` have been emitted before
-        /// this. `generation` is the connection number every subscription is
-        /// now taken on.
+        /// has already *attempted* `system.check_prereqs` and `workspace.list`:
+        /// this is emitted after both have answered, whether they succeeded or
+        /// failed. A success arrives as `prereqsChecked` / `workspacesListed`
+        /// before this signal and a failure as `operationFailed`, so the window
+        /// has already seen whichever it was; this only says the re-sync is no
+        /// longer in flight. `generation` is the connection number every
+        /// subscription is now taken on.
         ///
         /// The Rust-side panes do not need it -- they re-attach through the
         /// generation channel themselves -- so this is for the window: refresh
@@ -1168,10 +1195,11 @@ async fn supervise(spec: LaunchSpec, qt: QtHandle, process: ProcessHandle) {
                     return;
                 }
                 tracing::warn!("reconnect attempt {attempt} failed: {message}");
-                attempt += 1;
+                attempt = attempt.saturating_add(1);
                 continue;
             }
         };
+        let connected_at = Instant::now();
 
         // Connected. Two things end a connection and the loop acts on
         // whichever comes first: the event stream ending (the socket died) or
@@ -1207,8 +1235,13 @@ async fn supervise(spec: LaunchSpec, qt: QtHandle, process: ProcessHandle) {
             let _ = qt.queue(|q| q.set_state(ConnectionState::Lost));
             return;
         }
-        tracing::warn!("{reason}");
-        attempt = 1;
+        // How long the connection lasted is what decides whether the schedule
+        // starts over. A daemon that answers `hello` and dies a second later is
+        // crash-looping, not recovering, and must not be able to hold the
+        // backoff at one second for the rest of the session.
+        let held = connected_at.elapsed();
+        tracing::warn!("{reason} after {held:?}");
+        attempt = next_attempt(attempt, held);
     }
 }
 
