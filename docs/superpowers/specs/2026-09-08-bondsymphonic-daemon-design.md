@@ -144,13 +144,45 @@ older daemon finds `agent_records` defaulted to empty, which it must read as
 "nothing is known about these agents" rather than as "there are none".
 
 **Create** (`workspace.create`):
-1. Validate repo (`git rev-parse --git-common-dir`), base branch exists.
+1. Validate repo (`git rev-parse --git-common-dir`), base branch exists. With
+   `init_if_missing`, a path that is not a repository is initialised here
+   instead of failing (see below).
 2. Compute branch `bs/<name>/work`; fail with `Conflict` if it exists.
 3. Pre-create the writable ref directories (5.2).
 4. `git worktree add -b bs/<name>/work <worktree_path> <base_branch>`.
 5. Create `homes/<id>` seeded with Claude credentials (8.3) and `caches/<id>`.
 6. Build the `SandboxSpec` and start the sandbox supervisor (6).
 7. Persist to registry, emit `workspace.state`.
+
+**Starting from a folder that is not a repository.** `repo.inspect` answers for
+such a path rather than failing: `RepoInfo { is_repo: false, exists, branches:
+[], default_branch: "main" }`, where `exists` says whether the directory is
+there. The New Agent dialog asks about a folder before anything has been created
+in it, and "not a repository yet" is an ordinary starting point there. Two path
+shapes stay `InvalidParams`, because neither can become a repository and
+answering "it will be created" to them would have the daemon build a directory
+tree nobody named: a path that exists and is not a directory, and one whose
+parent directory is itself missing.
+
+`is_repo` defaults to **true** when it is absent from the wire, which is the only
+value that keeps a newer IDE honest against an older daemon: a daemon without
+this behaviour failed the call outright for a non-repository, so every answer it
+ever sent was about a repository. `exists` defaults to false.
+
+`workspace.create.init_if_missing` (default false) is what turns the answer into
+an action: the directory is created if needed, `git init -b main`, then
+`git commit --allow-empty -m "Initial commit"`. The empty commit is not
+decoration — a repository with no commits has no branch for `git worktree add` to
+branch from. An identity is supplied (`BondSymphonic <bondsymphonic@localhost>`)
+only where `git config user.email` finds none, so a configured identity keeps the
+commit as its own, and `commit.gpgsign` is off for this one commit: it is made
+while a dialog waits, and a signing program that wants a passphrase would hang it
+until the git timeout. The whole sequence runs with `core.hooksPath` pinned at
+the daemon's empty directory (5.4), because `git init` copies `init.templateDir`
+— hooks included — into the new repository and the commit would run them. A path
+that is already a repository is left exactly as it is; the flag is off by default
+so that a client which does not know about it cannot initialise anything, its
+user never having been shown that a folder was about to become a repository.
 
 **Destroy**: stop agents, runs, PTYs; tear down sandbox; `git worktree remove
 --force`; `git branch -D bs/<name>/work`; delete `homes/`, `caches/`, transcripts;
@@ -661,10 +693,30 @@ logged-in machine and correct any synthetic shape that differs.
 On workspace creation, `homes/<id>/` receives:
 - `.claude/settings.json` copied from the daemon user's `~/.claude/settings.json`
   if present.
-- `.claude/.credentials.json` and `~/.claude.json` copied if present
-  (OAuth login), else `ANTHROPIC_API_KEY` is passed through from the daemon's
-  environment or from `agent.start.options.api_key`.
+- `.claude/.credentials.json` copied if present (OAuth login), else
+  `ANTHROPIC_API_KEY` is passed through from the daemon's environment or from
+  `agent.start.options.api_key`.
+- `.claude.json` **written rather than copied**: the daemon user's own file is
+  parsed, `projects["<worktree path>"].hasTrustDialogAccepted` is set to true,
+  and the result is written with the same 0600 mode the copy would have had.
+  Every other key survives the merge — account, onboarding state, the user's
+  other projects. Where the daemon user has no such file, or one that will not
+  parse, the workspace gets a fresh object carrying only the trust entry: the
+  CLI could not have read an unparseable file either, and the alternative is a
+  workspace that stays untrusted for good.
 - `.gitconfig` with `user.name`/`user.email` copied from the daemon user's config.
+
+**Why the trust entry.** Claude Code keeps the answer to its trust dialog per
+project directory, and reads a repository's `.claude/settings.json` — the
+`permissions.allow` list a repo pins its agent's tools with — only for a project
+that has been trusted. A sandbox home is new for every workspace and has never
+seen this worktree, so without the entry the agent starts with the repository's
+permissions dropped (`Ignoring N permissions.allow entries from
+.claude/settings.json: this workspace has not been trusted`) and nobody can
+accept the dialog: the agent runs non-interactively, and the daemon created the
+directory in the first place. The key is the worktree path **as the agent sees
+it**, which is the path it has on the host: the sandbox binds the worktree at the
+same path and starts the CLI there (6.2).
 
 The spec accepts that the agent can read these credentials; the sandbox protects
 the host, not the credentials. A `.claude/settings.json` supplied via

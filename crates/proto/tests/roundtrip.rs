@@ -30,6 +30,7 @@ fn request_envelope_shape() {
             repo_path: "/home/bs/repo".into(),
             base_branch: "main".into(),
             name: "agent-1".into(),
+            init_if_missing: false,
         }),
     };
     let v = serde_json::to_value(&msg).unwrap();
@@ -550,4 +551,55 @@ fn detect_run_configs_defaults_its_warnings_to_empty() {
     );
     let back: DetectRunConfigsResult = serde_json::from_value(v).unwrap();
     assert_eq!(back, result);
+}
+
+/// Both halves of the additive change this pass makes, checked the only way
+/// that matters: against the bytes a peer of the *previous* vintage sends.
+///
+/// A client built before `init_if_missing` existed sends `workspace.create`
+/// without the key, and the daemon must read that as "do not create anything" —
+/// the conservative half, since the other reading would have an old IDE
+/// initialising repositories nobody asked for.
+#[test]
+fn workspace_create_from_a_client_that_predates_init_if_missing() {
+    let back: Request = serde_json::from_str(
+        r#"{"method":"workspace.create","params":{"repo_path":"/r","base_branch":"main","name":"a"}}"#,
+    )
+    .unwrap();
+    let Request::WorkspaceCreate(p) = back else {
+        panic!("wrong variant")
+    };
+    assert!(
+        !p.init_if_missing,
+        "an old client asks for a workspace in a repository that already exists"
+    );
+}
+
+/// And a daemon built before `repo.inspect` could answer for a non-repository
+/// only ever answered *about* one: it failed outright otherwise. So its answer
+/// has to decode as `is_repo: true`, or a new IDE reading an old daemon would
+/// offer to initialise every repository the user picked.
+///
+/// `exists` defaults the other way on purpose: it is only meaningful together
+/// with `is_repo: false`, and `false` is what an old daemon knew about it.
+#[test]
+fn repo_info_from_a_daemon_that_predates_the_non_repo_answer() {
+    let info: RepoInfo = serde_json::from_str(
+        r#"{"default_branch":"main","branches":["main"],"is_dirty":false,"remotes":[]}"#,
+    )
+    .unwrap();
+    assert!(info.is_repo, "an old daemon only ever answered for a repo");
+    assert!(!info.exists);
+
+    let v = serde_json::to_value(RepoInfo {
+        default_branch: "main".into(),
+        branches: vec![],
+        is_dirty: false,
+        remotes: vec![],
+        is_repo: false,
+        exists: true,
+    })
+    .unwrap();
+    assert_eq!(v["is_repo"], false);
+    assert_eq!(v["exists"], true);
 }

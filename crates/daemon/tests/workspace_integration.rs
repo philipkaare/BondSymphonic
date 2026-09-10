@@ -29,6 +29,7 @@ async fn create_list_get_status_destroy_roundtrip_with_events() {
             repo_path: repo.to_string_lossy().into(),
             base_branch: "main".into(),
             name: "agent-1".into(),
+            init_if_missing: false,
         }))
         .await;
     let mut events = Vec::new();
@@ -76,6 +77,7 @@ async fn create_list_get_status_destroy_roundtrip_with_events() {
             repo_path: repo.to_string_lossy().into(),
             base_branch: "main".into(),
             name: "agent-1".into(),
+            init_if_missing: false,
         }))
         .await
         .unwrap_err();
@@ -137,6 +139,7 @@ async fn restore_marks_missing_worktree_as_error() {
             repo_path: repo.to_string_lossy().into(),
             base_branch: "main".into(),
             name: "a".into(),
+            init_if_missing: false,
         }))
         .await
         .unwrap(),
@@ -269,6 +272,7 @@ async fn a_failed_create_emits_error_then_destroying() {
             repo_path: repo.to_string_lossy().into(),
             base_branch: "no-such-branch".into(),
             name: "a".into(),
+            init_if_missing: false,
         }))
         .await;
     let mut events = Vec::new();
@@ -805,6 +809,132 @@ async fn the_full_workspace_chain_from_create_to_a_destroy_that_leaves_nothing()
 
     // And the base branch still reads without the workspace behind it.
     assert_eq!(plain(&["show", "main:feature.txt"]), "from the sandbox");
+
+    cancel.cancel();
+}
+
+/// The whole point of `init_if_missing`, end to end: the user picks a folder
+/// that has never been a repository, and gets a workspace they can work in.
+///
+/// `repo.inspect` is asked first, the way the New Agent dialog asks it, because
+/// the dialog's offer to initialise and the daemon's willingness to do it have
+/// to agree about the same path.
+#[tokio::test]
+async fn create_initialises_a_folder_that_is_not_a_repository_yet() {
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = dir.path().join("brand-new-project");
+    let (port, token, _daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+
+    let info: RepoInfo = serde_json::from_value(
+        c.call(Request::RepoInspect(RepoPathParams {
+            path: fresh.to_string_lossy().into(),
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!info.is_repo);
+    assert!(!info.exists);
+
+    let ws: WorkspaceInfo = serde_json::from_value(
+        c.call(Request::WorkspaceCreate(WorkspaceCreateParams {
+            repo_path: fresh.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: "alpha".into(),
+            init_if_missing: true,
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(ws.state, WorkspaceState::Ready);
+    assert_eq!(ws.branch, "bs/alpha/work");
+    assert!(
+        fresh.join(".git").exists(),
+        "the folder is a repository now"
+    );
+    // The worktree is a checkout of the branch the initial commit is on, which
+    // is what makes the workspace usable at all: a repository with no commits
+    // has nothing for `git worktree add` to branch from.
+    let head = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%s", "HEAD"])
+        .current_dir(&ws.worktree_path)
+        .output()
+        .unwrap();
+    assert!(
+        head.status.success(),
+        "{}",
+        String::from_utf8_lossy(&head.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "Initial commit"
+    );
+
+    cancel.cancel();
+}
+
+/// Without the flag the answer is the one it always was. A client that does not
+/// know about `init_if_missing` is a client whose user was never shown that a
+/// folder is about to become a repository.
+#[tokio::test]
+async fn create_still_refuses_a_folder_that_is_not_a_repository_without_the_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("just-a-folder");
+    std::fs::create_dir_all(&plain).unwrap();
+    let (port, token, _daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+
+    let err = c
+        .call(Request::WorkspaceCreate(WorkspaceCreateParams {
+            repo_path: plain.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: "alpha".into(),
+            init_if_missing: false,
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::GitError);
+    assert!(
+        err.message.contains("not a git repository"),
+        "{}",
+        err.message
+    );
+    assert!(!plain.join(".git").exists(), "nothing was initialised");
+
+    cancel.cancel();
+}
+
+/// The sandbox home is what the agent reads its Claude Code configuration from,
+/// and the worktree has to be a trusted project in it or the repository's own
+/// `.claude/settings.json` is ignored with a line in the daemon log and no way
+/// for anyone to accept the dialog that would fix it.
+#[tokio::test]
+async fn a_new_workspace_home_trusts_its_own_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+
+    let ws = create_ws(&mut c, &repo, "trusted").await;
+
+    let claude_json = daemon.dirs.home(&ws.id).join(".claude.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
+    // The file is a merge of the daemon user's own and is not printed on
+    // failure: it is their account state, and the part this test is about is
+    // which projects it trusts.
+    let trusted: Vec<&String> = v["projects"]
+        .as_object()
+        .map(|p| p.keys().collect())
+        .unwrap_or_default();
+    assert_eq!(
+        v["projects"][&ws.worktree_path]["hasTrustDialogAccepted"], true,
+        "trusted: {trusted:?}"
+    );
 
     cancel.cancel();
 }

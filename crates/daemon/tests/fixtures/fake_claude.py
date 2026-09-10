@@ -22,6 +22,10 @@ Behaviour:
   message echoing its text and a `result` line, so a turn can be driven from
   the test. `FAKE_CLAUDE_ECHO_DELAY` (seconds, default 0) holds that turn open
   for a while, which is how a test gets an agent that is genuinely busy.
+* The one message it reads rather than echoes is `print-claude-json`, which is
+  answered with the contents of `$HOME/.claude.json` -- the file the real CLI
+  reads its per-project trust from. It is how a test sees the sandbox home as
+  the agent sees it, rather than as the daemon meant to write it.
 * An `interrupt` control request is acknowledged and ends the turn cleanly.
 * SIGINT exits 130; end of input on stdin exits 0.
 """
@@ -172,6 +176,20 @@ def interrupted_turn(session, request_id):
     )
 
 
+PRINT_CLAUDE_JSON = "print-claude-json"
+
+
+def home_claude_json():
+    """`$HOME/.claude.json` as the agent sees it, or why it cannot be read."""
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    path = os.path.join(home, ".claude.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError as e:
+        return "cannot read %s: %s" % (path, e)
+
+
 def user_text(msg):
     content = msg.get("message", {}).get("content", [])
     if isinstance(content, str):
@@ -199,7 +217,10 @@ def main():
             continue
         kind = msg.get("type")
         if kind == "user":
-            echo_turn(session, user_text(msg))
+            text = user_text(msg)
+            if text.strip() == PRINT_CLAUDE_JSON:
+                text = home_claude_json()
+            echo_turn(session, text)
         elif kind == "control_request":
             request = msg.get("request", {})
             if request.get("subtype") == "interrupt":

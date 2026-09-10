@@ -247,6 +247,7 @@ async fn bwrap_workspace_protects_main_branch_and_shared_objects() {
             repo_path: repo.to_string_lossy().into(),
             base_branch: "main".into(),
             name: "sb".into(),
+            init_if_missing: false,
         },
     )
     .await
@@ -358,6 +359,7 @@ async fn the_real_claude_binary_runs_inside_a_bwrap_workspace() {
             repo_path: repo.to_string_lossy().into(),
             base_branch: "main".into(),
             name: "claudebin".into(),
+            init_if_missing: false,
         },
     )
     .await
@@ -640,6 +642,7 @@ async fn a_workspace_whose_sandbox_dies_is_reported_as_sandbox_down() {
             repo_path: repo.to_string_lossy().into(),
             base_branch: "main".into(),
             name: "dies".into(),
+            init_if_missing: false,
         },
     )
     .await
@@ -786,6 +789,7 @@ async fn bwrap_workspace(
             repo_path: repo.to_string_lossy().into(),
             base_branch: "main".into(),
             name: name.into(),
+            init_if_missing: false,
         },
     )
     .await
@@ -986,6 +990,7 @@ async fn a_claude_agent_streams_a_turn_from_inside_the_sandbox() {
             repo_path: repo.to_string_lossy().into(),
             base_branch: "main".into(),
             name: "agent".into(),
+            init_if_missing: false,
         },
     )
     .await
@@ -1129,6 +1134,7 @@ async fn an_agent_cannot_redirect_the_settings_copy_out_of_its_own_home() {
             repo_path: repo.to_string_lossy().into(),
             base_branch: "main".into(),
             name: "esc".into(),
+            init_if_missing: false,
         },
     )
     .await

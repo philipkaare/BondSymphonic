@@ -538,7 +538,7 @@ impl AgentManager {
         // since this workspace was made, and a workspace that was created
         // logged out would otherwise stay that way forever.
         let home = d.dirs.home(&ws.id);
-        let seeded = credentials::seed_claude_files(&home);
+        let seeded = credentials::seed_claude_files(&home, &ws.worktree_path);
         if !seeded.is_empty() {
             info!(ws = %ws.id, files = ?seeded, "seeded claude credentials");
         }

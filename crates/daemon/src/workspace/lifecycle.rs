@@ -427,7 +427,7 @@ async fn seed_home(d: &Daemon, ws: &Workspace) {
             &format!("[user]\n\tname = {name}\n\temail = {email}\n[safe]\n\tdirectory = *\n"),
         );
     }
-    let seeded = crate::agents::credentials::seed_claude_files(&home);
+    let seeded = crate::agents::credentials::seed_claude_files(&home, &ws.worktree_path);
     if !seeded.is_empty() {
         tracing::info!(ws = %ws.id, files = ?seeded, "seeded claude credentials");
     }
@@ -444,7 +444,26 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
             "workspace name must be a single path-safe word",
         ));
     }
-    let git_common = repo::common_dir(&d.git, &repo_path).await?;
+    // A folder that is not a repository is an error unless the client asked for
+    // it to become one. The IDE only sets the flag after telling the user, in
+    // the New Agent dialog, that the folder will be initialised — so the error
+    // an older client sees is the one it always saw.
+    let git_common = match repo::common_dir(&d.git, &repo_path).await {
+        Ok(c) => c,
+        Err(e) if p.init_if_missing => {
+            // `core.hooksPath` pinned at the daemon's empty directory: `git init`
+            // copies `init.templateDir` into the new repository, hooks included,
+            // and the commit that follows would run them (daemon design §5.4).
+            let git = d
+                .git
+                .clone()
+                .with_config("core.hooksPath", &d.dirs.no_hooks().to_string_lossy());
+            tracing::info!(repo = %repo_path.display(), "initialising a folder that is not a repository: {}", e.message);
+            repo::init_repo(&git, &repo_path).await?;
+            repo::common_dir(&d.git, &repo_path).await?
+        }
+        Err(e) => return Err(e),
+    };
     if d.registry.find_by_name(&repo_path, &p.name).is_some() {
         return Err(RpcError::new(
             ErrorCode::Conflict,

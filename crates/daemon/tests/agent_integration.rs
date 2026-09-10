@@ -649,3 +649,63 @@ async fn an_interrupt_does_not_kill_the_turn_that_follows_it() {
         .unwrap();
     cancel.cancel();
 }
+
+/// The daemon log of the first real run said
+/// `claude: Ignoring 9 permissions.allow entries from .claude/settings.json:
+/// this workspace has not been trusted`. Claude Code keeps that consent per
+/// project directory in `$HOME/.claude.json`, and a sandbox home is a fresh one
+/// per workspace.
+///
+/// Asked of the agent rather than of the file the daemon wrote, because what
+/// matters is the path *as the process sees it*: the worktree is bound into the
+/// sandbox at its host path and is the working directory the CLI starts in, and
+/// a trust entry under any other spelling would be ignored exactly as silently.
+#[tokio::test]
+async fn the_agents_home_trusts_the_worktree_it_runs_in() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    use_fake_claude(py, "simple_turn.ndjson");
+    let (port, token, _d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "trusted").await;
+    let ag = start_agent(&mut c, &ws.id).await;
+    // Let the fixture finish, so what comes back next is the answer to the ask.
+    next_agent_events(&mut c, &ag, 4, Duration::from_secs(20)).await;
+
+    c.call(Request::AgentSend(AgentSendParams {
+        agent_id: ag.clone(),
+        text: "print-claude-json".into(),
+    }))
+    .await
+    .unwrap();
+
+    let events = next_agent_events(&mut c, &ag, 3, Duration::from_secs(20)).await;
+    let answer = bodies(&events)
+        .into_iter()
+        .find_map(|b| match b {
+            AgentMessageBody::AssistantText { text } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("the fake answers with the file it read");
+    let json = answer.trim_start_matches("echo: ");
+    let v: serde_json::Value = serde_json::from_str(json)
+        .unwrap_or_else(|e| panic!("the agent could not read a JSON .claude.json: {e}"));
+    // The file is a copy of the daemon user's own and is not printed on failure:
+    // it is their account state, and the only part this test is about is which
+    // projects it trusts.
+    let trusted: Vec<&String> = v["projects"]
+        .as_object()
+        .map(|p| p.keys().collect())
+        .unwrap_or_default();
+    assert_eq!(
+        v["projects"][&ws.worktree_path]["hasTrustDialogAccepted"], true,
+        "the worktree the agent runs in must be a trusted project; trusted: {trusted:?}"
+    );
+
+    cancel.cancel();
+}

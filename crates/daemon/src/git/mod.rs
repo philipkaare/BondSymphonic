@@ -62,6 +62,28 @@ pub struct GitBytes {
     pub stdout: Vec<u8>,
 }
 
+/// Times every git command the daemon runs, at debug.
+///
+/// A `repo.inspect` that took longer than the IDE's 30 s timeout on a large
+/// repository under `/mnt/c` left nothing in the log to say which of its six
+/// commands had been slow, and the answer to that has to be in the log the next
+/// time rather than in another round of guessing. Three fields are what it takes
+/// to act on one: the subcommand, the elapsed time, and the working tree it ran
+/// in. Debug rather than info, because a busy workspace runs a handful of these
+/// per second.
+///
+/// The `-c` prefix is deliberately not part of it: it is a fixed policy of this
+/// `Git`, the same on every line, and `args[0]` is the subcommand the caller
+/// asked for.
+fn log_elapsed(args: &[&str], cwd: &Path, started: std::time::Instant) {
+    tracing::debug!(
+        subcommand = args.first().copied().unwrap_or(""),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        cwd = %cwd.display(),
+        "git command finished"
+    );
+}
+
 impl Git {
     pub fn new() -> Self {
         Self::default()
@@ -100,7 +122,10 @@ impl Git {
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
-        let out = match tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await {
+        let started = std::time::Instant::now();
+        let finished = tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await;
+        log_elapsed(args, cwd, started);
+        let out = match finished {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => return Err(git_error(&command, None, &e.to_string())),
             Err(_) => return Err(git_error(&command, None, "timed out after 60s")),
@@ -161,7 +186,10 @@ impl Git {
             }
             child.wait_with_output().await.map_err(|e| e.to_string())
         };
-        let out = match tokio::time::timeout(GIT_TIMEOUT, run).await {
+        let started = std::time::Instant::now();
+        let finished = tokio::time::timeout(GIT_TIMEOUT, run).await;
+        log_elapsed(args, cwd, started);
+        let out = match finished {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => return Err(git_error(&command, None, &e)),
             Err(_) => return Err(git_error(&command, None, "timed out after 60s")),
@@ -241,7 +269,10 @@ impl Git {
             let status = child.wait().await.map_err(|e| e.to_string())?;
             Ok::<_, String>((stdout, stderr, status))
         };
-        let (stdout, stderr, status) = match tokio::time::timeout(GIT_TIMEOUT, read).await {
+        let started = std::time::Instant::now();
+        let finished = tokio::time::timeout(GIT_TIMEOUT, read).await;
+        log_elapsed(args, cwd, started);
+        let (stdout, stderr, status) = match finished {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(git_error(&command, None, &e)),
             Err(_) => return Err(git_error(&command, None, "timed out after 60s")),
@@ -414,4 +445,87 @@ pub fn git_error(command: &str, exit_code: Option<i32>, stderr: &str) -> RpcErro
     RpcError::new(ErrorCode::GitError, format!("{command} failed: {stderr}")).with_data(
         serde_json::json!({ "command": command, "exit_code": exit_code, "stderr": stderr }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// A `MakeWriter` that keeps what a subscriber writes, so a test can read
+    /// the log lines back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<StdMutex<Vec<u8>>>);
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Runs `f` with a debug-level subscriber of our own and returns everything
+    /// it logged. The runtime is built inside the guard because the subscriber
+    /// is thread-local and a `#[tokio::test]` would set it after the fact.
+    fn logs_of(f: impl std::future::Future<Output = ()>) -> String {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(f);
+        });
+        captured.text()
+    }
+
+    /// `repo.inspect` timed out at 30 s on a large repository on `/mnt/c` and
+    /// nothing in the log said which of its six git commands had been slow.
+    /// Every command the daemon runs is timed, and the three fields are what it
+    /// takes to act on one: which subcommand, how long, and in which working
+    /// tree.
+    #[test]
+    fn every_git_command_logs_its_elapsed_time_at_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let logs = logs_of(async move {
+            Git::new().run(&cwd, &["--version"]).await.unwrap();
+            // A command that fails is timed too: a slow failure is exactly the
+            // one this has to be able to explain.
+            let _ = Git::new().run(&cwd, &["rev-parse", "--git-dir"]).await;
+        });
+
+        assert_eq!(
+            logs.matches("elapsed_ms").count(),
+            2,
+            "both commands are timed, the failing one included: {logs}"
+        );
+        assert!(logs.contains("subcommand=\"--version\""), "{logs}");
+        assert!(logs.contains("subcommand=\"rev-parse\""), "{logs}");
+        assert!(
+            logs.contains(&dir.path().display().to_string()),
+            "the working directory is part of the line: {logs}"
+        );
+    }
 }

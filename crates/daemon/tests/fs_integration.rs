@@ -15,6 +15,7 @@ async fn fs_list_read_write_over_the_protocol() {
             repo_path: repo.to_string_lossy().into(),
             base_branch: "main".into(),
             name: "agent-1".into(),
+            init_if_missing: false,
         }))
         .await
         .unwrap(),

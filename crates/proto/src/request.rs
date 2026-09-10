@@ -34,7 +34,16 @@ params!(RepoPathParams { path: String });
 params!(WorkspaceCreateParams {
     repo_path: String,
     base_branch: String,
-    name: String
+    name: String,
+    /// Initialise `repo_path` as a git repository when it is not one already,
+    /// creating the directory if it is missing.
+    ///
+    /// Off by default, and deliberately so: a client that does not know about
+    /// this field is a client whose user was never shown that a folder is about
+    /// to become a repository, and the daemon must not make that decision for
+    /// them. Where it is set, the IDE has said so in the New Agent dialog.
+    #[serde(default)]
+    init_if_missing: bool
 });
 params!(WorkspaceIdParams {
     workspace_id: WorkspaceId
@@ -243,6 +252,7 @@ impl Request {
                 repo_path: "/r".into(),
                 base_branch: "main".into(),
                 name: "a".into(),
+                init_if_missing: true,
             }),
             WorkspaceList {},
             WorkspaceGet(WorkspaceIdParams {

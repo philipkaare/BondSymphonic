@@ -47,12 +47,39 @@ pub enum SetupAction {
     InstallGh,
 }
 
+/// What `repo.inspect` knows about a path the user picked.
+///
+/// It answers for a path that is *not* a repository as well as for one that is,
+/// because the New Agent dialog asks about a folder before anything has been
+/// created in it: a folder that is not a repository yet is an ordinary starting
+/// point, not an error to report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RepoInfo {
     pub default_branch: String,
     pub branches: Vec<String>,
     pub is_dirty: bool,
     pub remotes: Vec<String>,
+    /// False when the path is a directory git does not recognise. The other
+    /// fields are then the empty answer: no branches, `main` as the branch such
+    /// a folder would be initialised with.
+    ///
+    /// It defaults to **true**, which is the only value that keeps a newer
+    /// client honest against an older daemon: a daemon that predates this field
+    /// failed the whole call for a non-repository, so every answer it ever sent
+    /// was about a repository.
+    #[serde(default = "yes")]
+    pub is_repo: bool,
+    /// Whether the directory itself is there. Only meaningful with
+    /// `is_repo: false`: `false` means the folder would have to be created as
+    /// well as initialised.
+    #[serde(default)]
+    pub exists: bool,
+}
+
+/// The default for [`RepoInfo::is_repo`]. Serde takes a path to a function, not
+/// a literal.
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

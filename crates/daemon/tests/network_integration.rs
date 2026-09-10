@@ -426,6 +426,7 @@ async fn a_sandboxed_process_reaches_the_host_only_through_the_allowlisting_prox
             repo_path: repo.to_string_lossy().into(),
             base_branch: "main".into(),
             name: "netbox".into(),
+            init_if_missing: false,
         },
     )
     .await

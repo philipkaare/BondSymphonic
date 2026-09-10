@@ -225,6 +225,7 @@ pub async fn create_ws(c: &mut Client, repo: &std::path::Path, name: &str) -> Wo
             repo_path: repo.to_string_lossy().into(),
             base_branch: "main".into(),
             name: name.into(),
+            init_if_missing: false,
         }))
         .await
         .unwrap(),

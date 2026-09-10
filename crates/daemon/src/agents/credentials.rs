@@ -10,6 +10,11 @@
 //! Copying happens both when a workspace is created and every time an agent
 //! starts, so a login performed after the workspace existed reaches it without
 //! the user having to recreate anything.
+//!
+//! `.claude.json` is the one file that is written rather than copied: the
+//! workspace's worktree is added to it as a trusted project (§8.3), because
+//! Claude Code keeps that consent per project directory and a sandbox home has
+//! never seen this one.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,8 +28,12 @@ use std::path::{Path, PathBuf};
 const FILES: [(&str, bool); 3] = [
     (".claude/settings.json", false),
     (".claude/.credentials.json", true),
-    (".claude.json", true),
+    (CLAUDE_JSON, true),
 ];
+
+/// The file Claude Code keeps its per-project state in, including which project
+/// directories the user has accepted the trust dialog for.
+const CLAUDE_JSON: &str = ".claude.json";
 
 /// The daemon user's home, or `None` when the platform will not name one.
 fn daemon_home() -> Option<PathBuf> {
@@ -160,13 +169,80 @@ fn copy_file(from: &Path, to: &Path, secret: bool) -> std::io::Result<()> {
     dst.flush()
 }
 
-/// Copies the Claude Code login out of `source_home` into `home`, overwriting
-/// what is already there so a fresh login refreshes an existing workspace.
+/// Writes `body` into `path` with the private mode a secret gets, through the
+/// same unlink-then-`create_new` the copies use.
+fn write_private(path: &Path, body: &str) -> std::io::Result<()> {
+    clear_destination(path)?;
+    let mut f = create_private(path)?;
+    f.write_all(body.as_bytes())
+}
+
+/// `source` with `worktree` marked as a trusted project, as the bytes to write.
 ///
-/// Returns the relative names actually copied, for logging. Every failure is
+/// Claude Code stores the answer to its trust dialog per project directory in
+/// `~/.claude.json`, and reads a repository's `.claude/settings.json` — the
+/// `permissions.allow` list a repo pins its agent's tools with — only for a
+/// project it has been told to trust. A sandbox home is new every workspace and
+/// has never seen this worktree, so without this entry the agent starts with the
+/// repository's permissions dropped and no way to accept the dialog: it runs
+/// non-interactively, and the daemon is what created the directory in the first
+/// place.
+///
+/// Everything else in the file is the user's own and survives the merge. A
+/// source that will not parse — or is not a JSON object — is replaced rather
+/// than propagated: the CLI could not have read it either, and the alternative
+/// is a workspace that stays untrusted for good.
+pub(crate) fn claude_json_with_trust(source: Option<&str>, worktree: &Path) -> String {
+    let parsed = source.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    let mut root = match parsed {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => {
+            if source.is_some_and(|s| !s.trim().is_empty()) {
+                tracing::warn!(
+                    "the daemon user's .claude.json is not a JSON object; seeding a fresh one"
+                );
+            }
+            serde_json::Map::new()
+        }
+    };
+    let projects = match root.get_mut("projects") {
+        Some(serde_json::Value::Object(p)) => p,
+        _ => {
+            root.insert("projects".into(), serde_json::json!({}));
+            root.get_mut("projects")
+                .and_then(|v| v.as_object_mut())
+                .expect("just inserted an object")
+        }
+    };
+    // The worktree path *as the agent sees it*: the sandbox binds it at the same
+    // path it has on the host (`workspace::lifecycle::spec_for`) and starts the
+    // CLI with it as the working directory, so one string serves both sides.
+    let key = worktree.to_string_lossy().into_owned();
+    match projects.get_mut(&key) {
+        Some(serde_json::Value::Object(entry)) => {
+            entry.insert("hasTrustDialogAccepted".into(), true.into());
+        }
+        _ => {
+            projects.insert(key, serde_json::json!({ "hasTrustDialogAccepted": true }));
+        }
+    }
+    serde_json::Value::Object(root).to_string()
+}
+
+/// Copies the Claude Code login out of `source_home` into `home`, overwriting
+/// what is already there so a fresh login refreshes an existing workspace, and
+/// marks `worktree` as a project this home trusts.
+///
+/// Returns the relative names actually written, for logging. Every failure is
 /// non-fatal: a missing file simply means the user has not logged in (or has no
-/// settings), and the agent will say so itself when it starts.
-pub fn seed_claude_files_from(source_home: &Path, home: &Path) -> Vec<&'static str> {
+/// settings), and the agent will say so itself when it starts. `.claude.json` is
+/// the exception that is always written, because the trust entry has to be there
+/// whether or not the daemon user has a file to merge it into.
+pub fn seed_claude_files_from(
+    source_home: &Path,
+    home: &Path,
+    worktree: &Path,
+) -> Vec<&'static str> {
     let mut seeded = Vec::new();
     // The home itself before anything under it: `.claude.json` is written
     // directly into it, and it is as replaceable by the agent as `.claude` is.
@@ -176,6 +252,22 @@ pub fn seed_claude_files_from(source_home: &Path, home: &Path) -> Vec<&'static s
     }
     for (rel, secret) in FILES {
         let from = source_home.join(rel);
+        if rel == CLAUDE_JSON {
+            // Written, not copied: whatever the daemon user has (or has not) is
+            // merged with this workspace's trust entry. Straight into `home`,
+            // which `ensure_real_dir` has just made a real directory.
+            let to = home.join(rel);
+            let body =
+                claude_json_with_trust(std::fs::read_to_string(&from).ok().as_deref(), worktree);
+            let _ = clear_destination(&to);
+            match write_private(&to, &body) {
+                Ok(()) => seeded.push(rel),
+                Err(e) => {
+                    tracing::warn!(path = %to.display(), error = %e, "could not seed .claude.json")
+                }
+            }
+            continue;
+        }
         if !from.is_file() {
             continue;
         }
@@ -205,11 +297,15 @@ pub fn seed_claude_files_from(source_home: &Path, home: &Path) -> Vec<&'static s
 }
 
 /// [`seed_claude_files_from`] out of the daemon user's own home.
-pub fn seed_claude_files(home: &Path) -> Vec<&'static str> {
-    match daemon_home() {
-        Some(source_home) => seed_claude_files_from(&source_home, home),
-        None => Vec::new(),
-    }
+///
+/// A platform that will not name a home still gets the trust entry: the merge
+/// has nothing to merge into, which is the same case as a user who has never
+/// logged in.
+pub fn seed_claude_files(home: &Path, worktree: &Path) -> Vec<&'static str> {
+    // Never a path under `home`: that one is the agent's to write, and a source
+    // it could create is a source it could dictate.
+    let source_home = daemon_home().unwrap_or_else(|| PathBuf::from("/nonexistent/no-daemon-home"));
+    seed_claude_files_from(&source_home, home, worktree)
 }
 
 #[cfg(test)]
@@ -246,11 +342,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src-home");
         let dst = dir.path().join("ws-home");
+        let worktree = dir.path().join("wt");
         write(src.join(".claude/.credentials.json"), "{\"t\":1}");
         write(src.join(".claude.json"), "{}");
         // No settings.json: it must simply be skipped.
 
-        let seeded = seed_claude_files_from(&src, &dst);
+        let seeded = seed_claude_files_from(&src, &dst, &worktree);
         assert_eq!(seeded, vec![".claude/.credentials.json", ".claude.json"]);
         assert_eq!(
             std::fs::read_to_string(dst.join(".claude/.credentials.json")).unwrap(),
@@ -271,9 +368,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src-home");
         let dst = dir.path().join("ws-home");
+        let worktree = dir.path().join("wt");
         write(src.join(".claude/.credentials.json"), "old");
         write(src.join(".claude/settings.json"), "{\"a\":1}");
-        seed_claude_files_from(&src, &dst);
+        seed_claude_files_from(&src, &dst, &worktree);
 
         // A stale, wide-open destination, as an earlier version of this code
         // (or a user) could have left behind.
@@ -288,10 +386,14 @@ mod tests {
         }
         write(src.join(".claude/.credentials.json"), "new");
 
-        let seeded = seed_claude_files_from(&src, &dst);
+        let seeded = seed_claude_files_from(&src, &dst, &worktree);
         assert_eq!(
             seeded,
-            vec![".claude/settings.json", ".claude/.credentials.json"]
+            vec![
+                ".claude/settings.json",
+                ".claude/.credentials.json",
+                ".claude.json"
+            ]
         );
         assert_eq!(
             std::fs::read_to_string(dst.join(".claude/.credentials.json")).unwrap(),
@@ -321,16 +423,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src-home");
         let dst = dir.path().join("ws-home");
+        let worktree = dir.path().join("wt");
         write(src.join(".claude/.credentials.json"), "secret");
         write(src.join(".claude.json"), "{}");
         std::fs::create_dir_all(dst.join(".claude/.credentials.json")).unwrap();
 
-        let seeded = seed_claude_files_from(&src, &dst);
+        let seeded = seed_claude_files_from(&src, &dst, &worktree);
         assert_eq!(seeded, vec![".claude.json"]);
-        assert_eq!(
-            std::fs::read_to_string(dst.join(".claude.json")).unwrap(),
-            "{}"
-        );
+        assert!(std::fs::read_to_string(dst.join(".claude.json"))
+            .unwrap()
+            .contains("hasTrustDialogAccepted"));
         assert!(
             dst.join(".claude/.credentials.json").is_dir(),
             "the obstruction is reported, not removed"
@@ -345,6 +447,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src-home");
         let dst = dir.path().join("ws-home");
+        let worktree = dir.path().join("wt");
         let outside = dir.path().join("the-users-real-home").join(".claude");
         write(
             src.join(".claude/.credentials.json"),
@@ -358,8 +461,8 @@ mod tests {
             return;
         }
 
-        let seeded = seed_claude_files_from(&src, &dst);
-        assert_eq!(seeded, vec![".claude/.credentials.json"]);
+        let seeded = seed_claude_files_from(&src, &dst, &worktree);
+        assert_eq!(seeded, vec![".claude/.credentials.json", ".claude.json"]);
         assert!(
             std::fs::symlink_metadata(dst.join(".claude"))
                 .unwrap()
@@ -388,12 +491,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src-home");
         let dst = dir.path().join("ws-home");
+        let worktree = dir.path().join("wt");
         write(src.join(".claude/.credentials.json"), "tokens");
         std::fs::create_dir_all(&dst).unwrap();
         std::fs::write(dst.join(".claude"), "in the way").unwrap();
 
-        let seeded = seed_claude_files_from(&src, &dst);
-        assert_eq!(seeded, vec![".claude/.credentials.json"]);
+        let seeded = seed_claude_files_from(&src, &dst, &worktree);
+        assert_eq!(seeded, vec![".claude/.credentials.json", ".claude.json"]);
         assert!(dst.join(".claude").is_dir());
         assert_eq!(
             std::fs::read_to_string(dst.join(".claude/.credentials.json")).unwrap(),
@@ -446,7 +550,8 @@ mod tests {
     fn seeding_creates_exactly_what_it_reports() {
         let dir = tempfile::tempdir().unwrap();
         let dst = dir.path().join("ws-home");
-        let seeded = seed_claude_files(&dst);
+        let worktree = dir.path().join("wt");
+        let seeded = seed_claude_files(&dst, &worktree);
         for rel in &seeded {
             assert!(
                 dst.join(rel).is_file(),
@@ -460,6 +565,126 @@ mod tests {
                     "{rel} appeared without being reported"
                 );
             }
+        }
+    }
+
+    /// The bug this fixes, in the daemon log of the first real run:
+    /// `claude: Ignoring 9 permissions.allow entries from .claude/settings.json:
+    /// this workspace has not been trusted`. Claude Code keeps that consent per
+    /// project directory in `~/.claude.json`, and the sandbox home is a fresh
+    /// one every workspace — so unless the daemon writes the entry, a repository
+    /// that pins the tools its agent may use has those settings ignored, and
+    /// nobody inside the sandbox can answer the dialog that would fix it.
+    ///
+    /// Everything else in the file is the user's own and is carried across
+    /// untouched: their account, their other projects, their onboarding state.
+    #[test]
+    fn the_seeded_claude_json_trusts_the_worktree_and_keeps_everything_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src-home");
+        let dst = dir.path().join("ws-home");
+        let worktree = dir.path().join("worktrees").join("ws_1234");
+        write(
+            src.join(".claude.json"),
+            r#"{
+              "userID": "u-1",
+              "hasCompletedOnboarding": true,
+              "projects": {
+                "/home/someone/other": {"hasTrustDialogAccepted": true, "history": ["a"]}
+              }
+            }"#,
+        );
+
+        seed_claude_files_from(&src, &dst, &worktree);
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dst.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["userID"], "u-1");
+        assert_eq!(v["hasCompletedOnboarding"], true);
+        assert_eq!(v["projects"]["/home/someone/other"]["history"][0], "a");
+        assert_eq!(
+            v["projects"][worktree.to_string_lossy().as_ref()]["hasTrustDialogAccepted"],
+            true
+        );
+    }
+
+    /// A daemon user who has never run Claude Code has no `.claude.json` at all,
+    /// and the workspace still needs one: the trust entry is the point of the
+    /// file here, not a decoration on a copy.
+    #[test]
+    fn a_home_with_no_claude_json_still_gets_a_trusted_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src-home");
+        std::fs::create_dir_all(&src).unwrap();
+        let dst = dir.path().join("ws-home");
+        let worktree = dir.path().join("wt");
+
+        let seeded = seed_claude_files_from(&src, &dst, &worktree);
+
+        assert_eq!(seeded, vec![".claude.json"]);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dst.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            v["projects"][worktree.to_string_lossy().as_ref()]["hasTrustDialogAccepted"],
+            true
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            mode_of(&dst.join(".claude.json")),
+            0o600,
+            "it is written the way the copy of it would be"
+        );
+    }
+
+    /// A `.claude.json` that will not parse cannot be merged into, and refusing
+    /// to seed over it would leave the workspace untrusted for good. The trust
+    /// entry wins; what is lost is a file the CLI could not have read either.
+    #[test]
+    fn an_unparseable_claude_json_still_yields_a_trusted_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src-home");
+        let dst = dir.path().join("ws-home");
+        let worktree = dir.path().join("wt");
+        write(src.join(".claude.json"), "half a file {");
+
+        seed_claude_files_from(&src, &dst, &worktree);
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dst.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            v["projects"][worktree.to_string_lossy().as_ref()]["hasTrustDialogAccepted"],
+            true
+        );
+    }
+
+    /// The merge is where a mistake would be silent, so its edges are checked
+    /// directly: a `projects` key of the wrong shape must not make the whole
+    /// file unwritable, and an entry that is already there keeps its own fields.
+    #[test]
+    fn the_trust_merge_replaces_only_what_it_has_to() {
+        let wt = Path::new("/w/t");
+        let key = "/w/t";
+
+        let v: serde_json::Value = serde_json::from_str(&claude_json_with_trust(
+            Some(r#"{"projects": {"/w/t": {"history": ["x"], "hasTrustDialogAccepted": false}}}"#),
+            wt,
+        ))
+        .unwrap();
+        assert_eq!(v["projects"][key]["hasTrustDialogAccepted"], true);
+        assert_eq!(v["projects"][key]["history"][0], "x");
+
+        // `projects` as something other than an object, and a top level that is
+        // not an object at all: both are replaced rather than propagated.
+        for source in [r#"{"projects": 7}"#, "[1, 2]", "null"] {
+            let v: serde_json::Value =
+                serde_json::from_str(&claude_json_with_trust(Some(source), wt)).unwrap();
+            assert_eq!(
+                v["projects"][key]["hasTrustDialogAccepted"], true,
+                "source {source}"
+            );
         }
     }
 }
