@@ -3,10 +3,15 @@ use crate::types::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// A request's parameter struct.
+///
+/// Fields may carry attributes, which is how an optional field added after a
+/// method shipped gets its `#[serde(default)]`: an older client that never
+/// learned to send it must keep working against a newer daemon.
 macro_rules! params {
-    ($name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
+    ($name:ident { $($(#[$attr:meta])* $field:ident : $ty:ty),* $(,)? }) => {
         #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-        pub struct $name { $(pub $field: $ty),* }
+        pub struct $name { $($(#[$attr])* pub $field: $ty),* }
     };
 }
 
@@ -81,7 +86,17 @@ params!(PtyResizeParams {
 params!(PtyIdParams { pty_id: PtyId });
 params!(RunStartParams {
     workspace_id: WorkspaceId,
-    config_name: String
+    config_name: String,
+    /// The port this start should use instead of the one the run configuration
+    /// names, for a configuration whose port the daemon only guessed.
+    ///
+    /// `None` -- which is what an older client's request deserialises to -- is
+    /// "use the configured port". A port is a property of the start, not of the
+    /// configuration: nothing is written back to the repository's
+    /// `bondsymphonic.toml`, and the IDE remembers the choice per workspace and
+    /// configuration in its own state.
+    #[serde(default)]
+    port: Option<u16>
 });
 params!(RunIdParams { run_id: RunId });
 
@@ -324,6 +339,7 @@ impl Request {
             RunStart(RunStartParams {
                 workspace_id: ws.clone(),
                 config_name: "web".into(),
+                port: Some(5173),
             }),
             RunStop(RunIdParams {
                 run_id: run.clone(),

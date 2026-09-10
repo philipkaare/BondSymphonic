@@ -222,6 +222,13 @@ impl RunManager {
                 ws.id
             )));
         }
+        // Zero is the operating system's "pick one for me", and a run whose port
+        // nobody knows cannot be bridged, probed or opened in a browser.
+        if p.port == Some(0) {
+            return Err(RpcError::invalid_params(
+                "run.start: port 0 is not a port a run can be started on",
+            ));
+        }
         // The worktree's own copy of `bondsymphonic.toml`, not the source
         // repo's: the workspace is a checkout of a branch of its own, and a run
         // config an agent added there is the one the user is looking at.
@@ -299,10 +306,16 @@ impl RunManager {
         // unreachable from here, so it gets a host port and a forwarder; on the
         // no-sandbox backend the process is a plain child of the daemon and its
         // port already is the host's.
+        // The port this start runs on: the caller's override when it gave one,
+        // and otherwise the configuration's. Nothing is written back to the
+        // repository -- the override belongs to this start, which is what makes
+        // a *guessed* port correctable without editing a file the daemon does
+        // not own.
+        let port = p.port.unwrap_or(config.port);
         let (host_port, plumbing, readiness_source) = if d.backend.name() == BWRAP_BACKEND {
-            bridge_into(d, &ws.id, &id, &handle, config.port).await?
+            bridge_into(d, &ws.id, &id, &handle, port).await?
         } else {
-            (config.port, Plumbing::none(), ReadinessSource::Port)
+            (port, Plumbing::none(), ReadinessSource::Port)
         };
         let url = format!("http://localhost:{host_port}");
 
@@ -313,7 +326,7 @@ impl RunManager {
             .collect();
         // After the config's own entries, so a repo cannot quietly redefine the
         // two variables the daemon promises every run.
-        env.push(("PORT".into(), config.port.to_string()));
+        env.push(("PORT".into(), port.to_string()));
         env.push(("HOST".into(), "0.0.0.0".into()));
 
         let mut child = match handle

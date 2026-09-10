@@ -8,13 +8,16 @@
 pub mod claude;
 pub mod claude_stream;
 pub mod credentials;
+pub mod persist;
 
 use crate::daemon::Daemon;
 use crate::ids::new_id;
 use crate::server::broadcast::EventBus;
+use crate::workspace::now_rfc3339;
 use bondsymphonic_proto::*;
 use claude::{AgentAdapter, ClaudeAdapter};
 use parking_lot::Mutex;
+use persist::{AgentRecord, AgentRecords};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,6 +73,22 @@ impl TranscriptStore {
             .await?;
         file.write_all(line.as_bytes()).await?;
         file.flush().await
+    }
+
+    /// Deletes the transcript, if there is one.
+    ///
+    /// Only a workspace going away calls this: an agent's transcript outlives
+    /// the agent's process on purpose, and the record beside it is what makes
+    /// it readable again after a restart.
+    pub fn remove(&self, agent: &AgentId) {
+        let path = self.path(agent);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(agent = %agent, path = %path.display(), error = %e, "could not remove the transcript")
+            }
+        }
     }
 
     /// The whole transcript, oldest first. An agent that has never spoken (or
@@ -160,6 +179,10 @@ pub struct AgentSink {
     /// the concurrent callers: the adapter's stdout reader and the request task
     /// recording the user's prompt.
     order: Arc<tokio::sync::Mutex<()>>,
+    /// Where this agent's record is kept, so a session id and an exit reach the
+    /// file the next daemon reads. `None` in the unit tests below, which have no
+    /// data directory and nothing to restore into.
+    records: Option<Arc<AgentRecords>>,
 }
 
 impl AgentSink {
@@ -181,7 +204,17 @@ impl AgentSink {
             workspace_id,
             entry,
             order: Arc::new(tokio::sync::Mutex::new(())),
+            records: None,
         }
+    }
+
+    /// Keeps this agent's record up to date as it runs.
+    ///
+    /// Separate from [`new`](AgentSink::new) so the sink stays constructible
+    /// without a data directory: only [`AgentManager`] has one.
+    pub fn with_records(mut self, records: Arc<AgentRecords>) -> Self {
+        self.records = Some(records);
+        self
     }
 
     /// Records one transcript entry and publishes it.
@@ -219,6 +252,11 @@ impl AgentSink {
     /// the event goes out, so a client that reacts by asking for the agent's
     /// status never sees the older value.
     pub async fn state(&self, state: AgentState, detail: Option<String>) {
+        // Before the event: a client that reacts to `Exited` by restarting the
+        // daemon must not find the record still open.
+        if state == AgentState::Exited {
+            self.ended();
+        }
         *self.entry.state.lock() = (state, detail.clone());
         // After the state itself, so anyone who sees a new epoch also sees the
         // state that goes with it.
@@ -233,6 +271,43 @@ impl AgentSink {
         );
     }
 
+    /// The session the agent is in, as it last reported it.
+    ///
+    /// Recorded as well as remembered: it is the one thing a client needs to
+    /// carry a conversation across a daemon restart, by starting a new agent
+    /// with `options.resume_session`.
+    pub fn session_id(&self, id: String) {
+        // The CLI reports the session on every `init` line, which is once per
+        // turn on a resumed conversation, and the record is a file: nothing is
+        // written unless the id actually moved.
+        let changed = {
+            let mut current = self.entry.session_id.lock();
+            let changed = current.as_deref() != Some(id.as_str());
+            *current = Some(id.clone());
+            changed
+        };
+        if !changed {
+            return;
+        }
+        if let Some(records) = &self.records {
+            records.update(&self.agent_id, |r| r.session_id = Some(id));
+        }
+    }
+
+    /// The agent's process is gone: closes its record, so the next daemon
+    /// reports it as an agent that ended rather than one it lost.
+    ///
+    /// Idempotent, and it keeps the first answer: the moment the process ended
+    /// is what the record wants, not the moment somebody noticed again.
+    pub fn ended(&self) {
+        let Some(records) = &self.records else {
+            return;
+        };
+        records.update(&self.agent_id, |r| {
+            r.ended_at.get_or_insert_with(now_rfc3339);
+        });
+    }
+
     pub fn agent_id(&self) -> &AgentId {
         &self.agent_id
     }
@@ -242,17 +317,48 @@ impl AgentSink {
     }
 }
 
-/// One live agent: what the daemon knows about it, and the adapter that drives
-/// it.
-struct LiveAgent {
+/// One agent the daemon knows about, live or not.
+struct Agent {
     entry: Arc<AgentEntry>,
     /// Insertion order, so `agents_of` reports agents in the order they were
     /// started rather than in whatever order the map happens to hold them.
+    /// Restored agents are numbered first, in the order they were started, so a
+    /// restart does not reshuffle a workspace's tabs.
     ordinal: u64,
+    /// The adapter driving the process, or `None` for an agent restored from
+    /// its record: the process is gone, and only its transcript is left.
+    ///
     /// One request at a time per agent: the adapter methods take `&mut self`,
     /// and two turns written into the same stdin at once would interleave.
-    adapter: tokio::sync::Mutex<Box<dyn AgentAdapter>>,
+    adapter: Option<tokio::sync::Mutex<Box<dyn AgentAdapter>>>,
 }
+
+impl Agent {
+    /// The adapter, or the error an agent without a process answers with.
+    ///
+    /// `NotFound` rather than a state error because that is what the id now
+    /// means to the daemon: there is no process behind it and there never will
+    /// be again. The way on is a new agent resuming the same session, which the
+    /// message says because the id alone gives a client nothing to act on.
+    fn adapter(
+        &self,
+        id: &AgentId,
+    ) -> Result<&tokio::sync::Mutex<Box<dyn AgentAdapter>>, RpcError> {
+        self.adapter.as_ref().ok_or_else(|| {
+            RpcError::not_found(format!(
+                "agent {id} ended; start a new one with resume_session to continue it"
+            ))
+        })
+    }
+}
+
+/// The state detail a restored agent carries, for an agent that was still
+/// running when the daemon went and for one that had already ended.
+///
+/// Both name the restart, because that is what the IDE has to explain: the tab
+/// is there, the history is there, and the agent behind it is not.
+const ENDED_AT_RESTART: &str = "the agent ended when the daemon restarted";
+const ENDED_BEFORE_RESTART: &str = "the agent ended before the daemon restarted";
 
 /// Every agent the daemon is running, and the requests that reach them.
 ///
@@ -262,26 +368,110 @@ struct LiveAgent {
 pub struct AgentManager {
     events: EventBus,
     store: Arc<TranscriptStore>,
-    agents: Mutex<HashMap<AgentId, Arc<LiveAgent>>>,
+    agents: Mutex<HashMap<AgentId, Arc<Agent>>>,
     next_ordinal: AtomicU64,
+    /// The agents on disk, which is what makes the map survivable: see
+    /// [`restore`](AgentManager::restore).
+    records: Arc<AgentRecords>,
 }
 
 impl AgentManager {
-    pub fn new(events: EventBus, transcripts: PathBuf) -> Self {
+    pub fn new(events: EventBus, transcripts: PathBuf, records: PathBuf) -> Self {
         Self {
             events,
             store: Arc::new(TranscriptStore::new(transcripts)),
             agents: Mutex::new(HashMap::new()),
             next_ordinal: AtomicU64::new(0),
+            records: Arc::new(AgentRecords::new(records)),
         }
     }
 
-    fn get(&self, id: &AgentId) -> Result<Arc<LiveAgent>, RpcError> {
+    /// An agent id no agent in the map already holds.
+    ///
+    /// `new_id` is four random bytes, which was collision-free enough while the
+    /// map held only live agents; now that restored ones stay in it for the life
+    /// of their workspace, a collision would silently replace an agent and its
+    /// history. Checking costs one lock on a map of tens of entries.
+    fn mint_id(&self) -> AgentId {
+        loop {
+            let id: AgentId = new_id(AgentId::PREFIX).as_str().into();
+            if !self.agents.lock().contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    fn get(&self, id: &AgentId) -> Result<Arc<Agent>, RpcError> {
         self.agents
             .lock()
             .get(id)
             .cloned()
             .ok_or_else(|| RpcError::not_found(format!("agent {id}")))
+    }
+
+    /// Puts the agents from the last run of the daemon back, as agents that
+    /// have ended.
+    ///
+    /// Called once at startup, before anything can start an agent, so the
+    /// restored ordinals come first and a workspace's tabs keep their order.
+    /// The process behind each one is gone -- a daemon restart kills every
+    /// sandbox -- so each becomes an entry with no adapter: `agent.history`
+    /// still reads its transcript, `WorkspaceInfo.agents` still lists it, and
+    /// anything that would talk to the process is a `NotFound` pointing at
+    /// `resume_session`.
+    ///
+    /// Records for workspaces `known` does not name are dropped along with
+    /// their transcripts. A workspace can only leave the registry through
+    /// `workspace.destroy`, which removes its records itself, so this is the
+    /// path for a destroy that was interrupted or a registry edited by hand --
+    /// without it those records and transcripts would never be collected.
+    pub fn restore(&self, known: &[WorkspaceId]) {
+        let mut records = self.records.load();
+        let mut dropped = Vec::new();
+        records.retain(|r| {
+            if known.contains(&r.workspace_id) {
+                return true;
+            }
+            warn!(agent = %r.agent_id, ws = %r.workspace_id, "dropping the record of an agent whose workspace is gone");
+            dropped.push(r.agent_id.clone());
+            false
+        });
+        for id in &dropped {
+            self.store.remove(id);
+        }
+
+        let mut restored = 0usize;
+        let mut closed = 0usize;
+        for record in records.iter_mut() {
+            let entry = Arc::new(AgentEntry::new(record.workspace_id.clone(), record.adapter));
+            let detail = if record.ended_at.is_none() {
+                record.ended_at = Some(now_rfc3339());
+                closed += 1;
+                ENDED_AT_RESTART
+            } else {
+                ENDED_BEFORE_RESTART
+            };
+            *entry.state.lock() = (AgentState::Exited, Some(detail.to_owned()));
+            *entry.session_id.lock() = record.session_id.clone();
+            self.agents.lock().insert(
+                record.agent_id.clone(),
+                Arc::new(Agent {
+                    entry,
+                    ordinal: self.next_ordinal.fetch_add(1, Ordering::SeqCst),
+                    adapter: None,
+                }),
+            );
+            restored += 1;
+        }
+        // One write for the whole list rather than one per closed record, and
+        // only when there is something to say: a daemon that shut down cleanly
+        // rewrites nothing.
+        if !dropped.is_empty() || closed > 0 {
+            self.records.replace_all(records);
+        }
+        if restored > 0 {
+            info!(restored, closed, "restored agents from the records file");
+        }
     }
 
     /// Starts a Claude Code agent in a ready workspace's sandbox.
@@ -320,6 +510,10 @@ impl AgentManager {
         if !seeded.is_empty() {
             info!(ws = %ws.id, files = ?seeded, "seeded claude credentials");
         }
+        // After the seeding, because it overwrites what the seeding just put
+        // there: a repository that pins its own settings is pinning the tools
+        // the agent may use, and the daemon user's copy must not win.
+        claude::apply_repo_settings(&ws.worktree_path, &home)?;
 
         // The key is given to this one command, never written into the sandbox
         // spec: the spec's environment reaches every process in the workspace,
@@ -329,7 +523,7 @@ impl AgentManager {
             None => vec![],
         };
 
-        let id: AgentId = new_id(AgentId::PREFIX).as_str().into();
+        let id = self.mint_id();
         let entry = Arc::new(AgentEntry::new(ws.id.clone(), p.adapter));
         let sink = AgentSink::new(
             self.events.clone(),
@@ -337,17 +531,31 @@ impl AgentManager {
             id.clone(),
             ws.id.clone(),
             entry.clone(),
-        );
+        )
+        .with_records(self.records.clone());
         let mut adapter = ClaudeAdapter::new(sink, handle, argv, env, ws.worktree_path.clone());
         // Registered only once it is really running, so a failed start leaves
         // no agent behind for the IDE to find.
         adapter.start().await?;
+        // The record is written before the map and before this call answers, so
+        // a daemon killed the instant after `agent.start` returns still knows
+        // the agent existed. The session id is the one the client asked to
+        // resume, until the CLI reports its own on the init line.
+        self.records.upsert(AgentRecord {
+            agent_id: id.clone(),
+            workspace_id: ws.id.clone(),
+            adapter: p.adapter,
+            session_id: p.options.resume_session.clone(),
+            options: p.options,
+            started_at: now_rfc3339(),
+            ended_at: None,
+        });
         self.agents.lock().insert(
             id.clone(),
-            Arc::new(LiveAgent {
+            Arc::new(Agent {
                 entry,
                 ordinal: self.next_ordinal.fetch_add(1, Ordering::SeqCst),
-                adapter: tokio::sync::Mutex::new(Box::new(adapter)),
+                adapter: Some(tokio::sync::Mutex::new(Box::new(adapter))),
             }),
         );
         Ok(AgentStartResult { agent_id: id })
@@ -355,14 +563,19 @@ impl AgentManager {
 
     pub async fn send(&self, p: AgentSendParams) -> Result<Empty, RpcError> {
         let agent = self.get(&p.agent_id)?;
-        agent.adapter.lock().await.send(p.text).await?;
+        agent
+            .adapter(&p.agent_id)?
+            .lock()
+            .await
+            .send(p.text)
+            .await?;
         Ok(Empty {})
     }
 
     pub async fn permission_reply(&self, p: AgentPermissionReplyParams) -> Result<Empty, RpcError> {
         let agent = self.get(&p.agent_id)?;
         agent
-            .adapter
+            .adapter(&p.agent_id)?
             .lock()
             .await
             .permission_reply(p.request_id, p.decision, p.updated_input, p.message)
@@ -372,16 +585,23 @@ impl AgentManager {
 
     pub async fn interrupt(&self, p: AgentIdParams) -> Result<Empty, RpcError> {
         let agent = self.get(&p.agent_id)?;
-        agent.adapter.lock().await.interrupt().await?;
+        agent.adapter(&p.agent_id)?.lock().await.interrupt().await?;
         Ok(Empty {})
     }
 
     /// Ends the process but keeps the agent, so its transcript is still
     /// readable. Only the workspace going away removes it (see
     /// [`stop_all_in`](AgentManager::stop_all_in)).
+    ///
+    /// An agent that has already ended -- one restored from a record -- answers
+    /// `Ok`: `stop` is a teardown verb, and the client is asking for a state the
+    /// daemon is already in.
     pub async fn stop(&self, p: AgentIdParams) -> Result<Empty, RpcError> {
         let agent = self.get(&p.agent_id)?;
-        agent.adapter.lock().await.stop().await?;
+        let Some(adapter) = agent.adapter.as_ref() else {
+            return Ok(Empty {});
+        };
+        adapter.lock().await.stop().await?;
         Ok(Empty {})
     }
 
@@ -422,7 +642,7 @@ impl AgentManager {
     /// (stdin closed, exit awaited, `Exited` announced) instead of vanishing
     /// with the sandbox.
     pub async fn stop_all_in(&self, ws: &WorkspaceId) {
-        let victims: Vec<(AgentId, Arc<LiveAgent>)> = {
+        let victims: Vec<(AgentId, Arc<Agent>)> = {
             let mut agents = self.agents.lock();
             let ids: Vec<AgentId> = agents
                 .iter()
@@ -434,9 +654,19 @@ impl AgentManager {
                 .collect()
         };
         for (id, agent) in victims {
-            if let Err(e) = agent.adapter.lock().await.stop().await {
+            let Some(adapter) = agent.adapter.as_ref() else {
+                continue;
+            };
+            if let Err(e) = adapter.lock().await.stop().await {
                 warn!(agent = %id, error = %e, "stopping agent failed");
             }
+        }
+        // The records and the transcripts go with the workspace: they exist to
+        // outlive a daemon, not the workspace they belong to. Taken from the
+        // file rather than from the map, so an agent this daemon never held an
+        // entry for takes its transcript with it too.
+        for id in self.records.remove_workspace(ws) {
+            self.store.remove(&id);
         }
     }
 }

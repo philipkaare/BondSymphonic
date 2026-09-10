@@ -500,6 +500,16 @@ the host, not the credentials. A `.claude/settings.json` supplied via
 `bondsymphonic.toml [claude] settings = "path"` overrides the copy, which is how a
 repo can pin allowed tools.
 
+The override is applied at every `agent.start`, after the seeding it replaces,
+and the path is read from the *worktree's* copy of `bondsymphonic.toml` rather
+than the source repository's: the workspace is a checkout of a branch of its
+own. The path is repo-relative and resolved with the file service's containment
+rule (11), so an absolute path, a `..`, and a symlink pointing out are all
+`InvalidParams` on the start. So is a file that is not there, and so is a
+`bondsymphonic.toml` that will not parse: each of those would leave the agent
+running under settings nobody chose, which for a setting whose job is to pin
+allowed tools is worse than not starting at all.
+
 ### 8.4 Terminal adapter
 A terminal agent is a PTY, not an entry in the agent registry: the IDE calls
 `pty.open` directly with the configured command (default `$SHELL -l`, or e.g.
@@ -510,6 +520,31 @@ which is why a terminal tab's status follows its workspace rather than an agent.
 `AgentAdapterKind::Terminal` exists in the protocol and in `capabilities.adapters`
 only to name the choice in the New Agent dialog; `agent.start` refuses it with
 `InvalidParams("terminal agents use pty.open")`.
+
+### 8.5 Agent records
+`agents.json` under the data root, beside `workspaces.json`, holds one record per
+agent the daemon has started: `{agent_id, workspace_id, adapter, session_id,
+options, started_at, ended_at}`. `options` never carries `api_key` — the key is
+given to one process and is not state to keep. The file is rewritten whole
+through a temporary and a rename, when an agent starts, when the CLI reports its
+session id, and when the process ends.
+
+Without it a transcript survives a restart but is unreachable: `agent.history`
+and `WorkspaceInfo.agents` both come from the live agent map, and a restart kills
+every sandbox. On startup `AgentManager::restore` reads the records and puts each
+one back as an agent with no process — state `Exited`, detail naming the restart.
+Its `agent.history` still reads the transcript, `WorkspaceInfo.agents` still
+lists it in its original order, and `agent.send`, `agent.permission_reply` and
+`agent.interrupt` answer `NotFound` pointing at `resume_session`; `agent.stop`
+answers `Ok`. A record found open belonged to an agent that was still running
+when the daemon went, and restoring is what closes it. The conversation continues
+through a *new* agent started with `options.resume_session` set to the recorded
+session id, which is what the CLI's `--resume` needs.
+
+A file that will not parse is moved aside as `agents.json.corrupt` and read as
+empty: the workspaces live in a different file and must still come back.
+`workspace.destroy` removes the workspace's records and their transcripts, and so
+does a restore that finds a record whose workspace the registry no longer has.
 
 ## 9. PTY
 `portable-pty` (Rust) opens a pty pair; the slave is handed to the sandboxed
@@ -555,14 +590,23 @@ Ordered heuristics, each yielding `RunConfig {name, command, port, source:
 - `manage.py` → `python manage.py runserver 0.0.0.0:8000`, port 8000.
 - `pyproject.toml` with `fastapi`/`flask` → `uvicorn`/`flask run`, port 8000/5000.
 
-Guessed ports are flagged `port_guessed: true`. Editing the port in the IDE is
-deferred to M6: as of M5 the flag only spells the guess out in the run-config
-combo and its tooltip, and the way to pin a port is `bondsymphonic.toml`.
+Guessed ports are flagged `port_guessed: true`, which is what lets the IDE offer
+the port for editing: a configured port is the repository's and is shown
+read-only, a guessed one is the daemon's and can be replaced per start through
+`run.start`'s `port` (10.3). A port pinned for good still belongs in
+`bondsymphonic.toml`.
 
 ### 10.3 Manager
 `run.start` spawns the command through the sandbox with the run's env, plus
 `PORT=<port>` and `HOST=0.0.0.0`, sets up the bridge (7.3), and streams stdout/
-stderr lines as `run.output`. `PORT` and `HOST` are pushed after the config's own
+stderr lines as `run.output`. `<port>` is `params.port` when the request carries
+one and the configuration's port otherwise; the override reaches the `PORT`
+variable, the bridge and the readiness probe alike, so nothing in the run is left
+pointing at the port that was replaced. It applies to that start only — nothing
+is written back to `bondsymphonic.toml`, which is the repository's — and `port:
+0` is `InvalidParams`, since a run whose port nobody knows cannot be bridged,
+probed or opened. One run per configuration is unchanged: the claim is keyed by
+the configuration's name, not by the port. `PORT` and `HOST` are pushed after the config's own
 env, so a repository cannot quietly redefine the two variables every run is
 promised. State: `starting` → `ready` (regex match, else the forwarder's status
 byte, polled every 500 ms) → `stopped`/`failed`. A configuration that sets

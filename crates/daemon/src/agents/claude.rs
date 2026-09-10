@@ -134,6 +134,61 @@ pub fn claude_ro_bind() -> Option<(PathBuf, PathBuf)> {
     Some((host_claude_bin()?, PathBuf::from(CLAUDE_IN_SANDBOX)))
 }
 
+/// Copies the repository's own `[claude] settings` file into the workspace
+/// home, replacing the daemon user's `~/.claude/settings.json` for this agent.
+///
+/// This is how a repository pins what its agents may do -- allowed tools, hooks,
+/// a permission mode -- for everyone who opens a workspace on it, which only
+/// works if the repository's copy wins over whatever the user has. Read from the
+/// *worktree*, not the source repository: the workspace is a checkout of a
+/// branch of its own, and the file the user is looking at is the one that
+/// applies.
+///
+/// Every failure is an error on `agent.start` rather than a warning, because
+/// each one means the agent would run under settings nobody asked for. That
+/// includes a `bondsymphonic.toml` that will not parse: it may be the one
+/// naming the settings, and there is no way to tell.
+pub fn apply_repo_settings(
+    worktree: &std::path::Path,
+    home: &std::path::Path,
+) -> Result<(), RpcError> {
+    let config = crate::runs::config::load_repo_config(worktree)
+        .map_err(|e| RpcError::invalid_params(format!("[claude] settings: {e}")))?;
+    let Some(rel) = config.and_then(|c| c.claude.settings) else {
+        return Ok(());
+    };
+    // `fs::resolve` is the one place that decides what is inside a worktree:
+    // absolute paths, `..` and symlinks that point out are all refused there,
+    // and the message it gives names the rule that was broken.
+    let from = crate::fs::resolve(worktree, &rel).map_err(|e| {
+        RpcError::invalid_params(format!("[claude] settings {rel:?}: {}", e.message))
+    })?;
+    if !from.is_file() {
+        return Err(RpcError::invalid_params(format!(
+            "[claude] settings {rel:?}: no such file in the workspace"
+        )));
+    }
+    let dir = home.join(".claude");
+    let to = dir.join("settings.json");
+    let copy = || -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        // Removed first rather than written through, so a symlink left at the
+        // destination cannot redirect the write out of the workspace home.
+        match std::fs::remove_file(&to) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        std::fs::copy(&from, &to).map(|_| ())
+    };
+    copy().map_err(|e| {
+        RpcError::new(
+            ErrorCode::IoError,
+            format!("[claude] settings {rel:?}: copying it into the workspace home failed: {e}"),
+        )
+    })
+}
+
 fn claude_not_installed() -> RpcError {
     RpcError::new(
         ErrorCode::PrereqMissing,
@@ -477,15 +532,17 @@ impl AgentAdapter for ClaudeAdapter {
                             sink.message(body).await;
                         }
                         Parsed::State(state, detail) => sink.state(state, detail).await,
-                        Parsed::SessionId(id) => {
-                            *sink.entry().session_id.lock() = Some(id);
-                        }
+                        Parsed::SessionId(id) => sink.session_id(id),
                         Parsed::Nothing => {}
                     }
                 }
             }
             // stdout is closed, so the process is on its way out.
             let code = exit_for_reader.await;
+            // The process is gone whichever way the state went, so the record
+            // is closed here rather than only on the `Exited` announcement: an
+            // agent that died mid-turn stays in `Error` and never announces one.
+            sink.ended();
             // An error result already said why the turn failed, and it is the
             // more useful message of the two.
             if sink.entry().state().0 == AgentState::Error {
@@ -648,6 +705,128 @@ impl AgentAdapter for ClaudeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worktree with `bondsymphonic.toml` holding `body`, and a home beside
+    /// it. Answers `(worktree, home)`.
+    fn worktree_with(dir: &std::path::Path, body: Option<&str>) -> (PathBuf, PathBuf) {
+        let worktree = dir.join("worktree");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        if let Some(body) = body {
+            std::fs::write(worktree.join("bondsymphonic.toml"), body).unwrap();
+        }
+        (worktree, home)
+    }
+
+    fn settings_of(home: &std::path::Path) -> Option<String> {
+        std::fs::read_to_string(home.join(".claude").join("settings.json")).ok()
+    }
+
+    /// A repo that says nothing about Claude leaves the home exactly as the
+    /// credential seeding left it.
+    #[test]
+    fn without_a_claude_section_nothing_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let bodies = [
+            None,
+            Some("[[run]]\nname = \"web\"\ncommand = \"x\"\nport = 1\n"),
+        ];
+        for (i, body) in bodies.into_iter().enumerate() {
+            let (worktree, home) = worktree_with(&dir.path().join(format!("case{i}")), body);
+            std::fs::create_dir_all(home.join(".claude")).unwrap();
+            std::fs::write(home.join(".claude").join("settings.json"), "the user's").unwrap();
+            apply_repo_settings(&worktree, &home).unwrap();
+            assert_eq!(settings_of(&home).as_deref(), Some("the user's"));
+        }
+    }
+
+    /// The repo's file wins over the daemon user's copy, which is the whole
+    /// point: a repository pins the tools its agents may use.
+    #[test]
+    fn the_repos_settings_replace_the_users_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (worktree, home) = worktree_with(
+            dir.path(),
+            Some("[claude]\nsettings = \"config/claude.json\"\n"),
+        );
+        std::fs::create_dir_all(worktree.join("config")).unwrap();
+        std::fs::write(worktree.join("config").join("claude.json"), "the repo's").unwrap();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude").join("settings.json"), "the user's").unwrap();
+
+        apply_repo_settings(&worktree, &home).unwrap();
+        assert_eq!(settings_of(&home).as_deref(), Some("the repo's"));
+
+        // And again, with the repo's file changed: every start re-applies it,
+        // so an agent never runs under a settings file the branch has moved on
+        // from.
+        std::fs::write(worktree.join("config").join("claude.json"), "changed").unwrap();
+        apply_repo_settings(&worktree, &home).unwrap();
+        assert_eq!(settings_of(&home).as_deref(), Some("changed"));
+    }
+
+    /// The home does not have to exist yet: the first agent in a workspace whose
+    /// user has never logged in has no `.claude` directory to write into.
+    #[test]
+    fn the_claude_directory_is_created_when_it_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (worktree, home) = worktree_with(dir.path(), Some("[claude]\nsettings = \"s.json\"\n"));
+        std::fs::write(worktree.join("s.json"), "{}").unwrap();
+        apply_repo_settings(&worktree, &home).unwrap();
+        assert_eq!(settings_of(&home).as_deref(), Some("{}"));
+    }
+
+    /// Every way the setting can be wrong is an `InvalidParams` on the start,
+    /// not a warning: an agent must never run under settings nobody chose.
+    #[test]
+    fn a_settings_path_that_is_not_inside_the_worktree_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("outside.json"), "not yours").unwrap();
+        let absolute = dir
+            .path()
+            .join("outside.json")
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let cases = [
+            ("../outside.json", "climbing out"),
+            (absolute.as_str(), "an absolute path"),
+            ("config/absent.json", "a file that is not there"),
+        ];
+        for (rel, what) in cases {
+            let (worktree, home) = worktree_with(
+                &dir.path().join(what.replace(' ', "-")),
+                Some(&format!("[claude]\nsettings = \"{rel}\"\n")),
+            );
+            let e = apply_repo_settings(&worktree, &home).unwrap_err();
+            assert_eq!(e.code, ErrorCode::InvalidParams, "{what}: {e:?}");
+            assert!(
+                e.message.contains("settings"),
+                "{what}: the message must name the setting: {}",
+                e.message
+            );
+            assert!(
+                settings_of(&home).is_none(),
+                "{what}: nothing must be written"
+            );
+        }
+    }
+
+    /// A config file that will not parse may be the one naming the settings, and
+    /// there is no way to tell, so the agent does not start.
+    #[test]
+    fn an_unparseable_config_stops_the_start_and_says_where() {
+        let dir = tempfile::tempdir().unwrap();
+        let (worktree, home) = worktree_with(dir.path(), Some("[claude]\nsettings = \n"));
+        let e = apply_repo_settings(&worktree, &home).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidParams, "{e:?}");
+        assert!(
+            e.message.contains("bondsymphonic.toml"),
+            "the message must name the file: {}",
+            e.message
+        );
+    }
 
     /// `BS_CLAUDE_BIN` is process-wide, so every case that touches it lives in
     /// one test.

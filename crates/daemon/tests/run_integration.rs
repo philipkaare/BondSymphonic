@@ -227,10 +227,22 @@ async fn start_run(
     ws: &WorkspaceId,
     name: &str,
 ) -> Result<RunStartResult, RpcError> {
+    start_run_on(c, ws, name, None).await
+}
+
+/// `run.start` with an explicit port for this start, or the configuration's own
+/// when `port` is `None`.
+async fn start_run_on(
+    c: &mut Client,
+    ws: &WorkspaceId,
+    name: &str,
+    port: Option<u16>,
+) -> Result<RunStartResult, RpcError> {
     let v = c
         .call(Request::RunStart(RunStartParams {
             workspace_id: ws.clone(),
             config_name: name.into(),
+            port,
         }))
         .await?;
     Ok(serde_json::from_value(v).unwrap())
@@ -596,6 +608,74 @@ async fn a_run_gets_port_host_and_its_configured_environment_in_its_cwd() {
             .any(|l| l.trim() == format!("{port} 0.0.0.0 seven")),
         "the script must see PORT, HOST and the config's env: {lines:?}"
     );
+
+    cancel.cancel();
+}
+
+/// A port given on the start replaces the one the configuration names: the
+/// command sees it as `PORT`, and it is the port the caller is handed back.
+///
+/// This is what makes a *guessed* port usable: detection reads `3000` out of a
+/// `package.json` it never ran, the user corrects it in the Run panel, and
+/// nothing is written back to the repository.
+#[tokio::test]
+async fn run_start_honours_a_port_override() {
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let configured = free_port();
+    let overridden = free_port();
+    assert_ne!(configured, overridden);
+    write_repo_config(
+        &repo,
+        &format!(
+            "[[run]]
+name = \"envcheck\"
+command = \"{py} envprint.py\"
+port = {configured}
+cwd = \"sub\"
+env = {{ BS_TEST = \"seven\" }}
+"
+        ),
+    );
+    let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(p, &token).await;
+    let ws = create_ws(&mut c, &repo, "override").await;
+
+    let started = start_run_on(&mut c, &ws.id, "envcheck", Some(overridden))
+        .await
+        .unwrap();
+    assert_eq!(
+        started.host_port, overridden,
+        "the caller is told the port it asked for"
+    );
+    assert_eq!(started.url, format!("http://localhost:{overridden}"));
+
+    let evs = run_events(&mut c, &started.run_id, Duration::from_secs(20), |e| {
+        !output(e).is_empty() && has_state(e, RunState::Failed)
+    })
+    .await;
+    let lines = output(&evs);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.trim() == format!("{overridden} 0.0.0.0 seven")),
+        "the command must see the overridden port as PORT: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains(&configured.to_string())),
+        "the configured port must not reach the command: {lines:?}"
+    );
+
+    // Zero is not a port a run can be bound to; it is the operating system's
+    // "pick one", and a run whose port nobody knows cannot be reached.
+    let e = start_run_on(&mut c, &ws.id, "envcheck", Some(0))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidParams, "{e:?}");
 
     cancel.cancel();
 }

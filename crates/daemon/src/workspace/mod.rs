@@ -70,6 +70,11 @@ impl DataDirs {
     pub fn registry_file(&self) -> PathBuf {
         self.root.join("workspaces.json")
     }
+    /// One record per agent this daemon has ever started, beside the registry:
+    /// what makes a transcript reachable again after a restart.
+    pub fn agents_file(&self) -> PathBuf {
+        self.root.join("agents.json")
+    }
     pub fn worktree(&self, id: &WorkspaceId) -> PathBuf {
         self.worktrees.join(id.as_str())
     }

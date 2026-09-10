@@ -60,7 +60,8 @@ impl Daemon {
     ) -> anyhow::Result<Arc<Self>> {
         dirs.ensure()?;
         let registry = Registry::load(&dirs.registry_file())?;
-        let agents = AgentManager::new(events.clone(), dirs.transcripts.clone());
+        let agents =
+            AgentManager::new(events.clone(), dirs.transcripts.clone(), dirs.agents_file());
         Ok(Arc::new(Self {
             dirs,
             registry,
@@ -170,9 +171,17 @@ impl Daemon {
         Ok(ws)
     }
 
-    /// On startup: validate every registered workspace and restart its sandbox.
+    /// On startup: put the agents from the last run back, then validate every
+    /// registered workspace and restart its sandbox.
+    ///
+    /// The agents come first because a workspace's state event carries its agent
+    /// list: restoring them afterwards would publish a workspace with no agents
+    /// and then never correct it.
     pub async fn restore(self: &Arc<Self>) {
-        for ws in self.registry.list() {
+        let workspaces = self.registry.list();
+        let known: Vec<WorkspaceId> = workspaces.iter().map(|w| w.id.clone()).collect();
+        self.agents.restore(&known);
+        for ws in workspaces {
             if !ws.worktree_path.exists() {
                 let _ = self.set_state(
                     &ws.id,

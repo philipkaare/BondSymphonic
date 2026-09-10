@@ -353,3 +353,29 @@ fn merge_result_defaults_reason_to_none() {
     let back: MergeResult = serde_json::from_value(v).unwrap();
     assert_eq!(back, conflicted);
 }
+
+#[test]
+fn run_start_defaults_its_port_override_to_none() {
+    // `port` was added after `run.start` shipped, so a request from a client
+    // that never learned about it has to keep deserialising -- and mean "the
+    // port the configuration names".
+    let old: Request = serde_json::from_str(
+        r#"{"method":"run.start","params":{"workspace_id":"ws_1","config_name":"web"}}"#,
+    )
+    .unwrap();
+    let Request::RunStart(p) = old else {
+        panic!("expected run.start");
+    };
+    assert_eq!(p.port, None);
+    assert_eq!(p.config_name, "web");
+
+    let overridden = Request::RunStart(RunStartParams {
+        workspace_id: WorkspaceId("ws_1".into()),
+        config_name: "web".into(),
+        port: Some(4321),
+    });
+    let v = serde_json::to_value(&overridden).unwrap();
+    assert_eq!(v["params"]["port"], 4321);
+    let back: Request = serde_json::from_value(v).unwrap();
+    assert_eq!(back, overridden);
+}

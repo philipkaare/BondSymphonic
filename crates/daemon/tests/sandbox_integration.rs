@@ -583,6 +583,20 @@ fn pgrep_pids(pattern: &str) -> Vec<i32> {
         .unwrap_or_default()
 }
 
+/// Serialises the tests that start an in-sandbox port forwarder.
+///
+/// `pgrep` searches the whole machine and a forwarder's argv carries only its
+/// sandbox-internal socket path (`/run/bs/fwd-<run>.sock`), so nothing in it
+/// says which workspace it belongs to. A test that counts forwarders before and
+/// after an action can therefore only trust the difference while no other test
+/// in this binary is starting one -- which, with `cargo test`'s thread pool, is
+/// not something the tests get for free.
+///
+/// A `tokio` mutex rather than the standard one: the guard is held across the
+/// whole test, awaits included, and it is runtime-agnostic, so one static works
+/// for the separate runtime each `#[tokio::test]` builds.
+static FORWARDERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// I2: a sandbox that dies has to be reported. Killing bwrap takes its pid
 /// namespace, and with it init, so the exec socket closes exactly as it would
 /// on an OOM or a crash.
@@ -1136,6 +1150,7 @@ async fn wait_for_run_state(
 /// run 1's bridge pointing at run 2's forwarder and either stop killing both.
 #[tokio::test]
 async fn two_bwrap_runs_on_one_port_get_a_socket_and_a_bridge_each() {
+    let _forwarders = FORWARDERS.lock().await;
     if !bwrap_available() {
         eprintln!("SKIP: bwrap unavailable");
         return;
@@ -1271,6 +1286,7 @@ async fn two_bwrap_runs_on_one_port_get_a_socket_and_a_bridge_each() {
 /// connecting to a port nothing inside the sandbox is listening on.
 #[tokio::test]
 async fn a_bwrap_run_bridges_the_port_given_on_the_start() {
+    let _forwarders = FORWARDERS.lock().await;
     if !bwrap_available() {
         eprintln!("SKIP: bwrap unavailable");
         return;
@@ -1331,6 +1347,7 @@ async fn a_bwrap_run_bridges_the_port_given_on_the_start() {
 
 #[tokio::test]
 async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
+    let _forwarders = FORWARDERS.lock().await;
     if !bwrap_available() {
         eprintln!("SKIP: bwrap unavailable");
         return;
@@ -1360,8 +1377,9 @@ async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
     // Forwarders are counted rather than matched by name. A forwarder's argv
     // carries the *sandbox-internal* socket path (`/run/bs/fwd-<run>.sock`), so
     // nothing in it names this workspace, and `pgrep` searches the whole
-    // machine while the test binaries run in parallel. What can be said exactly
-    // is that a refused start must not add one.
+    // machine. What can be said exactly is that a refused start must not add
+    // one -- and [`FORWARDERS`], held for the length of this test, is what keeps
+    // a sibling test's forwarder out of the difference.
     let forwarders_before: std::collections::HashSet<i32> =
         pgrep_pids("forward --socket").into_iter().collect();
     let escape = daemon
