@@ -1248,3 +1248,109 @@ fn refreshing_attention_without_a_previous_tab_changes_nothing() {
     );
     assert_eq!(model.attention(), None);
 }
+
+/// A daemon restart takes every agent with it, and the tabs have to stop
+/// claiming otherwise.
+///
+/// The live `agent.state` stream reports changes, and an agent that no longer
+/// exists has none to report: a background tab left `waiting_permission` when
+/// the daemon died would keep its bullet forever, and the status bar would keep
+/// naming an agent that is gone. `reconcile` is the first thing a reconnect
+/// does, and the daemon's own `agent_records` are what it re-derives from.
+#[test]
+fn a_reconnect_re_derives_agent_state_and_drops_a_stale_attention_mark() {
+    let alpha = info("ws_1", "alpha", WorkspaceState::Ready);
+    let beta = info("ws_2", "beta", WorkspaceState::Ready);
+    let mut model = Workspaces::new_default();
+    model.add_tab(0, tab(&alpha));
+    model.add_tab(0, tab(&beta));
+    model.groups[0].tabs[0].agent_id = Some(AgentId("ag_1".to_owned()));
+    model.groups[0].tabs[1].agent_id = Some(AgentId("ag_2".to_owned()));
+
+    // beta is in front; alpha's agent asks for permission behind it and the
+    // window marks the tab.
+    model.set_active(0, 1);
+    model.set_agent_status(
+        &AgentId("ag_1".to_owned()),
+        TabStatus::WaitingPermission,
+        "Bash",
+    );
+    model.set_workspace_attention(&alpha.id, &permission_attention("alpha"));
+    assert_eq!(model.attention(), Some("alpha is waiting for permission"));
+
+    // The daemon dies and comes back. Both agents are gone; the records say so,
+    // and no `agent.state` event will ever be sent about them again.
+    let record = |id: &str, state: AgentState| AgentSummary {
+        id: AgentId(id.to_owned()),
+        adapter: AgentAdapterKind::Claude,
+        state,
+        session_id: None,
+        command: None,
+        model: None,
+        permission_mode: None,
+    };
+    let mut listed_alpha = alpha.clone();
+    listed_alpha.agent_records = vec![record("ag_1", AgentState::Exited)];
+    let mut listed_beta = beta.clone();
+    listed_beta.agent_records = vec![record("ag_2", AgentState::Exited)];
+    model.reconcile(&[listed_alpha, listed_beta]);
+
+    assert_eq!(
+        model.attention(),
+        None,
+        "the bullet outlived the agent it was about"
+    );
+    let (g, t) = model.find(&alpha.id).expect("alpha is still tracked");
+    assert_eq!(model.groups[g].tabs[t].attention, "");
+    assert_eq!(
+        model.groups[g].tabs[t].status,
+        TabStatus::Done,
+        "an exited agent's tab shows exited, not the permission it was blocked on"
+    );
+
+    // An agent that really is still blocked keeps its mark across the
+    // reconnect: the point is to re-derive, not to blank.
+    let mut still_waiting = alpha.clone();
+    still_waiting.agent_records = vec![record("ag_1", AgentState::WaitingPermission)];
+    let mut idle_beta = beta.clone();
+    idle_beta.agent_records = vec![record("ag_2", AgentState::Idle)];
+    model.reconcile(&[still_waiting, idle_beta]);
+    assert_eq!(model.attention(), Some("alpha is waiting for permission"));
+
+    // ...unless it is the tab in front, whose permission bar the user can see.
+    model.set_active(0, 0);
+    let mut still_waiting = alpha.clone();
+    still_waiting.agent_records = vec![record("ag_1", AgentState::WaitingPermission)];
+    let mut idle_beta = beta.clone();
+    idle_beta.agent_records = vec![record("ag_2", AgentState::Idle)];
+    model.reconcile(&[still_waiting, idle_beta]);
+    assert_eq!(model.attention(), None);
+}
+
+/// A daemon too old to send `agent_records` sends an empty list, which means
+/// "nothing is known about these agents" rather than "there are none". The tab
+/// falls back to idle and carries no mark, instead of keeping a claim that
+/// nothing on the wire supports.
+#[test]
+fn a_reconnect_to_a_daemon_without_records_clears_rather_than_keeps() {
+    let alpha = info("ws_1", "alpha", WorkspaceState::Ready);
+    let beta = info("ws_2", "beta", WorkspaceState::Ready);
+    let mut model = Workspaces::new_default();
+    model.add_tab(0, tab(&alpha));
+    model.add_tab(0, tab(&beta));
+    model.groups[0].tabs[0].agent_id = Some(AgentId("ag_1".to_owned()));
+    model.set_active(0, 1);
+    model.set_agent_status(
+        &AgentId("ag_1".to_owned()),
+        TabStatus::WaitingPermission,
+        "Bash",
+    );
+    model.set_workspace_attention(&alpha.id, &permission_attention("alpha"));
+
+    model.reconcile(&[alpha.clone(), beta]);
+
+    assert_eq!(model.attention(), None);
+    let (g, t) = model.find(&alpha.id).expect("alpha is still tracked");
+    assert_eq!(model.groups[g].tabs[t].status, TabStatus::Idle);
+    assert_eq!(model.groups[g].tabs[t].agent_status, None);
+}

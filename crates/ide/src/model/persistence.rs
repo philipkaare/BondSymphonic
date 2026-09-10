@@ -281,30 +281,71 @@ pub fn load(path: &Path) -> StateFile {
     }
 }
 
-/// Writes `state.json` atomically: a temporary file beside it, then a rename.
+/// Distinguishes two temporaries created by the same process. The pid
+/// separates processes; this separates writers inside one.
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The sibling temporary [`save`] will write `path` through:
+/// `.<name>.<pid>.<counter>.tmp`.
+///
+/// Unique per call, and deliberately not `<name>.tmp`. A fixed name is shared
+/// by every writer of that file and by every earlier run of the IDE, so two
+/// windows over the same `%APPDATA%` state file can rename each other's
+/// half-written temporary into place, and a leftover directory or a read-only
+/// file at that name wedges the writer for good. A sibling rather than a temp
+/// directory, because `rename` is only atomic within one filesystem.
+///
+/// The same shape as the daemon's `util::atomic::temp_path`, which cannot be
+/// called from here: it lives in the daemon crate, and the IDE does not depend
+/// on it.
+pub fn temp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "state.json".into());
+    let n = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = format!(".{name}.{}.{n}.tmp", std::process::id());
+    path.with_file_name(tmp)
+}
+
+/// Writes `state.json` atomically: a unique temporary file beside it, flushed
+/// all the way to the device, then a rename.
+///
 /// The temporary lives in the same directory so the rename stays on one volume
-/// and is therefore atomic.
+/// and is therefore atomic. `sync_all` happens **before** the rename, not
+/// after: the rename is what publishes the file, so the bytes have to be on
+/// the device by the time it happens. Without it a power cut just after the
+/// rename can leave a `state.json` that is zero-length or truncated, and the
+/// user's groups and tabs are gone -- `load` moves the unreadable file aside
+/// and starts fresh, which is a safe outcome but not the one they wanted.
 pub fn save(path: &Path, state: &StateFile) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
             std::fs::create_dir_all(dir)?;
         }
     }
-    let mut name = OsString::from(path.file_name().unwrap_or_default());
-    name.push(".tmp");
-    let tmp = path.with_file_name(name);
+    let tmp = temp_path(path);
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, json)?;
-    match std::fs::rename(&tmp, path) {
+    match write_and_rename(&tmp, path, json.as_bytes()) {
         Ok(()) => Ok(()),
         Err(e) => {
-            // Leaving a stray `.tmp` beside the real file would be read as a
+            // Leaving a stray temporary beside the real file would be read as a
             // half-written state by the next person to look in the directory.
             let _ = std::fs::remove_file(&tmp);
             Err(e)
         }
     }
+}
+
+fn write_and_rename(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(tmp, path)
 }
 
 /// The [`StateFile`] the running IDE holds, plus the debounce bookkeeping.

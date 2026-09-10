@@ -1,6 +1,13 @@
 name: ci
 on: [push, pull_request]
 
+# Neither job writes anything back to the repository and neither uses a secret,
+# so the token they get is read-only. Pinned here rather than left to the
+# repository's default setting, which is not a property of this file and can be
+# widened without anyone touching the workflow.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 

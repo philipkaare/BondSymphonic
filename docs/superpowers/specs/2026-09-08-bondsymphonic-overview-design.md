@@ -323,14 +323,22 @@ Milestone 7**; before that only the daemon and proto crates were covered.
 | Job | Runner | Steps |
 |---|---|---|
 | `linux` | `ubuntu-24.04` | Install bubblewrap and python3; **assert `bwrap` can create a user namespace** (relaxing `kernel.apparmor_restrict_unprivileged_userns` first if needed) and fail the job if it still cannot; `cargo fmt --all -- --check`; `cargo test -p bondsymphonic-proto -p bondsymphonic-daemon`; `cargo clippy -p bondsymphonic-proto -p bondsymphonic-daemon --all-targets -- -D warnings` |
-| `windows-ide` | `windows-latest` | `jurplel/install-qt-action@v4` with Qt 6.9.2 `win64_msvc2022_64`, cached; `QMAKE` derived from `QT_ROOT_DIR` and the job failed if the kit is not there; `QT_QPA_PLATFORM=offscreen`; `cargo fmt --all -- --check`; `cargo test -p bondsymphonic-proto -p bondsymphonic-ide --features bondsymphonic-ide/require-qt`; `cargo clippy -p bondsymphonic-ide --all-targets -- -D warnings` |
+| `windows-ide` | `windows-latest` | `jurplel/install-qt-action@v4` with Qt 6.9.2 `win64_msvc2022_64`, cached; `QMAKE` derived from `QT_ROOT_DIR` and the job failed if the kit is not there; `QT_QPA_PLATFORM=offscreen`; `cargo fmt --all -- --check`; `scripts\package.ps1 -NoDaemon` into `dist\BondSymphonic`; `cargo test -p bondsymphonic-proto -p bondsymphonic-ide --features bondsymphonic-ide/require-qt` with `BS_PACKAGED_EXE` pointed at that package; `cargo clippy -p bondsymphonic-ide --all-targets --features bondsymphonic-ide/require-qt -- -D warnings` |
 
-Two rules make a green run mean something. On Linux the user-namespace check is
-a **gate, not a probe**: every sandbox and network test skips with a printed
+Both jobs run under `permissions: contents: read`. Neither writes back to the
+repository and neither uses a secret, and pinning it here keeps that true
+regardless of the repository's default token setting.
+
+Three rules make a green run mean something. On Linux the user-namespace check
+is a **gate, not a probe**: every sandbox and network test skips with a printed
 reason when `bwrap` cannot unshare, so a runner that blocked it would give a
 green job in which none of them ran. On Windows `--features require-qt` turns
 each IDE test's "`QMAKE` unset, skipping" escape hatch into a panic, so a runner
-that lost its Qt installation cannot report green either.
+that lost its Qt installation cannot report green either — and it is on the
+clippy step as well as the test step, so the lint sees the same code the tests
+run. `BS_PACKAGED_EXE` is the same kind of gate for `packaged_smoke`: the
+package step runs first and the variable points at its output, so the one test
+that exercises a deployed build cannot pass by skipping.
 
 There is no `windows-proto` job; the proto crate is tested on Windows inside
 `windows-ide`.

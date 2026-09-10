@@ -92,6 +92,29 @@ The first run downloads several gigabytes. Switches are `-Debug` (debug daemon),
 To build a distributable package from a checkout: `. .\scripts\env.ps1` then
 `.\scripts\package.ps1`.
 
+### What provisioning trusts
+
+Provisioning the distro runs two vendor install scripts straight from the
+network, and this is a deliberate choice rather than an oversight, so it is
+written down here for you to weigh:
+
+- `curl -fsSL https://claude.ai/install.sh | bash` runs on **every**
+  provisioning, the packaged `install.ps1` path included. It installs Claude
+  Code.
+- `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` runs only in
+  developer mode, where a checkout has to build the daemon.
+
+Both are the vendors' own documented install commands, fetched over TLS. Neither
+pins a version and neither checks a published checksum, so each provisioning
+installs whatever those endpoints serve at that moment. The `bs` user inside the
+distro has passwordless `sudo`, so anything either script installs can reach root
+in the distro. That distro is a full WSL environment: it can read the Windows
+drives under `/mnt`, and it is not the bubblewrap sandbox your agents run inside.
+
+If that is more trust than you want to extend, provision the distro yourself and
+install Claude Code from a version you have pinned and verified; the IDE only
+needs `claude` on the `bs` user's `PATH`.
+
 ---
 
 ## First run and the setup page
@@ -284,9 +307,11 @@ only** — the rest of the file still loads. The Run panel hangs the reasons on
 the configuration combo as a tooltip and puts an amber line under it:
 
 ```
-1 run config ignored: bondsymphonic.toml: [[run]] #2 ('api') has no port; it is not offered
+bondsymphonic.toml: [[run]] #2 ('api') has no port; it is not offered
 ```
 
+One problem shows as its own sentence, exactly as above. More than one shows as
+`3 problems with bondsymphonic.toml`, with every reason in the tooltip.
 Blocks are numbered from one. A file that will not parse at all falls back to
 detection and reports the parser's own message, with its line and a caret, as a
 single warning. Unknown keys are accepted, so a file written for a newer daemon
@@ -432,10 +457,11 @@ What you have to do by hand:
 ## Troubleshooting
 
 **"daemon: protocol mismatch (daemon M, IDE N)".** The IDE and the daemon are
-from different builds. The IDE reinstalls the daemon it ships with and retries
-once by itself; if the second attempt mismatches too it stops there rather than
-retrying forever, because the answer would be the same every time. Fix it by
-making the pair match — reinstall the package, or rebuild the daemon with
+from different builds. The IDE stops at the handshake and does not try again:
+every attempt would be refused the same way. It has nothing to repair either —
+it installs the daemon binary it ships with before every launch, so a mismatch
+means that binary is itself from a different build. Fix it by making the pair
+match: reinstall the package, or rebuild the daemon with
 `.\scripts\build-daemon.ps1` from the same checkout as the IDE. An IDE and a
 daemon are shipped as a pair.
 

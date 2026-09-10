@@ -249,11 +249,13 @@ fn quoted_distro_path(path: &str) -> String {
 /// stays at 0.1.0 through development, so a rebuilt daemon would never be reinstalled and
 /// the IDE would silently keep running a stale binary. The two files are hashed instead.
 ///
-/// Idempotent, and public so a caller can install without launching. [`launch`]
-/// runs it before every spawn, which is what makes a protocol mismatch mean
-/// something other than a stale binary: the copy in the distro has already been
-/// brought level with the one this IDE ships before the handshake is tried.
-pub async fn install_daemon(spec: &LaunchSpec) -> Result<()> {
+/// Idempotent, and run by [`launch`] before every spawn -- which is what makes
+/// a protocol mismatch mean something other than a stale binary: the copy in
+/// the distro has already been brought level with the one this IDE ships before
+/// the handshake is tried. Its only caller lives in this module, so it is
+/// `pub(crate)`; the `pub` it used to carry was for the retry that premise
+/// made pointless.
+pub(crate) async fn install_daemon(spec: &LaunchSpec) -> Result<()> {
     let Some(local) = &spec.local_daemon_binary else {
         return Ok(());
     };

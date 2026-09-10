@@ -8,7 +8,8 @@
 
 use bondsymphonic_ide::model::app_state::{TabStatus, Workspaces};
 use bondsymphonic_ide::model::persistence::{
-    load, port_key, save, PersistedGroup, StateFile, StateStore, MAX_RECENT_REPOS, STATE_VERSION,
+    load, port_key, save, temp_path, PersistedGroup, StateFile, StateStore, MAX_RECENT_REPOS,
+    STATE_VERSION,
 };
 use bondsymphonic_proto::{WorkspaceId, WorkspaceInfo, WorkspaceState};
 use std::collections::BTreeMap;
@@ -477,4 +478,63 @@ fn the_state_file_sits_beside_the_settings_file_unless_overridden() {
             .and_then(|n| n.to_str()),
         Some("BondSymphonic")
     );
+}
+
+/// `state.json` is written the way the daemon writes its own state files: a
+/// unique sibling temporary, synced to the device, then a rename.
+///
+/// The uniqueness is not decoration. A fixed `state.json.tmp` is shared by
+/// every writer of that file, so two IDE windows over the same `%APPDATA%`
+/// path can rename each other's half-written temporary into place, and a
+/// leftover directory or a read-only file at that name wedges the writer for
+/// as long as it is there.
+#[test]
+fn saves_go_through_a_unique_temporary_and_leave_nothing_behind() {
+    let dir = temp_dir("atomic");
+    let path = dir.join("state.json");
+
+    let mut state = StateFile::default();
+    state.note_recent("C:/git/one");
+    save(&path, &state).expect("first save");
+    state.note_recent("C:/git/two");
+    save(&path, &state).expect("second save");
+
+    assert_eq!(load(&path).recent_repos, ["C:/git/two", "C:/git/one"]);
+
+    // Two saves in a row and the directory holds the state file and nothing
+    // else: no temporary survived either of them.
+    let left: Vec<String> = std::fs::read_dir(&dir)
+        .expect("read the directory back")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        left,
+        ["state.json"],
+        "a temporary was left behind: {left:?}"
+    );
+
+    // The name carries this process's id and a counter, so it cannot collide
+    // with another process's temporary or with the writer's own next one.
+    let pid = std::process::id();
+    let first = temp_path(&path);
+    let second = temp_path(&path);
+    assert_ne!(first, second, "two calls must not produce one name");
+    for tmp in [&first, &second] {
+        assert_eq!(tmp.parent(), path.parent(), "the temporary is a sibling");
+        let name = tmp
+            .file_name()
+            .expect("a file name")
+            .to_string_lossy()
+            .into_owned();
+        let rest = name
+            .strip_prefix(&format!(".state.json.{pid}."))
+            .unwrap_or_else(|| panic!("unexpected temporary name {name:?}"));
+        let counter = rest
+            .strip_suffix(".tmp")
+            .unwrap_or_else(|| panic!("unexpected temporary name {name:?}"));
+        assert!(
+            counter.chars().all(|c| c.is_ascii_digit()) && !counter.is_empty(),
+            "the counter is not a number in {name:?}"
+        );
+    }
 }

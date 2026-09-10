@@ -992,6 +992,66 @@ impl Workspaces {
             }
             None => self.fallback_active(),
         }
+
+        // Last, so it sees the tabs this call created and none of the ones it
+        // dropped.
+        self.resync_agents(daemon_list);
+    }
+
+    /// Re-derives what every tab says about its agent from the daemon's own
+    /// records, and rebuilds the attention marks from that.
+    ///
+    /// The live `agent.state` stream is the usual source, but it reports only
+    /// *changes*, and a daemon that has restarted has no change to report
+    /// about an agent that no longer exists. Without this a background tab
+    /// that was waiting for permission when the daemon died keeps its dot, and
+    /// the status bar keeps saying `<agent> is waiting for permission` about
+    /// an agent that is gone -- an untrue sentence in the one place the guide
+    /// tells the user to look, cleared only if they happen to visit that tab
+    /// and leave it again.
+    ///
+    /// `workspace.list` is the right moment: it is the daemon's own word, it
+    /// is fetched on the first connection and again after every reconnect, and
+    /// its records carry each agent's state. Re-deriving rather than blanking
+    /// is what keeps an agent that really is still blocked marked across a
+    /// reconnect.
+    ///
+    /// A daemon too old to send `agent_records` leaves them empty, which reads
+    /// as "nothing is known" -- the tab falls back to idle rather than keeping
+    /// a claim nothing supports.
+    fn resync_agents(&mut self, daemon_list: &[WorkspaceInfo]) {
+        for info in daemon_list {
+            let Some((g, t)) = self.find(&info.id) else {
+                continue;
+            };
+            let tab = &mut self.groups[g].tabs[t];
+            // By id, not the last record: the tab is bound to one agent, and a
+            // workspace can have several.
+            let derived = tab
+                .agent_id
+                .as_ref()
+                .and_then(|id| info.agent_records.iter().find(|a| &a.id == id))
+                .map(|a| TabStatus::from_agent_state(&a.state));
+            tab.agent_status = derived;
+            tab.agent_detail.clear();
+            // The badge is the agent's only while the workspace itself is
+            // `Ready`; anything else is the workspace's news, which
+            // `apply_workspace_info` has just put there.
+            if tab.agent_id.is_some() && matches!(info.state, WorkspaceState::Ready) {
+                tab.status = derived.unwrap_or(TabStatus::Idle);
+                tab.detail.clear();
+            }
+            tab.attention = match derived {
+                Some(TabStatus::WaitingPermission) => permission_attention(&tab.name),
+                _ => String::new(),
+            };
+        }
+        // The tab in front never carries a mark: its permission bar is on
+        // screen, which is the whole reason the mark exists for the others.
+        // Same rule as [`Workspaces::refresh_attention`].
+        if let Some(active) = self.active().map(|t| t.workspace_id.clone()) {
+            self.clear_workspace_attention(&active);
+        }
     }
 
     pub fn active(&self) -> Option<&AgentTab> {
