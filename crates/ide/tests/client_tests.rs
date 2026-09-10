@@ -599,6 +599,16 @@ async fn fake_daemon_speaking(token: &'static str, answer: MismatchAnswer) -> st
                     )
                 }
                 (Request::Hello(p), MismatchAnswer::Refuses(daemon)) if p.token == token => {
+                    // The refusing daemon is also the only place the IDE's own
+                    // half of the handshake can be read back. A client that
+                    // sent no version would be taken for a pre-M7 build and
+                    // accepted by a real daemon, so the version going out is
+                    // asserted here rather than left to the daemon's tests.
+                    assert_eq!(
+                        p.protocol_version,
+                        Some(PROTOCOL_VERSION),
+                        "the IDE must send its protocol version in `hello`"
+                    );
                     let client = peer_protocol_version(p.protocol_version);
                     ServerMessage::err(id, RpcError::protocol_mismatch(daemon, client))
                 }

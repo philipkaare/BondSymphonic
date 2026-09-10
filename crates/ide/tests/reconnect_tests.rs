@@ -518,8 +518,12 @@ fn wait_for(child: &mut std::process::Child, limit: Duration) -> Option<std::pro
 // ---------------------------------------------------------------------------
 
 /// What the status bar must say when the pair does not match, and the text
-/// that must never appear beside it.
-const MISMATCH_TEXT: &str = "daemon: protocol mismatch (daemon 2, IDE 1)";
+/// that must never appear beside it. The hint is part of it: the IDE stops
+/// here rather than trying to repair anything, so the sentence has to say what
+/// the user does next.
+const MISMATCH_TEXT: &str =
+    "daemon: protocol mismatch (daemon 2, IDE 1) \u{2014} rebuild the daemon \
+     (scripts\\build-daemon.ps1) or reinstall the package";
 const RECONNECTING_PREFIX: &str = "daemon: reconnecting (attempt";
 /// The mismatch is decided by the handshake, so a cold Qt start is all this
 /// waits for.
@@ -541,8 +545,10 @@ fn a_protocol_mismatch_stops_the_connection_loop_instead_of_backing_off() {
     let _ = std::fs::remove_dir_all(&config);
     std::fs::create_dir_all(&config).expect("mismatch config dir");
 
-    // `BS_DAEMON_ADDR` is set, so the launcher owns no daemon: there is nothing
-    // to reinstall and the first refusal is the last word.
+    // `BS_DAEMON_ADDR` is set, so no daemon of ours is launched -- and it would
+    // make no difference if one were: the IDE installs the daemon it ships with
+    // before every spawn, so a refusal is a pair that cannot talk and the first
+    // one is the last word.
     let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
         .env("QT_QPA_PLATFORM", "offscreen")
         .env("BS_DAEMON_ADDR", addr.to_string())
@@ -560,8 +566,10 @@ fn a_protocol_mismatch_stops_the_connection_loop_instead_of_backing_off() {
     let err = drain_live(child.stderr.take().expect("stderr is piped"));
     let logs = |()| format!("{}\n{}", read(&out), read(&err));
     // No script can run without a connection, so this run never quits by
-    // itself: it is watched until the status bar has said its piece, given a
-    // moment to prove nothing follows, and then stopped.
+    // itself: its log is watched until the status text appears there -- the
+    // supervisor logs the same sentence it puts in the status bar, which is the
+    // only way to read the bar from outside an offscreen process -- then given
+    // a moment to prove nothing follows, and stopped.
     let saw = wait_for_text(&mut child, &out, &err, MISMATCH_TEXT, MISMATCH_LIMIT);
     std::thread::sleep(Duration::from_secs(2));
     let _ = child.kill();

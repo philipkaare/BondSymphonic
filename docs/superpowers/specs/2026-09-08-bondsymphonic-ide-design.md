@@ -266,6 +266,13 @@ using the same `RustHighlighter`.
   opened has no pane at all, and it is cleared when the agent leaves
   `waiting_permission` (which is what a reply reaching the daemon causes) or
   when the user selects that tab.
+- `agent.state` is not the only driver: the window also calls
+  `GroupModel::refreshAttention(previousWorkspaceId)` on every tab change. That
+  clears the tab just selected **and marks the tab just left** when its agent is
+  still in `waiting_permission`. Without it, an agent that asked while its own
+  tab was in front stays unmarked after the user switches away, because no state
+  event fires for a change of selection. The agent's own status is the source
+  either way, so the bullet cannot disagree with the tab's status glyph.
 - Input box: multi-line, Enter sends, Shift+Enter newline. Disabled while the
   agent is working, except an Interrupt button.
 - On tab open, `agent.history` replays into the model before live events are

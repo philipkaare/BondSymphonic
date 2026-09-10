@@ -159,11 +159,14 @@ crate.
     the connection after the reply, exactly as it does for a bad token.
   - An IDE that reads another version back — or is refused with that error —
     stops at the handshake, puts
-    `daemon: protocol mismatch (daemon M, IDE N)` in the status bar, and does
-    not enter the reconnect backoff: every attempt would be refused the same
-    way. When the launcher owns the daemon it reinstalls the copy the IDE ships
-    with and retries once first, which is the mismatch a developer actually
-    hits (a stale binary in the distro).
+    `daemon: protocol mismatch (daemon M, IDE N) — rebuild the daemon
+    (scripts\build-daemon.ps1) or reinstall the package` in the status bar, and
+    does not enter the reconnect backoff: every attempt would be refused the
+    same way. It does not retry, and it has nothing to repair: the IDE installs
+    the daemon binary it ships with into the distro before every launch, so a
+    mismatch means that binary — the one beside the IDE, or the one in
+    `target\daemon` — is itself from a different build. Rebuilding it or
+    reinstalling the package is the fix, and the status text says so.
 - `system.check_prereqs` → list of `{name, ok, detail, fix_hint}` for git, bwrap,
   user-namespace support, claude, gh
 - `system.shutdown`

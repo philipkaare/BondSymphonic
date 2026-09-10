@@ -37,6 +37,40 @@ pub const DAEMON_FILE_NAME: &str = "bondsymphonic-daemon";
 /// tests, and by anyone who wants a package to run a daemon built elsewhere.
 pub const DAEMON_BINARY_ENV: &str = "BS_DAEMON_BINARY";
 
+/// The daemon's exit code for "another daemon already owns this data
+/// directory" (`BUSY_EXIT_CODE` in `crates/daemon/src/daemon.rs`). It has a
+/// code of its own precisely so the IDE can tell it from an ordinary start-up
+/// failure: relaunching is the one answer that cannot work.
+pub const DAEMON_BUSY_EXIT_CODE: i32 = 2;
+
+/// The data directory the daemon uses, for the message the IDE shows when
+/// another daemon already owns it. [`command_for`] passes no `--data-dir`, so
+/// this is the daemon's own default and must track it.
+pub const DAEMON_DATA_DIR: &str = "~/.bondsymphonic";
+
+/// The daemon closed stdout without ever printing its port line, which means it
+/// exited while starting up. `code` is the exit code when one could be read.
+///
+/// Its own error type rather than a sentence, because the exit code decides
+/// what the IDE does next: code 2 is a data directory another daemon owns and
+/// no relaunch can change that, while every other exit is worth trying again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonExited {
+    pub code: Option<i32>,
+}
+
+impl std::fmt::Display for DaemonExited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the daemon closed stdout before printing its port")?;
+        match self.code {
+            Some(code) => write!(f, "; it exited with code {code}"),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::error::Error for DaemonExited {}
+
 /// The Linux daemon binary this build of the IDE ships with, or `None` when
 /// there is none to install and whatever is already in the distro must do.
 ///
@@ -215,9 +249,10 @@ fn quoted_distro_path(path: &str) -> String {
 /// stays at 0.1.0 through development, so a rebuilt daemon would never be reinstalled and
 /// the IDE would silently keep running a stale binary. The two files are hashed instead.
 ///
-/// Idempotent, and called for its own sake as well as by [`launch`]: a
-/// handshake refused over the protocol version is answered by reinstalling the
-/// daemon this IDE ships with, and that is this step on its own.
+/// Idempotent, and public so a caller can install without launching. [`launch`]
+/// runs it before every spawn, which is what makes a protocol mismatch mean
+/// something other than a stale binary: the copy in the distro has already been
+/// brought level with the one this IDE ships before the handshake is tried.
 pub async fn install_daemon(spec: &LaunchSpec) -> Result<()> {
     let Some(local) = &spec.local_daemon_binary else {
         return Ok(());
@@ -290,8 +325,14 @@ pub async fn launch(spec: &LaunchSpec) -> Result<DaemonProcess> {
     let mut lines = BufReader::new(stdout).lines();
     let first = tokio::time::timeout(std::time::Duration::from_secs(30), lines.next_line())
         .await
-        .context("daemon did not print its port within 30s")??
-        .context("daemon closed stdout before printing its port")?;
+        .context("daemon did not print its port within 30s")??;
+    let Some(first) = first else {
+        // Stdout closed with no port line: the daemon exited during start-up.
+        // Reaped here so its exit code travels with the error -- that code is
+        // how the caller tells a data directory another daemon owns from a
+        // failure another launch could get past.
+        return Err(anyhow::Error::new(exit_of(&mut child).await));
+    };
     let (port, token) =
         parse_port_line(&first).ok_or_else(|| anyhow!("unexpected daemon first line: {first}"))?;
     let stdin = child.stdin.take();
@@ -301,6 +342,20 @@ pub async fn launch(spec: &LaunchSpec) -> Result<DaemonProcess> {
         port,
         token,
     })
+}
+
+/// Waits briefly for a daemon that has already closed stdout and reports how it
+/// ended. Bounded, because a `wsl.exe` relay that outlives the daemon it
+/// launched must not hold the launch path open for the rest of the session; an
+/// exit code that cannot be read in five seconds is reported as none, which the
+/// caller treats as an ordinary failure.
+async fn exit_of(child: &mut Child) -> DaemonExited {
+    let code = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+        .await
+        .ok()
+        .and_then(|status| status.ok())
+        .and_then(|status| status.code());
+    DaemonExited { code }
 }
 
 impl DaemonProcess {
@@ -318,6 +373,11 @@ impl DaemonProcess {
     /// It also closes nothing -- [`launch`] moves the child's stdin onto
     /// [`DaemonProcess::stdin`], so the handle tokio would drop here is
     /// already gone and the daemon is not asked to exit by being waited on.
+    ///
+    /// The full status is returned rather than a bare "it ended", because
+    /// `ExitStatus::code()` is what the supervisor reads: exit
+    /// [`DAEMON_BUSY_EXIT_CODE`] is a data directory another daemon owns, and
+    /// relaunching into it would only produce the same exit again.
     pub async fn wait_exit(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await
     }

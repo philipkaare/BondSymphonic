@@ -130,22 +130,30 @@ if (Test-Path $offscreen) {
 # a warning and no files -- which is exactly the silent failure that shipped a
 # package nobody could start. Copied explicitly instead, and asserted below.
 Write-Host "package: deploying the Visual C++ runtime"
-$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere; the Visual C++ runtime cannot be located" }
-$ErrorActionPreference = "Continue"
-$crtDlls = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Redist.14.Latest -find "VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT\*.dll"
-$ErrorActionPreference = "Stop"
-if (-not $crtDlls) {
-  throw "no Visual C++ redistributable found. Install the 'C++ Redistributable MSMs / Redist' component in the Visual Studio Installer, then run this again."
-}
-
-# Several toolsets can be installed side by side. Prefer the one the exe was
-# actually linked with, read out of its PE optional header (MajorLinkerVersion,
-# MinorLinkerVersion) -- a newer CRT than the binaries were built against
-# usually works, but "usually" is not something to ship.
+# Which toolset the exe was actually linked with, read out of its PE optional
+# header (MajorLinkerVersion, MinorLinkerVersion). Read before the search so the
+# number can be named when nothing is found -- "no redistributable" is not a
+# useful sentence without the version that was wanted.
 $peBytes = [System.IO.File]::ReadAllBytes((Join-Path $stage $exeName))
 $optionalHeader = [BitConverter]::ToInt32($peBytes, 0x3C) + 4 + 20
 $linked = "{0}.{1:00}" -f $peBytes[$optionalHeader + 2], $peBytes[$optionalHeader + 3]
+
+$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere; the Visual C++ runtime cannot be located" }
+# `Microsoft.VC1*.CRT` rather than a pinned `Microsoft.VC143.CRT`: the folder is
+# named after the toolset, so a Visual Studio that moves to VC144 would
+# otherwise find nothing here and the package would ship without a CRT until
+# somebody edited this line.
+$ErrorActionPreference = "Continue"
+$crtDlls = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Redist.14.Latest -find "VC\Redist\MSVC\*\x64\Microsoft.VC1*.CRT\*.dll"
+$ErrorActionPreference = "Stop"
+if (-not $crtDlls) {
+  throw "no Visual C++ redistributable found (the exe is linked with toolset $linked). Install the 'C++ Redistributable MSMs / Redist' component in the Visual Studio Installer, then run this again."
+}
+
+# Several toolsets can be installed side by side. Prefer the one the exe was
+# linked with -- a newer CRT than the binaries were built against usually works,
+# but "usually" is not something to ship.
 $byToolset = $crtDlls | Group-Object { ($_ -split '\\Redist\\MSVC\\')[1] -replace '\\.*$', '' }
 $chosen = $byToolset | Where-Object { $_.Name.StartsWith("$linked.") -or $_.Name -eq $linked }
 if (-not $chosen) {
@@ -238,9 +246,10 @@ $required = @(
 if (-not $NoDaemon) { $required += $daemonName }
 $missing = $required | Where-Object { -not (Test-Path (Join-Path $stage $_)) }
 if ($missing) { throw "package is incomplete: $($missing -join ', ') missing from $stage" }
-# The other half of the claim: what was dropped on purpose stayed dropped. A Qt
-# upgrade that starts needing the D3D12 shader compiler must fail here loudly
-# rather than have it silently deleted out from under the running application.
+# The other half of the claim: what was dropped on purpose is gone from the
+# staged folder. This proves the drop step ran and that windeployqt did not put
+# the files back after it; it says nothing about whether Qt needs them, which
+# only a run of the package can show. `packaged_smoke` is that run.
 $dropped = @("dxcompiler.dll", "dxil.dll") | Where-Object { Test-Path (Join-Path $stage $_) }
 if ($dropped) { throw "package still contains $($dropped -join ', '); the drop step did not run" }
 Write-Host "package: completeness check passed ($($required.Count) required files)"
