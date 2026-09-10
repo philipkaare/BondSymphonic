@@ -108,6 +108,23 @@ fn a_missing_state_file_reads_as_the_default() {
 /// silently: it is moved aside so it can be inspected, and the IDE starts on
 /// the defaults.
 #[test]
+fn a_state_file_that_is_not_utf8_is_moved_aside_too() {
+    let dir = temp_dir("corrupt-utf8");
+    let path = dir.join("state.json");
+    std::fs::write(&path, &[b'{', 0xff, 0xfe, 0x00, b'}'][..]).expect("corrupt file");
+    let state = load(&path);
+    assert_eq!(state, StateFile::default());
+    assert!(
+        dir.join("state.json.corrupt").exists(),
+        "non-UTF-8 bytes are kept aside"
+    );
+    assert!(
+        !path.exists(),
+        "the corrupt file is not left in place to be overwritten"
+    );
+}
+
+#[test]
 fn a_corrupt_state_file_is_moved_aside_and_reads_as_the_default() {
     let dir = temp_dir("corrupt");
     let path = dir.join("state.json");

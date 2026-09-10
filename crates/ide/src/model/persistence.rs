@@ -239,15 +239,20 @@ fn corrupt_path(path: &Path) -> PathBuf {
 /// level: overwriting it would throw away the only copy of an arrangement the
 /// user may well want back.
 pub fn load(path: &Path) -> StateFile {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return StateFile::default(),
         Err(e) => {
             tracing::warn!("{} could not be read ({e}); starting fresh", path.display());
             return StateFile::default();
         }
     };
-    match serde_json::from_str::<StateFile>(&raw) {
+    // Bytes that are not UTF-8 are corruption like any other and get the same
+    // move-aside: `read_to_string` would report them as an I/O error and skip it.
+    let parsed = std::str::from_utf8(&bytes)
+        .map_err(|e| e.to_string())
+        .and_then(|raw| serde_json::from_str::<StateFile>(raw).map_err(|e| e.to_string()));
+    match parsed {
         Ok(state) => {
             if state.version != STATE_VERSION {
                 tracing::warn!(
