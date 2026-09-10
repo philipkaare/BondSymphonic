@@ -789,3 +789,81 @@ fn a_denial_log_maps_onto_a_workspace_and_a_host() {
         None
     );
 }
+
+/// The first `workspace.list` after a restart rebuilds the tab model from
+/// `state.json` instead of filing everything into "Unsorted", and writes back
+/// what it settled on, so the file follows the daemon rather than accumulating
+/// workspaces that no longer exist.
+#[test]
+fn the_first_workspace_list_restores_the_persisted_arrangement() {
+    use bondsymphonic_ide::model::persistence::{PersistedGroup, StateStore};
+    use bondsymphonic_ide::qobjects::app_controller::restore_workspaces;
+
+    let group = |name: &str, ids: &[&str]| PersistedGroup {
+        name: name.to_owned(),
+        workspace_ids: ids.iter().map(|s| (*s).to_owned()).collect(),
+    };
+    // No path: nothing this test does can reach a file at all.
+    let store = StateStore::new(None);
+    store.update(|s| {
+        s.groups = vec![group("Backend", &["ws_2", "ws_gone"]), group("Empty", &[])];
+        s.active_workspace = Some("ws_2".to_owned());
+        s.open_editors
+            .insert("ws_gone".to_owned(), vec!["a.rs".to_owned()]);
+    });
+
+    let list = vec![
+        info("ws_1", "alpha", WorkspaceState::Ready),
+        info("ws_2", "beta", WorkspaceState::Ready),
+    ];
+    let (model, _token) = restore_workspaces(&store, &list);
+
+    assert_eq!(
+        model
+            .groups
+            .iter()
+            .map(|g| g.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Backend", "Empty", "Unsorted"]
+    );
+    assert_eq!(model.active().map(|t| t.name.as_str()), Some("beta"));
+
+    let saved = store.snapshot();
+    assert_eq!(saved.groups[0].workspace_ids, ["ws_2"]);
+    assert_eq!(saved.groups[2].workspace_ids, ["ws_1"]);
+    assert_eq!(saved.active_workspace.as_deref(), Some("ws_2"));
+    assert!(
+        saved.open_editors.is_empty(),
+        "the lost workspace's editors are pruned"
+    );
+}
+
+/// `noteEditors` is called by the window with the tab list of one workspace.
+/// It takes the object the window builds, and a bare array from anything that
+/// only knows the open paths.
+#[test]
+fn note_editors_takes_an_object_or_a_bare_array() {
+    use bondsymphonic_ide::qobjects::app_controller::parse_editors;
+
+    assert_eq!(
+        parse_editors(r#"{"open":["a.rs","b.rs"],"active":"b.rs"}"#),
+        Some((
+            vec!["a.rs".to_owned(), "b.rs".to_owned()],
+            Some("b.rs".to_owned())
+        ))
+    );
+    assert_eq!(
+        parse_editors(r#"["a.rs"]"#),
+        Some((vec!["a.rs".to_owned()], None))
+    );
+    // Every tab closed: an empty list, not "leave it as it was".
+    assert_eq!(parse_editors("[]"), Some((Vec::new(), None)));
+    assert_eq!(parse_editors("{}"), Some((Vec::new(), None)));
+    // An active tab that is not open is not a state the window can be in.
+    assert_eq!(
+        parse_editors(r#"{"open":["a.rs"],"active":"gone.rs"}"#),
+        Some((vec!["a.rs".to_owned()], None))
+    );
+    assert_eq!(parse_editors("not json"), None);
+    assert_eq!(parse_editors(""), None);
+}

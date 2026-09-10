@@ -16,6 +16,89 @@ use std::path::PathBuf;
 /// test can round-trip the file without touching the developer's own settings.
 pub const SETTINGS_PATH_ENV: &str = "BS_SETTINGS_PATH";
 
+/// Overrides where `state.json` is read from and written to, exactly as
+/// [`SETTINGS_PATH_ENV`] does for the settings file. **Test-only.** With it
+/// unset the state file sits beside `settings.json`.
+pub const STATE_PATH_ENV: &str = "BS_STATE_PATH";
+
+/// Overrides the pre-flatten settings location [`Settings::load`] migrates
+/// from. **Test-only**: a migration test needs an "old path" it can create
+/// without touching the developer's own `%APPDATA%`. With it unset the old
+/// path is the `ProjectDirs` one earlier builds wrote to -- unless
+/// [`SETTINGS_PATH_ENV`] is set and this is not, which is a test pointing at a
+/// temp settings file; that must not pull the developer's real settings into
+/// it, so migration is off in that case.
+pub const LEGACY_SETTINGS_PATH_ENV: &str = "BS_LEGACY_SETTINGS_PATH";
+
+/// The directory both files live in: `%APPDATA%\BondSymphonic`.
+///
+/// Flattened from the `ProjectDirs` layout, which nested a second
+/// `BondSymphonic` inside the first (IDE spec §11). See [`legacy_path`] for
+/// what happens to a file left at the old location.
+fn config_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|d| d.config_dir().join("BondSymphonic"))
+}
+
+/// A non-empty environment override, as a path.
+fn path_override(var: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(var)?;
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+/// Where earlier builds kept `settings.json`, or `None` when there is nothing
+/// to migrate from.
+fn legacy_path() -> Option<PathBuf> {
+    if let Some(over) = path_override(LEGACY_SETTINGS_PATH_ENV) {
+        return Some(over);
+    }
+    // A test pointing `BS_SETTINGS_PATH` at a temp file has no business
+    // reading the developer's real settings, so there is no legacy file for it
+    // unless it named one itself.
+    if path_override(SETTINGS_PATH_ENV).is_some() {
+        return None;
+    }
+    directories::ProjectDirs::from("", "BondSymphonic", "BondSymphonic")
+        .map(|d| d.config_dir().join("settings.json"))
+}
+
+/// Copies a pre-flatten `settings.json` up to its new home, once.
+///
+/// "Once" needs no marker file: the copy only happens while there is no file
+/// at the new path, and the copy itself creates one. The old file is left
+/// where it is rather than deleted, so an older build the user goes back to
+/// still finds its settings.
+fn migrate_legacy_settings() {
+    let Some(new_path) = Settings::path() else {
+        return;
+    };
+    if new_path.exists() {
+        return;
+    }
+    let Some(old_path) = legacy_path() else {
+        return;
+    };
+    if old_path == new_path || !old_path.exists() {
+        return;
+    }
+    if let Some(dir) = new_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!("{} could not be created: {e}", dir.display());
+            return;
+        }
+    }
+    match std::fs::copy(&old_path, &new_path) {
+        Ok(_) => tracing::info!(
+            "settings migrated from {} to {}",
+            old_path.display(),
+            new_path.display()
+        ),
+        Err(e) => tracing::warn!(
+            "settings could not be migrated from {}: {e}",
+            old_path.display()
+        ),
+    }
+}
+
 /// The credential-store service name. One entry, under one user name, for the
 /// whole application.
 const KEYRING_SERVICE: &str = "BondSymphonic";
@@ -55,16 +138,24 @@ impl Default for Settings {
 
 impl Settings {
     pub fn path() -> Option<PathBuf> {
-        if let Some(over) = std::env::var_os(SETTINGS_PATH_ENV) {
-            if !over.is_empty() {
-                return Some(PathBuf::from(over));
-            }
+        path_override(SETTINGS_PATH_ENV).or_else(|| config_dir().map(|d| d.join("settings.json")))
+    }
+
+    /// Where `state.json` lives: beside `settings.json`, so overriding the
+    /// settings path in a test moves both out of the user's `%APPDATA%`
+    /// together, and `BS_STATE_PATH` moves the state file on its own.
+    pub fn state_path() -> Option<PathBuf> {
+        if let Some(over) = path_override(STATE_PATH_ENV) {
+            return Some(over);
         }
-        directories::ProjectDirs::from("", "BondSymphonic", "BondSymphonic")
-            .map(|d| d.config_dir().join("settings.json"))
+        Self::path()?
+            .parent()
+            .map(|dir| dir.join("state.json"))
+            .or_else(|| config_dir().map(|d| d.join("state.json")))
     }
 
     pub fn load() -> Self {
+        migrate_legacy_settings();
         Self::path()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str(&s).ok())

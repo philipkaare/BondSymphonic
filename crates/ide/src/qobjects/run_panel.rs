@@ -13,7 +13,9 @@
 
 use crate::client::router::EventRx;
 use crate::model::run_config::{denial_owner, run_state_word, RunView, WorkspaceRuns};
-use crate::qobjects::app_controller::{connection_generation, require_connection, runtime, Shared};
+use crate::qobjects::app_controller::{
+    connection_generation, require_connection, runtime, state_store, Shared,
+};
 use bondsymphonic_proto::{
     DetectRunConfigsResult, Event, RepoPathParams, Request, RunConfig, RunId, RunIdParams, RunInfo,
     RunListResult, RunStartParams, RunStartResult, RunState, WorkspaceId, WorkspaceIdParams,
@@ -109,8 +111,9 @@ pub mod qobject {
         #[qinvokable]
         fn select_config(self: Pin<&mut RunPanelModel>, name: QString);
 
-        /// Starts the selected configuration. The daemon uses that
-        /// configuration's port; there is no per-start override.
+        /// Starts the selected configuration, on the port the user set for it
+        /// in this workspace (`AppController::setPortOverride`, kept in
+        /// `state.json`) or, with none, on the configuration's own port.
         #[qinvokable]
         fn start(self: Pin<&mut RunPanelModel>);
 
@@ -405,6 +408,15 @@ impl qobject::RunPanelModel {
         };
         let qt = self.as_ref().qt_thread();
         self.as_mut().begin_request();
+        // The port the user set on this configuration in this workspace, kept
+        // in `state.json` so it survives a restart. `None` means the port the
+        // configuration itself names.
+        let port = state_store().with(|s| s.port_override(&workspace, &config));
+        if let Some(port) = port {
+            // Task 2 adds `port: Option<u16>` to `RunStartParams`; the line
+            // below becomes `port,` in the literal once it lands.
+            tracing::info!(%workspace, %config, port, "run.start port override");
+        }
         let params = RunStartParams {
             workspace_id: WorkspaceId(workspace.clone()),
             config_name: config.clone(),

@@ -1,9 +1,15 @@
 //! Pure-Rust application state. This module must never import Qt types.
 
+use crate::model::persistence::PersistedGroup;
 use bondsymphonic_proto::{
     AgentAdapterKind, AgentId, AgentState, WorkspaceId, WorkspaceInfo, WorkspaceState,
 };
 use serde::{Deserialize, Serialize};
+
+/// Where a workspace the daemon has but no group claims is filed. Looked up by
+/// name rather than by a stable id, because the user can rename it and the
+/// next unclaimed workspace should still land somewhere sensible.
+pub const UNSORTED_GROUP: &str = "Unsorted";
 
 /// Lifecycle of the IDE's connection to the daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +188,35 @@ pub struct AgentTab {
     pub options_json: String,
 }
 
+impl AgentTab {
+    /// A plain terminal tab for a workspace the daemon described but the IDE
+    /// was not tracking: what [`Workspaces::reconcile`] files into "Unsorted"
+    /// and what [`Workspaces::from_persisted`] rebuilds a restored group from.
+    /// Nothing local is invented here -- no adapter, no command, no agent --
+    /// because the daemon's list says nothing about any of it.
+    pub fn from_workspace_info(info: &WorkspaceInfo) -> AgentTab {
+        AgentTab {
+            workspace_id: info.id.clone(),
+            name: info.name.clone(),
+            repo_path: info.repo_path.clone(),
+            branch: info.branch.clone(),
+            status: TabStatus::from_workspace_state(&info.state),
+            detail: match &info.state {
+                WorkspaceState::Error(detail) => detail.clone(),
+                _ => String::new(),
+            },
+            worktree_path: info.worktree_path.clone(),
+            adapter: AgentAdapterKind::Terminal,
+            command: None,
+            run_config: None,
+            agent_id: None,
+            agent_status: None,
+            agent_detail: String::new(),
+            options_json: String::new(),
+        }
+    }
+}
+
 /// A user-defined collection of agent tabs, shown as a section in the sidebar.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Group {
@@ -199,6 +234,106 @@ pub struct Workspaces {
 }
 
 impl Workspaces {
+    /// Rebuilds the tab model from `state.json`'s groups and the daemon's
+    /// authoritative workspace list.
+    ///
+    /// The persisted order is the user's order, so groups come back in the
+    /// order they were written and each keeps its workspaces in the order it
+    /// listed them. Everything else follows from the daemon being the authority
+    /// on what exists: a persisted id the daemon no longer has is dropped, a
+    /// workspace the daemon has that no group claims lands in
+    /// [`UNSORTED_GROUP`], and every tab is rebuilt from the daemon's
+    /// `WorkspaceInfo` rather than from anything the file remembered about it.
+    ///
+    /// An empty persisted group is kept: the user made it, and a group that
+    /// vanished every time its last workspace was destroyed would have to be
+    /// made again by hand. A workspace named by two groups is placed once, in
+    /// the first that claims it, so a hand-edited file cannot produce two tabs
+    /// for one workspace.
+    ///
+    /// `active` is the workspace that was in front. It is restored when the
+    /// daemon still has it; otherwise the first tab of the first non-empty
+    /// group is selected, which is what the user sees anyway.
+    pub fn from_persisted(
+        groups: &[PersistedGroup],
+        list: &[WorkspaceInfo],
+        active: Option<&str>,
+    ) -> Workspaces {
+        let by_id: std::collections::HashMap<&str, &WorkspaceInfo> =
+            list.iter().map(|info| (info.id.as_str(), info)).collect();
+        let mut placed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+        let mut model = Workspaces {
+            groups: Vec::new(),
+            active_group: 0,
+            active_tab: 0,
+        };
+        for persisted in groups {
+            let mut tabs = Vec::new();
+            for id in &persisted.workspace_ids {
+                let Some(info) = by_id.get(id.as_str()) else {
+                    continue;
+                };
+                if !placed.insert(info.id.as_str()) {
+                    continue;
+                }
+                tabs.push(AgentTab::from_workspace_info(info));
+            }
+            model.groups.push(Group {
+                id: format!("grp_{}", model.groups.len()),
+                name: persisted.name.clone(),
+                tabs,
+            });
+        }
+
+        let unclaimed: Vec<&WorkspaceInfo> = list
+            .iter()
+            .filter(|info| !placed.contains(info.id.as_str()))
+            .collect();
+        if !unclaimed.is_empty() {
+            let idx = match model.groups.iter().position(|g| g.name == UNSORTED_GROUP) {
+                Some(idx) => idx,
+                None => model.add_group(UNSORTED_GROUP),
+            };
+            for info in unclaimed {
+                model.groups[idx]
+                    .tabs
+                    .push(AgentTab::from_workspace_info(info));
+            }
+        }
+
+        // Nothing persisted and nothing running: the sidebar still needs a
+        // group for the first workspace to be created into.
+        if model.groups.is_empty() {
+            return Workspaces::new_default();
+        }
+
+        match active
+            .map(|id| WorkspaceId(id.to_owned()))
+            .and_then(|id| model.find(&id))
+        {
+            Some((g, t)) => {
+                model.active_group = g;
+                model.active_tab = t;
+            }
+            None => model.fallback_active(),
+        }
+        model
+    }
+
+    /// The arrangement to write to `state.json`: every group by name, in order,
+    /// with the workspaces it holds. The inverse of
+    /// [`Workspaces::from_persisted`].
+    pub fn persisted_groups(&self) -> Vec<PersistedGroup> {
+        self.groups
+            .iter()
+            .map(|g| PersistedGroup {
+                name: g.name.clone(),
+                workspace_ids: g.tabs.iter().map(|t| t.workspace_id.0.clone()).collect(),
+            })
+            .collect()
+    }
+
     /// A fresh model with a single group named "Default" and no tabs.
     pub fn new_default() -> Self {
         Workspaces {
@@ -432,29 +567,13 @@ impl Workspaces {
             }
             // Unknown workspaces are filed into a group named "Unsorted",
             // looked up (and created if absent) by name, not by a stable id.
-            let group_idx = match self.groups.iter().position(|g| g.name == "Unsorted") {
+            let group_idx = match self.groups.iter().position(|g| g.name == UNSORTED_GROUP) {
                 Some(idx) => idx,
-                None => self.add_group("Unsorted"),
+                None => self.add_group(UNSORTED_GROUP),
             };
-            self.groups[group_idx].tabs.push(AgentTab {
-                workspace_id: info.id.clone(),
-                name: info.name.clone(),
-                repo_path: info.repo_path.clone(),
-                branch: info.branch.clone(),
-                status: TabStatus::from_workspace_state(&info.state),
-                detail: match &info.state {
-                    WorkspaceState::Error(detail) => detail.clone(),
-                    _ => String::new(),
-                },
-                worktree_path: info.worktree_path.clone(),
-                adapter: AgentAdapterKind::Terminal,
-                command: None,
-                run_config: None,
-                agent_id: None,
-                agent_status: None,
-                agent_detail: String::new(),
-                options_json: String::new(),
-            });
+            self.groups[group_idx]
+                .tabs
+                .push(AgentTab::from_workspace_info(info));
         }
 
         // Restore the active selection: keep pointing at the same workspace

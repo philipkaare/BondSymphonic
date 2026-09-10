@@ -9,7 +9,10 @@
 use crate::client::router::EventRouter;
 use crate::client::DaemonClient;
 use crate::launcher::{self, LaunchSpec};
-use crate::model::app_state::{agent_state_word, compose_status, ConnectionState};
+use crate::model::app_state::{
+    agent_state_word, compose_status, ConnectionState, Workspaces, UNSORTED_GROUP,
+};
+use crate::model::persistence::{self, StateFile, StateStore};
 use crate::qobjects::settings::Settings;
 use crate::qobjects::smoke;
 use bondsymphonic_proto::*;
@@ -107,6 +110,118 @@ pub fn require_connection() -> Result<Shared, &'static str> {
         }
         None => Err(NOT_CONNECTED),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Persistence (`state.json`).
+//
+// The store is process-wide for the same reason [`SHARED`] is: the Run panel
+// has to read a port override and the window has to report its layout, and
+// neither holds a pointer to the controller. Everything the file knows lives in
+// `model/persistence.rs`; what is here is only when to write.
+// ---------------------------------------------------------------------------
+
+static STATE: OnceLock<StateStore> = OnceLock::new();
+
+/// The IDE's persisted state, read from disk on first use.
+///
+/// The path is decided once, at that first use, from `Settings::state_path()`,
+/// so anything overriding `BS_STATE_PATH` (or `BS_SETTINGS_PATH`) has to do it
+/// before the IDE starts -- which is what the launcher and the smoke test do.
+pub fn state_store() -> &'static StateStore {
+    STATE.get_or_init(|| StateStore::load(Settings::state_path()))
+}
+
+/// Applies a change and schedules the debounced write.
+///
+/// Every change hands out a token and starts a timer; a change made while a
+/// timer is running issues a newer token, so the earlier timer finds itself
+/// stale and does nothing. A burst -- a splitter being dragged, five tabs
+/// closing -- is therefore one write, [`persistence::DEBOUNCE`] after it stops.
+pub fn note_state(f: impl FnOnce(&mut StateFile)) {
+    schedule_flush(state_store().update(f));
+}
+
+/// Starts the timer that writes `state.json` unless a later change supersedes
+/// it. Separate from [`note_state`] so a caller that already updated the store
+/// (as [`restore_workspaces`] does) can schedule its write without a second
+/// mutation.
+pub fn schedule_flush(token: u64) {
+    runtime().spawn(async move {
+        tokio::time::sleep(persistence::DEBOUNCE).await;
+        state_store().flush_if_current(token);
+    });
+}
+
+/// Rebuilds the tab model from the persisted arrangement and the daemon's
+/// first workspace list, and records what it settled on.
+///
+/// Both halves matter. The model is what the sidebar is rebuilt from, so the
+/// user's groups come back rather than one "Unsorted" pile. Writing the result
+/// straight back is what keeps the file from growing forever: workspaces the
+/// daemon has lost take their editors and port overrides with them, and the
+/// ones it gained are recorded in the group they landed in.
+///
+/// Returns the model and the token whose timer may write the file.
+pub fn restore_workspaces(store: &StateStore, list: &[WorkspaceInfo]) -> (Workspaces, u64) {
+    let live: Vec<String> = list.iter().map(|info| info.id.0.clone()).collect();
+    let (groups, active) = store.with(|s| (s.groups.clone(), s.active_workspace.clone()));
+    let model = Workspaces::from_persisted(&groups, list, active.as_deref());
+    let restored_groups = model.persisted_groups();
+    let restored_active = model.active().map(|tab| tab.workspace_id.0.clone());
+    let token = store.update(|s| {
+        s.prune(&live);
+        s.set_groups(restored_groups, restored_active);
+    });
+    (model, token)
+}
+
+/// Records a workspace the daemon has just created: the group the user filed
+/// it into, and its repository as the most recently used one.
+///
+/// The window keeps the authoritative arrangement in `GroupModel` and reports
+/// it through `noteGroups`, but a create is the one mutation the controller can
+/// see for itself, so groups survive a restart even before the C++ side wires
+/// that signal up.
+fn note_workspace_created(group: &str, workspace: &str, repo_path: &str) {
+    let group = if group.is_empty() {
+        UNSORTED_GROUP
+    } else {
+        group
+    };
+    note_state(|s| {
+        s.add_to_group(group, workspace);
+        s.note_recent(repo_path);
+    });
+}
+
+/// What `noteEditors` accepts: the object the window builds,
+/// `{"open": [...], "active": "..."}`, or a bare array of open paths from
+/// anything that does not track which tab is in front. `None` for a string
+/// that is neither, which leaves the recorded list alone rather than emptying
+/// it over a bug in the caller.
+///
+/// An "active" path that is not in the open list is dropped: the window cannot
+/// be showing a tab it does not have, so recording one would only restore a
+/// selection that fails next time.
+pub fn parse_editors(json: &str) -> Option<(Vec<String>, Option<String>)> {
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct Editors {
+        open: Vec<String>,
+        active: Option<String>,
+    }
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let editors: Editors = match value {
+        serde_json::Value::Array(_) => Editors {
+            open: serde_json::from_value(value).ok()?,
+            active: None,
+        },
+        serde_json::Value::Object(_) => serde_json::from_value(value).ok()?,
+        _ => return None,
+    };
+    let active = editors.active.filter(|a| editors.open.contains(a));
+    Some((editors.open, active))
 }
 
 #[cxx_qt::bridge]
@@ -482,6 +597,82 @@ pub mod qobject {
         /// as its first caller.
         #[qinvokable]
         fn request_allow_host(self: Pin<&mut AppController>, workspace_id: QString, host: QString);
+
+        // -------------------------------------------------------------------
+        // Persistence (`state.json`). Everything below reads or writes the
+        // process-wide state store; none of it touches the connection.
+        // -------------------------------------------------------------------
+
+        /// The persisted state, as a JSON `StateFile`. Emitted by `loadState`,
+        /// so the window restores its geometry, dock layout, splitter sizes
+        /// and swap from one signal before anything is connected.
+        #[qsignal]
+        fn state_loaded(self: Pin<&mut AppController>, json: QString);
+
+        /// The tab model rebuilt from `state.json` and the daemon's *first*
+        /// workspace list, as a serialised `Workspaces`. The window hands this
+        /// to `GroupModel::loadWorkspaces`; every later list arrives as
+        /// `workspacesListed` and goes through `reconcile` as before.
+        #[qsignal]
+        fn workspaces_restored(self: Pin<&mut AppController>, json: QString);
+
+        /// Reads `state.json` and emits `stateLoaded` with it, returning the
+        /// same JSON for a caller that would rather have it directly. Called
+        /// before `start`, so the window is laid out before the daemon answers.
+        #[qinvokable]
+        fn load_state(self: Pin<&mut AppController>) -> QString;
+
+        /// Writes any pending change now rather than in half a second. The
+        /// window calls this from `closeEvent`, where there is no half second
+        /// left.
+        #[qinvokable]
+        fn flush_state(self: &AppController);
+
+        /// Records the whole arrangement after a `GroupModel` mutation:
+        /// `json` is what `GroupModel::groupsJson()` returns, an object with
+        /// `groups` and `active_workspace`.
+        #[qinvokable]
+        fn note_groups(self: &AppController, json: QString);
+
+        /// Records `workspace_id`'s open editor tabs. `json` is either
+        /// `{"open": ["rel/path", ...], "active": "rel/path"}` or a bare array
+        /// of the open paths; anything else is refused and the recorded list
+        /// left alone.
+        #[qinvokable]
+        fn note_editors(self: &AppController, workspace_id: QString, json: QString);
+
+        /// Records the agent-area splitter: `sizes_json` is a JSON array of
+        /// `QSplitter::sizes()`, `swapped` whether the halves are swapped.
+        #[qinvokable]
+        fn note_splitter(self: &AppController, sizes_json: QString, swapped: bool);
+
+        /// Records `QMainWindow::saveState()` and `saveGeometry()`, both
+        /// base64.
+        #[qinvokable]
+        fn note_window(self: &AppController, state_b64: QString, geometry_b64: QString);
+
+        /// The repositories the New Agent dialog offers, most recent first, as
+        /// a JSON array of paths.
+        #[qinvokable]
+        fn recent_repos(self: &AppController) -> QString;
+
+        /// Records a repository as the most recently used one.
+        #[qinvokable]
+        fn note_recent_repo(self: &AppController, path: QString);
+
+        /// The port a run of `config` in `workspace_id` should use instead of
+        /// the configured one, or 0 when the user set none.
+        #[qinvokable]
+        fn port_override(self: &AppController, workspace_id: QString, config: QString) -> i32;
+
+        /// Records that override. 0 (or anything outside 1..=65535) clears it.
+        #[qinvokable]
+        fn set_port_override(
+            self: &AppController,
+            workspace_id: QString,
+            config: QString,
+            port: i32,
+        );
     }
 
     impl cxx_qt::Threading for AppController {}
@@ -561,6 +752,10 @@ pub struct AppControllerRust {
     capabilities: QString,
     client: Option<DaemonClient>,
     process: Option<ProcessHandle>,
+    /// Whether a `workspace.list` has already been answered on this run. The
+    /// first one restores the persisted arrangement; every later one is an
+    /// ordinary reconcile.
+    first_list_done: bool,
 }
 
 impl Default for AppControllerRust {
@@ -572,6 +767,7 @@ impl Default for AppControllerRust {
             capabilities: QString::from(""),
             client: None,
             process: None,
+            first_list_done: false,
         }
     }
 }
@@ -787,7 +983,21 @@ async fn load_workspace_list(client: DaemonClient, qt: QtHandle) {
             Ok(res) => {
                 let json = serde_json::to_string(&res.workspaces).unwrap_or_else(|_| "[]".into());
                 tracing::info!(count = res.workspaces.len(), attempt, "workspaces_listed");
-                let _ = qt.queue(move |q| q.workspaces_listed(QString::from(&json)));
+                let list = res.workspaces;
+                let _ = qt.queue(move |mut q| {
+                    // The first list is the one the persisted arrangement is
+                    // reconciled against: the groups come back as the user left
+                    // them, and the workspaces the daemon has lost are dropped
+                    // from the file. Every later list is an ordinary reconcile.
+                    if !q.as_ref().rust().first_list_done {
+                        q.as_mut().rust_mut().first_list_done = true;
+                        let (model, token) = restore_workspaces(state_store(), &list);
+                        schedule_flush(token);
+                        q.as_mut()
+                            .workspaces_restored(QString::from(&model.to_json()));
+                    }
+                    q.workspaces_listed(QString::from(&json));
+                });
                 return;
             }
             Err(e) => {
@@ -953,6 +1163,8 @@ impl qobject::AppController {
             command.to_string(),
             run_config.to_string(),
         );
+        // Kept for `state.json`, which the echo above does not reach.
+        let (group_for_state, repo_for_state) = (group.clone(), params.repo_path.clone());
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(message) => {
@@ -967,6 +1179,7 @@ impl qobject::AppController {
                 .await
             {
                 Ok(info) => {
+                    note_workspace_created(&group_for_state, &info.id.0, &repo_for_state);
                     let json = serde_json::to_string(&info).unwrap_or_default();
                     let _ = qt.queue(move |q| {
                         q.workspace_created(
@@ -1021,6 +1234,8 @@ impl qobject::AppController {
             name: name.to_string(),
         };
         let group = group.to_string();
+        // Kept for `state.json`, which the echo below does not reach.
+        let (group_for_state, repo_for_state) = (group.clone(), params.repo_path.clone());
         let options = start_options(&options_json.to_string());
         // Echoed back to the window verbatim, so the tab keeps what the user
         // asked for and can start the agent again with it. The API key is not
@@ -1048,6 +1263,7 @@ impl qobject::AppController {
                     return;
                 }
             };
+            note_workspace_created(&group_for_state, &info.id.0, &repo_for_state);
             let json = serde_json::to_string(&info).unwrap_or_default();
             // The tab appears as soon as the workspace exists, so a slow
             // `agent.start` happens in front of the user rather than behind a
@@ -1107,6 +1323,10 @@ impl qobject::AppController {
                 .await
             {
                 Ok(_) => {
+                    // The workspace is gone: its group entry, editors and port
+                    // overrides go with it rather than waiting for the next
+                    // start to prune them.
+                    note_state(|s| s.forget_workspace(&id));
                     let _ = qt.queue(move |q| q.workspace_destroyed(QString::from(&id)));
                 }
                 Err(e) => report_failure(&qt, "workspace.destroy", e.to_string()),
@@ -1371,5 +1591,109 @@ impl qobject::AppController {
         let version = self.daemon_version().to_string();
         let text = compose_status(state.label(), &version);
         self.as_mut().set_status_message(QString::from(&text));
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistence (`state.json`). Thin adapters over the process-wide store;
+    // the rules live in `model/persistence.rs`.
+    // -----------------------------------------------------------------------
+
+    pub fn load_state(mut self: Pin<&mut Self>) -> QString {
+        let json = state_store().to_json();
+        tracing::info!(
+            path = ?state_store().path(),
+            "state loaded"
+        );
+        self.as_mut().state_loaded(QString::from(&json));
+        QString::from(&json)
+    }
+
+    pub fn flush_state(&self) {
+        if state_store().flush() {
+            tracing::info!("state written before exit");
+        }
+    }
+
+    pub fn note_groups(&self, json: QString) {
+        let json = json.to_string();
+        match serde_json::from_str::<persistence::PersistedGroups>(&json) {
+            Ok(reported) => {
+                note_state(|s| s.set_groups(reported.groups, reported.active_workspace))
+            }
+            // Refused rather than applied as an empty arrangement: that would
+            // record every group as deleted over a bug in the caller.
+            Err(e) => tracing::warn!("noteGroups: unparseable arrangement ({e})"),
+        }
+    }
+
+    pub fn note_editors(&self, workspace_id: QString, json: QString) {
+        let workspace = workspace_id.to_string();
+        let Some((open, active)) = parse_editors(&json.to_string()) else {
+            tracing::warn!("noteEditors: unparseable editor list for {workspace}");
+            return;
+        };
+        note_state(|s| {
+            if open.is_empty() {
+                s.open_editors.remove(&workspace);
+            } else {
+                s.open_editors.insert(workspace.clone(), open);
+            }
+            match active {
+                Some(active) => {
+                    s.active_editor.insert(workspace, active);
+                }
+                None => {
+                    s.active_editor.remove(&workspace);
+                }
+            }
+        });
+    }
+
+    pub fn note_splitter(&self, sizes_json: QString, swapped: bool) {
+        let sizes: Vec<i32> = match serde_json::from_str(&sizes_json.to_string()) {
+            Ok(sizes) => sizes,
+            Err(e) => {
+                tracing::warn!("noteSplitter: unparseable sizes ({e})");
+                return;
+            }
+        };
+        note_state(|s| {
+            s.splitter_sizes = sizes;
+            s.swapped = swapped;
+        });
+    }
+
+    pub fn note_window(&self, state_b64: QString, geometry_b64: QString) {
+        let (window, geometry) = (state_b64.to_string(), geometry_b64.to_string());
+        note_state(|s| {
+            s.window_state_b64 = window;
+            s.geometry_b64 = geometry;
+        });
+    }
+
+    pub fn recent_repos(&self) -> QString {
+        let json = state_store().with(|s| serde_json::to_string(&s.recent_repos));
+        QString::from(&json.unwrap_or_else(|_| "[]".into()))
+    }
+
+    pub fn note_recent_repo(&self, path: QString) {
+        let path = path.to_string();
+        note_state(|s| s.note_recent(&path));
+    }
+
+    pub fn port_override(&self, workspace_id: QString, config: QString) -> i32 {
+        let (workspace, config) = (workspace_id.to_string(), config.to_string());
+        state_store()
+            .with(|s| s.port_override(&workspace, &config))
+            .map(i32::from)
+            .unwrap_or(0)
+    }
+
+    pub fn set_port_override(&self, workspace_id: QString, config: QString, port: i32) {
+        let (workspace, config) = (workspace_id.to_string(), config.to_string());
+        // A spin box at its minimum means "no override", and so does anything
+        // that is not a port number at all.
+        let port = u16::try_from(port).ok().filter(|p| *p != 0);
+        note_state(|s| s.set_port_override(&workspace, &config, port));
     }
 }

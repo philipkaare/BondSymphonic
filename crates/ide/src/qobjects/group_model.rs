@@ -8,6 +8,7 @@
 //! the label, the tooltip, the status word and the counts directly.
 
 use crate::model::app_state::{parse_agent_state, AgentTab, TabStatus, Workspaces};
+use crate::model::persistence::PersistedGroups;
 use bondsymphonic_proto::{AgentAdapterKind, AgentId, WorkspaceId, WorkspaceInfo, WorkspaceState};
 
 #[cxx_qt::bridge]
@@ -37,6 +38,23 @@ pub mod qobject {
         /// `setStateJson`, which only overwrites the cached string.
         #[qinvokable]
         fn load_state(self: Pin<&mut GroupModel>, json: QString) -> bool;
+
+        /// Installs the model the controller rebuilt from `state.json` and the
+        /// daemon's first workspace list (`AppController::workspacesRestored`),
+        /// before any `reconcile`.
+        ///
+        /// Distinct from `loadState`, which is the session-file path and falls
+        /// back to the default single-group model. A restore that will not
+        /// parse must leave what is on screen alone instead: the alternative is
+        /// throwing away the user's groups because one string was malformed.
+        #[qinvokable]
+        fn load_workspaces(self: Pin<&mut GroupModel>, json: QString) -> bool;
+
+        /// The arrangement to persist: an object with `groups` (each a name
+        /// and its workspace ids, in order) and `active_workspace`. What the
+        /// window hands to `AppController::noteGroups` on every `changed`.
+        #[qinvokable]
+        fn groups_json(self: &GroupModel) -> QString;
 
         /// Appends an empty group and returns its index.
         #[qinvokable]
@@ -252,6 +270,25 @@ impl qobject::GroupModel {
         self.as_mut().rust_mut().workspaces = parsed.unwrap_or_else(Workspaces::new_default);
         self.publish();
         ok
+    }
+
+    pub fn load_workspaces(mut self: Pin<&mut Self>, json: QString) -> bool {
+        let Some(restored) = Workspaces::from_json(&json.to_string()) else {
+            tracing::warn!("load_workspaces: unparseable restored model; keeping the current one");
+            return false;
+        };
+        self.as_mut().rust_mut().workspaces = restored;
+        self.publish();
+        true
+    }
+
+    pub fn groups_json(&self) -> QString {
+        let workspaces = &self.rust().workspaces;
+        let reported = PersistedGroups {
+            groups: workspaces.persisted_groups(),
+            active_workspace: workspaces.active().map(|tab| tab.workspace_id.0.clone()),
+        };
+        QString::from(&serde_json::to_string(&reported).unwrap_or_default())
     }
 
     pub fn add_group(mut self: Pin<&mut Self>, name: QString) -> i32 {

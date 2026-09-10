@@ -209,11 +209,21 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
         .expect("tokio runtime");
     let (addr, journal, replies, allowlists) = rt.block_on(fake_daemon());
 
+    // The IDE persists its settings and its layout on exit. Both are pointed
+    // at a directory of this run's own: a test must never write the developer's
+    // real `%APPDATA%\BondSymphonic` files, and a smoke run that inherited
+    // their groups would not be reproducible either.
+    let config = std::env::temp_dir().join(format!("bs-smoke-config-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&config);
+    std::fs::create_dir_all(&config).expect("smoke config dir");
+
     let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
         .env("QT_QPA_PLATFORM", "offscreen")
         .env("BS_DAEMON_ADDR", addr.to_string())
         .env("BS_DAEMON_TOKEN", TOKEN)
         .env("BS_SMOKE_SCRIPT", SCRIPT)
+        .env("BS_SETTINGS_PATH", config.join("settings.json"))
+        .env("BS_STATE_PATH", config.join("state.json"))
         .env("BS_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
