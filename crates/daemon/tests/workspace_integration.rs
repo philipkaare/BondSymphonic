@@ -647,6 +647,15 @@ async fn a_run_entry_without_a_port_is_reported_and_the_others_still_load() {
 /// commits behind in `objects/<ws>/` looks like a success and breaks the user's
 /// own `git log main` the moment the workspace is destroyed, and a destroy that
 /// leaves a home or a cache behind grows the data directory forever.
+///
+/// The commit is made by a host `git` carrying the environment the sandbox
+/// gives git, not by a `git` running *inside* a sandbox. What it has to prove is
+/// where the objects land, and that is decided by `GIT_OBJECT_DIRECTORY` and
+/// `GIT_ALTERNATE_OBJECT_DIRECTORIES` alone; running it this way is what lets
+/// the chain be walked on Windows and under the noop backend as well as under
+/// bwrap. The sandbox's own git is exercised by
+/// `sandbox_integration::bwrap_workspace_protects_main_branch_and_shared_objects`,
+/// which is where the ref and object protections belong.
 #[tokio::test]
 async fn the_full_workspace_chain_from_create_to_a_destroy_that_leaves_nothing() {
     use bondsymphonic_daemon::agents::persist::{AgentRecord, AgentRecords};
@@ -759,10 +768,13 @@ async fn the_full_workspace_chain_from_create_to_a_destroy_that_leaves_nothing()
     assert_eq!(plain(&["show", "main:feature.txt"]), "from the sandbox");
     assert!(plain(&["rev-list", "--objects", "main"]).contains(&tip));
 
-    // Destroy, and nothing of this workspace is left anywhere.
+    // Destroy, and nothing of this workspace is left anywhere. Without `force`,
+    // which is the path a user actually takes: the work is merged and the
+    // worktree is clean, so the uncommitted-or-unmerged guard has to let this
+    // through rather than having to be overridden.
     c.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
         workspace_id: ws.id.clone(),
-        force: true,
+        force: false,
     }))
     .await
     .unwrap();

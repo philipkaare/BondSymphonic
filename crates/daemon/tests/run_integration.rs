@@ -246,7 +246,7 @@ async fn a_web_run_becomes_ready_streams_its_output_and_stops() {
     let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
     let mut c = Client::connect(p, &token).await;
     let ws = create_ws(&mut c, &repo, "runs").await;
-    let _guard = PortGuard::new(port);
+    let mut guard = PortGuard::new(port);
 
     let started = start_run(&mut c, &ws.id, "web").await.unwrap();
     assert_eq!(started.host_port, port, "the noop backend does not bridge");
@@ -325,6 +325,8 @@ async fn a_web_run_becomes_ready_streams_its_output_and_stops() {
         "a stopped run is not a failed one: {:?}",
         states(&evs)
     );
+    // The run is over, so the port is nobody's business from here on.
+    guard.disarm();
     assert!(
         http_get(port).await.is_none(),
         "the web app must be gone once the run stopped"
@@ -694,7 +696,7 @@ async fn a_blank_output_line_does_not_end_the_stream_or_strand_a_ready_regex() {
     let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
     let mut c = Client::connect(p, &token).await;
     let ws = create_ws(&mut c, &repo, "banner").await;
-    let _guard = PortGuard::new(port);
+    let mut guard = PortGuard::new(port);
 
     let started = start_run(&mut c, &ws.id, "banner").await.unwrap();
     let evs = run_events(&mut c, &started.run_id, READY, |e| {
@@ -721,6 +723,14 @@ async fn a_blank_output_line_does_not_end_the_stream_or_strand_a_ready_regex() {
     }))
     .await
     .unwrap();
+    // Waited for rather than assumed: the guard must stop watching the port at
+    // the run's terminal event, and there is no such event until it arrives.
+    let evs = run_events(&mut c, &started.run_id, SETTLED, |e| {
+        has_state(e, RunState::Stopped)
+    })
+    .await;
+    assert!(has_state(&evs, RunState::Stopped), "{:?}", states(&evs));
+    guard.disarm();
     cancel.cancel();
 }
 
@@ -766,7 +776,7 @@ async fn destroy_stops_a_ready_run_before_it_replies() {
     let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
     let mut c = Client::connect(p, &token).await;
     let ws = create_ws(&mut c, &repo, "destroyed").await;
-    let _guard = PortGuard::new(port);
+    let mut guard = PortGuard::new(port);
 
     let started = start_run(&mut c, &ws.id, "web").await.unwrap();
     run_events(&mut c, &started.run_id, READY, |e| {
@@ -797,6 +807,7 @@ async fn destroy_stops_a_ready_run_before_it_replies() {
         "destroy must stop the run before it answers: {:?}",
         during.iter().map(|(_, e)| e).collect::<Vec<_>>()
     );
+    guard.disarm();
     assert!(
         http_get(port).await.is_none(),
         "the web app must be gone with the workspace"

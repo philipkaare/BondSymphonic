@@ -83,7 +83,6 @@ impl Layout {
         Git::new()
             .with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", s(&self.objects_dir))
             .with_config("core.hooksPath", &s(&self.no_hooks_dir))
-            .with_config(QUOTE_PATH.0, QUOTE_PATH.1)
     }
 
     /// [`Layout::daemon_git`] with the repository's own hooks left in place, for
@@ -94,9 +93,7 @@ impl Layout {
     /// remote with nothing behind them. A push is also the one daemon-side git
     /// operation the user explicitly asked for by name, through **Create PR**.
     pub fn daemon_push_git(&self) -> Git {
-        Git::new()
-            .with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", s(&self.objects_dir))
-            .with_config(QUOTE_PATH.0, QUOTE_PATH.1)
+        Git::new().with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", s(&self.objects_dir))
     }
 
     /// Git for daemon-side commands that run *against a workspace worktree*.
@@ -117,30 +114,13 @@ impl Layout {
             // Not in the list below: an empty `core.hooksPath` does not disable
             // hooks, it moves them to the filesystem root, so this one needs a
             // real directory that is always empty.
-            .with_config("core.hooksPath", &s(&self.no_hooks_dir))
-            .with_config(QUOTE_PATH.0, QUOTE_PATH.1);
+            .with_config("core.hooksPath", &s(&self.no_hooks_dir));
         for key in NEUTRALISED_CONFIG {
             git = git.with_config(key, "");
         }
         git
     }
 }
-
-/// `core.quotePath=false`, applied to every `Git` this module builds.
-///
-/// Git's default is to print any path byte above 0x7f as a C-style octal escape
-/// and wrap the whole name in double quotes, so `håndbog.md` reaches the client
-/// as `"hÃ¥ndbog.md"`. Every path-listing command obeys it —
-/// `diff --name-only` for the conflict list, `diff --name-status`,
-/// `status --porcelain`, `worktree list` — and the IDE opens what those lists
-/// give it, so a quoted name is a file it cannot find and a name the user does
-/// not recognise. Set on the `Git` rather than at each call site so a command
-/// added later cannot be forgotten; it changes nothing for a pure-ASCII tree.
-///
-/// It is *not* the same thing as the `-z` some of those calls already pass: `-z`
-/// suppresses quoting where git supports it, and several of these commands have
-/// no `-z` at all. Both are kept.
-const QUOTE_PATH: (&str, &str) = ("core.quotePath", "false");
 
 /// Config keys whose value git executes as a command, cleared on the command
 /// line for every daemon-side worktree command.

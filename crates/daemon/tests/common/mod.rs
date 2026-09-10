@@ -275,18 +275,24 @@ pub fn commit_all(worktree: &Path, env: &[(String, String)], message: &str) {
 /// that back into an ordinary failure and leaves nothing behind for the next
 /// test to trip over.
 ///
-/// It kills **by process id**, and only ids it watched appear on the port while
-/// it was running. Killing "whatever is listening on the port" at teardown is a
-/// different and much worse thing: a test port is an ephemeral number the
-/// operating system hands out, the run under test may already have exited, and
-/// on a developer's own machine the process that has the number by then can be
-/// anything at all. Two rules keep this honest:
+/// It kills **by process id**, and only ids it can argue belong to the run under
+/// test. Killing "whatever is listening on the port" at teardown is a different
+/// and much worse thing: a test port is an ephemeral number the operating system
+/// hands out, and once the run has exited that number can belong to anything on
+/// the developer's machine. Four rules keep this honest:
 ///
 /// * Whatever already held the port when the guard was made is somebody else's
 ///   and is never killed.
-/// * The port is watched for the life of the guard rather than sampled once,
-///   because a run is `ready` before it binds when its readiness comes from a
-///   `ready_regex`, and because a run can rebind.
+/// * The port is watched rather than sampled once, because a run with a
+///   `ready_regex` is `ready` before it binds, and because a run can rebind.
+/// * Watching **stops** at [`PortGuard::disarm`], which each test calls as soon
+///   as it has seen the run's terminal event. After that point the run is gone
+///   and any new owner of the port is a stranger, so the window in which one
+///   could be recorded is closed rather than left open to the end of the test.
+/// * A recorded id is checked against the process table before it is killed:
+///   only the images a run is started through ([`KILLABLE_IMAGES`]) are killed,
+///   so even a pid that was reused between the recording and the drop cannot
+///   take an unrelated program with it.
 ///
 /// Windows only. On Unix the no-sandbox backend puts every child in a process
 /// group of its own, the daemon's own teardown reaches all of it, and a runtime
@@ -297,6 +303,14 @@ pub struct PortGuard {
     seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     watcher: Option<std::thread::JoinHandle<()>>,
 }
+
+/// The executable names a run of this suite is served by, lowercased.
+///
+/// The daemon starts a run through `cmd /C <command>` on Windows, and every
+/// command these tests configure is a Python interpreter. A pid whose image is
+/// not one of these is not this suite's, whatever the port said: pids are
+/// reused, and a wrong guess here kills a program the user was running.
+const KILLABLE_IMAGES: [&str; 4] = ["python.exe", "python3.exe", "py.exe", "cmd.exe"];
 
 impl PortGuard {
     pub fn new(port: u16) -> Self {
@@ -324,7 +338,7 @@ impl PortGuard {
                         g.push(pid);
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::thread::sleep(std::time::Duration::from_millis(250));
             }
         });
         Self {
@@ -333,19 +347,36 @@ impl PortGuard {
             watcher: Some(watcher),
         }
     }
-}
 
-impl Drop for PortGuard {
-    fn drop(&mut self) {
+    /// Stops watching the port, keeping whatever has been recorded so far.
+    ///
+    /// Called by a test the moment the run reaches a terminal state: from then
+    /// on the port belongs to whoever the operating system next hands it to, and
+    /// that is never this test's business. Idempotent, and the drop calls it
+    /// again for a test that ended before reaching this point.
+    pub fn disarm(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(h) = self.watcher.take() {
             let _ = h.join();
         }
+    }
+}
+
+impl Drop for PortGuard {
+    fn drop(&mut self) {
+        self.disarm();
         for pid in self.seen.lock().unwrap().iter() {
+            let Some(image) = image_of(pid) else {
+                // Already gone, which is the ordinary case: the test stopped its
+                // own run and this guard has nothing left to do.
+                continue;
+            };
+            if !KILLABLE_IMAGES.contains(&image.as_str()) {
+                eprintln!("PortGuard: leaving pid {pid} ({image}) alone; not a run of this suite");
+                continue;
+            }
             // `/T` for the tree: `cmd /C python …` is a child of the shell the
-            // daemon started it through. A pid that has already exited is not an
-            // error worth reporting — the ordinary case is a test that stopped
-            // its own run.
+            // daemon started it through.
             let _ = std::process::Command::new("taskkill")
                 .args(["/T", "/F", "/PID", pid])
                 .stdout(std::process::Stdio::null())
@@ -353,6 +384,30 @@ impl Drop for PortGuard {
                 .status();
         }
     }
+}
+
+/// The executable name behind a pid, lowercased, or `None` when the process is
+/// gone or the query failed. Answering `None` is what makes a failure here a
+/// reason *not* to kill.
+fn image_of(pid: &str) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let out = std::process::Command::new("tasklist")
+        .args(["/NH", "/FO", "CSV", "/FI", &format!("PID eq {pid}")])
+        .output()
+        .ok()?;
+    // A filter that matches nothing prints an informational line on stdout
+    // rather than failing, and it is not CSV, so the quote is what tells the two
+    // apart: `"python.exe","1234",…`.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| l.starts_with('"'))?;
+    Some(
+        line.trim_start_matches('"')
+            .split('"')
+            .next()?
+            .to_lowercase(),
+    )
 }
 
 /// The process ids listening on `port` right now, as strings, because that is

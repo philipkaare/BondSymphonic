@@ -13,13 +13,39 @@ use tokio::process::Command;
 
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Git {
     env: Vec<(String, String)>,
     /// `key=value` pairs passed as `-c key=value` before the subcommand on
     /// every invocation. Command-line config outranks every config *file*,
     /// which is what makes it usable against a config an agent can write.
     config: Vec<String>,
+}
+
+/// `core.quotePath=false` on every `Git` the daemon builds.
+///
+/// Git's default is to render each path byte above 0x7f as a C-style octal
+/// escape and wrap the name in double quotes, so `håndbog.md` reaches a client
+/// as `"h\303\245ndbog.md"` — a file the IDE cannot open and a name the user
+/// does not recognise. Every command that prints a path obeys it:
+/// `diff --name-only` for the conflict list, `diff --name-status`,
+/// `status --porcelain`, `rev-list --objects`, `worktree list`.
+///
+/// It belongs in the *default* rather than in the three `Layout` constructors,
+/// because "set it where it cannot be forgotten" only holds if a bare
+/// `Git::new()` has it too: `Daemon::git` is one, and it already reaches
+/// `status --porcelain` through `repo::inspect` and `rev-list --objects`
+/// through `verify_absorbed`. A `Git` with no path-printing call is unaffected —
+/// the option costs one argument and changes nothing for an ASCII tree.
+const QUOTE_PATH: (&str, &str) = ("core.quotePath", "false");
+
+impl Default for Git {
+    fn default() -> Self {
+        Self {
+            env: Vec::new(),
+            config: vec![format!("{}={}", QUOTE_PATH.0, QUOTE_PATH.1)],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

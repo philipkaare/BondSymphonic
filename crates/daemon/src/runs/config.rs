@@ -179,9 +179,13 @@ fn validate(entries: &[RunEntry]) -> (Vec<RunConfig>, Vec<String>) {
     let mut warnings = Vec::new();
     for (i, e) in entries.iter().enumerate() {
         let name = e.name.trim();
+        // The name is quoted rather than debug-formatted: this line is read by a
+        // person in a tooltip, and `{n:?}` would escape the quotes and
+        // backslashes of a name that has any, showing them something they did
+        // not write.
         let which = match name {
             "" => format!("[[run]] #{}", i + 1),
-            n => format!("[[run]] #{} ({n:?})", i + 1),
+            n => format!("[[run]] #{} ('{n}')", i + 1),
         };
         let problem = if name.is_empty() {
             Some("has no name")

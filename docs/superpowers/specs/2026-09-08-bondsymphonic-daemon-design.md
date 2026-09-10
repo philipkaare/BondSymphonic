@@ -97,6 +97,14 @@ Data directory default: `~/.bondsymphonic/` containing `workspaces.json`,
 `worktrees/<ws_id>/`, `homes/<ws_id>/`, `caches/<ws_id>/`, `transcripts/<agent_id>.ndjson`,
 `daemon.log`.
 
+A daemon killed part-way through writing one of the state files leaves its
+temporary — `.workspaces.json.<pid>.<n>.tmp` (4) — behind. These are
+**deliberately not swept**: nothing reads them, a name is never reused in a way
+that matters because the writer truncates, and one file per crash-mid-write is
+rare enough that a directory walk on every start would cost more than it saves.
+Anything matching `.<name>.*.tmp` in the data directory is a leftover and can be
+deleted by hand at any time.
+
 ## 4. Workspaces
 
 A workspace is the unit of isolation: one worktree, one branch, one sandbox, any
@@ -273,8 +281,9 @@ A `--no-git-protect` daemon flag mounts `.git` read-write for troubleshooting;
   Git's default is to render each path byte above 0x7f as a C-style octal escape
   and wrap the name in double quotes, so `håndbog.md` would reach the IDE as
   `"h\303\245ndbog.md"` — a file the IDE cannot open and a name the user does not
-  recognise. It is set on the `Git` itself rather than per call, so a command
-  added later cannot be forgotten, and it applies to the conflict list of 5.4
+  recognise. It is in the *default* `Git` rather than at any call site or
+  constructor, so a command added later cannot be forgotten and a bare
+  `Git::new()` carries it too. It applies to the conflict list of 5.4
   (`git diff --name-only --diff-filter=U`) as much as to the lists here.
 
 ### 5.4 Merge, rebase, squash
@@ -862,8 +871,12 @@ shell command.
 - Unit: allowlist matching; run config parsing and detection on fixture trees;
   stream-json parsing on recorded fixtures; registry load/save; path containment.
 - Integration (`tests/`, Linux only, `#[cfg(target_os = "linux")]`):
-  - `workspace_integration`: temp repo → create → commit inside worktree via
-    sandboxed `git` → `changes` lists it → `merge` succeeds and base contains it →
+  - `workspace_integration`: temp repo → create → commit into the worktree with
+    the environment the sandbox gives git (`GIT_OBJECT_DIRECTORY` and
+    `GIT_ALTERNATE_OBJECT_DIRECTORIES`), which is what decides where the objects
+    land and what lets this chain run under the noop backend and on Windows too;
+    the sandbox's *own* git is exercised by `sandbox_integration` below →
+    `changes` lists it → `merge` succeeds and base contains it →
     the objects were **absorbed** (5.2), so the base branch reads through a git
     carrying no `GIT_ALTERNATE_OBJECT_DIRECTORIES` → destroy cleans everything:
     worktree, private objects, home, cache, run directory, agent records and
