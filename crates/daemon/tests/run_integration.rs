@@ -638,6 +638,11 @@ command = \"{py} envprint.py\"
 port = {configured}
 cwd = \"sub\"
 env = {{ BS_TEST = \"seven\" }}
+
+[[run]]
+name = \"held\"
+command = \"{py} hold.py\"
+port = {configured}
 "
         ),
     );
@@ -676,6 +681,23 @@ env = {{ BS_TEST = \"seven\" }}
         .await
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidParams, "{e:?}");
+
+    // Still one run per configuration, and the override does not buy a second
+    // one: the claim is keyed by the configuration's name, so a start on a
+    // different port is the same run asking twice. `held` sleeps rather than
+    // exiting, so the claim is genuinely held while the second start is made.
+    let held = start_run_on(&mut c, &ws.id, "held", Some(free_port()))
+        .await
+        .unwrap();
+    let e = start_run_on(&mut c, &ws.id, "held", Some(free_port()))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict, "{e:?}");
+    c.call(Request::RunStop(RunIdParams {
+        run_id: held.run_id.clone(),
+    }))
+    .await
+    .unwrap();
 
     cancel.cancel();
 }
