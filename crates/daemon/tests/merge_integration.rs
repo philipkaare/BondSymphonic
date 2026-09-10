@@ -346,6 +346,29 @@ async fn merge_refuses_while_the_base_repo_has_uncommitted_work() {
         "hello\nlocal edit\n"
     );
 
+    // The same uncommitted edit, carried onto another branch. Now the merge
+    // goes to a scratch worktree that cannot see this checkout at all, so the
+    // guard does not apply: refusing here would refuse the ordinary state of a
+    // working developer.
+    git_ok(&repo, &["checkout", "-q", "-b", "elsewhere"]);
+    assert_ne!(git_out(&repo, &["status", "--porcelain"]), "");
+
+    let res = merge(&mut c, &ws.id, MergeMode::Merge, None).await.unwrap();
+    assert!(res.ok, "{res:?}");
+    assert_eq!(
+        git_out(&repo, &["log", "-1", "--format=%s", "main"]),
+        "Merge bs/alpha/work"
+    );
+    // Their edit was never touched, and they are still where they were.
+    assert_eq!(
+        git_out(&repo, &["symbolic-ref", "--short", "HEAD"]),
+        "elsewhere"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("README.md")).unwrap(),
+        "hello\nlocal edit\n"
+    );
+
     cancel.cancel();
 }
 
@@ -544,6 +567,138 @@ async fn a_conflicting_squash_aborts_and_leaves_the_base_clean() {
             .unwrap()
             .replace("\r\n", "\n"),
         "hello\nalpha\n"
+    );
+
+    cancel.cancel();
+}
+
+/// The merge landed but its objects could not be copied out of the workspace.
+///
+/// This must never be reported as success. The base branch points at commits
+/// that live in the workspace's private object directory, so a client that
+/// believed the merge and went on to destroy the workspace would be left with a
+/// `main` that no longer resolves.
+///
+/// `pack.threads` is set to something that is not a number, which makes
+/// `git pack-objects` refuse. `git merge` does not read that key, so the merge
+/// itself still succeeds and the failure lands exactly where it is wanted.
+#[tokio::test]
+async fn a_merge_whose_objects_cannot_be_copied_out_is_an_error_not_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "alpha").await;
+    commit_in_ws(&daemon, &ws, &[("alpha.txt", "a\n")], "alpha work").await;
+
+    let before = git_out(&repo, &["rev-parse", "main"]);
+    git_ok(&repo, &["config", "pack.threads", "not-a-number"]);
+
+    let err = c
+        .call(Request::WorkspaceMerge(WorkspaceMergeParams {
+            workspace_id: ws.id.clone(),
+            mode: MergeMode::Merge,
+            message: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Internal, "{err:?}");
+    // The flag says the work landed even though the call failed, so the IDE can
+    // say so rather than inviting a retry.
+    assert_eq!(
+        err.data.as_ref().and_then(|d| d["merged"].as_bool()),
+        Some(true),
+        "{err:?}"
+    );
+    assert!(
+        err.message.contains("Do not destroy this workspace"),
+        "{err:?}"
+    );
+
+    // The merge really did happen; only the copy failed.
+    assert_ne!(git_out(&repo, &["rev-parse", "main"]), before);
+
+    cancel.cancel();
+}
+
+/// A scratch worktree from a daemon that was killed mid-merge keeps the base
+/// branch checked out, and `git worktree prune` cannot clear it because the
+/// directory is still there. Left alone it would fail every later merge that
+/// needs a scratch worktree, forever.
+#[tokio::test]
+async fn a_scratch_worktree_left_by_an_earlier_run_does_not_block_a_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let data = dir.path().join("data");
+    let (port, token, daemon, cancel) = start_daemon(&data).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "alpha").await;
+    commit_in_ws(&daemon, &ws, &[("alpha.txt", "a\n")], "alpha work").await;
+
+    // The user is elsewhere, so this merge needs a scratch worktree of its own.
+    git_ok(&repo, &["checkout", "-q", "-b", "elsewhere"]);
+    // And an earlier one is still sitting on the base branch.
+    let stale = data.join("merge-ws_killed");
+    git_ok(
+        &repo,
+        &["worktree", "add", &stale.to_string_lossy(), "main"],
+    );
+    assert!(stale.is_dir());
+
+    let res = merge(&mut c, &ws.id, MergeMode::Merge, None).await.unwrap();
+    assert!(res.ok, "{res:?}");
+
+    assert!(!stale.exists(), "the stale worktree was not reaped");
+    let worktrees = git_out(&repo, &["worktree", "list", "--porcelain"]);
+    assert!(
+        !worktrees.contains("merge-"),
+        "a merge worktree is still registered: {worktrees}"
+    );
+    assert_eq!(
+        git_out(&repo, &["log", "-1", "--format=%s", "main"]),
+        "Merge bs/alpha/work"
+    );
+
+    cancel.cancel();
+}
+
+/// Two workspaces of one repository merged at the same time. Both move the base
+/// branch and both write the shared index and object store, so without the
+/// per-repository lock one of them loses on `index.lock`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_merges_of_one_repository_both_succeed() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let alpha = create_ws(&mut c, &repo, "alpha").await;
+    let beta = create_ws(&mut c, &repo, "beta").await;
+    // Different files, so anything that goes wrong is a race and not a conflict.
+    commit_in_ws(&daemon, &alpha, &[("alpha.txt", "a\n")], "alpha work").await;
+    commit_in_ws(&daemon, &beta, &[("beta.txt", "b\n")], "beta work").await;
+
+    // A connection each: the two requests have to be in flight together.
+    let mut c1 = Client::connect(port, &token).await;
+    let mut c2 = Client::connect(port, &token).await;
+    let (ra, rb) = tokio::join!(
+        merge(&mut c1, &alpha.id, MergeMode::Merge, None),
+        merge(&mut c2, &beta.id, MergeMode::Merge, None),
+    );
+    let ra = ra.expect("alpha merged");
+    let rb = rb.expect("beta merged");
+    assert!(ra.ok, "{ra:?}");
+    assert!(rb.ok, "{rb:?}");
+
+    // Both landed, in whichever order the lock granted.
+    assert!(repo.join("alpha.txt").is_file());
+    assert!(repo.join("beta.txt").is_file());
+    assert_eq!(
+        git_out(&repo, &["rev-list", "main..refs/heads/bs/alpha/work"]),
+        ""
+    );
+    assert_eq!(
+        git_out(&repo, &["rev-list", "main..refs/heads/bs/beta/work"]),
+        ""
     );
 
     cancel.cancel();

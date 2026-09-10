@@ -4,8 +4,10 @@ pub mod repo;
 pub mod worktree;
 
 use bondsymphonic_proto::{ErrorCode, RpcError};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -244,49 +246,138 @@ impl Git {
 /// asked for, which also makes it proportional to the merge rather than to the
 /// repository.
 ///
-/// Best effort, and loud when it fails: the merge or push it follows has
-/// already happened, so this cannot turn into a failed request. A warning says
-/// the refs still borrow.
+/// The pack is not trusted on the strength of an exit code. Whether the objects
+/// really are readable without the alternate is a question with a direct
+/// answer, and the consequence of getting it wrong — a `main` that stops
+/// resolving the next time a workspace is destroyed — is bad enough to be worth
+/// asking. One retry, then the error goes back to the caller.
 pub async fn absorb_objects(
     git: &Git,
     repo: &Path,
     git_common: &Path,
     include: &str,
     exclude: &str,
-) {
+) -> Result<(), RpcError> {
     if include == exclude {
-        return;
+        return Ok(());
     }
     // Written straight into `objects/pack`, named the way git names its own
     // packs: `pack-objects` builds each file under a temporary name and renames
     // it into place, which is exactly how `git repack` puts packs here.
     let pack_dir = git_common.join("objects").join("pack");
-    if let Err(e) = std::fs::create_dir_all(&pack_dir) {
-        tracing::warn!(dir = %pack_dir.display(), "cannot create the pack directory: {e}");
-        return;
-    }
+    std::fs::create_dir_all(&pack_dir).map_err(|e| {
+        RpcError::new(
+            ErrorCode::IoError,
+            format!("cannot create {}: {e}", pack_dir.display()),
+        )
+    })?;
     let prefix = pack_dir.join("pack").to_string_lossy().into_owned();
     let revs = format!("{include}\n^{exclude}\n");
-    if let Err(e) = git
-        .run_with_stdin(
-            repo,
-            &[
-                "pack-objects",
-                "--revs",
-                "--delta-base-offset",
-                "-q",
-                &prefix,
-            ],
-            &revs,
-        )
-        .await
-    {
-        tracing::warn!(
-            repo = %repo.display(),
-            "packing {include} failed; this repository still borrows objects from a workspace and will lose them when it is destroyed: {}",
-            e.message
-        );
+    let mut last: Option<RpcError> = None;
+    for attempt in 1..=2 {
+        if let Err(e) = git
+            .run_with_stdin(
+                repo,
+                &[
+                    "pack-objects",
+                    "--revs",
+                    "--delta-base-offset",
+                    "-q",
+                    &prefix,
+                ],
+                &revs,
+            )
+            .await
+        {
+            tracing::warn!(repo = %repo.display(), attempt, "packing {include} failed: {}", e.message);
+            last = Some(e);
+            continue;
+        }
+        match verify_absorbed(repo, include, exclude).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo.display(),
+                    attempt,
+                    "the pack for {include} is not readable without the workspace's objects: {}",
+                    e.message
+                );
+                last = Some(e);
+            }
+        }
     }
+    Err(last.unwrap_or_else(|| RpcError::internal("packing produced no result")))
+}
+
+/// Reads `include ^exclude` the way the *user's* git would: no alternate object
+/// directory anywhere in the environment.
+///
+/// The daemon never sets `GIT_ALTERNATE_OBJECT_DIRECTORIES` process-wide — it
+/// is added per command by [`worktree::Layout::daemon_git`] — so a plain [`Git`]
+/// inherits none of it, and this fails exactly where the user's own git would.
+///
+/// `rev-list --objects` reads every commit and every tree in the range, which
+/// is what proves the pack landed and was indexed. It lists blob ids without
+/// opening them, but blobs travel in the same pack as the trees that name them,
+/// so a pack whose trees are readable is a pack whose blobs are there too.
+async fn verify_absorbed(repo: &Path, include: &str, exclude: &str) -> Result<(), RpcError> {
+    let plain = Git::new();
+    plain
+        .run(repo, &["cat-file", "-e", &format!("{include}^{{commit}}")])
+        .await?;
+    plain
+        .run(
+            repo,
+            &["rev-list", "--objects", include, &format!("^{exclude}")],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Serialises the operations that move a repository's *base* branch.
+///
+/// A merge advances the base branch, and both the merge and the `pack-objects`
+/// that follows it write to the one shared object store and index. Two merges
+/// of two workspaces of the same repository race for both: the second loses on
+/// `index.lock`, or — on the scratch-worktree path — finds the base branch
+/// already checked out by the first one's worktree. Nothing else serialises
+/// them, because each request is its own task.
+///
+/// Keyed by the repository, so merges in unrelated repositories still run at
+/// the same time. Held for the whole of a merge and for the push half of
+/// `create_pr`.
+fn repo_locks() -> &'static parking_lot::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>> {
+    static LOCKS: OnceLock<parking_lot::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    LOCKS.get_or_init(Default::default)
+}
+
+/// The lock for one repository. Canonicalised where the filesystem allows it,
+/// so two workspaces created with differently spelled paths to the same
+/// repository still take the same lock.
+pub fn repo_lock(repo: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let key = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    repo_locks().lock().entry(key).or_default().clone()
+}
+
+/// The merge or push happened, but the commits it brought in are still only in
+/// the workspace's private object directory.
+///
+/// This is the one outcome that must never be reported as success. The branch
+/// now points at objects the user's own git cannot read and that
+/// `workspace.destroy` would delete for good, and a `tracing::warn!` is not a
+/// channel any user reads. `flag` is `"merged"` or `"pushed"`, so the IDE can
+/// say that the work landed even though the call failed.
+pub fn objects_stranded(what: &str, flag: &str, detail: &str) -> RpcError {
+    RpcError::new(
+        ErrorCode::Internal,
+        format!(
+            "the {what} completed, but the commits it brought in could not be copied out of the \
+             workspace's private object store into the repository: {detail}. Do not destroy this \
+             workspace: destroying it would delete objects the branch now points at."
+        ),
+    )
+    .with_data(serde_json::json!({ flag: true }))
 }
 
 pub fn git_error(command: &str, exit_code: Option<i32>, stderr: &str) -> RpcError {

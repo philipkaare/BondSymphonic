@@ -248,3 +248,38 @@ async fn the_remote_tracking_ref_still_reads_after_the_workspace_is_destroyed() 
 
     cancel.cancel();
 }
+
+/// The same gate `workspace.merge` applies. A workspace whose sandbox is down
+/// may have a half-formed branch, and publishing it is not something to do on
+/// the user's behalf. Refused before anything is pushed, so `gh` is never
+/// reached either.
+#[tokio::test]
+async fn create_pr_refuses_a_workspace_that_is_not_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, origin) = init_repo_with_origin(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "alpha").await;
+    commit_in_ws(&daemon, &ws, "alpha.txt", "alpha work").await;
+    daemon
+        .set_state(&ws.id, WorkspaceState::SandboxDown)
+        .unwrap();
+
+    let err = c
+        .call(Request::WorkspaceCreatePr(WorkspaceCreatePrParams {
+            workspace_id: ws.id.clone(),
+            title: "T".into(),
+            body: "B".into(),
+            draft: false,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidParams, "{err:?}");
+    assert!(err.message.contains("is not ready"), "{err:?}");
+
+    // Nothing was pushed: the origin never heard of the branch.
+    let refs = git_out(&origin, &["for-each-ref", "--format=%(refname)"]);
+    assert!(!refs.contains("bs/alpha/work"), "{refs}");
+
+    cancel.cancel();
+}

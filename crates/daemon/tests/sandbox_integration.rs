@@ -1176,6 +1176,7 @@ async fn two_bwrap_runs_on_one_port_get_a_socket_and_a_bridge_each() {
                     bondsymphonic_proto::RunStartParams {
                         workspace_id: ws.id.clone(),
                         config_name: name.into(),
+                        port: None,
                     },
                 )
                 .await
@@ -1261,6 +1262,73 @@ async fn two_bwrap_runs_on_one_port_get_a_socket_and_a_bridge_each() {
     lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
 }
 
+/// A port given on `run.start` reaches all the way in: the command inside the
+/// sandbox binds it, and the forwarder the daemon starts connects to it.
+///
+/// Nothing here asserts a number. The proof is that the run becomes ready and
+/// answers through the bridge at all: the forwarder is told one port, the
+/// command binds whatever `PORT` carried, and a mismatch leaves the bridge
+/// connecting to a port nothing inside the sandbox is listening on.
+#[tokio::test]
+async fn a_bwrap_run_bridges_the_port_given_on_the_start() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    if !std::path::Path::new("/usr/bin/python3").exists() {
+        eprintln!("SKIP: /usr/bin/python3 is missing");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let configured = free_port();
+    let overridden = free_port();
+    assert_ne!(configured, overridden);
+    std::fs::write(
+        repo.join("bondsymphonic.toml"),
+        format!(
+            "[[run]]\nname = \"web\"\ncommand = \"python3 -m http.server $PORT --bind 127.0.0.1\"\nport = {configured}\n"
+        ),
+    )
+    .unwrap();
+    common::commit_all(&repo, &[], "config");
+
+    let (daemon, ws, _layout) = bwrap_workspace(dir.path(), &repo, "overridden").await;
+    let mut events = daemon.events.subscribe();
+    let started = daemon
+        .runs
+        .start(
+            &daemon,
+            bondsymphonic_proto::RunStartParams {
+                workspace_id: ws.id.clone(),
+                config_name: "web".into(),
+                port: Some(overridden),
+            },
+        )
+        .await
+        .unwrap();
+
+    let seen = wait_for_run_state(
+        &mut events,
+        &started.run_id,
+        bondsymphonic_proto::RunState::Ready,
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(
+        seen.last().map(|(s, _)| *s),
+        Some(bondsymphonic_proto::RunState::Ready),
+        "the forwarder must have been pointed at the overridden port: {seen:?}"
+    );
+    let body = http_get(started.host_port)
+        .await
+        .unwrap_or_else(|| panic!("no answer on the bridged port {}", started.host_port));
+    assert!(body.contains("200"), "{body}");
+
+    daemon.runs.stop(&started.run_id).await.unwrap();
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+}
+
 #[tokio::test]
 async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
     if !bwrap_available() {
@@ -1288,6 +1356,14 @@ async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
 
     // A rejected cwd is refused before any plumbing exists: no host port, no
     // forwarder and no socket may be left behind by the attempt.
+    //
+    // Forwarders are counted rather than matched by name. A forwarder's argv
+    // carries the *sandbox-internal* socket path (`/run/bs/fwd-<run>.sock`), so
+    // nothing in it names this workspace, and `pgrep` searches the whole
+    // machine while the test binaries run in parallel. What can be said exactly
+    // is that a refused start must not add one.
+    let forwarders_before: std::collections::HashSet<i32> =
+        pgrep_pids("forward --socket").into_iter().collect();
     let escape = daemon
         .runs
         .start(
@@ -1295,6 +1371,7 @@ async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
             bondsymphonic_proto::RunStartParams {
                 workspace_id: ws.id.clone(),
                 config_name: "escape".into(),
+                port: None,
             },
         )
         .await
@@ -1314,14 +1391,13 @@ async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
         leftover.is_empty(),
         "a refused start left sockets behind: {leftover:?}"
     );
-    // Scoped to this workspace's run directory, for the reason spelled out
-    // further down: `pgrep` searches the whole machine, and the test binaries
-    // run in parallel, so a bare "forward --socket" also matches a forwarder
-    // another suite legitimately has running right now.
-    let fwd_here = format!("{}/fwd-", daemon.dirs.run(&ws.id).display());
+    let appeared: Vec<i32> = pgrep_pids("forward --socket")
+        .into_iter()
+        .filter(|p| !forwarders_before.contains(p))
+        .collect();
     assert!(
-        !pgrep(&fwd_here),
-        "a refused start left a forwarder running"
+        appeared.is_empty(),
+        "a refused start left a forwarder running: {appeared:?}"
     );
     let started = daemon
         .runs
@@ -1330,6 +1406,7 @@ async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
             bondsymphonic_proto::RunStartParams {
                 workspace_id: ws.id.clone(),
                 config_name: "web".into(),
+                port: None,
             },
         )
         .await

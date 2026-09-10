@@ -54,26 +54,20 @@ pub async fn merge(
     let layout = layout_for(d, &ws).await?;
     let git = layout.daemon_git();
 
-    // The user's own checkout comes first. Merging into a repository with
-    // uncommitted work either loses that work or wedges the checkout half-way
-    // through a merge the user never asked for, and neither is something to
-    // recover from afterwards — so this is a refusal, before anything moves.
-    if !git
-        .run(&ws.repo_path, &["status", "--porcelain"])
-        .await?
-        .stdout
-        .trim()
-        .is_empty()
-    {
-        return Err(RpcError::new(
-            ErrorCode::Conflict,
-            format!(
-                "{} has uncommitted changes; commit or stash them before merging",
-                ws.repo_path.display()
-            ),
-        )
-        .with_data(serde_json::json!({ "reason": "base_dirty" })));
-    }
+    // One merge at a time per repository. Two merges of two workspaces of the
+    // same repository both want to move the base branch and both write the
+    // shared index and object store, and nothing else keeps them apart. Taken
+    // before the reaper below, which is what makes "anything still there is
+    // stale" true.
+    let lock = crate::git::repo_lock(&ws.repo_path);
+    let _guard = lock.lock().await;
+
+    // Scratch worktrees a killed daemon left behind. Each one keeps the base
+    // branch checked out, so `git worktree add <new> <base>` fails with
+    // "already used by worktree" until a human deletes it — permanently, since
+    // `worktree prune` only forgets registrations whose directory is *gone*.
+    // With the lock held no live merge owns one, so every one of them is stale.
+    reap_scratch_worktrees(&git, &ws.repo_path).await;
 
     // Where the base branch gets to move. If the user happens to be sitting on
     // it, that is their checkout and the merge shows up in it. If they are
@@ -86,6 +80,32 @@ pub async fn merge(
     } else {
         Some(d.dirs.merge_worktree(id))
     };
+
+    // Only when the merge is going to land in the user's own checkout. Merging
+    // over uncommitted work either loses it or wedges the checkout half-way
+    // through a merge the user never asked for, so that is a refusal before
+    // anything moves. On the scratch path their checkout is not involved at
+    // all — `worktree add` makes its own clean one — and refusing a merge
+    // because a developer happens to have edits open on some other branch would
+    // be refusing the ordinary case.
+    if on_base
+        && !git
+            .run(&ws.repo_path, &["status", "--porcelain"])
+            .await?
+            .stdout
+            .trim()
+            .is_empty()
+    {
+        return Err(RpcError::new(
+            ErrorCode::Conflict,
+            format!(
+                "{} has uncommitted changes on {}; commit or stash them before merging",
+                ws.repo_path.display(),
+                ws.base_branch
+            ),
+        )
+        .with_data(serde_json::json!({ "reason": "base_dirty" })));
+    }
 
     // Where the base branch stood before any of this, so the objects it gains
     // can be copied out of the workspace afterwards. Read as a ref rather than
@@ -110,12 +130,64 @@ pub async fn merge(
         remove_scratch(&git, &ws.repo_path, path).await;
     }
     if matches!(&outcome, Ok(r) if r.ok) {
-        if let Ok(after) = repo::head_commit(&git, &ws.repo_path, &base_ref).await {
-            crate::git::absorb_objects(&git, &ws.repo_path, &layout.git_common, &after, &before)
-                .await;
-        }
+        // Neither of these may be swallowed. The base branch now points at
+        // commits that live in the workspace's private object directory, and if
+        // they cannot be copied out, reporting success would leave the user one
+        // `workspace.destroy` away from a `main` that no longer resolves.
+        let after = repo::head_commit(&git, &ws.repo_path, &base_ref)
+            .await
+            .map_err(|e| crate::git::objects_stranded("merge", "merged", &e.message))?;
+        crate::git::absorb_objects(&git, &ws.repo_path, &layout.git_common, &after, &before)
+            .await
+            .map_err(|e| crate::git::objects_stranded("merge", "merged", &e.message))?;
     }
     outcome
+}
+
+/// Removes every scratch worktree this repository still has registered.
+///
+/// Called with the repository lock held, so nothing here can be in use: a live
+/// merge would be holding the lock. Best effort throughout — a scratch worktree
+/// that will not go away is a reason to warn, and the `worktree add` that
+/// follows will produce the real error if it still matters.
+///
+/// Matched by directory name rather than by full path. Registrations are
+/// per-repository, so a `merge-*` worktree registered *here* was created by this
+/// daemon for this repository, whatever data root it was running with.
+async fn reap_scratch_worktrees(git: &Git, repo: &Path) {
+    let listing = match git.run(repo, &["worktree", "list", "--porcelain"]).await {
+        Ok(o) => o.stdout,
+        Err(e) => {
+            tracing::warn!(repo = %repo.display(), "cannot list worktrees: {}", e.message);
+            return;
+        }
+    };
+    let stale: Vec<PathBuf> = listing
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .map(|p| PathBuf::from(p.trim()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("merge-"))
+        })
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+    for path in &stale {
+        tracing::warn!(path = %path.display(), "reaping a merge worktree left by an earlier run");
+        if let Err(e) = git
+            .run(repo, &["worktree", "remove", "--force", &s(path)])
+            .await
+        {
+            tracing::warn!(path = %path.display(), "removing it failed: {}", e.message);
+        }
+        let _ = std::fs::remove_dir_all(path);
+    }
+    if let Err(e) = git.run(repo, &["worktree", "prune"]).await {
+        tracing::warn!(repo = %repo.display(), "pruning worktrees failed: {}", e.message);
+    }
 }
 
 /// The branch the main repository is checked out on, or `None` if it is not on
