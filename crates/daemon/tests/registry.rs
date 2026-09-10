@@ -67,3 +67,80 @@ fn ids_have_prefix_and_hex() {
         .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     assert_ne!(id, bondsymphonic_daemon::ids::new_id("ws_"));
 }
+
+/// Workspaces created before the allowlist carried any weight were stored with
+/// an empty one, and to the proxy an empty list means "reach nothing" — the
+/// agent in such a workspace could not even call the Anthropic API. A
+/// version-1 file is migrated once on load: an empty allowlist becomes the
+/// defaults, a list that already has entries is left alone, and the file is
+/// rewritten as version 2. The migration is keyed on the version rather than
+/// on emptiness because `workspace.set_allowlist` can empty a list on purpose,
+/// and that has to survive a restart.
+#[test]
+fn a_version_1_registry_gains_the_default_allowlist_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workspaces.json");
+    let defaults = bondsymphonic_daemon::net::allowlist::DEFAULT_ALLOW;
+
+    let mut configured = sample("ws_00000002", "b");
+    configured.allowlist = vec!["only.example".into()];
+    let legacy = serde_json::json!({
+        "version": 1,
+        "workspaces": [
+            serde_json::to_value(sample("ws_00000001", "a")).unwrap(),
+            serde_json::to_value(&configured).unwrap(),
+        ],
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+    let reg = Registry::load(&path).unwrap();
+    assert_eq!(
+        reg.get(&"ws_00000001".into()).unwrap().allowlist,
+        defaults.map(String::from).to_vec()
+    );
+    assert_eq!(
+        reg.get(&"ws_00000002".into()).unwrap().allowlist,
+        vec!["only.example".to_string()]
+    );
+
+    // The migration is written back, so it runs once rather than on every start.
+    let on_disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(on_disk["version"], 2);
+    assert_eq!(
+        on_disk["workspaces"][0]["allowlist"]
+            .as_array()
+            .unwrap()
+            .len(),
+        defaults.len()
+    );
+
+    // And from version 2 on, a list emptied on purpose stays empty.
+    reg.update(&"ws_00000001".into(), |w| w.allowlist.clear())
+        .unwrap();
+    let reg2 = Registry::load(&path).unwrap();
+    assert!(reg2
+        .get(&"ws_00000001".into())
+        .unwrap()
+        .allowlist
+        .is_empty());
+}
+
+/// A registry file the daemon has never written — no `version` key at all —
+/// predates every format there has been, so it takes the same migration rather
+/// than refusing to load.
+#[test]
+fn a_registry_file_without_a_version_is_treated_as_the_oldest_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workspaces.json");
+    let legacy = serde_json::json!({
+        "workspaces": [serde_json::to_value(sample("ws_00000001", "a")).unwrap()],
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+    let reg = Registry::load(&path).unwrap();
+    assert_eq!(
+        reg.get(&"ws_00000001".into()).unwrap().allowlist.len(),
+        bondsymphonic_daemon::net::allowlist::DEFAULT_ALLOW.len()
+    );
+}
