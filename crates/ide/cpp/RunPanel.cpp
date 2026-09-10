@@ -170,9 +170,10 @@ void RunPanel::buildTopRow(QVBoxLayout* outer) {
     row->addWidget(m_open, 0);
     outer->addLayout(row);
 
-    // Above the run's own status line and separate from it: an ignored `[[run]]`
-    // entry is a fact about the repository's file, not news about a run, and
-    // the two must not take turns in one label.
+    // Above the run's own status line and separate from it: a complaint about
+    // `bondsymphonic.toml` is a fact about the repository's file, not news
+    // about a run, and the two must not take turns in one label. Word-wrapped,
+    // because a single complaint is shown as the daemon wrote it.
     m_warnings = new QLabel(this);
     m_warnings->setObjectName("RunWarningsLabel");
     m_warnings->setTextFormat(Qt::PlainText);
@@ -314,11 +315,13 @@ void RunPanel::updateWarnings() {
     if (m_model.isNull()) {
         return;
     }
-    // The daemon loads the `[[run]]` entries it can parse and reports the rest
-    // instead of discarding the whole file. An entry that is not in the combo
-    // and was not complained about leaves the user staring at a file they
-    // believe is correct, so both halves of the answer are shown: the reasons
-    // on the combo the entries are missing from, and one line under the row.
+    // The daemon loads the `[[run]]` entries it can parse and reports what it
+    // could not, instead of discarding the whole file. An entry that is not in
+    // the combo and was not complained about leaves the user staring at a file
+    // they believe is correct, so both halves of the answer are shown: every
+    // complaint on the combo the entries are missing from -- a parse error runs
+    // to several lines and a tooltip is where those fit -- and one line under
+    // the row.
     const QString detail = m_model->configWarnings();
     m_configs->setToolTip(detail.isEmpty() ? kConfigTip
                                            : kConfigTip + QStringLiteral("\n\n") + detail);

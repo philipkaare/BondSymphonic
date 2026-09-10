@@ -1081,24 +1081,33 @@ fn the_qt_guard_does_not_skip_when_qmake_is_set() {
 // Run configurations the daemon refused to load (M7 Task 3, daemon Task 2).
 // ---------------------------------------------------------------------------
 
-/// `repo.detect_run_configs` answers with a `warnings` line per `[[run]]` entry
-/// it could not parse. Silently loading the rest is what the daemon used to do
-/// with the whole file; the panel is where the user finds out that an entry
-/// they wrote is not in the combo.
+/// `repo.detect_run_configs` answers with a `warnings` entry per complaint the
+/// daemon has about `bondsymphonic.toml`, and loads whatever else parsed.
+/// Silently discarding the whole file is what the daemon used to do; the panel
+/// is where the user finds out that an entry they wrote is not in the combo.
+///
+/// The daemon's own wording, so this pins what the panel does with the strings
+/// that actually arrive rather than with invented ones.
 #[test]
-fn ignored_run_configs_are_summarised_for_the_panel() {
+fn complaints_about_the_repo_config_are_summarised_for_the_panel() {
     use bondsymphonic_ide::qobjects::run_panel::warning_status;
 
+    const NO_PORT: &str =
+        r#"bondsymphonic.toml: [[run]] #2 ("api") has no port; it is not offered"#;
+    const NO_COMMAND: &str =
+        r#"bondsymphonic.toml: [[run]] #3 ("web") has no command; it is not offered"#;
+
     assert_eq!(warning_status(&[]), "");
+    // One complaint is the daemon's finished sentence, which already names the
+    // file. Anything added here would say it twice.
+    assert_eq!(warning_status(&[NO_PORT.to_owned()]), NO_PORT);
+    // Several are counted, and counted as problems rather than as ignored
+    // configurations: a file that will not parse at all is a single warning
+    // covering however many runs it declared, so the length is a count of
+    // complaints and not of dropped entries. The sentences themselves are on
+    // the combo's tooltip.
     assert_eq!(
-        warning_status(&["run \"api\": no port".to_owned()]),
-        "1 run config ignored: run \"api\": no port"
-    );
-    assert_eq!(
-        warning_status(&[
-            "run \"api\": no port".to_owned(),
-            "run \"web\": no port".to_owned()
-        ]),
-        "2 run configs ignored: run \"api\": no port; run \"web\": no port"
+        warning_status(&[NO_PORT.to_owned(), NO_COMMAND.to_owned()]),
+        "2 problems with bondsymphonic.toml"
     );
 }

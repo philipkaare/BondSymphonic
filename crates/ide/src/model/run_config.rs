@@ -154,14 +154,19 @@ pub struct WorkspaceRuns {
     /// Hosts the proxy blocked and the user has not answered for yet, oldest
     /// first. The head is the one the toast is showing.
     pub denied_hosts: Vec<String>,
-    /// One line per `[[run]]` entry the daemon refused to load, from the same
-    /// `repo.detect_run_configs` answer the configurations came in.
+    /// What the daemon had to complain about in this worktree's
+    /// `bondsymphonic.toml`, from the same `repo.detect_run_configs` answer the
+    /// configurations came in. One finished sentence per complaint, each
+    /// already naming the file.
     ///
     /// The daemon used to discard the whole file over one bad entry; it now
-    /// loads the rest and says which it dropped. An entry that is not in the
+    /// loads the rest and says what it dropped. An entry that is not in the
     /// combo and was not complained about leaves the user staring at a file
     /// they believe is correct, so the panel shows these rather than logging
     /// them.
+    ///
+    /// Not a count of dropped `[[run]]` entries: a file that will not parse at
+    /// all is one warning however many runs it declared.
     pub warnings: Vec<String>,
 }
 

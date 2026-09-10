@@ -156,15 +156,18 @@ pub mod qobject {
         #[qinvokable]
         fn configs_json(self: &RunPanelModel) -> QString;
 
-        /// What `repo.detect_run_configs` refused to load for this workspace,
-        /// one line per `[[run]]` entry, joined with newlines. Empty when the
-        /// file was clean or there was none. The panel hangs this on the
-        /// configuration combo as its tooltip.
+        /// Everything `repo.detect_run_configs` had to complain about in this
+        /// workspace's `bondsymphonic.toml`, one entry per complaint, joined
+        /// with newlines. Empty when the file was clean or there was none. The
+        /// panel hangs this on the configuration combo as its tooltip, which is
+        /// where a complaint that runs to several lines -- a parse error, with
+        /// the offending line and a caret -- belongs.
         #[qinvokable]
         fn config_warnings(self: &RunPanelModel) -> QString;
 
-        /// The same, as the one line the panel shows under the row:
-        /// "1 run config ignored: ...". Empty when there is nothing to say.
+        /// The one line the panel shows under the row: the single complaint
+        /// when there is one, and "N problems with bondsymphonic.toml" when
+        /// there are more. Empty when there is nothing to say.
         #[qinvokable]
         fn config_warning_status(self: &RunPanelModel) -> QString;
 
@@ -200,18 +203,34 @@ struct Subscription {
     generation: u64,
 }
 
-/// The one line the panel shows under its row for run configurations the
-/// daemon refused to load: "1 run config ignored: <reason>".
+/// The repository file the daemon reads run configurations from, named in the
+/// status line above. Spelled here rather than shared with the daemon by
+/// import: the two crates share `bondsymphonic-proto`, not this file name's
+/// meaning, and this is the IDE telling a user which file to open.
+const CONFIG_FILE: &str = "bondsymphonic.toml";
+
+/// The one line the panel shows under its row when `repo.detect_run_configs`
+/// had something to complain about.
 ///
-/// Pure, so the wording is settled without a Qt event loop. The reasons are the
-/// daemon's own sentences, joined rather than summarised: the user's next move
-/// is to open `bondsymphonic.toml` and fix the entry each one names, and a
-/// count on its own would not tell them which.
+/// Pure, so the wording is settled without a Qt event loop.
+///
+/// A single complaint is shown as the daemon wrote it. Each entry is already a
+/// finished sentence naming the file
+/// (`bondsymphonic.toml: [[run]] #2 ("api") has no port; it is not offered`),
+/// so anything this added would be said twice.
+///
+/// Several are counted rather than joined, and counted as *problems* rather
+/// than as ignored configurations: the list is not one line per dropped
+/// `[[run]]` entry. A file that will not parse at all yields exactly one
+/// warning carrying the `toml` crate's own message, caret and all, for a file
+/// that may have declared any number of runs -- so `warnings.len()` is a count
+/// of complaints and nothing else. The complaints themselves are on the
+/// configuration combo's tooltip, which is where a multi-line one belongs.
 pub fn warning_status(warnings: &[String]) -> String {
     match warnings.len() {
         0 => String::new(),
-        1 => format!("1 run config ignored: {}", warnings[0]),
-        n => format!("{n} run configs ignored: {}", warnings.join("; ")),
+        1 => warnings[0].clone(),
+        n => format!("{n} problems with {CONFIG_FILE}"),
     }
 }
 
