@@ -50,7 +50,10 @@ jobs:
   # Windows, which is what the old `windows-proto` job did on its own.
   windows-ide:
     runs-on: windows-latest
-    timeout-minutes: 45
+    # A release build with thin LTO for the package, a debug build for the
+    # tests and a third for clippy, all of a cxx-qt crate. 60 is headroom over
+    # the ~45 the cold-cache run takes, not a target.
+    timeout-minutes: 60
     env:
       # The Qt-backed tests create real QWidgets; the runner has no display.
       QT_QPA_PLATFORM: offscreen
@@ -82,10 +85,24 @@ jobs:
           & $qmake -query QT_VERSION
       - name: Format
         run: cargo fmt --all -- --check
+      # The packaged folder is what a user actually installs, so CI builds it
+      # rather than trusting that the release profile and windeployqt still
+      # agree with the debug build. `-NoDaemon` builds the release IDE, runs
+      # windeployqt, deploys the VC++ runtime and asserts the DLLs, but skips
+      # the WSL daemon build and the zip -- neither is reachable here.
+      # PowerShell 5.1 is what the script targets, so it is invoked by name
+      # rather than through the runner's default pwsh.
+      - name: Package dist\BondSymphonic
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\package.ps1" -NoDaemon
       # `require-qt` turns each test's "QMAKE unset, skipping" escape hatch into
       # a panic. Without it a runner that lost its Qt installation would report
       # a green job in which every test that needs the runtime did nothing.
+      # BS_PACKAGED_EXE is the same kind of gate for `packaged_smoke`: pointed
+      # at the folder the previous step built, it launches the real packaged
+      # executable instead of skipping.
       - name: Test proto and the IDE
+        env:
+          BS_PACKAGED_EXE: ${{ github.workspace }}\dist\BondSymphonic\bondsymphonic-ide.exe
         run: cargo test -p bondsymphonic-proto -p bondsymphonic-ide --features bondsymphonic-ide/require-qt
       - name: Clippy the IDE
         run: cargo clippy -p bondsymphonic-ide --all-targets -- -D warnings
