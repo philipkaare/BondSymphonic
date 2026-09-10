@@ -250,6 +250,33 @@ Run in the main repo by the daemon, never inside a sandbox:
   removing them is a separate `workspace.destroy`. The daemon then absorbs the
   merged range into the shared object store (§5.2), and a failure there fails the
   RPC with `reason: "objects_stranded"` and `merged: true`.
+- **`workspace.destroy` takes the same per-repository lock** across its teardown
+  half — from removing the worktree and the branch through deleting the
+  workspace's private object directory. Without it a destroy can delete the
+  objects a merge is still absorbing, and the base branch is left pointing at
+  commits that no longer exist: `git log main` fails in the user's own
+  repository. The lock is taken after the sandbox shutdown, which is slow and
+  touches no git.
+- **Hooks: a daemon merge runs none of the repository's.** `daemon_git` pins
+  `core.hooksPath` at the empty daemon-owned directory (`DataDirs::no_hooks`),
+  for the main repository and for the scratch worktree, matching what
+  `worktree_git` already does on the workspace side. A merge the daemon performs
+  is not the user typing `git merge`: it happens when they click a button in
+  another window, over content an agent wrote, so a `post-merge` or `commit-msg`
+  hook firing there would run repository-supplied shell commands nobody asked
+  for. The user's own `git merge` in their own checkout is unaffected.
+  - The one exception is `git push` (§5.5), which runs through `daemon_push_git`
+    with the repository's hooks left in place, because `pre-push` is how
+    `git-lfs` uploads the objects a push needs.
+- **Filter and merge drivers still run.** The `NEUTRALISED_CONFIG` list
+  `worktree_git` empties is deliberately *not* applied to `daemon_git`. Those
+  keys name the user's own `filter.*.clean` / `.smudge` and `merge.*.driver`
+  programs — `git-lfs` above all — the main repository's config is not
+  agent-writable, and emptying them would corrupt the user's checkout by leaving
+  LFS pointer files where their content should be. The residual risk is stated
+  rather than closed: a `.gitattributes` **in the merged tree**, which an agent
+  wrote, chooses which of the user's own drivers run and over what content,
+  during a merge the daemon performs on the host outside any sandbox.
 
 ### 5.5 PR
 `git push -u origin bs/<name>/work` then `gh pr create --title --body [--draft]
@@ -579,6 +606,33 @@ rule (11), so an absolute path, a `..`, and a symlink pointing out are all
 `bondsymphonic.toml` that will not parse: each of those would leave the agent
 running under settings nobody chose, which for a setting whose job is to pin
 allowed tools is worse than not starting at all.
+
+**Every write into `homes/<id>` de-symlinks its own path.** The home is bound
+into the sandbox read-write as `$HOME` (§6.2), so between one `agent.start` and
+the next the agent owns every name under it and can leave a symlink to any host
+path where `.claude` was. The target need not exist inside the namespace: only
+the link text survives to the host, where the daemon resolves it. What the
+settings override then writes is *the agent's own bytes*, and Claude Code
+settings carry `hooks`, which are shell commands — so following such a link is
+code execution as the daemon user the next time they run `claude` themselves.
+The rule, applied by both writers (the settings override and the credential
+seeding of §8.3):
+
+- Each directory on the way in is checked with `symlink_metadata`, which does not
+  follow. Anything that is not a real directory is unlinked — removing the link,
+  never its target — and a real directory is created in its place, with a warning
+  in the log.
+- The destination file is unlinked and then created with `create_new`, so a link
+  raced back in between the two is refused rather than followed. Never
+  `fs::copy`, which opens the destination by path and follows what it finds.
+- The source is opened **once**, `O_NOFOLLOW` where the platform has it, and every
+  later read is of that handle. `fs::resolve` proves the path is inside the
+  worktree; re-opening it afterwards would let an agent swap a regular file for a
+  symlink in between and have the link followed.
+- A real *directory* found at a destination file is the one obstruction that is
+  left alone: it cannot redirect a write, and removing it recursively would be
+  the daemon deleting data it did not put there. The copy fails, which the
+  seeding logs and skips and the settings override reports as `IoError`.
 
 ### 8.4 Terminal adapter
 A terminal agent is a PTY, not an entry in the agent registry: the IDE calls

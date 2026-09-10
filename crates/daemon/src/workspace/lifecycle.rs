@@ -598,6 +598,20 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
     // After the sandbox, so a last request is answered rather than cut off, and
     // before the directories go, since the socket file lives in one of them.
     d.proxies.stop(id);
+    // Everything from here on touches the repository: `worktree::remove` deletes
+    // the branch and the worktree registration, and `remove_workspace` deletes
+    // `objects/<id>` — the private object directory a merge or a push of the
+    // same repository may still be copying out into the shared store. Those hold
+    // this same lock across their `absorb_objects` (`git/merge.rs`, `git/pr.rs`),
+    // so taking it here is what stops a destroy from deleting objects the base
+    // branch already points at and leaving the user's own `git log main`
+    // unreadable.
+    //
+    // Deliberately not taken any earlier: the sandbox shutdown above is slow and
+    // touches no git, and holding a repository's merges behind it would be its
+    // own bug.
+    let repo_lock = crate::git::repo_lock(&ws.repo_path);
+    let _repo_guard = repo_lock.lock().await;
     if let Some(layout) = layout.as_ref() {
         if let Err(e) = worktree::remove(&d.git, layout).await {
             // The ptys are closed and the sandbox is down, so the workspace must not be

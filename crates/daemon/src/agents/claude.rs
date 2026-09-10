@@ -163,30 +163,76 @@ pub fn apply_repo_settings(
     let from = crate::fs::resolve(worktree, &rel).map_err(|e| {
         RpcError::invalid_params(format!("[claude] settings {rel:?}: {}", e.message))
     })?;
-    if !from.is_file() {
+    // Opened once, here, and every read after this is of *this handle*.
+    // `fs::resolve` proved the path was inside the worktree, but the value it
+    // returned used to be re-opened twice more — `is_file()` and then
+    // `fs::copy`, which follows symlinks. An agent renaming that name back and
+    // forth between a regular file and a link to, say, `~/.ssh/id_ed25519` wins
+    // the window occasionally and has the link followed. One handle closes it.
+    let mut src = open_no_follow(&from).map_err(|e| {
+        RpcError::invalid_params(format!(
+            "[claude] settings {rel:?}: no such readable file in the workspace ({e})"
+        ))
+    })?;
+    if !src.metadata().map(|m| m.is_file()).unwrap_or(false) {
         return Err(RpcError::invalid_params(format!(
             "[claude] settings {rel:?}: no such file in the workspace"
         )));
     }
     let dir = home.join(".claude");
     let to = dir.join("settings.json");
-    let copy = || -> std::io::Result<()> {
-        std::fs::create_dir_all(&dir)?;
-        // Removed first rather than written through, so a symlink left at the
-        // destination cannot redirect the write out of the workspace home.
-        match std::fs::remove_file(&to) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        std::fs::copy(&from, &to).map(|_| ())
-    };
-    copy().map_err(|e| {
+    write_settings(&mut src, home, &dir, &to).map_err(|e| {
         RpcError::new(
             ErrorCode::IoError,
             format!("[claude] settings {rel:?}: copying it into the workspace home failed: {e}"),
         )
     })
+}
+
+/// Opens `path` for reading without following a final symlink where the
+/// platform can say so.
+///
+/// On unix `O_NOFOLLOW` makes the rule the kernel's rather than a check this
+/// code has to win a race against. Windows has no equivalent on `open`, and no
+/// sandbox either — the caller's `metadata()` check on the returned handle is
+/// what stands there.
+fn open_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
+}
+
+/// Writes the already-open settings source into `<home>/.claude/settings.json`.
+///
+/// Both the directory and the file are de-symlinked. `home` is bind-mounted into
+/// the sandbox read-write, so the agent can replace `.claude` with a link out of
+/// the workspace between one `agent.start` and the next; `create_dir_all` would
+/// follow it, and what this writes is *the agent's own bytes* — Claude Code
+/// settings carry `hooks`, which are shell commands, so following that link is
+/// code execution as the daemon user next time they run `claude` themselves.
+fn write_settings(
+    src: &mut std::fs::File,
+    home: &std::path::Path,
+    dir: &std::path::Path,
+    to: &std::path::Path,
+) -> std::io::Result<()> {
+    super::credentials::ensure_real_dir(home)?;
+    super::credentials::ensure_real_dir(dir)?;
+    // Unlinked rather than written through, and then created with `create_new`,
+    // so a link raced back into the destination between the two is refused
+    // instead of followed.
+    super::credentials::remove_any(to)?;
+    let mut dst = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    std::io::copy(src, &mut dst)?;
+    Ok(())
 }
 
 fn claude_not_installed() -> RpcError {
@@ -723,6 +769,33 @@ mod tests {
         std::fs::read_to_string(home.join(".claude").join("settings.json")).ok()
     }
 
+    /// A file symlink at `link`, or `false` where the platform refuses to make
+    /// one (Windows without the symlink privilege).
+    fn symlink_file(target: &std::path::Path, link: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+    }
+
+    /// A directory symlink at `link`, or `false` where the platform refuses.
+    /// Unix, which is where the sandbox and therefore the attack live, always
+    /// makes it.
+    fn symlink_dir(target: &std::path::Path, link: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+        }
+    }
+
     /// A repo that says nothing about Claude leaves the home exactly as the
     /// credential seeding left it.
     #[test]
@@ -775,6 +848,136 @@ mod tests {
         std::fs::write(worktree.join("s.json"), "{}").unwrap();
         apply_repo_settings(&worktree, &home).unwrap();
         assert_eq!(settings_of(&home).as_deref(), Some("{}"));
+    }
+
+    /// C1. The agent owns `$HOME` inside the sandbox: it can `rm -rf ~/.claude`
+    /// and leave a symlink to the daemon user's own `~/.claude` in its place,
+    /// then write a `bondsymphonic.toml` naming settings full of `hooks`. The
+    /// next `agent.start` in that workspace used to follow the link and drop the
+    /// agent's shell commands into the file the user's own `claude` reads.
+    ///
+    /// Nothing outside the workspace home may be read, written or removed.
+    #[test]
+    fn a_symlinked_claude_dir_does_not_carry_the_settings_out_of_the_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let (worktree, home) = worktree_with(
+            dir.path(),
+            Some(
+                "[claude]
+settings = \"evil.json\"
+",
+            ),
+        );
+        std::fs::write(worktree.join("evil.json"), "{\"hooks\":\"rm -rf /\"}").unwrap();
+
+        // The daemon user's real home, outside the workspace, with the file the
+        // attack is aimed at.
+        let outside = dir.path().join("the-users-real-home").join(".claude");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("settings.json"), "the user's own settings").unwrap();
+
+        if !symlink_dir(&outside, &home.join(".claude")) {
+            eprintln!("SKIP: this host will not create directory symlinks");
+            return;
+        }
+
+        apply_repo_settings(&worktree, &home).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(outside.join("settings.json")).unwrap(),
+            "the user's own settings",
+            "the file outside the workspace home must be exactly as it was"
+        );
+        assert!(
+            std::fs::symlink_metadata(home.join(".claude"))
+                .unwrap()
+                .is_dir(),
+            "the link must have been replaced by a real directory"
+        );
+        assert_eq!(
+            settings_of(&home).as_deref(),
+            Some("{\"hooks\":\"rm -rf /\"}"),
+            "and the repo's settings must have landed inside the home"
+        );
+    }
+
+    /// The same guard without needing the symlink privilege, so it runs on
+    /// Windows as well: anything that is not a real directory is replaced.
+    #[test]
+    fn a_file_where_the_claude_dir_goes_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (worktree, home) = worktree_with(
+            dir.path(),
+            Some(
+                "[claude]
+settings = \"s.json\"
+",
+            ),
+        );
+        std::fs::write(worktree.join("s.json"), "{}").unwrap();
+        std::fs::write(home.join(".claude"), "in the way").unwrap();
+
+        apply_repo_settings(&worktree, &home).unwrap();
+        assert!(home.join(".claude").is_dir());
+        assert_eq!(settings_of(&home).as_deref(), Some("{}"));
+    }
+
+    /// A symlink left at the destination *file* is unlinked, not written
+    /// through — the same rule one level down.
+    #[test]
+    fn a_symlinked_settings_file_is_unlinked_rather_than_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let (worktree, home) = worktree_with(
+            dir.path(),
+            Some(
+                "[claude]
+settings = \"s.json\"
+",
+            ),
+        );
+        std::fs::write(worktree.join("s.json"), "the repo's").unwrap();
+        let outside = dir.path().join("outside.json");
+        std::fs::write(&outside, "the user's").unwrap();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        if !symlink_file(&outside, &home.join(".claude").join("settings.json")) {
+            eprintln!("SKIP: this host will not create file symlinks");
+            return;
+        }
+
+        apply_repo_settings(&worktree, &home).unwrap();
+        assert_eq!(settings_of(&home).as_deref(), Some("the repo's"));
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "the user's",
+            "the link's target must be untouched"
+        );
+    }
+
+    /// I2. The source is opened once, and that open refuses a symlink.
+    ///
+    /// `fs::resolve` canonicalises, so the path it hands back has already had
+    /// every link on it followed and checked for containment. The hole was that
+    /// the *value* it returned was then re-opened twice more — `is_file()` and
+    /// `fs::copy` — and an agent that turns that canonical name into a link to,
+    /// say, `~/.ssh/id_ed25519` in between gets the link followed. One
+    /// `O_NOFOLLOW` open is what closes it; the race itself cannot be staged
+    /// deterministically, so this pins the mechanism.
+    #[cfg(unix)]
+    #[test]
+    fn the_settings_source_is_opened_without_following_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        std::fs::write(&real, "{}").unwrap();
+        assert!(open_no_follow(&real).is_ok(), "a regular file opens");
+
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let e = open_no_follow(&link).unwrap_err();
+        assert_eq!(
+            e.raw_os_error(),
+            Some(libc::ELOOP),
+            "a symlink must be refused by the open itself: {e}"
+        );
     }
 
     /// Every way the setting can be wrong is an `InvalidParams` on the start,

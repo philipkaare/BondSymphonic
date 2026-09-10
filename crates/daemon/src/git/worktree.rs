@@ -63,7 +63,36 @@ impl Layout {
     /// Only safe for commands that run in the *main* repository, which is never
     /// bind-mounted into a sandbox. Anything that touches the worktree must use
     /// [`Layout::worktree_git`].
+    ///
+    /// `core.hooksPath` is pinned at the empty daemon-owned directory, for the
+    /// main repository and for the scratch worktree a merge checks out under it.
+    /// A merge the daemon runs is not the user typing `git merge`: it happens on
+    /// a schedule the user did not choose, over content an agent wrote, and a
+    /// `post-merge` or `pre-commit` hook firing there would run repository code
+    /// nobody in front of the screen asked for. Daemon design §5.4 states the
+    /// rule and its one exception.
+    ///
+    /// The [`NEUTRALISED_CONFIG`] list is deliberately **not** applied here.
+    /// Those keys name the user's own filter and merge drivers — `git-lfs`'s
+    /// `filter.lfs.clean` above all — and the main repository's config is not
+    /// agent-writable, so emptying them would not close a hole, it would corrupt
+    /// the user's checkout by writing LFS pointers where their files should be.
+    /// A `.gitattributes` in the merged tree still chooses which of those
+    /// drivers run, which is the residual risk §5.4 records.
     pub fn daemon_git(&self) -> Git {
+        Git::new()
+            .with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", s(&self.objects_dir))
+            .with_config("core.hooksPath", &s(&self.no_hooks_dir))
+    }
+
+    /// [`Layout::daemon_git`] with the repository's own hooks left in place, for
+    /// `git push` and nothing else.
+    ///
+    /// `pre-push` is not decoration: it is how `git-lfs` uploads the large
+    /// objects a push needs, and a push that skips it puts pointer files on the
+    /// remote with nothing behind them. A push is also the one daemon-side git
+    /// operation the user explicitly asked for by name, through **Create PR**.
+    pub fn daemon_push_git(&self) -> Git {
         Git::new().with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", s(&self.objects_dir))
     }
 

@@ -37,7 +37,10 @@ pub async fn create_pr(
         )));
     }
     let layout = layout_for(d, &ws).await?;
-    let git = layout.daemon_git();
+    // `daemon_push_git`, not `daemon_git`: the push must still run the
+    // repository's `pre-push` hook, because that is how `git-lfs` uploads the
+    // objects the pushed commits point at. See [`Layout::daemon_push_git`].
+    let git = layout.daemon_push_git();
     {
         // The push and the object copy that follows both write the repository's
         // shared object store, so they take the same per-repository lock a

@@ -475,6 +475,258 @@ async fn the_base_still_reads_after_the_merged_workspace_is_destroyed() {
     cancel.cancel();
 }
 
+/// The same proof for a squash and a rebase. Both leave the base pointing at
+/// blobs written into the workspace's private object directory, so a missed
+/// `absorb_objects` on either would break the user's repository exactly the way
+/// a missed one on a merge would -- and would otherwise pass this suite.
+#[tokio::test]
+async fn the_base_still_reads_after_a_squashed_or_rebased_workspace_is_destroyed() {
+    // A squash makes a *new* commit on the base, so the workspace branch still
+    // has commits the base does not contain and an unforced destroy refuses it.
+    // A rebase fast-forwards the base onto the branch, so it does not.
+    for (mode, name, subject, force) in [
+        (MergeMode::Squash, "sq", "sq: sq work", true),
+        (MergeMode::Rebase, "rb", "rb work", false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+        let mut c = Client::connect(port, &token).await;
+        let ws = create_ws(&mut c, &repo, name).await;
+        // A second workspace that is never merged, so its objects stay in a
+        // *different* private directory for the whole of this case: that is what
+        // makes a repository-wide `git repack -a -d` the wrong way to do this.
+        let other = create_ws(&mut c, &repo, "kept").await;
+
+        let file = format!("{name}.txt");
+        commit_in_ws(
+            &daemon,
+            &ws,
+            &[(file.as_str(), "x\n")],
+            &format!("{name} work"),
+        )
+        .await;
+        commit_in_ws(&daemon, &other, &[("kept.txt", "k\n")], "kept work").await;
+
+        let res = merge(&mut c, &ws.id, mode, None).await.unwrap();
+        assert!(res.ok, "{name}: {res:?}");
+
+        let objects = dir.path().join("data").join("objects").join(ws.id.as_str());
+        assert!(
+            objects.is_dir(),
+            "{name}: the private object directory exists"
+        );
+        c.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+            workspace_id: ws.id.clone(),
+            force,
+        }))
+        .await
+        .unwrap();
+        assert!(
+            !objects.exists(),
+            "{name}: destroy took the private objects"
+        );
+
+        // Plain git, as the user would run it, borrowing nothing.
+        assert_eq!(
+            git_out(&repo, &["log", "-1", "--format=%s", "main"]),
+            subject,
+            "{name}: the base must read without the destroyed workspace"
+        );
+        assert_eq!(git_out(&repo, &["show", &format!("main:{file}")]), "x");
+        // Walks every object reachable from the base and fails on a missing
+        // one. `git fsck` is the wrong tool here: the second, unmerged
+        // workspace legitimately keeps its objects private, and a repository-wide
+        // check would report those as broken.
+        git_ok(&repo, &["rev-list", "--objects", "main"]);
+
+        cancel.cancel();
+    }
+}
+
+/// C2. `destroy` deletes the workspace's private object directory; a merge or a
+/// push of the same repository is at that moment copying that directory's
+/// contents into the shared store under the per-repository lock. Without the
+/// same lock on the teardown the destroy wins, and the base branch is left
+/// pointing at objects that are gone: `git log main` and `git fsck` both fail,
+/// in the user's own repository, after a merge the daemon reported as
+/// successful.
+///
+/// The lock is held by the test rather than by an artificially slow merge. From
+/// `destroy`'s side that is the same thing, and it does not turn the assertion
+/// into a race against how long `pack-objects` happens to take.
+#[tokio::test]
+async fn destroy_waits_for_whoever_holds_the_repository_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "alpha").await;
+    commit_in_ws(&daemon, &ws, &[("alpha.txt", "a\n")], "alpha work").await;
+    assert!(
+        merge(&mut c, &ws.id, MergeMode::Merge, None)
+            .await
+            .unwrap()
+            .ok
+    );
+
+    let objects = dir.path().join("data").join("objects").join(ws.id.as_str());
+    assert!(objects.is_dir());
+
+    // Standing in for the tail of a merge: the repository lock, held across the
+    // `absorb_objects` that copies the merged range out of `objects/<id>`.
+    let lock = bondsymphonic_daemon::git::repo_lock(&repo);
+    let guard = lock.lock().await;
+
+    // A second connection, because the destroy has to be in flight while this
+    // task sits on the lock.
+    let mut c2 = Client::connect(port, &token).await;
+    let id = ws.id.clone();
+    let destroying = tokio::spawn(async move {
+        c2.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+            workspace_id: id,
+            force: false,
+        }))
+        .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    assert!(
+        !destroying.is_finished(),
+        "destroy must wait for the repository lock, not race the absorb"
+    );
+    assert!(
+        objects.is_dir(),
+        "and must not have deleted the private objects while the lock is held"
+    );
+
+    drop(guard);
+    destroying.await.unwrap().unwrap();
+    assert!(!objects.exists(), "and finishes once the lock is free");
+
+    let mut subjects: Vec<String> = git_out(&repo, &["log", "--format=%s", "main"])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    subjects.sort();
+    assert_eq!(subjects, ["Merge bs/alpha/work", "alpha work", "init"]);
+    // Every object the base branch reaches, not just the commits.
+    git_ok(&repo, &["rev-list", "--objects", "main"]);
+
+    cancel.cancel();
+}
+
+/// Writes an always-succeeding `<name>` hook into the repository that leaves a
+/// file behind in `fired` when git runs it.
+fn install_hook(repo: &Path, name: &str, fired: &Path) {
+    let hooks = repo.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let marker = fired.join(name).display().to_string().replace('\\', "/");
+    let path = hooks.join(name);
+    // `exit 0` throughout: a hook that failed would fail the merge, and this
+    // test has to tell "the hook did not run" apart from "the hook ran and broke
+    // something".
+    std::fs::write(&path, format!("#!/bin/sh\n: > \"{marker}\"\nexit 0\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// I5. A merge the daemon performs runs none of the repository's hooks.
+///
+/// It is not the user typing `git merge`: it happens when they click a button in
+/// another window, over content an agent wrote, and `post-merge` / `commit-msg`
+/// are repository-supplied shell commands. `daemon_git` pins `core.hooksPath` at
+/// the empty daemon-owned directory for the main repository and for the scratch
+/// worktree, which is the half `worktree_git` already did for the workspace
+/// side. Daemon design 5.4 records the rule, and that filter and merge drivers
+/// are deliberately *not* neutralised alongside it.
+#[tokio::test]
+async fn a_daemon_merge_runs_none_of_the_repositorys_hooks() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let fired = dir.path().join("fired");
+    std::fs::create_dir_all(&fired).unwrap();
+
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let alpha = create_ws(&mut c, &repo, "alpha").await;
+    let beta = create_ws(&mut c, &repo, "beta").await;
+    commit_in_ws(&daemon, &alpha, &[("alpha.txt", "a\n")], "alpha work").await;
+    commit_in_ws(&daemon, &beta, &[("beta.txt", "b\n")], "beta work").await;
+
+    // Installed only now: the commits above are made by this test with a plain
+    // git, which shares this repository's hooks and would fire them itself.
+    // Every hook a merge, a squash's commit or the scratch checkout can reach.
+    const HOOKS: [&str; 7] = [
+        "pre-commit",
+        "prepare-commit-msg",
+        "commit-msg",
+        "post-commit",
+        "post-merge",
+        "post-checkout",
+        "reference-transaction",
+    ];
+    for hook in HOOKS {
+        install_hook(&repo, hook, &fired);
+    }
+
+    // In the user's own checkout, which is on the base branch.
+    assert!(
+        merge(&mut c, &alpha.id, MergeMode::Merge, None)
+            .await
+            .unwrap()
+            .ok
+    );
+    assert!(
+        fired_hooks(&fired).is_empty(),
+        "a merge in the user's checkout ran hooks: {:?}",
+        fired_hooks(&fired)
+    );
+
+    // The positive control, and the setup for the scratch-worktree half: the
+    // same hooks, in the same repository, do run for a plain `git checkout`.
+    // Without it a hook this host declined to execute would make both
+    // assertions pass for the wrong reason.
+    git_ok(&repo, &["checkout", "-q", "-b", "elsewhere"]);
+    assert!(
+        fired_hooks(&fired).contains(&"post-checkout".to_string()),
+        "the hooks are installed and this host does run them: {:?}",
+        fired_hooks(&fired)
+    );
+    for name in fired_hooks(&fired) {
+        std::fs::remove_file(fired.join(name)).unwrap();
+    }
+
+    // The other half of I5: the user is elsewhere, so the daemon checks the base
+    // out in a scratch worktree under its own data root and commits there.
+    assert!(
+        merge(&mut c, &beta.id, MergeMode::Squash, None)
+            .await
+            .unwrap()
+            .ok
+    );
+    assert!(
+        fired_hooks(&fired).is_empty(),
+        "a squash in the scratch worktree ran hooks: {:?}",
+        fired_hooks(&fired)
+    );
+
+    cancel.cancel();
+}
+
+/// The hooks that have left a marker in `fired`, sorted.
+fn fired_hooks(fired: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(fired)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 /// The rebase abort, which unwinds inside the *workspace* worktree rather than
 /// in the base checkout. A rebase left in progress there would leave the agent
 /// on a detached HEAD in a half-replayed branch.
