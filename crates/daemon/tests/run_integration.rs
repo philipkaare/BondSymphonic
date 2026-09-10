@@ -41,6 +41,74 @@ fn python() -> Option<&'static str> {
     })
 }
 
+/// How one command is chained onto the next in the shell the daemon uses for
+/// this platform: `/bin/sh -c` on Unix, `cmd /C` on Windows.
+fn chain() -> &'static str {
+    if cfg!(windows) {
+        "&"
+    } else {
+        ";"
+    }
+}
+
+/// The spelling that prints one empty line. `cmd`'s bare `echo` prints the echo
+/// state instead, and `echo.` with a space before the separator would print the
+/// space, so the commands built with this are deliberately unspaced.
+fn blank_line() -> &'static str {
+    if cfg!(windows) {
+        "echo."
+    } else {
+        "echo"
+    }
+}
+
+/// Kills whatever is still listening on a test's port once the test is over,
+/// however it ended.
+///
+/// A `#[tokio::test]` whose body panics drops its runtime while the run's web
+/// server is still alive, and on Windows tokio waits for a child process on a
+/// blocking thread that the drop then waits for in turn — so one failed
+/// assertion hangs the whole test binary instead of reporting. The guard turns
+/// that back into an ordinary failure, and leaves nothing behind for the next
+/// test to trip over.
+struct PortGuard(u16);
+
+impl Drop for PortGuard {
+    fn drop(&mut self) {
+        kill_listener(self.0);
+    }
+}
+
+/// Ends whatever holds `port`, tree and all.
+///
+/// Windows only: on Unix the no-sandbox backend puts every child in a process
+/// group of its own and the daemon's own teardown reaches all of it, and a
+/// runtime drop there does not block on a surviving child.
+fn kill_listener(port: u16) {
+    if !cfg!(windows) {
+        return;
+    }
+    let Ok(out) = std::process::Command::new("netstat")
+        .args(["-ano", "-p", "tcp"])
+        .output()
+    else {
+        return;
+    };
+    let needle = format!(":{port}");
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        // proto, local address, remote address, state, pid
+        if f.len() < 5 || f[3] != "LISTENING" || !f[1].ends_with(&needle) {
+            continue;
+        }
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", f[4]])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 /// A port nothing is listening on right now. Bound and released, so the number
 /// is one the operating system just handed out rather than a guess.
 fn free_port() -> u16 {
@@ -56,6 +124,14 @@ fn write_repo_config(repo: &Path, toml: &str) {
     std::fs::write(
         repo.join("sub").join("envprint.py"),
         "import os\nprint(os.environ['PORT'], os.environ['HOST'], os.environ['BS_TEST'])\n",
+    )
+    .unwrap();
+    // Enough output that the daemon's reader cannot possibly have drained the
+    // pipe by the time the exit code arrives, so the detail can only carry the
+    // final marker if it is built after the drain rather than at the exit.
+    std::fs::write(
+        repo.join("sub").join("boom.py"),
+        "import sys\nfor i in range(20000):\n    print('filler', i)\nprint('boom-marker')\nsys.stdout.flush()\nsys.exit(3)\n",
     )
     .unwrap();
     common::commit_all(repo, &[], "config");
@@ -183,6 +259,7 @@ async fn a_web_run_becomes_ready_streams_its_output_and_stops() {
     let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
     let mut c = Client::connect(p, &token).await;
     let ws = create_ws(&mut c, &repo, "runs").await;
+    let _guard = PortGuard(port);
 
     let started = start_run(&mut c, &ws.id, "web").await.unwrap();
     assert_eq!(started.host_port, port, "the noop backend does not bridge");
@@ -322,12 +399,18 @@ async fn run_start_refuses_an_unknown_config_a_disabled_one_and_a_bad_regex() {
 /// A command that exits before it is ready fails, and says why.
 #[tokio::test]
 async fn a_run_that_exits_before_it_is_ready_fails_with_its_exit_code() {
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let repo = init_repo(dir.path());
     let port = free_port();
     write_repo_config(
         &repo,
-        &format!("[[run]]\nname = \"boom\"\ncommand = \"exit 3\"\nport = {port}\n"),
+        &format!(
+            "[[run]]\nname = \"boom\"\ncommand = \"{py} boom.py\"\nport = {port}\ncwd = \"sub\"\n"
+        ),
     );
     let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
     let mut c = Client::connect(p, &token).await;
@@ -348,9 +431,22 @@ async fn a_run_that_exits_before_it_is_ready_fails_with_its_exit_code() {
         .iter()
         .find(|(s, _, _)| *s == RunState::Failed)
         .unwrap_or_else(|| panic!("the run must fail: {seen:?}"));
+    let detail = failed.2.as_deref().unwrap_or_default();
     assert!(
-        failed.2.as_deref().unwrap_or_default().contains('3'),
-        "the detail must carry the exit code: {failed:?}"
+        detail.contains("exit code 3"),
+        "the detail must carry the exit code: {detail:?}"
+    );
+    // The detail is built after the readers drain, so the *last* lines the run
+    // printed are in it — not whatever the reader happened to have consumed
+    // when the exit code arrived.
+    assert!(
+        detail.contains("boom-marker"),
+        "the detail must carry the run's last output: {detail:?}"
+    );
+    assert!(
+        detail.lines().count() <= 21,
+        "the detail is the exit code plus at most 20 lines: {} lines",
+        detail.lines().count()
     );
     assert!(
         !has_state(&evs, RunState::Ready),
@@ -399,6 +495,82 @@ async fn a_run_gets_port_host_and_its_configured_environment_in_its_cwd() {
     cancel.cancel();
 }
 
+/// A dev server frames its banner with blank lines. One of those must not be
+/// read as end of stream: it would take the rest of the run's output with it,
+/// and with a `ready_regex` set the run could then never become ready at all.
+#[tokio::test]
+async fn a_blank_output_line_does_not_end_the_stream_or_strand_a_ready_regex() {
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let port = free_port();
+    let (sep, blank) = (chain(), blank_line());
+    // A blank line, then the marker, then the server: the marker is only ever
+    // seen by a reader that survived the blank line before it.
+    write_repo_config(
+        &repo,
+        &format!(
+            "[[run]]\nname = \"banner\"\ncommand = \"{blank}{sep}echo READY{sep}{py} -m http.server {port} --bind 127.0.0.1\"\nport = {port}\nready_regex = \"READY\"\n"
+        ),
+    );
+    let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(p, &token).await;
+    let ws = create_ws(&mut c, &repo, "banner").await;
+    let _guard = PortGuard(port);
+
+    let started = start_run(&mut c, &ws.id, "banner").await.unwrap();
+    let evs = run_events(&mut c, &started.run_id, READY, |e| {
+        has_state(e, RunState::Ready)
+    })
+    .await;
+    assert!(
+        has_state(&evs, RunState::Ready),
+        "the regex after the blank line must still make the run ready: {:?}",
+        states(&evs)
+    );
+    let lines = output(&evs);
+    assert!(
+        lines.iter().any(String::is_empty),
+        "the blank line itself must reach the client: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.trim() == "READY"),
+        "the line after the blank one must reach the client: {lines:?}"
+    );
+
+    c.call(Request::RunStop(RunIdParams {
+        run_id: started.run_id.clone(),
+    }))
+    .await
+    .unwrap();
+    cancel.cancel();
+}
+
+/// `run.stop` is idempotent for a run this daemon started, and honest about an
+/// id it never minted.
+#[tokio::test]
+async fn run_stop_refuses_an_id_that_never_existed() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    write_repo_config(&repo, "");
+    let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(p, &token).await;
+    let _ws = create_ws(&mut c, &repo, "nosuchrun").await;
+
+    let err = c
+        .call(Request::RunStop(RunIdParams {
+            run_id: "run_deadbeef".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound, "{err:?}");
+
+    cancel.cancel();
+}
+
 /// `workspace.destroy` ends the run before it answers, so a client never sees a
 /// workspace disappear with a run still claiming to be ready.
 #[tokio::test]
@@ -419,6 +591,7 @@ async fn destroy_stops_a_ready_run_before_it_replies() {
     let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
     let mut c = Client::connect(p, &token).await;
     let ws = create_ws(&mut c, &repo, "destroyed").await;
+    let _guard = PortGuard(port);
 
     let started = start_run(&mut c, &ws.id, "web").await.unwrap();
     run_events(&mut c, &started.run_id, READY, |e| {

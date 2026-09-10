@@ -45,6 +45,11 @@ use tracing::warn;
 /// a command that has not even been exec'd yet is never probed.
 const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// The whole budget for one readiness check, kept under [`PROBE_INTERVAL`] so a
+/// probe against a port that neither answers nor refuses cannot stretch a tick
+/// past the cadence it belongs to.
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// The most of one output line that reaches a client. A run is free to print a
 /// megabyte with no newline in it; that must cost the daemon a bounded buffer
 /// and the IDE a bounded event, so the rest of such a line is dropped.
@@ -81,8 +86,24 @@ const SIGKILL: i32 = 9;
 /// target OS.
 const BWRAP_BACKEND: &str = "linux_bwrap";
 
+/// How many ended run ids are remembered, so `run.stop` can tell a run that
+/// finished a moment ago from an id that never existed. Bounded because the
+/// only thing it has to cover is the gap between a terminal `run.state` event
+/// and a Stop click already on its way.
+const ENDED_MEMORY: usize = 64;
+
 type Tail = Arc<Mutex<VecDeque<String>>>;
 type Runs = Arc<Mutex<HashMap<RunId, Arc<Run>>>>;
+type Ended = Arc<Mutex<VecDeque<RunId>>>;
+
+/// Records that `id` is a run this daemon started and has since ended.
+fn retire(ended: &Ended, id: &RunId) {
+    let mut ended = ended.lock();
+    if ended.len() == ENDED_MEMORY {
+        ended.pop_front();
+    }
+    ended.push_back(id.clone());
+}
 
 /// One live run.
 ///
@@ -162,6 +183,9 @@ pub struct RunManager {
     /// `run.start` calls that arrive together cannot both pass the conflict
     /// check while neither is in `runs` yet.
     claims: Arc<Mutex<HashSet<(WorkspaceId, String)>>>,
+    /// The last [`ENDED_MEMORY`] runs to end, so `stop` can answer a race
+    /// differently from a mistake. See [`RunManager::stop`].
+    ended: Ended,
     next_ordinal: AtomicU64,
 }
 
@@ -184,6 +208,7 @@ impl RunManager {
             events,
             runs: Arc::new(Mutex::new(HashMap::new())),
             claims: Arc::new(Mutex::new(HashSet::new())),
+            ended: Arc::new(Mutex::new(VecDeque::new())),
             next_ordinal: AtomicU64::new(0),
         }
     }
@@ -331,6 +356,7 @@ impl RunManager {
         let supervisor = tokio::spawn(supervise(
             run.clone(),
             self.runs.clone(),
+            self.ended.clone(),
             self.events.clone(),
             readiness,
         ));
@@ -346,14 +372,23 @@ impl RunManager {
     /// Ends a run: SIGTERM to its process group, SIGKILL after [`TERM_GRACE`],
     /// then the bridge and the forwarder.
     ///
-    /// Idempotent. A run that has already ended — stopped by an earlier call,
-    /// or gone on its own a moment before the user clicked Stop — is not an
-    /// error: `stop` is a teardown verb, and the client has already been told
-    /// the run is over by its terminal `run.state` event.
+    /// Idempotent for a run this daemon actually started. One that has already
+    /// ended — stopped by an earlier call, or gone on its own a moment before
+    /// the user clicked Stop — answers `Ok`: `stop` is a teardown verb, and the
+    /// client has already been told the run is over by its terminal
+    /// `run.state` event. An id nobody ever minted is a different thing, and a
+    /// client that sends one is told so.
     pub async fn stop(&self, id: &RunId) -> Result<Empty, RpcError> {
         let Some(run) = self.runs.lock().remove(id) else {
-            return Ok(Empty {});
+            return if self.ended.lock().contains(id) {
+                Ok(Empty {})
+            } else {
+                Err(RpcError::not_found(format!("run {id}")))
+            };
         };
+        // Before the teardown rather than after it, so a second `run.stop` that
+        // arrives during the termination grace is answered as the race it is.
+        retire(&self.ended, id);
         stop_run(&run, &self.events).await;
         Ok(Empty {})
     }
@@ -391,6 +426,9 @@ impl RunManager {
                 .collect();
             ids.into_iter().filter_map(|id| runs.remove(&id)).collect()
         };
+        for run in &victims {
+            retire(&self.ended, &run.id);
+        }
         // Together rather than one after another: each one may wait out the
         // whole termination grace.
         futures::future::join_all(victims.iter().map(|run| stop_run(run, &self.events))).await;
@@ -498,7 +536,13 @@ enum ReadinessSource {
 /// Readiness is polled rather than pushed because both sources are polled
 /// things: a port either answers now or it does not, and a regex hit is a flag
 /// the readers set as output arrives.
-async fn supervise(run: Arc<Run>, runs: Runs, events: EventBus, readiness: ReadinessSource) {
+async fn supervise(
+    run: Arc<Run>,
+    runs: Runs,
+    ended: Ended,
+    events: EventBus,
+    readiness: ReadinessSource,
+) {
     let mut exit = run.exit.clone();
     loop {
         tokio::select! {
@@ -506,14 +550,7 @@ async fn supervise(run: Arc<Run>, runs: Runs, events: EventBus, readiness: Readi
                 // Gone before it ever answered: that is a failure, and the exit
                 // code with the last of its output is the only explanation
                 // anyone gets.
-                finish(
-                    &run,
-                    &runs,
-                    &events,
-                    RunState::Failed,
-                    Some(exit_detail(code, &run.tail)),
-                )
-                .await;
+                finish(&run, &runs, &ended, &events, RunState::Failed, code).await;
                 return;
             }
             _ = tokio::time::sleep(PROBE_INTERVAL) => {
@@ -523,28 +560,32 @@ async fn supervise(run: Arc<Run>, runs: Runs, events: EventBus, readiness: Readi
             }
         }
     }
+    // A probe that came good while `stop` was tearing the run down must not
+    // announce a URL for a run that has already stopped.
+    if run.finished.load(Ordering::SeqCst) {
+        return;
+    }
     publish(&events, &run, RunState::Ready, Some(run.url.clone()), None);
     // Ready, so whatever ends it from here is an ending rather than a failure.
     // `stop` claims `finished` before this ever sees the exit, and `finish`
     // then keeps quiet.
     let code = exit.await;
-    finish(
-        &run,
-        &runs,
-        &events,
-        RunState::Stopped,
-        Some(exit_detail(code, &run.tail)),
-    )
-    .await;
+    finish(&run, &runs, &ended, &events, RunState::Stopped, code).await;
 }
 
 /// Publishes a run's terminal state, once, and forgets it.
+///
+/// The detail is built *after* the drain, not before: a command that prints an
+/// error and exits usually delivers its exit code before the daemon has read
+/// its pipes, so a detail assembled at the exit would carry the code and none
+/// of the lines that explain it.
 async fn finish(
     run: &Arc<Run>,
     runs: &Runs,
+    ended: &Ended,
     events: &EventBus,
     state: RunState,
-    detail: Option<String>,
+    code: i32,
 ) {
     // What the process wrote before it went is still worth sending, so the
     // readers get a moment to finish ahead of the terminal state.
@@ -555,8 +596,9 @@ async fn finish(
         return;
     }
     runs.lock().remove(&run.id);
+    retire(ended, &run.id);
     teardown_run(run);
-    publish(events, run, state, None, detail);
+    publish(events, run, state, None, Some(exit_detail(code, &run.tail)));
 }
 
 /// Lets the reader tasks finish, then abandons whichever did not.
@@ -652,8 +694,14 @@ async fn is_ready(run: &Arc<Run>, readiness: &ReadinessSource) -> bool {
             // No sandbox between here and the process: the port it bound is the
             // host's. Connect and close, with nothing sent, so probing a server
             // that logs its requests does not fill the run's output with them.
+            //
+            // This proves the port answers, not who is behind it. A run whose
+            // own bind lost the port to something already listening can be seen
+            // as ready for the moment before its exit is observed. The bridged
+            // probe has no such hole: the socket it goes through belongs to
+            // this run's forwarder alone.
             tokio::time::timeout(
-                PROBE_INTERVAL,
+                PROBE_BUDGET,
                 tokio::net::TcpStream::connect(("127.0.0.1", run.host_port)),
             )
             .await
@@ -859,15 +907,23 @@ impl Lines {
         }
     }
 
+    /// The next line, or `None` once the pipe is finished.
+    ///
+    /// A terminated line is always `Some`, **including an empty one**: dev
+    /// servers frame their banners with blank lines, and treating one as the
+    /// end of the stream would silence the run's output — and the readiness
+    /// regex reading it — from the first blank line onwards.
     async fn next(&mut self) -> Option<String> {
         loop {
             let (consume, complete) = {
                 let available = match self.reader.fill_buf().await {
                     Ok(b) => b,
-                    Err(_) => return self.take(),
+                    // A read error ends the stream as surely as EOF does, and
+                    // whatever was already buffered is still a line.
+                    Err(_) => return self.take_partial(),
                 };
                 if available.is_empty() {
-                    return self.take();
+                    return self.take_partial();
                 }
                 match available.iter().position(|b| *b == b'\n') {
                     Some(i) => {
@@ -883,16 +939,22 @@ impl Lines {
             };
             self.reader.consume(consume);
             if complete {
-                return self.take();
+                return Some(self.take_line());
             }
         }
     }
 
-    /// The line built so far, or `None` at a clean end of stream.
-    fn take(&mut self) -> Option<String> {
+    /// What is left when the stream ends: a last line the process wrote without
+    /// a newline, or `None` when it ended on one.
+    fn take_partial(&mut self) -> Option<String> {
         if self.buf.is_empty() {
             return None;
         }
+        Some(self.take_line())
+    }
+
+    /// The line built so far, and the buffer cleared. May be empty.
+    fn take_line(&mut self) -> String {
         if self.truncated {
             tracing::debug!("a run printed a line longer than {MAX_LINE} bytes; it was cut");
             self.truncated = false;
@@ -901,7 +963,7 @@ impl Lines {
         // A Windows child writes CRLF, and the carriage return is not part of
         // the line anyone wants to read or match a regex against.
         let end = bytes.len() - usize::from(bytes.last() == Some(&b'\r'));
-        Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+        String::from_utf8_lossy(&bytes[..end]).into_owned()
     }
 }
 
@@ -927,6 +989,42 @@ mod tests {
             assert_eq!((argv[0].as_str(), argv[1].as_str()), ("/bin/sh", "-c"));
         }
         assert_eq!(argv[2], "npm run dev -- --port 3000");
+    }
+
+    /// A dev server frames its banner with blank lines. Reading one as end of
+    /// stream would take the rest of the run's output — and its readiness
+    /// regex — with it, so a terminated empty line has to come back as one.
+    #[tokio::test]
+    async fn a_blank_line_is_a_line_and_not_the_end_of_the_stream() {
+        let pipe: ChildReader = Box::pin(std::io::Cursor::new(b"a\n\nb\n".to_vec()));
+        let mut lines = Lines::new(pipe);
+        let mut seen = Vec::new();
+        while let Some(line) = lines.next().await {
+            seen.push(line);
+        }
+        assert_eq!(seen, vec!["a", "", "b"]);
+
+        // The vite shape: a leading blank line, then the banner. Before the
+        // fix this yielded nothing at all.
+        let vite = "\n  VITE v5.0  ready\n\n  Local:   http://localhost:5173/\n";
+        let pipe: ChildReader = Box::pin(std::io::Cursor::new(vite.as_bytes().to_vec()));
+        let mut lines = Lines::new(pipe);
+        let mut seen = Vec::new();
+        while let Some(line) = lines.next().await {
+            seen.push(line);
+        }
+        assert_eq!(seen.len(), 4, "{seen:?}");
+        assert_eq!(seen[0], "");
+        assert!(seen[1].contains("VITE"), "{seen:?}");
+        assert_eq!(seen[2], "");
+        assert!(seen[3].contains("Local:"), "{seen:?}");
+
+        // A stream that is nothing but blank lines still ends.
+        let pipe: ChildReader = Box::pin(std::io::Cursor::new(b"\n\n".to_vec()));
+        let mut lines = Lines::new(pipe);
+        assert_eq!(lines.next().await.as_deref(), Some(""));
+        assert_eq!(lines.next().await.as_deref(), Some(""));
+        assert_eq!(lines.next().await, None, "EOF is the only None");
     }
 
     #[tokio::test]

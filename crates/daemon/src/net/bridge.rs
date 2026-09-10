@@ -28,9 +28,10 @@ pub const STATUS_OK: u8 = 1;
 /// The forwarder could not reach the service on that port.
 pub const STATUS_FAILED: u8 = 0;
 
-/// How long [`Bridge::probe`] waits for the socket and the status byte. The
-/// readiness loop runs every 500 ms, so a probe must not outlive its turn.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+/// The whole budget for one [`probe`]: the socket connect *and* the status
+/// byte, together. The readiness loop runs every 500 ms, so this is what keeps
+/// a probe inside its own turn rather than spilling into the next.
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// A host port standing in for a port inside one sandbox.
 ///
@@ -95,15 +96,16 @@ impl Bridge {
 /// socket path: the [`Bridge`] itself lives behind a lock that must not be held
 /// across the probe's awaits.
 pub async fn probe(socket: &std::path::Path) -> bool {
-    let connect = tokio::time::timeout(PROBE_TIMEOUT, tokio::net::UnixStream::connect(socket));
-    let Ok(Ok(mut s)) = connect.await else {
-        return false;
-    };
-    let mut status = [0u8; 1];
-    matches!(
-        tokio::time::timeout(PROBE_TIMEOUT, s.read_exact(&mut status)).await,
-        Ok(Ok(_))
-    ) && status[0] == STATUS_OK
+    // One timeout over both steps, not one each: a connect that takes the whole
+    // budget leaves nothing for the byte, which is the honest reading of "this
+    // did not answer in time".
+    let round_trip = tokio::time::timeout(PROBE_BUDGET, async {
+        let mut s = tokio::net::UnixStream::connect(socket).await.ok()?;
+        let mut status = [0u8; 1];
+        s.read_exact(&mut status).await.ok()?;
+        Some(status[0])
+    });
+    matches!(round_trip.await, Ok(Some(STATUS_OK)))
 }
 
 async fn accept_loop(
