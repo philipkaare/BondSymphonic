@@ -48,18 +48,11 @@ SetupPage::SetupPage(AppController* controller, QWidget* parent)
     : QWidget(parent), m_controller(controller) {
     auto* outer = new QVBoxLayout(this);
 
-    m_title = new QLabel("Set up BondSymphonic", this);
-    QFont titleFont = m_title->font();
-    titleFont.setPointSize(titleFont.pointSize() + 6);
-    titleFont.setBold(true);
-    m_title->setFont(titleFont);
-    outer->addWidget(m_title);
-
-    m_subtitle = new QLabel(
+    auto* subtitle = new QLabel(
         "BondSymphonic runs its agents inside a sandbox in WSL. These are what it needs.", this);
-    m_subtitle->setWordWrap(true);
-    m_subtitle->setEnabled(false);
-    outer->addWidget(m_subtitle);
+    subtitle->setWordWrap(true);
+    subtitle->setEnabled(false);
+    outer->addWidget(subtitle);
 
     // Scrolled: eight rows fit, but a detail line long enough to wrap twice
     // must not push the buttons off the bottom of a short window.
@@ -138,22 +131,13 @@ SetupPage::SetupPage(AppController* controller, QWidget* parent)
 
     auto* buttons = new QHBoxLayout();
     m_recheckButton = new QPushButton("Re-check", this);
-    m_continueButton = new QPushButton("Continue anyway", this);
-    // The rule is "no blocking failure has been reported", not "a check
-    // succeeded". A check that never answers -- a daemon that is down, which is
-    // exactly when someone opens this page from the Help menu -- reports no
-    // failure, and the page must not become a room with no door. Nothing is
-    // lost by being wrong here: continuing with a broken sandbox fails loudly
-    // at the first workspace, whereas a window that cannot be dismissed has to
-    // be restarted.
+    m_recheckButton->setToolTip("Ask the daemon about these again");
     buttons->addWidget(m_recheckButton);
     buttons->addStretch(1);
-    buttons->addWidget(m_continueButton);
     outer->addLayout(buttons);
 
     QObject::connect(m_recheckButton, &QPushButton::clicked, this,
                      [this] { m_controller->recheckPrereqs(); });
-    QObject::connect(m_continueButton, &QPushButton::clicked, this, &SetupPage::completed);
     QObject::connect(m_controller, &AppController::prereqsChecked, this, &SetupPage::applyPrereqs);
     QObject::connect(m_controller, &AppController::setupPtyOpened, this,
                      &SetupPage::onSetupPtyOpened);
@@ -181,22 +165,12 @@ SetupPage::SetupPage(AppController* controller, QWidget* parent)
 void SetupPage::applyPrereqs(const QString& json) {
     clearRows();
     const QJsonArray items = QJsonDocument::fromJson(json.toUtf8()).array();
-    bool allOk = true;
     for (const QJsonValue& value : items) {
         const QJsonObject item = value.toObject();
-        const bool ok = item.value("ok").toBool();
-        allOk = allOk && ok;
-        addRow(item.value("name").toString(), ok, item.value("detail").toString(),
-               item.value("fix_hint").toString());
+        addRow(item.value("name").toString(), item.value("ok").toBool(),
+               item.value("detail").toString(), item.value("fix_hint").toString());
     }
     m_rowsLayout->addStretch(1);
-    // "Continue anyway" is about the four the IDE cannot work around; a missing
-    // CLI or login costs the user Claude Code and nothing else.
-    m_continueButton->setEnabled(!m_controller->prereqsBlock(json));
-    if (allOk && !items.isEmpty()) {
-        // Nothing left to do here. The page says so by getting out of the way.
-        emit completed();
-    }
 }
 
 void SetupPage::setActionsEnabled(bool enabled) {
@@ -417,14 +391,6 @@ void SetupPage::clearLink() {
     m_linkLabel->clear();
     m_linkLabel->setToolTip(QString());
     m_linkRow->setVisible(false);
-}
-
-void SetupPage::setEmbedded(bool embedded) {
-    m_title->setVisible(!embedded);
-    m_subtitle->setVisible(!embedded);
-    // "Continue anyway" dismisses a wall. Inside Settings there is no wall to
-    // dismiss and the dialog's own buttons are what close it.
-    m_continueButton->setVisible(!embedded);
 }
 
 void SetupPage::resizeEvent(QResizeEvent* event) {

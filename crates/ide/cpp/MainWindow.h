@@ -265,6 +265,13 @@ private:
     QLabel* m_opLabel = nullptr;
     /// The URL behind that line, so the click has something to open.
     QString m_opUrl;
+    /// What that line said before "Reading repository…" took it over: the
+    /// rendered text, its tooltip and the URL behind it. A pull request's
+    /// answer is a link the user may still want, and opening New Agent is no
+    /// reason to lose it.
+    QString m_opTextBeforeInspect;
+    QString m_opTipBeforeInspect;
+    QString m_opUrlBeforeInspect;
     /// What the sandbox label shows when no tab is selected: normally a dash,
     /// or the prerequisite warning once the controller has reported one.
     QString m_sandboxIdleText;

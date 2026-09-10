@@ -1416,11 +1416,11 @@ fn a_workspace_name_must_be_one_path_safe_word() {
     );
 }
 
-/// Whether the chat composer is open, read off the prerequisite list rather
-/// than off anything the IDE remembers: `claude_auth` is the daemon's answer to
-/// "can Claude Code run without a login prompt", and `-p` mode cannot log in,
-/// so a composer offered before it passes only ever produces "login is not
-/// available in this environment".
+/// Whether the chat composer is open, read off the prerequisite list and the
+/// credential store rather than off anything the IDE remembers: `claude_auth`
+/// is the daemon's answer to "can Claude Code run without a login prompt", and
+/// `-p` mode cannot log in, so a composer offered with neither credential only
+/// ever produces "login is not available in this environment".
 #[test]
 fn claude_login_is_read_off_the_claude_auth_prerequisite() {
     use bondsymphonic_ide::qobjects::app_controller::claude_logged_in;
@@ -1434,17 +1434,36 @@ fn claude_login_is_read_off_the_claude_auth_prerequisite() {
             fix_hint: None,
         }
     }
+    const NO_KEY: bool = false;
+    const KEY: bool = true;
 
-    assert!(claude_logged_in(&[
-        item("claude", true),
-        item("claude_auth", true)
-    ]));
-    assert!(!claude_logged_in(&[
-        item("claude", true),
-        item("claude_auth", false)
-    ]));
+    assert!(claude_logged_in(
+        &[item("claude", true), item("claude_auth", true)],
+        NO_KEY
+    ));
+    assert!(!claude_logged_in(
+        &[item("claude", true), item("claude_auth", false)],
+        NO_KEY
+    ));
     // No answer is not a yes: a daemon that never reported the item leaves the
     // gate shut rather than opening a composer that cannot send.
-    assert!(!claude_logged_in(&[item("claude", true)]));
-    assert!(!claude_logged_in(&[]));
+    assert!(!claude_logged_in(&[item("claude", true)], NO_KEY));
+    assert!(!claude_logged_in(&[], NO_KEY));
+
+    // A stored API key is the other credential. The daemon's `claude_auth`
+    // cannot see it -- it answers from `claude auth status` and the daemon's own
+    // environment -- so a gate on that alone would shut a user out of every
+    // composer while their agents ran perfectly on the key.
+    assert!(claude_logged_in(
+        &[item("claude", true), item("claude_auth", false)],
+        KEY
+    ));
+    assert!(claude_logged_in(&[], KEY));
+    // And removing the key shuts it again when nothing else vouches for Claude.
+    assert!(!claude_logged_in(
+        &[item("claude", true), item("claude_auth", false)],
+        NO_KEY
+    ));
+    // Either credential alone is enough; neither is not.
+    assert!(claude_logged_in(&[item("claude_auth", true)], KEY));
 }

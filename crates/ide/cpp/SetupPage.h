@@ -12,31 +12,25 @@ class QResizeEvent;
 class QTimer;
 class QVBoxLayout;
 
-/// The first-run page: one row per prerequisite, a button on the ones the IDE
-/// can fix by opening a terminal, and that terminal underneath.
+/// The Setup section of the Settings dialog: one row per prerequisite, a button
+/// on the ones the IDE can fix by opening a terminal, that terminal underneath,
+/// and the sign-in link the terminal printed.
 ///
 /// The page owns no state of its own. Every row is rebuilt from the
 /// `prereqsChecked` payload, so what it shows is always the daemon's last
 /// answer rather than a copy made when a button was clicked. A fix ends the
 /// same way whatever it was: the terminal exits, the controller re-checks, and
 /// the rows redraw.
+///
+/// It is a section rather than a page: `SettingsDialog` is the only thing that
+/// builds one, and the dialog's own buttons are what close it. It carries no
+/// heading and no "Continue anyway" of its own -- what a blocking prerequisite
+/// gets instead is the dialog opening by itself, which the user closes when
+/// they choose to carry on regardless.
 class SetupPage : public QWidget {
     Q_OBJECT
 public:
     explicit SetupPage(AppController* controller, QWidget* parent = nullptr);
-
-    /// Drops the heading, the subtitle and "Continue anyway".
-    ///
-    /// The page is hosted twice: on its own it is a first-run wall and needs
-    /// all three, and inside the Settings dialog it is one section of a form
-    /// whose own buttons close it. Nothing else differs, so this is a trim
-    /// rather than a second page.
-    void setEmbedded(bool embedded);
-
-signals:
-    /// Nothing is left to fix, or the user chose to carry on regardless. The
-    /// window takes this as "show the workbench".
-    void completed();
 
 protected:
     /// Re-elides the sign-in URL: the label's width is only known once the
@@ -107,9 +101,6 @@ private:
     TerminalWidget* m_terminal = nullptr;
     QLabel* m_terminalLabel = nullptr;
     QPushButton* m_recheckButton = nullptr;
-    QPushButton* m_continueButton = nullptr;
-    QLabel* m_title = nullptr;
-    QLabel* m_subtitle = nullptr;
     /// The "Sign-in link" row under the terminal, hidden until a login URL is
     /// detected and taken down again when the terminal exits.
     QWidget* m_linkRow = nullptr;

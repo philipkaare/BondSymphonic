@@ -836,12 +836,25 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journals) {
                     Request::SystemCheckPrereqs {} => Some(ServerMessage::ok(
                         id,
                         &CheckPrereqsResult {
-                            items: vec![PrereqStatus {
-                                name: "git".into(),
-                                ok: true,
-                                detail: "git version 2.43".into(),
-                                fix_hint: None,
-                            }],
+                            items: vec![
+                                PrereqStatus {
+                                    name: "git".into(),
+                                    ok: true,
+                                    detail: "git version 2.43".into(),
+                                    fix_hint: None,
+                                },
+                                // Part of the fixture, not decoration: it is
+                                // what opens the transcript composer, so the
+                                // scripted `send` runs against a pane in the
+                                // state a logged-in user sees rather than
+                                // behind the login button.
+                                PrereqStatus {
+                                    name: "claude_auth".into(),
+                                    ok: true,
+                                    detail: "logged in".into(),
+                                    fix_hint: None,
+                                },
+                            ],
                         },
                     )),
                     // Every workspace this daemon has made, which is empty at

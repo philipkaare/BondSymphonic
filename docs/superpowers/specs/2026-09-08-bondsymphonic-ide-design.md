@@ -112,6 +112,7 @@ crates/ide/
     RunPanel.{h,cpp}        config combo, start/stop, url label, log
     NewAgentDialog.{h,cpp}  repo picker, base branch, name, adapter, run config
     SetupPage.{h,cpp}       prereq rows, fix commands, login terminal, sign-in link
+                            (a section of SettingsDialog; it is never a page of its own)
     SettingsDialog.{h,cpp}  hosts SetupPage as its first section, then agent settings
   tests/
     model_tests.rs          pure model tests
@@ -279,16 +280,24 @@ using the same `RustHighlighter`.
 - Input box: multi-line, Enter sends, Shift+Enter newline. Disabled while the
   agent is working, except an Interrupt button.
 - **The composer is gated on `AppController::claudeLoggedIn`**, a bool property
-  derived from the daemon's `claude_auth` prerequisite (`claude_logged_in` in
-  `app_controller.rs`; an item that is absent counts as not logged in). While it
-  is false, `TranscriptView` hides the whole composer widget and shows a "Log in
-  to Claude Code…" button in its place, which the window turns into
-  Settings > Setup. An agent runs `claude -p` and `-p` mode cannot log in, so a
-  composer offered before the login exists can only lose what the user typed.
-  The property moves on the re-check a setup terminal triggers when it exits, so
-  the composer returns without an IDE restart. `AgentArea` holds the current
-  value and applies it to every transcript pane, including ones built later;
-  terminal panes and the permission bar are untouched.
+  meaning "a Claude agent can answer a prompt". `claude_logged_in` in
+  `app_controller.rs` is `claude_auth ok || api_key_set()`: **both** credentials
+  count, because the daemon's `claude_auth` answers from `claude auth status`,
+  the daemon user's credentials file and the daemon's own environment, and knows
+  nothing about the Anthropic API key this IDE keeps in the Windows credential
+  store and merges into `AgentStartOptions.api_key`. A gate on the prerequisite
+  alone would shut a key-only user out of every composer while their agents ran,
+  and send them to a dialog whose next section tells them the key is what to use
+  instead of a login. An absent `claude_auth` item counts as not logged in.
+  While the property is false, `TranscriptView` hides the whole composer widget
+  and shows a "Log in to Claude Code…" button in its place, which the window
+  turns into Settings > Setup. An agent runs `claude -p` and `-p` mode cannot
+  log in, so a composer offered with neither credential can only lose what the
+  user typed. The property is recomputed on every prerequisite check and again
+  after `setApiKey`/`clearApiKey`, so the composer returns without an IDE
+  restart either way. `AgentArea` holds the current value and applies it to
+  every transcript pane, including ones built later; terminal panes and the
+  permission bar are untouched.
 - On tab open, `agent.history` replays into the model before live events are
   applied (events received during replay are buffered).
 
@@ -409,6 +418,14 @@ terminal tab bound to no agent. There is deliberately no field in
   reaching other windows but not the event loop, so the login terminal inside it
   works exactly as it did on the full-window page, and a single dialog instance
   means a prerequisite re-check cannot stack a second one over the first.
+  Closing the dialog destroys the page and with it the terminal's session, which
+  closes the PTY and skips `onTerminalExited`, so `openSettings` calls
+  `recheckPrereqs()` after `exec` returns: a user who pastes the code and closes
+  Settings before the CLI process exits must not be left with a stale
+  `claude_auth: false` and no way back but the Re-check button. `SetupPage` has
+  no heading and no "Continue anyway" of its own — what a blocking prerequisite
+  gets instead is the dialog opening by itself, which the user closes when they
+  choose to carry on regardless.
 - **Logins happen inside the IDE, never via a terminal command the user must
   type.** The `SetupPage` lists each failing prerequisite with an action button.
   For `claude_auth` the button is "Log in to Claude Code": it opens a terminal
@@ -732,8 +749,10 @@ is immune to both and is what to use when a compound command is unavoidable.
     have already exited.
   - `system.setup_pty` never asked for: every prerequisite the fake daemon
     reports passes, so Settings never opens on Setup and no login terminal
-    opens. The same answer opens the transcript composer, because
-    `claudeLoggedIn` follows `claude_auth`.
+    opens. The fake daemon reports `git` and `claude_auth`, both ok; the second
+    is part of the fixture rather than decoration, because it is what makes
+    `claudeLoggedIn` true and so runs the scripted `send` against an open
+    composer rather than against a pane showing the login button.
   - `repo.detect_run_configs`, `run.list`, `run.start`, `workspace.get`,
     `workspace.set_allowlist` and `run.stop` in that order, after `agent.stop`
     and before the script's `pty.open`. The first two are the Run panel's own,

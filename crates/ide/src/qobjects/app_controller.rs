@@ -647,13 +647,18 @@ pub mod qobject {
         /// The key goes no further than the credential store and, later, the
         /// `agent.start` request: it is never held on this object, never
         /// logged, and never sent back out through a signal or a property.
+        ///
+        /// Takes `Pin<&mut>` because storing a key is one of the two ways
+        /// `claudeLoggedIn` can become true, and the property is recomputed
+        /// here rather than waiting for the next prerequisite check.
         #[qinvokable]
-        fn set_api_key(self: &AppController, key: QString) -> bool;
+        fn set_api_key(self: Pin<&mut AppController>, key: QString) -> bool;
 
         /// Removes the stored API key. Removing one that is not there
         /// succeeds: the caller asked for there to be none, and there is none.
+        /// Recomputes `claudeLoggedIn`, which may shut the composer again.
         #[qinvokable]
-        fn clear_api_key(self: &AppController) -> bool;
+        fn clear_api_key(self: Pin<&mut AppController>) -> bool;
 
         /// Whether a key is in the credential store. Asks the store, not the
         /// settings file, so a key deleted in Credential Manager is not still
@@ -1008,21 +1013,33 @@ pub fn prereqs_blocking(items: &[PrereqStatus]) -> bool {
 /// in. `claude --version` working is `claude`; this is the token behind it.
 pub const CLAUDE_AUTH_PREREQ: &str = "claude_auth";
 
-/// Whether Claude Code is logged in, according to the daemon's last check.
+/// Whether a Claude agent can answer a prompt: the daemon's `claude_auth`
+/// prerequisite passes, **or** this IDE has an Anthropic API key stored.
 ///
-/// The gate on the chat composer. An agent runs `claude -p`, which cannot log
-/// in -- typing `/login` into it answers "login is not available in this
-/// environment" -- so a composer offered before this is true can only produce
-/// that sentence. The login itself happens in the setup terminal, which is a
-/// PTY and can.
+/// The gate on the chat composer, and it takes two inputs because there are two
+/// ways to run Claude Code. An agent runs `claude -p`, which cannot log in --
+/// typing `/login` into it answers "login is not available in this
+/// environment" -- so a composer offered with neither credential can only
+/// produce that sentence. The login itself happens in the setup terminal,
+/// which is a PTY and can.
+///
+/// The key half is not optional. `claude_auth` is the daemon's own answer,
+/// derived from `claude auth status`, the daemon user's credentials file and
+/// the *daemon's* environment; it knows nothing about the key this IDE keeps in
+/// the Windows credential store and merges into `AgentStartOptions.api_key`.
+/// Without the second term, a user whose only credential is that key would be
+/// shut out of every composer while their agents ran perfectly, and sent to a
+/// dialog whose next section tells them the key is what to use instead of a
+/// login.
 ///
 /// An item that is not in the list at all counts as not logged in. A daemon
 /// that never reported it has told the IDE nothing, and a shut gate with a
 /// button on it costs one click, where an open one costs a lost prompt.
-pub fn claude_logged_in(items: &[PrereqStatus]) -> bool {
-    items
-        .iter()
-        .any(|item| item.name == CLAUDE_AUTH_PREREQ && item.ok)
+pub fn claude_logged_in(items: &[PrereqStatus], api_key_set: bool) -> bool {
+    api_key_set
+        || items
+            .iter()
+            .any(|item| item.name == CLAUDE_AUTH_PREREQ && item.ok)
 }
 
 /// The message the New Agent dialog shows under an unusable name.
@@ -1343,8 +1360,9 @@ async fn check_prereqs(client: DaemonClient, qt: QtHandle) {
     );
     // Computed here rather than in C++: the transcript panes read a property,
     // and deriving it from the JSON at each of them would put the same rule in
-    // as many places as there are panes.
-    let logged_in = claude_logged_in(&items);
+    // as many places as there are panes. The credential store is read on this
+    // thread, off the Qt one, for the same reason the request above was.
+    let logged_in = claude_logged_in(&items, crate::qobjects::settings::api_key_set());
     let _ = qt.queue(move |mut q| {
         // Before the signal, so a pane the window rebuilds on `prereqsChecked`
         // already sees the gate it is meant to draw.
@@ -1892,6 +1910,15 @@ impl qobject::AppController {
             name: name.to_string(),
             init_if_missing,
         };
+        // The same rule the dialog greys Create out on, applied again where the
+        // request is actually built. Not a duplicate check for its own sake:
+        // this is the only guard on a caller that is not the dialog, and a name
+        // stopped here fails with the sentence the user was already shown
+        // rather than with the daemon's wording for the same thing.
+        if let Err(hint) = validate_workspace_name(&params.name) {
+            report_failure(&qt, "workspace.create", hint.to_owned());
+            return;
+        }
         // Echoed straight back on success: the controller keeps no tab state.
         let (group, adapter, command, run_config) = (
             group.to_string(),
@@ -1972,6 +1999,12 @@ impl qobject::AppController {
             name: name.to_string(),
             init_if_missing,
         };
+        // As in `create_workspace_with_run`: the rule lives in one place and is
+        // applied wherever a create is built, not only where one is typed.
+        if let Err(hint) = validate_workspace_name(&params.name) {
+            report_failure(&qt, "workspace.create", hint.to_owned());
+            return;
+        }
         let group = group.to_string();
         // Kept for `state.json`, which the echo below does not reach.
         let (group_for_state, repo_for_state) = (group.clone(), params.repo_path.clone());
@@ -2298,15 +2331,40 @@ impl qobject::AppController {
         self.rust().capabilities.clone()
     }
 
-    pub fn set_api_key(&self, key: QString) -> bool {
+    pub fn set_api_key(mut self: Pin<&mut Self>, key: QString) -> bool {
         // `key` is moved straight into the credential store and dropped. It is
         // deliberately not logged, not stored on this object, and not echoed
         // back through any signal.
-        crate::qobjects::settings::set_api_key(&key.to_string())
+        let stored = crate::qobjects::settings::set_api_key(&key.to_string());
+        self.as_mut().refresh_claude_logged_in();
+        stored
     }
 
-    pub fn clear_api_key(&self) -> bool {
-        crate::qobjects::settings::clear_api_key()
+    pub fn clear_api_key(mut self: Pin<&mut Self>) -> bool {
+        let cleared = crate::qobjects::settings::clear_api_key();
+        self.as_mut().refresh_claude_logged_in();
+        cleared
+    }
+
+    /// Recomputes `claudeLoggedIn` from the last prerequisite list and the
+    /// credential store as it stands now.
+    ///
+    /// The prerequisite check is the usual trigger, but it is not the only one:
+    /// storing or removing an API key changes the answer with no daemon round
+    /// trip, and a composer that only reopened on the next check would leave a
+    /// key-only user pressing "Log in to Claude Code…" after they had just
+    /// supplied the credential in the section below it.
+    fn refresh_claude_logged_in(self: Pin<&mut Self>) {
+        let items: Vec<PrereqStatus> = {
+            let json = self.rust().prereqs_json.to_string();
+            if json.is_empty() {
+                Vec::new()
+            } else {
+                serde_json::from_str(&json).unwrap_or_default()
+            }
+        };
+        let logged_in = claude_logged_in(&items, crate::qobjects::settings::api_key_set());
+        self.set_claude_logged_in(logged_in);
     }
 
     pub fn api_key_set(&self) -> bool {

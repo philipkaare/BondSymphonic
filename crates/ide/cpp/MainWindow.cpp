@@ -301,6 +301,14 @@ void MainWindow::openSettings(bool onSetup) {
     }
     dialog.exec();
     m_settingsDialog = nullptr;
+    // Closing the dialog destroys the setup page, and with it the login
+    // terminal's session, which closes the PTY. That is correct cleanup, but it
+    // means `SetupPage::onTerminalExited` never runs -- so a user who pastes
+    // the code, sees "Login successful" and closes Settings before the CLI
+    // process exits would otherwise keep a stale `claude_auth: false` and go on
+    // being offered the login button. Asking again here is what makes the
+    // composer come back without an IDE restart.
+    m_controller->recheckPrereqs();
 }
 
 void MainWindow::onPrereqsChecked(const QString& json) {
@@ -725,7 +733,13 @@ void MainWindow::onNewAgent() {
     QApplication::setOverrideCursor(Qt::WaitCursor);
     // The permanent label rather than `showMessage`: a temporary status-bar
     // message hides every widget in the row, including the sandbox label, for
-    // as long as it is up -- and on a large repository that is a while.
+    // as long as it is up -- and on a large repository that is a while. What
+    // the label already said is put back afterwards: the last merge or pull
+    // request is often a link, and borrowing the line is not a reason to lose
+    // it.
+    m_opTextBeforeInspect = m_opLabel->text();
+    m_opTipBeforeInspect = m_opLabel->toolTip();
+    m_opUrlBeforeInspect = m_opUrl;
     showOperationMessage("Reading repository…", QString());
     // One shot. The guard object owns both connections, so whichever answer
     // arrives first takes the other one down with it and a later, unrelated
@@ -766,7 +780,16 @@ void MainWindow::openNewAgentDialog(const QString& initialPath, const QString& d
     if (m_newAgentPending) {
         m_newAgentPending = false;
         QApplication::restoreOverrideCursor();
-        showOperationMessage(QString(), QString());
+        // Put back verbatim rather than through `showOperationMessage`, which
+        // escapes what it is given: the stashed text is already the rendered
+        // HTML, and re-escaping it would show the markup.
+        m_opUrl = m_opUrlBeforeInspect;
+        m_opLabel->setText(m_opTextBeforeInspect);
+        m_opLabel->setToolTip(m_opTipBeforeInspect);
+        m_opLabel->setVisible(!m_opTextBeforeInspect.isEmpty());
+        m_opTextBeforeInspect.clear();
+        m_opTipBeforeInspect.clear();
+        m_opUrlBeforeInspect.clear();
     }
     NewAgentDialog dialog(m_controller, m_groupModel, initialPath, this);
     dialog.setGroup(m_groupBar->currentGroupName());

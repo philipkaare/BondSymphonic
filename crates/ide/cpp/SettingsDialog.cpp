@@ -57,7 +57,6 @@ SettingsDialog::SettingsDialog(AppController* controller, QWidget* parent)
     auto* setupBox = new QGroupBox("Setup", body);
     auto* setupLayout = new QVBoxLayout(setupBox);
     m_setup = new SetupPage(m_controller, setupBox);
-    m_setup->setEmbedded(true);
     setupLayout->addWidget(m_setup);
     bodyLayout->addWidget(setupBox, 1);
 

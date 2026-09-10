@@ -154,7 +154,13 @@ Use the row when the automatic open did not work, or when you want to finish the
 sign-in on another machine. The row goes away when the terminal exits, because
 the URL it carried is spent.
 
-**Re-check** runs the checks again. The four *blocking* checks are `git`,
+**Keep Settings open until the login terminal finishes.** Closing the dialog
+ends the `claude auth login` process it was running, so a sign-in half way
+through is abandoned. Closing it after a successful login is safe: the checks
+re-run when the dialog closes, so the ticks and the chat box catch up either
+way.
+
+**Re-check** runs the checks again, and so does closing the dialog. The four *blocking* checks are `git`,
 `bwrap`, `userns` and `sandbox`: without them there is no worktree and no
 sandbox, so there is nowhere to put an agent, and Settings opens on Setup by
 itself while one of them is failing. A missing `claude` or `gh`, or either
@@ -163,7 +169,9 @@ are warnings rather than a wall.
 
 **An API key instead of a login.** The **Agents** section of the same dialog
 stores an Anthropic API key in the Windows credential store, never in a config
-file. It is used only when
+file. A stored key counts as a credential everywhere a login does, so the chat
+box opens as soon as you save one — the `claude_auth` tick stays a cross,
+because that check is about the daemon's own login and cannot see your key. It is used only when
 Claude Code has no login of its own. Leaving the field empty keeps the stored
 key; **Remove key** deletes it. The same dialog sets the default permission mode
 new agents start with.
@@ -222,13 +230,15 @@ workspace the daemon has that no group claims lands in **Unsorted**.
 
 A Claude Code workspace's pane shows the conversation as it arrives.
 
-- **The prompt box only appears once Claude Code is logged in.** Until then the
-  foot of the pane says so and offers **Log in to Claude Code…**, which opens
-  Settings on its Setup section. An agent runs `claude -p`, and `-p` mode cannot
-  log in — typing `/login` into the chat answers "login is not available in this
-  environment" — so the login has to happen in the setup terminal. The box comes
-  back on its own when the check passes; there is no restart. Terminal tabs are
-  unaffected.
+- **The prompt box only appears once Claude Code has a credential** — either
+  the `claude_auth` check passes, or you have stored an Anthropic API key under
+  File > Settings… Until then the foot of the pane says so and offers **Log in
+  to Claude Code…**, which opens Settings on its Setup section. An agent runs
+  `claude -p`, and `-p` mode cannot log in — typing `/login` into the chat
+  answers "login is not available in this environment" — so the login has to
+  happen in the setup terminal. The box comes back on its own when the check
+  passes, and immediately when you store a key; there is no restart. Terminal
+  tabs are unaffected.
 - **Transcript.** Your prompts, the assistant's answers rendered as Markdown,
   one card per tool call with its input and its result, and a line per turn with
   what it cost and how long it took.
