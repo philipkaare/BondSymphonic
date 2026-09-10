@@ -537,6 +537,64 @@ web server the run started, roughly 78 MB across the seven `sandbox-init`
 helpers, and the rest in `bwrap` and the shells. The web server is the user's own
 process, not BondSymphonic's.
 
+**Measured, Milestone 7 (2026-09-10).** The first row taken on the **packaged
+release build** — `dist\BondSymphonic\bondsymphonic-ide.exe` produced by
+`scripts\package.ps1`, started with `BS_DAEMON_BINARY` unset so the launcher
+installed its own daemon copy into the distro, and with the real Windows
+platform plugin rather than offscreen, so it is comparable with M2b–M5. The
+second row is the same scenario on `target\debug\bondsymphonic-ide.exe`, so the
+release/debug difference can be read off directly and so M6's debug row still
+has a debug successor.
+
+The scenario, both rows: two workspaces over a throwaway repository — one a
+Claude tab whose transcript replayed a 198-message stream from a fake `claude`
+inside the workspace, one a terminal workspace with a live PTY — three open
+editor tabs (`README.md`, `src/main.rs`, `src/lib.rs`), one open diff, and one
+bridged run (`python3 -m http.server`), **plus** the workspace the daemon
+restored at startup, so three sandboxes were alive. Left idle 60 s after the run
+came up, and unlike M6's row this one *was* taken after that full idle.
+
+| | release (packaged) | debug | M6 (debug) | target |
+|---|---|---|---|---|
+| `bondsymphonic-ide.exe` working set | 139.6 MB | 146.0 MB | 132.1 MB | < 150 MB |
+| `bondsymphonic-ide.exe` private bytes | 78.7 MB | 78.7 MB | 67.9 MB | — |
+| `bondsymphonic-daemon` RSS | 13.3 MB | 22.9 MB | 20.7 MB | < 30 MB |
+
+Both targets hold, but the working set is the number to watch: **the debug build
+is 4 MB under the 150 MB target**, and this is the first scenario that carries a
+long transcript, three editors, a diff and a live run at the same time. The
+release build buys about 6 MB of that back and is the one a user runs.
+
+**Read the repeatability before drawing a trend.** Two samples ten seconds apart
+within one session were identical to 0.1 MB, but an earlier run of the same
+release scenario — on a package differing only by two smoke-script steps that
+nothing invoked — measured 126.6 MB working set, 80.0 MB private and 11.3 MB
+daemon. Working set therefore moves about 13 MB between runs while private bytes
+hold to about 1.3 MB, so **private bytes are the figure to compare across
+milestones** and the working-set column should be read as an upper bound of its
+run rather than as a settled constant. The higher of the two runs is recorded
+above.
+
+The daemon is 13.3 MB against M6's 20.7 MB for the reason M6 gave for being high:
+that row was taken seconds after a restart, while this one had been up and idle
+for a minute. The debug row's 22.9 MB is the same daemon binary under a session
+that had just destroyed two workspaces and created two more, which is the
+allocation-churn case again.
+
+Inside the distro the supervised tree came to roughly 58 MB across the three
+sandboxes: 27.2 MB in `bwrap` and the `sandbox-init` helpers, 19.5 MB in the
+Python web server the run started, and 10.9 MB in the Python stand-in for
+`claude`. The last two are the user's own processes, not BondSymphonic's.
+
+**Teardown.** After a quit through `closeEvent` the daemon is gone from the
+distro within **3.4 s**, measured by polling once a second from the moment the
+IDE process exited. Note that the obvious check for this is a trap on two
+counts: `pgrep -f bondsymphonic-daemon` run through `wsl -- bash -lc` always
+matches the wrapper's own command line and so is never empty, and `pgrep -x
+bondsymphonic-daemon` never matches at all because the name is 20 characters and
+`comm` is truncated to 15 (`bondsymphonic-d`). `ps -eo args | grep
+'[b]ondsymphonic-daemon'` is the check that answers truthfully.
+
 ## 14. Testing (IDE-specific)
 
 - `model/` unit tests: transcript delta coalescing and tool-result matching; diff

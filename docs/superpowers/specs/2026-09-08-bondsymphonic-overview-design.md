@@ -305,11 +305,32 @@ not). The first implementation task is a scripted, verified setup:
 | Unit | Windows and WSL, `cargo test` | Protocol round-trips; stream-json parsing against recorded Claude Code fixtures; run-config parsing and auto-detection; allowlist matching; diff and highlight span computation; IDE model state transitions |
 | Daemon integration | WSL (and Linux CI) | Create a real workspace in a temp repo; run a sandboxed process; assert it cannot write outside the worktree, cannot connect to a non-allowlisted host, and that a TCP listener inside is reachable on the forwarded host port; merge, rebase, conflict, destroy |
 | IDE smoke | Windows | Launch offscreen (`QT_QPA_PLATFORM=offscreen`), build the main window against a mock daemon, open a file, render a transcript |
-| Manual acceptance | Windows + WSL | The v1 scenario in section 2 |
+| Packaged smoke | Windows | `dist\BondSymphonic\bondsymphonic-ide.exe --version`, then the deployed exe run offscreen against a minimal fake daemon — proves the `windeployqt` output loads. Skips with a reason unless `BS_PACKAGED_EXE` points at a built package |
+| Manual acceptance | Windows + WSL | The v1 scenario in section 2, written up as a checklist at the end of `docs/user-guide.md` |
 
 Tests that need the real Claude Code binary are marked `#[ignore]` and run
 manually; everything else uses fixtures or a fake `claude` script that replays a
 recorded stream.
+
+### 9.1 Continuous integration
+
+`.github/workflows/ci.yml`, on every push and pull request. **Implemented in
+Milestone 7**; before that only the daemon and proto crates were covered.
+
+| Job | Runner | Steps |
+|---|---|---|
+| `linux` | `ubuntu-24.04` | Install bubblewrap and python3; **assert `bwrap` can create a user namespace** (relaxing `kernel.apparmor_restrict_unprivileged_userns` first if needed) and fail the job if it still cannot; `cargo fmt --all -- --check`; `cargo test -p bondsymphonic-proto -p bondsymphonic-daemon`; `cargo clippy -p bondsymphonic-proto -p bondsymphonic-daemon --all-targets -- -D warnings` |
+| `windows-ide` | `windows-latest` | `jurplel/install-qt-action@v4` with Qt 6.9.2 `win64_msvc2022_64`, cached; `QMAKE` derived from `QT_ROOT_DIR` and the job failed if the kit is not there; `QT_QPA_PLATFORM=offscreen`; `cargo fmt --all -- --check`; `cargo test -p bondsymphonic-proto -p bondsymphonic-ide --features bondsymphonic-ide/require-qt`; `cargo clippy -p bondsymphonic-ide --all-targets -- -D warnings` |
+
+Two rules make a green run mean something. On Linux the user-namespace check is
+a **gate, not a probe**: every sandbox and network test skips with a printed
+reason when `bwrap` cannot unshare, so a runner that blocked it would give a
+green job in which none of them ran. On Windows `--features require-qt` turns
+each IDE test's "`QMAKE` unset, skipping" escape hatch into a panic, so a runner
+that lost its Qt installation cannot report green either.
+
+There is no `windows-proto` job; the proto crate is tested on Windows inside
+`windows-ide`.
 
 ## 10. Milestones (build order)
 
@@ -336,3 +357,16 @@ Each milestone is independently demonstrable. Plans are written per milestone.
    `gh pr create`; discard; IDE layout and group persistence; reconnection.
 7. **Hardening.** Footprint measurement; integration test suite complete;
    packaging script (windeployqt + daemon binary); user docs.
+   **Done 2026-09-10.** `hello` carries a protocol version and a mismatched pair
+   fails with a reason instead of a decode error; the registry, agent records
+   and `state.json` are written atomically with fsync and the daemon refuses to
+   start twice on one data directory; the daemon integration suite covers every
+   scenario daemon spec §13 lists and passed three consecutive WSL runs;
+   Qt-less IDE tests report `SKIP` and fail under `--features require-qt`; CI
+   runs both hosts green (§9.1); `scripts\package.ps1` produces a runnable
+   `dist\BondSymphonic\`; transcripts collapse above 2,000 items; and
+   `docs/user-guide.md` is the guide, with the §2 acceptance scenario as a
+   checklist at its end. Footprint: IDE design §13, Milestone 7 rows.
+
+All seven milestones are complete. Each one's plan and its exit criteria are in
+`docs/superpowers/plans/`.
