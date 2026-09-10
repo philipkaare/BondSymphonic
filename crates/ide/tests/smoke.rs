@@ -553,12 +553,18 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
         .iter()
         .find(|g| g.name == GROUP)
         .unwrap_or_else(|| panic!("state.json has no {GROUP:?} group\n{context}"));
-    assert!(
-        group.workspace_ids.iter().any(|id| id == CLAUDE_WORKSPACE),
-        "state.json did not file {CLAUDE_WORKSPACE} under {GROUP:?}\n{context}"
+    // The group's whole membership, not just "the survivor is in there
+    // somewhere". The destroyed workspace has to be gone from it, or a restart
+    // would try to restore a tab for a workspace the daemon no longer has, and
+    // a `contains` check would pass while it sat there.
+    assert_eq!(
+        group.workspace_ids,
+        vec![CLAUDE_WORKSPACE.to_owned()],
+        "state.json's {GROUP:?} group should hold exactly {CLAUDE_WORKSPACE}, with the destroyed \
+         {TERMINAL_WORKSPACE} dropped\n{context}"
     );
-    // The destroyed workspace is gone from every group rather than left behind
-    // as a tab a restart would try to restore.
+    // And it is not hiding in another group either -- "Unsorted", say, if a
+    // reconcile had moved it before the destroy.
     assert!(
         !state
             .groups

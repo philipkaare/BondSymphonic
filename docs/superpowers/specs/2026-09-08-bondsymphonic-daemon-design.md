@@ -180,10 +180,14 @@ git pack-objects --revs --delta-base-offset -q <repo>/.git/objects/pack/pack
 
 ```
 
-`<after>` is the base branch after the operation and `<before>` the same ref
-before it, so the range is exactly the commits the operation added; for a push
-it is `refs/remotes/origin/<branch>` before and after. An empty range is a
-no-op. The pack is written straight into `objects/pack`, which is where `git
+For a merge, `<after>` is the base branch after the operation and `<before>`
+the same ref before it, so the range is exactly the commits the merge added. A
+push absorbs a different range: `<ws.branch> ^<ws.base_branch>`, everything the
+workspace's branch adds to its base. The reason is `refs/remotes/origin/<branch>`,
+which `git push -u` leaves behind — unlike the local workspace branch, that
+remote-tracking ref is *not* deleted when the workspace is destroyed, so it would
+be left pointing into an object directory that no longer exists. An empty range is
+a no-op. The pack is written straight into `objects/pack`, which is where `git
 repack` puts its own.
 
 The copy then proves itself, through a plain `git` carrying **no**
@@ -254,9 +258,10 @@ host with the daemon user's own configuration, never in a sandbox, and must be
 authenticated in the distro (reported by `check_prereqs` as `gh_auth`).
 `BS_GH_BIN` overrides the binary, split the way a shell would, for tests.
 
-Under the same per-repository lock as §5.4, and followed by the same absorb of
-`refs/remotes/origin/<branch>` before and after the push, whose failure is
-`reason: "objects_stranded"` with `pushed: true`.
+Under the same per-repository lock as §5.4, and followed by the same absorb
+(§5.2) — over `<ws.branch> ^<ws.base_branch>`, because what the push leaves
+behind is `refs/remotes/origin/<branch>` and that ref outlives the workspace.
+A failure there is `reason: "objects_stranded"` with `pushed: true`.
 
 A failure of either command is a `GitError` carrying `{command, exit_code,
 stderr}`. The `command` field is what tells the two apart; the title and the body

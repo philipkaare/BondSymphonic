@@ -355,16 +355,16 @@ find the Qt DLLs:
 ```powershell
 . .\scripts\env.ps1
 cargo test --workspace                                    # Windows; ide suites: lib, client, connection, diff, editor, model, persistence, qobject_smoke, reconnect, router, run, smoke, transcript
-.\scripts\test-daemon.ps1                                 # daemon tests inside WSL (16 integration test files; daemon unit tests: 77 on Windows, 81 on Linux)
+.\scripts\test-daemon.ps1                                 # daemon tests inside WSL (19 integration test files; daemon unit tests: 102 pass on Windows)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
 ### Test hooks
 
-The IDE carries four environment-gated hooks for `crates/ide/tests/smoke.rs` and
+The IDE carries three environment-gated hooks for `crates/ide/tests/smoke.rs` and
 `crates/ide/tests/reconnect_tests.rs`, which run the real binary with
-`QT_QPA_PLATFORM=offscreen` against an in-process fake daemon. All four are read once at
+`QT_QPA_PLATFORM=offscreen` against an in-process fake daemon. All three are read once at
 startup and do nothing at all when unset, which is every ordinary run.
 
 - `BS_DAEMON_ADDR` (a loopback `host:port`) and `BS_DAEMON_TOKEN`: connect straight to that
@@ -386,8 +386,8 @@ startup and do nothing at all when unset, which is every ordinary run.
   the fake daemon answers the start with a bridged host port, three state changes and a
   network denial; `allow_host` answers the denial toast through
   `AppController::requestAllowHost`, which the window routes to the Run panel's model only
-  when the panel is showing that workspace; `close` closes the script's PTY; `destroy`
-  destroys the workspace; `merge` merges the workspace through
+  when the panel is showing that workspace; `close` closes the script's PTY; `merge`
+  merges the workspace through
   `AppController::mergeWorkspace`, the same invokable the Changes toolbar calls (the first
   `merge` step of a run sends mode `merge` with no summary, the second `squash` with one);
   `pr` opens a pull request through `AppController::createPr`, the invokable behind the PR
@@ -434,8 +434,9 @@ needs a Claude login, a GitHub login or a network.
 - `FAKE_CLAUDE_ECHO_DELAY`: seconds the fake holds an echoed turn open before answering,
   for testing interrupt against something that is actually still working.
 
-The daemon reads these where it spawns an agent, so they have to be in the *daemon's*
-environment. When the IDE launches it through `wsl.exe`, name them in `WSLENV`
+The daemon reads each of these where it uses it -- the three Claude ones where it spawns
+an agent, `BS_GH_BIN` where it runs `gh` for a pull request -- so they have to be in the
+*daemon's* own environment. When the IDE launches it through `wsl.exe`, name them in `WSLENV`
 (`WSLENV=BS_CLAUDE_BIN/u:FAKE_CLAUDE_FIXTURE/u`, and `BS_GH_BIN/u:GH_STUB_LOG/u` for the
 `gh` stub) before starting the IDE, and put the fake
 somewhere the sandbox can see. The workspace's **worktree** is the reliable place: it is
