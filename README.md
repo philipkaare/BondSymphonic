@@ -71,11 +71,16 @@ provisioning over it and starts the IDE. It runs that provisioning every time, w
 what repairs a distro whose first setup was interrupted; it is idempotent, so a machine
 that is already set up ends up unchanged.
 
-**A second run is not instant.** It still works through the apt packages and probes the
-Claude Code installer, so expect minutes rather than seconds even when there is nothing to
-do. Run it again to repair a distro, not as a quick way to start the IDE — for that, run
-`bondsymphonic-ide.exe` directly. `-WhatIf` prints what it would do without touching
-anything, and `-NoStart` provisions without launching.
+**Close the IDE before re-running it.** Provisioning ends with
+`wsl --terminate bondsymphonic`, so a re-run shuts the whole distro down: the daemon, every
+sandbox, and with them your terminals, runs and agents. The IDE will reconnect and relaunch
+the daemon, but the processes inside are gone.
+
+**A second run is not instant either.** It still works through the apt packages and checks
+whether Claude Code is installed, so expect minutes rather than seconds even when there is
+nothing to do. Run it again to repair a distro, not as a quick way to start the IDE — for
+that, run `bondsymphonic-ide.exe` directly. `-WhatIf` prints what it would do without
+touching anything, and `-NoStart` provisions without launching.
 
 WSL2 itself is the one prerequisite the package cannot install for you. If `wsl --version`
 does not answer, run `wsl --install` in an elevated PowerShell and reboot first.

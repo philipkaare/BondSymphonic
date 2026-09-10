@@ -40,10 +40,18 @@ deliberate: a first setup interrupted half way leaves a distro that exists but i
 missing packages, and re-running the installer is how you repair it. Every step
 is idempotent, so a machine that is already set up ends up unchanged.
 
-Idempotent is not the same as quick. A second run still works through the apt
-packages and probes the Claude Code installer, so **expect it to take minutes
-even when it has nothing to do**. Re-run it to repair a distro you suspect is
-half-provisioned, not as a way to start the IDE — for that, run
+**Close the IDE before you re-run it.** Provisioning finishes with
+`wsl --terminate bondsymphonic`, which is what makes the distro's default user
+take effect — and it shuts the whole distro down. Every sandbox goes with it, so
+your terminals stop, your runs stop and your agents die. The IDE notices the
+daemon has gone and relaunches it, but nothing that was running inside comes
+back; terminals offer **Reopen** and runs have to be started again. Quit the IDE
+first and none of that arises.
+
+Idempotent is not the same as quick, either. A second run still works through the
+apt packages and checks whether Claude Code is installed, so **expect it to take
+minutes even when it has nothing to do**. Re-run it to repair a distro you
+suspect is half-provisioned, not as a way to start the IDE — for that, run
 `bondsymphonic-ide.exe` directly. `-WhatIf` prints the plan without touching
 anything; `-NoStart` provisions without launching.
 

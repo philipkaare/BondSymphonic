@@ -588,12 +588,21 @@ Python web server the run started, and 10.9 MB in the Python stand-in for
 
 **Teardown.** After a quit through `closeEvent` the daemon is gone from the
 distro within **3.4 s**, measured by polling once a second from the moment the
-IDE process exited. Note that the obvious check for this is a trap on two
-counts: `pgrep -f bondsymphonic-daemon` run through `wsl -- bash -lc` always
-matches the wrapper's own command line and so is never empty, and `pgrep -x
-bondsymphonic-daemon` never matches at all because the name is 20 characters and
-`comm` is truncated to 15 (`bondsymphonic-d`). `ps -eo args | grep
-'[b]ondsymphonic-daemon'` is the check that answers truthfully.
+IDE process exited. `wsl -d bondsymphonic -- pgrep -f bondsymphonic-daemon` is a
+sound check: it starts no shell at all, and `pgrep` never reports itself. So is a
+lone `bash -lc "pgrep -f bondsymphonic-daemon"`, because a shell given a single
+simple command `exec`s it in place rather than forking, so no process carrying
+the pattern on its command line survives to be matched.
+
+What does give a false positive is wrapping that in anything **compound** --
+`pgrep -f bondsymphonic-daemon || echo EMPTY`, or the same with a trailing
+`; echo $?`. The shell then has to stay alive to run the second half, its own
+command line contains the pattern, and the check reports a daemon that is not
+there. Reaching for `pgrep -x` to dodge that fails in the more dangerous
+direction: the name is 20 characters and `comm` is truncated to 15
+(`bondsymphonic-d`), so `-x` matches nothing, ever, and the check reports success
+whether or not a daemon is running. `ps -eo args | grep '[b]ondsymphonic-daemon'`
+is immune to both and is what to use when a compound command is unavoidable.
 
 ## 14. Testing (IDE-specific)
 
