@@ -412,8 +412,12 @@ impl AgentManager {
     /// Puts the agents from the last run of the daemon back, as agents that
     /// have ended.
     ///
-    /// Called once at startup, before anything can start an agent, so the
-    /// restored ordinals come first and a workspace's tabs keep their order.
+    /// Called once at startup and finished before the first connection is
+    /// accepted (`main` runs `Daemon::restore_agents` ahead of the accept loop,
+    /// which is the whole reason that half is split out), so no `agent.start`
+    /// can race it: the restored ordinals come first and a workspace's tabs keep
+    /// their order, and `mint_id` sees every id this daemon has ever handed out.
+    ///
     /// The process behind each one is gone -- a daemon restart kills every
     /// sandbox -- so each becomes an entry with no adapter: `agent.history`
     /// still reads its transcript, `WorkspaceInfo.agents` still lists it, and
@@ -422,9 +426,10 @@ impl AgentManager {
     ///
     /// Records for workspaces `known` does not name are dropped along with
     /// their transcripts. A workspace can only leave the registry through
-    /// `workspace.destroy`, which removes its records itself, so this is the
-    /// path for a destroy that was interrupted or a registry edited by hand --
-    /// without it those records and transcripts would never be collected.
+    /// `workspace.destroy`, which calls
+    /// [`forget_workspace`](AgentManager::forget_workspace) itself, so this is
+    /// the path for a destroy that was interrupted or a registry edited by hand
+    /// -- without it those records and transcripts would never be collected.
     pub fn restore(&self, known: &[WorkspaceId]) {
         let mut records = self.records.load();
         let mut dropped = Vec::new();
@@ -534,13 +539,21 @@ impl AgentManager {
         )
         .with_records(self.records.clone());
         let mut adapter = ClaudeAdapter::new(sink, handle, argv, env, ws.worktree_path.clone());
-        // Registered only once it is really running, so a failed start leaves
-        // no agent behind for the IDE to find.
-        adapter.start().await?;
-        // The record is written before the map and before this call answers, so
-        // a daemon killed the instant after `agent.start` returns still knows
-        // the agent existed. The session id is the one the client asked to
-        // resume, until the CLI reports its own on the init line.
+        // The record goes down *before* the process is spawned, and this
+        // ordering is the whole of what makes the session id survivable.
+        //
+        // `adapter.start` spawns the stdout reader, and the CLI's very first
+        // line is the `init` that names the session. That reader records the id
+        // by updating this record; an update against a record that is not there
+        // yet is a no-op, and because the entry then already holds the id,
+        // nothing later notices it was never written. The conversation would
+        // come back after a restart with no session to resume and no way to
+        // tell. Writing first costs one file write on a path that is already
+        // spawning a process, and leaves no window at all.
+        //
+        // The same ordering means an agent that exits immediately -- a bad
+        // flag, no login -- has a record for `ended()` to close, instead of
+        // coming back as one the daemon claims to have lost at restart.
         self.records.upsert(AgentRecord {
             agent_id: id.clone(),
             workspace_id: ws.id.clone(),
@@ -550,6 +563,13 @@ impl AgentManager {
             started_at: now_rfc3339(),
             ended_at: None,
         });
+        // Registered only once it is really running, so a failed start leaves
+        // no agent behind for the IDE to find -- and no record either, since
+        // nothing ever ran under this id.
+        if let Err(e) = adapter.start().await {
+            self.records.remove(&id);
+            return Err(e);
+        }
         self.agents.lock().insert(
             id.clone(),
             Arc::new(Agent {
@@ -661,10 +681,20 @@ impl AgentManager {
                 warn!(agent = %id, error = %e, "stopping agent failed");
             }
         }
-        // The records and the transcripts go with the workspace: they exist to
-        // outlive a daemon, not the workspace they belong to. Taken from the
-        // file rather than from the map, so an agent this daemon never held an
-        // entry for takes its transcript with it too.
+    }
+
+    /// Forgets a destroyed workspace's agents for good: their records and their
+    /// transcripts.
+    ///
+    /// Separate from [`stop_all_in`](AgentManager::stop_all_in), and called only
+    /// once the destroy has actually got rid of the worktree. A destroy that
+    /// fails late leaves the workspace in the registry in `Error`, and its
+    /// agents' history is the one thing the user might still want out of it.
+    ///
+    /// The ids come from the file rather than from the map, so an agent this
+    /// daemon never held an entry for -- one restored and then stopped, or one
+    /// whose entry was lost -- takes its transcript with it too.
+    pub fn forget_workspace(&self, ws: &WorkspaceId) {
         for id in self.records.remove_workspace(ws) {
             self.store.remove(&id);
         }
@@ -754,6 +784,121 @@ mod tests {
         // What was published is what was persisted.
         let stored = sink.store.read(sink.agent_id()).await.unwrap();
         assert_eq!(stored, vec![first, second]);
+    }
+
+    /// Why the record has to exist before the process does.
+    ///
+    /// The CLI's first line is the `init` that names the session, and the
+    /// reader records it by *updating* the agent's record. An update against a
+    /// record that is not there yet writes nothing — and the entry now holds
+    /// the id, so the `!changed` guard swallows every later `init` carrying the
+    /// same one. The session is then unrecoverable: the record is what a
+    /// restarted daemon reads, and it says the conversation has no session to
+    /// resume.
+    ///
+    /// This is the hazard `AgentManager::start` avoids by writing the record
+    /// before it spawns anything. The ordering itself cannot be observed from
+    /// outside without racing a process start, so it is pinned here instead.
+    #[tokio::test]
+    async fn a_session_id_reported_before_the_record_exists_is_lost_for_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = Arc::new(AgentRecords::new(dir.path().join("agents.json")));
+        let ws: WorkspaceId = "ws_1".into();
+        let id: AgentId = "ag_1".into();
+        let blank = || AgentRecord {
+            agent_id: id.clone(),
+            workspace_id: ws.clone(),
+            adapter: AgentAdapterKind::Claude,
+            session_id: None,
+            options: AgentStartOptions {
+                command: None,
+                resume_session: None,
+                model: None,
+                permission_mode: None,
+                api_key: None,
+            },
+            started_at: now_rfc3339(),
+            ended_at: None,
+        };
+        let sink = |entry: &Arc<AgentEntry>| {
+            AgentSink::new(
+                EventBus::new(16),
+                Arc::new(TranscriptStore::new(dir.path().join("t"))),
+                id.clone(),
+                ws.clone(),
+                entry.clone(),
+            )
+            .with_records(records.clone())
+        };
+
+        // The wrong order: the agent speaks, and only then is it recorded.
+        let entry = Arc::new(AgentEntry::new(ws.clone(), AgentAdapterKind::Claude));
+        let s = sink(&entry);
+        s.session_id("sess-1".into());
+        records.upsert(blank());
+        s.session_id("sess-1".into());
+        assert_eq!(
+            records.load()[0].session_id,
+            None,
+            "this is the loss the ordering exists to prevent"
+        );
+
+        // The order `start` actually uses: recorded first, so the reader's
+        // update lands and every later report is a cheap no-op.
+        std::fs::remove_file(dir.path().join("agents.json")).unwrap();
+        let entry = Arc::new(AgentEntry::new(ws.clone(), AgentAdapterKind::Claude));
+        let s = sink(&entry);
+        records.upsert(blank());
+        s.session_id("sess-1".into());
+        assert_eq!(records.load()[0].session_id.as_deref(), Some("sess-1"));
+        s.session_id("sess-1".into());
+        assert_eq!(records.load()[0].session_id.as_deref(), Some("sess-1"));
+        // And a session that really does move is followed.
+        s.session_id("sess-2".into());
+        assert_eq!(records.load()[0].session_id.as_deref(), Some("sess-2"));
+    }
+
+    /// `ended()` needs a record for the same reason: an agent that dies the
+    /// instant it starts must not come back from a restart as one the daemon
+    /// thinks it lost.
+    #[tokio::test]
+    async fn an_exit_reported_before_the_record_exists_leaves_it_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = Arc::new(AgentRecords::new(dir.path().join("agents.json")));
+        let ws: WorkspaceId = "ws_1".into();
+        let id: AgentId = "ag_1".into();
+        let entry = Arc::new(AgentEntry::new(ws.clone(), AgentAdapterKind::Claude));
+        let sink = AgentSink::new(
+            EventBus::new(16),
+            Arc::new(TranscriptStore::new(dir.path().join("t"))),
+            id.clone(),
+            ws.clone(),
+            entry.clone(),
+        )
+        .with_records(records.clone());
+
+        records.upsert(AgentRecord {
+            agent_id: id.clone(),
+            workspace_id: ws.clone(),
+            adapter: AgentAdapterKind::Claude,
+            session_id: None,
+            options: AgentStartOptions {
+                command: None,
+                resume_session: None,
+                model: None,
+                permission_mode: None,
+                api_key: None,
+            },
+            started_at: now_rfc3339(),
+            ended_at: None,
+        });
+        sink.state(AgentState::Exited, Some("exit code 1".into()))
+            .await;
+        let closed = records.load()[0].ended_at.clone();
+        assert!(closed.is_some(), "the exit must close the record");
+        // Idempotent, and it keeps the first answer.
+        sink.ended();
+        assert_eq!(records.load()[0].ended_at, closed);
     }
 
     /// Two callers is the real shape: the adapter's stdout reader records what

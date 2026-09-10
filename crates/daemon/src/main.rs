@@ -141,11 +141,15 @@ async fn serve(args: Args) -> Result<()> {
         "{}",
         serde_json::json!({ "port": server.port(), "token": server.token() })
     );
-    // `restore` runs alongside the accept loop rather than ahead of it, so `hello` is
-    // answered at once and each workspace flips to Ready or SandboxDown through the
-    // `workspace.state` events `restore` publishes as its sandboxes come up.
+    // The agents come back before the first connection is accepted. It is one file
+    // read, and it has to be finished before a client can call `agent.start`: the
+    // ids restore puts in the map are what a new agent's id is minted against.
+    daemon.restore_agents();
+    // The workspaces run alongside the accept loop rather than ahead of it, so
+    // `hello` is answered at once and each workspace flips to Ready or SandboxDown
+    // through the `workspace.state` events it publishes as its sandboxes come up.
     let restoring = daemon.clone();
-    tokio::spawn(async move { restoring.restore().await });
+    tokio::spawn(async move { restoring.restore_workspaces().await });
 
     let shutdown = CancellationToken::new();
     // Exit when stdin closes (IDE died) or on ctrl-c.

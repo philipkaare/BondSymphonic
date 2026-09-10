@@ -610,6 +610,12 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
             return Err(e);
         }
     }
+    // Only now, with the worktree gone and the registry entry about to follow:
+    // until this point the destroy could still have failed and left the
+    // workspace behind in `Error`, and its agents' transcripts are the one thing
+    // worth having out of a workspace that would not go. Reached on the forced
+    // path too, where there was no layout and no worktree to remove.
+    d.agents.forget_workspace(id);
     d.dirs.remove_workspace(id);
     d.registry
         .remove(id)

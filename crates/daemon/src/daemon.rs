@@ -171,17 +171,32 @@ impl Daemon {
         Ok(ws)
     }
 
-    /// On startup: put the agents from the last run back, then validate every
-    /// registered workspace and restart its sandbox.
+    /// Puts the agents from the last run of the daemon back.
+    ///
+    /// Split from [`restore_workspaces`](Self::restore_workspaces) and cheap --
+    /// one file read -- because it has to be finished before anything else can
+    /// touch the agent map, while restarting sandboxes takes seconds and must
+    /// not hold the accept loop up. `main` runs this one to completion and
+    /// spawns the other.
+    pub fn restore_agents(self: &Arc<Self>) {
+        let known: Vec<WorkspaceId> = self.registry.list().into_iter().map(|w| w.id).collect();
+        self.agents.restore(&known);
+    }
+
+    /// On startup: put the agents back, then validate every registered
+    /// workspace and restart its sandbox.
     ///
     /// The agents come first because a workspace's state event carries its agent
     /// list: restoring them afterwards would publish a workspace with no agents
     /// and then never correct it.
     pub async fn restore(self: &Arc<Self>) {
-        let workspaces = self.registry.list();
-        let known: Vec<WorkspaceId> = workspaces.iter().map(|w| w.id.clone()).collect();
-        self.agents.restore(&known);
-        for ws in workspaces {
+        self.restore_agents();
+        self.restore_workspaces().await;
+    }
+
+    /// Validates every registered workspace and restarts its sandbox.
+    pub async fn restore_workspaces(self: &Arc<Self>) {
+        for ws in self.registry.list() {
             if !ws.worktree_path.exists() {
                 let _ = self.set_state(
                     &ws.id,

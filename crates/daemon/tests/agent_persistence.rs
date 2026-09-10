@@ -212,6 +212,17 @@ async fn an_agent_survives_a_daemon_restart_as_exited_history() {
         vec![ag.clone()],
         "the restored agent must still belong to its workspace"
     );
+    // And through `workspace.list`, which is what the IDE re-syncs with after a
+    // reconnect. Same code path as `workspace.get`, but it is the one the
+    // requirement names.
+    let listed: WorkspaceListResult =
+        serde_json::from_value(c.call(Request::WorkspaceList {}).await.unwrap()).unwrap();
+    let mine = listed
+        .workspaces
+        .iter()
+        .find(|w| w.id == ws.id)
+        .expect("the workspace must still be listed");
+    assert_eq!(mine.agents, vec![ag.clone()]);
 
     let after = history(&mut c, &ag).await;
     assert_eq!(
@@ -262,6 +273,50 @@ async fn an_agent_survives_a_daemon_restart_as_exited_history() {
     );
 
     cancel2.cancel();
+}
+
+/// A start that never got a process leaves no record behind.
+///
+/// The record is written *before* the spawn, which is what keeps the session id
+/// (see the unit tests in `agents::tests`), so the failure path has to take it
+/// back: an id nothing ever ran under must not come back from a restart looking
+/// like an agent that ended.
+#[tokio::test]
+async fn a_failed_start_leaves_no_record() {
+    let _guard = ENV.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let root = dir.path().join("data");
+    // A program that is not there: the spawn fails, nothing runs.
+    std::env::set_var(
+        "BS_CLAUDE_BIN",
+        arg_path(&dir.path().join("no-such-claude-binary")),
+    );
+    std::env::remove_var("FAKE_CLAUDE_FIXTURE");
+
+    let (port, token, _d, cancel) = start_daemon(&root).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "alpha").await;
+
+    start_agent(&mut c, &ws.id, options())
+        .await
+        .expect_err("a missing program cannot start an agent");
+    assert!(
+        records_of(&root).is_empty(),
+        "a start that failed must not leave a record: {:?}",
+        records_of(&root)
+    );
+
+    let v = c
+        .call(Request::WorkspaceGet(WorkspaceIdParams {
+            workspace_id: ws.id.clone(),
+        }))
+        .await
+        .unwrap();
+    let info: WorkspaceInfo = serde_json::from_value(v).unwrap();
+    assert!(info.agents.is_empty());
+
+    cancel.cancel();
 }
 
 /// An agent that was still running when the daemon died. Its record has no

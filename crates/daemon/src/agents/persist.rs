@@ -47,6 +47,13 @@ pub struct AgentRecord {
     pub ended_at: Option<String>,
 }
 
+/// This daemon could not read the records file, and so must not write over it.
+///
+/// Deliberately not an `io::Error`: every caller does the same thing with it,
+/// which is nothing, and the reason has already been logged where it was known.
+#[derive(Debug)]
+struct Unreadable;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct FileFormat {
     #[serde(default)]
@@ -80,42 +87,62 @@ impl AgentRecords {
         &self.path
     }
 
-    /// Every record, oldest first.
+    /// Every record, oldest first, with an empty list for a file this daemon
+    /// could not read.
     ///
-    /// A missing file is the normal case for a daemon that has never started an
-    /// agent, and reads as empty. A file that will not parse is *not* a reason
-    /// to refuse to start: it is moved aside as `<name>.corrupt` and reported,
-    /// so the agents are lost but the daemon, its workspaces and their
-    /// transcripts are not — and the next write does not silently overwrite the
-    /// evidence.
+    /// For readers only. A caller that is about to *write* must use
+    /// [`read_locked`](Self::read_locked) instead and leave the file alone when
+    /// it answers `Err`: the two cases look the same here and are not the same
+    /// at all.
     pub fn load(&self) -> Vec<AgentRecord> {
         let _guard = self.lock.lock();
-        self.load_locked()
+        self.read_locked().unwrap_or_default()
     }
 
-    fn load_locked(&self) -> Vec<AgentRecord> {
+    /// The records, or [`Unreadable`] when this daemon could not get at them.
+    ///
+    /// Three outcomes, and the difference between the last two is the whole
+    /// point:
+    ///
+    /// * **No file.** The normal case for a daemon that has never started an
+    ///   agent. An empty list, and writing over it is correct.
+    /// * **A file that will not parse.** Not a reason to refuse to start: it is
+    ///   moved aside as `<name>.corrupt` and reported, so the agents are lost
+    ///   but the daemon, its workspaces and their transcripts are not. The
+    ///   evidence is preserved under the new name, so an empty list is a safe
+    ///   thing to write over what is now a *missing* file. If the rename itself
+    ///   fails there is no copy, so it becomes `Unreadable` instead.
+    /// * **A file that could not be read at all.** A sharing violation from an
+    ///   indexer or a scanner on Windows, a permission the daemon lost, a
+    ///   failing disk. The records are still there and still good, and treating
+    ///   this as "no records" would have the next write replace every one of
+    ///   them with the single record it happens to be adding. A lost update is
+    ///   recoverable; an overwritten file is not.
+    fn read_locked(&self) -> Result<Vec<AgentRecord>, Unreadable> {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => {
                 warn!(path = %self.path.display(), error = %e, "could not read the agent records");
-                return Vec::new();
+                return Err(Unreadable);
             }
         };
-        match serde_json::from_str::<FileFormat>(&text) {
-            Ok(f) => f.agents,
+        let e = match serde_json::from_str::<FileFormat>(&text) {
+            Ok(f) => return Ok(f.agents),
+            Err(e) => e,
+        };
+        let aside = self.path.with_extension("json.corrupt");
+        warn!(
+            path = %self.path.display(),
+            kept = %aside.display(),
+            error = %e,
+            "the agent records will not parse; keeping them aside and starting with none"
+        );
+        match std::fs::rename(&self.path, &aside) {
+            Ok(()) => Ok(Vec::new()),
             Err(e) => {
-                let aside = self.path.with_extension("json.corrupt");
-                warn!(
-                    path = %self.path.display(),
-                    kept = %aside.display(),
-                    error = %e,
-                    "the agent records will not parse; keeping them aside and starting with none"
-                );
-                if let Err(e) = std::fs::rename(&self.path, &aside) {
-                    warn!(path = %self.path.display(), error = %e, "could not move the unreadable records aside");
-                }
-                Vec::new()
+                warn!(path = %self.path.display(), error = %e, "could not move the unreadable records aside");
+                Err(Unreadable)
             }
         }
     }
@@ -126,7 +153,10 @@ impl AgentRecords {
     pub fn upsert(&self, mut record: AgentRecord) {
         record.options.api_key = None;
         let _guard = self.lock.lock();
-        let mut all = self.load_locked();
+        let Ok(mut all) = self.read_locked() else {
+            warn!(agent = %record.agent_id, "not recording the agent: the records file could not be read");
+            return;
+        };
         match all.iter_mut().find(|r| r.agent_id == record.agent_id) {
             Some(existing) => *existing = record,
             None => all.push(record),
@@ -134,12 +164,32 @@ impl AgentRecords {
         self.save_locked(&all);
     }
 
+    /// Forgets one agent, if it is there.
+    ///
+    /// The start path uses it to take back the record it wrote before spawning
+    /// the process, when the spawn then failed.
+    pub fn remove(&self, agent: &AgentId) {
+        let _guard = self.lock.lock();
+        let Ok(mut all) = self.read_locked() else {
+            warn!(agent = %agent, "not removing the record: the records file could not be read");
+            return;
+        };
+        let before = all.len();
+        all.retain(|r| &r.agent_id != agent);
+        if all.len() != before {
+            self.save_locked(&all);
+        }
+    }
+
     /// Applies `f` to the record for `agent`, if there is one. A record that is
     /// not there is not an error: the file may have been lost, and an agent
     /// whose record went missing must still be able to run.
     pub fn update(&self, agent: &AgentId, f: impl FnOnce(&mut AgentRecord)) {
         let _guard = self.lock.lock();
-        let mut all = self.load_locked();
+        let Ok(mut all) = self.read_locked() else {
+            warn!(agent = %agent, "not updating the record: the records file could not be read");
+            return;
+        };
         let Some(record) = all.iter_mut().find(|r| &r.agent_id == agent) else {
             return;
         };
@@ -158,6 +208,12 @@ impl AgentRecords {
             r.options.api_key = None;
         }
         let _guard = self.lock.lock();
+        // Read first and throw the answer away: this writes the whole file, so
+        // it is the one path that could replace records it never saw.
+        if self.read_locked().is_err() {
+            warn!("not rewriting the records: the file could not be read");
+            return;
+        }
         self.save_locked(&records);
     }
 
@@ -165,7 +221,10 @@ impl AgentRecords {
     /// caller can take their transcripts with them.
     pub fn remove_workspace(&self, ws: &WorkspaceId) -> Vec<AgentId> {
         let _guard = self.lock.lock();
-        let mut all = self.load_locked();
+        let Ok(mut all) = self.read_locked() else {
+            warn!(ws = %ws, "not removing the workspace's records: the file could not be read");
+            return Vec::new();
+        };
         let mut removed = Vec::new();
         all.retain(|r| {
             if &r.workspace_id == ws {
@@ -332,6 +391,102 @@ mod tests {
         // And the daemon carries on writing new records.
         records.upsert(record("ag_1", "ws_1"));
         assert_eq!(records.load().len(), 1);
+    }
+
+    /// A file this daemon cannot read holds records it must not destroy.
+    ///
+    /// Unix only, and only as a non-root user: `chmod 000` is what makes the
+    /// *read* fail while the directory still permits the rename, which is
+    /// exactly the shape that turns "treat it as empty" into data loss. Root
+    /// ignores the mode, so there is nothing to test there.
+    #[cfg(unix)]
+    #[test]
+    fn a_records_file_that_cannot_be_read_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.json");
+        let records = AgentRecords::new(&path);
+        records.upsert(record("ag_1", "ws_1"));
+        records.upsert(record("ag_2", "ws_1"));
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&path).is_ok() {
+            eprintln!("SKIP: running as root, the mode is not enforced");
+            return;
+        }
+
+        // Every mutating path, because each one of them rewrites the whole file.
+        records.upsert(record("ag_3", "ws_1"));
+        records.update(&"ag_1".into(), |r| r.session_id = Some("lost".into()));
+        records.remove(&"ag_2".into());
+        assert!(records.remove_workspace(&"ws_1".into()).is_empty());
+        records.replace_all(vec![record("ag_9", "ws_9")]);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a failed read must never become an overwrite"
+        );
+        let all = records.load();
+        assert_eq!(
+            all.iter().map(|r| r.agent_id.as_str()).collect::<Vec<_>>(),
+            vec!["ag_1", "ag_2"]
+        );
+    }
+
+    /// The same rule stated without needing a mode: when the read fails, the
+    /// write is not attempted at all, so not even a temporary appears.
+    ///
+    /// A directory where the file belongs is a read error on every platform and
+    /// is not `NotFound`, which is the distinction that matters. Portable, so
+    /// this half of the rule is covered on Windows too.
+    #[test]
+    fn a_read_failure_does_not_even_start_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("in-the-way"), "not a records file").unwrap();
+
+        let records = AgentRecords::new(&path);
+        assert!(records.load().is_empty());
+        records.upsert(record("ag_1", "ws_1"));
+
+        assert!(
+            !dir.path().join("agents.json.tmp").exists(),
+            "the write must not have been attempted"
+        );
+        assert!(
+            path.join("in-the-way").exists(),
+            "and what was there is untouched"
+        );
+    }
+
+    /// A corrupt file that cannot be moved aside is unreadable, not empty.
+    ///
+    /// Moving it aside is what makes writing a fresh file safe: the old content
+    /// still exists under the new name. With the rename blocked there is no
+    /// copy, so the same rule applies as for a read that failed outright.
+    #[test]
+    fn a_corrupt_file_that_cannot_be_kept_aside_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.json");
+        std::fs::write(&path, "{ not json at all").unwrap();
+        // A non-empty directory is refused as a rename destination everywhere.
+        let aside = dir.path().join("agents.json.corrupt");
+        std::fs::create_dir(&aside).unwrap();
+        std::fs::write(aside.join("occupied"), "x").unwrap();
+
+        let records = AgentRecords::new(&path);
+        records.upsert(record("ag_1", "ws_1"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ not json at all",
+            "the evidence must survive"
+        );
+        assert!(!dir.path().join("agents.json.tmp").exists());
     }
 
     /// The tmp file is never left where a later `load` could pick it up, and
