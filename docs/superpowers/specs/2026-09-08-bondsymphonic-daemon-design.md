@@ -173,9 +173,11 @@ callers ask about the path itself instead, by comparing `rev-parse
 false` rather than borrowing its parent's branches, dirty state and remotes, and
 `workspace.create` initialises such a folder as a repository of its own instead
 of making it a worktree of a repository the user did not pick. Without
-`init_if_missing`, that folder is `InvalidParams` naming the situation. A bare
-repository is not a repository for this purpose either; nothing in the daemon
-supports one as a workspace source.
+`init_if_missing`, that folder is `InvalidParams` naming the situation. A **bare** repository is
+refused by name from both calls — `InvalidParams`, "… is a bare repository;
+BondSymphonic needs a checkout (clone it first)" — rather than answered either
+way: reported as a folder it would be initialised *inside*, and reported as a
+repository it would produce a workspace whose worktree cannot be checked out.
 
 `is_repo` defaults to **true** when it is absent from the wire, which is the only
 value that keeps a newer IDE honest against an older daemon: a daemon without

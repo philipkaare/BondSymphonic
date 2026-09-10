@@ -147,9 +147,12 @@ pub fn canonical_ish(path: &Path) -> PathBuf {
 /// dialog just showed. Comparing `--show-toplevel` with the path asks about this
 /// directory and no other.
 ///
-/// A path that is not a directory is not a repository; a bare repository is not
-/// one either, as far as this daemon is concerned, and says so through the error
-/// `--show-toplevel` raises outside a working tree.
+/// A path that is not a directory is not a repository. A **bare** repository is
+/// neither a repository this daemon can use nor a folder it may write to, so it
+/// is the one answer that is an error rather than a `bool`: `false` would send
+/// `init_if_missing` on to run `git init` and a commit *inside somebody's bare
+/// repository*, and `true` would make a workspace whose worktree cannot be
+/// checked out. The caller gets a sentence naming the situation instead.
 pub async fn is_repo_root(git: &Git, path: &Path) -> Result<bool, RpcError> {
     if !path.is_dir() {
         return Ok(false);
@@ -163,8 +166,24 @@ pub async fn is_repo_root(git: &Git, path: &Path) -> Result<bool, RpcError> {
     {
         Ok(o) => Ok(canonical_ish(Path::new(o.stdout.trim())) == canonical_ish(path)),
         Err(e) if is_not_a_repository(&e) => Ok(false),
+        Err(e) if is_bare_repository(&e) => Err(RpcError::invalid_params(format!(
+            "{} is a bare repository; BondSymphonic needs a checkout (clone it first)",
+            path.display()
+        ))),
         Err(e) => Err(e),
     }
+}
+
+/// True when git refused because there is no working tree — a bare repository.
+///
+/// Its own wording, not an exit code: 128 is git's general fatal. Told apart
+/// from [`is_not_a_repository`] because the two lead opposite ways, one to a
+/// folder the daemon may initialise and one to a refusal.
+fn is_bare_repository(e: &RpcError) -> bool {
+    e.data
+        .as_ref()
+        .and_then(|d| d["stderr"].as_str())
+        .is_some_and(|s| s.contains("must be run in a work tree"))
 }
 
 pub async fn inspect(git: &Git, repo: &Path) -> Result<RepoInfo, RpcError> {

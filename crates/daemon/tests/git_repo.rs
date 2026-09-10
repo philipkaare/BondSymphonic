@@ -429,3 +429,51 @@ async fn init_repo_accepts_a_folder_that_already_has_files_in_it() {
     );
     assert_eq!(log_line(&existing, "--format=%s"), "Initial commit");
 }
+
+/// A bare repository has no working tree, so it is neither something a
+/// workspace can be made from nor a folder the daemon may write into. Both
+/// mistakes are available: reporting it as "not a repository" would send
+/// `init_if_missing` on to run `git init` and a commit *inside* it, and
+/// reporting it as a repository would make a workspace whose worktree cannot be
+/// checked out. It is refused by name instead.
+#[tokio::test]
+async fn a_bare_repository_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let bare = dir.path().join("origin.git");
+    let out = std::process::Command::new("git")
+        .args(["init", "--bare", "-q", "-b", "main"])
+        .arg(&bare)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git init --bare: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let git = git_without_an_identity(dir.path());
+
+    for err in [
+        repo::inspect(&git, &bare).await.unwrap_err(),
+        repo::init_repo(&git, &bare).await.unwrap_err(),
+    ] {
+        assert_eq!(err.code, ErrorCode::InvalidParams);
+        assert!(
+            err.message.contains("is a bare repository"),
+            "the message has to say what is wrong, not quote git: {}",
+            err.message
+        );
+    }
+
+    // Nothing was initialised inside it: no working tree, and no ref, so no
+    // commit was made either.
+    assert!(!bare.join(".git").exists());
+    let refs = git
+        .run(&bare, &["for-each-ref", "--format=%(refname)", "refs/"])
+        .await
+        .unwrap()
+        .stdout;
+    assert!(
+        refs.trim().is_empty(),
+        "the bare repository gained refs: {refs}"
+    );
+}

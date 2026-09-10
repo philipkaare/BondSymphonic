@@ -1090,3 +1090,40 @@ async fn create_refuses_to_initialise_inside_the_daemons_data_directory() {
 
     cancel.cancel();
 }
+
+/// And through the RPC, with the flag set — the one combination where reading a
+/// bare repository as "just a folder" would have the daemon run `git init` and a
+/// commit inside somebody's remote.
+#[tokio::test]
+async fn create_refuses_a_bare_repository_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let bare = dir.path().join("origin.git");
+    let out = std::process::Command::new("git")
+        .args(["init", "--bare", "-q", "-b", "main"])
+        .arg(&bare)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git init --bare");
+    let (port, token, _daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+
+    let err = c
+        .call(Request::WorkspaceCreate(WorkspaceCreateParams {
+            repo_path: bare.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: "alpha".into(),
+            init_if_missing: true,
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::InvalidParams);
+    assert!(
+        err.message.contains("is a bare repository"),
+        "{}",
+        err.message
+    );
+    assert!(!bare.join(".git").exists(), "nothing initialised inside it");
+
+    cancel.cancel();
+}
