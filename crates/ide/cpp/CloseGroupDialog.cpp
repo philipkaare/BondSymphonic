@@ -58,8 +58,16 @@ CloseGroupDialog::CloseGroupDialog(const QString& groupName,
             combo->addItem(actionLabel(action), static_cast<int>(action));
         }
         combo->setCurrentIndex(0);
+        if (choice.busy) {
+            // Pinned to Keep rather than merely refused later: the run is
+            // sequential and stops at the first refusal, so a row that cannot
+            // succeed would abandon every workspace after it.
+            combo->setEnabled(false);
+            combo->setToolTip(
+                QStringLiteral("This workspace has a merge, pull request or discard running."));
+        }
         m_combos.append(combo);
-        form->addRow(choice.name, combo);
+        form->addRow(choice.busy ? choice.name + QStringLiteral("  (busy)") : choice.name, combo);
     }
 
     m_buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
@@ -147,6 +155,13 @@ void CloseGroupRunner::next() {
     const CloseGroupChoice& step = m_steps.at(m_current);
     if (m_controller.isNull()) {
         stepDone(QStringLiteral("the controller is gone"));
+        return;
+    }
+    // Re-checked at the moment of the step, not only when the dialog opened: the
+    // steps run one after another, and the user can start a merge from the
+    // Changes toolbar while an earlier one of these is still going.
+    if (m_controller->isWorkspaceBusy(step.workspaceId)) {
+        stepDone(QStringLiteral("it has a merge, pull request or discard running"));
         return;
     }
     if (step.action == CloseGroupAction::Merge) {

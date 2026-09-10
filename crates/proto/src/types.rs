@@ -65,6 +65,39 @@ pub enum WorkspaceState {
     Destroying,
 }
 
+/// One agent a workspace has, as clients see it in [`WorkspaceInfo::agents`].
+///
+/// The id alone was not enough to bring a tab back: a client that restarts sees
+/// the workspace and its agents in `workspace.list`, and without the adapter it
+/// cannot tell a Claude agent -- whose transcript the daemon is still serving,
+/// and whose session is still resumable -- from a plain terminal. `adapter`,
+/// `model` and `permission_mode` are what rebuild the pane; `session_id` is what
+/// a resume needs, and is repeated here rather than only in the transcript so a
+/// client can tell a resumable agent from one that never got a session.
+///
+/// There is deliberately no field an API key could travel in. The daemon holds
+/// the options an agent was started with, and those carry the user's key; this
+/// is the subset that is safe to hand back, so the key cannot reach a client
+/// through a call site that forgot to clear it. A client that wants to start
+/// another agent like this one fills the key in itself, which is what
+/// `agent.start` has always expected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSummary {
+    pub id: AgentId,
+    pub adapter: AgentAdapterKind,
+    /// The last session the agent reported, or `None` for one that never
+    /// reported a session. What `resume_session` takes.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// The command a terminal agent was started with, if it was given one.
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceInfo {
     pub id: WorkspaceId,
@@ -77,7 +110,9 @@ pub struct WorkspaceInfo {
     pub allowlist: Vec<String>,
     #[serde(flatten)]
     pub state: WorkspaceState,
-    pub agents: Vec<AgentId>,
+    /// The workspace's agents, oldest first, running and ended alike. The last
+    /// is the one a client restoring this workspace's tab reattaches to.
+    pub agents: Vec<AgentSummary>,
     pub runs: Vec<RunId>,
 }
 

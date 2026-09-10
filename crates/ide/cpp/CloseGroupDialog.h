@@ -25,6 +25,11 @@ struct CloseGroupChoice {
     QString workspaceId;
     QString name;
     CloseGroupAction action = CloseGroupAction::Keep;
+    /// This workspace already had a merge, pull request, discard or destroy out
+    /// when the dialog opened. Such a row is pinned to Keep and greyed: merging
+    /// or discarding a workspace whose merge is still absorbing objects out of
+    /// it is what leaves the base branch pointing at commits that are gone.
+    bool busy = false;
 };
 
 /// Asks what to do with each workspace in a group before the group is closed.

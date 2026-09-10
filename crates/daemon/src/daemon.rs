@@ -147,7 +147,7 @@ impl Daemon {
     /// through this.
     pub fn workspace_info(&self, ws: &Workspace) -> WorkspaceInfo {
         let mut info = ws.info();
-        info.agents = self.agents.agents_of(&ws.id);
+        info.agents = self.agents.summaries_of(&ws.id);
         info.runs = self.runs.runs_of(&ws.id);
         info
     }

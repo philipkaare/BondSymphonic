@@ -96,10 +96,18 @@ struct Workspace {
     created_at: DateTime,
     allowlist: Vec<HostPattern>,
     state: WorkspaceState,     // Creating | Ready | SandboxDown | Error(String) | Destroying
-    agents: Vec<AgentId>,
+    agents: Vec<AgentSummary>, // oldest first, ended agents included
     runs: Vec<RunId>,
 }
 ```
+
+`AgentSummary` is `{id, adapter, session_id, command, model, permission_mode}`:
+the id alone does not let a client that restarted rebuild the tab, since it
+cannot tell a Claude agent whose transcript is still being served from a plain
+terminal. The three option fields are the non-secret half of what the agent was
+started with, so a client can offer "start another one like this"; there is
+deliberately no field the user's API key could travel in, which is what stops a
+call site leaking it by forgetting to clear it.
 
 **Create** (`workspace.create`):
 1. Validate repo (`git rev-parse --git-common-dir`), base branch exists.
@@ -668,8 +676,9 @@ It runs to completion *before the accept loop starts*, since the ids it puts in
 the map are what a new agent's id is minted against; restarting the sandboxes,
 which takes seconds, runs alongside the accept loop instead.
 Its `agent.history` still reads the transcript, `WorkspaceInfo.agents` still
-lists it in its original order, and `agent.send`, `agent.permission_reply` and
-`agent.interrupt` answer `NotFound` pointing at `resume_session`; `agent.stop`
+lists it in its original order with its adapter and start options, and
+`agent.send`, `agent.permission_reply` and `agent.interrupt` answer `NotFound`
+pointing at `resume_session`; `agent.stop`
 answers `Ok`. A record found open belonged to an agent that was still running
 when the daemon went, and restoring is what closes it. The conversation continues
 through a *new* agent started with `options.resume_session` set to the recorded

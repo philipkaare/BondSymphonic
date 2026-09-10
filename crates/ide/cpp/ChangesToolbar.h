@@ -1,7 +1,6 @@
 #pragma once
 #include <QHash>
 #include <QPointer>
-#include <QSet>
 #include <QStringList>
 #include <QString>
 #include <QToolBar>
@@ -109,12 +108,15 @@ private:
     /// Greys the five actions out when there is no workspace, or when this
     /// workspace already has a request in flight.
     void updateActions();
-    /// Books a request in for the current workspace and greys the toolbar out.
-    /// Returns false when one is already out, which is what makes a second
-    /// click on a slow merge do nothing.
+    /// Whether the controller has a merge, pull request, discard or destroy out
+    /// for `workspaceId`. The controller owns that set, so a merge started from
+    /// the close-group runner or a destroy from the tab context menu greys this
+    /// toolbar out too.
+    bool busy(const QString& workspaceId) const;
+    /// Whether a request may be started for the current workspace. Only a
+    /// pre-check: the controller books the workspace in and refuses a second
+    /// one itself, and answers `workspaceBusyChanged` either way.
     bool beginOperation();
-    /// Books it out again. Called for every answer, success or failure.
-    void endOperation(const QString& workspaceId);
 
     /// The number of changed files in the current workspace, or -1 when the
     /// daemon has not been asked or could not answer.
@@ -130,10 +132,6 @@ private:
     QAction* m_squash = nullptr;
     QAction* m_pr = nullptr;
     QAction* m_discard = nullptr;
-    /// Workspaces with a request out. A set rather than one id because the user
-    /// can switch tabs while a merge is running, and the toolbar must grey out
-    /// again when they come back to it.
-    QSet<QString> m_busy;
     /// The last `workspaceSummarized` per workspace, so the Discard
     /// confirmation can name a number without waiting for a round trip at the
     /// moment of the click.

@@ -1,4 +1,6 @@
-use bondsymphonic_ide::client::{ClientError, DaemonClient};
+use bondsymphonic_ide::client::{
+    default_timeout_for, ClientError, DaemonClient, DEFAULT_REQUEST_TIMEOUT,
+};
 use bondsymphonic_proto::*;
 use std::sync::Arc;
 use std::time::Duration;
@@ -460,4 +462,102 @@ async fn a_request_that_is_never_answered_times_out() {
     );
     // The connection itself is still up: a timeout resolves one request, not the session.
     assert!(client.is_connected());
+}
+
+// ---------------------------------------------------------------------------
+// Per-method request timeouts (final review I1).
+// ---------------------------------------------------------------------------
+
+/// The daemon spends up to 60 s on each git command and up to 120 s on `gh`, so a
+/// merge and a pull request are the two calls the IDE's ordinary 30 s wait is
+/// shorter than. A `create_pr` abandoned at 30 s is reported as failed while the
+/// branch is on the remote and the pull request is being opened, and the retry it
+/// invites answers "a pull request for branch ... already exists".
+#[test]
+fn merge_and_pr_wait_longer_than_the_daemon_spends_on_them() {
+    assert_eq!(
+        default_timeout_for("workspace.merge"),
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        default_timeout_for("workspace.create_pr"),
+        Duration::from_secs(180)
+    );
+}
+
+/// Everything else keeps the 30 s default, including the other two calls the
+/// Changes toolbar makes.
+#[test]
+fn every_other_method_keeps_the_default_wait() {
+    for method in [
+        "workspace.list",
+        "workspace.destroy",
+        "workspace.changes",
+        "agent.history",
+        "hello",
+        "a.method.this.build.has.never.heard.of",
+    ] {
+        assert_eq!(
+            default_timeout_for(method),
+            DEFAULT_REQUEST_TIMEOUT,
+            "{method} must keep the default wait"
+        );
+    }
+}
+
+/// The selection is keyed off the request the caller actually built, not off a
+/// string a call site had to remember to pass.
+#[test]
+fn the_wait_is_chosen_from_the_request_itself() {
+    let merge = Request::WorkspaceMerge(WorkspaceMergeParams {
+        workspace_id: WorkspaceId("ws_1".into()),
+        mode: MergeMode::Merge,
+        message: None,
+    });
+    let pr = Request::WorkspaceCreatePr(WorkspaceCreatePrParams {
+        workspace_id: WorkspaceId("ws_1".into()),
+        title: "t".into(),
+        body: String::new(),
+        draft: false,
+    });
+    assert_eq!(
+        default_timeout_for(merge.method_name()),
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        default_timeout_for(pr.method_name()),
+        Duration::from_secs(180)
+    );
+    assert_eq!(
+        default_timeout_for(Request::WorkspaceList {}.method_name()),
+        DEFAULT_REQUEST_TIMEOUT
+    );
+}
+
+/// A client given an explicit wait uses it for every method, long-running ones
+/// included. Without that the tests below -- and the flood test above, which
+/// asks for 500 ms -- would sit for two minutes on a merge that is never
+/// answered, and there would be no way to bound one at all.
+#[tokio::test]
+async fn an_explicit_wait_overrides_the_per_method_one() {
+    let addr = fake_daemon_silent_after_hello("secret").await;
+    let (client, _h, _e) = DaemonClient::connect(addr, "secret", "0.1.0")
+        .await
+        .unwrap();
+    let client = client.with_request_timeout(Duration::from_millis(200));
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.request::<MergeResult>(Request::WorkspaceMerge(WorkspaceMergeParams {
+            workspace_id: WorkspaceId("ws_1".into()),
+            mode: MergeMode::Merge,
+            message: None,
+        })),
+    )
+    .await
+    .expect("an explicit 200 ms wait must bound a merge too")
+    .expect_err("the fake daemon never answers");
+    assert!(
+        matches!(err, ClientError::Timeout),
+        "expected ClientError::Timeout, got {err:?}"
+    );
 }

@@ -12,6 +12,7 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QMenu>
 #include <QPalette>
 #include <QStyle>
@@ -271,8 +272,12 @@ void GroupBar::showGroupMenu(const QPoint& pos) {
         bool ok = false;
         const QString name = QInputDialog::getText(this, "Rename group", "Group name:", QLineEdit::Normal,
                                                    m_model->groupName(index), &ok);
-        if (ok && !name.trimmed().isEmpty()) {
-            m_model->renameGroup(index, name.trimmed());
+        if (ok && !name.trimmed().isEmpty() && !m_model->renameGroup(index, name.trimmed())) {
+            // The one way a rename is refused is a name another group already
+            // has, and a rename that silently did nothing would read as a bug.
+            QMessageBox::information(this, QStringLiteral("Rename group"),
+                                     QStringLiteral("There is already a group called \"%1\".")
+                                         .arg(name.trimmed()));
         }
     }
 }

@@ -115,6 +115,13 @@ async fn wait_for_messages(c: &mut Client, ag: &AgentId, want: usize) -> History
     }
 }
 
+/// The ids of a workspace's agents, in the order `WorkspaceInfo` lists them.
+/// Each entry also carries the adapter and the non-secret start options, which
+/// the assertions that care about check on their own.
+fn ids(agents: &[AgentSummary]) -> Vec<AgentId> {
+    agents.iter().map(|a| a.id.clone()).collect()
+}
+
 fn records_of(root: &Path) -> Vec<bondsymphonic_daemon::agents::persist::AgentRecord> {
     AgentRecords::new(root.join("agents.json")).load()
 }
@@ -208,10 +215,13 @@ async fn an_agent_survives_a_daemon_restart_as_exited_history() {
         .unwrap();
     let info: WorkspaceInfo = serde_json::from_value(v).unwrap();
     assert_eq!(
-        info.agents,
+        ids(&info.agents),
         vec![ag.clone()],
         "the restored agent must still belong to its workspace"
     );
+    // With its adapter, which is what lets a client that restarted alongside the
+    // daemon rebuild this workspace's tab as the Claude tab it was.
+    assert_eq!(info.agents[0].adapter, AgentAdapterKind::Claude);
     // And through `workspace.list`, which is what the IDE re-syncs with after a
     // reconnect. Same code path as `workspace.get`, but it is the one the
     // requirement names.
@@ -222,7 +232,7 @@ async fn an_agent_survives_a_daemon_restart_as_exited_history() {
         .iter()
         .find(|w| w.id == ws.id)
         .expect("the workspace must still be listed");
-    assert_eq!(mine.agents, vec![ag.clone()]);
+    assert_eq!(ids(&mine.agents), vec![ag.clone()]);
 
     let after = history(&mut c, &ag).await;
     assert_eq!(
@@ -395,7 +405,7 @@ async fn an_agent_live_at_shutdown_comes_back_closed() {
         .unwrap();
     let info: WorkspaceInfo = serde_json::from_value(v).unwrap();
     assert_eq!(
-        info.agents,
+        ids(&info.agents),
         vec![ag.clone(), fresh.clone()],
         "the restored agent comes first, the new one after it"
     );

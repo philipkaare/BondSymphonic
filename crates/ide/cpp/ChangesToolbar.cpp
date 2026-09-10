@@ -96,13 +96,17 @@ ChangesToolbar::ChangesToolbar(AppController* controller, QWidget* parent)
         QObject::connect(c, &AppController::workspaceSummarized, this,
                          &ChangesToolbar::onSummarized);
         // A workspace that has gone takes its bookkeeping with it, so a later
-        // workspace reusing the id could never inherit a stuck "busy" mark.
+        // workspace reusing the id could never inherit stale numbers.
         QObject::connect(c, &AppController::workspaceDestroyed, this, [this](const QString& id) {
-            m_busy.remove(id);
             m_changedFiles.remove(id);
             m_branchOf.remove(id);
             updateActions();
         });
+        // Which workspaces have an operation out is the controller's, not this
+        // toolbar's: the tab context menu and the close-group runner start them
+        // too, and a set kept here would not see either.
+        QObject::connect(c, &AppController::workspaceBusyChanged, this,
+                         [this](const QString&, bool) { updateActions(); });
     }
     updateActions();
 }
@@ -147,25 +151,25 @@ void ChangesToolbar::noteBranches(const QString& workspaceId, const QString& bra
     }
 }
 
+bool ChangesToolbar::busy(const QString& workspaceId) const {
+    return !m_controller.isNull() && !workspaceId.isEmpty() &&
+           m_controller->isWorkspaceBusy(workspaceId);
+}
+
 void ChangesToolbar::updateActions() {
-    const bool live = !m_workspaceId.isEmpty() && !m_busy.contains(m_workspaceId);
+    const bool live = !m_workspaceId.isEmpty() && !busy(m_workspaceId);
     for (QAction* action : { m_merge, m_rebase, m_squash, m_pr, m_discard }) {
         action->setEnabled(live);
     }
 }
 
 bool ChangesToolbar::beginOperation() {
-    if (m_workspaceId.isEmpty() || m_busy.contains(m_workspaceId) || m_controller.isNull()) {
-        return false;
-    }
-    m_busy.insert(m_workspaceId);
-    updateActions();
-    return true;
-}
-
-void ChangesToolbar::endOperation(const QString& workspaceId) {
-    m_busy.remove(workspaceId);
-    updateActions();
+    // Only a pre-check, and deliberately not a booking: the controller books the
+    // workspace in when the call reaches it and refuses a second one itself, so
+    // this is what stops the confirmation being *asked* rather than what makes
+    // the interlock hold. `workspaceBusyChanged` greys the actions out a moment
+    // later.
+    return !m_workspaceId.isEmpty() && !m_controller.isNull() && !busy(m_workspaceId);
 }
 
 void ChangesToolbar::onMerge(const QString& mode) {
@@ -261,7 +265,6 @@ void ChangesToolbar::onDiscard() {
 
 void ChangesToolbar::onMergeFinished(const QString& workspaceId, bool ok,
                                      const QString& conflictsJson, const QString& reason) {
-    endOperation(workspaceId);
     // Read out of the map rather than off the toolbar's own fields: a merge on
     // a large repository answers long after the user may have moved to another
     // tab, and the message has to name the branches that actually moved.
@@ -300,14 +303,12 @@ void ChangesToolbar::onMergeFinished(const QString& workspaceId, bool ok,
 }
 
 void ChangesToolbar::onPrCreated(const QString& workspaceId, const QString& url) {
-    endOperation(workspaceId);
     emit workspaceRecovered(workspaceId);
     emit statusMessage(QStringLiteral("PR: %1").arg(url), url);
 }
 
 void ChangesToolbar::onOperationFailed(const QString& workspaceId, const QString& op,
                                        const QString& message, const QString& dataJson) {
-    endOperation(workspaceId);
     const QJsonObject data = QJsonDocument::fromJson(dataJson.toUtf8()).object();
     const QString reason = data.value(QStringLiteral("reason")).toString();
     const QString stderrText = data.value(QStringLiteral("stderr")).toString();

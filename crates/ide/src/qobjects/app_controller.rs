@@ -907,6 +907,24 @@ pub mod qobject {
         /// confirmation. Answers with `workspaceSummarized`.
         #[qinvokable]
         fn workspace_summary(self: Pin<&mut AppController>, workspace_id: QString);
+
+        /// Whether `workspace_id` has a merge, pull request, discard or destroy
+        /// out. Anything that offers one of those to the user asks this before
+        /// enabling it.
+        ///
+        /// The interlock is here rather than in the Changes toolbar because the
+        /// toolbar is not the only caller: the tab context menu destroys and
+        /// `CloseGroupRunner` merges and discards, and a toolbar-local set
+        /// leaves both of those walking around it. A refusal is enforced here
+        /// too -- this is what a view *asks*, not what protects the daemon.
+        #[qinvokable]
+        fn is_workspace_busy(self: &AppController, workspace_id: QString) -> bool;
+
+        /// `workspace_id` started or finished one. Emitted on every change, so
+        /// a view that greys buttons out has something to re-run its enabling
+        /// on rather than polling.
+        #[qsignal]
+        fn workspace_busy_changed(self: Pin<&mut AppController>, workspace_id: QString, busy: bool);
     }
 
     impl cxx_qt::Threading for AppController {}
@@ -995,6 +1013,16 @@ pub struct AppControllerRust {
     /// anything recomposing the status from that property alone would
     /// otherwise lose the number.
     reconnect_attempt: u32,
+    /// The workspaces with a merge, pull request, discard or destroy out.
+    ///
+    /// Here rather than in the Changes toolbar because the toolbar is not the
+    /// only way to start one: the tab context menu destroys, and
+    /// `CloseGroupRunner` merges and discards without going near it. Every one
+    /// of those calls goes through this object, so this is the one place a
+    /// second operation on a workspace that is already busy can be refused --
+    /// and a discard racing a merge is how the user's base branch ends up
+    /// pointing at objects the discard deleted.
+    busy: crate::model::app_state::BusyWorkspaces,
 }
 
 impl Default for AppControllerRust {
@@ -1008,9 +1036,15 @@ impl Default for AppControllerRust {
             process: None,
             first_list_done: false,
             reconnect_attempt: 0,
+            busy: crate::model::app_state::BusyWorkspaces::default(),
         }
     }
 }
+
+/// What a merge, pull request, discard or destroy is refused with while the
+/// same workspace already has one out.
+pub const WORKSPACE_BUSY: &str =
+    "another merge, pull request or discard is still running on this workspace";
 
 /// The three merge modes, by the words the toolbar and the daemon both use.
 /// Anything else is refused here rather than sent on: an unrecognised mode is
@@ -1068,6 +1102,45 @@ fn report_workspace_failure(
             QString::from(&message),
             QString::from(&data),
         )
+    });
+}
+
+/// The same, for a failure that ends an operation booked in by
+/// [`AppController::begin_workspace_op`]: the slot is given back in the same
+/// queued step that raises the banner, so nothing can report the failure and
+/// leave the workspace looking busy forever.
+///
+/// Separate from [`report_workspace_failure`] rather than folded into it,
+/// because the one failure that must *not* free the slot is the refusal of a
+/// second operation while the first is still running -- freeing it there would
+/// hand the running operation's booking to the request that was just refused.
+fn end_workspace_op_with_failure(
+    qt: &QtHandle,
+    workspace: String,
+    op: &'static str,
+    message: String,
+    data: String,
+) {
+    tracing::warn!("{op} failed for {workspace}: {message} {data}");
+    let _ = qt.queue(move |mut q| {
+        q.as_mut().end_workspace_op(&workspace);
+        q.workspace_operation_failed(
+            QString::from(&workspace),
+            QString::from(op),
+            QString::from(&message),
+            QString::from(&data),
+        )
+    });
+}
+
+/// A `destroy_workspace` that failed: the booking goes back and the failure is
+/// reported on `operationFailed`, which is where a plain destroy's errors have
+/// always gone (a discard's go to the workspace's own banner instead).
+fn end_destroy(qt: &QtHandle, workspace: String, message: String) {
+    tracing::warn!("workspace.destroy failed for {workspace}: {message}");
+    let _ = qt.queue(move |mut q| {
+        q.as_mut().end_workspace_op(&workspace);
+        q.operation_failed(QString::from("workspace.destroy"), QString::from(&message))
     });
 }
 
@@ -1323,6 +1396,14 @@ async fn supervise(spec: LaunchSpec, qt: QtHandle, process: ProcessHandle) {
         let mut drain = match connect_once(&spec, &qt, &process, attempt).await {
             Ok(drain) => drain,
             Err(message) => {
+                // A quit that arrived while this attempt was in flight. Nothing
+                // to report and nothing to retry: the window is going, and the
+                // error state below would put a sentence about quitting in a
+                // status bar the user is closing.
+                if quitting() {
+                    tracing::info!("{message}");
+                    return;
+                }
                 if attempt == 0 {
                     // The very first launch never came up. That is not a lost
                     // connection but a machine that cannot run the daemon at
@@ -1421,6 +1502,14 @@ async fn connect_once(
     attempt: u32,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     let first = attempt == 0;
+    // Checked here as well as in `supervise`'s backoff sleep, because that check
+    // is followed by a `launch` that takes seconds: a quit announced inside that
+    // window would otherwise start one more daemon for an IDE on its way out.
+    // Checked before the launch rather than after it, so nothing is started that
+    // then has to be shut down.
+    if quitting() {
+        return Err("the IDE is quitting; no daemon was launched".to_owned());
+    }
     // `test_endpoint` is the `BS_DAEMON_ADDR` test hook and is `None` in every
     // ordinary run, which then launches the daemon inside WSL. Under the hook
     // a reconnect only reconnects: there is no daemon of ours to relaunch, and
@@ -1735,13 +1824,22 @@ impl qobject::AppController {
         ));
     }
 
-    pub fn destroy_workspace(self: Pin<&mut Self>, id: QString, force: bool) {
+    pub fn destroy_workspace(mut self: Pin<&mut Self>, id: QString, force: bool) {
         let qt = self.qt_thread();
         let id = id.to_string();
+        // The same interlock the Changes toolbar's Discard goes through, and
+        // for the same reason: this is reached from the tab context menu, which
+        // consults nothing, and destroying a workspace whose merge is still
+        // absorbing objects out of it leaves the base branch pointing at
+        // commits whose parents have been deleted.
+        if !self.as_mut().begin_workspace_op(&id) {
+            report_failure(&qt, "workspace.destroy", WORKSPACE_BUSY.to_owned());
+            return;
+        }
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(message) => {
-                report_failure(&qt, "workspace.destroy", message.to_owned());
+                end_destroy(&qt, id, message.to_owned());
                 return;
             }
         };
@@ -1760,9 +1858,12 @@ impl qobject::AppController {
                     // overrides go with it rather than waiting for the next
                     // start to prune them.
                     note_state(|s| s.forget_workspace(&id));
-                    let _ = qt.queue(move |q| q.workspace_destroyed(QString::from(&id)));
+                    let _ = qt.queue(move |mut q| {
+                        q.as_mut().end_workspace_op(&id);
+                        q.workspace_destroyed(QString::from(&id))
+                    });
                 }
-                Err(e) => report_failure(&qt, "workspace.destroy", e.to_string()),
+                Err(e) => end_destroy(&qt, id, e.to_string()),
             }
         });
     }
@@ -2167,8 +2268,36 @@ impl qobject::AppController {
     // everything about it, and what is here is only the crossing.
     // -----------------------------------------------------------------------
 
+    pub fn is_workspace_busy(&self, workspace_id: QString) -> bool {
+        self.rust().busy.contains(&workspace_id.to_string())
+    }
+
+    /// Books an operation in for `workspace`, or answers false because one is
+    /// already out.
+    ///
+    /// False is a refusal, not a queue: the two things that must never overlap
+    /// are a merge and the destroy that deletes the objects it is still packing
+    /// out, and running the second one late is the same data loss as running it
+    /// now. The user is told, and can ask again when the first has answered.
+    fn begin_workspace_op(mut self: Pin<&mut Self>, workspace: &str) -> bool {
+        if !self.as_mut().rust_mut().busy.begin(workspace) {
+            return false;
+        }
+        self.workspace_busy_changed(QString::from(workspace), true);
+        true
+    }
+
+    /// Books it out again. Called for every answer, success or failure, and
+    /// harmless for a workspace that was never booked in.
+    fn end_workspace_op(mut self: Pin<&mut Self>, workspace: &str) {
+        if !self.as_mut().rust_mut().busy.end(workspace) {
+            return;
+        }
+        self.workspace_busy_changed(QString::from(workspace), false);
+    }
+
     pub fn merge_workspace(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         workspace_id: QString,
         mode: QString,
         message: QString,
@@ -2191,10 +2320,20 @@ impl qobject::AppController {
         // being optional.
         let summary = message.to_string();
         let summary = (!summary.trim().is_empty()).then_some(summary);
+        if !self.as_mut().begin_workspace_op(&workspace) {
+            report_workspace_failure(
+                &qt,
+                workspace,
+                "workspace.merge",
+                WORKSPACE_BUSY.to_owned(),
+                String::new(),
+            );
+            return;
+        }
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(e) => {
-                report_workspace_failure(
+                end_workspace_op_with_failure(
                     &qt,
                     workspace,
                     "workspace.merge",
@@ -2226,7 +2365,8 @@ impl qobject::AppController {
                         %reason,
                         "workspace.merge answered"
                     );
-                    let _ = qt.queue(move |q| {
+                    let _ = qt.queue(move |mut q| {
+                        q.as_mut().end_workspace_op(&workspace);
                         q.merge_finished(
                             QString::from(&workspace),
                             result.ok,
@@ -2237,14 +2377,14 @@ impl qobject::AppController {
                 }
                 Err(e) => {
                     let (message, data) = failure_parts(&e);
-                    report_workspace_failure(&qt, workspace, "workspace.merge", message, data);
+                    end_workspace_op_with_failure(&qt, workspace, "workspace.merge", message, data);
                 }
             }
         });
     }
 
     pub fn create_pr(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         workspace_id: QString,
         title: QString,
         body: QString,
@@ -2258,10 +2398,20 @@ impl qobject::AppController {
             body: body.to_string(),
             draft,
         };
+        if !self.as_mut().begin_workspace_op(&workspace) {
+            report_workspace_failure(
+                &qt,
+                workspace,
+                "workspace.create_pr",
+                WORKSPACE_BUSY.to_owned(),
+                String::new(),
+            );
+            return;
+        }
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(e) => {
-                report_workspace_failure(
+                end_workspace_op_with_failure(
                     &qt,
                     workspace,
                     "workspace.create_pr",
@@ -2279,25 +2429,42 @@ impl qobject::AppController {
             {
                 Ok(result) => {
                     tracing::info!(%workspace, url = %result.url, "workspace.create_pr answered");
-                    let _ = qt.queue(move |q| {
+                    let _ = qt.queue(move |mut q| {
+                        q.as_mut().end_workspace_op(&workspace);
                         q.pr_created(QString::from(&workspace), QString::from(&result.url))
                     });
                 }
                 Err(e) => {
                     let (message, data) = failure_parts(&e);
-                    report_workspace_failure(&qt, workspace, "workspace.create_pr", message, data);
+                    end_workspace_op_with_failure(
+                        &qt,
+                        workspace,
+                        "workspace.create_pr",
+                        message,
+                        data,
+                    );
                 }
             }
         });
     }
 
-    pub fn discard_workspace(self: Pin<&mut Self>, workspace_id: QString) {
+    pub fn discard_workspace(mut self: Pin<&mut Self>, workspace_id: QString) {
         let qt = self.qt_thread();
         let workspace = workspace_id.to_string();
+        if !self.as_mut().begin_workspace_op(&workspace) {
+            report_workspace_failure(
+                &qt,
+                workspace,
+                "workspace.destroy",
+                WORKSPACE_BUSY.to_owned(),
+                String::new(),
+            );
+            return;
+        }
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(e) => {
-                report_workspace_failure(
+                end_workspace_op_with_failure(
                     &qt,
                     workspace,
                     "workspace.destroy",
@@ -2323,11 +2490,20 @@ impl qobject::AppController {
                 Ok(_) => {
                     note_state(|s| s.forget_workspace(&workspace));
                     tracing::info!(%workspace, "workspace discarded");
-                    let _ = qt.queue(move |q| q.workspace_destroyed(QString::from(&workspace)));
+                    let _ = qt.queue(move |mut q| {
+                        q.as_mut().end_workspace_op(&workspace);
+                        q.workspace_destroyed(QString::from(&workspace))
+                    });
                 }
                 Err(e) => {
                     let (message, data) = failure_parts(&e);
-                    report_workspace_failure(&qt, workspace, "workspace.destroy", message, data);
+                    end_workspace_op_with_failure(
+                        &qt,
+                        workspace,
+                        "workspace.destroy",
+                        message,
+                        data,
+                    );
                 }
             }
         });

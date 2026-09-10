@@ -54,7 +54,10 @@ or pushed as a pull request — and the IDE survives both its own restart and th
   and restores them on start, so after a restart the tab still reads the whole conversation.
   A restored agent is `exited`; the pane's **Restart** button starts a new one with
   `--resume` pointed at the session id read out of the old transcript, so the conversation
-  continues rather than beginning again.
+  continues rather than beginning again. This survives an IDE restart as well as a daemon
+  one: `workspace.list` names each workspace's agents with their adapter, so a Claude
+  workspace opens again as a Claude tab on the same agent, with the model and permission
+  mode it was started with.
 - **Run port override.** A run configuration whose port the daemon guessed shows the port as
   an editable field in the Run panel. Starting with a different number sends it as that
   start's port, `PORT` included, and the number is remembered per workspace and
@@ -88,6 +91,17 @@ Known limits in Milestone 6:
 - **Create PR needs a real `origin` and an authenticated `gh`.** There is no dialog for
   picking a remote and no fallback to the web; `system.check_prereqs` reports `gh_auth`, and
   Help > Setup… can log you in.
+- **A merge runs none of your repository's hooks; a Create PR runs your `pre-push`.** The
+  daemon performs a merge, rebase or squash with `core.hooksPath` pinned at an empty
+  directory, so a `post-merge` or `commit-msg` hook of yours does not fire for work you
+  landed from the Changes tab. The push behind **Create PR** is the exception and keeps your
+  hooks, because `pre-push` is how `git-lfs` uploads the objects a push needs — so that hook
+  does run, over content an agent wrote. Your own `git merge` and `git push` in your own
+  checkout are unaffected either way.
+- **Your filter and merge drivers still run during a merge.** `filter.*.clean`, `.smudge`
+  and `merge.*.driver` are deliberately left alone, so `git-lfs` keeps working in your
+  checkout. A `.gitattributes` in the merged tree — which an agent may have written — is
+  what chooses which of them run and over what content.
 
 Milestone 5: a workspace reaches the network only through an allowlisting proxy, and a
 web app it runs answers in the Windows browser.

@@ -134,6 +134,26 @@ show" belongs in Rust.
 - No blocking calls on the Qt thread. Requests that take long (create workspace,
   merge) show a busy indicator on the relevant tab and stay cancellable via
   `workspace.destroy`.
+- Every request has a deadline, and it is chosen from the method rather than
+  passed in by the caller (`client::default_timeout_for`). The default is 30 s.
+  `workspace.merge` gets 120 s and `workspace.create_pr` 180 s, because the
+  daemon allows itself 60 s per git command and 120 s for `gh`: a pull request
+  is a push plus a `gh pr create`, so a 30 s wait abandons a call that is
+  succeeding — the branch reaches the remote, the pull request opens, the user
+  is told it failed, and the retry that invites answers "a pull request for
+  branch … already exists". `DaemonClient::with_request_timeout` overrides the
+  per-method value for every method, which is how a test bounds a slow one.
+- A merge, pull request, discard or destroy books its workspace into
+  `AppController`'s in-flight set for as long as it is out. A second one on the
+  same workspace is refused with a sentence rather than queued, and
+  `isWorkspaceBusy(ws)` / `workspaceBusyChanged(ws, busy)` are what the views
+  disable themselves from: the Changes toolbar's five actions, the tab context
+  menu's Destroy, and the close-group dialog's rows. The set is on the
+  controller and not on the toolbar because the toolbar is not the only caller —
+  the context menu and `CloseGroupRunner` both go straight to the controller —
+  and the pair that must never overlap is a merge and the destroy that deletes
+  the objects it is still absorbing, which leaves the base branch pointing at
+  commits whose parents are gone.
 
 ## 5. Daemon launcher (Windows)
 
@@ -292,6 +312,24 @@ knows are dropped — along with their editors and port overrides — and daemon
 workspaces not in any group land in an "Unsorted" group. Groups keep their
 persisted order, an empty group is kept (a user may be holding it open), and the
 result is written straight back, which is what stops the file growing forever.
+Group names are unique: a rename onto a name another group already has is
+refused, because "Unsorted" is found by name and a second one would never
+receive an unclaimed workspace.
+
+**Agents are owned by the daemon too, and a tab is rebuilt from its list.**
+`state.json` remembers which workspaces were in which group and nothing about
+what was running in them. `WorkspaceInfo.agents` carries one `AgentSummary` per
+agent the daemon has for that workspace — id, adapter, session id, and the
+non-secret half of the options it was started with — oldest first, ended agents
+included. `AgentTab::from_workspace_info` adopts the last of them, so a Claude
+workspace comes back as a Claude tab whose transcript pane attaches to the same
+agent id, replays `agent.history`, reads back `exited`, and offers Restart with
+the model and permission mode the user originally chose. Without that the
+records file, the transcripts and the resumable sessions were reachable only
+while the IDE process itself survived: every Claude workspace returned as a
+terminal tab bound to no agent. There is deliberately no field in
+`AgentSummary` an API key could travel in; the key is merged in at
+`agent.start` and never comes back.
 
 ## 12. Error presentation
 

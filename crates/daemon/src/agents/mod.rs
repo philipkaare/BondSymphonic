@@ -318,13 +318,39 @@ impl AgentSink {
 }
 
 /// One agent the daemon knows about, live or not.
+/// The half of an agent's start options that is safe to report back.
+///
+/// The full [`AgentStartOptions`] carries the user's API key, and the whole
+/// point of holding these three separately is that there is then no field for
+/// the key to travel in when `WorkspaceInfo` is built. See
+/// [`bondsymphonic_proto::AgentSummary`].
+#[derive(Clone, Default)]
+struct StartedWith {
+    command: Option<String>,
+    model: Option<String>,
+    permission_mode: Option<String>,
+}
+
+impl StartedWith {
+    fn from_options(options: &AgentStartOptions) -> Self {
+        Self {
+            command: options.command.clone(),
+            model: options.model.clone(),
+            permission_mode: options.permission_mode.clone(),
+        }
+    }
+}
+
 struct Agent {
     entry: Arc<AgentEntry>,
-    /// Insertion order, so `agents_of` reports agents in the order they were
+    /// Insertion order, so `summaries_of` reports agents in the order they were
     /// started rather than in whatever order the map happens to hold them.
     /// Restored agents are numbered first, in the order they were started, so a
     /// restart does not reshuffle a workspace's tabs.
     ordinal: u64,
+    /// What this agent was started with, minus the API key: what a client needs
+    /// to offer "start another one like this".
+    started_with: StartedWith,
     /// The adapter driving the process, or `None` for an agent restored from
     /// its record: the process is gone, and only its transcript is left.
     ///
@@ -363,7 +389,7 @@ const ENDED_BEFORE_RESTART: &str = "the agent ended before the daemon restarted"
 /// Every agent the daemon is running, and the requests that reach them.
 ///
 /// The manager owns the list, not the workspace registry: an agent is a live
-/// process, and the registry is a file that survives restarts. `agents_of` is
+/// process, and the registry is a file that survives restarts. `summaries_of` is
 /// what puts them back into [`WorkspaceInfo`].
 pub struct AgentManager {
     events: EventBus,
@@ -463,6 +489,7 @@ impl AgentManager {
                 Arc::new(Agent {
                     entry,
                     ordinal: self.next_ordinal.fetch_add(1, Ordering::SeqCst),
+                    started_with: StartedWith::from_options(&record.options),
                     adapter: None,
                 }),
             );
@@ -554,6 +581,7 @@ impl AgentManager {
         // The same ordering means an agent that exits immediately -- a bad
         // flag, no login -- has a record for `ended()` to close, instead of
         // coming back as one the daemon claims to have lost at restart.
+        let started_with = StartedWith::from_options(&p.options);
         self.records.upsert(AgentRecord {
             agent_id: id.clone(),
             workspace_id: ws.id.clone(),
@@ -575,6 +603,7 @@ impl AgentManager {
             Arc::new(Agent {
                 entry,
                 ordinal: self.next_ordinal.fetch_add(1, Ordering::SeqCst),
+                started_with,
                 adapter: Some(tokio::sync::Mutex::new(Box::new(adapter))),
             }),
         );
@@ -645,16 +674,36 @@ impl AgentManager {
     }
 
     /// The agents belonging to `ws`, oldest first.
-    pub fn agents_of(&self, ws: &WorkspaceId) -> Vec<AgentId> {
-        let mut found: Vec<(u64, AgentId)> = self
+    ///
+    /// Each carries its adapter and the non-secret half of the options it was
+    /// started with, because the id alone does not let a client that restarted
+    /// rebuild the tab: it cannot tell a Claude agent, whose transcript this
+    /// daemon is still serving and whose session is still resumable, from a
+    /// plain terminal. Oldest first, and restored agents were given their
+    /// ordinals before any new one could take theirs, so the last entry is the
+    /// workspace's most recent agent whether or not this daemon started it.
+    pub fn summaries_of(&self, ws: &WorkspaceId) -> Vec<AgentSummary> {
+        let mut found: Vec<(u64, AgentSummary)> = self
             .agents
             .lock()
             .iter()
             .filter(|(_, a)| &a.entry.workspace_id == ws)
-            .map(|(id, a)| (a.ordinal, id.clone()))
+            .map(|(id, a)| {
+                (
+                    a.ordinal,
+                    AgentSummary {
+                        id: id.clone(),
+                        adapter: a.entry.adapter,
+                        session_id: a.entry.session_id.lock().clone(),
+                        command: a.started_with.command.clone(),
+                        model: a.started_with.model.clone(),
+                        permission_mode: a.started_with.permission_mode.clone(),
+                    },
+                )
+            })
             .collect();
         found.sort_by_key(|(ordinal, _)| *ordinal);
-        found.into_iter().map(|(_, id)| id).collect()
+        found.into_iter().map(|(_, summary)| summary).collect()
     }
 
     /// Stops and forgets every agent in `ws`. Called before a workspace's

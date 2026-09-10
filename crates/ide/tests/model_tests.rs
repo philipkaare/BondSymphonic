@@ -1,5 +1,6 @@
 use bondsymphonic_ide::model::app_state::*;
 use bondsymphonic_ide::model::file_tree::*;
+use bondsymphonic_ide::model::persistence::PersistedGroup;
 use bondsymphonic_proto::*;
 
 fn info(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
@@ -295,4 +296,220 @@ fn grid_renders_indexed_and_named_colours() {
     // Cells past the written text fall back to the terminal defaults.
     let plain = rows[0].spans.last().unwrap();
     assert!(plain.fg.is_empty() && plain.bg.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Group names are unique (final review, Minor).
+// ---------------------------------------------------------------------------
+
+/// "Unsorted" is found by name, so a second group wearing that name would take
+/// unclaimed workspaces off the first one forever: `reconcile` files them into
+/// whichever comes first, and every workspace the user then dropped into the
+/// other one would look, to the next restart, like it belonged nowhere.
+#[test]
+fn a_group_cannot_be_renamed_onto_another_groups_name() {
+    let mut w = Workspaces::new_default();
+    let frontend = w.add_group("Frontend");
+    w.add_group(UNSORTED_GROUP);
+    assert!(
+        !w.rename_group(frontend, UNSORTED_GROUP),
+        "renaming onto an existing name must be refused"
+    );
+    assert_eq!(w.groups[frontend].name, "Frontend", "the name is unchanged");
+    assert_eq!(
+        w.groups.iter().filter(|g| g.name == UNSORTED_GROUP).count(),
+        1
+    );
+}
+
+/// Any duplicate, not only "Unsorted": two groups with one name are two things
+/// the user cannot tell apart in the bar.
+#[test]
+fn a_group_cannot_be_renamed_onto_any_other_name_in_use() {
+    let mut w = Workspaces::new_default();
+    let frontend = w.add_group("Frontend");
+    let backend = w.add_group("Backend");
+    assert!(!w.rename_group(backend, "Frontend"));
+    assert_eq!(w.groups[backend].name, "Backend");
+    assert_eq!(w.groups[frontend].name, "Frontend");
+}
+
+/// Renaming a group to what it is already called is not a clash with itself.
+/// The dialog opens on the current name, so this is the ordinary "OK" press.
+#[test]
+fn renaming_a_group_to_its_own_name_is_allowed() {
+    let mut w = Workspaces::new_default();
+    let idx = w.add_group("Frontend");
+    assert!(w.rename_group(idx, "Frontend"));
+    assert_eq!(w.groups[idx].name, "Frontend");
+    assert!(w.rename_group(idx, "Platform"));
+    assert_eq!(w.groups[idx].name, "Platform");
+}
+
+/// The same rule from the other direction: adding a group that already exists
+/// hands back the one that is there rather than making a second.
+#[test]
+fn adding_a_group_that_already_exists_returns_the_existing_one() {
+    let mut w = Workspaces::new_default();
+    let first = w.add_group("Frontend");
+    let again = w.add_group("Frontend");
+    assert_eq!(first, again);
+    assert_eq!(w.groups.iter().filter(|g| g.name == "Frontend").count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// The in-flight set behind `AppController::isWorkspaceBusy` (final review I4).
+// ---------------------------------------------------------------------------
+
+/// One operation at a time per workspace, and the second is refused rather than
+/// queued: the pair that must never overlap is a merge and the destroy that
+/// deletes the objects the merge is still packing out.
+#[test]
+fn a_workspace_takes_one_operation_at_a_time() {
+    let mut busy = BusyWorkspaces::default();
+    assert!(!busy.contains("ws_1"));
+    assert!(busy.begin("ws_1"), "the first operation is booked in");
+    assert!(busy.contains("ws_1"));
+    assert!(!busy.begin("ws_1"), "the second is refused");
+    assert!(busy.end("ws_1"), "the answer books it out");
+    assert!(!busy.contains("ws_1"));
+    assert!(busy.begin("ws_1"), "and the next one may start");
+}
+
+/// Booking is per workspace: a merge on one must not grey out another, which is
+/// the whole reason this is a set rather than one id.
+#[test]
+fn one_busy_workspace_does_not_block_another() {
+    let mut busy = BusyWorkspaces::default();
+    assert!(busy.begin("ws_1"));
+    assert!(busy.begin("ws_2"));
+    assert!(busy.contains("ws_1") && busy.contains("ws_2"));
+    assert!(busy.end("ws_1"));
+    assert!(!busy.contains("ws_1"));
+    assert!(busy.contains("ws_2"), "ws_2's operation is still out");
+}
+
+/// Booking out something that was never booked in changes nothing and says so,
+/// which is what lets the controller emit `workspaceBusyChanged` only on a real
+/// change: a failure reported for a workspace with no operation out (a bad
+/// merge mode, a refused second request) must not announce that one ended.
+#[test]
+fn ending_an_operation_that_never_began_is_not_a_change() {
+    let mut busy = BusyWorkspaces::default();
+    assert!(!busy.end("ws_1"));
+    assert!(busy.is_empty());
+    assert!(busy.begin("ws_1"));
+    assert!(busy.end("ws_1"));
+    assert!(
+        !busy.end("ws_1"),
+        "and ending it twice is not a change either"
+    );
+    assert!(busy.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Restoring an agent tab from `WorkspaceInfo.agents` (final review I3).
+// ---------------------------------------------------------------------------
+
+fn agent(id: &str, adapter: AgentAdapterKind) -> AgentSummary {
+    AgentSummary {
+        id: AgentId(id.to_owned()),
+        adapter,
+        session_id: None,
+        command: None,
+        model: None,
+        permission_mode: None,
+    }
+}
+
+/// The daemon keeps a Claude agent's record and its transcript across its own
+/// restart, and lists it in `WorkspaceInfo.agents`. Without reading that, an IDE
+/// restart rebuilt every Claude workspace as a terminal tab bound to no agent,
+/// and nothing in the UI could reach a transcript the daemon was still serving.
+#[test]
+fn a_tab_built_from_the_daemons_list_adopts_the_workspaces_agent() {
+    let mut w = info("ws_1", "alpha", WorkspaceState::Ready);
+    w.agents = vec![AgentSummary {
+        model: Some("opus".into()),
+        permission_mode: Some("acceptEdits".into()),
+        session_id: Some("sess-1".into()),
+        ..agent("ag_1", AgentAdapterKind::Claude)
+    }];
+    let tab = AgentTab::from_workspace_info(&w);
+    assert_eq!(tab.adapter, AgentAdapterKind::Claude);
+    assert_eq!(tab.agent_id, Some(AgentId("ag_1".into())));
+    // The options the agent was started with come back too, so a Restart
+    // resumes on the model and permission mode the user chose rather than on
+    // the daemon's defaults.
+    let options: serde_json::Value = serde_json::from_str(&tab.options_json).expect("an object");
+    assert_eq!(options["model"], "opus");
+    assert_eq!(options["permission_mode"], "acceptEdits");
+    // Never the API key: there is no field in `AgentSummary` for one, and
+    // nothing here invents a place to put it.
+    assert!(options.get("api_key").is_none());
+}
+
+/// The last entry is the workspace's most recent agent -- the daemon hands
+/// restored agents their ordinals before any new one can take theirs -- so a
+/// workspace whose first agent ended and was restarted comes back on the second.
+#[test]
+fn the_latest_agent_is_the_one_the_tab_reattaches_to() {
+    let mut w = info("ws_1", "alpha", WorkspaceState::Ready);
+    w.agents = vec![
+        agent("ag_old", AgentAdapterKind::Claude),
+        agent("ag_new", AgentAdapterKind::Claude),
+    ];
+    let tab = AgentTab::from_workspace_info(&w);
+    assert_eq!(tab.agent_id, Some(AgentId("ag_new".into())));
+}
+
+/// A workspace the daemon has no agent for is still a plain terminal tab, which
+/// is what every workspace created without one is.
+#[test]
+fn a_workspace_with_no_agents_is_still_a_terminal_tab() {
+    let w = info("ws_1", "alpha", WorkspaceState::Ready);
+    let tab = AgentTab::from_workspace_info(&w);
+    assert_eq!(tab.adapter, AgentAdapterKind::Terminal);
+    assert_eq!(tab.agent_id, None);
+    assert_eq!(tab.options_json, "");
+}
+
+/// An agent with nothing but an id and an adapter leaves the options empty
+/// rather than writing an object of nulls: `TranscriptModel::restartOptions`
+/// treats an empty string as "the daemon's defaults", which is what it is.
+#[test]
+fn an_agent_started_with_no_options_leaves_the_options_empty() {
+    let mut w = info("ws_1", "alpha", WorkspaceState::Ready);
+    w.agents = vec![agent("ag_1", AgentAdapterKind::Claude)];
+    let tab = AgentTab::from_workspace_info(&w);
+    assert_eq!(tab.agent_id, Some(AgentId("ag_1".into())));
+    assert_eq!(tab.options_json, "");
+}
+
+/// The whole point of the fix: the restore path, end to end. A session file
+/// naming the workspace plus the daemon's list rebuilds the Claude tab with its
+/// agent, which is what the transcript pane attaches to.
+#[test]
+fn a_restored_session_brings_back_the_claude_tab_with_its_agent() {
+    let mut w = info("ws_1", "alpha", WorkspaceState::Ready);
+    w.agents = vec![agent("ag_1", AgentAdapterKind::Claude)];
+    let persisted = vec![PersistedGroup {
+        name: "Backend".to_owned(),
+        workspace_ids: vec!["ws_1".to_owned()],
+    }];
+    let model = Workspaces::from_persisted(&persisted, std::slice::from_ref(&w), Some("ws_1"));
+    let tab = model.active().expect("the restored tab is active");
+    assert_eq!(tab.adapter, AgentAdapterKind::Claude);
+    assert_eq!(tab.agent_id, Some(AgentId("ag_1".into())));
+
+    // And the same through `reconcile`, which is the path a workspace the
+    // session file did not name takes into "Unsorted".
+    let mut fresh = Workspaces::new_default();
+    fresh.reconcile(std::slice::from_ref(&w));
+    let (g, t) = fresh.find(&WorkspaceId("ws_1".into())).expect("filed");
+    assert_eq!(fresh.groups[g].tabs[t].adapter, AgentAdapterKind::Claude);
+    assert_eq!(
+        fresh.groups[g].tabs[t].agent_id,
+        Some(AgentId("ag_1".into()))
+    );
 }

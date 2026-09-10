@@ -2,7 +2,7 @@
 
 use crate::model::persistence::PersistedGroup;
 use bondsymphonic_proto::{
-    AgentAdapterKind, AgentId, AgentState, WorkspaceId, WorkspaceInfo, WorkspaceState,
+    AgentAdapterKind, AgentId, AgentState, AgentSummary, WorkspaceId, WorkspaceInfo, WorkspaceState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +10,45 @@ use serde::{Deserialize, Serialize};
 /// name rather than by a stable id, because the user can rename it and the
 /// next unclaimed workspace should still land somewhere sensible.
 pub const UNSORTED_GROUP: &str = "Unsorted";
+
+/// The workspaces with a merge, pull request, discard or destroy in flight.
+///
+/// One set, owned by `AppController`, because the Changes toolbar is not the
+/// only thing that starts those: the tab context menu destroys and the
+/// close-group runner merges and discards, and each of them used to walk past
+/// a set the toolbar kept to itself. What the set prevents is a destroy landing
+/// while a merge is still packing the merged commits out of the workspace's
+/// private object directory -- after which the base branch names a commit whose
+/// parents have been deleted, and the user's own repository will not read.
+///
+/// Split out of the QObject so it can be tested without a Qt event loop: the
+/// controller's half is two calls and a signal.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BusyWorkspaces(std::collections::HashSet<String>);
+
+impl BusyWorkspaces {
+    /// Books an operation in for `workspace`. False when one is already out,
+    /// which is a refusal rather than a queue: running the second one late is
+    /// the same loss as running it now, and the user can ask again once the
+    /// first has answered.
+    pub fn begin(&mut self, workspace: &str) -> bool {
+        self.0.insert(workspace.to_owned())
+    }
+
+    /// Books it out again. False when it was not booked in, so a caller can
+    /// tell whether anything changed before announcing that it did.
+    pub fn end(&mut self, workspace: &str) -> bool {
+        self.0.remove(workspace)
+    }
+
+    pub fn contains(&self, workspace: &str) -> bool {
+        self.0.contains(workspace)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 /// Lifecycle of the IDE's connection to the daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,12 +297,24 @@ impl AgentTab {
         }
     }
 
-    /// A plain terminal tab for a workspace the daemon described but the IDE
-    /// was not tracking: what [`Workspaces::reconcile`] files into "Unsorted"
-    /// and what [`Workspaces::from_persisted`] rebuilds a restored group from.
-    /// Nothing local is invented here -- no adapter, no command, no agent --
-    /// because the daemon's list says nothing about any of it.
+    /// A tab for a workspace the daemon described but the IDE was not tracking:
+    /// what [`Workspaces::reconcile`] files into "Unsorted" and what
+    /// [`Workspaces::from_persisted`] rebuilds a restored group from.
+    ///
+    /// Nothing local is invented -- no command, no run configuration -- but the
+    /// agent is not local: `WorkspaceInfo.agents` is the daemon's own list, and
+    /// the tab adopts the last of them. That is what makes an agent survive an
+    /// *IDE* restart as well as a daemon one. Without it every Claude workspace
+    /// came back as a terminal tab bound to no agent, and the transcript the
+    /// daemon was still serving had no pane in the UI that could reach it.
+    ///
+    /// The last entry rather than a search for a running one: the daemon lists
+    /// a workspace's agents oldest first, handing restored ones their place
+    /// before any new agent can take it, and an agent that has ended is exactly
+    /// the one worth coming back to -- its transcript replays and its Restart
+    /// resumes the session.
     pub fn from_workspace_info(info: &WorkspaceInfo) -> AgentTab {
+        let agent = info.agents.last();
         AgentTab {
             workspace_id: info.id.clone(),
             name: info.name.clone(),
@@ -276,16 +327,42 @@ impl AgentTab {
                 _ => String::new(),
             },
             worktree_path: info.worktree_path.clone(),
-            adapter: AgentAdapterKind::Terminal,
+            adapter: agent.map_or(AgentAdapterKind::Terminal, |a| a.adapter),
             command: None,
             run_config: None,
-            agent_id: None,
+            agent_id: agent.map(|a| a.id.clone()),
             agent_status: None,
             agent_detail: String::new(),
-            options_json: String::new(),
+            options_json: agent.map(restart_options_json).unwrap_or_default(),
             op_error: None,
         }
     }
+}
+
+/// The `options_json` a tab restored onto `agent` carries: the options the
+/// daemon says it was started with, as an `AgentStartOptions` object.
+///
+/// Only the keys that are set, so an agent started with nothing leaves the
+/// field empty -- which is what `TranscriptModel::restartOptions` reads as
+/// "the daemon's defaults", and is honest about there being no choice to
+/// restore. `resume_session` is deliberately not seeded from the summary: the
+/// transcript replay recovers the session id from the messages themselves, and
+/// that is the id a Restart resumes from.
+fn restart_options_json(agent: &AgentSummary) -> String {
+    let mut options = serde_json::Map::new();
+    for (key, value) in [
+        ("command", &agent.command),
+        ("model", &agent.model),
+        ("permission_mode", &agent.permission_mode),
+    ] {
+        if let Some(value) = value {
+            options.insert(key.to_owned(), serde_json::Value::String(value.clone()));
+        }
+    }
+    if options.is_empty() {
+        return String::new();
+    }
+    serde_json::Value::Object(options).to_string()
 }
 
 /// A user-defined collection of agent tabs, shown as a section in the sidebar.
@@ -418,8 +495,19 @@ impl Workspaces {
         }
     }
 
-    /// Appends a new, empty group and returns its index.
+    /// Appends a new, empty group and returns its index -- or the index of the
+    /// group that already has that name, without adding a second.
+    ///
+    /// Group names are the model's only handle on a group: [`UNSORTED_GROUP`]
+    /// is found by name, [`Workspaces::move_tab_to_group`] takes a name, and
+    /// [`Workspaces::remove_group`] removes the first match. Two groups sharing
+    /// one would each be reachable only by accident, and the second "Unsorted"
+    /// would never receive an unclaimed workspace however many the user put in
+    /// it by hand.
     pub fn add_group(&mut self, name: &str) -> usize {
+        if let Some(existing) = self.groups.iter().position(|g| g.name == name) {
+            return existing;
+        }
         let id = format!("grp_{}", self.groups.len());
         self.groups.push(Group {
             id,
@@ -429,14 +517,27 @@ impl Workspaces {
         self.groups.len() - 1
     }
 
+    /// Renames the group at `idx`. False for an index that is not there, and
+    /// for a name another group already has -- see [`Workspaces::add_group`]
+    /// for why a duplicate is refused rather than allowed and disambiguated.
+    ///
+    /// Renaming a group to what it is already called succeeds: the rename
+    /// dialog opens on the current name, so that is what pressing OK without
+    /// typing means, and it is not a clash with itself.
     pub fn rename_group(&mut self, idx: usize, name: &str) -> bool {
-        match self.groups.get_mut(idx) {
-            Some(g) => {
-                g.name = name.to_owned();
-                true
-            }
-            None => false,
+        if idx >= self.groups.len() {
+            return false;
         }
+        let taken = self
+            .groups
+            .iter()
+            .enumerate()
+            .any(|(i, g)| i != idx && g.name == name);
+        if taken {
+            return false;
+        }
+        self.groups[idx].name = name.to_owned();
+        true
     }
 
     /// Adds `tab` to the group at `group_idx` and makes it the active tab.

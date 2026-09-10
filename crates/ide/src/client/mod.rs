@@ -33,6 +33,39 @@ pub enum ClientError {
 /// [`DaemonClient::with_request_timeout`].
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What `workspace.merge` gets instead.
+///
+/// The daemon allows itself 60 s per git command (`git::GIT_TIMEOUT`) and a merge
+/// is more than one of them, so 30 s is a wait shorter than the answer it is
+/// waiting for.
+pub const MERGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// What `workspace.create_pr` gets instead.
+///
+/// A pull request is `git push` (60 s) followed by `gh pr create` (120 s,
+/// `git::pr::GH_TIMEOUT`), so the daemon is willing to spend three minutes on a
+/// call the 30 s default abandons after thirty seconds. Abandoning it is worse
+/// than waiting: the push has already happened and the pull request is already
+/// being opened, so the user is shown "Pull request failed" for one that
+/// succeeded, and the retry that invites answers "a pull request for branch
+/// ... already exists".
+pub const CREATE_PR_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long `method` is given when the client has not been told otherwise.
+///
+/// Keyed on the method name rather than passed in at each call site, so a wait
+/// cannot be forgotten at a new caller of an already-slow method: the two
+/// entries below are the two the daemon's own budget outlasts the default. A
+/// method this build has never heard of gets the default, which is the right
+/// answer for one whose cost nobody here knows.
+pub fn default_timeout_for(method: &str) -> Duration {
+    match method {
+        "workspace.merge" => MERGE_REQUEST_TIMEOUT,
+        "workspace.create_pr" => CREATE_PR_REQUEST_TIMEOUT,
+        _ => DEFAULT_REQUEST_TIMEOUT,
+    }
+}
+
 pub type EventStream = mpsc::Receiver<(Option<WorkspaceId>, Event)>;
 
 /// Outcome delivered to a pending request's oneshot. A dedicated `Disconnected` variant
@@ -66,7 +99,11 @@ pub struct DaemonClient {
     pending: Pending,
     next_id: Arc<AtomicU64>,
     connected: Arc<AtomicBool>,
-    request_timeout: Duration,
+    /// One wait for every method, or `None` to take each method's own from
+    /// [`default_timeout_for`]. `None` is what an ordinary client runs with;
+    /// `Some` is [`DaemonClient::with_request_timeout`], and it wins outright
+    /// so a caller that has to bound a slow method can.
+    request_timeout: Option<Duration>,
     _reader_guard: Arc<ReaderGuard>,
 }
 
@@ -143,7 +180,7 @@ impl DaemonClient {
             pending: pending.clone(),
             next_id: Arc::new(AtomicU64::new(1)),
             connected: connected.clone(),
-            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            request_timeout: None,
             _reader_guard: Arc::new(ReaderGuard(Some(reader_handle))),
         };
 
@@ -157,11 +194,24 @@ impl DaemonClient {
     }
 
     /// Sets how long each request waits for its response before failing with
-    /// [`ClientError::Timeout`]. Defaults to [`DEFAULT_REQUEST_TIMEOUT`]; the setting is
-    /// per-clone, so apply it to the client that will issue the requests.
+    /// [`ClientError::Timeout`], for every method alike. The setting is per-clone,
+    /// so apply it to the client that will issue the requests.
+    ///
+    /// Without it each method gets [`default_timeout_for`], which is the 30 s
+    /// default for everything but the merge and the pull request. An explicit
+    /// wait overrides that rather than raising it: the callers that set one are
+    /// bounding a request they must not sit on, and a two-minute floor would
+    /// take that away from them.
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
+        self.request_timeout = Some(timeout);
         self
+    }
+
+    /// The wait this client gives `req`: its own if it was given one, and the
+    /// method's otherwise.
+    fn timeout_for(&self, req: &Request) -> Duration {
+        self.request_timeout
+            .unwrap_or_else(|| default_timeout_for(req.method_name()))
     }
 
     pub fn is_connected(&self) -> bool {
@@ -172,6 +222,7 @@ impl DaemonClient {
         if !self.is_connected() {
             return Err(ClientError::Disconnected);
         }
+        let timeout = self.timeout_for(&req);
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -197,7 +248,7 @@ impl DaemonClient {
             self.pending.lock().unwrap().remove(&id);
             return Err(ClientError::Disconnected);
         }
-        match tokio::time::timeout(self.request_timeout, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(PendingOutcome::Value(v))) => Ok(v),
             Ok(Ok(PendingOutcome::Rpc(e))) => Err(ClientError::Rpc(e)),
             Ok(Ok(PendingOutcome::Disconnected)) | Ok(Err(_)) => Err(ClientError::Disconnected),

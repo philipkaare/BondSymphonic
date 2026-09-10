@@ -688,6 +688,17 @@ void MainWindow::onNewAgent() {
 }
 
 void MainWindow::onDestroyRequested(const QString& workspaceId) {
+    // The Changes toolbar greys its own Discard out while an operation is
+    // running; this menu is the other way to the same call, and a destroy that
+    // lands while a merge is still absorbing objects out of the workspace is
+    // what leaves the base branch pointing at commits that no longer exist.
+    if (m_controller->isWorkspaceBusy(workspaceId)) {
+        QMessageBox::information(
+            this, QStringLiteral("Destroy workspace"),
+            QStringLiteral("This workspace has a merge, pull request or discard running. "
+                           "Wait for it to finish, then try again."));
+        return;
+    }
     QMessageBox box(this);
     box.setIcon(QMessageBox::Question);
     box.setWindowTitle("Destroy workspace");
@@ -766,6 +777,7 @@ void MainWindow::onCloseGroup(int groupIndex) {
         toolbar->noteBranches(choice.workspaceId, tab.value("branch").toString(),
                               tab.value("base_branch").toString());
         toolbar->requestSummary(choice.workspaceId);
+        choice.busy = m_controller->isWorkspaceBusy(choice.workspaceId);
         workspaces.append(choice);
     }
 

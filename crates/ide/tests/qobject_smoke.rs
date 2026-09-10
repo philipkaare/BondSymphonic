@@ -17,8 +17,8 @@ use bondsymphonic_ide::qobjects::editor_document::{
     HIGHLIGHT_MAX_BYTES,
 };
 use bondsymphonic_proto::{
-    AgentAdapterKind, Event, FileEntry, FileStatus, LogLevel, PtyId, ReadFileResult, WorkspaceId,
-    WorkspaceInfo, WorkspaceState,
+    AgentAdapterKind, AgentId, AgentSummary, Event, FileEntry, FileStatus, LogLevel, PtyId,
+    ReadFileResult, WorkspaceId, WorkspaceInfo, WorkspaceState,
 };
 
 fn info(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
@@ -199,6 +199,43 @@ fn active_tab_json_round_trips() {
     let json = serde_json::to_string(active).expect("tab serialises");
     let parsed: AgentTab = serde_json::from_str(&json).expect("tab parses");
     assert_eq!(&parsed, active);
+}
+
+/// `activeTabJson` is how the window learns which pane to build, and the three
+/// keys it reads for a restored Claude tab have to survive the crossing.
+///
+/// `AgentArea::showWorkspace` switches on `adapter` and attaches the transcript
+/// to `agent_id`; `MainWindow` then hands `options_json` to
+/// `AgentArea::setOptionsJson`, which is what a Restart resumes with. A tab
+/// rebuilt from `WorkspaceInfo.agents` fills all three, and nothing in C++ can
+/// read them if the serialisation drops them.
+#[test]
+fn a_restored_agent_tab_crosses_the_boundary_with_its_adapter_and_agent() {
+    let mut listed = info("ws_1", "alpha", WorkspaceState::Ready);
+    listed.agents = vec![AgentSummary {
+        id: AgentId("ag_1".to_owned()),
+        adapter: AgentAdapterKind::Claude,
+        session_id: Some("sess-1".to_owned()),
+        command: None,
+        model: Some("claude-opus-5".to_owned()),
+        permission_mode: Some("acceptEdits".to_owned()),
+    }];
+    let mut model = Workspaces::new_default();
+    model.add_tab(0, AgentTab::from_workspace_info(&listed));
+
+    let json = serde_json::to_string(model.active().expect("a tab is active")).expect("serialises");
+    let tab: serde_json::Value = serde_json::from_str(&json).expect("an object");
+    // The words C++ compares against, not the Rust spellings.
+    assert_eq!(tab["adapter"], "claude");
+    assert_eq!(tab["agent_id"], "ag_1");
+    let options: serde_json::Value =
+        serde_json::from_str(tab["options_json"].as_str().expect("a string")).expect("an object");
+    assert_eq!(options["model"], "claude-opus-5");
+    assert_eq!(options["permission_mode"], "acceptEdits");
+    assert!(
+        options.get("api_key").is_none(),
+        "the key never crosses this boundary"
+    );
 }
 
 /// `cached_entries` returns what `FileTreeModel` stored from `fs.list_dir`.
