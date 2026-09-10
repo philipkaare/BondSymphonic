@@ -69,8 +69,13 @@ Ubuntu 24.04 with git, bubblewrap, python3, Claude Code and gh, and **no Rust to
 because the daemon is already in the folder as a binary — then runs the runtime
 provisioning over it and starts the IDE. It runs that provisioning every time, which is
 what repairs a distro whose first setup was interrupted; it is idempotent, so a machine
-that is already set up is unchanged. `-WhatIf` prints what it would do, and `-NoStart`
-provisions without launching.
+that is already set up ends up unchanged.
+
+**A second run is not instant.** It still works through the apt packages and probes the
+Claude Code installer, so expect minutes rather than seconds even when there is nothing to
+do. Run it again to repair a distro, not as a quick way to start the IDE — for that, run
+`bondsymphonic-ide.exe` directly. `-WhatIf` prints what it would do without touching
+anything, and `-NoStart` provisions without launching.
 
 WSL2 itself is the one prerequisite the package cannot install for you. If `wsl --version`
 does not answer, run `wsl --install` in an elevated PowerShell and reboot first.

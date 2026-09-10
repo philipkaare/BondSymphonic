@@ -38,9 +38,14 @@ distro and starts the IDE.
 It runs that provisioning on **every** invocation, not only the first. That is
 deliberate: a first setup interrupted half way leaves a distro that exists but is
 missing packages, and re-running the installer is how you repair it. Every step
-is idempotent, so on a machine that is already set up nothing changes. `-WhatIf`
-prints the plan without touching anything; `-NoStart` provisions without
-launching.
+is idempotent, so a machine that is already set up ends up unchanged.
+
+Idempotent is not the same as quick. A second run still works through the apt
+packages and probes the Claude Code installer, so **expect it to take minutes
+even when it has nothing to do**. Re-run it to repair a distro you suspect is
+half-provisioned, not as a way to start the IDE — for that, run
+`bondsymphonic-ide.exe` directly. `-WhatIf` prints the plan without touching
+anything; `-NoStart` provisions without launching.
 
 WSL2 itself is the one prerequisite the package cannot install for you. If
 `wsl --version` does not answer, run `wsl --install` from an elevated PowerShell
