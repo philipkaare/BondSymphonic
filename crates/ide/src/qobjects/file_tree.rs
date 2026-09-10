@@ -7,7 +7,7 @@
 //! model at another workspace drops it.
 
 use crate::model::file_tree::FileTree;
-use crate::qobjects::app_controller::{require_connection, runtime};
+use crate::qobjects::app_controller::{on_reconnect, require_connection, runtime};
 use bondsymphonic_proto::{FsPathParams, ListDirResult, Request, WorkspaceId};
 
 #[cxx_qt::bridge]
@@ -74,6 +74,18 @@ use cxx_qt_lib::QString;
 pub struct FileTreeModelRust {
     workspace_id: String,
     tree: FileTree,
+    /// Waits for the connection generation to move and then re-reads the root
+    /// from the daemon that came back. Replaced whenever the workspace
+    /// changes, aborted on Drop.
+    reconnect_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for FileTreeModelRust {
+    fn drop(&mut self) {
+        if let Some(task) = self.reconnect_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl qobject::FileTreeModel {
@@ -162,8 +174,43 @@ impl qobject::FileTreeModel {
         if self.as_ref().rust().workspace_id == workspace {
             return;
         }
-        let mut rust = self.as_mut().rust_mut();
-        rust.workspace_id = workspace.to_owned();
-        rust.tree = FileTree::new();
+        {
+            let mut rust = self.as_mut().rust_mut();
+            rust.workspace_id = workspace.to_owned();
+            rust.tree = FileTree::new();
+            if let Some(previous) = rust.reconnect_task.take() {
+                previous.abort();
+            }
+        }
+        if workspace.is_empty() {
+            return;
+        }
+        let qt = self.as_ref().qt_thread();
+        let watch = on_reconnect(qt, qobject::FileTreeModel::reload_after_reconnect);
+        self.as_mut().rust_mut().reconnect_task = Some(watch);
+    }
+
+    /// Drops the cache and re-reads the root from the daemon that came back.
+    ///
+    /// The root, not every expanded directory: this model holds no subscription
+    /// and cannot repaint the view by itself, so what it can honestly do is
+    /// invalidate what it cached against a daemon that is gone and answer the
+    /// view's `entriesLoaded("")` with the new listing. The view rebuilds from
+    /// the root and asks again for whatever the user re-opens.
+    fn reload_after_reconnect(mut self: Pin<&mut Self>) {
+        let workspace = self.as_ref().rust().workspace_id.clone();
+        if workspace.is_empty() {
+            return;
+        }
+        tracing::info!("file tree reloading {workspace} after a reconnect");
+        self.as_mut().rust_mut().tree = FileTree::new();
+        // Re-armed here rather than inside `load_dir`, which `adopt_workspace`
+        // would refuse to do for the workspace it is already showing.
+        {
+            let qt = self.as_ref().qt_thread();
+            let watch = on_reconnect(qt, qobject::FileTreeModel::reload_after_reconnect);
+            self.as_mut().rust_mut().reconnect_task = Some(watch);
+        }
+        self.load_dir(QString::from(&workspace), QString::from(""));
     }
 }

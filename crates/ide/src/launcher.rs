@@ -240,6 +240,24 @@ pub async fn launch(spec: &LaunchSpec) -> Result<DaemonProcess> {
 }
 
 impl DaemonProcess {
+    /// Resolves when the daemon process ends, whatever ended it.
+    ///
+    /// The connection dying is the usual way the IDE learns the daemon is
+    /// gone, but not the only one: a `wsl.exe` relay can be killed with the
+    /// socket left half-open, and a daemon that wedges without closing its
+    /// socket is a process the IDE should still notice the death of. The
+    /// reconnect loop waits on this alongside the event stream and acts on
+    /// whichever answers first.
+    ///
+    /// Cancel-safe, which the reconnect loop's `select!` relies on: awaiting
+    /// this and then dropping the future leaves the child exactly as it was.
+    /// It also closes nothing -- [`launch`] moves the child's stdin onto
+    /// [`DaemonProcess::stdin`], so the handle tokio would drop here is
+    /// already gone and the daemon is not asked to exit by being waited on.
+    pub async fn wait_exit(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait().await
+    }
+
     /// Closes stdin, which is how the daemon is asked to exit, and waits up to 5s
     /// for it to do so before killing the `wsl.exe` relay.
     pub async fn shutdown(mut self) {

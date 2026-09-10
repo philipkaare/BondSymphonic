@@ -1,4 +1,4 @@
-﻿pub mod codec;
+pub mod codec;
 pub mod router;
 
 use bondsymphonic_proto::*;
@@ -62,7 +62,7 @@ impl Drop for ReaderGuard {
 
 #[derive(Clone)]
 pub struct DaemonClient {
-    out: mpsc::Sender<ClientMessage>,
+    out: mpsc::Sender<String>,
     pending: Pending,
     next_id: Arc<AtomicU64>,
     connected: Arc<AtomicBool>,
@@ -81,7 +81,11 @@ impl DaemonClient {
         let (r, mut w) = stream.into_split();
         let mut reader = BufReader::new(r);
 
-        let (out_tx, mut out_rx) = mpsc::channel::<ClientMessage>(256);
+        // The channel carries *encoded* lines rather than `ClientMessage`s, so
+        // one hand-built line with a method the typed enum does not carry can
+        // travel the same socket in the same order as everything else. See
+        // [`DaemonClient::send_untyped`].
+        let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
         let (ev_tx, ev_rx) = mpsc::channel::<(Option<WorkspaceId>, Event)>(1024);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(true));
@@ -89,8 +93,8 @@ impl DaemonClient {
         // Writer task: serializes outgoing requests onto the socket. Ends (dropping its
         // write half) once every `DaemonClient` clone is gone and `out_tx` is dropped.
         tokio::spawn(async move {
-            while let Some(msg) = out_rx.recv().await {
-                if codec::write_message(&mut w, &msg).await.is_err() {
+            while let Some(line) = out_rx.recv().await {
+                if codec::write_line(&mut w, &line).await.is_err() {
                     break;
                 }
             }
@@ -181,7 +185,10 @@ impl DaemonClient {
         }
         if self
             .out
-            .send(ClientMessage::Request { id, request: req })
+            .send(codec::encode_message(&ClientMessage::Request {
+                id,
+                request: req,
+            }))
             .await
             .is_err()
         {
@@ -206,5 +213,32 @@ impl DaemonClient {
     pub async fn request<T: DeserializeOwned>(&self, req: Request) -> Result<T, ClientError> {
         let v = self.request_raw(req).await?;
         Ok(bondsymphonic_proto::codec::parse_result(v)?)
+    }
+
+    /// **Test-only.** Sends a request whose method the [`Request`] enum does
+    /// not carry, and does not wait for an answer.
+    ///
+    /// It exists for exactly one caller: the smoke script's `reconnect` step,
+    /// which asks an in-process *fake* daemon to drop the connection with
+    /// `system.test_drop`. A real daemon has never heard of that method and
+    /// answers "not implemented", so nothing this sends can make a real daemon
+    /// do anything it would not do for a typo.
+    ///
+    /// Not waiting is the point rather than a shortcut: the method this is for
+    /// is answered by the socket closing, so there is no reply to wait for and
+    /// no pending entry to leak. Any method that *does* have an answer belongs
+    /// in `Request`, where it is typed.
+    pub async fn send_untyped(&self, method: &str) -> Result<(), ClientError> {
+        if !self.is_connected() {
+            return Err(ClientError::Disconnected);
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let params =
+            serde_json::json!({ "type": "request", "id": id, "method": method, "params": {} });
+        let line = format!("{params}\n");
+        self.out
+            .send(line)
+            .await
+            .map_err(|_| ClientError::Disconnected)
     }
 }

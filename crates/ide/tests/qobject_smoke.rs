@@ -867,3 +867,48 @@ fn note_editors_takes_an_object_or_a_bare_array() {
     assert_eq!(parse_editors("not json"), None);
     assert_eq!(parse_editors(""), None);
 }
+
+/// What Restart sends after a reconnect. The tab's own options are kept
+/// whole -- including any field this build does not know about -- and the
+/// session id the transcript last saw is written into `resume_session`, which
+/// is what makes the new agent continue the conversation rather than begin one.
+#[test]
+fn restart_options_carry_the_tab_options_and_the_last_session() {
+    use bondsymphonic_ide::qobjects::transcript_model::restart_options;
+
+    let merged = restart_options(r#"{"model":"opus","future_field":7}"#, Some("sess-3"));
+    let value: serde_json::Value = serde_json::from_str(&merged).expect("an object");
+    assert_eq!(value["model"], "opus");
+    assert_eq!(value["resume_session"], "sess-3");
+    // A field a newer daemon understands and this build does not survives,
+    // because the options are merged as JSON rather than parsed into the
+    // struct this build happens to have.
+    assert_eq!(value["future_field"], 7);
+}
+
+#[test]
+fn restart_options_without_a_session_ask_for_a_fresh_one() {
+    use bondsymphonic_ide::qobjects::transcript_model::restart_options;
+
+    // No session seen: the key is absent, not null. A null would be a request
+    // to resume a session named nothing.
+    let merged = restart_options(r#"{"model":"opus","resume_session":"stale"}"#, None);
+    let value: serde_json::Value = serde_json::from_str(&merged).expect("an object");
+    assert_eq!(value["model"], "opus");
+    assert!(value.get("resume_session").is_none());
+}
+
+#[test]
+fn restart_options_survive_a_tab_with_no_options_at_all() {
+    use bondsymphonic_ide::qobjects::transcript_model::restart_options;
+
+    // An empty string is the ordinary case for a terminal-adapter tab or a
+    // dialog that set nothing; anything unparseable is treated the same way,
+    // because the point of the call is options that can start an agent.
+    for options in ["", "{}", "not json", "[1,2,3]"] {
+        let merged = restart_options(options, Some("sess-9"));
+        let value: serde_json::Value = serde_json::from_str(&merged).expect("an object");
+        assert_eq!(value["resume_session"], "sess-9", "for {options:?}");
+        assert!(value.is_object(), "for {options:?}");
+    }
+}

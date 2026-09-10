@@ -51,9 +51,17 @@ static SHARED: OnceLock<std::sync::Mutex<Option<Shared>>> = OnceLock::new();
 static CONNECTION_WAS_LOST: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Bumped by every [`publish_shared`], so a QObject holding a subscription can
-/// tell whether it was made on the connection that is live now.
-static CONNECTION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bumped by every [`publish_shared`]. A watch channel rather than a counter,
+/// so a QObject can both *read* which connection is live and *wait* for it to
+/// change without polling; see [`connection_generation`] and [`on_reconnect`].
+static GENERATION: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
+
+fn generation_channel() -> &'static tokio::sync::watch::Sender<u64> {
+    // The receiver end is dropped at once; every reader subscribes its own.
+    // `send_modify` works with no receivers at all, so the count is kept
+    // whether or not anything is currently listening.
+    GENERATION.get_or_init(|| tokio::sync::watch::channel(0).0)
+}
 
 /// Which connection is live, counting from 1. Zero means none has been
 /// published yet, so a recorded generation is always non-zero and can never be
@@ -65,7 +73,54 @@ static CONNECTION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// it parks forever. Anything that keeps a subscription across calls records
 /// this number with it and re-subscribes when it no longer matches.
 pub fn connection_generation() -> u64 {
-    CONNECTION_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+    *generation_channel().borrow()
+}
+
+/// A receiver that wakes whenever [`connection_generation`] moves.
+///
+/// This is the whole mechanism by which panes survive a daemon restart: the
+/// reconnect loop publishes a new connection, the number changes, and every
+/// subscriber re-attaches to the router that is live now. Prefer
+/// [`on_reconnect`], which wraps the waiting; this is for a caller that needs
+/// the receiver itself.
+pub fn generation_watch() -> tokio::sync::watch::Receiver<u64> {
+    generation_channel().subscribe()
+}
+
+/// Calls `apply` on `qt`'s Qt thread the next time the connection generation
+/// moves away from the one that is live now, then ends.
+///
+/// One shot, deliberately: `apply` re-attaches the object, and re-attaching is
+/// what arms the next watch. A loop here would need the object to abort its own
+/// task from inside the closure it queued.
+///
+/// The generation is captured when this is *called*, not when the task first
+/// runs, so a connection published in between still fires it. Without that, a
+/// pane attached microseconds before a reconnect would wait for a change that
+/// had already happened and stay dead for the session.
+pub fn on_reconnect<T>(
+    qt: cxx_qt::CxxQtThread<T>,
+    apply: fn(core::pin::Pin<&mut T>),
+) -> tokio::task::JoinHandle<()>
+where
+    T: cxx_qt::Threading + 'static,
+{
+    let armed_at = connection_generation();
+    runtime().spawn(async move {
+        let mut generations = generation_watch();
+        loop {
+            if *generations.borrow_and_update() != armed_at {
+                break;
+            }
+            // The sender is a process-wide `OnceLock` that is never dropped, so
+            // this only errors if that ever changes; ending the task is then
+            // the right answer either way.
+            if generations.changed().await.is_err() {
+                return;
+            }
+        }
+        let _ = qt.queue(apply);
+    })
 }
 
 fn shared_slot() -> &'static std::sync::Mutex<Option<Shared>> {
@@ -84,19 +139,56 @@ pub fn shared() -> Option<Shared> {
 }
 
 /// Publishes a fresh connection for every QObject to use.
+///
+/// The slot is filled *before* the generation is bumped: a subscriber woken by
+/// the change immediately reaches for [`shared`], and finding `None` there
+/// would cost it its re-attach.
 pub fn publish_shared(shared: Shared) {
     CONNECTION_WAS_LOST.store(false, std::sync::atomic::Ordering::SeqCst);
-    CONNECTION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     *shared_slot().lock().expect("shared handle mutex poisoned") = Some(shared);
+    generation_channel().send_modify(|generation| *generation += 1);
 }
 
 /// Drops the process-wide connection handle because the daemon connection has
-/// ended. Nothing reconnects in this milestone, so leaving the dead client in
-/// the slot would only mean every later operation issues a request on it and
-/// fails with a protocol error instead of a sentence the user can act on.
+/// ended. Leaving the dead client in the slot would only mean every operation
+/// made before the reconnect lands issues a request on it and fails with a
+/// protocol error instead of a sentence the user can act on.
 pub fn on_connection_lost() {
     CONNECTION_WAS_LOST.store(true, std::sync::atomic::Ordering::SeqCst);
     *shared_slot().lock().expect("shared handle mutex poisoned") = None;
+}
+
+/// Set by `prepareQuit`, so a connection ending because the IDE is shutting
+/// down is not mistaken for one that should be reconnected.
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the reconnect loop is already running. There is one daemon
+/// connection per IDE, so a second `start()` -- a stray call from C++, a
+/// window rebuilt -- must not put a second loop behind it: two loops would
+/// relaunch two daemons over one data directory and take turns replacing each
+/// other's connection.
+static SUPERVISING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the IDE is on its way out. The reconnect loop checks this at every
+/// step it could act on, so a daemon shut down by an exiting IDE is never
+/// relaunched behind it.
+pub fn quitting() -> bool {
+    QUITTING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// How long to wait before reconnect attempt `attempt`, counting from 1:
+/// 1, 2, 4, 8, 16, then 30 seconds for every attempt after that.
+///
+/// Doubling gives a daemon that is merely slow to come back a fast reconnect,
+/// and the cap keeps a daemon that is down for the afternoon from being poked
+/// once an hour. Attempts are unbounded, so the exponent is clamped before it
+/// is shifted rather than after: `1 << 64` is not a long wait, it is undefined.
+pub fn backoff_delay(attempt: u32) -> Duration {
+    const MAX_SECS: u64 = 30;
+    // Attempt 0 is not a thing the loop produces, but a caller that passes one
+    // must still get a wait rather than a spin.
+    let steps = attempt.saturating_sub(1).min(5);
+    Duration::from_secs((1u64 << steps).min(MAX_SECS))
 }
 
 /// The live connection, or the message an operation should fail with. Every
@@ -335,9 +427,33 @@ pub mod qobject {
         #[qsignal]
         fn operation_failed(self: Pin<&mut AppController>, op: QString, message: QString);
 
+        /// The IDE is talking to a daemon again after a connection loss, and
+        /// has already re-run `system.check_prereqs` and `workspace.list`:
+        /// `prereqsChecked` and `workspacesListed` have been emitted before
+        /// this. `generation` is the connection number every subscription is
+        /// now taken on.
+        ///
+        /// The Rust-side panes do not need it -- they re-attach through the
+        /// generation channel themselves -- so this is for the window: refresh
+        /// the status bar, take a "connection lost" banner down, re-enable
+        /// anything a loss disabled.
+        #[qsignal]
+        fn reconnected(self: Pin<&mut AppController>, generation: i64);
+
         /// Launch the daemon inside WSL and connect to it.
         #[qinvokable]
         fn start(self: Pin<&mut AppController>);
+
+        /// Records that the IDE is shutting down, so the connection about to
+        /// end is not treated as a loss to reconnect from.
+        ///
+        /// Call it from File > Exit and from `MainWindow::closeEvent`, before
+        /// anything else: without it, closing the window races the reconnect
+        /// loop, which relaunches a daemon inside WSL for an IDE that is on
+        /// its way out. Idempotent, and there is no way back -- an IDE that
+        /// has said it is quitting does not un-quit.
+        #[qinvokable]
+        fn prepare_quit(self: &AppController);
 
         /// Record the daemon version and recompose the status text. Callers use
         /// this rather than `set_daemon_version` so the status bar stays in sync.
@@ -756,6 +872,11 @@ pub struct AppControllerRust {
     /// first one restores the persisted arrangement; every later one is an
     /// ordinary reconcile.
     first_list_done: bool,
+    /// Which reconnect attempt the status text is counting. Kept here because
+    /// the `connection_state` property is one integer and cannot carry it, so
+    /// anything recomposing the status from that property alone would
+    /// otherwise lose the number.
+    reconnect_attempt: u32,
 }
 
 impl Default for AppControllerRust {
@@ -768,6 +889,7 @@ impl Default for AppControllerRust {
             client: None,
             process: None,
             first_list_done: false,
+            reconnect_attempt: 0,
         }
     }
 }
@@ -828,15 +950,10 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
             _ => {}
         }
     }
-    // The stream only ends when the connection does. Drop the shared handle
-    // first: the state change below is what the status bar shows, but it is the
-    // empty slot that makes the next operation fail at once instead of issuing
-    // a request nobody will answer.
-    on_connection_lost();
-    let _ = qt.queue(|mut q| {
-        q.as_mut().rust_mut().client = None;
-        q.set_state(ConnectionState::Lost);
-    });
+    // The stream only ends when the connection does. What happens next is
+    // [`supervise`]'s decision, not this task's: it is awaiting this very task
+    // and will drop the shared handle, reap the daemon and start the reconnect
+    // clock. Doing any of that here as well would race it.
 }
 
 /// The Anthropic API key to put in `agent.start`'s options.
@@ -1012,9 +1129,238 @@ async fn load_workspace_list(client: DaemonClient, qt: QtHandle) {
     report_failure(&qt, "workspace.list", last_error);
 }
 
+/// The daemon connection for the whole life of the IDE: the first launch, and
+/// then a relaunch after every loss until the window says it is quitting.
+///
+/// One task, one loop, so there can only ever be one reconnect in flight: the
+/// loop is not connecting while a connection is up, and it is not connected
+/// while it is waiting out a backoff. Everything that decides *whether* to
+/// reconnect is here rather than spread across the event drain and the process
+/// handle, which is what makes that guarantee readable.
+async fn supervise(spec: LaunchSpec, qt: QtHandle, process: ProcessHandle) {
+    let mut attempt: u32 = 0;
+    loop {
+        if attempt > 0 {
+            let delay = backoff_delay(attempt);
+            tracing::warn!("reconnecting to the daemon in {delay:?} (attempt {attempt})");
+            let _ = qt.queue(move |q| q.set_state(ConnectionState::Reconnecting { attempt }));
+            tokio::time::sleep(delay).await;
+            if quitting() {
+                return;
+            }
+        }
+        let mut drain = match connect_once(&spec, &qt, &process, attempt).await {
+            Ok(drain) => drain,
+            Err(message) => {
+                if attempt == 0 {
+                    // The very first launch never came up. That is not a lost
+                    // connection but a machine that cannot run the daemon at
+                    // all -- a missing distro, a bad path, a binary that will
+                    // not start -- and retrying it every second would only
+                    // repeat the same sentence behind a status bar that says
+                    // "reconnecting". The error text and the setup page are
+                    // the answer to that one instead.
+                    tracing::error!("{message}");
+                    let _ = qt.queue(move |mut q| {
+                        q.as_mut().set_state(ConnectionState::Error);
+                        q.set_status_message(QString::from(message.as_str()));
+                    });
+                    return;
+                }
+                tracing::warn!("reconnect attempt {attempt} failed: {message}");
+                attempt += 1;
+                continue;
+            }
+        };
+
+        // Connected. Two things end a connection and the loop acts on
+        // whichever comes first: the event stream ending (the socket died) or
+        // the daemon process exiting (the relay was killed, the daemon
+        // crashed). `select!` drops the losing future, which is what lets
+        // `wait_for_process` hold the process lock across its await.
+        let reason = tokio::select! {
+            _ = &mut drain => "the daemon's event stream ended",
+            reason = wait_for_process(&process) => {
+                // The stream has not ended yet, but nothing will answer on it.
+                drain.abort();
+                reason
+            }
+        };
+
+        // The dead client goes first: an operation attempted in the gap then
+        // fails at once, with a reason, instead of issuing a request nobody
+        // will answer.
+        on_connection_lost();
+        let _ = qt.queue(|mut q| {
+            q.as_mut().rust_mut().client = None;
+        });
+        // The old child is reaped rather than left behind: `shutdown` closes
+        // its stdin, which is how the daemon is asked to exit, and then kills
+        // the relay -- so a relaunch cannot end up with two daemons over one
+        // data directory.
+        let old = process.lock().await.take();
+        if let Some(old) = old {
+            old.shutdown().await;
+        }
+        if quitting() {
+            tracing::info!("{reason}; the IDE is quitting, so nothing is reconnected");
+            let _ = qt.queue(|q| q.set_state(ConnectionState::Lost));
+            return;
+        }
+        tracing::warn!("{reason}");
+        attempt = 1;
+    }
+}
+
+/// Resolves when the daemon process ends, and never when there is none.
+///
+/// Holding the lock across the await is deliberate. The only other thing that
+/// takes it is [`supervise`], and only after this future has been dropped by
+/// the `select!` that owned it, so the wait can never block the reaping that
+/// follows it.
+async fn wait_for_process(process: &ProcessHandle) -> &'static str {
+    let mut guard = process.lock().await;
+    match guard.as_mut() {
+        Some(daemon) => {
+            let status = daemon.wait_exit().await;
+            tracing::warn!("the daemon process ended: {status:?}");
+            "the daemon process exited"
+        }
+        // The `BS_DAEMON_ADDR` test hook: there is no process of ours to
+        // watch, so the event stream is the only signal and this parks.
+        None => std::future::pending().await,
+    }
+}
+
+/// One launch-connect-resync cycle. `attempt` is 0 for the first connection of
+/// the run and counts the reconnects after that.
+///
+/// Returns the handle of the task draining this connection's events, which is
+/// what [`supervise`] waits on to learn that the connection has ended.
+async fn connect_once(
+    spec: &LaunchSpec,
+    qt: &QtHandle,
+    process: &ProcessHandle,
+    attempt: u32,
+) -> Result<tokio::task::JoinHandle<()>, String> {
+    let first = attempt == 0;
+    // `test_endpoint` is the `BS_DAEMON_ADDR` test hook and is `None` in every
+    // ordinary run, which then launches the daemon inside WSL. Under the hook
+    // a reconnect only reconnects: there is no daemon of ours to relaunch, and
+    // the fake one is expected to be listening on the same port again.
+    let (addr, token) = match launcher::test_endpoint() {
+        Some((addr, token)) => {
+            if first {
+                tracing::warn!(
+                    "{} is set: connecting to {addr} instead of launching a daemon",
+                    launcher::TEST_ADDR_ENV
+                );
+            }
+            (addr, token)
+        }
+        None => {
+            if first {
+                let _ = qt.queue(|q| q.set_state(ConnectionState::Launching));
+            }
+            let daemon = launcher::launch(spec)
+                .await
+                .map_err(|e| format!("daemon: launch failed: {e:#}"))?;
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], daemon.port));
+            let token = daemon.token.clone();
+            *process.lock().await = Some(daemon);
+            (addr, token)
+        }
+    };
+    // Only on the first connection: a reconnect's status text is
+    // "daemon: reconnecting (attempt N)", and overwriting it with "connecting"
+    // would take away the count the user is watching.
+    if first {
+        let _ = qt.queue(|q| q.set_state(ConnectionState::Connecting));
+    }
+
+    let (client, hello, events) =
+        match DaemonClient::connect(addr, &token, env!("CARGO_PKG_VERSION")).await {
+            Ok(connected) => connected,
+            Err(e) => {
+                // A daemon we just launched but cannot talk to. Reaped here
+                // rather than left as an orphan behind every failed attempt.
+                let orphan = process.lock().await.take();
+                if let Some(orphan) = orphan {
+                    orphan.shutdown().await;
+                }
+                return Err(format!("daemon: connect failed: {e}"));
+            }
+        };
+
+    // Published before any event is dispatched, so a QObject woken by the
+    // first `workspaces_listed` -- or by the generation change this publish
+    // *is* -- can already reach the daemon.
+    let router = EventRouter::new();
+    publish_shared(Shared {
+        client: client.clone(),
+        router: router.clone(),
+    });
+    let generation = connection_generation();
+
+    // Draining starts before any request goes out. The client's event
+    // channel is bounded, and its socket reader pushes into it with
+    // backpressure, so a daemon that is already streaming (a reconnect to
+    // one with live PTYs) would otherwise fill the channel, stall the
+    // reader, and starve every reply below until the request timeout.
+    let drain = runtime().spawn(drain_events(events, router, qt.clone()));
+
+    let version = hello.daemon_version.clone();
+    let capabilities = serde_json::to_string(&hello.capabilities).unwrap_or_default();
+    let c2 = client.clone();
+    let _ = qt.queue(move |mut q| {
+        q.as_mut().rust_mut().client = Some(c2);
+        q.as_mut().rust_mut().capabilities = QString::from(&capabilities);
+        // State first, then the version, so `apply_daemon_version`
+        // recomposes the text as "daemon: connected v<version>".
+        q.as_mut().set_state(ConnectionState::Connected);
+        q.apply_daemon_version(QString::from(version.as_str()));
+    });
+
+    if first {
+        // Its own task, so the list does not queue behind the prereq check.
+        let list_client = client.clone();
+        let list_qt = qt.clone();
+        runtime().spawn(async move {
+            load_workspace_list(list_client.clone(), list_qt.clone()).await;
+            // The `BS_SMOKE_SCRIPT` test hook; `None` in every ordinary run.
+            // It starts only once the list has been fetched and queued:
+            // `reconcile` keeps only the workspaces the daemon listed, so a
+            // list applied after the script's `workspace_created` would drop
+            // the tab it just made, silently costing the run its coverage of
+            // the window's own PTY and directory requests. Queuing is enough
+            // to order them, because the Qt thread runs queued closures in
+            // the order they were posted.
+            if let Some(steps) = smoke::script() {
+                smoke::run(steps, list_client, list_qt).await;
+            }
+        });
+        check_prereqs(client, qt.clone()).await;
+    } else {
+        // A reconnect re-syncs in order and announces itself only once that is
+        // done, so anything listening for `reconnected` can take it that the
+        // prerequisites and the workspace list have already been reported.
+        // Awaited rather than spawned for exactly that reason.
+        check_prereqs(client.clone(), qt.clone()).await;
+        load_workspace_list(client, qt.clone()).await;
+        let announced = i64::try_from(generation).unwrap_or(i64::MAX);
+        tracing::info!("reconnected on connection generation {generation}");
+        let _ = qt.queue(move |q| q.reconnected(announced));
+    }
+    Ok(drain)
+}
+
 impl qobject::AppController {
-    pub fn start(self: Pin<&mut Self>) {
-        let qt = self.qt_thread();
+    pub fn start(mut self: Pin<&mut Self>) {
+        if SUPERVISING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            tracing::warn!("start() called again; the daemon connection is already supervised");
+            return;
+        }
+        let qt = self.as_ref().qt_thread();
         let settings = Settings::load();
         let spec = LaunchSpec {
             distro: settings.distro.clone(),
@@ -1022,102 +1368,12 @@ impl qobject::AppController {
             local_daemon_binary: Settings::local_daemon_binary(),
             log_level: settings.log_level.clone(),
         };
-        let _ = qt.queue(|q| q.set_state(ConnectionState::Launching));
-        runtime().spawn(async move {
-            // `test_endpoint` is the `BS_DAEMON_ADDR` test hook and is `None` in
-            // every ordinary run, which then launches the daemon inside WSL.
-            let (addr, token, proc) = match launcher::test_endpoint() {
-                Some((addr, token)) => {
-                    tracing::warn!(
-                        "{} is set: connecting to {addr} instead of launching a daemon",
-                        launcher::TEST_ADDR_ENV
-                    );
-                    (addr, token, None)
-                }
-                None => match launcher::launch(&spec).await {
-                    Ok(p) => (
-                        std::net::SocketAddr::from(([127, 0, 0, 1], p.port)),
-                        p.token.clone(),
-                        Some(p),
-                    ),
-                    Err(e) => {
-                        let msg = format!("daemon: launch failed: {e:#}");
-                        tracing::error!("{msg}");
-                        let _ = qt.queue(move |mut q| {
-                            q.as_mut().set_state(ConnectionState::Error);
-                            q.set_status_message(QString::from(msg.as_str()));
-                        });
-                        return;
-                    }
-                },
-            };
-            let _ = qt.queue(|q| q.set_state(ConnectionState::Connecting));
-
-            let (client, hello, events) =
-                match DaemonClient::connect(addr, &token, env!("CARGO_PKG_VERSION")).await {
-                    Ok(x) => x,
-                    Err(e) => {
-                        let msg = format!("daemon: connect failed: {e}");
-                        tracing::error!("{msg}");
-                        let _ = qt.queue(move |mut q| {
-                            q.as_mut().set_state(ConnectionState::Error);
-                            q.set_status_message(QString::from(msg.as_str()));
-                        });
-                        return;
-                    }
-                };
-
-            // Published before any event is dispatched, so a QObject woken by the
-            // first `workspaces_listed` can already reach the daemon.
-            let router = EventRouter::new();
-            publish_shared(Shared {
-                client: client.clone(),
-                router: router.clone(),
-            });
-
-            // Draining starts before any request goes out. The client's event
-            // channel is bounded, and its socket reader pushes into it with
-            // backpressure, so a daemon that is already streaming (a reconnect to
-            // one with live PTYs) would otherwise fill the channel, stall the
-            // reader, and starve every reply below until the request timeout.
-            runtime().spawn(drain_events(events, router.clone(), qt.clone()));
-
-            let version = hello.daemon_version.clone();
-            let capabilities = serde_json::to_string(&hello.capabilities).unwrap_or_default();
-            // `None` under the test hook: there is no daemon process to own.
-            let handle: Option<ProcessHandle> =
-                proc.map(|p| std::sync::Arc::new(tokio::sync::Mutex::new(Some(p))));
-            let c2 = client.clone();
-            let _ = qt.queue(move |mut q| {
-                q.as_mut().rust_mut().client = Some(c2);
-                q.as_mut().rust_mut().process = handle;
-                q.as_mut().rust_mut().capabilities = QString::from(&capabilities);
-                // State first, then the version, so `apply_daemon_version`
-                // recomposes the text as "daemon: connected v<version>".
-                q.as_mut().set_state(ConnectionState::Connected);
-                q.apply_daemon_version(QString::from(version.as_str()));
-            });
-
-            // Its own task, so the list does not queue behind the prereq check.
-            let list_client = client.clone();
-            let list_qt = qt.clone();
-            runtime().spawn(async move {
-                load_workspace_list(list_client.clone(), list_qt.clone()).await;
-                // The `BS_SMOKE_SCRIPT` test hook; `None` in every ordinary run.
-                // It starts only once the list has been fetched and queued:
-                // `reconcile` keeps only the workspaces the daemon listed, so a
-                // list applied after the script's `workspace_created` would drop
-                // the tab it just made, silently costing the run its coverage of
-                // the window's own PTY and directory requests. Queuing is enough
-                // to order them, because the Qt thread runs queued closures in
-                // the order they were posted.
-                if let Some(steps) = smoke::script() {
-                    smoke::run(steps, list_client, list_qt).await;
-                }
-            });
-
-            check_prereqs(client, qt).await;
-        });
+        // The slot the reconnect loop empties and refills. Kept on the
+        // controller as well, so a later Exit action reaches the daemon that
+        // is running now rather than the one that was running at start-up.
+        let process: ProcessHandle = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        self.as_mut().rust_mut().process = Some(process.clone());
+        runtime().spawn(supervise(spec, qt, process));
     }
 
     pub fn create_workspace(
@@ -1576,20 +1832,52 @@ impl qobject::AppController {
     }
 
     pub fn set_state(mut self: Pin<&mut Self>, state: ConnectionState) {
+        if let ConnectionState::Reconnecting { attempt } = state {
+            self.as_mut().rust_mut().reconnect_attempt = attempt;
+        }
         self.as_mut().set_connection_state(state.as_i32());
         self.refresh_status(state);
     }
 
     pub fn apply_daemon_version(mut self: Pin<&mut Self>, version: QString) {
         self.as_mut().set_daemon_version(version);
-        let state = ConnectionState::from_i32(*self.connection_state());
+        let state = self.as_ref().current_state();
         self.refresh_status(state);
     }
 
+    pub fn prepare_quit(&self) {
+        // No un-setting: an IDE that has announced it is quitting does not
+        // change its mind, and a way back would only be a way for a stray
+        // caller to re-arm the reconnect loop during teardown.
+        QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!("the IDE is quitting; the daemon will not be relaunched");
+    }
+
+    /// The connection state the property holds, with the reconnect attempt put
+    /// back. The property cannot carry the attempt, so anything that needs the
+    /// whole state reads it through here rather than through `from_i32` alone.
+    fn current_state(&self) -> ConnectionState {
+        match ConnectionState::from_i32(*self.connection_state()) {
+            ConnectionState::Reconnecting { .. } => ConnectionState::Reconnecting {
+                attempt: self.rust().reconnect_attempt,
+            },
+            other => other,
+        }
+    }
+
     /// Recomposes `status_message` from `state` and the current `daemon_version`.
+    ///
+    /// The text is logged as well as published. The status bar is the one place
+    /// a user watches a reconnect happen, and an offscreen run has no status
+    /// bar to read: without this, "reconnecting (attempt 1)" would be a claim
+    /// no test could check. Only a change is logged, so recomposing the same
+    /// text (which `apply_daemon_version` does) says nothing twice.
     fn refresh_status(mut self: Pin<&mut Self>, state: ConnectionState) {
         let version = self.daemon_version().to_string();
-        let text = compose_status(state.label(), &version);
+        let text = compose_status(state, &version);
+        if self.as_ref().status_message().to_string() != text {
+            tracing::info!(target: "connection", "{text}");
+        }
         self.as_mut().set_status_message(QString::from(&text));
     }
 

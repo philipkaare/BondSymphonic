@@ -18,15 +18,23 @@ pub enum ConnectionState {
     Launching,
     Connecting,
     Connected,
-    /// The connection ended. Nothing reconnects in this milestone, so this is
-    /// a terminal state: every operation fails immediately until the IDE is
-    /// restarted.
+    /// The connection ended and nothing is being done about it: the IDE is on
+    /// its way out, or the very first connect failed. An ordinary loss goes to
+    /// [`ConnectionState::Reconnecting`] instead.
     Lost,
     Error,
+    /// The connection ended and the IDE is relaunching the daemon. `attempt`
+    /// counts from 1 and never stops climbing; the delay before each attempt
+    /// is the controller's `backoff_delay`.
+    Reconnecting {
+        attempt: u32,
+    },
 }
 
 impl ConnectionState {
-    /// Stable numeric code exposed to C++/QML as the `connection_state` property.
+    /// Stable numeric code exposed to C++/QML as the `connection_state`
+    /// property. The attempt count is deliberately not in it: the property is
+    /// one integer and the number the user reads is in `status_message`.
     pub fn as_i32(self) -> i32 {
         match self {
             Self::Disconnected => 0,
@@ -35,12 +43,18 @@ impl ConnectionState {
             Self::Connected => 3,
             Self::Lost => 4,
             Self::Error => 5,
+            Self::Reconnecting { .. } => 6,
         }
     }
 
-    /// Inverse of [`ConnectionState::as_i32`]. Codes outside 0..=5 map to
+    /// Inverse of [`ConnectionState::as_i32`]. Codes outside 0..=6 map to
     /// [`ConnectionState::Error`], since the `connection_state` property is
     /// writable from C++ and may hold anything.
+    ///
+    /// A code of 6 comes back as attempt 0, because the code never carried the
+    /// attempt. The controller keeps the live number itself and re-applies it,
+    /// so nothing that recomposes the status text from the property alone can
+    /// invent an attempt that was never made.
     pub fn from_i32(code: i32) -> Self {
         match code {
             0 => Self::Disconnected,
@@ -48,11 +62,13 @@ impl ConnectionState {
             2 => Self::Connecting,
             3 => Self::Connected,
             4 => Self::Lost,
+            6 => Self::Reconnecting { attempt: 0 },
             _ => Self::Error,
         }
     }
 
-    /// Human readable text for the status bar.
+    /// Human readable text for the status bar, without the attempt count.
+    /// [`compose_status`] is what adds that.
     pub fn label(self) -> &'static str {
         match self {
             Self::Disconnected => "daemon: not started",
@@ -61,18 +77,33 @@ impl ConnectionState {
             Self::Connected => "daemon: connected",
             Self::Lost => "daemon: connection lost",
             Self::Error => "daemon: error",
+            Self::Reconnecting { .. } => "daemon: reconnecting",
         }
     }
 }
 
-/// Builds the status bar text from a connection label and the daemon version.
-/// An empty version contributes nothing. This is the only place the two are
-/// combined, so the C++ shell never has to branch on the version.
-pub fn compose_status(label: &str, version: &str) -> String {
+/// Builds the status bar text from a connection state and the daemon version.
+/// This is the only place the two are combined, so the C++ shell never has to
+/// branch on either.
+///
+/// An empty version contributes nothing. While reconnecting the version
+/// contributes nothing either, whatever it holds: it describes the daemon that
+/// has just died, and repeating it beside "reconnecting" would claim a version
+/// for a daemon that has not answered yet. The attempt takes its place, so the
+/// user can see that something is still being tried.
+pub fn compose_status(state: ConnectionState, version: &str) -> String {
+    if let ConnectionState::Reconnecting { attempt } = state {
+        // Attempt 0 only arises from `from_i32` on the raw property; there is
+        // no such attempt, so the bare label is the honest text.
+        return match attempt {
+            0 => state.label().to_owned(),
+            n => format!("{} (attempt {n})", state.label()),
+        };
+    }
     if version.is_empty() {
-        label.to_owned()
+        state.label().to_owned()
     } else {
-        format!("{label} v{version}")
+        format!("{} v{version}", state.label())
     }
 }
 
@@ -655,13 +686,14 @@ pub fn parse_agent_state(word: &str) -> Option<AgentState> {
 mod tests {
     use super::*;
 
-    const ALL_STATES: [ConnectionState; 6] = [
+    const ALL_STATES: [ConnectionState; 7] = [
         ConnectionState::Disconnected,
         ConnectionState::Launching,
         ConnectionState::Connecting,
         ConnectionState::Connected,
         ConnectionState::Lost,
         ConnectionState::Error,
+        ConnectionState::Reconnecting { attempt: 0 },
     ];
 
     #[test]
@@ -669,13 +701,22 @@ mod tests {
         let codes: std::collections::HashSet<i32> = ALL_STATES.iter().map(|s| s.as_i32()).collect();
         assert_eq!(codes.len(), ALL_STATES.len());
         assert_eq!(ConnectionState::Connected.label(), "daemon: connected");
-        // The state the controller lands in when the event stream ends. It has
-        // to say the connection is gone: nothing reconnects, so a status bar
-        // promising a reconnect would be a lie the user waits on.
+        // The state the controller lands in when the event stream ends and it
+        // is *not* going to try again: the IDE is quitting, or the first
+        // connect never came up. An ordinary loss says "reconnecting" instead.
         assert_eq!(ConnectionState::Lost.label(), "daemon: connection lost");
         assert_eq!(
-            compose_status(ConnectionState::Lost.label(), "0.1.0"),
+            compose_status(ConnectionState::Lost, "0.1.0"),
             "daemon: connection lost v0.1.0"
+        );
+    }
+
+    #[test]
+    fn every_reconnect_attempt_shares_one_code() {
+        // The property is one integer; the attempt travels in the status text.
+        assert_eq!(
+            ConnectionState::Reconnecting { attempt: 1 }.as_i32(),
+            ConnectionState::Reconnecting { attempt: 47 }.as_i32()
         );
     }
 
@@ -684,16 +725,46 @@ mod tests {
         for state in ALL_STATES {
             assert_eq!(ConnectionState::from_i32(state.as_i32()), state);
         }
+        // The attempt is not in the code, so a reconnecting state read back
+        // out of the property has no attempt rather than a guessed one.
+        assert_eq!(
+            ConnectionState::from_i32(ConnectionState::Reconnecting { attempt: 9 }.as_i32()),
+            ConnectionState::Reconnecting { attempt: 0 }
+        );
         assert_eq!(ConnectionState::from_i32(-1), ConnectionState::Error);
         assert_eq!(ConnectionState::from_i32(99), ConnectionState::Error);
     }
 
     #[test]
     fn compose_status_appends_the_version_only_when_present() {
-        assert_eq!(compose_status("daemon: connected", ""), "daemon: connected");
         assert_eq!(
-            compose_status("daemon: connected", "0.1.0"),
+            compose_status(ConnectionState::Connected, ""),
+            "daemon: connected"
+        );
+        assert_eq!(
+            compose_status(ConnectionState::Connected, "0.1.0"),
             "daemon: connected v0.1.0"
+        );
+    }
+
+    #[test]
+    fn compose_status_counts_the_reconnect_attempt_and_drops_the_version() {
+        // The version belongs to the daemon that just died, so it is left out:
+        // "reconnecting v0.1.0" would claim a version nothing has answered
+        // with yet.
+        assert_eq!(
+            compose_status(ConnectionState::Reconnecting { attempt: 1 }, "0.1.0"),
+            "daemon: reconnecting (attempt 1)"
+        );
+        assert_eq!(
+            compose_status(ConnectionState::Reconnecting { attempt: 12 }, ""),
+            "daemon: reconnecting (attempt 12)"
+        );
+        // Attempt 0 is what `from_i32` produces; there is no attempt 0 to
+        // report, so the text stays bare rather than counting one.
+        assert_eq!(
+            compose_status(ConnectionState::Reconnecting { attempt: 0 }, "0.1.0"),
+            "daemon: reconnecting"
         );
     }
 }

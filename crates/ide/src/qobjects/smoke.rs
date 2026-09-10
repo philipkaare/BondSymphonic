@@ -55,16 +55,23 @@
 //!   process has exited.
 //! * `destroy` — destroy the workspace and emit `workspace_destroyed`, which is
 //!   what makes the window tear its panes down.
+//! * `reconnect` — ask the daemon to drop the connection with
+//!   [`TEST_DROP_METHOD`], then wait for the controller's reconnect loop to
+//!   publish a new one and re-sync. **Only a fake daemon answers this**: the
+//!   method is not in `Request`, the real daemon has never heard of it and
+//!   replies "not implemented", so nothing but a test can make this step do
+//!   anything. Every step after it runs on the new connection, because this is
+//!   the one step that hands the script a fresh client.
 //! * `quit` — let the window settle, then end the process with status 0.
 //!
 //! A failing step logs and stops the script *without* quitting, so a broken run
 //! is a process that never exits rather than a green exit code.
 
 use crate::client::DaemonClient;
-use crate::qobjects::app_controller::QtHandle;
+use crate::qobjects::app_controller::{connection_generation, shared, QtHandle};
 use bondsymphonic_proto::*;
 use cxx_qt_lib::QString;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The comma-separated step list. Unset in every ordinary run.
 const SCRIPT_ENV: &str = "BS_SMOKE_SCRIPT";
@@ -125,6 +132,22 @@ const PERMISSION_REQUEST_ID: &str = "req-1";
 /// the reply reaches the window through the same queue, so `allow` gets the
 /// same grace before the next step reads the result.
 const AGENT_SETTLE: Duration = Duration::from_millis(1_500);
+/// The control method `reconnect` sends. **Fake daemons only.** It is not a
+/// `Request` variant, so it can only be built by hand and only a daemon written
+/// to recognise it does anything with it; the real daemon answers "not
+/// implemented" and stays connected.
+pub const TEST_DROP_METHOD: &str = "system.test_drop";
+/// How long `reconnect` waits for the connection generation to move. The first
+/// backoff is one second, so this covers several attempts of a fake daemon that
+/// is slow to accept again, and fails the step rather than the whole run if it
+/// never does.
+const RECONNECT_LIMIT: Duration = Duration::from_secs(45);
+/// How often the generation is checked while waiting.
+const RECONNECT_POLL: Duration = Duration::from_millis(100);
+/// How long `reconnect` waits after the new connection is published, so the
+/// re-sync it triggers -- `system.check_prereqs` and `workspace.list` -- and
+/// every pane's own re-attach have landed before the next step acts.
+const RECONNECT_SETTLE: Duration = Duration::from_millis(1_500);
 
 /// The steps in `BS_SMOKE_SCRIPT`, or `None` when it is unset or empty.
 pub(crate) fn script() -> Option<Vec<String>> {
@@ -138,7 +161,11 @@ pub(crate) fn script() -> Option<Vec<String>> {
 }
 
 /// Runs `steps` in order against the connected daemon.
-pub(crate) async fn run(steps: Vec<String>, client: DaemonClient, qt: QtHandle) {
+///
+/// `client` is the connection the script started on. The `reconnect` step
+/// replaces it, so every step after one runs on the connection that is live
+/// then rather than on a socket that has been closed.
+pub(crate) async fn run(steps: Vec<String>, mut client: DaemonClient, qt: QtHandle) {
     let repo = std::env::var(REPO_ENV).unwrap_or_else(|_| DEFAULT_REPO.to_owned());
     let mut workspace: Option<WorkspaceId> = None;
     let mut pty: Option<PtyId> = None;
@@ -180,6 +207,7 @@ pub(crate) async fn run(steps: Vec<String>, client: DaemonClient, qt: QtHandle) 
             "run_stop" => run_stop(&client, run.take()).await,
             "close" => close(&client, pty.take()).await,
             "destroy" => destroy(&client, &qt, workspace.take()).await,
+            "reconnect" => reconnect(&client).await.map(|fresh| client = fresh),
             "quit" => quit(&qt).await,
             other => Err(format!("unknown step {other:?}")),
         };
@@ -373,6 +401,44 @@ async fn destroy(
     Ok(())
 }
 
+/// Makes the daemon drop the connection, then waits for the IDE to build a new
+/// one and hands the script the client for it.
+///
+/// Nothing here reconnects anything: the request goes out, the socket closes,
+/// and everything after that is `AppController`'s reconnect loop acting on its
+/// own. What this step waits for is the connection generation moving, which
+/// only [`crate::qobjects::app_controller::publish_shared`] does, so a run that
+/// gets past this step is a run in which the IDE really did relaunch and
+/// re-handshake without being told to.
+///
+/// The drop request is expected to fail as often as it succeeds -- the daemon
+/// answers it by closing the socket, and the writer may notice that before the
+/// line is even flushed -- so a send error is logged rather than failed on.
+async fn reconnect(client: &DaemonClient) -> Result<DaemonClient, String> {
+    let before = connection_generation();
+    if let Err(e) = client.send_untyped(TEST_DROP_METHOD).await {
+        tracing::info!(
+            target: "smoke",
+            "{TEST_DROP_METHOD} could not be sent ({e}); the connection was already going"
+        );
+    }
+    let deadline = Instant::now() + RECONNECT_LIMIT;
+    while connection_generation() <= before {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the IDE did not reconnect within {RECONNECT_LIMIT:?}"
+            ));
+        }
+        tokio::time::sleep(RECONNECT_POLL).await;
+    }
+    // The connection is published before the re-sync runs, so the settle is
+    // what makes the next step act on a window that has caught up.
+    tokio::time::sleep(RECONNECT_SETTLE).await;
+    let shared = shared().ok_or_else(|| "the reconnect published no connection".to_owned())?;
+    tracing::info!(target: "smoke", "reconnected on generation {}", connection_generation());
+    Ok(shared.client)
+}
+
 /// Which of the two open requests [`open_editor`] makes.
 #[derive(Clone, Copy)]
 enum Pane {
@@ -450,6 +516,9 @@ async fn run_start(
         .request::<RunStartResult>(Request::RunStart(RunStartParams {
             workspace_id,
             config_name: RUN_CONFIG.to_owned(),
+            // The port override is the Run panel's business; this step starts
+            // the configuration as it is written.
+            port: None,
         }))
         .await
         .map_err(|e| e.to_string())?;

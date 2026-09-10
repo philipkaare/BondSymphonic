@@ -12,7 +12,7 @@
 
 use crate::client::router::{EventRouter, EventRx};
 use crate::model::terminal_grid::{key_to_bytes, TerminalGrid};
-use crate::qobjects::app_controller::{require_connection, runtime, shared};
+use crate::qobjects::app_controller::{on_reconnect, require_connection, runtime, shared};
 use base64::Engine as _;
 use bondsymphonic_proto::{
     Event, PtyId, PtyIdParams, PtyOpenParams, PtyOpenResult, PtyResizeParams, PtyWriteParams,
@@ -125,6 +125,22 @@ pub mod qobject {
         /// daemon reports that it discarded events.
         #[qinvokable]
         fn note_output_dropped(self: Pin<&mut TerminalSession>);
+
+        /// Opens a new PTY with the workspace, command and size the last
+        /// `open` used.
+        ///
+        /// This is the answer to the `[daemon restarted]` state: a PTY does
+        /// not survive a daemon restart -- the process inside it was in a
+        /// sandbox that is gone -- so the session cannot resume, only start
+        /// again. The scrollback of the old one is deliberately dropped with
+        /// it: it describes a shell that no longer exists.
+        ///
+        /// Refused, with the reason on `error`, for a session that was
+        /// `attach`ed rather than opened: a setup terminal on the host belongs
+        /// to a `system.setup_pty` call, and re-running that is the setup
+        /// page's decision, not this object's.
+        #[qinvokable]
+        fn reopen(self: Pin<&mut TerminalSession>);
     }
 
     impl cxx_qt::Threading for TerminalSession {}
@@ -150,6 +166,12 @@ const BATCH_WINDOW: Duration = Duration::from_millis(16);
 
 /// The banner written into the screen when the daemon drops events.
 const DROP_MARKER: &str = "[output dropped]";
+
+/// The exit line written into the screen when the daemon the PTY lived in was
+/// restarted. A PTY cannot survive that -- the process was in a sandbox the
+/// new daemon has not got -- so this is the session's last word, and `reopen`
+/// is the only way forward from it.
+pub const RESTART_MARKER: &str = "[daemon restarted]";
 
 const DEFAULT_COLS: i32 = 80;
 const DEFAULT_ROWS: i32 = 24;
@@ -328,6 +350,21 @@ pub struct TerminalSessionRust {
     /// session's frames.
     frame_pending: Arc<AtomicBool>,
     unsubscribe: Option<Unsubscribe>,
+    /// What `open` was last called with, or `None` for a session that was
+    /// `attach`ed to somebody else's PTY. This is what `reopen` re-runs, and
+    /// its absence is what makes `reopen` refuse.
+    last_open: Option<OpenRequest>,
+    /// Waits for the connection generation to move, and marks the session
+    /// restarted when it does. Replaced on every `open`/`attach`, aborted on
+    /// Drop.
+    reconnect_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// The arguments of an `open`, kept so `reopen` can repeat it.
+#[derive(Clone)]
+struct OpenRequest {
+    workspace_id: String,
+    command: String,
 }
 
 impl Default for TerminalSessionRust {
@@ -349,6 +386,8 @@ impl Default for TerminalSessionRust {
             close_requested: false,
             frame_pending: Arc::new(AtomicBool::new(false)),
             unsubscribe: None,
+            last_open: None,
+            reconnect_task: None,
         }
     }
 }
@@ -357,6 +396,9 @@ impl Drop for TerminalSessionRust {
     fn drop(&mut self) {
         // The widget went away. `Drop` runs on the Rust struct, not the
         // QObject, so it repeats what `teardown` does rather than calling it.
+        if let Some(task) = self.reconnect_task.take() {
+            task.abort();
+        }
         if let Some(unsubscribe) = self.unsubscribe.take() {
             unsubscribe();
         }
@@ -601,6 +643,12 @@ impl qobject::TerminalSession {
         let (cols, rows) = clamp_size(cols, rows);
         let pending = self.as_mut().begin(cols, rows);
         self.as_mut().set_workspace_id(workspace_id.clone());
+        // Recorded before the request goes out, so a `reopen` works even for a
+        // session whose first `pty.open` never answered.
+        self.as_mut().rust_mut().last_open = Some(OpenRequest {
+            workspace_id: workspace_id.to_string(),
+            command: command.to_string(),
+        });
 
         let shared = match require_connection() {
             Ok(shared) => shared,
@@ -651,6 +699,9 @@ impl qobject::TerminalSession {
         // guessed at: its events carry no workspace id either, which is why
         // the router has to key this one by PTY id alone.
         self.as_mut().set_workspace_id(QString::from(""));
+        // Nothing to reopen: the PTY was opened by whoever called `attach`,
+        // and only they can decide to ask for another one.
+        self.as_mut().rust_mut().last_open = None;
 
         let shared = match require_connection() {
             Ok(shared) => shared,
@@ -787,6 +838,51 @@ impl qobject::TerminalSession {
         self.apply_frame();
     }
 
+    pub fn reopen(self: Pin<&mut Self>) {
+        let Some(request) = self.as_ref().rust().last_open.clone() else {
+            self.fail("this terminal was not opened by the IDE, so it cannot be reopened");
+            return;
+        };
+        // The pane's current size, not the one the old PTY was opened at: the
+        // widget may well have been resized while the daemon was away.
+        let (cols, rows) = (*self.as_ref().cols(), *self.as_ref().rows());
+        tracing::info!("reopening the terminal in {}", request.workspace_id);
+        self.open(
+            QString::from(&request.workspace_id),
+            cols,
+            rows,
+            QString::from(&request.command),
+        );
+    }
+
+    /// Reports the PTY gone because the daemon behind it was restarted.
+    ///
+    /// Queued by [`on_reconnect`]. Nothing is asked of the daemon: the old one
+    /// is not there to answer and the new one has never heard of this PTY id,
+    /// so a `pty.close` would come back `NotFound` and put an error banner over
+    /// a pane whose only news is that its shell is gone. Clearing the id is
+    /// what makes every later `write`, `resize` and `close` a local no-op, and
+    /// marking it exited is what stops `Drop` from trying to close it.
+    fn note_daemon_restarted(mut self: Pin<&mut Self>) {
+        if *self.as_ref().exited() {
+            // The process had already finished; there is nothing to report and
+            // nothing to reopen from.
+            return;
+        }
+        tracing::info!("terminal marked exited: the daemon was restarted");
+        if let Some(unsubscribe) = self.as_mut().rust_mut().unsubscribe.take() {
+            unsubscribe();
+        }
+        self.as_mut().set_pty_id(QString::from(""));
+        self.as_mut().set_exited(true);
+        self.as_mut().set_exit_code(0);
+        if let Some(grid) = self.as_mut().rust_mut().grid.as_mut() {
+            grid.insert_marker(RESTART_MARKER);
+        }
+        self.as_mut().apply_frame();
+        self.exited_signal();
+    }
+
     /// Clears the session down to an empty `cols` x `rows` screen and hands
     /// back the frame flag the new pump is to use. Both `open` and `attach`
     /// start here, because a session that is being pointed at a second PTY has
@@ -807,6 +903,17 @@ impl qobject::TerminalSession {
             // A fresh flag: any closure still queued by an older pump clears
             // that pump's flag, not this session's.
             rust.frame_pending = Arc::new(AtomicBool::new(false));
+            if let Some(previous) = rust.reconnect_task.take() {
+                previous.abort();
+            }
+        }
+        // A PTY does not survive a daemon restart, so every session watches for
+        // one from the moment it starts -- before `pty.open` has even answered,
+        // because a restart in that window leaves the same dead pane behind.
+        {
+            let qt = self.as_ref().qt_thread();
+            let watch = on_reconnect(qt, qobject::TerminalSession::note_daemon_restarted);
+            self.as_mut().rust_mut().reconnect_task = Some(watch);
         }
         let pending = self.as_ref().rust().frame_pending.clone();
         self.apply_frame();

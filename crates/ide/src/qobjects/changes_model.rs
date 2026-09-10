@@ -9,7 +9,7 @@
 //! per burst rather than one per file.
 
 use crate::client::router::EventRx;
-use crate::qobjects::app_controller::{require_connection, runtime, Shared};
+use crate::qobjects::app_controller::{on_reconnect, require_connection, runtime, Shared};
 use bondsymphonic_proto::{
     ChangesResult, Event, FsWatchParams, Request, WorkspaceId, WorkspaceIdParams,
 };
@@ -76,11 +76,19 @@ pub struct ChangesModelRust {
     /// Background subscription to `fs.changed`, aborted on every
     /// `set_workspace` and on Drop.
     watch_task: Option<tokio::task::JoinHandle<()>>,
+    /// Waits for the connection generation to move and then reloads the shown
+    /// workspace on the router that is live then. Without it the model would
+    /// keep a subscription to a router nothing dispatches into any more, and
+    /// the list would silently stop following the worktree.
+    reconnect_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for ChangesModelRust {
     fn drop(&mut self) {
         if let Some(task) = self.watch_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.reconnect_task.take() {
             task.abort();
         }
     }
@@ -133,18 +141,37 @@ impl qobject::ChangesModel {
         if self.as_ref().rust().workspace_id == workspace {
             return;
         }
+        self.as_mut().rust_mut().workspace_id = workspace;
+        self.follow_workspace();
+    }
+
+    /// Subscribes to the current workspace's worktree changes and loads its
+    /// list. Split out of `set_workspace` because a reconnect has to do all of
+    /// it again for a workspace that has not changed at all.
+    fn follow_workspace(mut self: Pin<&mut Self>) {
+        let workspace = self.as_ref().rust().workspace_id.clone();
         {
             let mut rust = self.as_mut().rust_mut();
-            rust.workspace_id = workspace.clone();
-            // The previous workspace's watch stops here, so its events can
-            // never refresh a list that is now describing another worktree.
+            // The previous watch stops here, so its events can never refresh a
+            // list that is now describing another worktree -- or arrive from a
+            // router that has been replaced.
             if let Some(task) = rust.watch_task.take() {
+                task.abort();
+            }
+            if let Some(task) = rust.reconnect_task.take() {
                 task.abort();
             }
         }
         if workspace.is_empty() {
             self.changes_loaded(QString::from("[]"));
             return;
+        }
+        // Armed before the connection is required, so a model that could not
+        // load because the daemon was down still reloads when it comes back.
+        {
+            let qt = self.as_ref().qt_thread();
+            let watch = on_reconnect(qt, qobject::ChangesModel::reload_after_reconnect);
+            self.as_mut().rust_mut().reconnect_task = Some(watch);
         }
         let shared = match require_connection() {
             Ok(shared) => shared,
@@ -217,6 +244,18 @@ impl qobject::ChangesModel {
 
     pub fn workspace_id(&self) -> QString {
         QString::from(&self.rust().workspace_id)
+    }
+
+    /// Re-subscribes and reloads on the connection that is live now. Queued by
+    /// [`on_reconnect`] after a daemon restart; the daemon has forgotten every
+    /// `fs.watch` it was told about, so this asks again as well as re-reading
+    /// the list.
+    fn reload_after_reconnect(self: Pin<&mut Self>) {
+        if self.as_ref().rust().workspace_id.is_empty() {
+            return;
+        }
+        tracing::info!("changes list reloading after a reconnect");
+        self.follow_workspace();
     }
 }
 

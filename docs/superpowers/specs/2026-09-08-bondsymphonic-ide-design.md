@@ -149,12 +149,23 @@ show" belongs in Rust.
    daemon's lifetime (closing it is the shutdown signal).
 4. Connect TCP to `127.0.0.1:port`, send `hello`. Call `check_prereqs`; if any
    item fails, show `SetupPage` with the fix hints but keep the window usable.
-5. On process exit or connection loss: state `reconnecting`, retry launch with
-   backoff (1, 2, 4, 8 s, max 30 s), then re-sync (`workspace.list`, then
-   `agent.history` for each open agent tab). *Status (Milestone 2b): the IDE
-   enters a `lost` state ("daemon: connection lost"), drops the dead client so
-   every action fails fast, and does not retry; relaunch with backoff and
-   re-sync land in Milestone 6.*
+5. On process exit or connection loss: state `reconnecting` ("daemon:
+   reconnecting (attempt N)"), retry launch with backoff (1, 2, 4, 8, 16 s, max
+   30 s, unbounded attempts), then re-sync (`check_prereqs`, then
+   `workspace.list`, then `agent.history` for each open agent tab). The dead
+   client is dropped as soon as the loss is seen, so an action in the gap fails
+   fast with a reason rather than hanging. Whichever comes first ends a
+   connection: the event stream ending, or `DaemonProcess::wait_exit`
+   resolving; the old child is reaped before a new daemon is launched. A loss
+   after `prepareQuit()` (File > Exit, `closeEvent`) is not reconnected, it is
+   `lost`. Each successful reconnect bumps the connection generation, and
+   `reconnected(generation)` is emitted once the re-sync above has finished.
+   Every subscriber re-attaches on that generation: transcripts re-`attach`
+   and replay (the restored agent reads back `exited`, so the pane offers
+   Restart with `restartOptionsJson()`, which carries `resume_session`), the
+   Run panel refreshes, the Changes list and the file tree reload, and terminals
+   mark themselves exited with `[daemon restarted]` and offer `reopen()` —
+   a PTY cannot survive, since the sandbox it ran in is gone.
 
 On Linux/macOS the launcher spawns the daemon binary directly. The launcher is
 the only place with `cfg(windows)` branches in the IDE.

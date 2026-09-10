@@ -14,7 +14,7 @@
 use crate::client::router::EventRx;
 use crate::model::run_config::{denial_owner, run_state_word, RunView, WorkspaceRuns};
 use crate::qobjects::app_controller::{
-    connection_generation, require_connection, runtime, state_store, Shared,
+    connection_generation, on_reconnect, require_connection, runtime, state_store, Shared,
 };
 use bondsymphonic_proto::{
     DetectRunConfigsResult, Event, RepoPathParams, Request, RunConfig, RunId, RunIdParams, RunInfo,
@@ -234,10 +234,17 @@ pub struct RunPanelModelRust {
     current_denial: Option<(String, String)>,
     /// Requests in flight; `busy` is this being non-zero.
     inflight: u32,
+    /// Waits for the connection generation to move and then refreshes the
+    /// panel against the daemon that came back. Replaced on every arm and
+    /// aborted on Drop.
+    reconnect_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for RunPanelModelRust {
     fn drop(&mut self) {
+        if let Some(task) = self.reconnect_task.take() {
+            task.abort();
+        }
         for (_, sub) in std::mem::take(&mut self.subscriptions) {
             sub.end();
         }
@@ -330,6 +337,7 @@ impl qobject::RunPanelModel {
             self.pump_denial();
             return;
         }
+        self.as_mut().arm_reconnect();
         {
             let mut rust = self.as_mut().rust_mut();
             rust.by_workspace.entry(workspace.clone()).or_default();
@@ -413,13 +421,12 @@ impl qobject::RunPanelModel {
         // configuration itself names.
         let port = state_store().with(|s| s.port_override(&workspace, &config));
         if let Some(port) = port {
-            // Task 2 adds `port: Option<u16>` to `RunStartParams`; the line
-            // below becomes `port,` in the literal once it lands.
             tracing::info!(%workspace, %config, port, "run.start port override");
         }
         let params = RunStartParams {
             workspace_id: WorkspaceId(workspace.clone()),
             config_name: config.clone(),
+            port,
         };
         runtime().spawn(async move {
             match shared
@@ -634,6 +641,36 @@ impl qobject::RunPanelModel {
             Some(entry) => QString::from(&entry.runs_json()),
             None => QString::from("[]"),
         }
+    }
+
+    /// Arms the watch that refreshes this panel when the connection is
+    /// replaced. Any previous watch is dropped first, so a tab switch leaves
+    /// exactly one armed.
+    fn arm_reconnect(mut self: Pin<&mut Self>) {
+        if let Some(previous) = self.as_mut().rust_mut().reconnect_task.take() {
+            previous.abort();
+        }
+        let qt = self.as_ref().qt_thread();
+        let watch = on_reconnect(qt, qobject::RunPanelModel::reload_after_reconnect);
+        self.as_mut().rust_mut().reconnect_task = Some(watch);
+    }
+
+    /// Re-reads the shown workspace from the daemon that came back.
+    ///
+    /// `refresh` is the whole answer: it re-detects the configurations and
+    /// re-lists the runs, and `apply_detection` then drops every run the new
+    /// daemon does not have and re-subscribes to the ones it does -- on the
+    /// new router, because `watch_run` compares the connection generation the
+    /// old subscription was taken on. A daemon restart loses every run, so in
+    /// practice what comes back is an empty list and a panel that says so
+    /// rather than one still showing a run that stopped existing.
+    fn reload_after_reconnect(mut self: Pin<&mut Self>) {
+        if self.as_ref().rust().workspace_id.to_string().is_empty() {
+            return;
+        }
+        tracing::info!("run panel refreshing after a reconnect");
+        self.as_mut().arm_reconnect();
+        self.refresh();
     }
 
     /// Detection plus a run list for one workspace, in the background.

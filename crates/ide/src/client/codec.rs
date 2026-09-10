@@ -23,8 +23,13 @@ pub async fn read_message(
     }
 }
 
-/// Encode a `ClientMessage` as one NDJSON line and write it.
-pub async fn write_message(w: &mut OwnedWriteHalf, msg: &ClientMessage) -> Result<(), ClientError> {
-    w.write_all(codec::encode(msg).as_bytes()).await?;
+/// Encode a `ClientMessage` as one NDJSON line.
+pub fn encode_message(msg: &ClientMessage) -> String {
+    codec::encode(msg)
+}
+
+/// Write one already-encoded NDJSON line (terminator included).
+pub async fn write_line(w: &mut OwnedWriteHalf, line: &str) -> Result<(), ClientError> {
+    w.write_all(line.as_bytes()).await?;
     Ok(())
 }

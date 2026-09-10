@@ -188,6 +188,15 @@ const NO_WARNINGS: [&str; 16] = [
     "allow host not routed",
 ];
 
+/// The fake daemon's own control method: it answers by closing the connection,
+/// so the IDE's reconnect loop has something to reconnect from.
+///
+/// **Test-only, and fake-daemon-only.** It is not a `Request` variant, so it
+/// can only be built by hand; the real daemon has never heard of it and answers
+/// "not implemented" without dropping anything. `crates/ide/tests/reconnect_tests.rs`
+/// is where it is exercised end to end.
+const TEST_DROP: &str = "system.test_drop";
+
 /// A recorder the fake daemon appends to: every request method it answered in
 /// arrival order, every permission reply it received, or every allowlist it was
 /// handed.
@@ -554,10 +563,6 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal, Journal) {
     let recorded_allowlists = allowlists.clone();
 
     tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        let (r, mut w) = stream.into_split();
-        let mut r = BufReader::new(r);
-        let mut line = String::new();
         // One workspace id per created name, so a repeated `create` is answered
         // consistently and `pty.open` can be checked against a known workspace.
         let mut workspaces: HashMap<String, String> = HashMap::new();
@@ -580,425 +585,467 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal, Journal) {
         // everything it has broadcast, which `agent.history` reads back.
         let mut agent: Option<(WorkspaceId, AgentId)> = None;
         let mut transcript: Vec<AgentMessage> = Vec::new();
+        // A daemon that can be restarted. The listener stays bound for the
+        // whole run, so the connection the IDE makes after a
+        // `system.test_drop` lands on the same port the first one did --
+        // which is what makes this a daemon restarting rather than the IDE
+        // finding a different one. Everything the daemon knows is declared
+        // above this loop, so it survives the drop the way a real daemon
+        // reads its registry back off disk.
         loop {
-            line.clear();
-            // The `quit` step ends the process, which resets this socket rather
-            // than closing it politely, so a read error ends the session too.
-            match r.read_line(&mut line).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            let ClientMessage::Request { id, request } =
-                codec::decode(line.trim_end()).expect("decode");
-            recorded
-                .lock()
-                .expect("journal mutex")
-                .push(request.method_name().to_owned());
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (r, mut w) = stream.into_split();
+            let mut r = BufReader::new(r);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                // The `quit` step ends the process, which resets this socket rather
+                // than closing it politely, so a read error ends the session too.
+                match r.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let trimmed = line.trim_end();
+                // The method is read before the body is typed. `system.test_drop`
+                // is not a `Request` the proto crate knows -- it is this fake's
+                // own control method, and the real daemon answers it "not
+                // implemented" -- so decoding it as one would fail rather than
+                // reach the arm below.
+                let method = serde_json::from_str::<serde_json::Value>(trimmed)
+                    .ok()
+                    .and_then(|v| v.get("method")?.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                recorded.lock().expect("journal mutex").push(method.clone());
+                if method == TEST_DROP {
+                    // No reply at all: the socket simply goes, which is what a
+                    // daemon that has died looks like from the IDE's side. The
+                    // accept loop above takes the reconnect on the same port.
+                    break;
+                }
+                let ClientMessage::Request { id, request } =
+                    codec::decode(trimmed).expect("decode");
 
-            let mut follow_ups: Vec<ServerMessage> = Vec::new();
-            let reply: Option<ServerMessage> = match request {
-                Request::Hello(p) if p.token == TOKEN => Some(ServerMessage::ok(
-                    id,
-                    &HelloResult {
-                        daemon_version: "0.0.0-fake".into(),
-                        capabilities: Capabilities {
-                            sandbox_backend: "noop".into(),
-                            git_protect: false,
-                            // What a daemon with a `claude` on PATH advertises.
-                            // The New Agent dialog opens on Claude only when it
-                            // sees this, so the list is part of the fixture.
-                            adapters: vec![AgentAdapterKind::Terminal, AgentAdapterKind::Claude],
-                        },
-                    },
-                )),
-                Request::Hello(_) => Some(ServerMessage::err(id, RpcError::unauthorized())),
-                Request::SystemCheckPrereqs {} => Some(ServerMessage::ok(
-                    id,
-                    &CheckPrereqsResult {
-                        items: vec![PrereqStatus {
-                            name: "git".into(),
-                            ok: true,
-                            detail: "git version 2.43".into(),
-                            fix_hint: None,
-                        }],
-                    },
-                )),
-                Request::WorkspaceList {} => Some(ServerMessage::ok(
-                    id,
-                    &WorkspaceListResult { workspaces: vec![] },
-                )),
-                Request::WorkspaceCreate(p) => {
-                    let ws_id = format!("ws_smoke{}", workspaces.len() + 1);
-                    workspaces.insert(p.name.clone(), ws_id.clone());
-                    names.insert(ws_id.clone(), p.name.clone());
-                    // A real daemon gives a new workspace the default list,
-                    // extended by the repository's `bondsymphonic.toml`. There
-                    // is no toml here, so it is the twelve defaults exactly.
-                    let hosts: Vec<String> =
-                        DEFAULT_ALLOW.iter().map(|h| (*h).to_owned()).collect();
-                    allowed.insert(ws_id.clone(), hosts.clone());
-                    let creating = workspace(&ws_id, &p.name, WorkspaceState::Creating, &hosts);
-                    let ready = workspace(&ws_id, &p.name, WorkspaceState::Ready, &hosts);
-                    // A real daemon answers while still creating and reports the
-                    // rest through events; the tab has to survive both.
-                    for info in [creating.clone(), ready] {
-                        follow_ups.push(ServerMessage::event(
-                            Some(WorkspaceId(ws_id.clone())),
-                            Event::WorkspaceStateChanged { info },
-                        ));
-                    }
-                    Some(ServerMessage::ok(id, &creating))
-                }
-                Request::PtyOpen(p) => {
-                    ptys += 1;
-                    let pty_id = PtyId(format!("pty_smoke{ptys}"));
-                    open_ptys.push((p.workspace_id.clone(), pty_id.clone()));
-                    follow_ups.push(ServerMessage::event(
-                        Some(p.workspace_id.clone()),
-                        Event::PtyOutput {
-                            pty_id: pty_id.clone(),
-                            data_b64: BASE64.encode("prompt$ "),
-                        },
-                    ));
-                    Some(ServerMessage::ok(id, &PtyOpenResult { pty_id }))
-                }
-                // A real daemon would exit only the PTY named here. This one
-                // ends every PTY it has handed out, because the script closes
-                // its own and has no way to name the ones the window opened for
-                // its panes — and those are the ones the steps after this have
-                // to find already exited.
-                //
-                // The reply is held until such a pane exists: the window opens
-                // its terminal only once Qt has laid it out, which is later
-                // than the script's first steps, so answering straight away
-                // would end the script's PTY and leave the window's untouched.
-                Request::PtyClose(_) => {
-                    held_close = Some(id);
-                    None
-                }
-                Request::WorkspaceDestroy(_) => Some(ServerMessage::ok(id, &Empty {})),
-                // One agent, started once. A real daemon reports the process
-                // coming up as a state change rather than in the reply, so the
-                // IDE has to survive an `agent.state` that arrives before its
-                // transcript has subscribed -- which is exactly what the
-                // router's early buffer is for.
-                Request::AgentStart(p) => {
-                    let agent_id = AgentId(AGENT_ID.to_owned());
-                    agent = Some((p.workspace_id.clone(), agent_id.clone()));
-                    follow_ups.push(agent_state(
-                        &p.workspace_id,
-                        &agent_id,
-                        AgentState::Working,
-                        None,
-                    ));
-                    Some(ServerMessage::ok(id, &AgentStartResult { agent_id }))
-                }
-                // A file read on a real daemon. Here it is whatever has been
-                // broadcast so far, which is what a reopened tab would replay.
-                Request::AgentHistory(_) => Some(ServerMessage::ok(
-                    id,
-                    &HistoryResult {
-                        messages: transcript.clone(),
-                        state: AgentState::Idle,
-                        detail: None,
-                    },
-                )),
-                // The prompt, then the turn stalling on a tool the user has to
-                // allow: the same shape as the `permission_turn.ndjson` fixture
-                // the daemon's parser tests run on.
-                Request::AgentSend(p) => match agent.clone() {
-                    Some((ws, ag)) => {
-                        follow_ups.push(emit(
-                            &mut transcript,
-                            &ws,
-                            &ag,
-                            AgentMessageBody::UserText { text: p.text },
-                        ));
-                        follow_ups.push(emit(
-                            &mut transcript,
-                            &ws,
-                            &ag,
-                            AgentMessageBody::System {
-                                subtype: "init".to_owned(),
-                                data: serde_json::json!({
-                                    "session_id": "sess-3",
-                                    "model": "claude-opus-5",
-                                    "tools": [TOOL_NAME],
-                                }),
-                            },
-                        ));
-                        follow_ups.push(emit(
-                            &mut transcript,
-                            &ws,
-                            &ag,
-                            AgentMessageBody::PermissionRequest {
-                                request_id: REQUEST_ID.to_owned(),
-                                tool_name: TOOL_NAME.to_owned(),
-                                input: serde_json::json!({ "command": "rm -rf build" }),
-                                suggestions: Vec::new(),
-                            },
-                        ));
-                        follow_ups.push(agent_state(
-                            &ws,
-                            &ag,
-                            AgentState::WaitingPermission,
-                            Some(TOOL_NAME),
-                        ));
-                        Some(ServerMessage::ok(id, &Empty {}))
-                    }
-                    None => Some(ServerMessage::err(
+                let mut follow_ups: Vec<ServerMessage> = Vec::new();
+                let reply: Option<ServerMessage> = match request {
+                    Request::Hello(p) if p.token == TOKEN => Some(ServerMessage::ok(
                         id,
-                        RpcError::internal("agent.send before agent.start"),
+                        &HelloResult {
+                            daemon_version: "0.0.0-fake".into(),
+                            capabilities: Capabilities {
+                                sandbox_backend: "noop".into(),
+                                git_protect: false,
+                                // What a daemon with a `claude` on PATH advertises.
+                                // The New Agent dialog opens on Claude only when it
+                                // sees this, so the list is part of the fixture.
+                                adapters: vec![
+                                    AgentAdapterKind::Terminal,
+                                    AgentAdapterKind::Claude,
+                                ],
+                            },
+                        },
                     )),
-                },
-                // The answer, and the rest of the turn it unblocks.
-                Request::AgentPermissionReply(p) => {
-                    let decision = match p.decision {
-                        PermissionDecision::Allow => "allow",
-                        PermissionDecision::Deny => "deny",
-                    };
-                    recorded_replies
-                        .lock()
-                        .expect("replies mutex")
-                        .push(format!("{}:{decision}", p.request_id));
-                    match agent.clone() {
+                    Request::Hello(_) => Some(ServerMessage::err(id, RpcError::unauthorized())),
+                    Request::SystemCheckPrereqs {} => Some(ServerMessage::ok(
+                        id,
+                        &CheckPrereqsResult {
+                            items: vec![PrereqStatus {
+                                name: "git".into(),
+                                ok: true,
+                                detail: "git version 2.43".into(),
+                                fix_hint: None,
+                            }],
+                        },
+                    )),
+                    // Every workspace this daemon has made, which is empty at
+                    // the connect-time call and not after a `system.test_drop`:
+                    // a restarted daemon reads its registry back, so the IDE's
+                    // re-sync has to find the tabs it already has rather than
+                    // reconciling them away.
+                    Request::WorkspaceList {} => {
+                        let workspaces = names
+                            .iter()
+                            .map(|(ws, name)| {
+                                let hosts = allowed.get(ws).cloned().unwrap_or_default();
+                                workspace(ws, name, WorkspaceState::Ready, &hosts)
+                            })
+                            .collect::<Vec<_>>();
+                        Some(ServerMessage::ok(id, &WorkspaceListResult { workspaces }))
+                    }
+                    Request::WorkspaceCreate(p) => {
+                        let ws_id = format!("ws_smoke{}", workspaces.len() + 1);
+                        workspaces.insert(p.name.clone(), ws_id.clone());
+                        names.insert(ws_id.clone(), p.name.clone());
+                        // A real daemon gives a new workspace the default list,
+                        // extended by the repository's `bondsymphonic.toml`. There
+                        // is no toml here, so it is the twelve defaults exactly.
+                        let hosts: Vec<String> =
+                            DEFAULT_ALLOW.iter().map(|h| (*h).to_owned()).collect();
+                        allowed.insert(ws_id.clone(), hosts.clone());
+                        let creating = workspace(&ws_id, &p.name, WorkspaceState::Creating, &hosts);
+                        let ready = workspace(&ws_id, &p.name, WorkspaceState::Ready, &hosts);
+                        // A real daemon answers while still creating and reports the
+                        // rest through events; the tab has to survive both.
+                        for info in [creating.clone(), ready] {
+                            follow_ups.push(ServerMessage::event(
+                                Some(WorkspaceId(ws_id.clone())),
+                                Event::WorkspaceStateChanged { info },
+                            ));
+                        }
+                        Some(ServerMessage::ok(id, &creating))
+                    }
+                    Request::PtyOpen(p) => {
+                        ptys += 1;
+                        let pty_id = PtyId(format!("pty_smoke{ptys}"));
+                        open_ptys.push((p.workspace_id.clone(), pty_id.clone()));
+                        follow_ups.push(ServerMessage::event(
+                            Some(p.workspace_id.clone()),
+                            Event::PtyOutput {
+                                pty_id: pty_id.clone(),
+                                data_b64: BASE64.encode("prompt$ "),
+                            },
+                        ));
+                        Some(ServerMessage::ok(id, &PtyOpenResult { pty_id }))
+                    }
+                    // A real daemon would exit only the PTY named here. This one
+                    // ends every PTY it has handed out, because the script closes
+                    // its own and has no way to name the ones the window opened for
+                    // its panes — and those are the ones the steps after this have
+                    // to find already exited.
+                    //
+                    // The reply is held until such a pane exists: the window opens
+                    // its terminal only once Qt has laid it out, which is later
+                    // than the script's first steps, so answering straight away
+                    // would end the script's PTY and leave the window's untouched.
+                    Request::PtyClose(_) => {
+                        held_close = Some(id);
+                        None
+                    }
+                    Request::WorkspaceDestroy(_) => Some(ServerMessage::ok(id, &Empty {})),
+                    // One agent, started once. A real daemon reports the process
+                    // coming up as a state change rather than in the reply, so the
+                    // IDE has to survive an `agent.state` that arrives before its
+                    // transcript has subscribed -- which is exactly what the
+                    // router's early buffer is for.
+                    Request::AgentStart(p) => {
+                        let agent_id = AgentId(AGENT_ID.to_owned());
+                        agent = Some((p.workspace_id.clone(), agent_id.clone()));
+                        follow_ups.push(agent_state(
+                            &p.workspace_id,
+                            &agent_id,
+                            AgentState::Working,
+                            None,
+                        ));
+                        Some(ServerMessage::ok(id, &AgentStartResult { agent_id }))
+                    }
+                    // A file read on a real daemon. Here it is whatever has been
+                    // broadcast so far, which is what a reopened tab would replay.
+                    Request::AgentHistory(_) => Some(ServerMessage::ok(
+                        id,
+                        &HistoryResult {
+                            messages: transcript.clone(),
+                            state: AgentState::Idle,
+                            detail: None,
+                        },
+                    )),
+                    // The prompt, then the turn stalling on a tool the user has to
+                    // allow: the same shape as the `permission_turn.ndjson` fixture
+                    // the daemon's parser tests run on.
+                    Request::AgentSend(p) => match agent.clone() {
                         Some((ws, ag)) => {
-                            follow_ups.push(agent_state(&ws, &ag, AgentState::Working, None));
                             follow_ups.push(emit(
                                 &mut transcript,
                                 &ws,
                                 &ag,
-                                AgentMessageBody::ToolUse {
-                                    id: "toolu_2".to_owned(),
-                                    name: TOOL_NAME.to_owned(),
+                                AgentMessageBody::UserText { text: p.text },
+                            ));
+                            follow_ups.push(emit(
+                                &mut transcript,
+                                &ws,
+                                &ag,
+                                AgentMessageBody::System {
+                                    subtype: "init".to_owned(),
+                                    data: serde_json::json!({
+                                        "session_id": "sess-3",
+                                        "model": "claude-opus-5",
+                                        "tools": [TOOL_NAME],
+                                    }),
+                                },
+                            ));
+                            follow_ups.push(emit(
+                                &mut transcript,
+                                &ws,
+                                &ag,
+                                AgentMessageBody::PermissionRequest {
+                                    request_id: REQUEST_ID.to_owned(),
+                                    tool_name: TOOL_NAME.to_owned(),
                                     input: serde_json::json!({ "command": "rm -rf build" }),
+                                    suggestions: Vec::new(),
                                 },
                             ));
-                            follow_ups.push(emit(
-                                &mut transcript,
+                            follow_ups.push(agent_state(
                                 &ws,
                                 &ag,
-                                AgentMessageBody::ToolResult {
-                                    id: "toolu_2".to_owned(),
-                                    output: "removed 'build'".to_owned(),
-                                    is_error: false,
-                                },
+                                AgentState::WaitingPermission,
+                                Some(TOOL_NAME),
                             ));
-                            follow_ups.push(emit(
-                                &mut transcript,
-                                &ws,
-                                &ag,
-                                AgentMessageBody::Result {
-                                    cost_usd: TURN_COST_USD,
-                                    duration_ms: 500,
-                                    num_turns: 1,
-                                    session_id: "sess-3".to_owned(),
-                                },
-                            ));
-                            follow_ups.push(agent_state(&ws, &ag, AgentState::Idle, None));
                             Some(ServerMessage::ok(id, &Empty {}))
                         }
                         None => Some(ServerMessage::err(
                             id,
-                            RpcError::internal("agent.permission_reply before agent.start"),
+                            RpcError::internal("agent.send before agent.start"),
                         )),
-                    }
-                }
-                Request::AgentInterrupt(_) => Some(ServerMessage::ok(id, &Empty {})),
-                Request::AgentStop(_) => {
-                    if let Some((ws, ag)) = agent.clone() {
-                        follow_ups.push(agent_state(
-                            &ws,
-                            &ag,
-                            AgentState::Exited,
-                            Some("exit code 0"),
-                        ));
-                    }
-                    Some(ServerMessage::ok(id, &Empty {}))
-                }
-                // Answered, and answered with a failure: a login terminal on
-                // the host is the one thing this run must never open, and an
-                // error here would show up in the journal rather than starting
-                // one. The assertions below require it never to be asked for.
-                Request::SystemSetupPty(_) => Some(ServerMessage::err(
-                    id,
-                    RpcError::internal("the smoke run never logs in"),
-                )),
-                // The terminal widget restates its size once the PTY exists.
-                Request::PtyResize(_) | Request::PtyWrite(_) => {
-                    Some(ServerMessage::ok(id, &Empty {}))
-                }
-                Request::FsListDir(_) => Some(ServerMessage::ok(
-                    id,
-                    &ListDirResult {
-                        entries: vec![entry("src", true, 0), entry(OPEN_PATH, false, 42)],
                     },
-                )),
-                // The editor tab's load. Small, valid UTF-8 and not truncated,
-                // so the document opens editable rather than as a notice.
-                Request::FsReadFile(_) => Some(ServerMessage::ok(
-                    id,
-                    &ReadFileResult {
-                        content: BASE_TEXT.to_owned(),
-                        encoding: "utf-8".to_owned(),
-                        truncated: false,
-                    },
-                )),
-                // Ctrl+S and the watch the editor and the Changes tab both ask
-                // for. Nothing here has to do anything: the assertions are that
-                // the requests were made and that neither was reported failed.
-                Request::FsWriteFile(_) | Request::FsWatch(_) => {
-                    Some(ServerMessage::ok(id, &Empty {}))
-                }
-                // One modified file, so the Changes tab has a row to build and
-                // the counts have somewhere to land.
-                Request::WorkspaceChanges(_) => Some(ServerMessage::ok(
-                    id,
-                    &ChangesResult {
-                        files: vec![ChangedFile {
-                            path: OPEN_PATH.to_owned(),
-                            status: FileStatus::Modified,
-                            additions: 1,
-                            deletions: 0,
-                        }],
-                    },
-                )),
-                // One added line, which aligns to one equal row and one insert
-                // row: enough for `DiffWidget` to build both panes, tint a row
-                // and size its gutter from two different line-number columns.
-                Request::WorkspaceDiff(_) => Some(ServerMessage::ok(
-                    id,
-                    &DiffResult {
-                        base_text: BASE_TEXT.to_owned(),
-                        work_text: WORK_TEXT.to_owned(),
-                        truncated: false,
-                    },
-                )),
-                // What `RunPanelModel::allowHost` reads before it writes.
-                Request::WorkspaceGet(p) => {
-                    let ws = p.workspace_id.0.clone();
-                    match names.get(&ws) {
-                        Some(name) => {
-                            let hosts = allowed.get(&ws).cloned().unwrap_or_default();
-                            let info = workspace(&ws, name, WorkspaceState::Ready, &hosts);
-                            Some(ServerMessage::ok(id, &info))
+                    // The answer, and the rest of the turn it unblocks.
+                    Request::AgentPermissionReply(p) => {
+                        let decision = match p.decision {
+                            PermissionDecision::Allow => "allow",
+                            PermissionDecision::Deny => "deny",
+                        };
+                        recorded_replies
+                            .lock()
+                            .expect("replies mutex")
+                            .push(format!("{}:{decision}", p.request_id));
+                        match agent.clone() {
+                            Some((ws, ag)) => {
+                                follow_ups.push(agent_state(&ws, &ag, AgentState::Working, None));
+                                follow_ups.push(emit(
+                                    &mut transcript,
+                                    &ws,
+                                    &ag,
+                                    AgentMessageBody::ToolUse {
+                                        id: "toolu_2".to_owned(),
+                                        name: TOOL_NAME.to_owned(),
+                                        input: serde_json::json!({ "command": "rm -rf build" }),
+                                    },
+                                ));
+                                follow_ups.push(emit(
+                                    &mut transcript,
+                                    &ws,
+                                    &ag,
+                                    AgentMessageBody::ToolResult {
+                                        id: "toolu_2".to_owned(),
+                                        output: "removed 'build'".to_owned(),
+                                        is_error: false,
+                                    },
+                                ));
+                                follow_ups.push(emit(
+                                    &mut transcript,
+                                    &ws,
+                                    &ag,
+                                    AgentMessageBody::Result {
+                                        cost_usd: TURN_COST_USD,
+                                        duration_ms: 500,
+                                        num_turns: 1,
+                                        session_id: "sess-3".to_owned(),
+                                    },
+                                ));
+                                follow_ups.push(agent_state(&ws, &ag, AgentState::Idle, None));
+                                Some(ServerMessage::ok(id, &Empty {}))
+                            }
+                            None => Some(ServerMessage::err(
+                                id,
+                                RpcError::internal("agent.permission_reply before agent.start"),
+                            )),
                         }
-                        None => Some(ServerMessage::err(id, RpcError::not_found(ws))),
                     }
-                }
-                // The other half of the click. A real daemon persists the list
-                // and reports the new one as a `workspace.state` event, which is
-                // what refreshes every client; the assertion is on what arrived
-                // here.
-                Request::WorkspaceSetAllowlist(p) => {
-                    let ws = p.workspace_id.0.clone();
-                    recorded_allowlists
-                        .lock()
-                        .expect("allowlists mutex")
-                        .push(p.hosts.join(","));
-                    allowed.insert(ws.clone(), p.hosts.clone());
-                    if let Some(name) = names.get(&ws) {
-                        let info = workspace(&ws, name, WorkspaceState::Ready, &p.hosts);
-                        follow_ups.push(ServerMessage::event(
-                            Some(p.workspace_id.clone()),
-                            Event::WorkspaceStateChanged { info },
-                        ));
+                    Request::AgentInterrupt(_) => Some(ServerMessage::ok(id, &Empty {})),
+                    Request::AgentStop(_) => {
+                        if let Some((ws, ag)) = agent.clone() {
+                            follow_ups.push(agent_state(
+                                &ws,
+                                &ag,
+                                AgentState::Exited,
+                                Some("exit code 0"),
+                            ));
+                        }
+                        Some(ServerMessage::ok(id, &Empty {}))
                     }
-                    Some(ServerMessage::ok(id, &Empty {}))
-                }
-                // One configuration, whatever path is asked about: the New Agent
-                // dialog asks about the repository and the Run panel about the
-                // worktree, and both have to get a list they can render.
-                Request::RepoDetectRunConfigs(_) => Some(ServerMessage::ok(
-                    id,
-                    &DetectRunConfigsResult {
-                        configs: vec![run_config()],
-                        network_allow: vec![],
-                    },
-                )),
-                // The run, on a bridged port, then the three events a real
-                // daemon reports it with -- and behind them the proxy refusing a
-                // host the run reached for, built with the same proto helper the
-                // daemon builds it with, so the IDE recognises it the same way.
-                Request::RunStart(p) => {
-                    let run_id = RunId(RUN_ID.to_owned());
-                    run_workspace = Some(p.workspace_id.clone());
-                    runs.push(RunInfo {
-                        run_id: run_id.clone(),
-                        config_name: p.config_name.clone(),
-                        state: RunState::Ready,
-                        host_port: HOST_PORT,
-                        url: RUN_URL.to_owned(),
-                    });
-                    follow_ups.push(run_state(
-                        &p.workspace_id,
-                        &run_id,
-                        RunState::Starting,
-                        None,
-                    ));
-                    follow_ups.push(ServerMessage::event(
-                        Some(p.workspace_id.clone()),
-                        Event::RunOutput {
-                            run_id: run_id.clone(),
-                            line: RUN_OUTPUT_LINE.to_owned(),
-                        },
-                    ));
-                    follow_ups.push(run_state(
-                        &p.workspace_id,
-                        &run_id,
-                        RunState::Ready,
-                        Some(RUN_URL.to_owned()),
-                    ));
-                    follow_ups.push(ServerMessage::event(
-                        Some(p.workspace_id.clone()),
-                        Event::network_denied(DENIED_HOST),
-                    ));
-                    Some(ServerMessage::ok(
+                    // Answered, and answered with a failure: a login terminal on
+                    // the host is the one thing this run must never open, and an
+                    // error here would show up in the journal rather than starting
+                    // one. The assertions below require it never to be asked for.
+                    Request::SystemSetupPty(_) => Some(ServerMessage::err(
                         id,
-                        &RunStartResult {
-                            run_id,
+                        RpcError::internal("the smoke run never logs in"),
+                    )),
+                    // The terminal widget restates its size once the PTY exists.
+                    Request::PtyResize(_) | Request::PtyWrite(_) => {
+                        Some(ServerMessage::ok(id, &Empty {}))
+                    }
+                    Request::FsListDir(_) => Some(ServerMessage::ok(
+                        id,
+                        &ListDirResult {
+                            entries: vec![entry("src", true, 0), entry(OPEN_PATH, false, 42)],
+                        },
+                    )),
+                    // The editor tab's load. Small, valid UTF-8 and not truncated,
+                    // so the document opens editable rather than as a notice.
+                    Request::FsReadFile(_) => Some(ServerMessage::ok(
+                        id,
+                        &ReadFileResult {
+                            content: BASE_TEXT.to_owned(),
+                            encoding: "utf-8".to_owned(),
+                            truncated: false,
+                        },
+                    )),
+                    // Ctrl+S and the watch the editor and the Changes tab both ask
+                    // for. Nothing here has to do anything: the assertions are that
+                    // the requests were made and that neither was reported failed.
+                    Request::FsWriteFile(_) | Request::FsWatch(_) => {
+                        Some(ServerMessage::ok(id, &Empty {}))
+                    }
+                    // One modified file, so the Changes tab has a row to build and
+                    // the counts have somewhere to land.
+                    Request::WorkspaceChanges(_) => Some(ServerMessage::ok(
+                        id,
+                        &ChangesResult {
+                            files: vec![ChangedFile {
+                                path: OPEN_PATH.to_owned(),
+                                status: FileStatus::Modified,
+                                additions: 1,
+                                deletions: 0,
+                            }],
+                        },
+                    )),
+                    // One added line, which aligns to one equal row and one insert
+                    // row: enough for `DiffWidget` to build both panes, tint a row
+                    // and size its gutter from two different line-number columns.
+                    Request::WorkspaceDiff(_) => Some(ServerMessage::ok(
+                        id,
+                        &DiffResult {
+                            base_text: BASE_TEXT.to_owned(),
+                            work_text: WORK_TEXT.to_owned(),
+                            truncated: false,
+                        },
+                    )),
+                    // What `RunPanelModel::allowHost` reads before it writes.
+                    Request::WorkspaceGet(p) => {
+                        let ws = p.workspace_id.0.clone();
+                        match names.get(&ws) {
+                            Some(name) => {
+                                let hosts = allowed.get(&ws).cloned().unwrap_or_default();
+                                let info = workspace(&ws, name, WorkspaceState::Ready, &hosts);
+                                Some(ServerMessage::ok(id, &info))
+                            }
+                            None => Some(ServerMessage::err(id, RpcError::not_found(ws))),
+                        }
+                    }
+                    // The other half of the click. A real daemon persists the list
+                    // and reports the new one as a `workspace.state` event, which is
+                    // what refreshes every client; the assertion is on what arrived
+                    // here.
+                    Request::WorkspaceSetAllowlist(p) => {
+                        let ws = p.workspace_id.0.clone();
+                        recorded_allowlists
+                            .lock()
+                            .expect("allowlists mutex")
+                            .push(p.hosts.join(","));
+                        allowed.insert(ws.clone(), p.hosts.clone());
+                        if let Some(name) = names.get(&ws) {
+                            let info = workspace(&ws, name, WorkspaceState::Ready, &p.hosts);
+                            follow_ups.push(ServerMessage::event(
+                                Some(p.workspace_id.clone()),
+                                Event::WorkspaceStateChanged { info },
+                            ));
+                        }
+                        Some(ServerMessage::ok(id, &Empty {}))
+                    }
+                    // One configuration, whatever path is asked about: the New Agent
+                    // dialog asks about the repository and the Run panel about the
+                    // worktree, and both have to get a list they can render.
+                    Request::RepoDetectRunConfigs(_) => Some(ServerMessage::ok(
+                        id,
+                        &DetectRunConfigsResult {
+                            configs: vec![run_config()],
+                            network_allow: vec![],
+                        },
+                    )),
+                    // The run, on a bridged port, then the three events a real
+                    // daemon reports it with -- and behind them the proxy refusing a
+                    // host the run reached for, built with the same proto helper the
+                    // daemon builds it with, so the IDE recognises it the same way.
+                    Request::RunStart(p) => {
+                        let run_id = RunId(RUN_ID.to_owned());
+                        run_workspace = Some(p.workspace_id.clone());
+                        runs.push(RunInfo {
+                            run_id: run_id.clone(),
+                            config_name: p.config_name.clone(),
+                            state: RunState::Ready,
                             host_port: HOST_PORT,
                             url: RUN_URL.to_owned(),
-                        },
-                    ))
-                }
-                Request::RunStop(p) => {
-                    runs.retain(|r| r.run_id != p.run_id);
-                    if let Some(ws) = run_workspace.clone() {
-                        follow_ups.push(run_state(&ws, &p.run_id, RunState::Stopped, None));
-                    }
-                    Some(ServerMessage::ok(id, &Empty {}))
-                }
-                Request::RunList(_) => {
-                    Some(ServerMessage::ok(id, &RunListResult { runs: runs.clone() }))
-                }
-                other => Some(ServerMessage::err(
-                    id,
-                    RpcError::internal(format!("not implemented: {}", other.method_name())),
-                )),
-            };
-
-            // The held `pty.close` is answered as soon as the window has a pane
-            // of its own, and every PTY ends with it.
-            if let Some(close_id) = held_close {
-                if open_ptys.len() >= 2 {
-                    held_close = None;
-                    for (workspace_id, pty_id) in open_ptys.drain(..) {
-                        follow_ups.push(ServerMessage::event(
-                            Some(workspace_id),
-                            Event::PtyExit { pty_id, code: 0 },
+                        });
+                        follow_ups.push(run_state(
+                            &p.workspace_id,
+                            &run_id,
+                            RunState::Starting,
+                            None,
                         ));
+                        follow_ups.push(ServerMessage::event(
+                            Some(p.workspace_id.clone()),
+                            Event::RunOutput {
+                                run_id: run_id.clone(),
+                                line: RUN_OUTPUT_LINE.to_owned(),
+                            },
+                        ));
+                        follow_ups.push(run_state(
+                            &p.workspace_id,
+                            &run_id,
+                            RunState::Ready,
+                            Some(RUN_URL.to_owned()),
+                        ));
+                        follow_ups.push(ServerMessage::event(
+                            Some(p.workspace_id.clone()),
+                            Event::network_denied(DENIED_HOST),
+                        ));
+                        Some(ServerMessage::ok(
+                            id,
+                            &RunStartResult {
+                                run_id,
+                                host_port: HOST_PORT,
+                                url: RUN_URL.to_owned(),
+                            },
+                        ))
                     }
-                    follow_ups.push(ServerMessage::ok(close_id, &Empty {}));
-                }
-            }
+                    Request::RunStop(p) => {
+                        runs.retain(|r| r.run_id != p.run_id);
+                        if let Some(ws) = run_workspace.clone() {
+                            follow_ups.push(run_state(&ws, &p.run_id, RunState::Stopped, None));
+                        }
+                        Some(ServerMessage::ok(id, &Empty {}))
+                    }
+                    Request::RunList(_) => {
+                        Some(ServerMessage::ok(id, &RunListResult { runs: runs.clone() }))
+                    }
+                    other => Some(ServerMessage::err(
+                        id,
+                        RpcError::internal(format!("not implemented: {}", other.method_name())),
+                    )),
+                };
 
-            let mut batch = reply.as_ref().map(codec::encode).unwrap_or_default();
-            for message in &follow_ups {
-                batch.push_str(&codec::encode(message));
-            }
-            if w.write_all(batch.as_bytes()).await.is_err() {
-                break;
+                // The held `pty.close` is answered as soon as the window has a pane
+                // of its own, and every PTY ends with it.
+                if let Some(close_id) = held_close {
+                    if open_ptys.len() >= 2 {
+                        held_close = None;
+                        for (workspace_id, pty_id) in open_ptys.drain(..) {
+                            follow_ups.push(ServerMessage::event(
+                                Some(workspace_id),
+                                Event::PtyExit { pty_id, code: 0 },
+                            ));
+                        }
+                        follow_ups.push(ServerMessage::ok(close_id, &Empty {}));
+                    }
+                }
+
+                let mut batch = reply.as_ref().map(codec::encode).unwrap_or_default();
+                for message in &follow_ups {
+                    batch.push_str(&codec::encode(message));
+                }
+                if w.write_all(batch.as_bytes()).await.is_err() {
+                    break;
+                }
             }
         }
     });

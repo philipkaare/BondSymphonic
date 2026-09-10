@@ -20,7 +20,7 @@
 
 use crate::model::app_state::agent_state_word;
 use crate::model::transcript::{Applied, LiveEvent, Transcript};
-use crate::qobjects::app_controller::{require_connection, runtime, Shared};
+use crate::qobjects::app_controller::{on_reconnect, require_connection, runtime, Shared};
 use bondsymphonic_proto::{
     AgentId, AgentIdParams, AgentMessage, AgentPermissionReplyParams, AgentSendParams, AgentState,
     Event, HistoryResult, PermissionDecision, Request,
@@ -51,6 +51,12 @@ pub mod qobject {
         #[qproperty(i32, turns)]
         #[qproperty(QString, pending_json)]
         #[qproperty(bool, busy)]
+        // The `AgentStartOptions` the tab was created with, as the New Agent
+        // dialog built them, or empty. The model never sends them anywhere; it
+        // holds them so `restartOptionsJson` can hand them back with the
+        // session filled in. Never the API key: that is merged into the
+        // request by `AppController` and crosses this boundary nowhere.
+        #[qproperty(QString, options_json)]
         type TranscriptModel = super::TranscriptModelRust;
 
         /// One item was added at `index`; append a frame from `itemJson(index)`.
@@ -122,6 +128,20 @@ pub mod qobject {
         /// item is a tool call and the value actually changed.
         #[qinvokable]
         fn set_collapsed(self: Pin<&mut TranscriptModel>, index: i32, collapsed: bool);
+
+        /// The options a Restart should start the new agent with: this tab's
+        /// own `optionsJson`, plus `resume_session` set to the last session id
+        /// this transcript has seen.
+        ///
+        /// That is what makes Restart continue the conversation rather than
+        /// begin a new one, which matters most after a daemon restart: the
+        /// agent comes back as an `exited` record whose history is still
+        /// readable, and the session id in that history is the one Claude
+        /// resumes from. With no session id seen (a tab that never got as far
+        /// as an init message) the key is left out entirely rather than sent
+        /// as null, so the daemon starts a fresh session.
+        #[qinvokable]
+        fn restart_options_json(self: &TranscriptModel) -> QString;
     }
 
     impl cxx_qt::Threading for TranscriptModel {}
@@ -148,10 +168,15 @@ pub struct TranscriptModelRust {
     turns: i32,
     pending_json: QString,
     busy: bool,
+    options_json: QString,
     /// The state of record. Every property above is derived from it.
     transcript: Transcript,
     /// Replay plus the live loop, aborted on re-attach and on Drop.
     task: Option<tokio::task::JoinHandle<()>>,
+    /// Waits for the connection generation to move and then re-attaches this
+    /// pane to the daemon that came back. Replaced on every `attach` and
+    /// aborted on Drop, so a closed tab does not re-attach itself.
+    reconnect_task: Option<tokio::task::JoinHandle<()>>,
     unsubscribe: Option<Unsubscribe>,
     /// Bumped on every `attach`, so a reply for an earlier agent that lands
     /// late is dropped instead of being folded into the new transcript.
@@ -170,8 +195,10 @@ impl Default for TranscriptModelRust {
             turns: 0,
             pending_json: QString::from(""),
             busy: false,
+            options_json: QString::from(""),
             transcript,
             task: None,
+            reconnect_task: None,
             unsubscribe: None,
             generation: 0,
         }
@@ -184,6 +211,9 @@ impl Drop for TranscriptModelRust {
         // so it repeats what `detach` does rather than calling it. The agent
         // itself keeps running: closing a transcript is not stopping an agent.
         if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.reconnect_task.take() {
             task.abort();
         }
         if let Some(unsubscribe) = self.unsubscribe.take() {
@@ -305,10 +335,20 @@ impl qobject::TranscriptModel {
 
         let agent = agent_id.to_string();
         if agent.is_empty() {
-            // Detaching: an empty transcript, and no request to make.
+            // Detaching: an empty transcript, and no request to make. No
+            // reconnect watch either -- there is nothing to come back to.
             self.as_mut().set_busy(false);
             self.reset_items();
             return;
+        }
+        // Armed before the connection is even required. A pane that could not
+        // attach because there was no connection is precisely the pane a
+        // reconnect has to bring back, so this must not sit behind the check
+        // below.
+        {
+            let qt = self.as_ref().qt_thread();
+            let watch = on_reconnect(qt, qobject::TranscriptModel::reattach);
+            self.as_mut().rust_mut().reconnect_task = Some(watch);
         }
         let shared = match require_connection() {
             Ok(shared) => shared,
@@ -432,6 +472,13 @@ impl qobject::TranscriptModel {
             Ok(i) => QString::from(&self.rust().transcript.item_json(i)),
             Err(_) => QString::from(""),
         }
+    }
+
+    pub fn restart_options_json(&self) -> QString {
+        QString::from(&restart_options(
+            &self.options_json().to_string(),
+            self.rust().transcript.session_id.as_deref(),
+        ))
     }
 
     pub fn set_collapsed(mut self: Pin<&mut Self>, index: i32, collapsed: bool) {
@@ -590,10 +637,13 @@ impl qobject::TranscriptModel {
         }
     }
 
-    /// Ends the current agent's subscription and stops its task. Called before
-    /// `attach` replaces the agent, and mirrored by `Drop`.
+    /// Ends the current agent's subscription and stops its tasks. Called
+    /// before `attach` replaces the agent, and mirrored by `Drop`.
     fn detach(mut self: Pin<&mut Self>) {
         if let Some(task) = self.as_mut().rust_mut().task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.as_mut().rust_mut().reconnect_task.take() {
             task.abort();
         }
         if let Some(unsubscribe) = self.as_mut().rust_mut().unsubscribe.take() {
@@ -601,11 +651,63 @@ impl qobject::TranscriptModel {
         }
     }
 
+    /// Points the model at the same agent again, on the connection that is
+    /// live now. Queued by [`on_reconnect`] after a daemon restart.
+    ///
+    /// `attach` does the whole job: it subscribes on the new router, replays
+    /// `agent.history` and takes the state from it. After a restart that state
+    /// is `exited` (the daemon reloaded the agent as a record), so the pane
+    /// comes back with its conversation intact and a Restart button, which is
+    /// what `restartOptionsJson` is for.
+    fn reattach(mut self: Pin<&mut Self>) {
+        let agent = self.as_ref().agent_id().clone();
+        if agent.to_string().is_empty() {
+            return;
+        }
+        let workspace = self.as_ref().workspace_id().clone();
+        tracing::info!("transcript re-attaching to {agent} after a reconnect");
+        self.as_mut().attach(workspace, agent);
+    }
+
     /// Raises a failure on the view. The transcript is never changed by one:
     /// an error is news about the request, not about the conversation.
     fn fail(self: Pin<&mut Self>, message: &str) {
         self.error_occurred(QString::from(message));
     }
+}
+
+/// The tab's start options with `resume_session` set to `session`, as JSON.
+///
+/// Pure, so the merge is testable without an agent or a Qt event loop. The
+/// options travel as JSON rather than as `AgentStartOptions` because that is
+/// what the tab holds and what `AppController::startAgent` takes back: parsing
+/// them into the struct here would drop any field a newer daemon understands
+/// and this build does not.
+///
+/// A string that is not a JSON object is replaced by one rather than refused:
+/// the point of the call is to produce options that can start an agent, and
+/// the daemon's own defaults are a working agent. `None` for the session
+/// removes the key instead of writing null, so the request asks for a fresh
+/// session rather than for one named "nothing".
+pub fn restart_options(options_json: &str, session: Option<&str>) -> String {
+    let mut options = serde_json::from_str::<serde_json::Value>(options_json)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(map) = options.as_object_mut() {
+        match session {
+            Some(session) => {
+                map.insert(
+                    "resume_session".to_owned(),
+                    serde_json::Value::String(session.to_owned()),
+                );
+            }
+            None => {
+                map.remove("resume_session");
+            }
+        }
+    }
+    options.to_string()
 }
 
 /// This agent's half of one routed event, or `None` for anything else. The
