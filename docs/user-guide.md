@@ -120,9 +120,11 @@ needs `claude` on the `bs` user's `PATH`.
 ## First run and Settings > Setup
 
 Setup lives in **File > Settings…**, in the **Setup** section at the top of the
-dialog. It opens by itself at startup when something is missing that would stop
-a workspace being created, and the **Set up…** link in the status bar goes there
-whenever a check is failing. It is where logging in to Claude Code and to GitHub
+dialog. It opens by itself when something is missing that would stop a workspace
+being created — once, so you can close it and carry on even with the problem
+unfixed — and the **Set up…** link in the status bar goes there whenever a check
+is failing. If the same problem is still there later, or a new one appears, it
+opens by itself again. It is where logging in to Claude Code and to GitHub
 happens; there is no Help > Setup any more, because a login is a setting you
 come back to when a token expires.
 
@@ -160,12 +162,12 @@ through is abandoned. Closing it after a successful login is safe: the checks
 re-run when the dialog closes, so the ticks and the chat box catch up either
 way.
 
-**Re-check** runs the checks again, and so does closing the dialog. The four *blocking* checks are `git`,
-`bwrap`, `userns` and `sandbox`: without them there is no worktree and no
-sandbox, so there is nowhere to put an agent, and Settings opens on Setup by
-itself while one of them is failing. A missing `claude` or `gh`, or either
-login, costs you Claude Code and leaves the rest of the IDE working, so those
-are warnings rather than a wall.
+**Re-check** runs the checks again, and so does closing the dialog. The four
+*blocking* checks are `git`, `bwrap`, `userns` and `sandbox`: without them there
+is no worktree and no sandbox, so there is nowhere to put an agent, which is why
+one of them failing is what opens Settings for you. A missing `claude` or `gh`,
+or either login, costs you Claude Code and leaves the rest of the IDE working,
+so those are warnings rather than a wall.
 
 **An API key instead of a login.** The **Agents** section of the same dialog
 stores an Anthropic API key in the Windows credential store, never in a config

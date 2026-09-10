@@ -408,8 +408,15 @@ terminal tab bound to no agent. There is deliberately no field in
   workspace's agent area, with the error message and, for `GitError`, the stderr
   in an expandable section.
 - Daemon-level problems (disconnect, prereqs) show in the status bar and, when
-  blocking, by opening the Settings dialog on its Setup section. The status bar's
-  "Set up…" link goes to the same place while any check is failing.
+  blocking, by opening the Settings dialog on its Setup section — **once per run
+  of blocking failures**, which is `should_auto_open_setup(blocked,
+  already_shown)` in `app_controller.rs`. The window sets `already_shown`
+  whenever it opens Settings at all and clears it on the first answer that
+  blocks nothing, so a prerequisite that breaks again later opens the dialog
+  again. Without the memory the dialog cannot be closed on the machine the flow
+  exists for: closing it re-checks, the re-check still says blocked, and it
+  reopens. Closing it is what "carry on regardless" means now, and the status
+  bar's "Set up…" link goes to the same place while any check is failing.
 - **Setup lives in File > Settings…, not under Help.** `SettingsDialog` hosts
   the whole `SetupPage` — rows, fix buttons, login terminal and sign-in link —
   as its first section, and `MainWindow::showSetupPage` opens the dialog on it.
@@ -422,10 +429,12 @@ terminal tab bound to no agent. There is deliberately no field in
   closes the PTY and skips `onTerminalExited`, so `openSettings` calls
   `recheckPrereqs()` after `exec` returns: a user who pastes the code and closes
   Settings before the CLI process exits must not be left with a stale
-  `claude_auth: false` and no way back but the Re-check button. `SetupPage` has
-  no heading and no "Continue anyway" of its own — what a blocking prerequisite
-  gets instead is the dialog opening by itself, which the user closes when they
-  choose to carry on regardless.
+  `claude_auth: false` and no way back but the Re-check button. That re-check
+  never raises a message box of its own: closing Settings during a reconnect
+  fails it, and the status bar is already saying the connection is down.
+  `SetupPage` has no heading and no "Continue anyway" of its own — what a
+  blocking prerequisite gets instead is the dialog opening by itself once, which
+  the user closes when they choose to carry on regardless.
 - **Logins happen inside the IDE, never via a terminal command the user must
   type.** The `SetupPage` lists each failing prerequisite with an action button.
   For `claude_auth` the button is "Log in to Claude Code": it opens a terminal

@@ -1467,3 +1467,32 @@ fn claude_login_is_read_off_the_claude_auth_prerequisite() {
     // Either credential alone is enough; neither is not.
     assert!(claude_logged_in(&[item("claude_auth", true)], KEY));
 }
+
+/// Settings opens on Setup by itself when a blocking prerequisite fails, and
+/// it has to be closable afterwards.
+///
+/// Closing the dialog re-checks the prerequisites. On the machine the setup
+/// flow exists for -- a first run with no bubblewrap -- that answer still says
+/// "blocked", so an auto-open with no memory reopens the dialog every time it
+/// is closed and the user cannot get past it. This walks that episode.
+#[test]
+fn setup_opens_itself_once_per_run_of_blocking_failures() {
+    use bondsymphonic_ide::qobjects::app_controller::should_auto_open_setup;
+
+    // First answer of the session: blocked, nothing shown yet.
+    assert!(should_auto_open_setup(true, false));
+    // The window records that it opened one. The re-check that closing the
+    // dialog issues arrives still blocked -- and must not reopen it.
+    assert!(!should_auto_open_setup(true, true));
+    // Nor does any later check, for as long as the same failure stands.
+    assert!(!should_auto_open_setup(true, true));
+
+    // Nothing blocking: no dialog, and the window clears its flag on this
+    // answer, which is what re-arms the rule.
+    assert!(!should_auto_open_setup(false, true));
+    assert!(!should_auto_open_setup(false, false));
+
+    // A prerequisite that breaks again later is a new episode, so the dialog
+    // is offered again rather than staying silent for the session.
+    assert!(should_auto_open_setup(true, false));
+}

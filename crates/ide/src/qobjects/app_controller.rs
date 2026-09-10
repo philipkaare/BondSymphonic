@@ -629,6 +629,14 @@ pub mod qobject {
         #[qinvokable]
         fn prereqs_json(self: &AppController) -> QString;
 
+        /// Whether a prerequisite answer should open Settings on Setup by
+        /// itself. See [`super::should_auto_open_setup`]: `already_shown` is
+        /// what stops a still-blocked machine reopening the dialog every time
+        /// it is closed, and the window clears it when nothing blocks any more.
+        #[qinvokable]
+        fn should_auto_open_setup(self: &AppController, blocked: bool, already_shown: bool)
+            -> bool;
+
         /// Whether any prerequisite in `json` is one the IDE cannot work
         /// without. The window asks before deciding between the setup page and
         /// a status-bar warning.
@@ -1040,6 +1048,27 @@ pub fn claude_logged_in(items: &[PrereqStatus], api_key_set: bool) -> bool {
         || items
             .iter()
             .any(|item| item.name == CLAUDE_AUTH_PREREQ && item.ok)
+}
+
+/// Whether a prerequisite answer should open the Settings dialog on Setup by
+/// itself.
+///
+/// `blocked` is [`prereqs_blocking`]; `already_shown` is whether the dialog has
+/// already been opened during the current run of failures. The second argument
+/// is the whole point. Closing Settings re-checks the prerequisites, so on a
+/// machine where a blocking one is still failing -- a first run with no
+/// bubblewrap, which is exactly what the setup flow exists for -- an
+/// unconditional auto-open makes the dialog impossible to close: close it,
+/// the re-check answers "still blocked", and it opens again.
+///
+/// Once per run of failures is the rule. The caller sets `already_shown` when
+/// it opens the dialog and clears it the moment `blocked` goes false, so a
+/// prerequisite that breaks again later opens it again. The status-bar
+/// "Set up…" link and File > Settings remain the way in meanwhile, and a
+/// blocking failure that the user has decided to live with no longer traps
+/// them: closing the dialog is what "carry on regardless" now means.
+pub fn should_auto_open_setup(blocked: bool, already_shown: bool) -> bool {
+    blocked && !already_shown
 }
 
 /// The message the New Agent dialog shows under an unusable name.
@@ -2314,6 +2343,10 @@ impl qobject::AppController {
                 false
             }
         }
+    }
+
+    pub fn should_auto_open_setup(&self, blocked: bool, already_shown: bool) -> bool {
+        should_auto_open_setup(blocked, already_shown)
     }
 
     pub fn prereqs_json(&self) -> QString {

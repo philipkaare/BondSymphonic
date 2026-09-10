@@ -45,6 +45,15 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+namespace {
+
+/// What the operation label says while the New Agent dialog's repository is
+/// being read. Named because it is both written and compared: the previous
+/// message is only put back if this is still what the label shows.
+const QString kReadingRepository = QStringLiteral("Reading repository…");
+
+} // namespace
+
 MainWindow::MainWindow(AppController* controller, GroupModel* groupModel, FileTreeModel* fileTreeModel,
                        ChangesModel* changesModel, RunPanelModel* runModel, QWidget* parent)
     : QMainWindow(parent), m_controller(controller), m_groupModel(groupModel),
@@ -293,6 +302,10 @@ void MainWindow::openSettings(bool onSetup) {
     }
     SettingsDialog dialog(m_controller, this);
     m_settingsDialog = &dialog;
+    // Set for every open, not only the automatic one. A user who reaches
+    // Settings by hand while a blocking prerequisite is failing must not have
+    // it thrown back at them the moment they close it either.
+    m_setupShownForBlock = true;
     if (onSetup) {
         // Deferred by one turn of the event loop: the scroll area only knows
         // where its sections are once the dialog has been laid out, and it is
@@ -330,7 +343,12 @@ void MainWindow::onPrereqsChecked(const QString& json) {
     m_setupLabel->setVisible(anyFailed);
     updateWorkspaceStatus();
 
-    if (blocked) {
+    if (!blocked) {
+        // Re-arms the automatic open: the next run of blocking failures gets
+        // one of its own rather than being silent for the session.
+        m_setupShownForBlock = false;
+    }
+    if (m_controller->shouldAutoOpenSetup(blocked, m_setupShownForBlock)) {
         // Deferred, because this runs inside the controller's own signal and
         // `openSettings` spins a nested event loop for the length of the
         // dialog. Queuing it lets this handler finish first.
@@ -740,7 +758,7 @@ void MainWindow::onNewAgent() {
     m_opTextBeforeInspect = m_opLabel->text();
     m_opTipBeforeInspect = m_opLabel->toolTip();
     m_opUrlBeforeInspect = m_opUrl;
-    showOperationMessage("Reading repository…", QString());
+    showOperationMessage(kReadingRepository, QString());
     // One shot. The guard object owns both connections, so whichever answer
     // arrives first takes the other one down with it and a later, unrelated
     // `operationFailed` cannot open a second dialog.
@@ -780,13 +798,20 @@ void MainWindow::openNewAgentDialog(const QString& initialPath, const QString& d
     if (m_newAgentPending) {
         m_newAgentPending = false;
         QApplication::restoreOverrideCursor();
-        // Put back verbatim rather than through `showOperationMessage`, which
-        // escapes what it is given: the stashed text is already the rendered
-        // HTML, and re-escaping it would show the markup.
-        m_opUrl = m_opUrlBeforeInspect;
-        m_opLabel->setText(m_opTextBeforeInspect);
-        m_opLabel->setToolTip(m_opTipBeforeInspect);
-        m_opLabel->setVisible(!m_opTextBeforeInspect.isEmpty());
+        // Only while the line is still the one this borrowed. A merge or a pull
+        // request that finished while the repository was being read has written
+        // its own answer there since, and that is newer news than what was
+        // stashed. The comparison holds because the text carries no markup, so
+        // `showOperationMessage`'s escaping left it unchanged.
+        if (m_opLabel->text() == kReadingRepository) {
+            // Put back verbatim rather than through `showOperationMessage`,
+            // which escapes what it is given: the stashed text is already the
+            // rendered HTML, and re-escaping it would show the markup.
+            m_opUrl = m_opUrlBeforeInspect;
+            m_opLabel->setText(m_opTextBeforeInspect);
+            m_opLabel->setToolTip(m_opTipBeforeInspect);
+            m_opLabel->setVisible(!m_opTextBeforeInspect.isEmpty());
+        }
         m_opTextBeforeInspect.clear();
         m_opTipBeforeInspect.clear();
         m_opUrlBeforeInspect.clear();
@@ -1122,6 +1147,15 @@ void MainWindow::onOperationFailed(const QString& op, const QString& message) {
         // the operation and not the workspace, and only one start is ever in
         // flight, so every mark comes down.
         m_agentArea->clearStarting();
+    }
+    if (op == QLatin1String("system.check_prereqs")) {
+        // Never a box. The commonest way to see this is closing Settings during
+        // a reconnect: `openSettings` re-checks on the way out and the daemon
+        // is not there to answer. The status bar is already saying the
+        // connection is down, and the checks are re-run on every reconnect, so
+        // there is nothing for the user to do with a modal about it.
+        qWarning("prerequisite check failed: %s", qUtf8Printable(message));
+        return;
     }
     if (m_newAgentPending && op == QLatin1String("repo.inspect")) {
         // The inspection that precedes the New Agent dialog. It is about to be

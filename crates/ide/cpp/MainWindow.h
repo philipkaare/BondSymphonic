@@ -225,6 +225,12 @@ private:
     /// The Settings dialog while it is up, so a second request raises it
     /// instead of opening another one over it.
     QPointer<SettingsDialog> m_settingsDialog;
+    /// Whether Settings has already been shown during the current run of
+    /// blocking prerequisite failures. See `AppController::shouldAutoOpenSetup`:
+    /// closing the dialog re-checks, so without this a machine that is still
+    /// blocked reopens it every time it is closed. Cleared the moment nothing
+    /// blocks any more, so a later failure opens it again.
+    bool m_setupShownForBlock = false;
     QSplitter* m_centerSplitter = nullptr;
     /// The centre pane: one tab per open file.
     EditorArea* m_editorArea = nullptr;
