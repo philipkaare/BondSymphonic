@@ -1,6 +1,8 @@
 #include "NewAgentDialog.h"
+#include "RunPanel.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
+#include <QAbstractItemModel>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -28,6 +30,12 @@ const char* kTerminalAdapter = "terminal";
 
 /// How many lines of opening prompt are visible before the box scrolls.
 constexpr int kPromptRows = 4;
+
+/// The run-config entry that means "record nothing on the tab". First in the
+/// list and selected until the daemon has answered, so a dialog accepted before
+/// the detection lands creates a workspace with no run configuration rather
+/// than with a guess.
+const char* kNoRunConfig = "(none)";
 
 /// Whether the daemon said it has the Claude adapter, from the capabilities it
 /// reported in `hello`. Offering Claude Code by default against a daemon that
@@ -105,6 +113,11 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWi
                                     2 * static_cast<int>(m_initialPrompt->document()->documentMargin()));
     form->addRow("Initial prompt:", m_initialPrompt);
 
+    m_runConfig = new QComboBox(this);
+    m_runConfig->addItem(kNoRunConfig, QString());
+    m_runConfig->setToolTip("How the Run panel starts this workspace's application");
+    form->addRow("Run config:", m_runConfig);
+
     m_group = new QComboBox(this);
     for (int g = 0; g < m_model->groupCount(); ++g) {
         m_group->addItem(m_model->groupName(g));
@@ -136,6 +149,8 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWi
     QObject::connect(m_buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
     QObject::connect(m_buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     QObject::connect(m_controller, &AppController::repoInspected, this, &NewAgentDialog::onRepoInspected);
+    QObject::connect(m_controller, &AppController::runConfigsDetected, this,
+                     &NewAgentDialog::onRunConfigsDetected);
     QObject::connect(m_controller, &AppController::operationFailed, this, &NewAgentDialog::onInspectFailed);
 
     onAdapterChanged();
@@ -193,6 +208,12 @@ QString NewAgentDialog::initialPrompt() const {
     return m_initialPrompt->toPlainText().trimmed();
 }
 
+QString NewAgentDialog::runConfig() const {
+    // The user data, not the text: a guessed port is spelled out in the label
+    // and is no part of the name the daemon knows the configuration by.
+    return m_runConfig->currentData().toString();
+}
+
 QString NewAgentDialog::group() const {
     // Reading the combo text rather than the line edit's visibility keeps this
     // correct after `exec()` returns, when every child widget is hidden again.
@@ -219,6 +240,9 @@ void NewAgentDialog::inspectRepo() {
     m_pendingPath = path;
     m_status->setText(QString("Inspecting %1…").arg(path));
     m_controller->inspectRepo(path);
+    // Alongside, not after: the two answers are independent and the run
+    // configurations are not worth another round trip's delay.
+    m_controller->detectRunConfigs(path);
 }
 
 void NewAgentDialog::onRepoInspected(const QString& path, const QString& infoJson) {
@@ -242,11 +266,43 @@ void NewAgentDialog::onRepoInspected(const QString& path, const QString& infoJso
     updateOkEnabled();
 }
 
+void NewAgentDialog::onRunConfigsDetected(const QString& path, const QString& json) {
+    // A late answer for a repository the user has since edited away from would
+    // offer configurations from the wrong tree.
+    if (path != m_pendingPath) {
+        return;
+    }
+    const QString current = runConfig();
+    m_runConfig->clear();
+    m_runConfig->addItem(kNoRunConfig, QString());
+    runpanel::appendConfigItems(m_runConfig, json);
+    // The first runnable configuration is the offer, matching what the Run
+    // panel preselects once the workspace exists. A re-detection that still has
+    // what the user picked keeps it.
+    const int previous = current.isEmpty() ? -1 : m_runConfig->findData(current);
+    if (previous >= 0) {
+        m_runConfig->setCurrentIndex(previous);
+        return;
+    }
+    for (int i = 1; i < m_runConfig->count(); ++i) {
+        if (m_runConfig->model()->flags(m_runConfig->model()->index(i, 0)) & Qt::ItemIsEnabled) {
+            m_runConfig->setCurrentIndex(i);
+            return;
+        }
+    }
+}
+
 void NewAgentDialog::onInspectFailed(const QString& op, const QString& message) {
     // Only inspection failures belong in this dialog; the window reports the rest.
     if (op == "repo.inspect") {
         m_pendingPath.clear();
         m_status->setText(message);
+        return;
+    }
+    // A daemon that cannot detect run configurations is not a reason to refuse
+    // to create the workspace: the list stays at "(none)" and says why.
+    if (op == "repo.detect_run_configs") {
+        m_runConfig->setToolTip(message);
     }
 }
 

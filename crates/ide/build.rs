@@ -63,6 +63,8 @@ fn main() {
             "cpp/EditorArea.cpp",
             "cpp/DiffWidget.h",
             "cpp/DiffWidget.cpp",
+            "cpp/RunPanel.h",
+            "cpp/RunPanel.cpp",
             "cpp/MainWindow.h",
             "cpp/MainWindow.cpp",
             "cpp/app.cpp",

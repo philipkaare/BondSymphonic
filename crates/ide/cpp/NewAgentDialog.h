@@ -20,8 +20,10 @@ class QPlainTextEdit;
 /// and hands them over as `optionsJson` and `initialPrompt` rather than as
 /// separate arguments, because the daemon's start options are what they are.
 ///
-/// The branch list is filled asynchronously: editing the repository path asks
-/// the daemon to inspect it, and the answer arrives on `repoInspected`.
+/// The branch list and the run-configuration list are filled asynchronously:
+/// editing the repository path asks the daemon to inspect it and to detect its
+/// run configurations, and the answers arrive on `repoInspected` and
+/// `runConfigsDetected`.
 class NewAgentDialog : public QDialog {
     Q_OBJECT
 public:
@@ -47,10 +49,16 @@ public:
     /// The first prompt to send once the agent is up, or empty for none.
     QString initialPrompt() const;
 
+    /// The run configuration to record on the new tab, so the Run panel opens
+    /// on it, or empty when the user chose none. It is a name out of the
+    /// daemon's own detection, never something typed.
+    QString runConfig() const;
+
 private:
     void browse();
     void inspectRepo();
     void onRepoInspected(const QString& path, const QString& infoJson);
+    void onRunConfigsDetected(const QString& path, const QString& json);
     void onInspectFailed(const QString& op, const QString& message);
     void onGroupChanged(int index);
     /// Shows the fields the selected adapter has and hides the rest.
@@ -67,6 +75,7 @@ private:
     QLineEdit* m_command = nullptr;
     QLineEdit* m_claudeModel = nullptr;
     QComboBox* m_permissionMode = nullptr;
+    QComboBox* m_runConfig = nullptr;
     QPlainTextEdit* m_initialPrompt = nullptr;
     QComboBox* m_group = nullptr;
     QLineEdit* m_newGroup = nullptr;

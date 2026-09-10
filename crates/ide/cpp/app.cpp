@@ -5,6 +5,7 @@
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
+#include "bondsymphonic-ide/src/qobjects/run_panel.cxxqt.h"
 #include <QApplication>
 
 std::int32_t run_app() {
@@ -24,7 +25,10 @@ std::int32_t run_app() {
     auto* groupModel = new GroupModel(&app);
     auto* fileTreeModel = new FileTreeModel(&app);
     auto* changesModel = new ChangesModel(&app);
-    MainWindow window(controller, groupModel, fileTreeModel, changesModel);
+    // One for the whole application, like the Changes model: a run keeps
+    // running, and keeps printing, while the user is looking at another tab.
+    auto* runModel = new RunPanelModel(&app);
+    MainWindow window(controller, groupModel, fileTreeModel, changesModel, runModel);
     window.show();
     controller->start();
     return app.exec();

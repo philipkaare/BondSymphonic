@@ -7,12 +7,14 @@
 #include "ExplorerDock.h"
 #include "GroupBar.h"
 #include "NewAgentDialog.h"
+#include "RunPanel.h"
 #include "SettingsDialog.h"
 #include "SetupPage.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
+#include "bondsymphonic-ide/src/qobjects/run_panel.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/transcript_model.cxxqt.h"
 #include <QAction>
@@ -40,9 +42,9 @@
 #include <QWidget>
 
 MainWindow::MainWindow(AppController* controller, GroupModel* groupModel, FileTreeModel* fileTreeModel,
-                       ChangesModel* changesModel, QWidget* parent)
+                       ChangesModel* changesModel, RunPanelModel* runModel, QWidget* parent)
     : QMainWindow(parent), m_controller(controller), m_groupModel(groupModel),
-      m_fileTreeModel(fileTreeModel), m_changesModel(changesModel) {
+      m_fileTreeModel(fileTreeModel), m_changesModel(changesModel), m_runModel(runModel) {
     setWindowTitle("BondSymphonic");
     resize(1400, 900);
     // Central first: the File, Edit and View items act on the editor area, so
@@ -284,7 +286,8 @@ void MainWindow::buildDocks() {
     auto* bottom = new QDockWidget("Output", this);
     bottom->setObjectName("BottomDock");
     m_bottomTabs = new QTabWidget(bottom);
-    m_bottomTabs->addTab(new QPlainTextEdit(m_bottomTabs), "Run");
+    m_runPanel = new RunPanel(m_runModel, m_bottomTabs);
+    m_bottomTabs->addTab(m_runPanel, "Run");
     m_shellArea = new AgentArea(m_bottomTabs);
     m_shellArea->setPlaceholderText("No workspace selected");
     m_bottomTabs->addTab(m_shellArea, "Terminal");
@@ -344,23 +347,52 @@ void MainWindow::connectController() {
                      [this](const QString& json) { m_groupModel->reconcile(json); });
     QObject::connect(m_controller, &AppController::workspaceCreated, this,
                      [this](const QString& info, const QString& group, const QString& adapter,
-                            const QString& command, const QString& options) {
+                            const QString& command, const QString& options,
+                            const QString& runConfig) {
                          m_groupModel->addTab(info, group, adapter, command, options);
+                         const QString workspaceId =
+                             QJsonDocument::fromJson(info.toUtf8()).object().value("id").toString();
+                         // After `addTab`, which is what creates the tab this
+                         // writes on. The Run panel reads it back off the tab
+                         // on every activation, so recording it here is what
+                         // makes the dialog's choice survive a tab switch and a
+                         // restored session.
+                         if (!runConfig.isEmpty()) {
+                             m_groupModel->setTabRunConfig(workspaceId, runConfig);
+                         }
                          // A Claude workspace is created with an agent start
                          // already on its way, and the tab is shown before that
                          // answers. The pane has to know, or it offers a Start
                          // button for a start that is already running.
                          if (adapter == QLatin1String("claude")) {
-                             const QString workspaceId = QJsonDocument::fromJson(info.toUtf8())
-                                                             .object()
-                                                             .value("id")
-                                                             .toString();
                              m_agentArea->setStarting(workspaceId, true);
                          }
                      });
     QObject::connect(m_controller, &AppController::workspaceChanged, this,
                      [this](const QString& info) { m_groupModel->applyWorkspaceInfo(info); });
+    // Before `onWorkspaceDestroyed`, which takes the tab out and so provokes
+    // the active-tab change that points the Run panel at whatever survived: the
+    // dead workspace's runs, logs and blocked hosts have to be gone by then.
+    QObject::connect(m_controller, &AppController::workspaceDestroyed, m_runModel,
+                     &RunPanelModel::forgetWorkspace);
     QObject::connect(m_controller, &AppController::workspaceDestroyed, this, &MainWindow::onWorkspaceDestroyed);
+    // A host the workspace's proxy refused. The queue is per workspace and
+    // lives in the model, so one blocked while another tab is in front waits
+    // there rather than being shown over the wrong workspace.
+    QObject::connect(m_controller, &AppController::networkDenied, m_runModel,
+                     &RunPanelModel::noteDenied);
+    // `setWorkspace` publishes what it already knows and only then re-detects,
+    // so the tab's own configuration is offered again each time the list
+    // changes, until the model accepts it.
+    QObject::connect(m_runModel, &RunPanelModel::configsChanged, this, [this] {
+        if (m_pendingRunConfig.isEmpty()) {
+            return;
+        }
+        m_runModel->selectConfig(m_pendingRunConfig);
+        if (m_runModel->getSelectedConfig() == m_pendingRunConfig) {
+            m_pendingRunConfig.clear();
+        }
+    });
     // The tab records the agent so a restored session finds it again, and the
     // pane attaches to it. Both, in that order: `onActiveTabChanged` reads the
     // id back out of the tab.
@@ -492,13 +524,15 @@ void MainWindow::onNewAgent() {
         // One call: the workspace, the agent in it and its opening prompt. The
         // controller emits `workspaceCreated` as soon as the workspace exists,
         // so a slow `agent.start` happens in front of the user.
-        m_controller->createWorkspaceWithAgent(dialog.repoPath(), dialog.baseBranch(), dialog.name(),
-                                               dialog.group(), dialog.optionsJson(),
-                                               dialog.initialPrompt());
+        m_controller->createWorkspaceWithAgentAndRun(dialog.repoPath(), dialog.baseBranch(),
+                                                     dialog.name(), dialog.group(),
+                                                     dialog.optionsJson(), dialog.initialPrompt(),
+                                                     dialog.runConfig());
         return;
     }
-    m_controller->createWorkspace(dialog.repoPath(), dialog.baseBranch(), dialog.name(), dialog.group(),
-                                  dialog.adapter(), dialog.command());
+    m_controller->createWorkspaceWithRun(dialog.repoPath(), dialog.baseBranch(), dialog.name(),
+                                         dialog.group(), dialog.adapter(), dialog.command(),
+                                         dialog.runConfig());
 }
 
 void MainWindow::onDestroyRequested(const QString& workspaceId) {
@@ -550,7 +584,10 @@ void MainWindow::onOperationFailed(const QString& op, const QString& message) {
     // The New Agent dialog reports its own inspection failures inline, and while
     // it is up it is modal, so a box parented to this window could not be closed.
     if (!m_newAgentDialog.isNull()) {
-        if (op == "repo.inspect") {
+        // Both of the dialog's own lookups: it reports them in place, and a
+        // repository with no detectable run configuration is a normal answer
+        // rather than something to put a box over.
+        if (op == "repo.inspect" || op == "repo.detect_run_configs") {
             return;
         }
         QMessageBox::warning(m_newAgentDialog, op, message);
@@ -577,11 +614,18 @@ void MainWindow::onActiveTabChanged() {
         m_agentArea->showPlaceholder();
         m_shellArea->showPlaceholder();
         m_explorer->setWorkspace(QString());
+        m_pendingRunConfig.clear();
+        m_runModel->setWorkspace(QString(), QString());
         rebindCost();
         return;
     }
     const QString workspaceId = active.value("workspace_id").toString();
     m_explorer->setWorkspace(workspaceId);
+    // The tab's choice first, because `setWorkspace` publishes the list it
+    // already has synchronously and the `configsChanged` slot above applies
+    // this to it; the worktree path is the daemon's, from `WorkspaceInfo`.
+    m_pendingRunConfig = active.value("run_config").toString();
+    m_runModel->setWorkspace(workspaceId, active.value("worktree_path").toString());
     // Both areas create their terminal on the workspace's first activation and
     // keep it afterwards, so this runs on every model change and is a no-op
     // once the pane exists.
@@ -644,3 +688,4 @@ void MainWindow::updateWorkspaceStatus() {
     // The word itself comes from the model; this only frames it.
     m_sandboxLabel->setText(QString("sandbox: %1").arg(m_groupModel->statusWord(group, tab)));
 }
+

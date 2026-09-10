@@ -24,6 +24,8 @@ class QPlainTextEdit;
 class QSplitter;
 class QStackedWidget;
 class QTabWidget;
+class RunPanel;
+class RunPanelModel;
 class SetupPage;
 class TranscriptModel;
 
@@ -31,7 +33,7 @@ class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
     MainWindow(AppController* controller, GroupModel* groupModel, FileTreeModel* fileTreeModel,
-               ChangesModel* changesModel, QWidget* parent = nullptr);
+               ChangesModel* changesModel, RunPanelModel* runModel, QWidget* parent = nullptr);
 
 protected:
     /// Refuses to close over unsaved editors without asking. Both ways out of
@@ -110,6 +112,7 @@ private:
     GroupModel* m_groupModel;
     FileTreeModel* m_fileTreeModel;
     ChangesModel* m_changesModel;
+    RunPanelModel* m_runModel;
     GroupBar* m_groupBar = nullptr;
     /// The left dock: the active workspace's worktree.
     ExplorerDock* m_explorer = nullptr;
@@ -130,6 +133,14 @@ private:
     QTabWidget* m_bottomTabs = nullptr;
     /// The bottom dock's Terminal tab: one shell per workspace.
     AgentArea* m_shellArea = nullptr;
+    /// The bottom dock's Run tab.
+    RunPanel* m_runPanel = nullptr;
+    /// The run configuration the active tab was created with, still waiting for
+    /// the model to have a list it appears in. `setWorkspace` publishes what it
+    /// already knows before re-detecting, and `selectConfig` refuses a name that
+    /// is not in the current list, so the request is offered again on every
+    /// `configsChanged` until the model takes it.
+    QString m_pendingRunConfig;
     QLabel* m_daemonLabel = nullptr;
     QLabel* m_sandboxLabel = nullptr;
     QLabel* m_branchLabel = nullptr;
