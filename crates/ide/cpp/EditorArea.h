@@ -70,7 +70,21 @@ public:
     /// landed and nothing has been typed since.
     bool closeTab(int index);
 
+    /// The open file tabs, per workspace, as
+    /// `{"<workspace>": {"open": [...], "active": "..."}}` -- exactly what
+    /// `AppController::noteEditors` takes for each entry.
+    ///
+    /// Files only. A diff tab is a view of a file's history rather than
+    /// something the user was working in, and reopening a handful of them at
+    /// start-up would ask the daemon for both sides of each. A workspace with
+    /// no file tabs is absent rather than present and empty.
+    QString openEditorsJson() const;
+
 signals:
+    /// A file tab was opened, closed or replaced, so `openEditorsJson` has
+    /// moved. Not emitted for an edit, a save or a scroll.
+    void openEditorsChanged();
+
     /// The current tab changed. `editor` is null when no editor is showing.
     void currentEditorChanged(EditorWidget* editor);
 

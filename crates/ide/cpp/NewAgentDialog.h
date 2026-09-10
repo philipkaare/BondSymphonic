@@ -10,6 +10,7 @@ class QFormLayout;
 class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
+class QToolButton;
 
 /// Collects everything a new workspace needs: which repository and base branch
 /// to fork, what to call the agent, which adapter runs in it, and which group
@@ -56,6 +57,11 @@ public:
 
 private:
     void browse();
+    /// Rebuilds the Recent menu from the controller's list, most recent first,
+    /// and disables the button when there is nothing to offer. The paths are
+    /// the ones a create succeeded with, so this is the list of repositories
+    /// the user has actually worked in.
+    void buildRecentMenu();
     void inspectRepo();
     void onRepoInspected(const QString& path, const QString& infoJson);
     void onRunConfigsDetected(const QString& path, const QString& json);
@@ -72,6 +78,8 @@ private:
     GroupModel* m_model;
     QFormLayout* m_form = nullptr;
     QLineEdit* m_repoPath = nullptr;
+    /// Drops down the repositories the user has created workspaces in before.
+    QToolButton* m_recent = nullptr;
     QComboBox* m_baseBranch = nullptr;
     QLineEdit* m_name = nullptr;
     QComboBox* m_adapter = nullptr;

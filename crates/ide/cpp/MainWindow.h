@@ -1,10 +1,13 @@
 #pragma once
+#include <QHash>
 #include <QKeySequence>
 #include <QList>
 #include <QMainWindow>
 #include <QMetaObject>
 #include <QPointer>
+#include <QSet>
 #include <QString>
+#include <QStringList>
 
 class AgentArea;
 class AppController;
@@ -20,7 +23,9 @@ class QCloseEvent;
 class QJsonObject;
 class QLabel;
 class QMenu;
+class QMoveEvent;
 class QPlainTextEdit;
+class QResizeEvent;
 class QSplitter;
 class QStackedWidget;
 class QTabWidget;
@@ -40,7 +45,18 @@ protected:
     /// the application arrive here -- the title bar's close button and File >
     /// Exit, which calls `close()` -- so this is the one place the question has
     /// to be put.
+    ///
+    /// `AppController::prepareQuit()` is its first statement and `flushState()`
+    /// its second. Without the first, the connection this close is about to
+    /// drop reads as a loss and the IDE relaunches a daemon inside WSL on its
+    /// way out; without the second, a change made in the last half second is
+    /// still on its debounce timer when the process goes.
     void closeEvent(QCloseEvent* event) override;
+
+    /// Both record the window's geometry, debounced in Rust, so a window the
+    /// user moved or resized comes back where they left it.
+    void moveEvent(QMoveEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
 
 private:
     /// Where a close request has got to. `Idle` is the ordinary state; the
@@ -80,6 +96,41 @@ private:
     /// read, so the title and the Explorer's header cannot disagree.
     void updateWindowTitle(const QJsonObject& active);
     void onWorkspaceDestroyed(const QString& workspaceId);
+
+    // --- persistence -------------------------------------------------------
+
+    /// Applies `state.json` to the window: geometry, dock layout, the centre
+    /// splitter and its swap, and the editor tabs to reopen per workspace.
+    /// Called once, before the daemon is connected.
+    void onStateLoaded(const QString& json);
+    /// Records `saveState()` and `saveGeometry()`. A no-op while the restore is
+    /// still running, so the layout being installed is not written back over
+    /// itself.
+    void noteWindowState();
+    /// Records the centre splitter's sizes and whether its halves are swapped.
+    void noteSplitterState();
+    /// Records every workspace's open editor tabs, and empties the record of a
+    /// workspace whose last tab has just gone.
+    void noteEditorState();
+    /// Reopens the editors `state.json` remembered for `workspaceId`, once,
+    /// the first time its tab is shown. Failures are ignored: a file the agent
+    /// has since deleted is not a reason to refuse to show the workspace.
+    void restoreEditorsFor(const QString& workspaceId);
+
+    // --- merge, pull requests and closing a group ---------------------------
+
+    /// Puts a line in the status bar. A non-empty `url` makes it a link that
+    /// opens in the system browser.
+    void showOperationMessage(const QString& text, const QString& url);
+    /// Raises `workspaceId`'s banner and marks its tab, from a failed merge,
+    /// pull request or discard.
+    void showWorkspaceError(const QString& workspaceId, const QString& title,
+                            const QString& detail, const QString& stderrText);
+    /// Takes both down again, after an operation on that workspace worked.
+    void clearWorkspaceError(const QString& workspaceId);
+    /// Asks what to do with each workspace in the group at `groupIndex` and
+    /// runs the answers.
+    void onCloseGroup(int groupIndex);
     /// Points the status bar's cost at the active tab's transcript, dropping
     /// the watch on the tab before it. A tab with no transcript costs nothing.
     void rebindCost();
@@ -152,9 +203,39 @@ private:
     /// The status bar's way back to the setup page, shown only while a
     /// non-blocking prerequisite is failing.
     QLabel* m_setupLabel = nullptr;
+    /// The last merge, pull request or close-group result. A permanent widget
+    /// rather than `showMessage`, which would hide every other status widget
+    /// while it was up; rich text, because a pull request's answer is a link.
+    QLabel* m_opLabel = nullptr;
+    /// The URL behind that line, so the click has something to open.
+    QString m_opUrl;
     /// What the sandbox label shows when no tab is selected: normally a dash,
     /// or the prerequisite warning once the controller has reported one.
     QString m_sandboxIdleText;
+    /// Whether the swap in the View menu has been applied, so the arrangement
+    /// can be persisted and restored. The splitter itself only knows the order
+    /// of its children.
+    bool m_swapped = false;
+    /// Set while `onStateLoaded` installs a layout, so the geometry and
+    /// splitter changes it provokes are not written straight back.
+    ///
+    /// Starts true and is cleared at the end of that call, which is the last
+    /// thing the constructor does: the resizes the window issues while it is
+    /// being built describe nothing the user chose, and recording them would
+    /// overwrite the layout that is about to be restored.
+    bool m_restoring = true;
+    /// Editors to reopen per workspace, from `state.json`, taken out of the map
+    /// the first time that workspace's tab is shown. `{workspace: paths}` with
+    /// the active one first in the list, so restoring in order leaves the right
+    /// tab in front.
+    QHash<QString, QStringList> m_editorsToRestore;
+    /// The workspaces whose editor lists were last recorded, so a workspace
+    /// that has just lost its last tab has its entry emptied rather than left
+    /// describing tabs that are gone.
+    QSet<QString> m_notedEditors;
+    /// Set while `restoreEditorsFor` is opening tabs, so the opens it makes are
+    /// not recorded one at a time over the list being restored.
+    bool m_restoringEditors = false;
     /// The watch on the active transcript's cost, dropped and remade whenever
     /// the active tab changes.
     QMetaObject::Connection m_costWatch;

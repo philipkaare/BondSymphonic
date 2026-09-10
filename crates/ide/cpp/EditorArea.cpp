@@ -4,10 +4,14 @@
 #include "EditorWidget.h"
 #include "bondsymphonic-ide/src/qobjects/diff_document.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/editor_document.cxxqt.h"
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLatin1Char>
 #include <QMessageBox>
 #include <QStackedWidget>
+#include <QTabBar>
 #include <QTabWidget>
 #include <QVBoxLayout>
 #include <QtGlobal>
@@ -37,6 +41,17 @@ EditorDocument* dirtyDocument(QWidget* page) {
     auto* editor = qobject_cast<EditorWidget*>(page);
     EditorDocument* doc = editor == nullptr ? nullptr : editor->document();
     return (doc != nullptr && doc->getDirty()) ? doc : nullptr;
+}
+
+/// The kind a tab key names ("file" or "diff"), empty for a page with no key.
+QString kindOfKey(const QString& key) {
+    return key.section(QLatin1Char('\n'), 0, 0);
+}
+
+/// The path a tab key names, empty for a page with no key. Everything from the
+/// third field on, so a path containing a newline comes back whole.
+QString pathOfKey(const QString& key) {
+    return key.section(QLatin1Char('\n'), 2);
 }
 
 /// The workspace a tab key names, empty for a page that has no key. Reading it
@@ -97,6 +112,9 @@ EditorArea::EditorArea(QWidget* parent) : QWidget(parent) {
                      [this](int index) { closeTab(index); });
     QObject::connect(m_tabs, &QTabWidget::currentChanged, this,
                      [this](int) { emit currentEditorChanged(currentEditor()); });
+    // Dragging a tab changes the order the files come back in next time.
+    QObject::connect(m_tabs->tabBar(), &QTabBar::tabMoved, this,
+                     [this](int, int) { emit openEditorsChanged(); });
 }
 
 void EditorArea::openFile(const QString& workspaceId, const QString& path) {
@@ -139,6 +157,7 @@ void EditorArea::openFile(const QString& workspaceId, const QString& path) {
     // Last: `open` is asynchronous, and the pane has to be wired up before its
     // answer arrives.
     doc->open(workspaceId, path);
+    emit openEditorsChanged();
 }
 
 void EditorArea::openDiff(const QString& workspaceId, const QString& path) {
@@ -315,6 +334,7 @@ void EditorArea::removePage(QWidget* page) {
     // A dirty editor can leave this way -- `Discard`, or a workspace that is
     // gone -- so what the window is waiting on may have just become nothing.
     emit unsavedStateChanged();
+    emit openEditorsChanged();
 }
 
 void EditorArea::updateTabTitle(QWidget* page) {
@@ -325,6 +345,34 @@ void EditorArea::updateTabTitle(QWidget* page) {
     const bool dirty = dirtyDocument(page) != nullptr;
     const QString title = page->property(kTabTitle).toString();
     m_tabs->setTabText(index, dirty ? QString::fromUtf8(kDirtyMarker) + title : title);
+}
+
+QString EditorArea::openEditorsJson() const {
+    QJsonObject byWorkspace;
+    const QString currentKey =
+        m_tabs->currentWidget() == nullptr
+            ? QString()
+            : m_tabs->currentWidget()->property(kTabKey).toString();
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        const QString key = m_tabs->widget(i)->property(kTabKey).toString();
+        if (kindOfKey(key) != QLatin1String("file")) {
+            continue;
+        }
+        const QString workspaceId = workspaceOfKey(key);
+        const QString path = pathOfKey(key);
+        if (workspaceId.isEmpty() || path.isEmpty()) {
+            continue;
+        }
+        QJsonObject entry = byWorkspace.value(workspaceId).toObject();
+        QJsonArray open = entry.value(QStringLiteral("open")).toArray();
+        open.append(path);
+        entry.insert(QStringLiteral("open"), open);
+        if (key == currentKey) {
+            entry.insert(QStringLiteral("active"), path);
+        }
+        byWorkspace.insert(workspaceId, entry);
+    }
+    return QString::fromUtf8(QJsonDocument(byWorkspace).toJson(QJsonDocument::Compact));
 }
 
 int EditorArea::indexOfKey(const QString& key) const {

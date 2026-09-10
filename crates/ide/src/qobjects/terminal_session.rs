@@ -141,6 +141,15 @@ pub mod qobject {
         /// page's decision, not this object's.
         #[qinvokable]
         fn reopen(self: Pin<&mut TerminalSession>);
+
+        /// The exit line a PTY lost to a daemon restart leaves on the screen.
+        ///
+        /// Exposed so the pane can recognise that state -- and offer Reopen for
+        /// it, rather than for an ordinary `exit` the user typed -- without
+        /// spelling the marker a second time in C++, where it could drift from
+        /// the one written here.
+        #[qinvokable]
+        fn restart_marker(self: &TerminalSession) -> QString;
     }
 
     impl cxx_qt::Threading for TerminalSession {}
@@ -836,6 +845,10 @@ impl qobject::TerminalSession {
             grid.insert_marker(DROP_MARKER);
         }
         self.apply_frame();
+    }
+
+    pub fn restart_marker(&self) -> QString {
+        QString::from(RESTART_MARKER)
     }
 
     pub fn reopen(self: Pin<&mut Self>) {

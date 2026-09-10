@@ -1,6 +1,8 @@
 #include "MainWindow.h"
 #include "AgentArea.h"
 #include "Branding.h"
+#include "ChangesToolbar.h"
+#include "CloseGroupDialog.h"
 #include "CodeView.h"
 #include "EditorArea.h"
 #include "EditorWidget.h"
@@ -19,9 +21,11 @@
 #include "bondsymphonic-ide/src/qobjects/transcript_model.cxxqt.h"
 #include <QAction>
 #include <QApplication>
+#include <QByteArray>
 #include <QChar>
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QDesktopServices>
 #include <QDockWidget>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -37,6 +41,7 @@
 #include <QStackedWidget>
 #include <QStatusBar>
 #include <QTabWidget>
+#include <QUrl>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -53,6 +58,10 @@ MainWindow::MainWindow(AppController* controller, GroupModel* groupModel, FileTr
     buildDocks();
     buildStatusBar();
     connectController();
+    // Last, and before the controller connects: the layout is installed on a
+    // window that has all its widgets and no daemon news yet, so nothing it
+    // restores can be overwritten by an answer arriving mid-restore.
+    onStateLoaded(m_controller->loadState());
     onConnectionStateChanged();
     updateWorkspaceStatus();
     onActiveTabChanged();
@@ -60,6 +69,13 @@ MainWindow::MainWindow(AppController* controller, GroupModel* groupModel, FileTr
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
+    // First, before anything else can fail or ask a question: the connection
+    // this close is about to drop must not read as a loss, or the reconnect
+    // loop relaunches a daemon inside WSL for an IDE that is on its way out.
+    m_controller->prepareQuit();
+    // Second: whatever was changed in the last half second is still sitting on
+    // its debounce timer, and there is no half second left.
+    m_controller->flushState();
     // Already answered, or there is nothing to lose. `hasUnsavedEditors` is the
     // whole test: a clean editor and a diff pane have nothing on them that the
     // file on disk does not.
@@ -91,6 +107,22 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         event->ignore();
         return;
     }
+}
+
+void MainWindow::moveEvent(QMoveEvent* event) {
+    QMainWindow::moveEvent(event);
+    noteWindowState();
+}
+
+void MainWindow::resizeEvent(QResizeEvent* event) {
+    QMainWindow::resizeEvent(event);
+    noteWindowState();
+    // The splitter's own `splitterMoved` only fires when the user drags it, so
+    // a session where they never did would persist no sizes at all and come
+    // back on the seeded default. Its children are re-divided on every window
+    // resize, and the write is debounced, so recording here is what makes the
+    // ratio the user is actually looking at the one that comes back.
+    noteSplitterState();
 }
 
 void MainWindow::armCloseAfterSaves() {
@@ -141,7 +173,13 @@ void MainWindow::buildMenus() {
     file->addSeparator();
     file->addAction("Se&ttings…", this, &MainWindow::onSettings);
     file->addSeparator();
-    file->addAction("E&xit", this, &QWidget::close);
+    file->addAction("E&xit", this, [this] {
+        // `close()` reaches `closeEvent`, which does this too; saying it here
+        // as well costs nothing (it is idempotent) and means the intent is
+        // recorded even if a close is refused and retried.
+        m_controller->prepareQuit();
+        close();
+    });
 
     auto* edit = menuBar()->addMenu("&Edit");
     addEditAction(edit, "&Undo", QKeySequence::Undo, &QPlainTextEdit::undo);
@@ -163,6 +201,8 @@ void MainWindow::buildMenus() {
         if (sizes.size() == 2) {
             m_centerSplitter->setSizes({ sizes.at(1), sizes.at(0) });
         }
+        m_swapped = !m_swapped;
+        noteSplitterState();
     });
     menuBar()->addMenu("&Workspace");
     menuBar()->addMenu("&Run");
@@ -232,6 +272,9 @@ void MainWindow::buildCentral() {
     QObject::connect(m_setupPage, &SetupPage::completed, this, &MainWindow::showWorkbench);
     QObject::connect(m_groupBar, &GroupBar::newAgentRequested, this, &MainWindow::onNewAgent);
     QObject::connect(m_groupBar, &GroupBar::destroyRequested, this, &MainWindow::onDestroyRequested);
+    QObject::connect(m_groupBar, &GroupBar::closeGroupRequested, this, &MainWindow::onCloseGroup);
+    QObject::connect(m_centerSplitter, &QSplitter::splitterMoved, this,
+                     [this](int, int) { noteSplitterState(); });
 }
 
 void MainWindow::showSetupPage() {
@@ -272,8 +315,16 @@ void MainWindow::onPrereqsChecked(const QString& json) {
 }
 
 void MainWindow::buildDocks() {
-    m_explorer = new ExplorerDock(m_fileTreeModel, m_changesModel, this);
+    m_explorer = new ExplorerDock(m_fileTreeModel, m_changesModel, m_controller, this);
     addDockWidget(Qt::LeftDockWidgetArea, m_explorer);
+    // The toolbar sends the requests and reads their answers; the window is
+    // what has a status bar and a set of workspace panes to put them in.
+    QObject::connect(m_explorer->changesToolbar(), &ChangesToolbar::statusMessage, this,
+                     &MainWindow::showOperationMessage);
+    QObject::connect(m_explorer->changesToolbar(), &ChangesToolbar::workspaceError, this,
+                     &MainWindow::showWorkspaceError);
+    QObject::connect(m_explorer->changesToolbar(), &ChangesToolbar::workspaceRecovered, this,
+                     &MainWindow::clearWorkspaceError);
     QObject::connect(m_explorer, &ExplorerDock::fileActivated, this, [this](const QString& path) {
         m_editorArea->openFile(activeWorkspaceId(), path);
     });
@@ -284,13 +335,24 @@ void MainWindow::buildDocks() {
     auto* bottom = new QDockWidget("Output", this);
     bottom->setObjectName("BottomDock");
     m_bottomTabs = new QTabWidget(bottom);
-    m_runPanel = new RunPanel(m_runModel, m_bottomTabs);
+    m_runPanel = new RunPanel(m_runModel, m_controller, m_bottomTabs);
     m_bottomTabs->addTab(m_runPanel, "Run");
     m_shellArea = new AgentArea(m_bottomTabs);
     m_shellArea->setPlaceholderText("No workspace selected");
     m_bottomTabs->addTab(m_shellArea, "Terminal");
     bottom->setWidget(m_bottomTabs);
     addDockWidget(Qt::BottomDockWidgetArea, bottom);
+
+    // A dock that was moved, floated or hidden is part of what `saveState`
+    // records, and none of those raise a resize on the window itself.
+    for (QDockWidget* dock : { static_cast<QDockWidget*>(m_explorer), bottom }) {
+        QObject::connect(dock, &QDockWidget::dockLocationChanged, this,
+                         [this](Qt::DockWidgetArea) { noteWindowState(); });
+        QObject::connect(dock, &QDockWidget::topLevelChanged, this,
+                         [this](bool) { noteWindowState(); });
+        QObject::connect(dock, &QDockWidget::visibilityChanged, this,
+                         [this](bool) { noteWindowState(); });
+    }
 }
 
 void MainWindow::buildStatusBar() {
@@ -307,12 +369,57 @@ void MainWindow::buildStatusBar() {
     m_setupLabel->setVisible(false);
     QObject::connect(m_setupLabel, &QLabel::linkActivated, this,
                      [this](const QString&) { showSetupPage(); });
+    // The last merge or pull request, at the right of the row. Rich text so a
+    // pull request's URL is a link; the href is never followed by Qt itself,
+    // `openUrl` is the one place the IDE hands a URL to the system browser.
+    m_opLabel = new QLabel(this);
+    m_opLabel->setObjectName("OperationLabel");
+    m_opLabel->setTextFormat(Qt::RichText);
+    m_opLabel->setOpenExternalLinks(false);
+    m_opLabel->setTextInteractionFlags(Qt::TextBrowserInteraction);
+    m_opLabel->setVisible(false);
+    QObject::connect(m_opLabel, &QLabel::linkActivated, this, [this](const QString&) {
+        if (!m_opUrl.isEmpty()) {
+            QDesktopServices::openUrl(QUrl(m_opUrl));
+        }
+    });
     statusBar()->addWidget(m_daemonLabel);
     statusBar()->addWidget(m_sandboxLabel);
     statusBar()->addWidget(m_setupLabel);
     statusBar()->addWidget(m_branchLabel);
+    statusBar()->addPermanentWidget(m_opLabel);
     statusBar()->addPermanentWidget(m_costLabel);
     updateCostLabel();
+}
+
+void MainWindow::showOperationMessage(const QString& text, const QString& url) {
+    m_opUrl = url;
+    m_opLabel->setText(url.isEmpty()
+                           ? text.toHtmlEscaped()
+                           : QStringLiteral("<a href=\"%1\">%2</a>")
+                                 .arg(url.toHtmlEscaped(), text.toHtmlEscaped()));
+    m_opLabel->setToolTip(url.isEmpty() ? text : url);
+    m_opLabel->setVisible(!text.isEmpty());
+}
+
+void MainWindow::showWorkspaceError(const QString& workspaceId, const QString& title,
+                                    const QString& detail, const QString& stderrText) {
+    if (workspaceId.isEmpty()) {
+        return;
+    }
+    // The banner is on the workspace's own pane, and the tab's red glyph is
+    // what says so from a group the user is not looking at. Both are needed:
+    // one of them is only visible when that workspace is in front.
+    m_agentArea->showBanner(workspaceId, title, detail, stderrText);
+    m_groupModel->setWorkspaceError(workspaceId, detail.isEmpty() ? title : title + "\n" + detail);
+}
+
+void MainWindow::clearWorkspaceError(const QString& workspaceId) {
+    if (workspaceId.isEmpty()) {
+        return;
+    }
+    m_agentArea->clearBanner(workspaceId);
+    m_groupModel->clearWorkspaceError(workspaceId);
 }
 
 void MainWindow::connectController() {
@@ -331,8 +438,25 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::prereqsChecked, this,
                      &MainWindow::onPrereqsChecked);
 
+    // Before `workspacesListed` is wired up, because the controller emits the
+    // restore first and the reconcile then finds every workspace already
+    // placed. Only the first list is a restore; every later one reconciles.
+    QObject::connect(m_controller, &AppController::workspacesRestored, this,
+                     [this](const QString& json) { m_groupModel->loadWorkspaces(json); });
     QObject::connect(m_controller, &AppController::workspacesListed, this,
                      [this](const QString& json) { m_groupModel->reconcile(json); });
+    // Every arrangement the user makes -- a rename, a drag between groups, a
+    // group closed -- reaches `state.json` from here. The model is the
+    // authority on the arrangement; the controller only records what it says.
+    QObject::connect(m_groupModel, &GroupModel::changed, this,
+                     [this] { m_controller->noteGroups(m_groupModel->groupsJson()); });
+    // The re-sync has finished. The panes re-attached themselves in Rust; what
+    // is left is the window's own furniture.
+    QObject::connect(m_controller, &AppController::reconnected, this, [this](::std::int64_t) {
+        onConnectionStateChanged();
+        updateWorkspaceStatus();
+        showOperationMessage(QStringLiteral("Reconnected to the daemon."), QString());
+    });
     QObject::connect(m_controller, &AppController::workspaceCreated, this,
                      [this](const QString& info, const QString& group, const QString& adapter,
                             const QString& command, const QString& options,
@@ -354,6 +478,15 @@ void MainWindow::connectController() {
                          // button for a start that is already running.
                          if (adapter == QLatin1String("claude")) {
                              m_agentArea->setStarting(workspaceId, true);
+                         }
+                         // The repository the user actually created something
+                         // in, so the New Agent dialog offers it next time.
+                         const QString repoPath = QJsonDocument::fromJson(info.toUtf8())
+                                                      .object()
+                                                      .value("repo_path")
+                                                      .toString();
+                         if (!repoPath.isEmpty()) {
+                             m_controller->noteRecentRepo(repoPath);
                          }
                      });
     QObject::connect(m_controller, &AppController::workspaceChanged, this,
@@ -410,6 +543,12 @@ void MainWindow::connectController() {
     // restarted agent gets the model and permission mode the user chose.
     QObject::connect(m_agentArea, &AgentArea::startAgentRequested, this,
                      &MainWindow::onStartAgentRequested);
+    // Dismissing the banner is the user saying they have read it, which is also
+    // what takes the red glyph off the tab.
+    QObject::connect(m_agentArea, &AgentArea::bannerDismissed, this,
+                     [this](const QString& workspaceId) {
+                         m_groupModel->clearWorkspaceError(workspaceId);
+                     });
     QObject::connect(m_controller, &AppController::agentStateChanged, this,
                      [this](const QString& agentId, const QString& state, const QString& detail) {
                          m_groupModel->setAgentStatus(agentId, state, detail);
@@ -479,7 +618,14 @@ void MainWindow::connectController() {
                      });
 
     QObject::connect(m_editorArea, &EditorArea::currentEditorChanged, this,
-                     [this](EditorWidget*) { updateEditActions(); });
+                     [this](EditorWidget*) {
+                         updateEditActions();
+                         noteEditorState();
+                     });
+    // A tab opened, closed or moved: which files are open and which is in front
+    // are both part of what comes back next time.
+    QObject::connect(m_editorArea, &EditorArea::openEditorsChanged, this,
+                     &MainWindow::noteEditorState);
 }
 
 void MainWindow::addEditAction(QMenu* menu, const QString& text,
@@ -573,7 +719,187 @@ void MainWindow::onStartAgentRequested(const QString& workspaceId) {
         return;
     }
     m_agentArea->setStarting(workspaceId, true);
-    m_controller->startAgent(workspaceId, tab.value("options_json").toString());
+    // The transcript's own options, which are the tab's plus the session id it
+    // saw in the history: a restart after an agent exited -- or after a daemon
+    // restart left the workspace with none -- resumes the conversation rather
+    // than starting a fresh one. A pane with no transcript (a terminal tab) has
+    // nothing to resume and falls back to what the tab was created with.
+    TranscriptModel* model = m_agentArea->transcriptModel(workspaceId);
+    const QString options = model == nullptr ? tab.value("options_json").toString()
+                                             : model->restartOptionsJson();
+    m_controller->startAgent(workspaceId, options);
+}
+
+void MainWindow::onCloseGroup(int groupIndex) {
+    const QString groupName = m_groupModel->groupName(groupIndex);
+    if (groupName.isEmpty()) {
+        return;
+    }
+    // The group's tabs in order, from the model's own state, so the dialog's
+    // rows and the run that follows are in the order the user sees.
+    const QJsonArray groups = QJsonDocument::fromJson(m_groupModel->getStateJson().toUtf8())
+                                  .object()
+                                  .value("groups")
+                                  .toArray();
+    const QJsonArray tabs =
+        groupIndex < groups.size() ? groups.at(groupIndex).toObject().value("tabs").toArray()
+                                   : QJsonArray();
+    QList<CloseGroupChoice> workspaces;
+    for (const QJsonValue& value : tabs) {
+        const QJsonObject tab = value.toObject();
+        CloseGroupChoice choice;
+        choice.workspaceId = tab.value("workspace_id").toString();
+        choice.name = tab.value("name").toString();
+        if (!choice.workspaceId.isEmpty()) {
+            workspaces.append(choice);
+        }
+    }
+
+    CloseGroupDialog dialog(groupName, workspaces, this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+    auto* runner = new CloseGroupRunner(m_controller, m_groupModel, groupName, dialog.choices(),
+                                        this);
+    QObject::connect(runner, &CloseGroupRunner::finished, this,
+                     [this, groupName](bool ok, const QString&, const QString& message) {
+                         // A stop is already on the workspace's own banner and
+                         // on its tab, put there by the toolbar's handler for
+                         // the same signal. The status bar is where the *group*
+                         // says what became of it, without a second modal over
+                         // an explanation the user already has.
+                         showOperationMessage(
+                             ok ? QStringLiteral("Closed the group \"%1\".").arg(groupName)
+                                : QStringLiteral("\"%1\" was left open: %2")
+                                      .arg(groupName, message),
+                             QString());
+                     });
+    runner->start();
+}
+
+// ---------------------------------------------------------------------------
+// Persistence. Everything the window knows that `state.json` remembers is
+// reported through these four; the debounce and the file are the controller's.
+// ---------------------------------------------------------------------------
+
+void MainWindow::onStateLoaded(const QString& json) {
+    const QJsonObject state = QJsonDocument::fromJson(json.toUtf8()).object();
+    m_restoring = true;
+    const QByteArray geometry =
+        QByteArray::fromBase64(state.value("geometry_b64").toString().toLatin1());
+    if (!geometry.isEmpty()) {
+        restoreGeometry(geometry);
+    }
+    const QByteArray windowState =
+        QByteArray::fromBase64(state.value("window_state_b64").toString().toLatin1());
+    if (!windowState.isEmpty()) {
+        // Named docks only: `restoreState` matches by object name, and a dock
+        // whose name it does not find is left where `buildDocks` put it.
+        restoreState(windowState);
+    }
+    if (state.value("swapped").toBool() && !m_swapped) {
+        const QList<int> sizes = m_centerSplitter->sizes();
+        m_centerSplitter->insertWidget(0, m_centerSplitter->widget(1));
+        if (sizes.size() == 2) {
+            m_centerSplitter->setSizes({ sizes.at(1), sizes.at(0) });
+        }
+        m_swapped = true;
+    }
+    // After the swap, so the sizes land on the arrangement they were saved for.
+    QList<int> sizes;
+    for (const QJsonValue& value : state.value("splitter_sizes").toArray()) {
+        sizes.append(value.toInt());
+    }
+    if (sizes.size() == m_centerSplitter->count()) {
+        m_centerSplitter->setSizes(sizes);
+    }
+
+    // Held rather than opened: a workspace's editors are reopened the first
+    // time its tab is shown, because opening a file asks the daemon for it and
+    // there is no point asking for every workspace at start-up.
+    const QJsonObject open = state.value("open_editors").toObject();
+    const QJsonObject active = state.value("active_editor").toObject();
+    m_editorsToRestore.clear();
+    for (auto it = open.constBegin(); it != open.constEnd(); ++it) {
+        QStringList paths;
+        for (const QJsonValue& value : it.value().toArray()) {
+            const QString path = value.toString();
+            if (!path.isEmpty()) {
+                paths.append(path);
+            }
+        }
+        // The active one last, so it is the tab left in front when the others
+        // have been opened around it.
+        const QString front = active.value(it.key()).toString();
+        if (!front.isEmpty() && paths.removeAll(front) > 0) {
+            paths.append(front);
+        }
+        if (!paths.isEmpty()) {
+            m_editorsToRestore.insert(it.key(), paths);
+        }
+    }
+    m_restoring = false;
+}
+
+void MainWindow::noteWindowState() {
+    if (m_restoring || m_controller == nullptr) {
+        return;
+    }
+    m_controller->noteWindow(QString::fromLatin1(saveState().toBase64()),
+                             QString::fromLatin1(saveGeometry().toBase64()));
+}
+
+void MainWindow::noteSplitterState() {
+    if (m_restoring) {
+        return;
+    }
+    QJsonArray sizes;
+    for (const int size : m_centerSplitter->sizes()) {
+        sizes.append(size);
+    }
+    m_controller->noteSplitter(
+        QString::fromUtf8(QJsonDocument(sizes).toJson(QJsonDocument::Compact)), m_swapped);
+}
+
+void MainWindow::noteEditorState() {
+    if (m_restoring || m_restoringEditors) {
+        return;
+    }
+    const QJsonObject open = QJsonDocument::fromJson(m_editorArea->openEditorsJson().toUtf8())
+                                 .object();
+    QSet<QString> seen;
+    for (auto it = open.constBegin(); it != open.constEnd(); ++it) {
+        seen.insert(it.key());
+        m_controller->noteEditors(
+            it.key(),
+            QString::fromUtf8(QJsonDocument(it.value().toObject()).toJson(QJsonDocument::Compact)));
+    }
+    // A workspace whose last editor has just closed is recorded as having none,
+    // rather than left describing tabs that are gone.
+    for (const QString& workspaceId : m_notedEditors) {
+        if (!seen.contains(workspaceId)) {
+            m_controller->noteEditors(workspaceId, QStringLiteral("[]"));
+        }
+    }
+    m_notedEditors = seen;
+}
+
+void MainWindow::restoreEditorsFor(const QString& workspaceId) {
+    const QStringList paths = m_editorsToRestore.take(workspaceId);
+    if (paths.isEmpty()) {
+        return;
+    }
+    // The opens are asynchronous and any of them may fail -- a file the agent
+    // deleted since -- which the editor area reports in the tab itself. None of
+    // that is a reason to refuse to show the workspace.
+    m_restoringEditors = true;
+    for (const QString& path : paths) {
+        m_editorArea->openFile(workspaceId, path);
+    }
+    m_restoringEditors = false;
+    // Once, at the end: the list that is now open is the list that was
+    // restored, and recording it per open would have written it out in pieces.
+    noteEditorState();
 }
 
 void MainWindow::onOperationFailed(const QString& op, const QString& message) {
@@ -629,7 +955,8 @@ void MainWindow::onActiveTabChanged() {
     // the daemon renamed reaches the strip.
     m_explorer->setWorkspaceHeader(active.value("name").toString(),
                                    active.value("branch").toString(),
-                                   active.value("repo_path").toString());
+                                   active.value("repo_path").toString(),
+                                   active.value("base_branch").toString());
     // The tab's choice first, because `setWorkspace` publishes the list it
     // already has synchronously and the `configsChanged` slot above applies
     // this to it; the worktree path is the daemon's, from `WorkspaceInfo`.
@@ -643,9 +970,16 @@ void MainWindow::onActiveTabChanged() {
     m_agentArea->showWorkspace(workspaceId, active.value("adapter").toString(),
                                active.value("command").toString(),
                                active.value("agent_id").toString());
+    // After the pane exists: the options are what a Restart resumes with, and
+    // the transcript that holds them is created by `showWorkspace`.
+    m_agentArea->setOptionsJson(workspaceId, active.value("options_json").toString());
     // The shell tab is a plain login shell in the same sandbox, whatever the
     // tab's adapter is.
     m_shellArea->showWorkspace(workspaceId, "terminal", QString());
+    // The first time this workspace is shown in this run, its editors from the
+    // last one come back. `restoreEditorsFor` takes the entry out of the map,
+    // so this is a no-op on every later activation.
+    restoreEditorsFor(workspaceId);
     rebindCost();
 }
 

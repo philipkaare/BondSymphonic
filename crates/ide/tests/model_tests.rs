@@ -23,6 +23,7 @@ fn tab(id: &str, name: &str) -> AgentTab {
         name: name.into(),
         repo_path: "/r".into(),
         branch: format!("bs/{name}/work"),
+        base_branch: "main".into(),
         status: TabStatus::Creating,
         detail: String::new(),
         worktree_path: format!("/wt/{name}"),
@@ -33,6 +34,7 @@ fn tab(id: &str, name: &str) -> AgentTab {
         agent_id: None,
         agent_status: None,
         agent_detail: String::new(),
+        op_error: None,
     }
 }
 

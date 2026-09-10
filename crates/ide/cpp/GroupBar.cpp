@@ -246,9 +246,18 @@ void GroupBar::showGroupMenu(const QPoint& pos) {
     QMenu menu(this);
     QAction* addAction = menu.addAction("New group…");
     QAction* renameAction = index >= 0 ? menu.addAction("Rename group…") : nullptr;
+    QAction* closeAction = nullptr;
+    if (index >= 0) {
+        menu.addSeparator();
+        closeAction = menu.addAction("Close group…");
+    }
 
     QAction* chosen = menu.exec(m_groupTabs->mapToGlobal(pos));
     if (chosen == nullptr) {
+        return;
+    }
+    if (chosen == closeAction) {
+        emit closeGroupRequested(index);
         return;
     }
     if (chosen == addAction) {

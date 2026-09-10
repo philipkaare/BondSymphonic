@@ -112,6 +112,36 @@ pub mod qobject {
         #[qinvokable]
         fn remove_workspace(self: Pin<&mut GroupModel>, id: QString) -> bool;
 
+        /// Marks `workspace_id`'s tab as carrying a failed merge, pull request
+        /// or discard: the tab reads as an error, with `detail` as its
+        /// tooltip, until `clearWorkspaceError`.
+        ///
+        /// Per workspace, not per agent: a merge conflict says nothing about
+        /// whatever is running in the sandbox, and a terminal tab with no agent
+        /// at all can still fail to merge. The daemon's own status carries on
+        /// underneath, so clearing gives the badge straight back to it. False
+        /// when the workspace is not tracked.
+        #[qinvokable]
+        fn set_workspace_error(
+            self: Pin<&mut GroupModel>,
+            workspace_id: QString,
+            detail: QString,
+        ) -> bool;
+
+        /// Takes that mark off again. False when the workspace is not tracked.
+        #[qinvokable]
+        fn clear_workspace_error(self: Pin<&mut GroupModel>, workspace_id: QString) -> bool;
+
+        /// Removes the group named `name`, moving whatever tabs it still holds
+        /// into "Unsorted". What "Close group" does once the per-workspace
+        /// merges and discards it asked for have all succeeded.
+        ///
+        /// False for a name no group has, and for "Unsorted" itself: its tabs
+        /// would have nowhere to go and the next `reconcile` would only make it
+        /// again.
+        #[qinvokable]
+        fn remove_group(self: Pin<&mut GroupModel>, name: QString) -> bool;
+
         #[qinvokable]
         fn set_active(self: Pin<&mut GroupModel>, group_idx: i32, tab_idx: i32) -> bool;
 
@@ -382,6 +412,7 @@ impl qobject::GroupModel {
             name: info.name.clone(),
             repo_path: info.repo_path.clone(),
             branch: info.branch.clone(),
+            base_branch: info.base_branch.clone(),
             status: TabStatus::from_workspace_state(&info.state),
             detail: state_detail(&info.state),
             worktree_path: info.worktree_path.clone(),
@@ -392,6 +423,7 @@ impl qobject::GroupModel {
             agent_status: None,
             agent_detail: String::new(),
             options_json: options_json.to_string(),
+            op_error: None,
         };
         self.as_mut().rust_mut().workspaces.add_tab(group_idx, tab);
         self.publish();
@@ -468,6 +500,46 @@ impl qobject::GroupModel {
         removed
     }
 
+    pub fn set_workspace_error(
+        mut self: Pin<&mut Self>,
+        workspace_id: QString,
+        detail: QString,
+    ) -> bool {
+        let id = WorkspaceId(workspace_id.to_string());
+        let detail = detail.to_string();
+        let marked = self
+            .as_mut()
+            .rust_mut()
+            .workspaces
+            .set_workspace_error(&id, &detail);
+        if marked {
+            self.publish();
+        }
+        marked
+    }
+
+    pub fn clear_workspace_error(mut self: Pin<&mut Self>, workspace_id: QString) -> bool {
+        let id = WorkspaceId(workspace_id.to_string());
+        let cleared = self
+            .as_mut()
+            .rust_mut()
+            .workspaces
+            .clear_workspace_error(&id);
+        if cleared {
+            self.publish();
+        }
+        cleared
+    }
+
+    pub fn remove_group(mut self: Pin<&mut Self>, name: QString) -> bool {
+        let name = name.to_string();
+        let removed = self.as_mut().rust_mut().workspaces.remove_group(&name);
+        if removed {
+            self.publish();
+        }
+        removed
+    }
+
     pub fn set_active(mut self: Pin<&mut Self>, group_idx: i32, tab_idx: i32) -> bool {
         let (Some(g), Some(t)) = (index(group_idx), index(tab_idx)) else {
             return false;
@@ -519,22 +591,26 @@ impl qobject::GroupModel {
         }
     }
 
+    // The three below report the tab's *displayed* status, which is the
+    // daemon's own unless a failed merge, pull request or discard is showing
+    // on it. `stateJson` keeps carrying the underlying one, so nothing that
+    // reads the model back loses what the daemon actually said.
     pub fn tab_label(&self, group_idx: i32, tab_idx: i32) -> QString {
         match self.tab_at(group_idx, tab_idx) {
-            Some(tab) => QString::from(&format!("{} {}", tab.status.glyph(), tab.name)),
+            Some(tab) => QString::from(&format!("{} {}", tab.display_status().glyph(), tab.name)),
             None => QString::from(""),
         }
     }
 
     pub fn tab_status(&self, group_idx: i32, tab_idx: i32) -> i32 {
         self.tab_at(group_idx, tab_idx)
-            .map(|tab| tab.status.as_i32())
+            .map(|tab| tab.display_status().as_i32())
             .unwrap_or(-1)
     }
 
     pub fn status_word(&self, group_idx: i32, tab_idx: i32) -> QString {
         match self.tab_at(group_idx, tab_idx) {
-            Some(tab) => QString::from(status_text(tab.status)),
+            Some(tab) => QString::from(status_text(tab.display_status())),
             None => QString::from(""),
         }
     }
@@ -549,11 +625,12 @@ impl qobject::GroupModel {
             tab.repo_path,
             tab.branch,
             adapter_name(tab.adapter),
-            status_text(tab.status),
+            status_text(tab.display_status()),
         );
-        if !tab.detail.is_empty() {
+        let detail = tab.display_detail();
+        if !detail.is_empty() {
             text.push('\n');
-            text.push_str(&tab.detail);
+            text.push_str(detail);
         }
         QString::from(&text)
     }

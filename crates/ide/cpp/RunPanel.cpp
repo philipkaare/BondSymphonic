@@ -1,6 +1,7 @@
 #include "RunPanel.h"
 #include "CodeView.h"
 #include "Theme.h"
+#include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/run_panel.cxxqt.h"
 #include <QComboBox>
 #include <QDesktopServices>
@@ -16,6 +17,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSizePolicy>
+#include <QSpinBox>
 #include <QStandardItemModel>
 #include <QTextCursor>
 #include <QUrl>
@@ -90,17 +92,20 @@ void runpanel::appendConfigItems(QComboBox* combo, const QString& configsJson) {
         }
         QString tip = config.value("command").toString();
         if (guessed) {
-            // Milestone 5 has no per-start port override, so the only way to
-            // change it is the repository's own file. Saying so here is the
-            // whole of the "editable port" the spec asks for.
-            tip += QStringLiteral("\nPort %1 was guessed; edit bondsymphonic.toml to pin the port.")
+            // A guessed port is the one thing about a detected configuration
+            // the user may have to argue with, and the Run panel's port box is
+            // where they do it. Pinning it in the repository's own file is the
+            // permanent answer; the box is the per-workspace one.
+            tip += QStringLiteral("\nPort %1 was guessed; set another in the Run panel, or pin it "
+                                  "in bondsymphonic.toml.")
                        .arg(port);
         }
         combo->setItemData(row, tip, Qt::ToolTipRole);
     }
 }
 
-RunPanel::RunPanel(RunPanelModel* model, QWidget* parent) : QWidget(parent), m_model(model) {
+RunPanel::RunPanel(RunPanelModel* model, AppController* controller, QWidget* parent)
+    : QWidget(parent), m_model(model), m_controller(controller) {
     auto* outer = new QVBoxLayout(this);
     outer->setContentsMargins(6, 4, 6, 4);
     outer->setSpacing(4);
@@ -124,8 +129,19 @@ void RunPanel::buildTopRow(QVBoxLayout* outer) {
     m_configs->setToolTip("Run configuration, from bondsymphonic.toml or detected");
     row->addWidget(m_configs, 0);
 
+    m_port = new QSpinBox(this);
+    m_port->setObjectName("RunPortSpin");
+    // 0 is "no override" rather than a port, and says so instead of showing a
+    // number the daemon would refuse.
+    m_port->setRange(0, 65535);
+    m_port->setSpecialValueText("auto");
+    m_port->setPrefix(":");
+    row->addWidget(m_port, 0);
+
     m_start = new QPushButton("Start", this);
+    m_start->setObjectName("RunStartButton");
     m_stop = new QPushButton("Stop", this);
+    m_stop->setObjectName("RunStopButton");
     row->addWidget(m_start, 0);
     row->addWidget(m_stop, 0);
 
@@ -157,6 +173,7 @@ void RunPanel::buildTopRow(QVBoxLayout* outer) {
     outer->addWidget(m_status);
 
     QObject::connect(m_configs, &QComboBox::activated, this, &RunPanel::onConfigActivated);
+    QObject::connect(m_port, &QSpinBox::valueChanged, this, &RunPanel::onPortChanged);
     QObject::connect(m_start, &QPushButton::clicked, this, [this] {
         if (m_model.isNull()) {
             return;
@@ -256,6 +273,9 @@ void RunPanel::connectModel() {
     });
     // A different workspace has a different log and its own last failure.
     QObject::connect(model, &RunPanelModel::workspaceIdChanged, this, [this] {
+        // The override is per workspace and per configuration, so the box has
+        // to be re-read rather than carried across.
+        syncPort();
         m_lastError.clear();
         // The log on screen belongs to a run of the workspace that has gone,
         // and the new one may have no run at all -- in which case the run id
@@ -282,7 +302,59 @@ void RunPanel::syncSelection() {
     // `findData` on an empty name finds nothing, which is the index -1 an empty
     // selection wants anyway.
     m_configs->setCurrentIndex(selected.isEmpty() ? -1 : m_configs->findData(selected));
+    syncPort();
     updateRow();
+}
+
+void RunPanel::syncPort() {
+    if (m_model.isNull()) {
+        return;
+    }
+    const QString workspaceId = m_model->getWorkspaceId();
+    const QString config = m_model->getSelectedConfig();
+    const QJsonObject selected =
+        QJsonDocument::fromJson(m_model->selectedConfigJson().toUtf8()).object();
+    // The daemon's own words: `port_guessed` is true when it inferred the port
+    // from the command rather than reading it out of `bondsymphonic.toml`. Only
+    // a guess is the user's to argue with.
+    const bool guessed = selected.value("port_guessed").toBool();
+    const int configured = selected.value("port").toInt();
+    const int override =
+        m_controller.isNull() || workspaceId.isEmpty() || config.isEmpty()
+            ? 0
+            : m_controller->portOverride(workspaceId, config);
+
+    m_syncingPort = true;
+    // The override if there is one, else the configuration's own port as the
+    // number the run will actually use. Editing from that number is what makes
+    // the field an adjustment rather than a blank to fill in.
+    m_port->setValue(override != 0 ? override : configured);
+    m_syncingPort = false;
+
+    m_port->setEnabled(guessed && !workspaceId.isEmpty());
+    m_port->setVisible(!config.isEmpty());
+    m_port->setToolTip(
+        guessed ? QStringLiteral("The daemon guessed this port. Change it to run on another one; "
+                                 "`auto` uses the guess.")
+                : QStringLiteral("This port comes from the repository's bondsymphonic.toml and is "
+                                 "not overridden here."));
+}
+
+void RunPanel::onPortChanged(int port) {
+    if (m_syncingPort || m_model.isNull() || m_controller.isNull()) {
+        return;
+    }
+    const QString workspaceId = m_model->getWorkspaceId();
+    const QString config = m_model->getSelectedConfig();
+    if (workspaceId.isEmpty() || config.isEmpty()) {
+        return;
+    }
+    const QJsonObject selected =
+        QJsonDocument::fromJson(m_model->selectedConfigJson().toUtf8()).object();
+    // Back at the configuration's own port is not an override: recording one
+    // would pin a number that the repository is entitled to change.
+    const int configured = selected.value("port").toInt();
+    m_controller->setPortOverride(workspaceId, config, port == configured ? 0 : port);
 }
 
 void RunPanel::onConfigActivated(int index) {

@@ -8,6 +8,7 @@
 class TerminalSession;
 class QJsonArray;
 class QPainter;
+class QPushButton;
 class QTimer;
 
 /// Paints one `TerminalSession` as a terminal and feeds it keyboard input.
@@ -57,6 +58,13 @@ private:
     void applySize();
     /// Opens the pending session once the widget is visible; a no-op otherwise.
     void maybeOpen();
+    /// Shows the Reopen button when the shell is gone because the daemon
+    /// restarted, and hides it otherwise -- including for an ordinary `exit`,
+    /// where there is nothing to recover from and a button offering to start
+    /// another shell would only be in the way.
+    void updateReopenButton();
+    /// Puts it in the top right corner, clear of the cursor's home position.
+    void placeReopenButton();
 
     QPointer<TerminalSession> m_session;
     QFont m_font;
@@ -69,6 +77,10 @@ private:
     int m_cols = 80;
     int m_rows = 24;
     QTimer* m_blinkTimer = nullptr;
+    /// Offered only over a shell the daemon's restart took away. A real child
+    /// widget rather than a painted hotspot, so it is reachable from the
+    /// keyboard and looks like the button it is.
+    QPushButton* m_reopen = nullptr;
     bool m_blinkOn = true;
     /// The session's `error` at the moment the process exited, so a later one
     /// (a reply that lost its race with the exit) can be told apart from it.

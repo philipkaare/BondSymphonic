@@ -180,6 +180,13 @@ pub struct AgentTab {
     pub name: String,
     pub repo_path: String,
     pub branch: String,
+    /// The branch this workspace was forked from and merges back into, from
+    /// `WorkspaceInfo`. The Changes toolbar names it in every confirmation, so
+    /// a user reads which branch is about to move before they move it.
+    /// Defaulted so a session saved before it was carried still loads;
+    /// [`Workspaces::apply_workspace_info`] fills it in again.
+    #[serde(default)]
+    pub base_branch: String,
     pub status: TabStatus,
     /// `Error(detail)` text from the daemon, or empty for any other status.
     pub detail: String,
@@ -217,9 +224,40 @@ pub struct AgentTab {
     /// call time and this is written to `session.json`.
     #[serde(default)]
     pub options_json: String,
+    /// A merge, pull request or discard on this workspace that failed, as the
+    /// sentence the user is shown. While it is set the tab reads as
+    /// [`TabStatus::Error`] whatever the workspace and its agent report, and
+    /// clearing it hands the badge straight back to them.
+    ///
+    /// Kept beside `status` rather than written into it because the two have
+    /// different owners: `status` belongs to the daemon's events, and this
+    /// belongs to a request the user made from the Changes toolbar. Overlaying
+    /// is what lets a `workspace.state` arriving mid-banner keep the model
+    /// current without taking the banner's badge down, and what makes clearing
+    /// the banner a single assignment rather than a guess at what the badge
+    /// used to say.
+    #[serde(default)]
+    pub op_error: Option<String>,
 }
 
 impl AgentTab {
+    /// The status the tab bar paints: [`TabStatus::Error`] while an operation
+    /// error is showing, and the daemon's own status otherwise.
+    pub fn display_status(&self) -> TabStatus {
+        match self.op_error {
+            Some(_) => TabStatus::Error,
+            None => self.status,
+        }
+    }
+
+    /// The detail belonging to [`AgentTab::display_status`].
+    pub fn display_detail(&self) -> &str {
+        match &self.op_error {
+            Some(detail) => detail.as_str(),
+            None => self.detail.as_str(),
+        }
+    }
+
     /// A plain terminal tab for a workspace the daemon described but the IDE
     /// was not tracking: what [`Workspaces::reconcile`] files into "Unsorted"
     /// and what [`Workspaces::from_persisted`] rebuilds a restored group from.
@@ -231,6 +269,7 @@ impl AgentTab {
             name: info.name.clone(),
             repo_path: info.repo_path.clone(),
             branch: info.branch.clone(),
+            base_branch: info.base_branch.clone(),
             status: TabStatus::from_workspace_state(&info.state),
             detail: match &info.state {
                 WorkspaceState::Error(detail) => detail.clone(),
@@ -244,6 +283,7 @@ impl AgentTab {
             agent_status: None,
             agent_detail: String::new(),
             options_json: String::new(),
+            op_error: None,
         }
     }
 }
@@ -526,7 +566,78 @@ impl Workspaces {
         // written before this field existed has none, and the Run panel cannot
         // detect anything without it.
         tab.worktree_path = info.worktree_path.clone();
+        // Same reason, and the Changes toolbar has to name it in every
+        // confirmation it puts up.
+        tab.base_branch = info.base_branch.clone();
         Some((g, t))
+    }
+
+    /// Marks the workspace's tab as carrying a failed operation, with `detail`
+    /// as the sentence to show. False when the workspace is not tracked.
+    ///
+    /// The error is the workspace's, not its agent's: a merge that conflicts
+    /// says nothing about whatever is running inside the sandbox, and a tab
+    /// with no agent at all can still fail to merge.
+    pub fn set_workspace_error(&mut self, id: &WorkspaceId, detail: &str) -> bool {
+        let Some((g, t)) = self.find(id) else {
+            return false;
+        };
+        self.groups[g].tabs[t].op_error = Some(detail.to_owned());
+        true
+    }
+
+    /// Takes that mark off again, handing the badge back to whatever the
+    /// daemon last said about the workspace or its agent. False when the
+    /// workspace is not tracked.
+    pub fn clear_workspace_error(&mut self, id: &WorkspaceId) -> bool {
+        let Some((g, t)) = self.find(id) else {
+            return false;
+        };
+        self.groups[g].tabs[t].op_error = None;
+        true
+    }
+
+    /// Removes the group named `name`, moving whatever tabs it still holds
+    /// into [`UNSORTED_GROUP`]. False when there is no such group.
+    ///
+    /// The tabs move rather than going with the group: closing a group is a
+    /// decision about the group, and the workspaces in it that the user chose
+    /// to keep are still live in the daemon. A group being closed that *is*
+    /// "Unsorted" is refused, because the tabs would have nowhere to go and
+    /// the next `reconcile` would only make it again.
+    pub fn remove_group(&mut self, name: &str) -> bool {
+        let Some(idx) = self.groups.iter().position(|g| g.name == name) else {
+            return false;
+        };
+        if name == UNSORTED_GROUP {
+            return false;
+        }
+        let active_id = self.active().map(|t| t.workspace_id.clone());
+        let kept = std::mem::take(&mut self.groups[idx].tabs);
+        self.groups.remove(idx);
+        if !kept.is_empty() {
+            let target = match self.groups.iter().position(|g| g.name == UNSORTED_GROUP) {
+                Some(existing) => existing,
+                None => self.add_group(UNSORTED_GROUP),
+            };
+            self.groups[target].tabs.extend(kept);
+        }
+        // Every index after the removed group has shifted, so the selection is
+        // re-derived from the workspace that was in front rather than repaired
+        // arithmetically.
+        match active_id.and_then(|id| self.find(&id)) {
+            Some((g, t)) => {
+                self.active_group = g;
+                self.active_tab = t;
+            }
+            None => self.fallback_active(),
+        }
+        // A model with no groups left has nowhere to create the next workspace.
+        if self.groups.is_empty() {
+            self.add_group(UNSORTED_GROUP);
+            self.fallback_active();
+        }
+        true
     }
 
     /// Records the agent running in the tab for `ws`. False when that
@@ -733,6 +844,105 @@ mod tests {
         );
         assert_eq!(ConnectionState::from_i32(-1), ConnectionState::Error);
         assert_eq!(ConnectionState::from_i32(99), ConnectionState::Error);
+    }
+
+    /// A tracked tab, built the way `reconcile` builds one, for the group
+    /// operations below.
+    fn tab(id: &str) -> AgentTab {
+        AgentTab {
+            workspace_id: WorkspaceId(id.to_owned()),
+            name: id.to_owned(),
+            repo_path: "/repo".to_owned(),
+            branch: format!("bs/{id}/work"),
+            base_branch: "main".to_owned(),
+            status: TabStatus::Working,
+            detail: "busy".to_owned(),
+            worktree_path: String::new(),
+            adapter: AgentAdapterKind::Terminal,
+            command: None,
+            run_config: None,
+            agent_id: None,
+            agent_status: None,
+            agent_detail: String::new(),
+            options_json: String::new(),
+            op_error: None,
+        }
+    }
+
+    #[test]
+    fn a_workspace_error_overlays_the_badge_and_gives_it_back() {
+        let mut model = Workspaces::new_default();
+        model.add_tab(0, tab("ws_a"));
+        let id = WorkspaceId("ws_a".to_owned());
+
+        assert!(model.set_workspace_error(&id, "Merge stopped: conflicts in a.txt"));
+        let showing = model.active().expect("a tab");
+        assert_eq!(showing.display_status(), TabStatus::Error);
+        assert_eq!(
+            showing.display_detail(),
+            "Merge stopped: conflicts in a.txt"
+        );
+        // The daemon's own status is untouched underneath, which is what makes
+        // clearing the banner an assignment rather than a guess.
+        assert_eq!(showing.status, TabStatus::Working);
+
+        assert!(model.clear_workspace_error(&id));
+        let showing = model.active().expect("a tab");
+        assert_eq!(showing.display_status(), TabStatus::Working);
+        assert_eq!(showing.display_detail(), "busy");
+
+        // An id nobody is tracking is refused rather than inventing a tab.
+        assert!(!model.set_workspace_error(&WorkspaceId("ws_gone".to_owned()), "x"));
+        assert!(!model.clear_workspace_error(&WorkspaceId("ws_gone".to_owned())));
+    }
+
+    #[test]
+    fn removing_a_group_keeps_its_tabs_in_unsorted() {
+        let mut model = Workspaces::new_default();
+        let feature = model.add_group("Feature");
+        model.add_tab(feature, tab("ws_keep"));
+        model.add_tab(feature, tab("ws_other"));
+        // The tab that was in front stays in front, in its new home.
+        model.set_active(feature, 1);
+
+        assert!(model.remove_group("Feature"));
+        assert!(model.groups.iter().all(|g| g.name != "Feature"));
+        let unsorted = model
+            .groups
+            .iter()
+            .find(|g| g.name == UNSORTED_GROUP)
+            .expect("Unsorted");
+        let ids: Vec<&str> = unsorted
+            .tabs
+            .iter()
+            .map(|t| t.workspace_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["ws_keep", "ws_other"]);
+        assert_eq!(
+            model.active().map(|t| t.workspace_id.as_str()),
+            Some("ws_other")
+        );
+
+        // No such group, and the one group tabs are moved *into*, are both
+        // refused rather than half-applied.
+        assert!(!model.remove_group("Feature"));
+        assert!(!model.remove_group(UNSORTED_GROUP));
+    }
+
+    #[test]
+    fn removing_the_last_group_leaves_one_to_create_into() {
+        let mut model = Workspaces {
+            groups: vec![Group {
+                id: "grp_0".to_owned(),
+                name: "Only".to_owned(),
+                tabs: Vec::new(),
+            }],
+            active_group: 0,
+            active_tab: 0,
+        };
+        assert!(model.remove_group("Only"));
+        assert_eq!(model.groups.len(), 1);
+        assert_eq!(model.groups[0].name, UNSORTED_GROUP);
     }
 
     #[test]

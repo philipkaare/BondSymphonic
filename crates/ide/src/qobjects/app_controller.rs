@@ -816,6 +816,97 @@ pub mod qobject {
             config: QString,
             port: i32,
         );
+
+        // -------------------------------------------------------------------
+        // Merge, pull request and discard, for the Changes toolbar.
+        //
+        // The three of them and `workspaceSummary` all name a workspace in
+        // their answer. `operationFailed` does not, and a banner belongs to one
+        // workspace's pane, so these report their own failures on
+        // `workspaceOperationFailed` instead -- which also carries the error's
+        // `data`, where `GitError`'s stderr is.
+        // -------------------------------------------------------------------
+
+        /// A `workspace.merge` answered. `ok` is the daemon's: true means the
+        /// base branch moved. False means the merge was attempted and stopped,
+        /// with `conflicts_json` a JSON array of repo-relative paths and
+        /// `reason` the daemon's tag for why (`"conflict"` today). A merge the
+        /// daemon *refused* never gets here; that is
+        /// `workspaceOperationFailed`.
+        #[qsignal]
+        fn merge_finished(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            ok: bool,
+            conflicts_json: QString,
+            reason: QString,
+        );
+
+        /// `workspace.create_pr` succeeded: `url` is the pull request.
+        #[qsignal]
+        fn pr_created(self: Pin<&mut AppController>, workspace_id: QString, url: QString);
+
+        /// What `workspaceSummary` found, as
+        /// `{"dirty": bool, "changed_files": n}`. `changed_files` is -1 when
+        /// the daemon could not be asked, so a confirmation can say "its
+        /// changed files" rather than claiming a count it does not have.
+        #[qsignal]
+        fn workspace_summarized(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            json: QString,
+        );
+
+        /// A merge, pull request or discard failed. `op` is the daemon method
+        /// name, `message` the error's own sentence, and `data_json` the
+        /// error's `data` object verbatim (empty when it had none) so the
+        /// banner can read `reason` and put a `GitError`'s `stderr` in its
+        /// expandable section.
+        #[qsignal]
+        fn workspace_operation_failed(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            op: QString,
+            message: QString,
+            data_json: QString,
+        );
+
+        /// Merges the workspace's branch into its base. `mode` is "merge",
+        /// "rebase" or "squash"; `message` is the squash summary line and is
+        /// ignored by the other two, and empty lets the daemon derive it from
+        /// the workspace's last commit. Answers with `mergeFinished` or
+        /// `workspaceOperationFailed`.
+        #[qinvokable]
+        fn merge_workspace(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            mode: QString,
+            message: QString,
+        );
+
+        /// Pushes the workspace's branch and opens a pull request. Answers with
+        /// `prCreated` or `workspaceOperationFailed`.
+        #[qinvokable]
+        fn create_pr(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            title: QString,
+            body: QString,
+            draft: bool,
+        );
+
+        /// Destroys the workspace and everything unmerged in it: a
+        /// `workspace.destroy` with `force`. Answers with the same
+        /// `workspaceDestroyed` an ordinary destroy does, or with
+        /// `workspaceOperationFailed` so the reason lands in the workspace's
+        /// own banner rather than in a box over the window.
+        #[qinvokable]
+        fn discard_workspace(self: Pin<&mut AppController>, workspace_id: QString);
+
+        /// Asks what would be lost with the workspace, for the Discard
+        /// confirmation. Answers with `workspaceSummarized`.
+        #[qinvokable]
+        fn workspace_summary(self: Pin<&mut AppController>, workspace_id: QString);
     }
 
     impl cxx_qt::Threading for AppController {}
@@ -921,10 +1012,63 @@ impl Default for AppControllerRust {
     }
 }
 
+/// The three merge modes, by the words the toolbar and the daemon both use.
+/// Anything else is refused here rather than sent on: an unrecognised mode is
+/// a bug in the caller, and guessing one would move a branch nobody asked to
+/// move.
+pub fn parse_merge_mode(word: &str) -> Option<MergeMode> {
+    match word {
+        "merge" => Some(MergeMode::Merge),
+        "rebase" => Some(MergeMode::Rebase),
+        "squash" => Some(MergeMode::Squash),
+        _ => None,
+    }
+}
+
+/// A failed request as the pair a workspace banner needs: the sentence to
+/// show, and the error's `data` verbatim.
+///
+/// The `data` is passed through rather than picked apart because the daemon
+/// keeps growing keys in it -- `reason` for a refusal, `command`/`exit_code`/
+/// `stderr` for a `GitError`, `merged`/`pushed` for work that landed and could
+/// not be copied out -- and the banner is the thing that decides which of them
+/// it can render. An error that is not an `RpcError` at all (a timeout, a
+/// closed socket) has no data, only its own text.
+pub fn failure_parts(e: &crate::client::ClientError) -> (String, String) {
+    match e {
+        crate::client::ClientError::Rpc(rpc) => {
+            let data = rpc.data.as_ref().map(|d| d.to_string()).unwrap_or_default();
+            (rpc.message.clone(), data)
+        }
+        other => (other.to_string(), String::new()),
+    }
+}
+
 /// Queues an `operation_failed` for `op` back onto the Qt thread.
 fn report_failure(qt: &QtHandle, op: &'static str, message: String) {
     tracing::warn!("{op} failed: {message}");
     let _ = qt.queue(move |q| q.operation_failed(QString::from(op), QString::from(&message)));
+}
+
+/// Queues a `workspace_operation_failed` back onto the Qt thread. Used instead
+/// of [`report_failure`] wherever the failure belongs to one workspace's pane,
+/// so the window can raise a banner there rather than a box over everything.
+fn report_workspace_failure(
+    qt: &QtHandle,
+    workspace: String,
+    op: &'static str,
+    message: String,
+    data: String,
+) {
+    tracing::warn!("{op} failed for {workspace}: {message} {data}");
+    let _ = qt.queue(move |q| {
+        q.workspace_operation_failed(
+            QString::from(&workspace),
+            QString::from(op),
+            QString::from(&message),
+            QString::from(&data),
+        )
+    });
 }
 
 /// Drains the connection's event stream for the life of the connection. Runs on
@@ -2017,4 +2161,238 @@ impl qobject::AppController {
         let port = u16::try_from(port).ok().filter(|p| *p != 0);
         note_state(|s| s.set_port_override(&workspace, &config, port));
     }
+
+    // -----------------------------------------------------------------------
+    // Merge, pull request and discard. Each is one request; the daemon decides
+    // everything about it, and what is here is only the crossing.
+    // -----------------------------------------------------------------------
+
+    pub fn merge_workspace(
+        self: Pin<&mut Self>,
+        workspace_id: QString,
+        mode: QString,
+        message: QString,
+    ) {
+        let qt = self.qt_thread();
+        let workspace = workspace_id.to_string();
+        let word = mode.to_string();
+        let Some(mode) = parse_merge_mode(&word) else {
+            report_workspace_failure(
+                &qt,
+                workspace,
+                "workspace.merge",
+                format!("unknown merge mode {word:?}"),
+                String::new(),
+            );
+            return;
+        };
+        // Empty means "not supplied": the daemon then takes the summary from
+        // the workspace's last commit, which is the whole point of the field
+        // being optional.
+        let summary = message.to_string();
+        let summary = (!summary.trim().is_empty()).then_some(summary);
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(e) => {
+                report_workspace_failure(
+                    &qt,
+                    workspace,
+                    "workspace.merge",
+                    e.to_owned(),
+                    String::new(),
+                );
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            let params = WorkspaceMergeParams {
+                workspace_id: WorkspaceId(workspace.clone()),
+                mode,
+                message: summary,
+            };
+            match shared
+                .client
+                .request::<MergeResult>(Request::WorkspaceMerge(params))
+                .await
+            {
+                Ok(result) => {
+                    let conflicts = serde_json::to_string(&result.conflicts)
+                        .unwrap_or_else(|_| "[]".to_owned());
+                    let reason = result.reason.unwrap_or_default();
+                    tracing::info!(
+                        %workspace,
+                        ok = result.ok,
+                        conflicts = result.conflicts.len(),
+                        %reason,
+                        "workspace.merge answered"
+                    );
+                    let _ = qt.queue(move |q| {
+                        q.merge_finished(
+                            QString::from(&workspace),
+                            result.ok,
+                            QString::from(&conflicts),
+                            QString::from(&reason),
+                        )
+                    });
+                }
+                Err(e) => {
+                    let (message, data) = failure_parts(&e);
+                    report_workspace_failure(&qt, workspace, "workspace.merge", message, data);
+                }
+            }
+        });
+    }
+
+    pub fn create_pr(
+        self: Pin<&mut Self>,
+        workspace_id: QString,
+        title: QString,
+        body: QString,
+        draft: bool,
+    ) {
+        let qt = self.qt_thread();
+        let workspace = workspace_id.to_string();
+        let params = WorkspaceCreatePrParams {
+            workspace_id: WorkspaceId(workspace.clone()),
+            title: title.to_string(),
+            body: body.to_string(),
+            draft,
+        };
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(e) => {
+                report_workspace_failure(
+                    &qt,
+                    workspace,
+                    "workspace.create_pr",
+                    e.to_owned(),
+                    String::new(),
+                );
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            match shared
+                .client
+                .request::<CreatePrResult>(Request::WorkspaceCreatePr(params))
+                .await
+            {
+                Ok(result) => {
+                    tracing::info!(%workspace, url = %result.url, "workspace.create_pr answered");
+                    let _ = qt.queue(move |q| {
+                        q.pr_created(QString::from(&workspace), QString::from(&result.url))
+                    });
+                }
+                Err(e) => {
+                    let (message, data) = failure_parts(&e);
+                    report_workspace_failure(&qt, workspace, "workspace.create_pr", message, data);
+                }
+            }
+        });
+    }
+
+    pub fn discard_workspace(self: Pin<&mut Self>, workspace_id: QString) {
+        let qt = self.qt_thread();
+        let workspace = workspace_id.to_string();
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(e) => {
+                report_workspace_failure(
+                    &qt,
+                    workspace,
+                    "workspace.destroy",
+                    e.to_owned(),
+                    String::new(),
+                );
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            let params = WorkspaceDestroyParams {
+                workspace_id: WorkspaceId(workspace.clone()),
+                // A discard is exactly a forced destroy. The confirmation
+                // naming what is lost happens in front of the user, in the
+                // toolbar, and is the whole of the protection.
+                force: true,
+            };
+            match shared
+                .client
+                .request_raw(Request::WorkspaceDestroy(params))
+                .await
+            {
+                Ok(_) => {
+                    note_state(|s| s.forget_workspace(&workspace));
+                    tracing::info!(%workspace, "workspace discarded");
+                    let _ = qt.queue(move |q| q.workspace_destroyed(QString::from(&workspace)));
+                }
+                Err(e) => {
+                    let (message, data) = failure_parts(&e);
+                    report_workspace_failure(&qt, workspace, "workspace.destroy", message, data);
+                }
+            }
+        });
+    }
+
+    pub fn workspace_summary(self: Pin<&mut Self>, workspace_id: QString) {
+        let qt = self.qt_thread();
+        let workspace = workspace_id.to_string();
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(e) => {
+                // Not a failure worth a banner: the confirmation it feeds can
+                // stand without a count, and the connection has already said
+                // so everywhere else.
+                tracing::warn!("workspace summary for {workspace}: {e}");
+                let _ = qt.queue(move |q| {
+                    q.workspace_summarized(
+                        QString::from(&workspace),
+                        QString::from(UNKNOWN_SUMMARY),
+                    )
+                });
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            let id = WorkspaceId(workspace.clone());
+            let status = shared
+                .client
+                .request::<WorkspaceStatusResult>(Request::WorkspaceStatus(WorkspaceIdParams {
+                    workspace_id: id.clone(),
+                }))
+                .await;
+            let changes = shared
+                .client
+                .request::<ChangesResult>(Request::WorkspaceChanges(WorkspaceIdParams {
+                    workspace_id: id,
+                }))
+                .await;
+            // Either half failing leaves the count unknown rather than zero: a
+            // confirmation that says "its 0 changed files will be lost" over a
+            // workspace nobody could ask about is the one wording that would
+            // talk a user into a discard.
+            let json = match (status, changes) {
+                (Ok(status), Ok(changes)) => serde_json::json!({
+                    "dirty": !status.entries.is_empty(),
+                    "changed_files": changes.files.len(),
+                })
+                .to_string(),
+                (status, changes) => {
+                    let reason = status
+                        .err()
+                        .map(|e| e.to_string())
+                        .or_else(|| changes.err().map(|e| e.to_string()))
+                        .unwrap_or_default();
+                    tracing::warn!("workspace summary for {workspace}: {reason}");
+                    UNKNOWN_SUMMARY.to_owned()
+                }
+            };
+            let _ = qt.queue(move |q| {
+                q.workspace_summarized(QString::from(&workspace), QString::from(&json))
+            });
+        });
+    }
 }
+
+/// What `workspaceSummarized` carries when the daemon could not be asked. The
+/// -1 is the "unknown" the Discard confirmation branches on.
+const UNKNOWN_SUMMARY: &str = r#"{"dirty":false,"changed_files":-1}"#;

@@ -5,7 +5,9 @@
 #include <QSet>
 #include <QString>
 
+class AppController;
 class ChangesModel;
+class ChangesToolbar;
 class FileTreeModel;
 class QLabel;
 class QModelIndex;
@@ -43,7 +45,8 @@ public:
     /// claim a directory is loaded whose children are still the placeholder.
     static constexpr int kLoadedRole = Qt::UserRole + 2;
 
-    ExplorerDock(FileTreeModel* model, ChangesModel* changes, QWidget* parent = nullptr);
+    ExplorerDock(FileTreeModel* model, ChangesModel* changes, AppController* controller,
+                 QWidget* parent = nullptr);
 
     /// Shows `workspaceId`'s worktree and changed files: the tree is emptied
     /// and its root asked for, and the changes model is pointed at the same
@@ -55,9 +58,16 @@ public:
     /// the whole path in the tooltip. An empty `name` is the no-workspace
     /// state: the strip says so and the Refresh button is disabled.
     ///
-    /// The three strings are the active tab's, passed straight through from the
+    /// The strings are the active tab's, passed straight through from the
     /// window; nothing here looks a workspace up or shortens a branch.
-    void setWorkspaceHeader(const QString& name, const QString& branch, const QString& repoPath);
+    /// `baseBranch` is not shown in the strip: it is what the Changes toolbar
+    /// names in the confirmation before it moves anything.
+    void setWorkspaceHeader(const QString& name, const QString& branch, const QString& repoPath,
+                            const QString& baseBranch);
+
+    /// The Changes tab's toolbar, so the window can connect its results to the
+    /// status bar and to the workspace banners. Never null.
+    ChangesToolbar* changesToolbar() const;
 
     /// Drops every cached listing and loads the root again, and re-fetches the
     /// changed files. Directories that were expanded, at any depth, are
@@ -107,6 +117,8 @@ private:
 
     FileTreeModel* m_model;
     ChangesModel* m_changes;
+    /// Merge, Rebase, Squash, Create PR and Discard, above the changed files.
+    ChangesToolbar* m_changesToolbar = nullptr;
     QTreeView* m_files = nullptr;
     QStandardItemModel* m_items = nullptr;
     QTreeView* m_changesView = nullptr;
@@ -121,6 +133,12 @@ private:
     QIcon m_fileIcon;
     /// The workspace the tree shows, empty when none is selected.
     QString m_workspaceId;
+    /// What `setWorkspaceHeader` was last told about the workspace, so a change
+    /// of either half reaches the toolbar with the id it belongs to. The header
+    /// and the id arrive in two calls, in either order.
+    QString m_name;
+    QString m_branch;
+    QString m_baseBranch;
     /// How many listings are out for each directory. Usually one; a refresh
     /// asks again for a directory that already has a request out, and both
     /// answers have to be booked in before the directory counts as settled.

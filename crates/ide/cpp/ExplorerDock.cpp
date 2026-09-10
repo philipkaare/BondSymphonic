@@ -1,4 +1,5 @@
 #include "ExplorerDock.h"
+#include "ChangesToolbar.h"
 #include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
@@ -73,7 +74,8 @@ QStandardItem* makeCount(int n) {
 
 } // namespace
 
-ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, QWidget* parent)
+ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, AppController* controller,
+                           QWidget* parent)
     : QDockWidget(QStringLiteral("Explorer"), parent), m_model(model), m_changes(changes) {
     setObjectName(QStringLiteral("ExplorerDock"));
     m_dirIcon = style()->standardIcon(QStyle::SP_DirIcon);
@@ -110,7 +112,17 @@ ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, QWidget*
     for (int column = 1; column < m_changeItems->columnCount(); ++column) {
         m_changesView->header()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
     }
-    tabs->addTab(m_changesView, QStringLiteral("Changes"));
+    // The toolbar goes above the list rather than in the window's menus: what
+    // Merge and Discard act on is the thing the list is showing, and the two
+    // belong next to each other.
+    auto* changesTab = new QWidget(tabs);
+    auto* changesLayout = new QVBoxLayout(changesTab);
+    changesLayout->setContentsMargins(0, 0, 0, 0);
+    changesLayout->setSpacing(0);
+    m_changesToolbar = new ChangesToolbar(controller, changesTab);
+    changesLayout->addWidget(m_changesToolbar);
+    changesLayout->addWidget(m_changesView, 1);
+    tabs->addTab(changesTab, QStringLiteral("Changes"));
     bodyLayout->addWidget(tabs, 1);
     setWidget(body);
 
@@ -127,7 +139,11 @@ ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, QWidget*
     QObject::connect(m_changes, &ChangesModel::loadFailed, this, &ExplorerDock::onChangesFailed);
 
     // The empty state, so the strip is never blank before the first tab.
-    setWorkspaceHeader(QString(), QString(), QString());
+    setWorkspaceHeader(QString(), QString(), QString(), QString());
+}
+
+ChangesToolbar* ExplorerDock::changesToolbar() const {
+    return m_changesToolbar;
 }
 
 QWidget* ExplorerDock::buildHeader() {
@@ -184,7 +200,14 @@ QWidget* ExplorerDock::buildHeader() {
 }
 
 void ExplorerDock::setWorkspaceHeader(const QString& name, const QString& branch,
-                                      const QString& repoPath) {
+                                      const QString& repoPath, const QString& baseBranch) {
+    m_name = name;
+    m_branch = branch;
+    m_baseBranch = baseBranch;
+    // The toolbar acts on the workspace the tree is showing, and is told about
+    // it from here because this is where the name and the two branch names
+    // arrive. An empty name is the no-workspace state for it too.
+    m_changesToolbar->setWorkspace(m_workspaceId, name, branch, baseBranch);
     if (name.isEmpty()) {
         m_headerName->setText(QStringLiteral("No workspace selected"));
         m_headerName->setToolTip(QString());
@@ -222,9 +245,13 @@ void ExplorerDock::setWorkspace(const QString& workspaceId) {
     // clearing of its own.
     m_changes->setWorkspace(workspaceId);
     if (workspaceId.isEmpty()) {
-        setWorkspaceHeader(QString(), QString(), QString());
+        setWorkspaceHeader(QString(), QString(), QString(), QString());
         return;
     }
+    // The window calls `setWorkspaceHeader` right after this, but the id has to
+    // reach the toolbar even if it did not: acting on the workspace before it
+    // is switched is the one mistake this widget must not make.
+    m_changesToolbar->setWorkspace(workspaceId, m_name, m_branch, m_baseBranch);
     requestDir(QString());
 }
 
@@ -314,6 +341,10 @@ void ExplorerDock::onLoadFailed(const QString& path, const QString& message) {
 }
 
 void ExplorerDock::onChangesLoaded(const QString& json) {
+    // The list moved, so what a Discard would cost has moved with it. The
+    // toolbar asks the daemon rather than counting these rows: "dirty" is the
+    // daemon's judgement and the rows are only its changed files.
+    m_changesToolbar->refreshSummary();
     m_changeItems->removeRows(0, m_changeItems->rowCount());
     const bool dark = theme::isDark(palette());
     const QJsonArray files = QJsonDocument::fromJson(json.toUtf8()).array();

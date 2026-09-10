@@ -43,6 +43,7 @@ fn tab(info: &WorkspaceInfo) -> AgentTab {
         name: info.name.clone(),
         repo_path: info.repo_path.clone(),
         branch: info.branch.clone(),
+        base_branch: info.base_branch.clone(),
         status: TabStatus::from_workspace_state(&info.state),
         detail: String::new(),
         worktree_path: info.worktree_path.clone(),
@@ -53,6 +54,7 @@ fn tab(info: &WorkspaceInfo) -> AgentTab {
         agent_id: None,
         agent_status: None,
         agent_detail: String::new(),
+        op_error: None,
     }
 }
 

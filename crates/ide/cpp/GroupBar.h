@@ -29,6 +29,9 @@ signals:
     void newAgentRequested();
     /// "Destroy workspace…" on the agent tab for this workspace id.
     void destroyRequested(const QString& workspaceId);
+    /// "Close group…" on the group tab at this index. The window asks what to
+    /// do with each of its workspaces; the bar only says which group.
+    void closeGroupRequested(int groupIndex);
 
 private:
     void rebuild();

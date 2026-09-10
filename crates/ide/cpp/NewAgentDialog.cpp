@@ -15,9 +15,11 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QStringList>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 namespace {
@@ -63,11 +65,20 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWi
 
     auto* repoRow = new QHBoxLayout();
     m_repoPath = new QLineEdit(this);
+    m_repoPath->setObjectName("NewAgentRepoPath");
     m_repoPath->setPlaceholderText("C:\\git\\project or /home/you/project");
+    m_recent = new QToolButton(this);
+    m_recent->setObjectName("NewAgentRecentButton");
+    m_recent->setText("Recent");
+    m_recent->setToolTip("Repositories you have created workspaces in before");
+    m_recent->setPopupMode(QToolButton::InstantPopup);
+    m_recent->setMenu(new QMenu(m_recent));
     auto* browseButton = new QPushButton("Browse…", this);
     repoRow->addWidget(m_repoPath, 1);
+    repoRow->addWidget(m_recent, 0);
     repoRow->addWidget(browseButton, 0);
     form->addRow("Repository:", repoRow);
+    buildRecentMenu();
 
     m_baseBranch = new QComboBox(this);
     m_baseBranch->setEditable(true);
@@ -230,6 +241,28 @@ QString NewAgentDialog::group() const {
         return m_newGroup->text().trimmed();
     }
     return m_group->currentText();
+}
+
+void NewAgentDialog::buildRecentMenu() {
+    QMenu* menu = m_recent->menu();
+    menu->clear();
+    const QJsonArray paths =
+        QJsonDocument::fromJson(m_controller->recentRepos().toUtf8()).array();
+    for (const QJsonValue& value : paths) {
+        const QString path = value.toString();
+        if (path.isEmpty()) {
+            continue;
+        }
+        // The path as recorded, which is the distro path the daemon was given.
+        // `repoPath()` converts a Windows path on the way out and leaves one
+        // that is already a distro path alone, so putting it back in the field
+        // round-trips.
+        menu->addAction(path, this, [this, path] {
+            m_repoPath->setText(path);
+            inspectRepo();
+        });
+    }
+    m_recent->setEnabled(!menu->isEmpty());
 }
 
 void NewAgentDialog::browse() {

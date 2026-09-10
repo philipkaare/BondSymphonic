@@ -9,6 +9,7 @@
 #include <QKeyEvent>
 #include <QList>
 #include <QPainter>
+#include <QPushButton>
 #include <QPalette>
 #include <QShowEvent>
 #include <QTimer>
@@ -86,6 +87,18 @@ TerminalWidget::TerminalWidget(TerminalSession* session, QWidget* parent)
         update();
     });
 
+    m_reopen = new QPushButton(QStringLiteral("Reopen"), this);
+    m_reopen->setObjectName(QStringLiteral("TerminalReopenButton"));
+    m_reopen->setToolTip(
+        QStringLiteral("Start a new shell in this workspace. The old one and its scrollback are "
+                       "gone with the daemon that ran them."));
+    m_reopen->hide();
+    QObject::connect(m_reopen, &QPushButton::clicked, this, [this] {
+        if (m_session) {
+            m_session->reopen();
+        }
+    });
+
     if (m_session) {
         // `frame` means "repaint now": it fires on output, scroll, resize and
         // error alike.
@@ -94,9 +107,14 @@ TerminalWidget::TerminalWidget(TerminalSession* session, QWidget* parent)
             // Remembered so `paintError` can tell an error that predates the
             // exit from one that arrived after it.
             m_errorAtExit = m_session->getError();
+            updateReopenButton();
             update();
         });
         QObject::connect(m_session, &TerminalSession::errorChanged, this, [this] { update(); });
+        // `exited` goes back to false on a successful reopen, which is what
+        // takes the button away again.
+        QObject::connect(m_session, &TerminalSession::exitedChanged, this,
+                         [this] { updateReopenButton(); });
         // A resize between `open` and its answer updates the grid but cannot
         // reach a PTY that does not exist yet, and the session's own `cols`
         // and `rows` follow the grid, so they cannot tell what the daemon
@@ -302,8 +320,42 @@ void TerminalWidget::wheelEvent(QWheelEvent* event) {
     event->accept();
 }
 
+void TerminalWidget::updateReopenButton() {
+    if (m_session.isNull()) {
+        m_reopen->hide();
+        return;
+    }
+    // The marker comes from the session rather than being spelled here, so the
+    // one place that writes it is the one place that defines it.
+    const QString marker = m_session->restartMarker();
+    bool restarted = false;
+    if (m_session->getExited() && !marker.isEmpty()) {
+        const QJsonArray rows = QJsonDocument::fromJson(m_session->getRowsJson().toUtf8()).array();
+        for (const QJsonValue& value : rows) {
+            if (value.toObject().value(QStringLiteral("text")).toString().contains(marker)) {
+                restarted = true;
+                break;
+            }
+        }
+    }
+    m_reopen->setVisible(restarted);
+    if (restarted) {
+        placeReopenButton();
+        m_reopen->raise();
+    }
+}
+
+void TerminalWidget::placeReopenButton() {
+    const QSize hint = m_reopen->sizeHint();
+    // Top right, clear of the shell's last output and of the home cursor.
+    m_reopen->setGeometry(qMax(0, width() - hint.width() - 8), 8, hint.width(), hint.height());
+}
+
 void TerminalWidget::resizeEvent(QResizeEvent* event) {
     QWidget::resizeEvent(event);
+    if (m_reopen->isVisible()) {
+        placeReopenButton();
+    }
     if (m_pendingOpen) {
         // The first real geometry: open at that size rather than resizing a
         // PTY that has only just been created.

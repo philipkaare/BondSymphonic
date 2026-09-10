@@ -9,6 +9,7 @@ class TerminalSession;
 class TerminalWidget;
 class TranscriptModel;
 class TranscriptView;
+class WorkspaceBanner;
 class QLabel;
 
 /// A stack of agent panes, one per workspace, with a placeholder page for when
@@ -32,6 +33,10 @@ signals:
     /// `workspaceId`. The window is what knows the options the tab was created
     /// with and how to reach the controller.
     void startAgentRequested(const QString& workspaceId);
+
+    /// The user dismissed `workspaceId`'s error banner. The window answers by
+    /// clearing the tab's error mark; the area touches no model.
+    void bannerDismissed(const QString& workspaceId);
 
 public:
     /// What the placeholder page says while nothing is showing.
@@ -78,10 +83,35 @@ public:
     /// as the daemon's "output dropped" notice.
     QList<TerminalSession*> sessions() const;
 
+    /// Raises the error banner over `workspaceId`'s pane.
+    ///
+    /// A workspace whose pane has not been created yet -- one that failed to
+    /// merge from the close-group dialog, say, without the user ever having
+    /// opened its tab -- has nowhere to put a banner, so the strings are held
+    /// and raised when that pane is first built. Without that the tab's red
+    /// glyph would lead to a pane that says nothing about why it is red.
+    void showBanner(const QString& workspaceId, const QString& title, const QString& detail,
+                    const QString& stderrText);
+
+    /// Takes it down again, without emitting `bannerDismissed`. What a
+    /// successful operation on that workspace does to the banner its last
+    /// failure left.
+    void clearBanner(const QString& workspaceId);
+
+    /// Records the `AgentStartOptions` the workspace's tab was created with on
+    /// its transcript model, so a Restart resumes the same conversation with
+    /// the same model and permission mode. A workspace with no transcript is
+    /// ignored.
+    void setOptionsJson(const QString& workspaceId, const QString& optionsJson);
+
 private:
     /// Creates the transcript pane for `workspaceId` if it has none, and
     /// attaches it to `agentId` when that is new. Returns the pane.
     TranscriptView* ensureTranscript(const QString& workspaceId, const QString& agentId);
+
+    /// Wraps `body` in the page this area actually stacks: a banner above the
+    /// pane, hidden until something fails. Records both and returns the page.
+    QWidget* makePage(const QString& workspaceId, QWidget* body);
 
     QLabel* m_placeholder = nullptr;
     /// What the placeholder says when nothing is showing, kept so the message
@@ -89,6 +119,14 @@ private:
     QString m_placeholderText;
     QHash<QString, TerminalWidget*> m_terminals;
     QHash<QString, TranscriptView*> m_transcripts;
+    /// The stacked page for each workspace: the banner and the pane together.
+    /// The stack holds these, not the panes, so a banner can appear above a
+    /// terminal or a transcript without either widget knowing about it.
+    QHash<QString, QWidget*> m_pages;
+    QHash<QString, WorkspaceBanner*> m_banners;
+    /// A banner raised for a workspace that had no pane yet: its title, detail
+    /// and stderr, in that order, waiting for the pane to be built.
+    QHash<QString, QStringList> m_pendingBanners;
     /// The agent id each transcript is attached to, so re-showing a tab does
     /// not replay its history again.
     QHash<QString, QString> m_attached;

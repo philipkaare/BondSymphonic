@@ -4,11 +4,13 @@
 #include <QString>
 #include <QWidget>
 
+class AppController;
 class QComboBox;
 class QFrame;
 class QLabel;
 class QPlainTextEdit;
 class QPushButton;
+class QSpinBox;
 class QVBoxLayout;
 class RunPanelModel;
 
@@ -48,7 +50,10 @@ void appendConfigItems(QComboBox* combo, const QString& configsJson);
 class RunPanel : public QWidget {
     Q_OBJECT
 public:
-    explicit RunPanel(RunPanelModel* model, QWidget* parent = nullptr);
+    /// `controller` is only ever asked for the port override this workspace and
+    /// configuration were last given, and told when the user changes it. It may
+    /// be null in a test that builds the panel on its own.
+    RunPanel(RunPanelModel* model, AppController* controller, QWidget* parent = nullptr);
 
 private:
     void buildTopRow(QVBoxLayout* outer);
@@ -65,6 +70,16 @@ private:
     /// The user picked an entry: offer it to the model and take back whatever
     /// it settled on, which for a refused name is the previous selection.
     void onConfigActivated(int index);
+    /// Points the port box at the selected configuration: the override the
+    /// workspace already has, or the configuration's own port as a hint, and
+    /// editable only when the daemon guessed that port.
+    ///
+    /// A configured port is the repository's decision and is shown greyed
+    /// rather than hidden, so a user who wonders why they cannot change it can
+    /// see the number they would be arguing with.
+    void syncPort();
+    /// The user moved the box: record the override, or clear it at 0.
+    void onPortChanged(int port);
     /// Puts `runId`'s whole output in the log widget, unless it is already
     /// showing it. The empty id empties the widget.
     void showLogOf(const QString& runId);
@@ -97,7 +112,14 @@ private:
     void openUrl();
 
     QPointer<RunPanelModel> m_model;
+    QPointer<AppController> m_controller;
     QComboBox* m_configs = nullptr;
+    /// The port the next run of the selected configuration uses. 0 is "the
+    /// configuration's own", shown as `auto`.
+    QSpinBox* m_port = nullptr;
+    /// Set while `syncPort` writes into the box, so the `valueChanged` it
+    /// provokes is not recorded as a change the user made.
+    bool m_syncingPort = false;
     QPushButton* m_start = nullptr;
     QPushButton* m_stop = nullptr;
     QLabel* m_glyph = nullptr;
