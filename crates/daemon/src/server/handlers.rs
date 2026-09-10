@@ -76,6 +76,11 @@ impl Handler for WorkspaceHandler {
             Request::AgentInterrupt(p) => ok(d.agents.interrupt(p).await?),
             Request::AgentStop(p) => ok(d.agents.stop(p).await?),
             Request::AgentHistory(p) => ok(d.agents.history(p).await?),
+            Request::RunStart(p) => ok(d.runs.start(d, p).await?),
+            Request::RunStop(p) => ok(d.runs.stop(&p.run_id).await?),
+            Request::RunList(p) => ok(RunListResult {
+                runs: d.runs.list(&p.workspace_id),
+            }),
             // A setup terminal runs on the host rather than in a sandbox, so
             // it needs the daemon and cannot live in `SystemHandler` with the
             // other `system.*` methods.

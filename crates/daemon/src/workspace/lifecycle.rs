@@ -68,7 +68,7 @@ pub const PROXY_BYPASS: &str = "localhost,127.0.0.1";
 /// (`~/.bondsymphonic/bin`) and built under it in development, and bwrap
 /// replaces `/home` with a tmpfs, so the binary is always bound in at this
 /// path rather than reachable at its own.
-const INIT_EXE_IN_SANDBOX: &str = "/tmp/.bs-init";
+pub const INIT_EXE_IN_SANDBOX: &str = "/tmp/.bs-init";
 
 /// How long the shim gets to bind its port before the workspace comes up
 /// anyway. Exceeded, the workspace is still usable — it simply has no route out
@@ -316,6 +316,10 @@ fn watch_sandbox(
             return;
         }
         d.sandboxes.lock().remove(&id);
+        // The processes went with the sandbox, but their bridges did not: a
+        // host port still accepting connections for a run that no longer exists
+        // would hang a browser rather than refuse it.
+        d.runs.stop_all_in(&id).await;
         // Nothing can reach the socket now that the sandbox holding the shim is
         // gone, and a listener left behind would outlive the workspace.
         d.proxies.stop(&id);
@@ -507,7 +511,13 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
         }
     }
     d.set_state(id, WorkspaceState::Destroying)?;
-    // Agents first: each one ends through its own `stop` (stdin closed, exit
+    // Runs first: each one holds a bridge on the host as well as a process in
+    // the sandbox, and the bridge would outlive the workspace it belongs to.
+    // Stopping them here also means the last `run.state` a client sees is
+    // `stopped` rather than a run frozen at `ready` for a workspace that is
+    // gone.
+    d.runs.stop_all_in(id).await;
+    // Then the agents: each one ends through its own `stop` (stdin closed, exit
     // awaited, `Exited` announced), so the IDE learns the agent is gone. Left
     // until after the sandbox went down they would simply vanish with it, and a
     // client would go on showing an agent that no longer exists.

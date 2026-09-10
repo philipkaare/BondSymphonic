@@ -50,11 +50,22 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:3128")]
         listen: String,
     },
+    /// Internal: forward a socket in the sandbox's run directory to a port on
+    /// the sandbox's loopback, so the host can reach a run. Not for direct use.
+    Forward {
+        /// The run's forwarder socket, as seen from inside the sandbox.
+        #[arg(long)]
+        socket: PathBuf,
+        /// The port the run listens on inside the sandbox.
+        #[arg(long)]
+        port: u16,
+    },
 }
 
 /// Synchronous so `sandbox-init` never starts a tokio runtime: it is PID 1
-/// inside the sandbox and runs on blocking std plus threads. The proxy shim is
-/// an ordinary async program, so it builds a runtime of its own.
+/// inside the sandbox and runs on blocking std plus threads. The proxy shim and
+/// the port forwarder are ordinary async programs, so each builds a runtime of
+/// its own.
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.cmd {
@@ -67,6 +78,9 @@ fn main() -> Result<()> {
             ref listen,
         }) => {
             return tokio::runtime::Runtime::new()?.block_on(net::shim::run(socket, listen));
+        }
+        Some(Cmd::Forward { ref socket, port }) => {
+            return tokio::runtime::Runtime::new()?.block_on(net::forward::run(socket, port));
         }
         None => {}
     }

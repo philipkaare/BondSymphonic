@@ -1056,3 +1056,176 @@ async fn a_claude_agent_streams_a_turn_from_inside_the_sandbox() {
     assert!(daemon.agents.agents_of(&ws.id).is_empty());
     std::env::remove_var("BS_CLAUDE_BIN");
 }
+
+// ---------------------------------------------------------------------------
+// The port bridge: a web app started inside a bwrap workspace answers on the
+// host, while the host port stays invisible from inside the sandbox.
+// ---------------------------------------------------------------------------
+
+/// A port nothing is listening on right now, handed out by the operating
+/// system rather than guessed.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// One `GET /` over a fresh connection to the host's loopback. `None` when the
+/// port refuses it.
+async fn http_get(port: u16) -> Option<String> {
+    let mut s = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    s.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .await
+        .ok()?;
+    let mut out = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), s.read_to_end(&mut out))
+        .await
+        .ok()?
+        .ok()?;
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Waits for `run` to reach `want`, returning the state events seen on the way.
+async fn wait_for_run_state(
+    events: &mut tokio::sync::broadcast::Receiver<ServerMessage>,
+    run: &bondsymphonic_proto::RunId,
+    want: bondsymphonic_proto::RunState,
+    limit: std::time::Duration,
+) -> Vec<(bondsymphonic_proto::RunState, Option<String>)> {
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut seen = Vec::new();
+    loop {
+        let Ok(Ok(msg)) = tokio::time::timeout_at(deadline, events.recv()).await else {
+            return seen;
+        };
+        if let ServerMessage::Event {
+            event:
+                Event::RunStateChanged {
+                    run_id,
+                    state,
+                    url,
+                    detail,
+                },
+            ..
+        } = msg
+        {
+            if &run_id != run {
+                continue;
+            }
+            seen.push((state, url.or(detail)));
+            if state == want {
+                return seen;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    if !std::path::Path::new("/usr/bin/python3").exists() {
+        eprintln!("SKIP: /usr/bin/python3 is missing");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let port = free_port();
+    std::fs::write(
+        repo.join("bondsymphonic.toml"),
+        format!(
+            "[[run]]\nname = \"web\"\ncommand = \"python3 -m http.server {port} --bind 127.0.0.1\"\nport = {port}\n"
+        ),
+    )
+    .unwrap();
+    common::commit_all(&repo, &[], "config");
+
+    let (daemon, ws, _layout) = bwrap_workspace(dir.path(), &repo, "bridged").await;
+    let mut events = daemon.events.subscribe();
+    let started = daemon
+        .runs
+        .start(
+            &daemon,
+            bondsymphonic_proto::RunStartParams {
+                workspace_id: ws.id.clone(),
+                config_name: "web".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        started.host_port, port,
+        "a sandboxed run is reached through a host port of its own"
+    );
+    assert_eq!(
+        started.url,
+        format!("http://localhost:{}", started.host_port)
+    );
+    let socket = daemon.dirs.run(&ws.id).join(format!("fwd-{port}.sock"));
+
+    let seen = wait_for_run_state(
+        &mut events,
+        &started.run_id,
+        bondsymphonic_proto::RunState::Ready,
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(
+        seen.last().map(|(s, _)| *s),
+        Some(bondsymphonic_proto::RunState::Ready),
+        "readiness must come from the bridge probe: {seen:?}"
+    );
+    assert!(
+        socket.exists(),
+        "the forwarder must bind {}",
+        socket.display()
+    );
+    // The socket path carries this test's own port, so it names exactly one
+    // process on the machine however many sandboxes other suites are running.
+    let forwarder = format!("fwd-{port}[.]sock");
+    assert!(pgrep(&forwarder), "the forwarder must be running");
+
+    // Through the bridge, from the host, exactly as the Windows browser does.
+    let body = http_get(started.host_port)
+        .await
+        .unwrap_or_else(|| panic!("no answer on the bridged port {}", started.host_port));
+    assert!(body.contains("200"), "{body}");
+
+    // The host port is not reachable from inside the sandbox: the bridge runs
+    // on the host, and the sandbox has a network namespace of its own.
+    let handle: Handle = daemon.sandbox(&ws.id).unwrap();
+    let (code, _) = run_bash(
+        &handle,
+        &format!("exec 3<>/dev/tcp/127.0.0.1/{}", started.host_port),
+    )
+    .await;
+    assert_ne!(code, 0, "the sandbox must not see the host's bridge port");
+
+    daemon.runs.stop(&started.run_id).await.unwrap();
+    assert!(
+        http_get(started.host_port).await.is_none(),
+        "the bridge must be gone with the run"
+    );
+    wait_until(std::time::Duration::from_secs(5), || !pgrep(&forwarder)).await;
+    assert!(
+        !pgrep(&forwarder),
+        "the forwarder must die with the run it served"
+    );
+    assert!(
+        !socket.exists(),
+        "the forwarder socket must be removed with the run"
+    );
+    assert!(daemon.runs.list(&ws.id).is_empty());
+
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+}

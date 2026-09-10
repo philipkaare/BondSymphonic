@@ -43,6 +43,8 @@ pub struct Daemon {
     /// One allowlisting proxy per live workspace: the only route out of a
     /// sandbox, and the only place the allowlist is enforced.
     pub proxies: crate::net::proxy::ProxyRegistry,
+    /// The running runs, which is where `WorkspaceInfo.runs` comes from.
+    pub runs: crate::runs::manager::RunManager,
     /// The handle the setup terminals (`system.setup_pty`) run under: not a
     /// sandbox at all, but the daemon user's own home and environment. See
     /// [`Daemon::host`]. Built on first use, because most daemons never open a
@@ -66,10 +68,11 @@ impl Daemon {
             backend,
             sandboxes: Mutex::new(HashMap::new()),
             events: events.clone(),
-            ptys: PtyManager::new(events),
+            ptys: PtyManager::new(events.clone()),
             watchers: Watchers::default(),
             agents,
             proxies: crate::net::proxy::ProxyRegistry::default(),
+            runs: crate::runs::manager::RunManager::new(events),
             host: tokio::sync::OnceCell::new(),
         }))
     }
@@ -136,13 +139,15 @@ impl Daemon {
         })
     }
 
-    /// A workspace as clients see it. `Workspace::info` cannot fill `agents`:
-    /// the registry is a file that outlives the daemon and the agents are live
-    /// processes, so the list comes from the manager here instead. Every path
-    /// that hands a `WorkspaceInfo` to a client goes through this.
+    /// A workspace as clients see it. `Workspace::info` cannot fill `agents` or
+    /// `runs`: the registry is a file that outlives the daemon while both of
+    /// those are live processes, so the lists come from their managers here
+    /// instead. Every path that hands a `WorkspaceInfo` to a client goes
+    /// through this.
     pub fn workspace_info(&self, ws: &Workspace) -> WorkspaceInfo {
         let mut info = ws.info();
         info.agents = self.agents.agents_of(&ws.id);
+        info.runs = self.runs.runs_of(&ws.id);
         info
     }
 
