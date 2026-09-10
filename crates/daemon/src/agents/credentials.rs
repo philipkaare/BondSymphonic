@@ -81,7 +81,7 @@ pub(crate) fn ensure_real_dir(path: &Path) -> std::io::Result<()> {
             tracing::warn!(
                 path = %path.display(),
                 symlink = md.is_symlink(),
-                "the workspace home holds something other than a real directory here;                  replacing it before writing into it"
+                "replacing something other than a real directory in the workspace home"
             );
             remove_any(path)?;
         }
@@ -89,6 +89,35 @@ pub(crate) fn ensure_real_dir(path: &Path) -> std::io::Result<()> {
         Err(e) => return Err(e),
     }
     std::fs::create_dir_all(path)
+}
+
+/// Unlinks whatever is at `path` unless it is a real directory.
+///
+/// The directory is the one obstruction deliberately left in place: it cannot
+/// redirect a write the way a symlink can, and removing it recursively would be
+/// the daemon deleting data it did not put there. The `create_new` that follows
+/// fails on it instead, which every caller reports.
+pub(crate) fn clear_destination(path: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    remove_any(path)
+}
+
+/// Writes `body` into `path` the way everything under `homes/<id>` is written:
+/// the destination is unlinked first, never followed, and then created with
+/// `create_new` so a symlink raced back in is refused rather than written
+/// through. Daemon design §8.3.
+pub(crate) fn write_guarded(path: &Path, body: &str) -> std::io::Result<()> {
+    clear_destination(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(body.as_bytes())
 }
 
 /// Creates `path` for writing, refusing to reuse anything already there, and
@@ -161,17 +190,10 @@ pub fn seed_claude_files_from(source_home: &Path, home: &Path) -> Vec<&'static s
                 continue;
             }
         }
-        // Removed first, which is also what makes `create_new` succeed: it
-        // keeps a stale mode from surviving a refresh, and unlinks a symlink
-        // planted at the destination rather than writing through it. A real
-        // directory in the way is left alone and the copy below fails, which is
-        // logged and skipped like any other unwritable destination.
-        if !std::fs::symlink_metadata(&to)
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
-        {
-            let _ = remove_any(&to);
-        }
+        // Cleared first, which is also what makes `create_new` succeed: it keeps
+        // a stale mode from surviving a refresh, and unlinks a symlink planted at
+        // the destination rather than writing through it.
+        let _ = clear_destination(&to);
         match copy_file(&from, &to, secret) {
             Ok(()) => seeded.push(rel),
             Err(e) => {
@@ -377,6 +399,45 @@ mod tests {
             std::fs::read_to_string(dst.join(".claude/.credentials.json")).unwrap(),
             "tokens"
         );
+    }
+
+    /// `write_guarded` is what `seed_home` writes `.gitconfig` through, so the
+    /// spec's claim that *every* write into `homes/<id>` de-symlinks its path is
+    /// true of that one too.
+    #[test]
+    fn a_guarded_write_unlinks_a_symlink_rather_than_writing_through_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("the-users-real.gitconfig");
+        std::fs::write(&outside, "the user's own").unwrap();
+        let home = dir.path().join("ws-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let to = home.join(".gitconfig");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &to).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(&outside, &to).is_err() {
+            eprintln!("SKIP: this host will not create file symlinks");
+            return;
+        }
+
+        write_guarded(&to, "ours").unwrap();
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "ours");
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "the user's own",
+            "the link's target must be untouched"
+        );
+    }
+
+    /// And a real directory in the way is left there rather than deleted.
+    #[test]
+    fn a_guarded_write_leaves_a_real_directory_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let to = dir.path().join(".gitconfig");
+        std::fs::create_dir_all(to.join("something")).unwrap();
+        assert!(write_guarded(&to, "ours").is_err());
+        assert!(to.join("something").is_dir(), "nothing was deleted");
     }
 
     /// Whatever this machine's daemon home happens to hold, the public entry

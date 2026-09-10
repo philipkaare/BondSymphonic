@@ -146,6 +146,78 @@ async fn create_pr_pushes_the_branch_and_returns_the_url_gh_printed() {
     cancel.cancel();
 }
 
+/// The one exception to "a daemon git operation runs none of the repository's
+/// hooks": `create_pr` pushes through `Layout::daemon_push_git`, which leaves
+/// them in place.
+///
+/// `pre-push` is not decoration. It is how `git-lfs` uploads the large objects
+/// the pushed commits point at, and a push that skips it puts pointer files on
+/// the remote with nothing behind them. The hook is asserted to have received
+/// the real push payload on stdin -- `<local ref> <local sha> <remote ref>
+/// <remote sha>` -- because that payload is exactly what `git-lfs` reads to
+/// decide what to upload.
+///
+/// The other side of the rule, that a daemon *merge* runs no hooks at all, is
+/// `a_daemon_merge_runs_none_of_the_repositorys_hooks` in
+/// `merge_integration.rs`. Daemon design 5.4 and 5.5.
+#[tokio::test]
+async fn create_pr_still_runs_the_repositorys_pre_push_hook() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, origin) = init_repo_with_origin(dir.path());
+    let log = dir.path().join("gh.log");
+    use_gh_stub(py, &log, false);
+
+    // Records what git fed it, so the assertion is about a real invocation and
+    // not merely about a file appearing.
+    let payload = dir.path().join("pre-push-stdin");
+    common::install_hook(
+        &repo,
+        "pre-push",
+        &format!("cat > \"{}\"\nexit 0", common::sh_path(&payload)),
+    );
+
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "alpha").await;
+    commit_in_ws(&daemon, &ws, "alpha.txt", "alpha work").await;
+
+    let res: CreatePrResult = serde_json::from_value(
+        c.call(Request::WorkspaceCreatePr(WorkspaceCreatePrParams {
+            workspace_id: ws.id.clone(),
+            title: "T".into(),
+            body: "B".into(),
+            draft: false,
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(res.url, "https://github.com/example/repo/pull/42");
+
+    let fed = std::fs::read_to_string(&payload)
+        .expect("the repository's pre-push hook must have run: git-lfs uploads from it");
+    let tip = git_out(&repo, &["rev-parse", "bs/alpha/work"]);
+    assert!(
+        fed.contains("refs/heads/bs/alpha/work") && fed.contains(&tip),
+        "the hook must get the real push payload on stdin, got: {fed:?}"
+    );
+    // And the push itself still happened.
+    assert_eq!(
+        git_out(
+            &origin,
+            &["log", "-1", "--format=%s", "refs/heads/bs/alpha/work"]
+        ),
+        "alpha work"
+    );
+
+    cancel.cancel();
+}
+
 #[tokio::test]
 async fn create_pr_reports_a_failing_gh_as_a_git_error_carrying_its_stderr() {
     let _guard = ENV.lock().await;

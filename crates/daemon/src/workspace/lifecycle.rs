@@ -397,8 +397,18 @@ fn watch_sandbox(
 /// Code login is copied in here too, so an agent started in this workspace is
 /// not logged out; a user who has not logged in simply gets no credentials.
 async fn seed_home(d: &Daemon, ws: &Workspace) {
+    use crate::agents::credentials::{ensure_real_dir, write_guarded};
     let home = d.dirs.home(&ws.id);
-    let _ = std::fs::create_dir_all(&home);
+    // `ensure_real_dir`, not `create_dir_all`, and `write_guarded`, not
+    // `fs::write`: every write into `homes/<id>` de-symlinks its own path
+    // (daemon design §8.3). This one runs at creation, before the workspace has
+    // an agent to plant anything, so it is defence in depth rather than a live
+    // hole — but the rule belongs to the directory, not to the caller, and a
+    // guard that holds only on some of the writers is one nobody can rely on.
+    if let Err(e) = ensure_real_dir(&home) {
+        tracing::warn!(ws = %ws.id, path = %home.display(), error = %e, "could not create the workspace home");
+        return;
+    }
     let name = d
         .git
         .run(&ws.repo_path, &["config", "--get", "user.name"])
@@ -412,9 +422,9 @@ async fn seed_home(d: &Daemon, ws: &Workspace) {
         .map(|o| o.stdout.trim().to_string())
         .unwrap_or_default();
     if !name.is_empty() || !email.is_empty() {
-        let _ = std::fs::write(
-            home.join(".gitconfig"),
-            format!("[user]\n\tname = {name}\n\temail = {email}\n[safe]\n\tdirectory = *\n"),
+        let _ = write_guarded(
+            &home.join(".gitconfig"),
+            &format!("[user]\n\tname = {name}\n\temail = {email}\n[safe]\n\tdirectory = *\n"),
         );
     }
     let seeded = crate::agents::credentials::seed_claude_files(&home);

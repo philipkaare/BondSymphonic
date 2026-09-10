@@ -46,6 +46,27 @@ pub fn init_repo(dir: &Path) -> PathBuf {
 /// Local so `git push -u origin` is a real push that a test can inspect
 /// (`git --git-dir=<origin> show-ref`) without any of it leaving the machine.
 /// Returns `(repo, origin)`.
+/// A path as a `/bin/sh` script can carry it: git for Windows runs hooks through
+/// its bundled shell, which takes `C:/...` but not backslashes.
+pub fn sh_path(p: &Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
+/// Writes an executable `<name>` hook into `repo`'s `.git/hooks`, with `body` as
+/// its script. A `#!/bin/sh` line is prepended; `body` supplies the rest,
+/// including its own `exit`.
+pub fn install_hook(repo: &Path, name: &str, body: &str) {
+    let hooks = repo.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let path = hooks.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 pub fn init_repo_with_origin(dir: &Path) -> (PathBuf, PathBuf) {
     let repo = init_repo(dir);
     let origin = dir.join("origin.git");

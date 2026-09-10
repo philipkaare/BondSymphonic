@@ -616,22 +616,15 @@ async fn destroy_waits_for_whoever_holds_the_repository_lock() {
     cancel.cancel();
 }
 
-/// Writes an always-succeeding `<name>` hook into the repository that leaves a
-/// file behind in `fired` when git runs it.
-fn install_hook(repo: &Path, name: &str, fired: &Path) {
-    let hooks = repo.join(".git").join("hooks");
-    std::fs::create_dir_all(&hooks).unwrap();
-    let marker = fired.join(name).display().to_string().replace('\\', "/");
-    let path = hooks.join(name);
-    // `exit 0` throughout: a hook that failed would fail the merge, and this
-    // test has to tell "the hook did not run" apart from "the hook ran and broke
-    // something".
-    std::fs::write(&path, format!("#!/bin/sh\n: > \"{marker}\"\nexit 0\n")).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+/// An always-succeeding `<name>` hook that leaves a file behind in `fired` when
+/// git runs it.
+///
+/// `exit 0` throughout: a hook that failed would fail the merge, and these tests
+/// have to tell "the hook did not run" apart from "the hook ran and broke
+/// something".
+fn install_marker_hook(repo: &Path, name: &str, fired: &Path) {
+    let marker = common::sh_path(&fired.join(name));
+    common::install_hook(repo, name, &format!(": > \"{marker}\"\nexit 0"));
 }
 
 /// I5. A merge the daemon performs runs none of the repository's hooks.
@@ -670,7 +663,7 @@ async fn a_daemon_merge_runs_none_of_the_repositorys_hooks() {
         "reference-transaction",
     ];
     for hook in HOOKS {
-        install_hook(&repo, hook, &fired);
+        install_marker_hook(&repo, hook, &fired);
     }
 
     // In the user's own checkout, which is on the base branch.

@@ -298,6 +298,14 @@ Under the same per-repository lock as §5.4, and followed by the same absorb
 behind is `refs/remotes/origin/<branch>` and that ref outlives the workspace.
 A failure there is `reason: "objects_stranded"` with `pushed: true`.
 
+**The push runs the repository's own hooks**, unlike every other daemon-side git
+operation (§5.4). It goes through `Layout::daemon_push_git`, which is
+`daemon_git` without the `core.hooksPath` pin, because `pre-push` is how
+`git-lfs` uploads the large objects the pushed commits point at — a push that
+skipped it would put pointer files on the remote with nothing behind them. So a
+**Create PR** runs the user's `pre-push` over content an agent wrote. A push is
+also the one daemon-side git operation the user asked for by name.
+
 A failure of either command is a `GitError` carrying `{command, exit_code,
 stderr}`. The `command` field is what tells the two apart; the title and the body
 are deliberately not in it, so a client cannot echo them back from the error.
