@@ -48,6 +48,23 @@ static SHARED: OnceLock<std::sync::Mutex<Option<Shared>>> = OnceLock::new();
 static CONNECTION_WAS_LOST: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Bumped by every [`publish_shared`], so a QObject holding a subscription can
+/// tell whether it was made on the connection that is live now.
+static CONNECTION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Which connection is live, counting from 1. Zero means none has been
+/// published yet, so a recorded generation is always non-zero and can never be
+/// mistaken for "never connected".
+///
+/// Every connect builds a fresh [`EventRouter`], which makes every subscription
+/// taken on the previous one dead: its sender lives in a router nothing
+/// dispatches into any more, so the receiver never closes and the task behind
+/// it parks forever. Anything that keeps a subscription across calls records
+/// this number with it and re-subscribes when it no longer matches.
+pub fn connection_generation() -> u64 {
+    CONNECTION_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 fn shared_slot() -> &'static std::sync::Mutex<Option<Shared>> {
     SHARED.get_or_init(|| std::sync::Mutex::new(None))
 }
@@ -66,6 +83,7 @@ pub fn shared() -> Option<Shared> {
 /// Publishes a fresh connection for every QObject to use.
 pub fn publish_shared(shared: Shared) {
     CONNECTION_WAS_LOST.store(false, std::sync::atomic::Ordering::SeqCst);
+    CONNECTION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     *shared_slot().lock().expect("shared handle mutex poisoned") = Some(shared);
 }
 

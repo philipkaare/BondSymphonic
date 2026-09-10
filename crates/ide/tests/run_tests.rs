@@ -9,8 +9,9 @@
 //! settled without a Qt event loop.
 
 use bondsymphonic_ide::model::run_config::{
-    parse_run_state, run_state_word, RunLog, RunView, WorkspaceRuns,
+    denial_owner, parse_run_state, run_state_word, RunLog, RunView, WorkspaceRuns,
 };
+use bondsymphonic_ide::qobjects::run_panel::needs_resubscribe;
 use bondsymphonic_proto::{RunConfig, RunConfigSource, RunId, RunInfo, RunState};
 use std::collections::BTreeMap;
 
@@ -184,12 +185,24 @@ fn apply_list_builds_views_and_apply_state_moves_them() {
     assert_eq!(runs.runs[0].detail, "exit code 1");
 
     // A URL the daemon does not repeat is kept rather than blanked: the panel
-    // still has to offer "Open" for the run that just went ready.
-    runs.apply_state("run_1", RunState::Ready, None, None);
+    // still has to offer "Open" for the run that just went ready. The detail is
+    // the opposite -- it describes the state the run is in now, so a transition
+    // that explains nothing leaves nothing behind.
+    assert!(runs.apply_state("run_1", RunState::Ready, None, None));
     assert_eq!(runs.runs[0].url, "http://localhost:41873");
+    assert_eq!(
+        runs.runs[0].detail, "",
+        "the failure text does not outlive it"
+    );
+
+    // A relist keeps the detail of a run the daemon still reports: `RunInfo`
+    // does not carry it, so re-reading the list must not erase it.
+    runs.apply_state("run_1", RunState::Failed, None, Some("exit code 2"));
+    runs.apply_list(vec![info("run_1", "dev", RunState::Failed, 41873)]);
+    assert_eq!(runs.runs[0].detail, "exit code 2");
 
     // A relist drops the runs the daemon no longer has, and their logs with
-    // them, but keeps the detail of the ones it still reports.
+    // them.
     runs.apply_output("run_1", "hello");
     runs.apply_list(vec![]);
     assert!(runs.runs.is_empty());
@@ -334,4 +347,69 @@ fn run_state_words_round_trip() {
     assert_eq!(run_state_word(RunState::Starting), "starting");
     assert_eq!(parse_run_state("nonsense"), None);
     assert_eq!(parse_run_state(""), None);
+}
+
+/// A reconnect builds a fresh `EventRouter`, so every subscription made on the
+/// previous connection is dead: its sender lives in the old router, which
+/// nothing dispatches into any more. The panel has to notice that and subscribe
+/// again, or a run that is still running goes silent for the rest of the
+/// session with Refresh unable to recover it.
+#[test]
+fn a_subscription_from_an_earlier_connection_is_replaced() {
+    assert!(
+        needs_resubscribe(None, 1),
+        "a run with no subscription needs one"
+    );
+    assert!(
+        !needs_resubscribe(Some(1), 1),
+        "a subscription on the live connection is kept"
+    );
+    assert!(
+        needs_resubscribe(Some(1), 2),
+        "a subscription from before a reconnect is replaced"
+    );
+}
+
+/// The toast carries no workspace of its own, so answering it has to name one.
+/// Extending the allowlist of a workspace that never denied the host is exactly
+/// what an allowlist exists to prevent, so the answer goes to the workspace the
+/// toast was raised for -- or, for a caller that never saw a toast, to a
+/// workspace that has the host queued itself.
+#[test]
+fn a_denial_is_answered_for_the_workspace_it_was_raised_for() {
+    // The ordinary case: the toast is up for ws_a and the user clicks Allow.
+    assert_eq!(
+        denial_owner(Some(("ws_a", "example.com")), Some("ws_a"), "example.com"),
+        Some("ws_a".to_owned())
+    );
+
+    // The user switched to ws_b while the toast for ws_a was up. The host goes
+    // to ws_a, which is the workspace that was actually blocked.
+    assert_eq!(
+        denial_owner(Some(("ws_a", "example.com")), None, "example.com"),
+        Some("ws_a".to_owned()),
+        "the toast's workspace wins over whatever is on screen"
+    );
+
+    // A caller answering a host that is not the one on screen falls back to the
+    // workspace that has it queued, and to nothing when none does.
+    assert_eq!(
+        denial_owner(
+            Some(("ws_a", "example.com")),
+            Some("ws_b"),
+            "cdn.example.net"
+        ),
+        Some("ws_b".to_owned())
+    );
+    assert_eq!(
+        denial_owner(Some(("ws_a", "example.com")), None, "cdn.example.net"),
+        None,
+        "a host no workspace denied is not allowed anywhere"
+    );
+    assert_eq!(denial_owner(None, None, "example.com"), None);
+    assert_eq!(
+        denial_owner(None, Some("ws_b"), "example.com"),
+        Some("ws_b".to_owned()),
+        "no toast on screen, but this workspace queued the host"
+    );
 }

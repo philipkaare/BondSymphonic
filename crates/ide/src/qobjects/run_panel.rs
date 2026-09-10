@@ -12,8 +12,8 @@
 //! moves JSON and signals across the boundary and owns the subscriptions.
 
 use crate::client::router::EventRx;
-use crate::model::run_config::{run_state_word, RunView, WorkspaceRuns};
-use crate::qobjects::app_controller::{require_connection, runtime, Shared};
+use crate::model::run_config::{denial_owner, run_state_word, RunView, WorkspaceRuns};
+use crate::qobjects::app_controller::{connection_generation, require_connection, runtime, Shared};
 use bondsymphonic_proto::{
     DetectRunConfigsResult, Event, RepoPathParams, Request, RunConfig, RunId, RunIdParams, RunInfo,
     RunListResult, RunStartParams, RunStartResult, RunState, WorkspaceId, WorkspaceIdParams,
@@ -71,6 +71,13 @@ pub mod qobject {
         /// `allowHost` or `dismissDenied`.
         #[qsignal]
         fn denied(self: Pin<&mut RunPanelModel>, host: QString);
+
+        /// Take the denial toast down: the host it was showing has been
+        /// answered, or the panel has moved to a workspace that has no denial
+        /// waiting. A toast left up after a tab switch would answer for the
+        /// wrong workspace, so the panel must act on this.
+        #[qsignal]
+        fn denied_cleared(self: Pin<&mut RunPanelModel>);
 
         /// A request this panel made failed. Nothing changed.
         #[qsignal]
@@ -165,6 +172,21 @@ type Unsubscribe = Box<dyn FnOnce() + Send>;
 struct Subscription {
     task: tokio::task::JoinHandle<()>,
     unsubscribe: Option<Unsubscribe>,
+    /// The connection this was taken on; see [`needs_resubscribe`].
+    generation: u64,
+}
+
+/// Whether a run has to be subscribed to now.
+///
+/// `existing` is the connection generation of the subscription the panel
+/// already holds for that run, if any, and `current` the connection that is
+/// live. A run with no subscription needs one; so does a run whose
+/// subscription was taken on a connection that has since been replaced,
+/// because every connect builds a fresh `EventRouter` and the old one's sender
+/// is never dispatched into again. Without this the panel would go silent for
+/// a run that is still running, with `refresh()` unable to recover it.
+pub fn needs_resubscribe(existing: Option<u64>, current: u64) -> bool {
+    existing != Some(current)
 }
 
 impl Subscription {
@@ -194,6 +216,10 @@ pub struct RunPanelModelRust {
     run_workspace: BTreeMap<String, String>,
     /// One entry per run being followed.
     subscriptions: BTreeMap<String, Subscription>,
+    /// The `(workspace, host)` the toast is showing, or `None` when none is up.
+    /// Answering a toast uses this rather than the current workspace, so a tab
+    /// switch cannot send a host to a workspace that never denied it.
+    current_denial: Option<(String, String)>,
     /// Requests in flight; `busy` is this being non-zero.
     inflight: u32,
 }
@@ -287,6 +313,9 @@ impl qobject::RunPanelModel {
         self.as_mut().set_workspace_id(QString::from(&workspace));
         if workspace.is_empty() {
             self.as_mut().publish_current();
+            // Detaching takes any toast down: it belongs to a workspace the
+            // panel is no longer showing.
+            self.pump_denial();
             return;
         }
         {
@@ -345,6 +374,19 @@ impl qobject::RunPanelModel {
             self.fail("no run configuration is selected");
             return;
         };
+        // One run per configuration per workspace (daemon spec §10.3). The
+        // daemon would answer `Conflict`, but a model that knows a run is
+        // already up should not have to ask.
+        let already = self
+            .as_ref()
+            .rust()
+            .by_workspace
+            .get(&workspace)
+            .is_some_and(|entry| entry.active_run().is_some());
+        if already {
+            self.fail("that configuration is already running");
+            return;
+        }
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(message) => {
@@ -417,11 +459,11 @@ impl qobject::RunPanelModel {
     }
 
     pub fn allow_host(mut self: Pin<&mut Self>, host: QString) {
-        let workspace = self.as_ref().rust().workspace_id.to_string();
         let host = host.to_string();
-        if workspace.is_empty() || host.is_empty() {
+        let Some(workspace) = self.as_ref().denial_owner_of(&host) else {
+            tracing::debug!("allowHost: no workspace has {host:?} blocked");
             return;
-        }
+        };
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(message) => {
@@ -480,8 +522,11 @@ impl qobject::RunPanelModel {
     }
 
     pub fn dismiss_denied(self: Pin<&mut Self>, host: QString) {
-        let workspace = self.as_ref().rust().workspace_id.to_string();
-        self.clear_denial(&workspace, &host.to_string());
+        let host = host.to_string();
+        let Some(workspace) = self.as_ref().denial_owner_of(&host) else {
+            return;
+        };
+        self.clear_denial(&workspace, &host);
     }
 
     pub fn note_denied(mut self: Pin<&mut Self>, workspace_id: QString, host: QString) {
@@ -525,8 +570,11 @@ impl qobject::RunPanelModel {
         }
         if self.as_ref().rust().workspace_id.to_string() == workspace {
             self.as_mut().set_workspace_id(QString::from(""));
-            self.publish_current();
+            self.as_mut().publish_current();
         }
+        // The queue went with the workspace, so a toast raised for it has
+        // nothing left to answer.
+        self.pump_denial();
     }
 
     pub fn configs_json(&self) -> QString {
@@ -688,16 +736,27 @@ impl qobject::RunPanelModel {
         }
     }
 
-    /// Subscribes to `run` unless it is already being followed.
+    /// Subscribes to `run`, unless it is already being followed on the
+    /// connection that is live.
+    ///
+    /// A subscription left over from before a reconnect is ended and replaced:
+    /// its sender belongs to a router nothing dispatches into any more, so
+    /// keeping it would leave a running run silent for the rest of the session
+    /// and make `refresh()` a no-op for it.
     fn watch_run(mut self: Pin<&mut Self>, workspace: &str, run_id: &str) {
+        let generation = connection_generation();
         {
             let mut rust = self.as_mut().rust_mut();
             rust.run_workspace
                 .insert(run_id.to_owned(), workspace.to_owned());
-            if rust.subscriptions.contains_key(run_id) {
+            let existing = rust.subscriptions.get(run_id).map(|sub| sub.generation);
+            if !needs_resubscribe(existing, generation) {
                 return;
             }
         }
+        // Ends the stale task and drops its row in the old router, so nothing
+        // is left parked on a channel that will never close.
+        self.as_mut().stop_watching(run_id);
         let Ok(shared) = require_connection() else {
             return;
         };
@@ -715,6 +774,7 @@ impl qobject::RunPanelModel {
             Subscription {
                 task,
                 unsubscribe: Some(Box::new(unsubscribe)),
+                generation,
             },
         );
     }
@@ -749,17 +809,50 @@ impl qobject::RunPanelModel {
         }
     }
 
-    /// Offers the head of the current workspace's denial queue, if any.
-    fn pump_denial(self: Pin<&mut Self>) {
-        let host = self
+    /// Brings the toast in line with the head of the current workspace's queue.
+    ///
+    /// Raises `denied` for a new head, `deniedCleared` when there is no longer
+    /// one, and says nothing when the head has not moved -- so a second blocked
+    /// host arriving behind the one on screen, or a switch back to a workspace
+    /// whose toast is already up, does not raise the same host twice.
+    fn pump_denial(mut self: Pin<&mut Self>) {
+        let workspace = self.as_ref().rust().workspace_id.to_string();
+        let next = self
             .as_ref()
             .rust()
             .by_workspace
-            .get(&self.as_ref().rust().workspace_id.to_string())
-            .and_then(|entry| entry.current_denial().map(str::to_owned));
-        if let Some(host) = host {
-            self.denied(QString::from(&host));
+            .get(&workspace)
+            .and_then(|entry| entry.current_denial())
+            .map(|host| (workspace.clone(), host.to_owned()));
+        if next == self.as_ref().rust().current_denial {
+            return;
         }
+        self.as_mut().rust_mut().current_denial = next.clone();
+        match next {
+            Some((_, host)) => self.denied(QString::from(&host)),
+            None => self.denied_cleared(),
+        }
+    }
+
+    /// Whose denial `host` is, for an `allowHost`/`dismissDenied` that carries
+    /// only the host. The toast on screen wins; failing that, the current
+    /// workspace, and only when it really has that host queued.
+    fn denial_owner_of(&self, host: &str) -> Option<String> {
+        if host.is_empty() {
+            return None;
+        }
+        let workspace = self.rust().workspace_id.to_string();
+        let queued_here = self
+            .rust()
+            .by_workspace
+            .get(&workspace)
+            .is_some_and(|entry| entry.denied_hosts.iter().any(|h| h == host));
+        let shown = self
+            .rust()
+            .current_denial
+            .as_ref()
+            .map(|(ws, h)| (ws.as_str(), h.as_str()));
+        denial_owner(shown, queued_here.then_some(workspace.as_str()), host)
     }
 
     /// Republishes everything the panel paints for the current workspace.

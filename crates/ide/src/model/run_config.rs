@@ -107,6 +107,33 @@ pub fn parse_run_state(word: &str) -> Option<RunState> {
     }
 }
 
+/// Which workspace an answer to a denial toast belongs to.
+///
+/// The toast shows a host and no workspace, so `allowHost`/`dismissDenied`
+/// carry only the host and something has to decide whose allowlist is being
+/// extended. Answering for whichever workspace happens to be on screen is
+/// wrong: a user who switches tabs while a toast is up would silently add the
+/// host to a workspace that never asked for it, which is the exact failure the
+/// allowlist exists to prevent.
+///
+/// `shown` is the `(workspace, host)` of the toast actually on screen, and
+/// wins whenever it is about this host. `fallback` is for a caller that never
+/// saw a toast (the smoke script answers a denial programmatically); it must
+/// already have been checked to have `host` in its own queue, so this can never
+/// name a workspace that did not report the denial.
+pub fn denial_owner(
+    shown: Option<(&str, &str)>,
+    fallback: Option<&str>,
+    host: &str,
+) -> Option<String> {
+    if let Some((workspace, shown_host)) = shown {
+        if shown_host == host {
+            return Some(workspace.to_owned());
+        }
+    }
+    fallback.map(str::to_owned)
+}
+
 /// Everything the Run panel holds for one workspace.
 #[derive(Debug, Default)]
 pub struct WorkspaceRuns {
@@ -212,6 +239,12 @@ impl WorkspaceRuns {
     /// A `None` url leaves the one already known in place: the daemon sends the
     /// url with the transition to ready and need not repeat it, and blanking it
     /// would take "Open" away from a run that is still serving.
+    ///
+    /// A `None` detail does the opposite and clears it. The two are not the
+    /// same kind of fact: a url outlives the transition that announced it,
+    /// while the detail explains the state the run is in *now*, so leaving the
+    /// exit status of a failed run attached to a later `starting` would show
+    /// the user an error about a run that is coming back up.
     pub fn apply_state(
         &mut self,
         run_id: &str,
