@@ -85,6 +85,18 @@ impl Handler for WorkspaceHandler {
             }
             Request::WorkspaceChanges(p) => ok(changes::changes(d, &p.workspace_id).await?),
             Request::WorkspaceDiff(p) => ok(changes::diff(d, &p.workspace_id, &p.path).await?),
+            // Merging runs as the daemon in the main repository, never in the
+            // sandbox: the branch it is folding in was written by an agent, and
+            // the base checkout is the user's own.
+            Request::WorkspaceMerge(p) => {
+                ok(crate::git::merge::merge(d, &p.workspace_id, p.mode, p.message).await?)
+            }
+            Request::WorkspaceCreatePr(p) => {
+                ok(
+                    crate::git::pr::create_pr(d, &p.workspace_id, &p.title, &p.body, p.draft)
+                        .await?,
+                )
+            }
             Request::AgentStart(p) => ok(d.agents.start(d, p).await?),
             Request::AgentSend(p) => ok(d.agents.send(p).await?),
             Request::AgentPermissionReply(p) => ok(d.agents.permission_reply(p).await?),

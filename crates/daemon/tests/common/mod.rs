@@ -6,23 +6,70 @@ use std::process::Command;
 pub fn init_repo(dir: &Path) -> PathBuf {
     let repo = dir.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
+    // `output()` rather than `status()`: on Windows git narrates every LF/CRLF
+    // rewrite on stderr, and inheriting that buries the suite's real output in
+    // warnings. Kept and printed only when the command actually fails.
     let git = |args: &[&str]| {
-        let st = Command::new("git")
+        let out = Command::new("git")
             .args(args)
             .current_dir(&repo)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@t")
-            .status()
+            .output()
             .unwrap();
-        assert!(st.success(), "git {args:?}");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     git(&["init", "-q", "-b", "main"]);
+    // Identity and signing in the repository's own config, not in the ambient
+    // environment: the daemon commits here itself (`merge --no-ff`, `rebase`,
+    // `merge --squash` + `commit`) and does not inherit the `GIT_AUTHOR_*` the
+    // helper above sets, so without this those commits fail on a host with no
+    // global identity and hang on one that signs by default.
+    git(&["config", "user.name", "t"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "commit.gpgsign", "false"]);
     std::fs::write(repo.join("README.md"), "hello\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-q", "-m", "init"]);
     repo
+}
+
+/// A repository with a *local* bare "origin" it tracks, for the push half of
+/// `workspace.create_pr`.
+///
+/// Local so `git push -u origin` is a real push that a test can inspect
+/// (`git --git-dir=<origin> show-ref`) without any of it leaving the machine.
+/// Returns `(repo, origin)`.
+pub fn init_repo_with_origin(dir: &Path) -> (PathBuf, PathBuf) {
+    let repo = init_repo(dir);
+    let origin = dir.join("origin.git");
+    let st = Command::new("git")
+        .args(["init", "--bare", "-q", "-b", "main"])
+        .arg(&origin)
+        .status()
+        .unwrap();
+    assert!(st.success(), "git init --bare");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["remote", "add", "origin", &origin.to_string_lossy()]);
+    git(&["push", "-q", "-u", "origin", "main"]);
+    (repo, origin)
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +230,11 @@ pub fn commit_all(worktree: &Path, env: &[(String, String)], message: &str) {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        assert!(cmd.status().unwrap().success(), "git {args:?}");
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

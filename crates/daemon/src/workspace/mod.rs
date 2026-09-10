@@ -88,6 +88,17 @@ impl DataDirs {
     pub fn bin(&self) -> PathBuf {
         self.root.join("bin")
     }
+    /// Where a merge puts its scratch checkout of the base branch when the
+    /// user's own checkout is on some other branch.
+    ///
+    /// Under the data root rather than beside the repository: it is the
+    /// daemon's, it must never be bind-mounted into a sandbox, and it exists
+    /// only for the length of one `workspace.merge`. Named after the workspace
+    /// so two concurrent merges cannot collide, and so a directory left behind
+    /// by a killed daemon says which merge left it.
+    pub fn merge_worktree(&self, id: &WorkspaceId) -> PathBuf {
+        self.root.join(format!("merge-{id}"))
+    }
     /// An empty directory the daemon owns, pointed at by `core.hooksPath` for
     /// every daemon-side git command that runs against a worktree. Git has no
     /// way to say "no hooks": an empty `core.hooksPath` resolves hooks relative

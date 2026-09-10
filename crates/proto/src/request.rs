@@ -387,7 +387,20 @@ pub struct DiffResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MergeResult {
     pub ok: bool,
+    /// Repo-relative paths git left with conflict markers, taken before the
+    /// merge was aborted. Empty unless `ok` is false.
     pub conflicts: Vec<String>,
+    /// Why `ok` is false, as a stable machine-readable tag the IDE can branch
+    /// on rather than matching on prose. `"conflict"` today.
+    ///
+    /// A merge the daemon refuses outright — a dirty base checkout — is an
+    /// `RpcError` with `data.reason` instead, because no merge was attempted
+    /// and there is no result to report.
+    ///
+    /// `serde(default)` so a reply from a daemon that predates the field still
+    /// deserialises, as "no reason given".
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreatePrResult {

@@ -332,3 +332,24 @@ fn detect_run_configs_carries_the_repo_network_allow() {
     let back: DetectRunConfigsResult = serde_json::from_value(v).unwrap();
     assert_eq!(back, result);
 }
+
+#[test]
+fn merge_result_defaults_reason_to_none() {
+    // `reason` distinguishes a conflict from the other ways a merge can come
+    // back not-ok, and it was added after `MergeResult` first shipped, so a
+    // reply without it has to keep deserialising.
+    let old: MergeResult = serde_json::from_str(r#"{"ok":true,"conflicts":[]}"#).unwrap();
+    assert!(old.ok);
+    assert_eq!(old.reason, None);
+
+    let conflicted = MergeResult {
+        ok: false,
+        conflicts: vec!["README.md".into()],
+        reason: Some("conflict".into()),
+    };
+    let v = serde_json::to_value(&conflicted).unwrap();
+    assert_eq!(v["reason"], "conflict");
+    assert_eq!(v["conflicts"][0], "README.md");
+    let back: MergeResult = serde_json::from_value(v).unwrap();
+    assert_eq!(back, conflicted);
+}

@@ -1314,8 +1314,13 @@ async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
         leftover.is_empty(),
         "a refused start left sockets behind: {leftover:?}"
     );
+    // Scoped to this workspace's run directory, for the reason spelled out
+    // further down: `pgrep` searches the whole machine, and the test binaries
+    // run in parallel, so a bare "forward --socket" also matches a forwarder
+    // another suite legitimately has running right now.
+    let fwd_here = format!("{}/fwd-", daemon.dirs.run(&ws.id).display());
     assert!(
-        !pgrep("forward --socket"),
+        !pgrep(&fwd_here),
         "a refused start left a forwarder running"
     );
     let started = daemon
