@@ -5,8 +5,10 @@
 //! handed to somebody else: what `windeployqt` copied into `dist\BondSymphonic`
 //! is a different, smaller set of files, and the first thing a user would see
 //! if one were missing is a silent failure to start. So this suite runs the
-//! deployed exe itself, from its own folder, and asserts it both answers
-//! `--version` without Qt and completes a whole connect-and-quit cycle with it.
+//! deployed exe itself, from its own folder: `--version`, which proves the
+//! statically imported libraries load (the five Qt DLLs and the Visual C++
+//! runtime) without building a window, and then a whole connect-and-quit cycle,
+//! which proves the plugins do too.
 //!
 //! It is skipped, loudly, unless `BS_PACKAGED_EXE` points at a built
 //! `dist\BondSymphonic\bondsymphonic-ide.exe`:
@@ -61,11 +63,24 @@ fn packaged_exe() -> Option<PathBuf> {
 #[test]
 fn the_packaged_exe_reports_its_version_and_runs_offscreen() {
     let Some(exe) = packaged_exe() else {
-        eprintln!(
-            "SKIP: {PACKAGED_EXE_ENV} unset, so there is no packaged build to test. Run \
+        let reason = format!(
+            "{PACKAGED_EXE_ENV} unset, so there is no packaged build to test. Run \
              scripts\\package.ps1 and set it to dist\\BondSymphonic\\bondsymphonic-ide.exe."
         );
-        eprintln!("skipped: 1");
+        // The same bargain `bondsymphonic_ide::testing::skip_without_qt` makes
+        // for the Qt-less suites, on this suite's own variable: a developer
+        // gets a loud skip, and CI's Windows job -- which turns `require-qt` on
+        // -- gets a failure. Without this, a job that forgot to build the
+        // package would report `1 passed` and nobody would learn the package
+        // went untested, which is precisely the regression this suite exists
+        // to catch.
+        if cfg!(feature = "require-qt") {
+            panic!("{reason}");
+        }
+        // stdout, and prefixed `SKIP:`, so it reads the same way as the other
+        // suites' skips. Cargo captures it unless the run asks for --nocapture.
+        println!("SKIP: {reason}");
+        println!("skipped: 1");
         return;
     };
     assert!(
@@ -74,14 +89,17 @@ fn the_packaged_exe_reports_its_version_and_runs_offscreen() {
         exe.display()
     );
 
-    version_answers_without_qt(&exe);
+    version_loads_the_qt_libraries(&exe);
     connects_and_quits_against_a_fake_daemon(&exe);
 }
 
-/// `--version` is answered before Qt is touched, so it works even in a folder
-/// whose deployment is broken — which is what makes it a useful first question
-/// to ask of a package.
-fn version_answers_without_qt(exe: &PathBuf) {
+/// `--version` returns before `QApplication` is constructed, so no plugin is
+/// loaded and no window is built. It is not a test that runs "without Qt": the
+/// five Qt DLLs are static imports of the exe, so the loader resolves them
+/// before `main` — which is exactly why this is a useful first question to ask
+/// of a package. It proves those DLLs and the Visual C++ runtime beside them
+/// are present and loadable. The plugin folders are proven by the run below.
+fn version_loads_the_qt_libraries(exe: &PathBuf) {
     let out = Command::new(exe)
         .arg("--version")
         .stdin(Stdio::null())
