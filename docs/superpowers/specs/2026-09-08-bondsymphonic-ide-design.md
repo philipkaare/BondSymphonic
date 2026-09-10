@@ -159,7 +159,18 @@ show" belongs in Rust.
    resolving; the old child is reaped before a new daemon is launched. A loss
    after `prepareQuit()` (File > Exit, `closeEvent`) is not reconnected, it is
    `lost`. Each successful reconnect bumps the connection generation, and
-   `reconnected(generation)` is emitted once the re-sync above has finished.
+   `reconnected(generation)` is emitted once the re-sync above has finished —
+   whether it succeeded or not, since the window most wants to repaint its
+   status bar on a failure; a client that needs to tell them apart watches
+   `operationFailed` for `system.check_prereqs`/`workspace.list`.
+
+   The backoff schedule resets to one second only after a connection that
+   **held for at least five seconds**. A daemon that answers `hello` and dies a
+   moment later is a crash loop, not a recovery: resetting on every successful
+   handshake would relaunch it every one to two seconds for as long as the
+   window is open, with the status bar frozen on "attempt 1". An ordinary
+   restart still costs one second, because the connection it replaced had been
+   up for minutes.
    Every subscriber re-attaches on that generation: transcripts re-`attach`
    and replay (the restored agent reads back `exited`, so the pane offers
    Restart with `restartOptionsJson()`, which carries `resume_session`), the
@@ -254,14 +265,33 @@ prompt if any.
 - `settings.json`: distro, daemon path, editor font/size, theme, default
   permission mode, `api_key_set: bool` (the key itself is stored in the Windows
   Credential Manager via the `keyring` crate and passed to the daemon at start).
-- `state.json`: groups with ordered workspace ids, active group/tab, open editor
-  tabs per workspace, splitter ratios, recent repos, and the base64 of
-  `QMainWindow::saveState()` and geometry.
+- `state.json`: `version`, groups with ordered workspace ids, the active
+  workspace, the open editor tabs per workspace and which of them was in front,
+  the agent-area splitter sizes and whether its halves are swapped, recent repos
+  (most recent first, capped at 10), the base64 of `QMainWindow::saveState()`
+  and of `saveGeometry()`, and the per-start run port overrides keyed by
+  workspace and configuration name.
 
-State is written on every structural change (debounced 500 ms) and on exit.
-Workspaces are owned by the daemon; on start the IDE reconciles: workspaces in
-`state.json` that the daemon no longer knows are dropped, and daemon workspaces
-not in any group land in an "Unsorted" group.
+Both files live in one flat `%APPDATA%\BondSymphonic\` directory. Earlier
+builds nested a second `BondSymphonic` inside the first (the `ProjectDirs`
+layout); a `settings.json` left there is copied up once, the first time the new
+path has no file, and the old one is left where it is so an older build still
+finds its settings. `BS_SETTINGS_PATH` and `BS_STATE_PATH` override the two
+paths for tests, and naming the first also turns the migration off, so a test
+can never read the developer's own settings.
+
+State is written on every structural change (debounced 500 ms: a burst — a
+splitter dragged, five tabs closed — is one write, 500 ms after it stops) and
+again on exit, through a temporary file and a rename. A `state.json` that will
+not parse is renamed `.corrupt` and read as defaults, since a layout is not
+worth refusing to start over.
+
+Workspaces are owned by the daemon; on start the IDE reconciles against the
+first `workspace.list`: workspaces in `state.json` that the daemon no longer
+knows are dropped — along with their editors and port overrides — and daemon
+workspaces not in any group land in an "Unsorted" group. Groups keep their
+persisted order, an empty group is kept (a user may be holding it open), and the
+result is written straight back, which is what stops the file growing forever.
 
 ## 12. Error presentation
 
@@ -403,6 +433,46 @@ into the panel costs nothing that shows against a 150 MB target. The run log is
 capped at 2,000 lines per run in Rust and the same in the widget, so a run that
 prints for hours cannot move this number.
 
+**Measured, Milestone 6 (2026-09-10).** The same machine and the same debug
+build against the real daemon in WSL, **after a full daemon restart**: the
+daemon was killed with `pkill -f bondsymphonic-daemon` and the IDE relaunched
+and reconnected it by itself. Two workspaces over a throwaway repository — one a
+terminal tab with `README.md` open in an editor, one a Claude tab whose
+transcript was replayed from `agent.history` after the restart and which shows
+the "agent ended when the daemon restarted" banner — plus the workspace the
+daemon restored at startup, so three sandboxes were alive, and a run started
+again after the reconnect (`python3 -m http.server`, bridged to a host port):
+
+| | measured | M5 | target |
+|---|---|---|---|
+| `bondsymphonic-ide.exe` working set | 132.1 MB | 129.3 MB | < 150 MB |
+| `bondsymphonic-ide.exe` private bytes | 67.9 MB | 69.2 MB | — |
+| `bondsymphonic-daemon` RSS | 20.7 MB | 9.7 MB | < 30 MB |
+
+Both targets hold, and the IDE is where M5 left it: a reconnect cycle costs it
+nothing that shows, which is the thing this milestone had to prove. A second run
+of the same scenario measured 130.9 MB and 67.9 MB, so the working-set figure is
+repeatable to about a megabyte.
+
+**Read the timing before comparing.** Unlike the M2b–M5 rows, this one was *not*
+taken after 60 s of idling: it was taken about five seconds after the run came
+up, which is the moment the scenario the milestone is about actually exists.
+Treat it as an upper bound of that moment rather than as a settled idle figure.
+
+The daemon at 20.7 MB is 11 MB above M5 and is the one number worth explaining.
+It is a daemon that has just restarted: it read its registry and its agent
+records back (`restored agents from the records file restored=1 closed=1`), then
+restarted a sandbox for each of the three workspaces while answering the IDE's
+re-sync — allocation the M5 measurement, taken on a daemon that had been up and
+idle, never did. It is still a third of the target, so it was recorded rather
+than chased; if it ever matters, the measurement to take first is the same
+daemon left idle for a minute after the restart, which this run did not do.
+
+Inside the distro the supervised tree was about 100 MB: 19.7 MB in the Python
+web server the run started, roughly 78 MB across the seven `sandbox-init`
+helpers, and the rest in `bwrap` and the shells. The web server is the user's own
+process, not BondSymphonic's.
+
 ## 14. Testing (IDE-specific)
 
 - `model/` unit tests: transcript delta coalescing and tool-result matching; diff
@@ -414,7 +484,7 @@ prints for hours cannot move this number.
   implementing the proto types).
 - `smoke.rs`: start the fake daemon, launch the real binary with
   `QT_QPA_PLATFORM=offscreen`, and drive it through `BS_SMOKE_SCRIPT` —
-  `create_claude,open_agent,send,allow,tree,open_file,open_diff,stop,create,detect,run_start,allow_host,run_stop,open,close,destroy,quit`.
+  `create_claude,open_agent,send,allow,tree,open_file,open_diff,stop,create,detect,run_start,allow_host,run_stop,merge,merge,pr,open,close,reconnect,destroy,quit`.
   Two workspaces, because the two halves need different panes: the first is a
   Claude tab and carries one whole agent turn, the second a terminal tab that
   also carries the run and the network denial, and whose PTY the
@@ -429,9 +499,12 @@ prints for hours cannot move this number.
   tabs, answers the permission bar, and the prompt, the stop and the allow leave
   `TranscriptModel::send`/`::stop` and `RunPanelModel::allowHost`, which is what
   makes the "no failure warning" guards below able to fire at all. Only
-  `create*`, `open_agent`, `run_start`, `run_stop`, `open`, `close` and
-  `destroy` are the script's own requests, because they stand in for a dialog or
-  for a button this suite cannot press rather than for a click on a pane. The
+  `create*`, `open_agent`, `run_start`, `run_stop`, `open`, `close`,
+  `reconnect` and `destroy` are the script's own requests, because they stand in
+  for a dialog or for a button this suite cannot press rather than for a click on
+  a pane. `merge` and `pr` are through the window too: they call
+  `AppController::mergeWorkspace` and `::createPr`, the invokables the Changes
+  toolbar calls once its confirmation or its dialog has been answered. The
   run is the script's for that reason — the Start button is a widget and no test
   here touches the desktop — but everything the run provokes is the window's:
   the fake daemon reports `starting` → one output line → `ready` on a **bridged**
@@ -444,7 +517,9 @@ prints for hours cannot move this number.
 
   - `hello`, `workspace.create`, `agent.start`, `agent.history`, `agent.send`,
     `agent.permission_reply`, `fs.list_dir`, `fs.read_file`, `workspace.diff`,
-    `agent.stop`, `pty.open`, `pty.close`, `workspace.destroy` in that order.
+    `agent.stop`, `workspace.merge`, `workspace.merge`, `workspace.create_pr`,
+    `pty.open`, `pty.close`, `hello`, `workspace.list`, `workspace.destroy` in
+    that order.
     `agent.history` is the window's own: only `TranscriptModel::attach` sends it,
     and the model attaches only because the window reacted to `agentStarted`, so
     its place before `agent.send` shows the pane was wired up before the turn.
@@ -488,6 +563,37 @@ prints for hours cannot move this number.
     when the Run panel is showing exactly the workspace named, and logs that
     line otherwise — so a `workspace.set_allowlist` reaching the daemon at all
     is the proof the toast was up on the right tab.
+  - The two merges the daemon received are `merge` with no summary and then
+    `squash` with one. The journal shows two `workspace.merge` calls arrived;
+    this shows the toolbar's word crossed into the daemon's `MergeMode` for both,
+    and that an empty summary box crossed as "not supplied" rather than as an
+    empty string, which is what makes the daemon take the workspace's last commit
+    subject. The fake answers the first as work that landed and the second as a
+    conflict, so one run covers both shapes of `MergeResult` — both RPC
+    successes, since a conflict is an answer and not an error.
+  - The pull request the daemon received carries the title, the body and the
+    draft flag that were sent.
+  - Exactly **two** `hello`s. Nothing in the script connects to anything, so the
+    second can only be the controller's reconnect loop noticing the socket had
+    gone and rebuilding the connection by itself; `system.test_drop` in the
+    journal is what asked the fake daemon to close it, and the `workspace.destroy`
+    after the second `hello` is the proof the next step reached the daemon on the
+    new connection. (`reconnect_tests.rs` covers the same loop in more detail:
+    the status-bar text, every pane re-attaching, and no `pty.*` for a PTY the
+    restarted daemon never had.)
+  - The `state.json` at `BS_STATE_PATH` carries `version`, the surviving Claude
+    workspace filed under its group, no trace of the destroyed one, and
+    `README.md` as that workspace's open editor. Nothing in the script writes it:
+    the window reports its arrangement through `noteGroups` and its editors
+    through `noteEditors`, and the controller writes the file behind them, so
+    this is the whole persistence path having run — across the reconnect, and
+    with the developer's own `%APPDATA%` untouched.
+  - No failure warning for `workspace.merge`, `workspace.create_pr`,
+    `workspace.list` or `system.check_prereqs`, and none for the toolbar's
+    `workspace.status`/`workspace.changes` summary pair. The last two are the
+    re-sync's own, issued on the connection the controller has just built, so a
+    warning there is a status bar saying "connected" over a client that could not
+    be used.
 
   Runs in `cargo test` on Windows when Qt is present; skipped with a message
   otherwise.

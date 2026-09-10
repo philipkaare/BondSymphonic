@@ -5,7 +5,7 @@
 //! The variable holds a comma-separated step list, run in order once the daemon
 //! connection is up. `tests/smoke.rs` runs the real IDE binary offscreen against
 //! an in-process fake daemon with
-//! `create_claude,open_agent,send,allow,tree,open_file,open_diff,stop,create,detect,run_start,allow_host,run_stop,open,close,destroy,quit`.
+//! `create_claude,open_agent,send,allow,tree,open_file,open_diff,stop,create,detect,run_start,allow_host,run_stop,merge,merge,pr,open,close,reconnect,destroy,quit`.
 //! The steps are:
 //!
 //! * `create` — create a workspace over the repository in `BS_SMOKE_REPO` and
@@ -53,6 +53,17 @@
 //!   ending every PTY it has handed out, including the ones the window opened
 //!   for its own panes, so the steps after this one run against terminals whose
 //!   process has exited.
+//! * `merge` — merge the workspace the last `create*` made into its base
+//!   branch, through `AppController::mergeWorkspace` — the invokable the
+//!   Changes toolbar calls once its confirmation has been answered. The first
+//!   `merge` of a run sends mode `merge` with no summary and the second
+//!   `squash` with one, so a run covers both the mode crossing and the optional
+//!   message. Nothing here reads the answer: it arrives as `mergeFinished` or
+//!   `workspaceOperationFailed`, which the toolbar turns into a status message
+//!   or a banner.
+//! * `pr` — open a pull request for that workspace through
+//!   `AppController::createPr`, the invokable behind the PR dialog's OK. The
+//!   URL comes back as `prCreated` and reaches the status bar as a link.
 //! * `destroy` — destroy the workspace and emit `workspace_destroyed`, which is
 //!   what makes the window tear its panes down.
 //! * `reconnect` — ask the daemon to drop the connection with
@@ -145,6 +156,27 @@ pub const TEST_DROP_METHOD: &str = "system.test_drop";
 const RECONNECT_LIMIT: Duration = Duration::from_secs(45);
 /// How often the generation is checked while waiting.
 const RECONNECT_POLL: Duration = Duration::from_millis(100);
+/// The modes the `merge` steps use, in that order: the first lands the branch,
+/// the second squashes it. Two rather than one because the word is translated
+/// into the daemon's `MergeMode` on the way, and a run that only ever sent
+/// `merge` would not show that translation happening. A third `merge` step
+/// repeats the last.
+const MERGE_MODES: [&str; 2] = ["merge", "squash"];
+/// The summary the squashing merge carries. The plain `merge` sends none, the
+/// way the toolbar does it -- Merge and Rebase have no box to type in, and
+/// Squash's may be left empty -- so the pair covers both halves of the
+/// daemon's optional message.
+const SQUASH_SUMMARY: &str = "smoke: squashed";
+/// What `pr` puts in the three fields of the PR dialog. `draft` is true so the
+/// flag travels as something other than its default.
+const PR_TITLE: &str = "Smoke PR";
+const PR_BODY: &str = "Opened by the smoke run.";
+const PR_DRAFT: bool = true;
+/// How long `merge` and `pr` wait. Each is one request, made on the Qt thread
+/// and answered back onto it, and the toolbar makes two more of its own behind
+/// a merge that landed; a step that returned at once would let the next one
+/// race them into the journal.
+const OPERATION_SETTLE: Duration = Duration::from_millis(750);
 /// How long `reconnect` waits after the new connection is published, so the
 /// re-sync it triggers -- `system.check_prereqs` and `workspace.list` -- and
 /// every pane's own re-attach have landed before the next step acts.
@@ -173,6 +205,8 @@ pub(crate) async fn run(steps: Vec<String>, mut client: DaemonClient, qt: QtHand
     let mut agent: Option<AgentId> = None;
     let mut run: Option<RunId> = None;
     let mut created = 0usize;
+    // How many `merge` steps have run, which is what picks the mode.
+    let mut merged = 0usize;
     for step in steps {
         tracing::info!(target: "smoke", "step: {step}");
         let outcome = match step.as_str() {
@@ -207,6 +241,11 @@ pub(crate) async fn run(steps: Vec<String>, mut client: DaemonClient, qt: QtHand
             "allow_host" => allow_host(&qt, workspace.as_ref()).await,
             "run_stop" => run_stop(&client, run.take()).await,
             "close" => close(&client, pty.take()).await,
+            "merge" => {
+                merged += 1;
+                merge(&qt, workspace.as_ref(), merged).await
+            }
+            "pr" => pr(&qt, workspace.as_ref()).await,
             "destroy" => destroy(&client, &qt, workspace.take()).await,
             "reconnect" => reconnect(&client).await.map(|fresh| client = fresh),
             "quit" => quit(&qt).await,
@@ -399,6 +438,56 @@ async fn destroy(
     let id = workspace_id.to_string();
     qt.queue(move |q| q.workspace_destroyed(QString::from(&id)))
         .map_err(|_| "the Qt thread is gone".to_owned())?;
+    Ok(())
+}
+
+/// Merges the workspace the last `create*` made into its base branch.
+///
+/// Through the window, not on this module's own client: `workspace.merge` has
+/// to leave `AppController::merge_workspace`, which is where the toolbar's word
+/// becomes a `MergeMode` and where an empty summary becomes `None`. Sending the
+/// request by hand would prove only that the daemon answers one, and would step
+/// around both of those.
+///
+/// `nth` is which merge of the run this is, and picks the mode out of
+/// [`MERGE_MODES`]. Nothing here reads the answer -- it arrives as
+/// `mergeFinished` or `workspaceOperationFailed`, both of which the toolbar
+/// handles -- so a conflict is not a failed step; a failed *request* is, and
+/// shows up as the `workspace.merge failed` warning the suite asserts against.
+async fn merge(qt: &QtHandle, workspace: Option<&WorkspaceId>, nth: usize) -> Result<(), String> {
+    let workspace_id = need(workspace, "merge")?.to_string();
+    let mode = MERGE_MODES[nth.saturating_sub(1).min(MERGE_MODES.len() - 1)];
+    let summary = if mode == "squash" { SQUASH_SUMMARY } else { "" };
+    qt.queue(move |q| {
+        q.merge_workspace(
+            QString::from(&workspace_id),
+            QString::from(mode),
+            QString::from(summary),
+        )
+    })
+    .map_err(|_| "the Qt thread is gone".to_owned())?;
+    tokio::time::sleep(OPERATION_SETTLE).await;
+    tracing::info!(target: "smoke", "merge requested with mode {mode}");
+    Ok(())
+}
+
+/// Opens a pull request for that workspace, the way the PR dialog's OK does.
+///
+/// Through the window for the same reason [`merge`] is: `workspace.create_pr`
+/// has to leave `AppController::create_pr` carrying the dialog's three fields.
+async fn pr(qt: &QtHandle, workspace: Option<&WorkspaceId>) -> Result<(), String> {
+    let workspace_id = need(workspace, "pr")?.to_string();
+    qt.queue(move |q| {
+        q.create_pr(
+            QString::from(&workspace_id),
+            QString::from(PR_TITLE),
+            QString::from(PR_BODY),
+            PR_DRAFT,
+        )
+    })
+    .map_err(|_| "the Qt thread is gone".to_owned())?;
+    tokio::time::sleep(OPERATION_SETTLE).await;
+    tracing::info!(target: "smoke", "pull request requested");
     Ok(())
 }
 

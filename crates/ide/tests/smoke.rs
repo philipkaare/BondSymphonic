@@ -19,11 +19,16 @@
 //! configuration is detected and a run started and stopped on a bridged host
 //! port, the network denial the daemon reports behind it becomes a toast on the
 //! workspace that raised it and answering that toast sends the workspace's own
-//! allowlist back with the blocked host added, the Qt event loop is still
-//! responsive at the end (the `quit` step runs on it), and the process ends with
-//! status 0 well inside the time limit.
+//! allowlist back with the blocked host added, a workspace is merged and then
+//! squashed into a conflict and a pull request opened for it, the daemon drops
+//! the connection and the IDE builds a new one and re-syncs on its own, the
+//! layout is written to `state.json` with the workspace's group and its open
+//! editor in it, the Qt event loop is still responsive at the end (the `quit`
+//! step runs on it), and the process ends with status 0 well inside the time
+//! limit.
 
 use base64::Engine as _;
+use bondsymphonic_ide::model::persistence::{StateFile, STATE_VERSION};
 use bondsymphonic_proto::*;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
@@ -42,11 +47,23 @@ const TOKEN: &str = "smoke-token";
 /// second on another: a Claude tab has a transcript pane and no PTY, so the
 /// `close`/`destroy` pair only means something over a workspace whose pane is a
 /// terminal.
+///
+/// The two `merge` steps and the `pr` land on that terminal workspace, and the
+/// `reconnect` comes after them, so everything before it was done on the first
+/// connection and the `destroy` after it on the second.
 const SCRIPT: &str = "create_claude,open_agent,send,allow,tree,open_file,open_diff,stop,create,\
-                      detect,run_start,allow_host,run_stop,open,close,destroy,quit";
+                      detect,run_start,allow_host,run_stop,merge,merge,pr,open,close,reconnect,\
+                      destroy,quit";
 /// The file `open_file` and `open_diff` act on, and the one entry of the fake
 /// `fs.list_dir` listing that is not a directory.
 const OPEN_PATH: &str = "README.md";
+/// The group the smoke script files its tabs under, spelled the same way
+/// `qobjects::smoke` spells it, and the id the fake daemon gives the first
+/// workspace — the Claude one, the only one still alive when the process ends.
+const GROUP: &str = "Default";
+const CLAUDE_WORKSPACE: &str = "ws_smoke1";
+/// The second, the terminal one, which the `destroy` step takes away again.
+const TERMINAL_WORKSPACE: &str = "ws_smoke2";
 /// The agent the fake daemon hands out, the tool it asks about and the id of
 /// the request the `allow` step answers. The script agrees the request id with
 /// the daemon rather than reading it off the transcript, and the window refuses
@@ -90,11 +107,25 @@ const DEFAULT_ALLOW: [&str; 12] = [
     "*.github.com",
     "*.githubusercontent.com",
 ];
+/// The file the second merge reports a conflict in. Deliberately not
+/// [`OPEN_PATH`]: a conflict list is the daemon's own reading of the failed
+/// merge and has nothing to do with what the Explorer happens to be showing.
+const CONFLICT_PATH: &str = "a.txt";
+/// The summary the squashing merge carries. The first merge sends none, so the
+/// pair shows both halves of the optional field crossing the wire.
+const MERGE_SUMMARY: &str = "smoke: squashed";
+/// What `pr` sends and what the fake daemon answers with. `draft` is true so
+/// the flag is carried as something other than its default.
+const PR_TITLE: &str = "Smoke PR";
+const PR_BODY: &str = "Opened by the smoke run.";
+const PR_DRAFT: bool = true;
+const PR_URL: &str = "https://github.com/example/repo/pull/42";
 /// The `quit` step alone waits 2 s, each of `open_agent`, `send`, `allow`,
-/// `run_start` and `allow_host` another 1.5 s, and `create`, `create_claude`,
-/// `open_file`, `open_diff`, `stop`, `detect` and `close` another 0.75 s each —
-/// about 16 s of deliberate waiting; the rest is a Qt startup on a cold cache.
-const RUN_LIMIT: Duration = Duration::from_secs(75);
+/// `run_start` and `allow_host` another 1.5 s, `reconnect` a second of backoff
+/// and 1.5 s of settling, and `create`, `create_claude`, `open_file`,
+/// `open_diff`, `stop`, `detect`, `merge`, `pr` and `close` another 0.75 s each
+/// — about 22 s of deliberate waiting; the rest is a Qt startup on a cold cache.
+const RUN_LIMIT: Duration = Duration::from_secs(120);
 /// The methods the script must produce, in this order. `agent.history` is the
 /// window's own doing — only `TranscriptModel::attach` sends it, and the model
 /// only attaches because the window reacted to `agentStarted` — so its place
@@ -109,7 +140,14 @@ const RUN_LIMIT: Duration = Duration::from_secs(75);
 /// `workspace.set_allowlist` are `RunPanelModel::allowHost` answering the
 /// toast, in that order, because it reads the daemon's list before it sends one
 /// back.
-const EXPECTED: [&str; 19] = [
+/// The second `hello` and the `workspace.list` after it are the reconnect: no
+/// step connects to anything, so a second handshake can only be
+/// `AppController`'s own loop noticing the socket had gone and building a new
+/// connection, and the `workspace.list` behind it is the re-sync that finds the
+/// tabs the restarted daemon still knows. The `workspace.destroy` after both is
+/// the proof that the script's next step reached the daemon on the *new*
+/// connection.
+const EXPECTED: [&str; 24] = [
     "hello",
     "workspace.create",
     "agent.start",
@@ -126,8 +164,13 @@ const EXPECTED: [&str; 19] = [
     "workspace.get",
     "workspace.set_allowlist",
     "run.stop",
+    "workspace.merge",
+    "workspace.merge",
+    "workspace.create_pr",
     "pty.open",
     "pty.close",
+    "hello",
+    "workspace.list",
     "workspace.destroy",
 ];
 /// Requests the window must have made after `workspace.create` on its own
@@ -147,7 +190,7 @@ const WORK_TEXT: &str = "hello\nworld\n";
 /// `fs.write_file` is not among them: no step saves, so asserting on its
 /// warning would assert nothing. The fake daemon answers it anyway, so a future
 /// step that does save needs no change on the daemon side.
-const NO_WARNINGS: [&str; 16] = [
+const NO_WARNINGS: [&str; 21] = [
     "fs.read_file failed",
     "workspace.diff failed",
     "workspace.changes failed",
@@ -186,6 +229,24 @@ const NO_WARNINGS: [&str; 16] = [
     // wish: `workspace.set_allowlist` reaches the daemon only after the window
     // has matched the request against the panel's own workspace.
     "allow host not routed",
+    // The Changes toolbar's three. A merge that conflicts is not one of these:
+    // it comes back as `mergeFinished(ok: false)`, an answer rather than a
+    // failure, and only a refusal or a `GitError` is logged here. So a run in
+    // which either of the first two appears is a run where the request never
+    // reached the daemon or its reply could not be read -- which the journal
+    // alone cannot tell apart from a served one.
+    "workspace.merge failed",
+    "workspace.create_pr failed",
+    // The pair the toolbar issues behind every `mergeFinished` to refresh its
+    // "N changed files": logged together under this prefix when either half
+    // fails, which would leave the Discard confirmation with no count.
+    "workspace summary for",
+    // The re-sync after the reconnect. Both are `AppController`'s own, and both
+    // go out on the connection it has just built, so a warning here is a
+    // reconnect that produced a status bar saying "connected" over a client
+    // that could not be used.
+    "workspace.list failed",
+    "system.check_prereqs failed",
 ];
 
 /// The fake daemon's own control method: it answers by closing the connection,
@@ -197,10 +258,48 @@ const NO_WARNINGS: [&str; 16] = [
 /// `crates/ide/tests/reconnect_tests.rs` is where it is exercised end to end.
 const TEST_DROP: &str = "system.test_drop";
 
-/// A recorder the fake daemon appends to: every request method it answered in
-/// arrival order, every permission reply it received, or every allowlist it was
-/// handed.
+/// A recorder the fake daemon appends to.
 type Journal = Arc<Mutex<Vec<String>>>;
+
+/// Everything the fake daemon writes down, so a request that arrived can be
+/// told apart from a request that arrived carrying the right thing. The method
+/// list alone cannot do that: it says a `workspace.merge` was sent, not which
+/// mode it asked for.
+#[derive(Clone)]
+struct Journals {
+    /// Every request method answered, in arrival order.
+    methods: Journal,
+    /// Every `agent.permission_reply` as `<request id>:<decision>`.
+    replies: Journal,
+    /// Every `workspace.set_allowlist` as its comma-joined host list.
+    allowlists: Journal,
+    /// Every `workspace.merge` as `<mode>|<summary>`, with `-` for a merge that
+    /// sent none.
+    merges: Journal,
+    /// Every `workspace.create_pr` as `<title>|<body>|<draft>`.
+    prs: Journal,
+}
+
+impl Journals {
+    fn new() -> Self {
+        let fresh = || -> Journal { Arc::new(Mutex::new(Vec::new())) };
+        Self {
+            methods: fresh(),
+            replies: fresh(),
+            allowlists: fresh(),
+            merges: fresh(),
+            prs: fresh(),
+        }
+    }
+
+    fn push(journal: &Journal, entry: String) {
+        journal.lock().expect("journal mutex").push(entry);
+    }
+
+    fn read(journal: &Journal) -> Vec<String> {
+        journal.lock().expect("journal mutex").clone()
+    }
+}
 
 #[test]
 fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
@@ -216,7 +315,7 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let (addr, journal, replies, allowlists) = rt.block_on(fake_daemon());
+    let (addr, journals) = rt.block_on(fake_daemon());
 
     // The IDE persists its settings and its layout on exit. Both are pointed
     // at a directory of this run's own: a test must never write the developer's
@@ -225,6 +324,7 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
     let config = std::env::temp_dir().join(format!("bs-smoke-config-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&config);
     std::fs::create_dir_all(&config).expect("smoke config dir");
+    let state_path = config.join("state.json");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
         .env("QT_QPA_PLATFORM", "offscreen")
@@ -232,7 +332,7 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
         .env("BS_DAEMON_TOKEN", TOKEN)
         .env("BS_SMOKE_SCRIPT", SCRIPT)
         .env("BS_SETTINGS_PATH", config.join("settings.json"))
-        .env("BS_STATE_PATH", config.join("state.json"))
+        .env("BS_STATE_PATH", &state_path)
         .env("BS_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -253,11 +353,17 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
         out.recv().expect("the stdout drain thread is alive"),
         err.recv().expect("the stderr drain thread is alive"),
     );
-    let seen = journal.lock().expect("journal mutex").clone();
-    let answered = replies.lock().expect("replies mutex").clone();
-    let allowed = allowlists.lock().expect("allowlists mutex").clone();
+    let seen = Journals::read(&journals.methods);
+    let answered = Journals::read(&journals.replies);
+    let allowed = Journals::read(&journals.allowlists);
+    let merges = Journals::read(&journals.merges);
+    let prs = Journals::read(&journals.prs);
+    // Read before the assertions, so a failure prints the file the run left
+    // behind rather than only the fact that it was wrong.
+    let state_json = std::fs::read_to_string(&state_path).unwrap_or_default();
     let context = format!(
         "requests: {seen:?}\npermission replies: {answered:?}\nallowlists: {allowed:?}\n\
+         merges: {merges:?}\npull requests: {prs:?}\nstate.json: {state_json}\n\
          --- stdout ---\n{out}\n--- stderr ---\n{err}"
     );
     // Both pipes together. `tracing_subscriber::fmt()` writes to *stdout* by
@@ -268,7 +374,7 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
     let logs = format!("{out}\n{err}");
     eprintln!(
         "smoke: the fake daemon answered {seen:?}, permission replies {answered:?}, allowlists \
-         {allowed:?}"
+         {allowed:?}, merges {merges:?}, pull requests {prs:?}"
     );
 
     let status =
@@ -340,6 +446,38 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
         vec![expected_allowlist.join(",")],
         "the allowlist the fake daemon received was not the defaults plus {DENIED_HOST}\n{context}"
     );
+    // What the two `merge` steps actually asked for. The journal shows two
+    // `workspace.merge` calls; this shows the toolbar's word reached the daemon
+    // as the right mode both times, and that an empty summary crossed as "not
+    // supplied" while a real one crossed intact. A run that sent `merge` twice,
+    // or that turned the empty box into an empty string, would still have
+    // satisfied the journal.
+    assert_eq!(
+        merges,
+        vec!["merge|-".to_owned(), format!("squash|{MERGE_SUMMARY}"),],
+        "the merges the fake daemon received were not a merge with no summary then a squash with \
+         one\n{context}"
+    );
+    // The same for the pull request: the journal shows one was asked for, this
+    // shows the title, the body and the draft flag arrived as they were sent.
+    assert_eq!(
+        prs,
+        vec![format!("{PR_TITLE}|{PR_BODY}|{PR_DRAFT}")],
+        "the pull request the fake daemon received did not carry the smoke run's title, body and \
+         draft flag\n{context}"
+    );
+    // The reconnect. Nothing in the script connects to anything, so a second
+    // handshake can only be `AppController`'s loop noticing the socket had gone
+    // and building a new connection by itself.
+    let hellos = seen.iter().filter(|m| *m == "hello").count();
+    assert_eq!(
+        hellos, 2,
+        "expected exactly two handshakes, one per connection\n{context}"
+    );
+    assert!(
+        seen.iter().any(|m| m == TEST_DROP),
+        "the reconnect step never asked the fake daemon to drop the connection\n{context}"
+    );
     // A login terminal on the host is the one thing this run must never open,
     // and nothing in the script asks for one: every prerequisite the fake
     // daemon reports passes, so the setup page never appears.
@@ -391,6 +529,48 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
             "the IDE logged {warning:?} even though the fake daemon answered\n{context}"
         );
     }
+
+    // The layout the run left on disk, at `BS_STATE_PATH` and nowhere near the
+    // developer's own `%APPDATA%\BondSymphonic`. Nothing in the script writes
+    // it: the window reports its arrangement through `noteGroups` and its
+    // editor tabs through `noteEditors`, and the controller writes the file
+    // debounced behind them. So a file with the Claude workspace filed under
+    // its group and the editor's path against it is the whole persistence path
+    // having run -- and having survived the reconnect, which happened before
+    // the process ended.
+    assert!(
+        !state_json.is_empty(),
+        "the IDE wrote no state.json at BS_STATE_PATH\n{context}"
+    );
+    let state: StateFile = serde_json::from_str(&state_json)
+        .unwrap_or_else(|e| panic!("state.json is not a StateFile ({e})\n{context}"));
+    assert_eq!(
+        state.version, STATE_VERSION,
+        "state.json carries the wrong format version\n{context}"
+    );
+    let group = state
+        .groups
+        .iter()
+        .find(|g| g.name == GROUP)
+        .unwrap_or_else(|| panic!("state.json has no {GROUP:?} group\n{context}"));
+    assert!(
+        group.workspace_ids.iter().any(|id| id == CLAUDE_WORKSPACE),
+        "state.json did not file {CLAUDE_WORKSPACE} under {GROUP:?}\n{context}"
+    );
+    // The destroyed workspace is gone from every group rather than left behind
+    // as a tab a restart would try to restore.
+    assert!(
+        !state
+            .groups
+            .iter()
+            .any(|g| g.workspace_ids.iter().any(|id| id == TERMINAL_WORKSPACE)),
+        "state.json still files the destroyed {TERMINAL_WORKSPACE} under a group\n{context}"
+    );
+    assert_eq!(
+        state.open_editors.get(CLAUDE_WORKSPACE).map(Vec::as_slice),
+        Some(&[OPEN_PATH.to_owned()][..]),
+        "state.json did not record {OPEN_PATH} as {CLAUDE_WORKSPACE}'s open editor\n{context}"
+    );
 }
 
 /// Whether `wanted` appears in `seen` in order, other requests in between
@@ -546,23 +726,25 @@ fn entry(name: &str, is_dir: bool, size: u64) -> FileEntry {
 /// output for each PTY, an exit for each PTY it ends). Everything else is an
 /// explicit error, so an unexpected request shows up in the journal rather than
 /// hanging the IDE.
-async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal, Journal) {
+async fn fake_daemon() -> (std::net::SocketAddr, Journals) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
-    let journal: Journal = Arc::new(Mutex::new(Vec::new()));
-    let recorded = journal.clone();
-    // Every `agent.permission_reply` as `<request id>:<decision>`. The method
-    // journal shows that an answer was sent; this shows which request it
-    // answered and what it said, which is the whole point of the `allow` step.
-    let replies: Journal = Arc::new(Mutex::new(Vec::new()));
-    let recorded_replies = replies.clone();
-    // Every `workspace.set_allowlist` as its comma-joined host list. The method
-    // journal shows one was sent; this shows what the IDE put in it, which is
-    // the whole point of the `allow_host` step.
-    let allowlists: Journal = Arc::new(Mutex::new(Vec::new()));
-    let recorded_allowlists = allowlists.clone();
+    let journals = Journals::new();
+    let recording = journals.clone();
 
     tokio::spawn(async move {
+        let Journals {
+            methods: recorded,
+            replies: recorded_replies,
+            allowlists: recorded_allowlists,
+            merges: recorded_merges,
+            prs: recorded_prs,
+        } = recording;
+        // How many merges have been asked for. The first is answered as work
+        // that landed and the ones after it as a conflict, so one script can
+        // drive both shapes of `MergeResult` -- an answer either way, never an
+        // error -- through the same path.
+        let mut merges = 0usize;
         // One workspace id per created name, so a repeated `create` is answered
         // consistently and `pty.open` can be checked against a known workspace.
         let mut workspaces: HashMap<String, String> = HashMap::new();
@@ -617,7 +799,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal, Journal) {
                     .ok()
                     .and_then(|v| v.get("method")?.as_str().map(str::to_owned))
                     .unwrap_or_default();
-                recorded.lock().expect("journal mutex").push(method.clone());
+                Journals::push(&recorded, method.clone());
                 if method == TEST_DROP {
                     // No reply at all: the socket simply goes, which is what a
                     // daemon that has died looks like from the IDE's side. The
@@ -803,10 +985,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal, Journal) {
                             PermissionDecision::Allow => "allow",
                             PermissionDecision::Deny => "deny",
                         };
-                        recorded_replies
-                            .lock()
-                            .expect("replies mutex")
-                            .push(format!("{}:{decision}", p.request_id));
+                        Journals::push(&recorded_replies, format!("{}:{decision}", p.request_id));
                         match agent.clone() {
                             Some((ws, ag)) => {
                                 follow_ups.push(agent_state(&ws, &ag, AgentState::Working, None));
@@ -938,10 +1117,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal, Journal) {
                     // here.
                     Request::WorkspaceSetAllowlist(p) => {
                         let ws = p.workspace_id.0.clone();
-                        recorded_allowlists
-                            .lock()
-                            .expect("allowlists mutex")
-                            .push(p.hosts.join(","));
+                        Journals::push(&recorded_allowlists, p.hosts.join(","));
                         allowed.insert(ws.clone(), p.hosts.clone());
                         if let Some(name) = names.get(&ws) {
                             let info = workspace(&ws, name, WorkspaceState::Ready, &p.hosts);
@@ -952,6 +1128,68 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal, Journal) {
                         }
                         Some(ServerMessage::ok(id, &Empty {}))
                     }
+                    // The Changes toolbar's half of a merge. Both answers are
+                    // successes at the RPC level -- a conflict is a `MergeResult`
+                    // with `ok: false`, not an error -- because that is the split
+                    // the toolbar branches on: `mergeFinished` for both, a banner
+                    // only for the second.
+                    Request::WorkspaceMerge(p) => {
+                        let mode = match p.mode {
+                            MergeMode::Merge => "merge",
+                            MergeMode::Rebase => "rebase",
+                            MergeMode::Squash => "squash",
+                        };
+                        // `-` for a merge that sent no summary, so the two cases
+                        // are told apart in the journal rather than both reading
+                        // as an empty string.
+                        let summary = p.message.clone().unwrap_or_else(|| "-".to_owned());
+                        Journals::push(&recorded_merges, format!("{mode}|{summary}"));
+                        merges += 1;
+                        let result = if merges == 1 {
+                            MergeResult {
+                                ok: true,
+                                conflicts: Vec::new(),
+                                reason: None,
+                            }
+                        } else {
+                            MergeResult {
+                                ok: false,
+                                conflicts: vec![CONFLICT_PATH.to_owned()],
+                                reason: Some("conflict".to_owned()),
+                            }
+                        };
+                        Some(ServerMessage::ok(id, &result))
+                    }
+                    // The pull request. A real daemon pushes the branch and shells
+                    // out to `gh`; what the IDE has to get right is only that the
+                    // dialog's three fields reach the wire and that the URL in the
+                    // reply is what it shows.
+                    Request::WorkspaceCreatePr(p) => {
+                        Journals::push(
+                            &recorded_prs,
+                            format!("{}|{}|{}", p.title, p.body, p.draft),
+                        );
+                        Some(ServerMessage::ok(
+                            id,
+                            &CreatePrResult {
+                                url: PR_URL.to_owned(),
+                            },
+                        ))
+                    }
+                    // Half of what the Changes toolbar asks for behind every
+                    // `mergeFinished` to refresh its changed-file count; the other
+                    // half is `workspace.changes` above. One dirty file, matching
+                    // that listing.
+                    Request::WorkspaceStatus(_) => Some(ServerMessage::ok(
+                        id,
+                        &WorkspaceStatusResult {
+                            entries: vec![GitStatusEntry {
+                                path: OPEN_PATH.to_owned(),
+                                status: FileStatus::Modified,
+                                staged: false,
+                            }],
+                        },
+                    )),
                     // One configuration, whatever path is asked about: the New Agent
                     // dialog asks about the repository and the Run panel about the
                     // worktree, and both have to get a list they can render.
@@ -1050,7 +1288,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal, Journal) {
         }
     });
 
-    (addr, journal, replies, allowlists)
+    (addr, journals)
 }
 
 #[test]
@@ -1061,7 +1299,53 @@ fn request_order_is_checked_as_a_subsequence() {
         methods.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    let seen = journal(&[
+    /// The same run with the first `method` taken out. Used to show that a run
+    /// missing one call is not a match, without respelling the other forty.
+    fn drop_first(methods: &[&'static str], method: &str) -> Vec<&'static str> {
+        let mut out = methods.to_vec();
+        let at = out
+            .iter()
+            .position(|m| *m == method)
+            .unwrap_or_else(|| panic!("{method} is not in the fixture"));
+        out.remove(at);
+        out
+    }
+
+    /// The same, for the last occurrence: which is how the reconnect's second
+    /// `hello` and the second of the two merges are taken away.
+    fn drop_last(methods: &[&'static str], method: &str) -> Vec<&'static str> {
+        let mut out = methods.to_vec();
+        let at = out
+            .iter()
+            .rposition(|m| *m == method)
+            .unwrap_or_else(|| panic!("{method} is not in the fixture"));
+        out.remove(at);
+        out
+    }
+
+    /// The same run with the first `a` and the first `b` exchanged, which is
+    /// how every "in the wrong order" case below is built.
+    fn swap_first(methods: &[&'static str], a: &str, b: &str) -> Vec<&'static str> {
+        let mut out = methods.to_vec();
+        let (i, j) = (
+            out.iter()
+                .position(|m| *m == a)
+                .unwrap_or_else(|| panic!("{a} is not in the fixture")),
+            out.iter()
+                .position(|m| *m == b)
+                .unwrap_or_else(|| panic!("{b} is not in the fixture")),
+        );
+        out.swap(i, j);
+        out
+    }
+
+    // One whole run, in the order the fake daemon really sees it: the
+    // connect-time pair, the Claude tab and its turn, the editor and the diff,
+    // the terminal tab with its Run panel, the merge pair and the pull request,
+    // the PTY pair, then the drop -- and behind it the second handshake, the
+    // controller's re-sync and every pane re-attaching on the new connection,
+    // with the script's `workspace.destroy` last of all.
+    let full: Vec<&'static str> = vec![
         "hello",
         "workspace.list",
         "system.check_prereqs",
@@ -1089,131 +1373,73 @@ fn request_order_is_checked_as_a_subsequence() {
         "workspace.get",
         "workspace.set_allowlist",
         "run.stop",
+        "workspace.merge",
+        // The Changes toolbar refreshing its count behind the merge that landed.
+        "workspace.status",
+        "workspace.changes",
+        "workspace.merge",
+        "workspace.create_pr",
         "pty.open",
         "pty.close",
-        "workspace.destroy",
-    ]);
-    assert!(contains_in_order(&seen, &EXPECTED));
-    // Order still matters: a `pty.open` before the first create is not a match.
-    let reordered = journal(&[
+        "system.test_drop",
         "hello",
-        "pty.open",
-        "workspace.create",
-        "agent.start",
-        "agent.history",
-        "agent.send",
-        "agent.permission_reply",
+        "workspace.list",
+        "system.check_prereqs",
         "fs.list_dir",
-        "fs.read_file",
-        "workspace.diff",
-        "agent.stop",
+        "fs.watch",
+        "workspace.changes",
         "repo.detect_run_configs",
         "run.list",
-        "run.start",
-        "workspace.get",
-        "workspace.set_allowlist",
-        "run.stop",
-        "pty.close",
+        "agent.history",
         "workspace.destroy",
-    ]);
-    assert!(!contains_in_order(&reordered, &EXPECTED));
+    ];
+    assert!(contains_in_order(&journal(&full), &EXPECTED));
+
+    // Order still matters: a `pty.open` before the first create is not a match,
+    // because the only PTY this script opens is the one after the pull request.
+    let mut early_pty: Vec<&'static str> =
+        full.iter().copied().filter(|m| *m != "pty.open").collect();
+    early_pty.insert(1, "pty.open");
+    assert!(!contains_in_order(&journal(&early_pty), &EXPECTED));
+
     // Nor does the diff count as the file's own load: a run that opened the
     // diff first would put `workspace.diff` ahead of `fs.read_file`.
-    let diff_first = journal(&[
-        "hello",
-        "workspace.create",
-        "agent.start",
-        "agent.history",
-        "agent.send",
-        "agent.permission_reply",
-        "fs.list_dir",
-        "workspace.diff",
-        "fs.read_file",
-        "agent.stop",
-        "repo.detect_run_configs",
-        "run.list",
-        "run.start",
-        "workspace.get",
-        "workspace.set_allowlist",
-        "run.stop",
-        "pty.open",
-        "pty.close",
-        "workspace.destroy",
-    ]);
-    assert!(!contains_in_order(&diff_first, &EXPECTED));
+    let diff_first = swap_first(&full, "fs.read_file", "workspace.diff");
+    assert!(!contains_in_order(&journal(&diff_first), &EXPECTED));
+
     // A transcript that replayed its history only after the turn had started
     // would be a pane attached too late to have shown the permission bar.
-    let history_late = journal(&[
-        "hello",
-        "workspace.create",
-        "agent.start",
-        "agent.send",
-        "agent.history",
-        "agent.permission_reply",
-        "fs.list_dir",
-        "fs.read_file",
-        "workspace.diff",
-        "agent.stop",
-        "repo.detect_run_configs",
-        "run.list",
-        "run.start",
-        "workspace.get",
-        "workspace.set_allowlist",
-        "run.stop",
-        "pty.open",
-        "pty.close",
-        "workspace.destroy",
-    ]);
-    assert!(!contains_in_order(&history_late, &EXPECTED));
+    let history_late = swap_first(&full, "agent.history", "agent.send");
+    assert!(!contains_in_order(&journal(&history_late), &EXPECTED));
+
     // A turn that never asked for permission, or was never answered, is not a
     // match: the whole point of the Claude half is that one reply went out.
-    let unanswered = journal(&[
-        "hello",
-        "workspace.create",
-        "agent.start",
-        "agent.history",
-        "agent.send",
-        "fs.list_dir",
-        "fs.read_file",
-        "workspace.diff",
-        "agent.stop",
-        "repo.detect_run_configs",
-        "run.list",
-        "run.start",
-        "workspace.get",
-        "workspace.set_allowlist",
-        "run.stop",
-        "pty.open",
-        "pty.close",
-        "workspace.destroy",
-    ]);
-    assert!(!contains_in_order(&unanswered, &EXPECTED));
+    let unanswered = drop_first(&full, "agent.permission_reply");
+    assert!(!contains_in_order(&journal(&unanswered), &EXPECTED));
+
     // An "Allow host" that sent a list without reading the daemon's first would
     // put `workspace.set_allowlist` ahead of `workspace.get`. The order is the
     // claim: the IDE extends the workspace's own allowlist rather than
     // replacing it with whatever it happened to be holding.
-    let allowlist_unread = journal(&[
-        "hello",
-        "workspace.create",
-        "agent.start",
-        "agent.history",
-        "agent.send",
-        "agent.permission_reply",
-        "fs.list_dir",
-        "fs.read_file",
-        "workspace.diff",
-        "agent.stop",
-        "repo.detect_run_configs",
-        "run.list",
-        "run.start",
-        "workspace.set_allowlist",
-        "workspace.get",
-        "run.stop",
-        "pty.open",
-        "pty.close",
-        "workspace.destroy",
-    ]);
-    assert!(!contains_in_order(&allowlist_unread, &EXPECTED));
+    let allowlist_unread = swap_first(&full, "workspace.get", "workspace.set_allowlist");
+    assert!(!contains_in_order(&journal(&allowlist_unread), &EXPECTED));
+
+    // One merge is not two: the pair is what covers the daemon's two answers,
+    // the one that moved the base and the one that stopped on a conflict.
+    let one_merge = drop_last(&full, "workspace.merge");
+    assert!(!contains_in_order(&journal(&one_merge), &EXPECTED));
+
+    // A run that never came back is not a match either. Without the second
+    // handshake there is nothing to show the IDE rebuilt the connection on its
+    // own, which is the whole claim of the `reconnect` step.
+    let never_reconnected = drop_last(&full, "hello");
+    assert!(!contains_in_order(&journal(&never_reconnected), &EXPECTED));
+
+    // And a reconnect that handshook without re-syncing: the status bar would
+    // say "connected" over tabs nobody had checked against the daemon.
+    let no_resync = drop_last(&full, "workspace.list");
+    assert!(!contains_in_order(&journal(&no_resync), &EXPECTED));
+
     // A missing step is not a match either.
     let short = journal(&["hello", "workspace.create", "agent.start", "fs.list_dir"]);
     assert!(!contains_in_order(&short, &EXPECTED));

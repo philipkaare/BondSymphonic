@@ -158,10 +158,49 @@ Consequences the daemon handles:
   rebase, squash, push) runs outside the sandbox with the main store as primary
   (`GIT_OBJECT_DIRECTORY` unset) and `GIT_ALTERNATE_OBJECT_DIRECTORIES=<private
   objects>`, so it can read workspace commits and any commits it creates land in
-  the shared store. After a successful merge, rebase, squash, or push the daemon
-  runs `git repack -a -d` in the main repo so every referenced object is copied
-  into the shared store before the private directory is deleted with the
-  workspace.
+  the shared store. That is not enough on its own: a merge commit lands in the
+  shared store, but the workspace commits under it are still only in the
+  workspace's private object directory, which is deleted with the workspace. So
+  after a successful merge, rebase, squash or push the daemon copies the range
+  out — see "Absorbing the workspace's objects" below.
+
+**Absorbing the workspace's objects.** `git repack -a -d` cannot be used for
+this, and the reason is structural rather than incidental. Every live
+workspace's `refs/heads/bs/<name>/work` lives in the *base repository's* ref
+store while its objects live in that workspace's private object directory. A
+`repack -a` packs everything reachable from every ref and then deletes the loose
+objects it replaced; as soon as a second workspace exists, the refs it has to
+reach include commits it cannot read, and it fails — after the delete. The
+daemon therefore packs one range and nothing else:
+
+```
+git pack-objects --revs --delta-base-offset -q <repo>/.git/objects/pack/pack
+  stdin: <after>
+^<before>
+
+```
+
+`<after>` is the base branch after the operation and `<before>` the same ref
+before it, so the range is exactly the commits the operation added; for a push
+it is `refs/remotes/origin/<branch>` before and after. An empty range is a
+no-op. The pack is written straight into `objects/pack`, which is where `git
+repack` puts its own.
+
+The copy then proves itself, through a plain `git` carrying **no**
+`GIT_ALTERNATE_OBJECT_DIRECTORIES` — the user's own view of the repository:
+
+```
+git cat-file -e <after>^{commit}
+git rev-list --objects <after> ^<before>
+```
+
+`rev-list --objects` reads every commit and every tree in the range, which is
+what shows the pack landed and was indexed. A failure is retried once. If it
+still fails, the RPC fails with `ErrorCode::Internal`, `data.reason =
+"objects_stranded"` and `data.merged` (or `data.pushed`) `true`, and a message
+saying the work landed, that its objects could not be copied out, and that the
+workspace must not be destroyed. It is never a warning: silently succeeding here
+would hand the user a base branch that stops being readable when they clean up.
 - `git fetch`/`git pull` inside the sandbox cannot update `refs/remotes/*` (read-
   only). This is intended: fetches are a daemon operation (`repo.inspect` refreshes
   remotes on request).
@@ -179,23 +218,49 @@ A `--no-git-protect` daemon flag mounts `.git` read-write for troubleshooting;
 
 ### 5.4 Merge, rebase, squash
 Run in the main repo by the daemon, never inside a sandbox:
-- Guard: main repo working tree must be clean on the base branch, else
-  `Conflict {reason: "base_dirty"}`. If the main repo is currently checked out on a
-  different branch, the daemon uses a temporary worktree of the base branch under
-  `~/.bondsymphonic/merge-<id>` so it never disturbs the user's checkout.
+- Serialised per repository: two merges, or a merge and a push, of the same
+  repository never run at once, because both move the same base branch.
+- Where it lands: in the user's own checkout when that is on the base branch,
+  and otherwise in a temporary worktree of the base under
+  `~/.bondsymphonic/merge-<id>`, removed on every exit path. Scratch worktrees an
+  earlier run left behind (a killed daemon) are reaped at the start of each
+  merge, under the same lock, so anything still there belongs to nobody.
+- Guard: the working tree must be clean, **and it is only checked on the first
+  of those two paths** — when the merge will land in the user's own checkout.
+  Otherwise the user's checkout is not involved and is not inspected. A dirty
+  base is `Conflict {reason: "base_dirty"}` with a message naming the repository
+  and the base branch; `--porcelain` counts untracked files, because `git merge`
+  refuses when an untracked file would be overwritten.
 - `merge`: `git merge --no-ff bs/<name>/work`.
 - `rebase`: `git rebase <base> bs/<name>/work` in the workspace worktree, then
   fast-forward the base.
 - `squash`: `git merge --squash` + `git commit -m "<name>: <summary>"` where the
   summary is the first line of the last workspace commit unless the request
   supplies a message.
-- On conflict: abort (`--abort`), return `{ok:false, conflicts:[paths]}`. The
-  workspace is untouched and the user can ask the agent to rebase.
+- On conflict: abort (`--abort`, or `reset --merge` for a squash), return
+  `{ok:false, conflicts:[paths], reason:"conflict"}` — an RPC *success*, not an
+  error, because a conflict is an answer. The workspace is untouched and the user
+  can ask the agent to rebase. `conflicts` holds repo-relative paths with `/`
+  separators on every platform.
+- After success the base has moved and the workspace and its branch still exist;
+  removing them is a separate `workspace.destroy`. The daemon then absorbs the
+  merged range into the shared object store (§5.2), and a failure there fails the
+  RPC with `reason: "objects_stranded"` and `merged: true`.
 
 ### 5.5 PR
 `git push -u origin bs/<name>/work` then `gh pr create --title --body [--draft]
---head bs/<name>/work --base <base>`; parse the URL from stdout. `gh` must be
-authenticated in the distro (reported by `check_prereqs`).
+--head bs/<name>/work --base <base>`; parse the URL from stdout. `gh` runs on the
+host with the daemon user's own configuration, never in a sandbox, and must be
+authenticated in the distro (reported by `check_prereqs` as `gh_auth`).
+`BS_GH_BIN` overrides the binary, split the way a shell would, for tests.
+
+Under the same per-repository lock as §5.4, and followed by the same absorb of
+`refs/remotes/origin/<branch>` before and after the push, whose failure is
+`reason: "objects_stranded"` with `pushed: true`.
+
+A failure of either command is a `GitError` carrying `{command, exit_code,
+stderr}`. The `command` field is what tells the two apart; the title and the body
+are deliberately not in it, so a client cannot echo them back from the error.
 
 ## 6. Sandbox
 
@@ -529,10 +594,20 @@ given to one process and is not state to keep. The file is rewritten whole
 through a temporary and a rename, when an agent starts, when the CLI reports its
 session id, and when the process ends.
 
+The record is written **before** the process is spawned, and removed again if
+the spawn fails. Writing it afterwards leaves a window in which the CLI's `init`
+line — and therefore the session id `--resume` needs — arrives before there is
+anything to record it against, and the id is then lost for good. Ordering the
+two this way closes the window structurally rather than by timing: the stdout
+reader cannot exist before the record does.
+
 Without it a transcript survives a restart but is unreachable: `agent.history`
 and `WorkspaceInfo.agents` both come from the live agent map, and a restart kills
 every sandbox. On startup `AgentManager::restore` reads the records and puts each
 one back as an agent with no process — state `Exited`, detail naming the restart.
+It runs to completion *before the accept loop starts*, since the ids it puts in
+the map are what a new agent's id is minted against; restarting the sandboxes,
+which takes seconds, runs alongside the accept loop instead.
 Its `agent.history` still reads the transcript, `WorkspaceInfo.agents` still
 lists it in its original order, and `agent.send`, `agent.permission_reply` and
 `agent.interrupt` answer `NotFound` pointing at `resume_session`; `agent.stop`
@@ -542,7 +617,10 @@ through a *new* agent started with `options.resume_session` set to the recorded
 session id, which is what the CLI's `--resume` needs.
 
 A file that will not parse is moved aside as `agents.json.corrupt` and read as
-empty: the workspaces live in a different file and must still come back.
+empty: the workspaces live in a different file and must still come back. If it
+cannot even be moved aside, it is *unreadable* rather than empty, and this
+daemon never writes the file again — overwriting records it could not read would
+lose agents that a later run, or a person, could still recover.
 `workspace.destroy` removes the workspace's records and their transcripts, and so
 does a restore that finds a record whose workspace the registry no longer has.
 

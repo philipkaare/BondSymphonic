@@ -9,6 +9,86 @@ Design: `docs/superpowers/specs/`. Plans: `docs/superpowers/plans/`.
 
 ## What works now
 
+Milestone 6: a workspace's work goes back to its base branch — merged, rebased, squashed,
+or pushed as a pull request — and the IDE survives both its own restart and the daemon's.
+
+- **Merge, Rebase, Squash.** The Explorer's Changes tab has a toolbar. **Merge** runs
+  `git merge --no-ff` of `bs/<name>/work` into the workspace's base branch, **Rebase**
+  replays the workspace's commits onto the base and fast-forwards it, and **Squash** lands
+  the lot as one commit whose subject you type — leave it empty and the daemon takes the
+  subject of the workspace's last commit. The daemon runs all three itself, never inside a
+  sandbox: in your own checkout when it is on the base branch, and otherwise in a scratch
+  worktree of the base under its data directory, so a repository checked out on some other
+  branch is never disturbed. A conflict aborts (`merge --abort`, `rebase --abort`,
+  `reset --merge`) and comes back as a banner listing the conflicting paths, with the
+  workspace exactly as it was. Merges and pushes of one repository are serialised, and
+  scratch worktrees an earlier run left behind are reaped at the start of each merge. A
+  merged workspace and its branch stay; removing them is a separate Discard.
+- **Create PR.** Fill in a title, a body and a draft flag, and the daemon runs
+  `git push -u origin bs/<name>/work` on the host followed by `gh pr create`, with your own
+  `gh` credentials — never in a sandbox. The pull request's URL appears in the status bar as
+  a link. A push or a `gh` failure comes back as a banner naming the command, its exit code
+  and its stderr in an expandable section, so "not logged in" reads as itself.
+- **Discard.** Destroys the workspace and everything unmerged in it, behind a confirmation
+  that names the workspace and how many changed files go with it.
+- **Close group.** Closing a group asks once per workspace — keep, merge or discard — and
+  then does exactly that, one workspace at a time. One confirmation covers every discard in
+  the run, and cancelling it cancels the whole run, merges included.
+- **The layout comes back.** `%APPDATA%\BondSymphonic\state.json` records the groups and
+  their order, the active tab, the open editor tabs per workspace and which was in front,
+  the splitter sizes and whether the two halves are swapped, the window geometry and dock
+  layout, the recently used repositories, and the per-workspace run port overrides. It is
+  written 500 ms after the last change and again on exit. On start the IDE reconciles it
+  against the daemon: workspaces the daemon no longer has are dropped along with their
+  editors and overrides, and workspaces it has that no group claims land in **Unsorted**.
+  `settings.json` moved beside it from the old per-project directory, and is copied across
+  once if the old file is the only one there.
+- **Reconnection.** When the daemon dies, the status bar says
+  `daemon: reconnecting (attempt N)` and the IDE relaunches it, backing off 1, 2, 4, 8, 16
+  and then 30 seconds between tries. The schedule only resets after a connection that held
+  for five seconds, so a daemon that crash-loops backs off instead of being restarted every
+  second. On reconnect the IDE re-runs `system.check_prereqs` and `workspace.list` and every
+  pane re-attaches by itself: the file tree re-lists, the Changes tab re-subscribes, the Run
+  panel re-detects, and each transcript replays its history.
+- **Agents come back as history.** The daemon records every agent it starts in `agents.json`
+  and restores them on start, so after a restart the tab still reads the whole conversation.
+  A restored agent is `exited`; the pane's **Restart** button starts a new one with
+  `--resume` pointed at the session id read out of the old transcript, so the conversation
+  continues rather than beginning again.
+- **Run port override.** A run configuration whose port the daemon guessed shows the port as
+  an editable field in the Run panel. Starting with a different number sends it as that
+  start's port, `PORT` included, and the number is remembered per workspace and
+  configuration. A port the repository's `bondsymphonic.toml` spells out is not editable.
+- **`[claude] settings`.** `[claude] settings = "<path>"` in a repository's
+  `bondsymphonic.toml` is copied into the workspace's sandbox home as `.claude/settings.json`
+  when an agent starts, instead of the daemon user's own copy. A path that escapes the
+  worktree is refused.
+
+Known limits in Milestone 6:
+
+- **PTYs do not survive a daemon restart.** A terminal pane whose daemon went away prints
+  `[daemon restarted]` and offers **Reopen**, which starts a fresh shell. The scrollback
+  above the marker is kept; the process, its shell history and anything it was running are
+  gone. The bottom Terminal tab behaves the same way.
+- **Runs do not survive one either.** A restarted daemon has no run processes and no port
+  bridges, so the Run panel comes back empty and a run has to be started again.
+- **Only history survives for agents, not the process.** A restored agent answers
+  `agent.history` and nothing else: sending to it, answering a permission for it or
+  interrupting it is a `NotFound` telling you to start a new one with resume.
+- **Merging into your own checkout needs it clean.** When the repository is checked out on
+  the base branch, an uncommitted change anywhere in it — untracked files included — refuses
+  the merge with "commit or stash your changes there first" rather than merging over your
+  work. Checked out on another branch, your working tree is not inspected at all, because
+  the merge happens in a scratch worktree instead.
+- **A merge that lands but cannot be copied out is an error.** A workspace's commits live in
+  its own object directory, and the daemon packs the merged range into the shared store
+  afterwards. If that fails twice the RPC fails with `reason: "objects_stranded"` and
+  `merged` or `pushed` true: the base really did move, but the objects behind it are only
+  readable while the workspace exists, so do not destroy it.
+- **Create PR needs a real `origin` and an authenticated `gh`.** There is no dialog for
+  picking a remote and no fallback to the web; `system.check_prereqs` reports `gh_auth`, and
+  Help > Setup… can log you in.
+
 Milestone 5: a workspace reaches the network only through an allowlisting proxy, and a
 web app it runs answers in the Windows browser.
 
@@ -80,7 +160,7 @@ Known limits in Milestone 5:
   outright, because serving it would mean terminating TLS in the daemon.
 - **A guessed port is not editable in the IDE.** The panel says the port was guessed and
   tells you to pin it in `bondsymphonic.toml`; there is no field to change it for one
-  start. Editing lands in Milestone 6.
+  start. *Resolved in Milestone 6: a guessed port is an editable field.*
 - **One run per configuration per workspace.** A second Start for the same configuration
   is refused while the first is alive. Two different configurations in the same workspace
   run side by side.
@@ -89,7 +169,7 @@ Known limits in Milestone 5:
   reaching the host's would hand the workspace a way straight out of it.
 - **`[claude] settings` in `bondsymphonic.toml` is parsed and ignored.** The key is
   accepted so a file written for a later daemon still loads; nothing copies that settings
-  file into the sandbox yet.
+  file into the sandbox yet. *Resolved in Milestone 6: it is copied in at agent start.*
 - **The daemon's allowlist is per workspace, not per agent.** Every process in a
   workspace's sandbox shares one list, including the terminal you type in. It holds at
   most 256 entries.
@@ -171,7 +251,8 @@ Known limits in Milestone 4:
   restored tab has no agent and offers a **Start agent** button; pressing it starts a
   fresh conversation with the options the tab was created with. The session id
   `claude --resume` would need is kept in memory only and the IDE never sends one, so
-  the old conversation is not continued. Resume lands in Milestone 6.
+  the old conversation is not continued. *Resolved in Milestone 6: the daemon keeps agent
+  records and transcripts across a restart, and Restart resumes the session.*
 - An agent that exits — including one that dies at start-up because nobody is logged in —
   puts the reason in a banner above the prompt and offers **Restart agent**.
 - "Always allow this tool for this session" lives in the tab's transcript in the IDE. It is
@@ -273,7 +354,7 @@ find the Qt DLLs:
 
 ```powershell
 . .\scripts\env.ps1
-cargo test --workspace                                    # Windows; ide suites: lib, client, connection, diff, editor, model, qobject_smoke, router, run, smoke, transcript
+cargo test --workspace                                    # Windows; ide suites: lib, client, connection, diff, editor, model, persistence, qobject_smoke, reconnect, router, run, smoke, transcript
 .\scripts\test-daemon.ps1                                 # daemon tests inside WSL (16 integration test files; daemon unit tests: 77 on Windows, 81 on Linux)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
@@ -281,9 +362,10 @@ cargo fmt --all -- --check
 
 ### Test hooks
 
-The IDE carries two environment-gated hooks for `crates/ide/tests/smoke.rs`, which runs
-the real binary with `QT_QPA_PLATFORM=offscreen` against an in-process fake daemon. Both
-are read once at startup and do nothing at all when unset, which is every ordinary run.
+The IDE carries four environment-gated hooks for `crates/ide/tests/smoke.rs` and
+`crates/ide/tests/reconnect_tests.rs`, which run the real binary with
+`QT_QPA_PLATFORM=offscreen` against an in-process fake daemon. All four are read once at
+startup and do nothing at all when unset, which is every ordinary run.
 
 - `BS_DAEMON_ADDR` (a loopback `host:port`) and `BS_DAEMON_TOKEN`: connect straight to that
   address with that handshake token instead of starting a daemon through `wsl.exe`. Only
@@ -305,15 +387,40 @@ are read once at startup and do nothing at all when unset, which is every ordina
   network denial; `allow_host` answers the denial toast through
   `AppController::requestAllowHost`, which the window routes to the Run panel's model only
   when the panel is showing that workspace; `close` closes the script's PTY; `destroy`
+  destroys the workspace; `merge` merges the workspace through
+  `AppController::mergeWorkspace`, the same invokable the Changes toolbar calls (the first
+  `merge` step of a run sends mode `merge` with no summary, the second `squash` with one);
+  `pr` opens a pull request through `AppController::createPr`, the invokable behind the PR
+  dialog; `reconnect` asks the daemon to drop the connection and waits for the IDE to build
+  a new one and re-sync, so every step after it runs on that new connection; `destroy`
   destroys the workspace; `quit` ends the process with status 0 after letting the window
   settle.
+- `BS_SETTINGS_PATH` and `BS_STATE_PATH`: where `settings.json` and `state.json` are read
+  and written. A test points both at a directory of its own so it can assert on what the
+  IDE persisted without ever touching the developer's real `%APPDATA%\BondSymphonic`
+  files. `BS_SETTINGS_PATH` also turns the one-time migration from the old per-project
+  location off, so a test can never read those settings either; `BS_LEGACY_SETTINGS_PATH`
+  is what a migration test points at a fake old file instead.
 
-The smoke test skips itself with a message when `QMAKE` is unset, since the IDE cannot
-start without the Qt runtime on PATH.
+One more hook belongs to the fake daemon rather than to the IDE: a request whose method
+is `system.test_drop` makes the fakes in `smoke.rs` and `reconnect_tests.rs` close the
+connection without answering, which is what a daemon that has died looks like from the
+IDE's side. It is not a request the protocol has, so it can only be built by hand and only
+a daemon written to recognise it does anything with it — the real daemon's decoder sees an
+unknown method, answers `invalid_params`, and leaves the connection up.
 
-The daemon carries three, all read from its own environment, all inert when unset. No test
-needs a Claude login or a network.
+The smoke and reconnect tests skip themselves with a message when `QMAKE` is unset, since
+the IDE cannot start without the Qt runtime on PATH.
 
+The daemon carries four, all read from its own environment, all inert when unset. No test
+needs a Claude login, a GitHub login or a network.
+
+- `BS_GH_BIN`: the command to run instead of the real `gh`, split the way a shell would, so
+  the pull-request tests can point it at `crates/daemon/tests/fixtures/gh_stub.py`. The stub
+  writes its argv to `$GH_STUB_LOG` and prints a pull request URL, and fails with
+  `not logged in` on stderr when `GH_STUB_FAIL=1`. Unset, the daemon runs `gh` from its own
+  PATH with the daemon user's credentials. Nothing in the suite reaches GitHub: the tests
+  push to a bare `origin` created with `git init --bare` beside the repository.
 - `BS_CLAUDE_BIN`: the command to run instead of the real `claude`, split the way a shell
   would, so a stand-in can be an interpreter plus a script
   (`python3 <worktree>/fake_claude.py`). Unset, the daemon resolves the real binary from
@@ -329,7 +436,8 @@ needs a Claude login or a network.
 
 The daemon reads these where it spawns an agent, so they have to be in the *daemon's*
 environment. When the IDE launches it through `wsl.exe`, name them in `WSLENV`
-(`WSLENV=BS_CLAUDE_BIN/u:FAKE_CLAUDE_FIXTURE/u`) before starting the IDE, and put the fake
+(`WSLENV=BS_CLAUDE_BIN/u:FAKE_CLAUDE_FIXTURE/u`, and `BS_GH_BIN/u:GH_STUB_LOG/u` for the
+`gh` stub) before starting the IDE, and put the fake
 somewhere the sandbox can see. The workspace's **worktree** is the reliable place: it is
 bound read-write at its own path. `/home` is a tmpfs with the workspace's own home
 mounted over it, `/tmp` is a fresh tmpfs, and `/opt` is a tmpfs holding only the bound
