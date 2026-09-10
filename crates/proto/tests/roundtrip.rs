@@ -178,6 +178,80 @@ fn the_drop_notice_round_trips_through_the_wire_form() {
     );
 }
 
+/// The denial notice is the same cross-crate contract as the drop notice: the
+/// daemon's proxy builds it, the IDE turns it into a toast with an "Allow host"
+/// action, and neither of them writes the wording down. The host has to survive
+/// the wire in the field the IDE actually reads, and anything that is not a
+/// denial has to come back as one.
+#[test]
+fn the_network_denial_round_trips_through_the_wire_form() {
+    let json = serde_json::to_string(&Event::network_denied("evil.example")).unwrap();
+    let back: Event = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.denied_host(), Some("evil.example"));
+    // The wire text is what a human reads in the log, asserted once, here.
+    assert!(
+        json.contains("network denied: evil.example"),
+        "unexpected wire text: {json}"
+    );
+
+    // A plain warning is not a denial, whatever host it happens to carry, and
+    // neither is the denial text at another level.
+    assert_eq!(
+        Event::DaemonLog {
+            level: LogLevel::Warn,
+            message: "sandbox is down".into(),
+            host: Some("evil.example".into()),
+        }
+        .denied_host(),
+        None
+    );
+    assert_eq!(
+        Event::DaemonLog {
+            level: LogLevel::Info,
+            message: format!("{NETWORK_DENIED_PREFIX}evil.example"),
+            host: Some("evil.example".into()),
+        }
+        .denied_host(),
+        None
+    );
+    assert_eq!(Event::events_dropped(1).denied_host(), None);
+    assert_eq!(
+        Event::network_denied("evil.example").dropped_event_count(),
+        None
+    );
+}
+
+/// `detail` was added to `run.state` after the event shipped, and it is absent
+/// on every ordinary transition, so it has to be optional in both directions:
+/// a daemon that does not send it must still deserialise, and a state change
+/// without one must not put a null on the wire.
+#[test]
+fn run_state_detail_is_optional_in_both_directions() {
+    let old: Event =
+        serde_json::from_str(r#"{"kind":"run.state","run_id":"run_1","state":"ready"}"#).unwrap();
+    assert_eq!(
+        old,
+        Event::RunStateChanged {
+            run_id: "run_1".into(),
+            state: RunState::Ready,
+            url: None,
+            detail: None,
+        }
+    );
+    let v = serde_json::to_value(&old).unwrap();
+    assert!(v.get("detail").is_none(), "{v}");
+    assert!(v.get("url").is_none(), "{v}");
+
+    let failed = Event::RunStateChanged {
+        run_id: "run_1".into(),
+        state: RunState::Failed,
+        url: None,
+        detail: Some("exited with status 1".into()),
+    };
+    let back: Event = serde_json::from_str(&serde_json::to_string(&failed).unwrap()).unwrap();
+    assert_eq!(back, failed);
+}
+
 #[test]
 fn diff_result_defaults_truncated_to_false() {
     // The field was added after the first daemons shipped, so a reply without

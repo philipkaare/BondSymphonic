@@ -183,6 +183,18 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
     }
     let id = WorkspaceId(new_id("ws_"));
     d.dirs.ensure_workspace(&id).map_err(|e| RpcError::io(&e))?;
+    // The repo's own `[network] allow` extends the defaults for this workspace.
+    // A `bondsymphonic.toml` that will not parse is worth a warning and nothing
+    // more: refusing to create the workspace over it would leave the user
+    // unable to open the very repo they need a workspace in to fix the file.
+    let repo_config = match crate::runs::config::load_repo_config(&repo_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!(repo = %repo_path.display(), error = %e, "using the default allowlist");
+            None
+        }
+    };
+    let allowlist = crate::net::allowlist::effective(repo_config.as_ref());
     let ws = Workspace {
         id: id.clone(),
         name: p.name.clone(),
@@ -191,7 +203,7 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
         branch: Workspace::branch_for(&p.name),
         worktree_path: d.dirs.worktree(&id),
         created_at: now_rfc3339(),
-        allowlist: vec![],
+        allowlist,
         state: WorkspaceState::Creating,
         agents: vec![],
         runs: vec![],

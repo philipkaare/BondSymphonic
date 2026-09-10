@@ -1,0 +1,6 @@
+[package]
+name = "svc"
+version = "0.1.0"
+
+[dependencies]
+axum = "0.7"

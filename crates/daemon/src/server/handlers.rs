@@ -38,6 +38,16 @@ impl Handler for WorkspaceHandler {
             Request::RepoInspect(p) => {
                 ok(crate::git::repo::inspect(&d.git, std::path::Path::new(&p.path)).await?)
             }
+            // Detection walks a directory the user has just picked, on whatever
+            // filesystem it lives on, so it goes to the blocking pool rather
+            // than stalling every other request behind a slow stat.
+            Request::RepoDetectRunConfigs(p) => ok(DetectRunConfigsResult {
+                configs: tokio::task::spawn_blocking(move || {
+                    crate::runs::config::configs_for(std::path::Path::new(&p.path))
+                })
+                .await
+                .map_err(|e| RpcError::internal(e.to_string()))?,
+            }),
             Request::WorkspaceCreate(p) => ok(lifecycle::create(d, p).await?),
             Request::WorkspaceList {} => ok(WorkspaceListResult {
                 workspaces: d

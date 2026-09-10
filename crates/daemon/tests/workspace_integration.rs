@@ -36,6 +36,15 @@ async fn create_list_get_status_destroy_roundtrip_with_events() {
         serde_json::from_value(c.recv_response(id, &mut events).await.unwrap()).unwrap();
     assert_eq!(ws.branch, "bs/agent-1/work");
     assert_eq!(ws.state, WorkspaceState::Ready);
+    // A repo with no `bondsymphonic.toml` starts on the default allowlist, so
+    // the agent can reach the Anthropic API and the package registries and
+    // nothing else.
+    assert_eq!(
+        ws.allowlist,
+        bondsymphonic_daemon::net::allowlist::DEFAULT_ALLOW
+            .map(String::from)
+            .to_vec()
+    );
     assert!(std::path::Path::new(&ws.worktree_path)
         .join("README.md")
         .exists());
@@ -516,5 +525,53 @@ async fn daemon_side_worktree_git_resolves_hooks_into_an_empty_daemon_directory(
         0,
         "the hooks directory must stay empty"
     );
+    cancel.cancel();
+}
+
+/// The repo's `bondsymphonic.toml` decides what its workspaces may reach, and
+/// it is read on the create path, where a bad file is most likely to be found:
+/// the user is opening the repo precisely because they want to work in it. So
+/// a config that will not parse costs the extra hosts and nothing else — the
+/// workspace still comes up, on the defaults.
+#[tokio::test]
+async fn the_repo_config_extends_the_allowlist_and_a_broken_one_does_not_block_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, _daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let defaults = bondsymphonic_daemon::net::allowlist::DEFAULT_ALLOW.len();
+
+    std::fs::write(
+        repo.join("bondsymphonic.toml"),
+        "[network]\nallow = [\"*.mycompany.com\", \"github.com\", \"not a host\"]\n",
+    )
+    .unwrap();
+    let ws = create_ws(&mut c, &repo, "extended").await;
+    // The repo's own host is appended; the one it repeats from the defaults is
+    // not doubled, and the entry that is not a host at all is dropped.
+    assert_eq!(ws.allowlist.len(), defaults + 1);
+    assert_eq!(ws.allowlist.last().unwrap(), "*.mycompany.com");
+
+    std::fs::write(repo.join("bondsymphonic.toml"), "[network\nallow = ").unwrap();
+    let ws = create_ws(&mut c, &repo, "broken").await;
+    assert_eq!(ws.state, WorkspaceState::Ready);
+    assert_eq!(ws.allowlist.len(), defaults);
+
+    // The same config, over the wire: `repo.detect_run_configs` answers for a
+    // path the client picked, before any workspace exists for it, and a config
+    // file it cannot read still leaves detection to answer.
+    std::fs::write(repo.join("manage.py"), "#!/usr/bin/env python\n").unwrap();
+    let found: DetectRunConfigsResult = serde_json::from_value(
+        c.call(Request::RepoDetectRunConfigs(RepoPathParams {
+            path: repo.to_string_lossy().into(),
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(found.configs.len(), 1);
+    assert_eq!(found.configs[0].name, "django");
+    assert_eq!(found.configs[0].port, 8000);
+    assert_eq!(found.configs[0].source, RunConfigSource::Detected);
     cancel.cancel();
 }

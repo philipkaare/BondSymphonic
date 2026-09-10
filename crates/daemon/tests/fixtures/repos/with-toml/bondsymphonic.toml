@@ -1,0 +1,18 @@
+[[run]]
+name = "web"
+command = "npm run dev -- --port 3000"
+port = 3000
+cwd = "."               # optional, relative to worktree
+env = { NODE_ENV = "development" }
+ready_regex = "Local:.*http"   # optional, marks state "ready"
+
+[[run]]
+name = "api"
+command = "cargo run -p api"
+port = 8080
+
+[network]
+allow = ["*.mycompany.com"]
+
+[claude]
+settings = ".claude/settings.json"   # optional
