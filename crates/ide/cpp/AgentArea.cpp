@@ -162,12 +162,26 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
         addWidget(makePage(workspaceId, view));
         QObject::connect(view, &TranscriptView::startAgentRequested, this,
                          [this, workspaceId] { emit startAgentRequested(workspaceId); });
+        QObject::connect(view, &TranscriptView::loginRequested, this,
+                         &AgentArea::loginRequested);
         // A start that began before this pane existed -- which is every
         // workspace created with an agent, since the tab is shown first.
         view->setStarting(m_starting.contains(workspaceId));
+        // Built with the gate the area already knows about, rather than with a
+        // composer that is taken away a moment later.
+        view->setClaudeLoggedIn(m_claudeLoggedIn);
     }
     setAgent(workspaceId, agentId);
     return view;
+}
+
+void AgentArea::setClaudeLoggedIn(bool loggedIn) {
+    m_claudeLoggedIn = loggedIn;
+    for (TranscriptView* view : m_transcripts) {
+        if (view != nullptr) {
+            view->setClaudeLoggedIn(loggedIn);
+        }
+    }
 }
 
 void AgentArea::showPlaceholder() {

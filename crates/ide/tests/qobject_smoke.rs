@@ -1354,3 +1354,97 @@ fn a_reconnect_to_a_daemon_without_records_clears_rather_than_keeps() {
     assert_eq!(model.groups[g].tabs[t].status, TabStatus::Idle);
     assert_eq!(model.groups[g].tabs[t].agent_status, None);
 }
+
+// ---------------------------------------------------------------------------
+// UI pass 2: the sign-in link, the name rule and the login gate.
+// ---------------------------------------------------------------------------
+
+/// What `claude auth login` actually prints. The URL is on `claude.com`, not
+/// `claude.ai`, and the line after it is the prompt for the code -- so the
+/// scanner has to stop at the newline and report the query string whole.
+///
+/// This is the failure the first real run hit: the browser never opened,
+/// because the only Claude prefix the IDE knew was `https://claude.ai/`.
+#[test]
+fn the_real_claude_sign_in_url_opens_the_browser() {
+    use bondsymphonic_ide::qobjects::terminal_session::{find_links, LinkScanner};
+
+    const URL: &str = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c\
+                       &state=abc";
+    let printed = format!(
+        "Opening browser to sign in… If the browser didn't open, visit: {URL}\
+         \r\nPaste code here if prompted > "
+    );
+
+    assert_eq!(find_links(&printed), [URL]);
+
+    // And through the chunked path the PTY actually takes: once, and whole.
+    let mut scanner = LinkScanner::new();
+    let (head, tail) = printed.split_at(90);
+    assert!(scanner.push(head.as_bytes()).is_empty());
+    assert_eq!(scanner.push(tail.as_bytes()), [URL]);
+    assert!(scanner.push(printed.as_bytes()).is_empty());
+    assert!(scanner.flush().is_empty());
+
+    // The list stays closed: `claude.com` is a login host, not an open door.
+    assert!(find_links("see https://claude.com.evil.example/x").is_empty());
+}
+
+/// The rule the daemon enforces after the dialog has closed, moved to where
+/// the user is still typing. Exactly the daemon's four conditions, so the
+/// dialog can never accept a name `workspace.create` then refuses.
+#[test]
+fn a_workspace_name_must_be_one_path_safe_word() {
+    use bondsymphonic_ide::qobjects::app_controller::validate_workspace_name;
+
+    assert!(validate_workspace_name("agent-1").is_ok());
+    assert!(validate_workspace_name("agent_1").is_ok());
+    assert!(validate_workspace_name("fix.the.bug").is_ok());
+
+    // Empty, whitespace anywhere, a path separator, or a parent reference.
+    assert!(validate_workspace_name("").is_err());
+    assert!(validate_workspace_name("my agent").is_err());
+    assert!(validate_workspace_name("agent\t1").is_err());
+    assert!(validate_workspace_name("feature/x").is_err());
+    assert!(validate_workspace_name("..").is_err());
+    assert!(validate_workspace_name("a..b").is_err());
+
+    // One sentence, so the dialog can show it verbatim under the field.
+    assert_eq!(
+        validate_workspace_name("my agent").unwrap_err(),
+        "Use a single word: letters, digits, - or _"
+    );
+}
+
+/// Whether the chat composer is open, read off the prerequisite list rather
+/// than off anything the IDE remembers: `claude_auth` is the daemon's answer to
+/// "can Claude Code run without a login prompt", and `-p` mode cannot log in,
+/// so a composer offered before it passes only ever produces "login is not
+/// available in this environment".
+#[test]
+fn claude_login_is_read_off_the_claude_auth_prerequisite() {
+    use bondsymphonic_ide::qobjects::app_controller::claude_logged_in;
+    use bondsymphonic_proto::PrereqStatus;
+
+    fn item(name: &str, ok: bool) -> PrereqStatus {
+        PrereqStatus {
+            name: name.to_owned(),
+            ok,
+            detail: String::new(),
+            fix_hint: None,
+        }
+    }
+
+    assert!(claude_logged_in(&[
+        item("claude", true),
+        item("claude_auth", true)
+    ]));
+    assert!(!claude_logged_in(&[
+        item("claude", true),
+        item("claude_auth", false)
+    ]));
+    // No answer is not a yes: a daemon that never reported the item leaves the
+    // gate shut rather than opening a composer that cannot send.
+    assert!(!claude_logged_in(&[item("claude", true)]));
+    assert!(!claude_logged_in(&[]));
+}

@@ -490,6 +490,23 @@ fn merge_and_pr_wait_longer_than_the_daemon_spends_on_them() {
     );
 }
 
+/// `repo.inspect` and `workspace.create` are the two the New Agent dialog waits
+/// on, and both walk a repository the daemon has never seen. On a large tree
+/// reached through `/mnt/c` the inspect alone outlasted the 30 s default, which
+/// is what left the dialog with an empty branch list on the first real run; a
+/// create that has to initialise the folder does the same work and more.
+#[test]
+fn the_new_agent_dialog_waits_two_minutes_for_the_repository() {
+    assert_eq!(
+        default_timeout_for("repo.inspect"),
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        default_timeout_for("workspace.create"),
+        Duration::from_secs(120)
+    );
+}
+
 /// Everything else keeps the 30 s default, including the other two calls the
 /// Changes toolbar makes.
 #[test]

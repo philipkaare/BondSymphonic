@@ -67,17 +67,30 @@ pub const MERGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// ... already exists".
 pub const CREATE_PR_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// What `repo.inspect` and `workspace.create` get instead.
+///
+/// The same two minutes, for the same kind of reason: both walk a repository
+/// the daemon has never touched before, and the daemon allows itself 60 s per
+/// git command (`git::GIT_TIMEOUT`) while either call is more than one of
+/// them. Measured rather than guessed at: on the first real run an inspect of
+/// a large repository reached through `/mnt/c` took longer than the 30 s
+/// default, and the New Agent dialog opened with no branches in its list
+/// because of it. A create that has to initialise the folder first does that
+/// work and more.
+pub const REPOSITORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// How long `method` is given when the client has not been told otherwise.
 ///
 /// Keyed on the method name rather than passed in at each call site, so a wait
-/// cannot be forgotten at a new caller of an already-slow method: the two
-/// entries below are the two whose typical worst case on the daemon outlasts
-/// the default. A method this build has never heard of gets the default, which
-/// is the right answer for one whose cost nobody here knows.
+/// cannot be forgotten at a new caller of an already-slow method: the entries
+/// below are the ones whose typical worst case on the daemon outlasts the
+/// default. A method this build has never heard of gets the default, which is
+/// the right answer for one whose cost nobody here knows.
 pub fn default_timeout_for(method: &str) -> Duration {
     match method {
         "workspace.merge" => MERGE_REQUEST_TIMEOUT,
         "workspace.create_pr" => CREATE_PR_REQUEST_TIMEOUT,
+        "repo.inspect" | "workspace.create" => REPOSITORY_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
 }

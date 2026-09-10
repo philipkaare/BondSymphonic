@@ -8,6 +8,8 @@ class TerminalSession;
 class TerminalWidget;
 class QLabel;
 class QPushButton;
+class QResizeEvent;
+class QTimer;
 class QVBoxLayout;
 
 /// The first-run page: one row per prerequisite, a button on the ones the IDE
@@ -23,10 +25,23 @@ class SetupPage : public QWidget {
 public:
     explicit SetupPage(AppController* controller, QWidget* parent = nullptr);
 
+    /// Drops the heading, the subtitle and "Continue anyway".
+    ///
+    /// The page is hosted twice: on its own it is a first-run wall and needs
+    /// all three, and inside the Settings dialog it is one section of a form
+    /// whose own buttons close it. Nothing else differs, so this is a trim
+    /// rather than a second page.
+    void setEmbedded(bool embedded);
+
 signals:
     /// Nothing is left to fix, or the user chose to carry on regardless. The
     /// window takes this as "show the workbench".
     void completed();
+
+protected:
+    /// Re-elides the sign-in URL: the label's width is only known once the
+    /// layout has run, and it changes with the dialog.
+    void resizeEvent(QResizeEvent* event) override;
 
 private:
     /// Rebuilds the rows from a `prereqsChecked` payload.
@@ -56,8 +71,26 @@ private:
     /// Enables or disables every fix button at once, so a click cannot start a
     /// second action while one is being opened.
     void setActionsEnabled(bool enabled);
-    /// Opens a login URL the terminal printed in the desktop browser.
+    /// Opens a login URL the terminal printed in the desktop browser, and
+    /// raises the row that offers it again by hand.
+    ///
+    /// The automatic open is kept, not replaced: it is right nearly every
+    /// time. The row is for the times it is not -- no default browser, a
+    /// browser that swallowed the URL, a login that has to happen on another
+    /// machine -- when the alternative was reading a wrapped URL off a
+    /// terminal and typing it out.
     void onLinkDetected(const QString& url);
+    /// Puts the current URL on the clipboard and says so for a few seconds.
+    void copyLink();
+    /// Hands the current URL to the desktop browser.
+    void openLink();
+    /// Copy and open together: what clicking the URL text itself does.
+    void useLink();
+    /// Re-renders the URL label at the width it now has, elided in the middle
+    /// so the host and the tail of the query both stay readable.
+    void updateLinkElide();
+    /// Takes the row down and forgets the URL.
+    void clearLink();
     /// The terminal's process ended, so whatever it was fixing is either fixed
     /// or not: ask the daemon rather than guessing.
     void onTerminalExited();
@@ -75,6 +108,24 @@ private:
     QLabel* m_terminalLabel = nullptr;
     QPushButton* m_recheckButton = nullptr;
     QPushButton* m_continueButton = nullptr;
+    QLabel* m_title = nullptr;
+    QLabel* m_subtitle = nullptr;
+    /// The "Sign-in link" row under the terminal, hidden until a login URL is
+    /// detected and taken down again when the terminal exits.
+    QWidget* m_linkRow = nullptr;
+    /// The URL itself, elided in the middle and clickable.
+    QLabel* m_linkLabel = nullptr;
+    /// Transient "Link copied" feedback. The page has no status bar of its
+    /// own -- it lives in a dialog -- so the acknowledgement is on the row.
+    QLabel* m_linkFeedback = nullptr;
+    QPushButton* m_copyLink = nullptr;
+    QPushButton* m_openLink = nullptr;
+    /// The URL as printed, which is what is copied and opened. The label shows
+    /// an elided rendering of it and is never the source.
+    QString m_linkUrl;
+    /// Takes the "Link copied" acknowledgement down again. One timer, restarted
+    /// by a second copy, so two clicks do not leave two of them running.
+    QTimer* m_linkFeedbackTimer = nullptr;
     /// The action whose terminal is being waited for, so a `setupPtyOpened`
     /// for something else -- there is nothing else today, but the signal is
     /// the controller's, not this page's -- is left alone. Non-empty means a

@@ -30,11 +30,10 @@ class QMoveEvent;
 class QPlainTextEdit;
 class QResizeEvent;
 class QSplitter;
-class QStackedWidget;
 class QTabWidget;
 class RunPanel;
 class RunPanelModel;
-class SetupPage;
+class SettingsDialog;
 class TranscriptModel;
 
 class MainWindow : public QMainWindow {
@@ -82,19 +81,40 @@ private:
 
     void buildMenus();
     void buildCentral();
-    /// Puts the setup page in front of the workbench, or takes it away again.
-    /// Both directions go through here so the two are never both current.
+    /// Opens Settings on its Setup section: the prerequisite rows, the fix
+    /// buttons, the login terminal and the sign-in link.
+    ///
+    /// The one way in, so the status bar's "Set up..." link, the first run and
+    /// anything else that wants a login all land in the same place. There is no
+    /// separate setup page any more: a login is a setting, and File > Settings
+    /// is where the user looks for one.
     void showSetupPage();
-    void showWorkbench();
     void onSettings();
-    /// Decides, from the daemon's prerequisite list, between the setup page,
-    /// a status-bar warning with a way back to it, and neither.
+    /// Opens the Settings dialog, on the Setup section when asked. A second
+    /// call while one is up raises the one that is up rather than stacking a
+    /// second: a prerequisite re-check arrives every time a setup terminal
+    /// exits, and each of those would otherwise open another dialog.
+    void openSettings(bool onSetup);
+    /// Decides, from the daemon's prerequisite list, between opening Settings
+    /// on Setup, a status-bar warning with a way there, and neither.
     void onPrereqsChecked(const QString& json);
     void buildDocks();
     void buildStatusBar();
     void connectController();
     void onConnectionStateChanged();
+    /// File > New Agent. Asks the daemon about the repository the dialog will
+    /// open on *before* opening it, so the base-branch combo is filled the
+    /// moment the dialog appears.
+    ///
+    /// The dialog used to open first and fill itself in later, which on a large
+    /// repository reached through `/mnt/c` meant a branch list that was still
+    /// empty when the user pressed Create.
     void onNewAgent();
+    /// Builds and runs the New Agent dialog, seeded with an inspection the
+    /// window already has. `distroPath` empty means there was nothing to
+    /// inspect; otherwise exactly one of `infoJson` and `error` is set.
+    void openNewAgentDialog(const QString& initialPath, const QString& distroPath,
+                            const QString& infoJson, const QString& error);
     void onAbout();
     void onDestroyRequested(const QString& workspaceId);
     void onOperationFailed(const QString& op, const QString& message);
@@ -198,10 +218,13 @@ private:
     /// The New Agent dialog while it is up, so daemon failures can be parented
     /// to it rather than to a window the modal dialog is blocking.
     QPointer<NewAgentDialog> m_newAgentDialog;
-    /// The central widget: the workbench, and the setup page in front of it.
-    QStackedWidget* m_stack = nullptr;
-    QWidget* m_workbench = nullptr;
-    SetupPage* m_setupPage = nullptr;
+    /// Whether the `repo.inspect` that precedes the dialog is still out. A
+    /// second New Agent while one is being prepared would start a second
+    /// inspection and open two dialogs when both answered.
+    bool m_newAgentPending = false;
+    /// The Settings dialog while it is up, so a second request raises it
+    /// instead of opening another one over it.
+    QPointer<SettingsDialog> m_settingsDialog;
     QSplitter* m_centerSplitter = nullptr;
     /// The centre pane: one tab per open file.
     EditorArea* m_editorArea = nullptr;
@@ -233,8 +256,8 @@ private:
     /// -- so the tab being left has to be named on the way past.
     QString m_previousWorkspaceId;
     QLabel* m_costLabel = nullptr;
-    /// The status bar's way back to the setup page, shown only while a
-    /// non-blocking prerequisite is failing.
+    /// The status bar's way to Settings > Setup, shown while any prerequisite
+    /// is failing.
     QLabel* m_setupLabel = nullptr;
     /// The last merge, pull request or close-group result. A permanent widget
     /// rather than `showMessage`, which would hide every other status widget

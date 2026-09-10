@@ -38,6 +38,10 @@ signals:
     /// clearing the tab's error mark; the area touches no model.
     void bannerDismissed(const QString& workspaceId);
 
+    /// A transcript pane's "Log in to Claude Code…" was pressed. The window
+    /// answers by opening Settings on its Setup section.
+    void loginRequested();
+
 public:
     /// What the placeholder page says while nothing is showing.
     void setPlaceholderText(const QString& text);
@@ -75,6 +79,15 @@ public:
     /// failure signal names the operation, not the workspace, and only one
     /// start is ever in flight.
     void clearStarting();
+
+    /// Whether Claude Code is logged in, per the daemon's `claude_auth`
+    /// prerequisite. Applied to every transcript pane, now and as each one is
+    /// built: a workspace whose tab has not been opened yet has no pane to
+    /// tell, and it must not be built with the composer open.
+    ///
+    /// Terminal panes are untouched. A shell is a shell whether or not Claude
+    /// Code is logged in -- and the setup terminal is where the login happens.
+    void setClaudeLoggedIn(bool loggedIn);
 
     /// Closes the workspace's PTY or transcript and drops its pane.
     void removeWorkspace(const QString& workspaceId);
@@ -133,4 +146,7 @@ private:
     /// Workspaces with an `agent.start` in flight, kept here rather than only
     /// on the pane because the start begins before the pane exists.
     QSet<QString> m_starting;
+    /// See [`setClaudeLoggedIn`]. False until the first prerequisite check
+    /// answers, so a pane built in the seconds before it opens no composer.
+    bool m_claudeLoggedIn = false;
 };

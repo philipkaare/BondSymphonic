@@ -11,7 +11,6 @@
 #include "NewAgentDialog.h"
 #include "RunPanel.h"
 #include "SettingsDialog.h"
-#include "SetupPage.h"
 #include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
@@ -39,9 +38,9 @@
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QSplitter>
-#include <QStackedWidget>
 #include <QStatusBar>
 #include <QTabWidget>
+#include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -212,10 +211,10 @@ void MainWindow::buildMenus() {
     menuBar()->addMenu("&Workspace");
     menuBar()->addMenu("&Run");
     auto* help = menuBar()->addMenu("&Help");
-    // Available whatever the prerequisites say: the page is also how a user
-    // logs in to Claude Code again after a token has expired.
-    help->addAction("&Setup…", this, &MainWindow::showSetupPage);
-    help->addSeparator();
+    // No "Setup..." here any more. Logging in to Claude Code or GitHub is a
+    // setting the user comes back to -- a token expires, an account changes --
+    // and File > Settings is where they look for one; Help is where they look
+    // for documentation.
     help->addAction("&About BondSymphonic…", this, &MainWindow::onAbout);
     help->addAction("About &Qt", qApp, &QApplication::aboutQt);
 }
@@ -238,12 +237,11 @@ void MainWindow::onAbout() {
 }
 
 void MainWindow::buildCentral() {
-    // The window shows one of two things: the workbench, or the setup page in
-    // front of it. A stack rather than a hidden workbench, so the panes, tabs
-    // and terminals behind the page keep their state while it is up.
-    m_stack = new QStackedWidget(this);
-    auto* central = new QWidget(m_stack);
-    m_workbench = central;
+    // One central widget. The setup page used to sit in a stack in front of
+    // this one; it lives in the Settings dialog now, so the workbench is
+    // always what the window shows and its panes are never torn between two
+    // pages.
+    auto* central = new QWidget(this);
     auto* layout = new QVBoxLayout(central);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
@@ -268,13 +266,8 @@ void MainWindow::buildCentral() {
     m_centerSplitter->setSizes({ 900, 600 });
     layout->addWidget(m_centerSplitter, 1);
 
-    m_stack->addWidget(central);
-    m_setupPage = new SetupPage(m_controller, m_stack);
-    m_stack->addWidget(m_setupPage);
-    m_stack->setCurrentWidget(central);
-    setCentralWidget(m_stack);
+    setCentralWidget(central);
 
-    QObject::connect(m_setupPage, &SetupPage::completed, this, &MainWindow::showWorkbench);
     QObject::connect(m_groupBar, &GroupBar::newAgentRequested, this, &MainWindow::onNewAgent);
     QObject::connect(m_groupBar, &GroupBar::destroyRequested, this, &MainWindow::onDestroyRequested);
     QObject::connect(m_groupBar, &GroupBar::closeGroupRequested, this, &MainWindow::onCloseGroup);
@@ -282,17 +275,32 @@ void MainWindow::buildCentral() {
                      [this](int, int) { noteSplitterState(); });
 }
 
-void MainWindow::showSetupPage() {
-    m_stack->setCurrentWidget(m_setupPage);
-}
+void MainWindow::showSetupPage() { openSettings(true); }
 
-void MainWindow::showWorkbench() {
-    m_stack->setCurrentWidget(m_workbench);
-}
+void MainWindow::onSettings() { openSettings(false); }
 
-void MainWindow::onSettings() {
+void MainWindow::openSettings(bool onSetup) {
+    if (!m_settingsDialog.isNull()) {
+        // Already up. A prerequisite re-check arrives every time a setup
+        // terminal exits, so without this the dialog the user is logging in
+        // through would collect a second one on top of it.
+        m_settingsDialog->raise();
+        m_settingsDialog->activateWindow();
+        if (onSetup) {
+            m_settingsDialog->revealSetup();
+        }
+        return;
+    }
     SettingsDialog dialog(m_controller, this);
+    m_settingsDialog = &dialog;
+    if (onSetup) {
+        // Deferred by one turn of the event loop: the scroll area only knows
+        // where its sections are once the dialog has been laid out, and it is
+        // laid out by `exec`.
+        QTimer::singleShot(0, &dialog, [&dialog] { dialog.revealSetup(); });
+    }
     dialog.exec();
+    m_settingsDialog = nullptr;
 }
 
 void MainWindow::onPrereqsChecked(const QString& json) {
@@ -309,13 +317,16 @@ void MainWindow::onPrereqsChecked(const QString& json) {
     if (!anyFailed) {
         m_sandboxLabel->setToolTip(QString());
     }
-    // Only worth offering when the workbench is what is on screen. While the
-    // page is up, the link would point at the page the user is already on.
-    m_setupLabel->setVisible(anyFailed && !blocked);
+    // Offered whenever anything is failing, blocking or not: Settings is a
+    // dialog the user closes, so after closing it there has to be a way back.
+    m_setupLabel->setVisible(anyFailed);
     updateWorkspaceStatus();
 
     if (blocked) {
-        showSetupPage();
+        // Deferred, because this runs inside the controller's own signal and
+        // `openSettings` spins a nested event loop for the length of the
+        // dialog. Queuing it lets this handler finish first.
+        QTimer::singleShot(0, this, [this] { showSetupPage(); });
     }
 }
 
@@ -369,6 +380,7 @@ void MainWindow::buildStatusBar() {
     // Rich text so the offer is a link rather than an instruction to go and
     // find a menu item. The href is never followed by Qt itself.
     m_setupLabel = new QLabel("<a href=\"#setup\">Set up…</a>", this);
+    m_setupLabel->setToolTip("Open Settings on the Setup section");
     m_setupLabel->setTextFormat(Qt::RichText);
     m_setupLabel->setOpenExternalLinks(false);
     m_setupLabel->setVisible(false);
@@ -562,6 +574,15 @@ void MainWindow::connectController() {
     // restarted agent gets the model and permission mode the user chose.
     QObject::connect(m_agentArea, &AgentArea::startAgentRequested, this,
                      &MainWindow::onStartAgentRequested);
+    // The chat gate. `claudeLoggedIn` is derived from the daemon's own
+    // `claude_auth` prerequisite, so the composer comes back on the re-check a
+    // successful login triggers -- no restart, and no second source of truth
+    // about whether Claude Code can answer.
+    QObject::connect(m_controller, &AppController::claudeLoggedInChanged, this, [this] {
+        m_agentArea->setClaudeLoggedIn(m_controller->getClaudeLoggedIn());
+    });
+    m_agentArea->setClaudeLoggedIn(m_controller->getClaudeLoggedIn());
+    QObject::connect(m_agentArea, &AgentArea::loginRequested, this, &MainWindow::showSetupPage);
     // Dismissing the banner is the user saying they have read it, which is also
     // what takes the red glyph off the tab.
     QObject::connect(m_agentArea, &AgentArea::bannerDismissed, this,
@@ -680,8 +701,79 @@ void MainWindow::onConnectionStateChanged() {
 }
 
 void MainWindow::onNewAgent() {
-    NewAgentDialog dialog(m_controller, m_groupModel, this);
+    if (m_newAgentPending) {
+        // An inspection is already out for the dialog that is being prepared.
+        return;
+    }
+    if (!m_newAgentDialog.isNull()) {
+        m_newAgentDialog->raise();
+        m_newAgentDialog->activateWindow();
+        return;
+    }
+    const QString initialPath = NewAgentDialog::initialRepoPath(m_controller);
+    const QString distroPath =
+        initialPath.isEmpty() ? QString() : m_controller->wslPath(initialPath);
+    if (distroPath.isEmpty()) {
+        // Nothing to ask about: a first run has no recent repository, and a
+        // path the launcher cannot translate is one the daemon could not read
+        // either. The dialog opens empty, as it always did.
+        openNewAgentDialog(initialPath, QString(), QString(), QString());
+        return;
+    }
+
+    m_newAgentPending = true;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    // The permanent label rather than `showMessage`: a temporary status-bar
+    // message hides every widget in the row, including the sandbox label, for
+    // as long as it is up -- and on a large repository that is a while.
+    showOperationMessage("Reading repository…", QString());
+    // One shot. The guard object owns both connections, so whichever answer
+    // arrives first takes the other one down with it and a later, unrelated
+    // `operationFailed` cannot open a second dialog.
+    auto* guard = new QObject(this);
+    QObject::connect(m_controller, &AppController::repoInspected, guard,
+                     [this, guard, initialPath, distroPath](const QString& path,
+                                                            const QString& infoJson) {
+                         if (path != distroPath) {
+                             return;
+                         }
+                         // Disconnected before the deletion, not by it: the
+                         // dialog below runs a nested event loop, and a
+                         // deferred delete is not what stops the other
+                         // connection firing inside it.
+                         guard->disconnect();
+                         guard->deleteLater();
+                         openNewAgentDialog(initialPath, distroPath, infoJson, QString());
+                     });
+    QObject::connect(m_controller, &AppController::operationFailed, guard,
+                     [this, guard, initialPath, distroPath](const QString& op,
+                                                            const QString& message) {
+                         if (op != QLatin1String("repo.inspect")) {
+                             return;
+                         }
+                         guard->disconnect();
+                         guard->deleteLater();
+                         // A failure still opens the dialog, carrying the
+                         // reason: the user came here to make a workspace, and
+                         // the path is theirs to correct.
+                         openNewAgentDialog(initialPath, distroPath, QString(), message);
+                     });
+    m_controller->inspectRepo(distroPath);
+}
+
+void MainWindow::openNewAgentDialog(const QString& initialPath, const QString& distroPath,
+                                    const QString& infoJson, const QString& error) {
+    if (m_newAgentPending) {
+        m_newAgentPending = false;
+        QApplication::restoreOverrideCursor();
+        showOperationMessage(QString(), QString());
+    }
+    NewAgentDialog dialog(m_controller, m_groupModel, initialPath, this);
     dialog.setGroup(m_groupBar->currentGroupName());
+    if (!distroPath.isEmpty()) {
+        // Replayed, because the answer arrived before this dialog existed.
+        dialog.applyInspection(distroPath, infoJson, error);
+    }
     m_newAgentDialog = &dialog;
     const int result = dialog.exec();
     m_newAgentDialog = nullptr;
@@ -692,15 +784,15 @@ void MainWindow::onNewAgent() {
         // One call: the workspace, the agent in it and its opening prompt. The
         // controller emits `workspaceCreated` as soon as the workspace exists,
         // so a slow `agent.start` happens in front of the user.
-        m_controller->createWorkspaceWithAgentAndRun(dialog.repoPath(), dialog.baseBranch(),
-                                                     dialog.name(), dialog.group(),
-                                                     dialog.optionsJson(), dialog.initialPrompt(),
-                                                     dialog.runConfig());
+        m_controller->createWorkspaceWithAgentAndRun(
+            dialog.repoPath(), dialog.baseBranch(), dialog.name(), dialog.group(),
+            dialog.optionsJson(), dialog.initialPrompt(), dialog.runConfig(),
+            dialog.initIfMissing());
         return;
     }
     m_controller->createWorkspaceWithRun(dialog.repoPath(), dialog.baseBranch(), dialog.name(),
                                          dialog.group(), dialog.adapter(), dialog.command(),
-                                         dialog.runConfig());
+                                         dialog.runConfig(), dialog.initIfMissing());
 }
 
 void MainWindow::onDestroyRequested(const QString& workspaceId) {
@@ -1007,6 +1099,12 @@ void MainWindow::onOperationFailed(const QString& op, const QString& message) {
         // the operation and not the workspace, and only one start is ever in
         // flight, so every mark comes down.
         m_agentArea->clearStarting();
+    }
+    if (m_newAgentPending && op == QLatin1String("repo.inspect")) {
+        // The inspection that precedes the New Agent dialog. It is about to be
+        // reported inside the dialog it opens, so a box here would say the same
+        // thing twice, the second time over a modal dialog.
+        return;
     }
     // The New Agent dialog reports its own inspection failures inline, and while
     // it is up it is modal, so a box parented to this window could not be closed.

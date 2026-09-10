@@ -28,7 +28,25 @@ class QToolButton;
 class NewAgentDialog : public QDialog {
     Q_OBJECT
 public:
-    NewAgentDialog(AppController* controller, GroupModel* model, QWidget* parent = nullptr);
+    /// `initialPath` is the repository the dialog opens on, as the user would
+    /// type it. The window supplies the most recent one and has already asked
+    /// the daemon about it; see `applyInspection`.
+    NewAgentDialog(AppController* controller, GroupModel* model, const QString& initialPath,
+                   QWidget* parent = nullptr);
+
+    /// The repository the dialog will open on: the most recently used one, or
+    /// empty when there is none. Static because the window needs it *before*
+    /// there is a dialog -- it inspects that path first, so the branch list is
+    /// filled the moment the dialog appears rather than half a minute later.
+    static QString initialRepoPath(AppController* controller);
+
+    /// Hands the dialog the `repo.inspect` answer the window already has for
+    /// its initial path. `infoJson` is a `RepoInfo`, or `error` says why there
+    /// is none; exactly one of the two is non-empty.
+    ///
+    /// Replayed rather than waited for: the answer arrived before this dialog
+    /// existed, so no `repoInspected` will reach it.
+    void applyInspection(const QString& path, const QString& infoJson, const QString& error);
 
     /// Preselects a group, adding it to the list if it is not there yet.
     void setGroup(const QString& name);
@@ -55,6 +73,15 @@ public:
     /// daemon's own detection, never something typed.
     QString runConfig() const;
 
+    /// Whether the daemon should create and initialise the folder as a git
+    /// repository before making the workspace.
+    ///
+    /// True only when the last inspection said this path is not a repository,
+    /// which is also when the dialog says so in the "Repository" line. The
+    /// user is never asked to tick anything: the sentence under the path is
+    /// the consent, and pressing Create is the agreement to it.
+    bool initIfMissing() const;
+
 private:
     void browse();
     /// Rebuilds the Recent menu from the controller's list, most recent first,
@@ -69,6 +96,14 @@ private:
     /// `bondsymphonic.toml` would add to the new workspace's allowlist.
     void showNetworkAllow(const QString& json);
     void onInspectFailed(const QString& op, const QString& message);
+    /// Re-runs the name rule and shows or hides the hint under the field.
+    /// Called on every edit, so a name the daemon would refuse is refused
+    /// while it is being typed rather than after the dialog has closed and
+    /// taken everything else typed into it with it.
+    void updateNameHint();
+    /// Puts the "Repository" line under the path: nothing for an ordinary
+    /// repository, and what is about to be created for anything else.
+    void showRepoState(bool isRepo, bool exists);
     void onGroupChanged(int index);
     /// Shows the fields the selected adapter has and hides the rest.
     void onAdapterChanged();
@@ -94,6 +129,12 @@ private:
     /// never have opened, so this is the one place before Create where that is
     /// visible. Plain text: the repository chose the strings.
     QLabel* m_networkNote = nullptr;
+    /// Why the typed name will not do, or hidden when it will. Red, under the
+    /// field, and the same sentence the rule itself carries.
+    QLabel* m_nameHint = nullptr;
+    /// What creating from this path will do to it, when that is anything more
+    /// than using a repository that is already there.
+    QLabel* m_repoState = nullptr;
     QPlainTextEdit* m_initialPrompt = nullptr;
     QComboBox* m_group = nullptr;
     QLineEdit* m_newGroup = nullptr;
@@ -103,4 +144,15 @@ private:
     /// The distro path of the inspection in flight, so a late answer for a path
     /// the user has since edited away from is ignored.
     QString m_pendingPath;
+    /// Whether an inspection for `m_pendingPath` is still out. Create is
+    /// refused while it is: the base branch would be whatever was left in the
+    /// combo from the previous repository.
+    bool m_inspectPending = false;
+    /// Whether the last inspection failed. Create is refused then too: the
+    /// daemon could not read the repository, so nothing in the branch combo
+    /// is known to exist.
+    bool m_inspectFailed = false;
+    /// See `initIfMissing`. Recomputed from every inspection, so it cannot
+    /// survive a move to a path that is a repository.
+    bool m_initIfMissing = false;
 };

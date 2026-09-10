@@ -53,7 +53,15 @@ bool daemonHasClaude(AppController* controller) {
 
 } // namespace
 
-NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWidget* parent)
+QString NewAgentDialog::initialRepoPath(AppController* controller) {
+    const QJsonArray paths = QJsonDocument::fromJson(controller->recentRepos().toUtf8()).array();
+    // The most recent, which is the one a second agent on the same project
+    // wants and the one a first run has none of.
+    return paths.isEmpty() ? QString() : paths.first().toString();
+}
+
+NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
+                               const QString& initialPath, QWidget* parent)
     : QDialog(parent), m_controller(controller), m_model(model) {
     setWindowTitle("New Agent");
     setModal(true);
@@ -80,6 +88,14 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWi
     form->addRow("Repository:", repoRow);
     buildRecentMenu();
 
+    m_repoState = new QLabel(this);
+    m_repoState->setWordWrap(true);
+    // Plain text: the sentence is the dialog's, but the path in it is the
+    // user's, and a path is not markup.
+    m_repoState->setTextFormat(Qt::PlainText);
+    m_repoState->hide();
+    form->addRow(QString(), m_repoState);
+
     m_baseBranch = new QComboBox(this);
     m_baseBranch->setEditable(true);
     form->addRow("Base branch:", m_baseBranch);
@@ -90,6 +106,15 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWi
     }
     m_name = new QLineEdit(QString("agent-%1").arg(tabs + 1), this);
     form->addRow("Name:", m_name);
+
+    m_nameHint = new QLabel(this);
+    m_nameHint->setWordWrap(true);
+    m_nameHint->setTextFormat(Qt::PlainText);
+    // The one colour in this dialog that means "this will not work". Set here
+    // rather than through the palette so it reads the same on both themes.
+    m_nameHint->setStyleSheet("color:#eb5757");
+    m_nameHint->hide();
+    form->addRow(QString(), m_nameHint);
 
     m_adapter = new QComboBox(this);
     // Claude Code first, so it is the default: it is what the IDE is for, and
@@ -159,6 +184,7 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWi
     m_buttons->button(QDialogButtonBox::Ok)->setText("Create");
     outer->addWidget(m_buttons);
 
+    QObject::connect(m_name, &QLineEdit::textChanged, this, &NewAgentDialog::updateNameHint);
     QObject::connect(browseButton, &QPushButton::clicked, this, &NewAgentDialog::browse);
     QObject::connect(m_repoPath, &QLineEdit::editingFinished, this, &NewAgentDialog::inspectRepo);
     QObject::connect(m_repoPath, &QLineEdit::textChanged, this, &NewAgentDialog::updateOkEnabled);
@@ -174,7 +200,30 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWi
     QObject::connect(m_controller, &AppController::operationFailed, this, &NewAgentDialog::onInspectFailed);
 
     onAdapterChanged();
+    updateNameHint();
+    if (!initialPath.isEmpty()) {
+        m_repoPath->setText(initialPath);
+        // The window has already asked about this path and will replay the
+        // answer through `applyInspection`; the inspection is marked as in
+        // flight so Create stays dead until it does. The run configurations are
+        // not pre-fetched: they are quick, and they do not gate Create.
+        m_pendingPath = repoPath();
+        m_inspectPending = true;
+        m_controller->detectRunConfigs(m_pendingPath);
+    }
     updateOkEnabled();
+}
+
+void NewAgentDialog::applyInspection(const QString& path, const QString& infoJson,
+                                     const QString& error) {
+    if (path != m_pendingPath) {
+        return;
+    }
+    if (!error.isEmpty()) {
+        onInspectFailed(QStringLiteral("repo.inspect"), error);
+        return;
+    }
+    onRepoInspected(path, infoJson);
 }
 
 void NewAgentDialog::setGroup(const QString& name) {
@@ -234,6 +283,8 @@ QString NewAgentDialog::runConfig() const {
     return m_runConfig->currentData().toString();
 }
 
+bool NewAgentDialog::initIfMissing() const { return m_initIfMissing; }
+
 QString NewAgentDialog::group() const {
     // Reading the combo text rather than the line edit's visibility keeps this
     // correct after `exec()` returns, when every child widget is hidden again.
@@ -276,16 +327,25 @@ void NewAgentDialog::browse() {
 
 void NewAgentDialog::inspectRepo() {
     const QString path = repoPath();
-    if (path.isEmpty() || path == m_pendingPath) {
+    // The same path again is a no-op *unless* the last attempt at it failed:
+    // that one is a retry, and a daemon that was down when the dialog opened is
+    // exactly the case that needs one.
+    if (path.isEmpty() || (path == m_pendingPath && !m_inspectFailed)) {
         return;
     }
     m_pendingPath = path;
-    // The note belongs to the repository that was inspected, so it goes down
-    // with that repository rather than surviving into the answer for another
-    // one -- or into no answer at all, if detection fails.
+    m_inspectPending = true;
+    m_inspectFailed = false;
+    // Both notes belong to the repository that was inspected, so they go down
+    // with it rather than surviving into the answer for another one -- or into
+    // no answer at all, if the inspection fails.
     m_networkNote->clear();
     m_networkNote->hide();
+    m_repoState->clear();
+    m_repoState->hide();
+    m_initIfMissing = false;
     m_status->setText(QString("Inspecting %1…").arg(path));
+    updateOkEnabled();
     m_controller->inspectRepo(path);
     // Alongside, not after: the two answers are independent and the run
     // configurations are not worth another round trip's delay.
@@ -296,7 +356,12 @@ void NewAgentDialog::onRepoInspected(const QString& path, const QString& infoJso
     if (path != m_pendingPath) {
         return;
     }
+    m_inspectPending = false;
+    m_inspectFailed = false;
     const QJsonObject info = QJsonDocument::fromJson(infoJson.toUtf8()).object();
+    // A daemon too old to send these answered nothing but repositories, so an
+    // absent `is_repo` is a repository. `exists` only matters when it is not.
+    showRepoState(info.value("is_repo").toBool(true), info.value("exists").toBool(false));
     const QString current = m_baseBranch->currentText();
     m_baseBranch->clear();
     for (const QJsonValue& branch : info.value("branches").toArray()) {
@@ -310,6 +375,33 @@ void NewAgentDialog::onRepoInspected(const QString& path, const QString& infoJso
         m_baseBranch->setEditText(preferred);
     }
     m_status->setText(info.value("is_dirty").toBool() ? "Repository has uncommitted changes." : QString());
+    updateOkEnabled();
+}
+
+void NewAgentDialog::showRepoState(bool isRepo, bool exists) {
+    m_initIfMissing = !isRepo;
+    if (isRepo) {
+        m_repoState->clear();
+        m_repoState->hide();
+        return;
+    }
+    // Said before Create, because Create is what does it. Creating a workspace
+    // from a folder that is not a repository used to fail with the daemon's own
+    // wording; it now succeeds, and the user is owed the sentence saying what
+    // it will do to their folder.
+    m_repoState->setText(exists ? "This folder is not a git repository. It will be initialised "
+                                  "with an empty first commit when the agent is created."
+                                : "This folder does not exist; it will be created and "
+                                  "initialised.");
+    m_repoState->show();
+}
+
+void NewAgentDialog::updateNameHint() {
+    // The rule itself is in Rust, next to the create it guards, so this dialog
+    // and the daemon cannot come to different conclusions about a name.
+    const QString hint = m_controller->validateWorkspaceName(name());
+    m_nameHint->setText(hint);
+    m_nameHint->setVisible(!hint.isEmpty());
     updateOkEnabled();
 }
 
@@ -369,8 +461,14 @@ void NewAgentDialog::onRunConfigsDetected(const QString& path, const QString& js
 void NewAgentDialog::onInspectFailed(const QString& op, const QString& message) {
     // Only inspection failures belong in this dialog; the window reports the rest.
     if (op == "repo.inspect") {
-        m_pendingPath.clear();
+        // The path is kept, not cleared: an inspection that failed is still the
+        // one this dialog is showing, and `updateOkEnabled` refuses Create while
+        // it stands. `inspectRepo` lets the same path be asked about again once
+        // this flag is up, so Enter, Recent or Browse are all a retry.
+        m_inspectPending = false;
+        m_inspectFailed = true;
         m_status->setText(message);
+        updateOkEnabled();
         return;
     }
     // A daemon that cannot detect run configurations is not a reason to refuse
@@ -396,6 +494,15 @@ void NewAgentDialog::onGroupChanged(int index) {
 }
 
 void NewAgentDialog::updateOkEnabled() {
-    const bool ok = !repoPath().isEmpty() && !baseBranch().isEmpty() && !group().isEmpty();
+    // Create needs an answer about the path that is in the box *now*. An
+    // inspection still out means the branch combo holds the previous
+    // repository's branches, one that failed means nothing in it is known to
+    // exist, and a path edited since the last inspection has never been asked
+    // about at all. Each of the three creates a workspace forked off a branch
+    // the user did not choose.
+    const QString path = repoPath();
+    const bool ok = !path.isEmpty() && path == m_pendingPath && !m_inspectPending &&
+                    !m_inspectFailed && !baseBranch().isEmpty() && !group().isEmpty() &&
+                    m_controller->validateWorkspaceName(name()).isEmpty();
     m_buttons->button(QDialogButtonBox::Ok)->setEnabled(ok);
 }

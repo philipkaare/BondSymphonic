@@ -60,8 +60,8 @@ WSL2 itself is the one prerequisite the package cannot install for you. If
 and reboot before you start.
 
 The first provisioning downloads about a gigabyte. Signing in to Claude Code and
-GitHub happens **afterwards, inside the IDE**, on its setup page — never by
-typing a login command into a terminal yourself.
+GitHub happens **afterwards, inside the IDE**, under File > Settings… > Setup —
+never by typing a login command into a terminal yourself.
 
 To check that a package unzipped intact:
 
@@ -117,12 +117,17 @@ needs `claude` on the `bs` user's `PATH`.
 
 ---
 
-## First run and the setup page
+## First run and Settings > Setup
 
-The setup page appears by itself at startup when something is missing that would
-stop a workspace being created. **Help > Setup…** opens it any time.
+Setup lives in **File > Settings…**, in the **Setup** section at the top of the
+dialog. It opens by itself at startup when something is missing that would stop
+a workspace being created, and the **Set up…** link in the status bar goes there
+whenever a check is failing. It is where logging in to Claude Code and to GitHub
+happens; there is no Help > Setup any more, because a login is a setting you
+come back to when a token expires.
 
-It lists eight checks, each with a tick or a cross and the detail behind it:
+The section lists eight checks, each with a tick or a cross and the detail
+behind it:
 
 | Check | What it means |
 | --- | --- |
@@ -137,21 +142,28 @@ It lists eight checks, each with a tick or a cross and the detail behind it:
 
 **Log in here, not in a terminal.** A failing check the IDE can fix carries a
 button — **Install Claude Code**, **Log in to Claude Code**, **Install GitHub
-CLI**, **Log in to GitHub**. Pressing it runs that command in a terminal pane on
-the page, on the host rather than inside a sandbox, because a login has to write
-to your home directory. A login URL printed in that output is opened in your
-browser for you. When the command exits the checks re-run, and when they all
-pass the page steps aside on its own.
+CLI**, **Log in to GitHub**. Pressing it runs that command in a terminal pane in
+the dialog, on the host rather than inside a sandbox, because a login has to
+write to your home directory. When the command exits the checks re-run.
 
-**Re-check** runs the checks again. **Continue anyway** is enabled only when no
-*blocking* check is failing. The four blocking ones are `git`, `bwrap`, `userns`
-and `sandbox`: without them there is no worktree and no sandbox, so there is
-nowhere to put an agent. A missing `claude` or `gh`, or either login, costs you
-Claude Code and leaves the rest of the IDE working, so those are warnings rather
-than a wall.
+**The sign-in link.** `claude auth login` prints a URL and then waits for the
+code the browser gives you. The IDE opens that URL in your browser for you, and
+a **Sign-in link** row appears under the terminal with the URL on it, a **Copy**
+button and an **Open in browser** button; clicking the URL itself does both.
+Use the row when the automatic open did not work, or when you want to finish the
+sign-in on another machine. The row goes away when the terminal exits, because
+the URL it carried is spent.
 
-**An API key instead of a login.** File > Settings… stores an Anthropic API key
-in the Windows credential store, never in a config file. It is used only when
+**Re-check** runs the checks again. The four *blocking* checks are `git`,
+`bwrap`, `userns` and `sandbox`: without them there is no worktree and no
+sandbox, so there is nowhere to put an agent, and Settings opens on Setup by
+itself while one of them is failing. A missing `claude` or `gh`, or either
+login, costs you Claude Code and leaves the rest of the IDE working, so those
+are warnings rather than a wall.
+
+**An API key instead of a login.** The **Agents** section of the same dialog
+stores an Anthropic API key in the Windows credential store, never in a config
+file. It is used only when
 Claude Code has no login of its own. Leaving the field empty keeps the stored
 key; **Remove key** deletes it. The same dialog sets the default permission mode
 new agents start with.
@@ -162,11 +174,18 @@ new agents start with.
 
 **New agent** on the group bar, or **File > New Agent…**.
 
+The dialog opens on the repository you used last, and it opens *after* the
+daemon has read that repository — the window shows a wait cursor and "Reading
+repository…" in the meantime — so the base-branch list is filled the moment you
+see the dialog rather than half a minute later. If reading it fails, the dialog
+opens anyway with the reason on it, so you can correct the path. **Create** is
+greyed out while the repository in the box has not been read.
+
 | Field | What it does |
 | --- | --- |
 | Repository | The git repository to branch from. **Browse…** picks one; **Recent** lists repositories you have used before. |
 | Base branch | The branch the workspace starts from and later merges back into. |
-| Name | Names the workspace and its branch, `bs/<name>/work`. Defaults to `agent-<n>`. |
+| Name | Names the workspace and its branch, `bs/<name>/work`. Defaults to `agent-<n>`. One word: letters, digits, `-` or `_`. A space or a `/` is refused as you type, with the reason under the field, and **Create** stays greyed out until you fix it. |
 | Adapter | **Claude Code** (the default when the daemon has it) or **Terminal**. |
 | Command | For a Terminal workspace, the command to run. Empty means your default shell. |
 | Model | Claude Code's `--model`. Empty means its default. |
@@ -182,6 +201,13 @@ writable; the repository's shared `refs/heads` and object store are read-only;
 the sandbox has its own PID namespace; and it reaches the network only through
 an allowlisting proxy.
 
+**A folder that is not a repository yet.** Point the dialog at one and it says
+so under the path: "This folder is not a git repository. It will be initialised
+with an empty first commit when the agent is created." A folder that does not
+exist at all says "This folder does not exist; it will be created and
+initialised." Pressing **Create** is what agrees to it; there is nothing to
+tick.
+
 If the repository's `bondsymphonic.toml` extends the network allowlist, the
 dialog says so before you click **Create** — "This repository adds 2 hosts to
 the network allowlist: …" — because creating the workspace is what applies it.
@@ -196,6 +222,13 @@ workspace the daemon has that no group claims lands in **Unsorted**.
 
 A Claude Code workspace's pane shows the conversation as it arrives.
 
+- **The prompt box only appears once Claude Code is logged in.** Until then the
+  foot of the pane says so and offers **Log in to Claude Code…**, which opens
+  Settings on its Setup section. An agent runs `claude -p`, and `-p` mode cannot
+  log in — typing `/login` into the chat answers "login is not available in this
+  environment" — so the login has to happen in the setup terminal. The box comes
+  back on its own when the check passes; there is no restart. Terminal tabs are
+  unaffected.
 - **Transcript.** Your prompts, the assistant's answers rendered as Markdown,
   one card per tool call with its input and its result, and a line per turn with
   what it cost and how long it took.
@@ -530,18 +563,19 @@ If the version prints but no window appears, the platform plugin is the suspect:
 Setting `QT_DEBUG_PLUGINS=1` makes Qt say which plugin it tried and why it
 failed.
 
-**Nothing was created but the agent produced nothing.** Check the setup page:
-an agent that dies at start-up because nobody is logged in reports the reason in
-a banner above the prompt.
+**Nothing was created but the agent produced nothing.** Check **File >
+Settings… > Setup**: an agent that dies at start-up because nobody is logged in
+reports the reason in a banner above the prompt.
 
 ---
 
 ## The v1 acceptance scenario
 
 This is the checklist the product is measured against. It needs a real Claude
-Code login, so run it yourself after signing in on the setup page.
+Code login, so run it yourself after signing in under File > Settings… > Setup.
 
-1. [ ] Open the IDE. The setup page shows eight ticks, or steps aside by itself.
+1. [ ] Open the IDE. File > Settings… > Setup shows eight ticks, or opens by
+       itself with the failing ones.
 2. [ ] **New agent** on a repository you can afford to branch. Adapter **Claude
        Code**, name `alpha`, group `demo`, an initial prompt that asks for a
        visible change to the web app.

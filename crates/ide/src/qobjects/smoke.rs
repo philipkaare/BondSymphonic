@@ -282,6 +282,9 @@ async fn create(
             repo_path: repo.to_owned(),
             base_branch: BASE_BRANCH.to_owned(),
             name,
+            // The script's repository is a repository already; the script is
+            // not the place to exercise initialising one.
+            init_if_missing: false,
         }))
         .await
         .map_err(|e| e.to_string())?;

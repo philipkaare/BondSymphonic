@@ -111,7 +111,8 @@ crates/ide/
     TerminalWidget.{h,cpp}  paints cells from TerminalSession, forwards keys
     RunPanel.{h,cpp}        config combo, start/stop, url label, log
     NewAgentDialog.{h,cpp}  repo picker, base branch, name, adapter, run config
-    SetupPage.{h,cpp}       shown when daemon/prereqs missing, with fix commands
+    SetupPage.{h,cpp}       prereq rows, fix commands, login terminal, sign-in link
+    SettingsDialog.{h,cpp}  hosts SetupPage as its first section, then agent settings
   tests/
     model_tests.rs          pure model tests
     smoke.rs                offscreen launch against a mock daemon
@@ -167,8 +168,10 @@ show" belongs in Rust.
 3. Spawn `wsl.exe -d D --exec <daemon> --log-level info` with piped stdin/stdout/
    stderr. Parse the first stdout line for port and token. Keep stdin open for the
    daemon's lifetime (closing it is the shutdown signal).
-4. Connect TCP to `127.0.0.1:port`, send `hello`. Call `check_prereqs`; if any
-   item fails, show `SetupPage` with the fix hints but keep the window usable.
+4. Connect TCP to `127.0.0.1:port`, send `hello`. Call `check_prereqs`; if a
+   *blocking* item fails, open the Settings dialog on its Setup section. The
+   window itself stays usable: the setup page is a section of a dialog, not a
+   page in front of the workbench.
 5. On process exit or connection loss: state `reconnecting` ("daemon:
    reconnecting (attempt N)"), retry launch with backoff (1, 2, 4, 8, 16 s, max
    30 s, unbounded attempts), then re-sync (`check_prereqs`, then
@@ -275,6 +278,17 @@ using the same `RustHighlighter`.
   either way, so the bullet cannot disagree with the tab's status glyph.
 - Input box: multi-line, Enter sends, Shift+Enter newline. Disabled while the
   agent is working, except an Interrupt button.
+- **The composer is gated on `AppController::claudeLoggedIn`**, a bool property
+  derived from the daemon's `claude_auth` prerequisite (`claude_logged_in` in
+  `app_controller.rs`; an item that is absent counts as not logged in). While it
+  is false, `TranscriptView` hides the whole composer widget and shows a "Log in
+  to Claude Code…" button in its place, which the window turns into
+  Settings > Setup. An agent runs `claude -p` and `-p` mode cannot log in, so a
+  composer offered before the login exists can only lose what the user typed.
+  The property moves on the re-check a setup terminal triggers when it exits, so
+  the composer returns without an IDE restart. `AgentArea` holds the current
+  value and applies it to every transcript pane, including ones built later;
+  terminal panes and the permission bar are untouched.
 - On tab open, `agent.history` replays into the model before live events are
   applied (events received during replay are buffered).
 
@@ -297,6 +311,31 @@ Terminal with command), run config (combo from `repo.detect_run_configs`, with
 editable port when guessed), group (existing or new), optional initial prompt.
 "Create" calls `workspace.create`, then `agent.start`, then sends the initial
 prompt if any.
+
+Three rules govern when it opens and what it will accept:
+
+- **Inspected before shown.** `MainWindow::onNewAgent` asks `repo.inspect` about
+  the repository the dialog will open on — the most recent one — under a wait
+  cursor and a "Reading repository…" status line, and builds the dialog only
+  when the answer (or its failure) arrives; the answer is replayed into the
+  dialog through `applyInspection`. A failure still opens the dialog, with the
+  reason on it. `repo.inspect` and `workspace.create` get a 120 s client-side
+  wait (`client::REPOSITORY_REQUEST_TIMEOUT`): the 30 s default was shorter than
+  an inspect of a large repository reached through `/mnt/c`.
+- **The name is validated as it is typed.** `validate_workspace_name` in
+  `app_controller.rs` is the daemon's own rule — non-empty, no whitespace, no
+  `/`, no `..` — exposed as the `validateWorkspaceName` invokable. The dialog
+  calls it on every edit, shows "Use a single word: letters, digits, - or _"
+  in red under the field, and greys Create out. Create is also greyed out while
+  the path in the box has not been inspected, while an inspection is out, and
+  after one has failed.
+- **A folder that is not a repository is explained.** `RepoInfo.is_repo == false`
+  puts a line under the path — "This folder is not a git repository. It will be
+  initialised with an empty first commit when the agent is created.", or "This
+  folder does not exist; it will be created and initialised." when `exists` is
+  false too — and makes `initIfMissing()` true, which the window passes to
+  `createWorkspace*` as `WorkspaceCreateParams.init_if_missing`. Pressing Create
+  is the consent; there is no checkbox.
 
 ## 11. Persistence
 
@@ -360,7 +399,16 @@ terminal tab bound to no agent. There is deliberately no field in
   workspace's agent area, with the error message and, for `GitError`, the stderr
   in an expandable section.
 - Daemon-level problems (disconnect, prereqs) show in the status bar and, when
-  blocking, as the `SetupPage` replacing the central area.
+  blocking, by opening the Settings dialog on its Setup section. The status bar's
+  "Set up…" link goes to the same place while any check is failing.
+- **Setup lives in File > Settings…, not under Help.** `SettingsDialog` hosts
+  the whole `SetupPage` — rows, fix buttons, login terminal and sign-in link —
+  as its first section, and `MainWindow::showSetupPage` opens the dialog on it.
+  A login is a setting the user comes back to when a token expires; Help is
+  where they look for documentation. The dialog is modal: modality stops input
+  reaching other windows but not the event loop, so the login terminal inside it
+  works exactly as it did on the full-window page, and a single dialog instance
+  means a prerequisite re-check cannot stack a second one over the first.
 - **Logins happen inside the IDE, never via a terminal command the user must
   type.** The `SetupPage` lists each failing prerequisite with an action button.
   For `claude_auth` the button is "Log in to Claude Code": it opens a terminal
@@ -368,7 +416,16 @@ terminal tab bound to no agent. There is deliberately no field in
   completes the OAuth flow there; the IDE watches the PTY output for the login
   URL and opens it in the system browser automatically, so the user only has
   to approve in the browser and paste the code if asked. The same pattern
-  serves `gh_auth` with `gh auth login`. Missing tools (`bwrap`, `claude`,
+  serves `gh_auth` with `gh auth login`. `LINK_PREFIXES` in
+  `terminal_session.rs` is the closed list of hosts a browser will be opened
+  for: `https://claude.ai/`, `https://claude.com/` (what the CLI actually
+  prints) and `https://github.com/login/device`. Under the terminal, a
+  **Sign-in link** row appears when a URL is detected: the URL elided in the
+  middle, **Copy** (with a transient "Link copied") and **Open in browser**,
+  and clicking the URL itself does both. The automatic open stays; the row is
+  for the case it cannot be verified — no default browser, or a sign-in that has
+  to finish on another machine. The row goes down when the terminal exits,
+  because the URL it carried is spent. Missing tools (`bwrap`, `claude`,
   `gh`) get an "Install" button that runs the `fix_hint` command in the same
   terminal pane. After the pane's process exits, the IDE re-runs
   `check_prereqs`; when everything passes the page dismisses itself. Settings
@@ -674,7 +731,9 @@ is immune to both and is what to use when a compound command is unavoidable.
     `pty.close`, `pty.resize` or `pty.write` after it either, because those PTYs
     have already exited.
   - `system.setup_pty` never asked for: every prerequisite the fake daemon
-    reports passes, so the setup page never appears and no login terminal opens.
+    reports passes, so Settings never opens on Setup and no login terminal
+    opens. The same answer opens the transcript composer, because
+    `claudeLoggedIn` follows `claude_auth`.
   - `repo.detect_run_configs`, `run.list`, `run.start`, `workspace.get`,
     `workspace.set_allowlist` and `run.stop` in that order, after `agent.stop`
     and before the script's `pty.open`. The first two are the Run panel's own,

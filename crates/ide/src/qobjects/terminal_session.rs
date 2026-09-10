@@ -185,13 +185,23 @@ pub const RESTART_MARKER: &str = "[daemon restarted]";
 const DEFAULT_COLS: i32 = 80;
 const DEFAULT_ROWS: i32 = 24;
 
-/// The only two URLs the IDE will open a browser for, both of them printed by
-/// a setup terminal that is waiting for a login to happen elsewhere.
+/// The only URLs the IDE will open a browser for, all of them printed by a
+/// setup terminal that is waiting for a login to happen elsewhere.
 ///
 /// A deliberately closed list. The output of a terminal is whatever the program
 /// inside it chose to print, so anything wider would let a repository's build
 /// script open a page on the developer's desktop by writing a link.
-const LINK_PREFIXES: [&str; 2] = ["https://claude.ai/", "https://github.com/login/device"];
+///
+/// Both Claude hosts are here because the CLI prints `claude.com` and the
+/// documentation says `claude.ai`. Knowing only the second is what left the
+/// first real login with a browser that never opened. The trailing slash is
+/// part of each prefix, so a look-alike host -- `claude.com.evil.example` --
+/// is not a match.
+const LINK_PREFIXES: [&str; 3] = [
+    "https://claude.ai/",
+    "https://claude.com/",
+    "https://github.com/login/device",
+];
 
 /// How much of the output stream a [`LinkScanner`] keeps, so that a URL split
 /// across two `pty.output` events is still seen whole. One kibibyte is several

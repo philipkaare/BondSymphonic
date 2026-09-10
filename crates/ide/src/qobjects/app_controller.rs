@@ -355,6 +355,15 @@ pub mod qobject {
         #[qproperty(i32, connection_state)]
         #[qproperty(QString, status_message)]
         #[qproperty(QString, daemon_version)]
+        /// Whether Claude Code is logged in, from the daemon's last
+        /// `system.check_prereqs`. False before the first answer.
+        ///
+        /// Every Claude transcript hides its composer behind a "Log in to
+        /// Claude Code…" button while this is false, because an agent runs
+        /// `claude -p` and `-p` mode cannot log in. It becomes true on the
+        /// re-check a setup terminal triggers when it exits, so the composer
+        /// comes back without an IDE restart.
+        #[qproperty(bool, claude_logged_in)]
         type AppController = super::AppControllerRust;
 
         #[qsignal]
@@ -505,6 +514,12 @@ pub mod qobject {
         /// picked. Identical to `createWorkspace` otherwise; the name is not
         /// sent to the daemon, only echoed back in `workspaceCreated` so the
         /// window can store it on the tab.
+        ///
+        /// `init_if_missing` lets the daemon create and initialise the folder
+        /// when it is not a git repository. It is the New Agent dialog's
+        /// answer, never a default: the dialog only sets it once it has told
+        /// the user, in the sentence under the path, that the folder is about
+        /// to become a repository.
         #[qinvokable]
         fn create_workspace_with_run(
             self: Pin<&mut AppController>,
@@ -515,10 +530,12 @@ pub mod qobject {
             adapter: QString,
             command: QString,
             run_config: QString,
+            init_if_missing: bool,
         );
 
         /// `createWorkspaceWithAgent` plus the run configuration the user
-        /// picked, echoed back in `workspaceCreated`.
+        /// picked, echoed back in `workspaceCreated`, and the same
+        /// `init_if_missing` as `createWorkspaceWithRun`.
         #[qinvokable]
         fn create_workspace_with_agent_and_run(
             self: Pin<&mut AppController>,
@@ -529,6 +546,7 @@ pub mod qobject {
             options_json: QString,
             initial_prompt: QString,
             run_config: QString,
+            init_if_missing: bool,
         );
 
         /// Create a workspace and start a Claude agent in it. Answers with
@@ -592,6 +610,24 @@ pub mod qobject {
         /// Answers with `setup_pty_opened` or `operation_failed("setup", ...)`.
         #[qinvokable]
         fn open_setup_pty(self: Pin<&mut AppController>, action: QString, cols: i32, rows: i32);
+
+        /// Empty when `name` is one `workspace.create` will accept, and
+        /// otherwise the single sentence to show under the field.
+        ///
+        /// The New Agent dialog calls it on every keystroke. The rule lives in
+        /// Rust, next to the create it guards, so the dialog and the daemon
+        /// cannot disagree about what a workspace may be called.
+        #[qinvokable]
+        fn validate_workspace_name(self: &AppController, name: QString) -> QString;
+
+        /// The last `prereqsChecked` payload, or empty before the first check
+        /// has answered.
+        ///
+        /// The setup page is built when the Settings dialog opens, which is
+        /// long after the check it draws. Without this it would show an empty
+        /// list until something happened to trigger another one.
+        #[qinvokable]
+        fn prereqs_json(self: &AppController) -> QString;
 
         /// Whether any prerequisite in `json` is one the IDE cannot work
         /// without. The window asks before deciding between the setup page and
@@ -968,6 +1004,53 @@ pub fn prereqs_blocking(items: &[PrereqStatus]) -> bool {
         .any(|item| !item.ok && BLOCKING_PREREQS.contains(&item.name.as_str()))
 }
 
+/// The prerequisite that says Claude Code can run without asking anyone to log
+/// in. `claude --version` working is `claude`; this is the token behind it.
+pub const CLAUDE_AUTH_PREREQ: &str = "claude_auth";
+
+/// Whether Claude Code is logged in, according to the daemon's last check.
+///
+/// The gate on the chat composer. An agent runs `claude -p`, which cannot log
+/// in -- typing `/login` into it answers "login is not available in this
+/// environment" -- so a composer offered before this is true can only produce
+/// that sentence. The login itself happens in the setup terminal, which is a
+/// PTY and can.
+///
+/// An item that is not in the list at all counts as not logged in. A daemon
+/// that never reported it has told the IDE nothing, and a shut gate with a
+/// button on it costs one click, where an open one costs a lost prompt.
+pub fn claude_logged_in(items: &[PrereqStatus]) -> bool {
+    items
+        .iter()
+        .any(|item| item.name == CLAUDE_AUTH_PREREQ && item.ok)
+}
+
+/// The message the New Agent dialog shows under an unusable name.
+///
+/// One sentence, and the same one whichever rule was broken: the four rules
+/// together are "one path-safe word", and naming which of them a half-typed
+/// name is currently failing would change the text under the field on nearly
+/// every keystroke.
+pub const WORKSPACE_NAME_HINT: &str = "Use a single word: letters, digits, - or _";
+
+/// Whether `name` is a name `workspace.create` will accept.
+///
+/// Exactly the daemon's own four conditions (`workspace::lifecycle::create`),
+/// deliberately duplicated rather than inferred: the daemon is the authority
+/// and keeps its check, and this is the same rule moved to where the user is
+/// still typing. Before it existed, a name with a space was refused after the
+/// dialog had closed and everything typed into it was gone.
+pub fn validate_workspace_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains("..")
+        || name.contains(char::is_whitespace)
+    {
+        return Err(WORKSPACE_NAME_HINT);
+    }
+    Ok(())
+}
+
 /// The workspace and host of a network denial, for an event that is one.
 ///
 /// The proxy announces a refused connection as a warn-level `daemon.log`
@@ -1023,6 +1106,13 @@ pub struct AppControllerRust {
     /// and a discard racing a merge is how the user's base branch ends up
     /// pointing at objects the discard deleted.
     busy: crate::model::app_state::BusyWorkspaces,
+    /// Whether the daemon's last prerequisite check said Claude Code is logged
+    /// in. Backs the `claudeLoggedIn` property; see [`claude_logged_in`] for
+    /// what the transcript panes do with it.
+    claude_logged_in: bool,
+    /// The last `prereqs_checked` payload, so a setup page built later can
+    /// draw its rows without waiting for another check. See `prereqs_json`.
+    prereqs_json: QString,
 }
 
 impl Default for AppControllerRust {
@@ -1037,6 +1127,10 @@ impl Default for AppControllerRust {
             first_list_done: false,
             reconnect_attempt: 0,
             busy: crate::model::app_state::BusyWorkspaces::default(),
+            // Shut until a check says otherwise: the composer must not be open
+            // in the seconds before the first `system.check_prereqs` answers.
+            claude_logged_in: false,
+            prereqs_json: QString::from(""),
         }
     }
 }
@@ -1247,7 +1341,15 @@ async fn check_prereqs(client: DaemonClient, qt: QtHandle) {
         failed = failures.len(),
         "prerequisites checked"
     );
+    // Computed here rather than in C++: the transcript panes read a property,
+    // and deriving it from the JSON at each of them would put the same rule in
+    // as many places as there are panes.
+    let logged_in = claude_logged_in(&items);
     let _ = qt.queue(move |mut q| {
+        // Before the signal, so a pane the window rebuilds on `prereqsChecked`
+        // already sees the gate it is meant to draw.
+        q.as_mut().set_claude_logged_in(logged_in);
+        q.as_mut().rust_mut().prereqs_json = QString::from(&json);
         q.as_mut().prereqs_checked(QString::from(&json));
         if !failures.is_empty() {
             q.prereq_warning(QString::from(&failures.join("\n")));
@@ -1768,6 +1870,7 @@ impl qobject::AppController {
             adapter,
             command,
             QString::from(""),
+            false,
         );
     }
 
@@ -1780,12 +1883,14 @@ impl qobject::AppController {
         adapter: QString,
         command: QString,
         run_config: QString,
+        init_if_missing: bool,
     ) {
         let qt = self.qt_thread();
         let params = WorkspaceCreateParams {
             repo_path: repo_path.to_string(),
             base_branch: base_branch.to_string(),
             name: name.to_string(),
+            init_if_missing,
         };
         // Echoed straight back on success: the controller keeps no tab state.
         let (group, adapter, command, run_config) = (
@@ -1845,6 +1950,7 @@ impl qobject::AppController {
             options_json,
             initial_prompt,
             QString::from(""),
+            false,
         );
     }
 
@@ -1857,12 +1963,14 @@ impl qobject::AppController {
         options_json: QString,
         initial_prompt: QString,
         run_config: QString,
+        init_if_missing: bool,
     ) {
         let qt = self.qt_thread();
         let params = WorkspaceCreateParams {
             repo_path: repo_path.to_string(),
             base_branch: base_branch.to_string(),
             name: name.to_string(),
+            init_if_missing,
         };
         let group = group.to_string();
         // Kept for `state.json`, which the echo below does not reach.
@@ -2172,6 +2280,17 @@ impl qobject::AppController {
                 tracing::warn!("prereqs_block: unparseable prerequisite list: {e}");
                 false
             }
+        }
+    }
+
+    pub fn prereqs_json(&self) -> QString {
+        self.rust().prereqs_json.clone()
+    }
+
+    pub fn validate_workspace_name(&self, name: QString) -> QString {
+        match validate_workspace_name(&name.to_string()) {
+            Ok(()) => QString::from(""),
+            Err(hint) => QString::from(hint),
         }
     }
 

@@ -2,12 +2,21 @@
 #include <QDialog>
 
 class AppController;
+class SetupPage;
 class QComboBox;
 class QLineEdit;
 class QPushButton;
+class QScrollArea;
 
-/// The application settings: the Anthropic API key, and what permission mode a
-/// new agent starts on.
+/// The application settings: setup and logins, the Anthropic API key, and what
+/// permission mode a new agent starts on.
+///
+/// Setup is the first section, and it is the whole `SetupPage`: the
+/// prerequisite rows, their fix buttons, the login terminal and the sign-in
+/// link row. This is where logging in to Claude Code and to GitHub happens.
+/// It is here rather than under Help because a login is a setting the user
+/// comes back to -- a token expires, an account changes -- and Help is where
+/// people look for documentation, not for a terminal.
 ///
 /// The key is write-only here. The dialog can put one in the Windows
 /// credential store and take one out again, but it never reads one back: the
@@ -18,6 +27,12 @@ class SettingsDialog : public QDialog {
 public:
     explicit SettingsDialog(AppController* controller, QWidget* parent = nullptr);
 
+    /// Scrolls the Setup section into view and gives it the focus. What
+    /// `MainWindow::showSetupPage` calls, so the status-bar "Set up…" link and
+    /// the first-run check land on the section they are about rather than at
+    /// the top of a form.
+    void revealSetup();
+
     void accept() override;
 
 private:
@@ -27,6 +42,11 @@ private:
     void removeKey();
 
     AppController* m_controller;
+    /// The whole setup page, hosted as this dialog's first section.
+    SetupPage* m_setup = nullptr;
+    /// The scroller the sections live in, so `revealSetup` can bring the first
+    /// one back into view in a dialog the user has scrolled.
+    QScrollArea* m_scroll = nullptr;
     QLineEdit* m_apiKey = nullptr;
     QPushButton* m_removeKey = nullptr;
     QComboBox* m_permissionMode = nullptr;

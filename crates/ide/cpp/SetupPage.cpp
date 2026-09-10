@@ -2,8 +2,11 @@
 #include "TerminalWidget.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
+#include <QClipboard>
 #include <QDesktopServices>
 #include <QFont>
+#include <QFontMetrics>
+#include <QGuiApplication>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QJsonArray>
@@ -11,7 +14,9 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QScrollArea>
+#include <QSizePolicy>
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -30,24 +35,31 @@ constexpr int kPrereqCount = 8;
 const QString kOk = QStringLiteral("✓");
 const QString kBad = QStringLiteral("✗");
 
+/// How long "Link copied" stays on the sign-in row.
+constexpr int kCopiedFeedbackMs = 3000;
+
+/// The narrowest the URL label will elide to. Below this the elision is all
+/// ellipsis and says nothing; the tooltip and the buttons still work.
+constexpr int kMinLinkWidth = 40;
+
 } // namespace
 
 SetupPage::SetupPage(AppController* controller, QWidget* parent)
     : QWidget(parent), m_controller(controller) {
     auto* outer = new QVBoxLayout(this);
 
-    auto* title = new QLabel("Set up BondSymphonic", this);
-    QFont titleFont = title->font();
+    m_title = new QLabel("Set up BondSymphonic", this);
+    QFont titleFont = m_title->font();
     titleFont.setPointSize(titleFont.pointSize() + 6);
     titleFont.setBold(true);
-    title->setFont(titleFont);
-    outer->addWidget(title);
+    m_title->setFont(titleFont);
+    outer->addWidget(m_title);
 
-    auto* subtitle = new QLabel(
+    m_subtitle = new QLabel(
         "BondSymphonic runs its agents inside a sandbox in WSL. These are what it needs.", this);
-    subtitle->setWordWrap(true);
-    subtitle->setEnabled(false);
-    outer->addWidget(subtitle);
+    m_subtitle->setWordWrap(true);
+    m_subtitle->setEnabled(false);
+    outer->addWidget(m_subtitle);
 
     // Scrolled: eight rows fit, but a detail line long enough to wrap twice
     // must not push the buttons off the bottom of a short window.
@@ -80,6 +92,50 @@ SetupPage::SetupPage(AppController* controller, QWidget* parent)
     m_terminalHost->setVisible(false);
     outer->addWidget(m_terminalHost, 1);
 
+    // The sign-in row, under the terminal and hidden until a login URL is
+    // printed. It exists because opening the browser is the one step of the
+    // login the IDE cannot verify: nothing comes back to say a browser took
+    // the URL, and without this row the only copy of it is wrapped across
+    // eighty columns of terminal.
+    m_linkRow = new QWidget(this);
+    auto* linkLayout = new QHBoxLayout(m_linkRow);
+    linkLayout->setContentsMargins(0, 0, 0, 0);
+    auto* linkTitle = new QLabel("Sign-in link:", m_linkRow);
+    QFont linkTitleFont = linkTitle->font();
+    linkTitleFont.setBold(true);
+    linkTitle->setFont(linkTitleFont);
+    linkLayout->addWidget(linkTitle);
+    m_linkLabel = new QLabel(m_linkRow);
+    // Rich text so the URL reads as a link, but Qt never follows it itself:
+    // `QDesktopServices::openUrl` is the one place in the IDE a URL reaches the
+    // system browser, and this one was printed by a terminal.
+    m_linkLabel->setTextFormat(Qt::RichText);
+    m_linkLabel->setOpenExternalLinks(false);
+    m_linkLabel->setTextInteractionFlags(Qt::TextBrowserInteraction);
+    // Ignored, and a minimum of one pixel: the label is given whatever width
+    // the row has left and elides to it. Without this the label asks for the
+    // whole URL and the dialog grows to fit a query string.
+    m_linkLabel->setMinimumWidth(1);
+    m_linkLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    linkLayout->addWidget(m_linkLabel, 1);
+    m_linkFeedback = new QLabel(m_linkRow);
+    m_linkFeedback->setTextFormat(Qt::PlainText);
+    m_linkFeedback->setEnabled(false);
+    m_linkFeedback->setVisible(false);
+    linkLayout->addWidget(m_linkFeedback);
+    m_copyLink = new QPushButton("Copy", m_linkRow);
+    m_copyLink->setToolTip("Put the sign-in link on the clipboard");
+    m_openLink = new QPushButton("Open in browser", m_linkRow);
+    m_openLink->setToolTip("Open the sign-in link in your desktop browser");
+    linkLayout->addWidget(m_copyLink);
+    linkLayout->addWidget(m_openLink);
+    m_linkRow->setVisible(false);
+    outer->addWidget(m_linkRow);
+
+    m_linkFeedbackTimer = new QTimer(this);
+    m_linkFeedbackTimer->setSingleShot(true);
+    m_linkFeedbackTimer->setInterval(kCopiedFeedbackMs);
+
     auto* buttons = new QHBoxLayout();
     m_recheckButton = new QPushButton("Re-check", this);
     m_continueButton = new QPushButton("Continue anyway", this);
@@ -105,6 +161,21 @@ SetupPage::SetupPage(AppController* controller, QWidget* parent)
                      &SetupPage::onOperationFailed);
     QObject::connect(m_session, &TerminalSession::linkDetected, this, &SetupPage::onLinkDetected);
     QObject::connect(m_session, &TerminalSession::exitedSignal, this, &SetupPage::onTerminalExited);
+    QObject::connect(m_linkFeedbackTimer, &QTimer::timeout, this,
+                     [this] { m_linkFeedback->setVisible(false); });
+    QObject::connect(m_copyLink, &QPushButton::clicked, this, &SetupPage::copyLink);
+    QObject::connect(m_openLink, &QPushButton::clicked, this, &SetupPage::openLink);
+    QObject::connect(m_linkLabel, &QLabel::linkActivated, this,
+                     [this](const QString&) { useLink(); });
+
+    // The page is built when the Settings dialog opens, long after the check it
+    // draws. Drawing the last answer straight away is what stops the section
+    // being an empty box until something happens to trigger another check;
+    // "Re-check" is beneath it for anything that has changed since.
+    const QString last = m_controller->prereqsJson();
+    if (!last.isEmpty()) {
+        applyPrereqs(last);
+    }
 }
 
 void SetupPage::applyPrereqs(const QString& json) {
@@ -240,6 +311,10 @@ void SetupPage::runAction(const QString& action) {
     }
     m_pendingAction = action;
     setActionsEnabled(false);
+    // Whatever the last terminal printed belongs to the last terminal. A row
+    // left standing here would offer the previous login's URL beside the new
+    // one's output.
+    clearLink();
     // The previous action's terminal, if there is one, is released by the
     // `attach` below: `TerminalSession::begin` tears the old subscription down
     // and closes the PTY it held. What that cannot cover is a *second* request
@@ -282,10 +357,88 @@ void SetupPage::onOperationFailed(const QString& op, const QString& message) {
 }
 
 void SetupPage::onLinkDetected(const QString& url) {
+    m_linkUrl = url;
+    m_linkFeedbackTimer->stop();
+    m_linkFeedback->setVisible(false);
+    m_linkRow->setVisible(true);
+    updateLinkElide();
+    // Unchanged: the first thing that happens to a detected link is still that
+    // the browser is asked to open it. `LinkScanner` reports each URL once, so
+    // this is one open per login rather than one per chunk of output.
     QDesktopServices::openUrl(QUrl(url));
 }
 
+void SetupPage::copyLink() {
+    if (m_linkUrl.isEmpty()) {
+        return;
+    }
+    // The URL as printed, never the label's text: the label shows an elided
+    // rendering, and pasting an ellipsis into a browser is worse than nothing.
+    QGuiApplication::clipboard()->setText(m_linkUrl);
+    m_linkFeedback->setText("Link copied");
+    m_linkFeedback->setVisible(true);
+    m_linkFeedbackTimer->start();
+}
+
+void SetupPage::openLink() {
+    if (m_linkUrl.isEmpty()) {
+        return;
+    }
+    QDesktopServices::openUrl(QUrl(m_linkUrl));
+}
+
+void SetupPage::useLink() {
+    // Both halves, because a click on the URL itself is the user saying "I want
+    // this link" without saying what for, and either one alone is a guess.
+    copyLink();
+    openLink();
+}
+
+void SetupPage::updateLinkElide() {
+    if (m_linkUrl.isEmpty()) {
+        m_linkLabel->clear();
+        m_linkLabel->setToolTip(QString());
+        return;
+    }
+    // Elided in the middle: the host says which login this is and the tail
+    // carries the state, so a URL cut at either end says less than one cut in
+    // the middle. The href is always the whole URL.
+    const int room = qMax(m_linkLabel->width(), kMinLinkWidth);
+    const QString shown = m_linkLabel->fontMetrics().elidedText(m_linkUrl, Qt::ElideMiddle, room);
+    m_linkLabel->setText(QStringLiteral("<a href=\"%1\">%2</a>")
+                             .arg(m_linkUrl.toHtmlEscaped(), shown.toHtmlEscaped()));
+    m_linkLabel->setToolTip(m_linkUrl);
+}
+
+void SetupPage::clearLink() {
+    m_linkUrl.clear();
+    m_linkFeedbackTimer->stop();
+    m_linkFeedback->setVisible(false);
+    m_linkLabel->clear();
+    m_linkLabel->setToolTip(QString());
+    m_linkRow->setVisible(false);
+}
+
+void SetupPage::setEmbedded(bool embedded) {
+    m_title->setVisible(!embedded);
+    m_subtitle->setVisible(!embedded);
+    // "Continue anyway" dismisses a wall. Inside Settings there is no wall to
+    // dismiss and the dialog's own buttons are what close it.
+    m_continueButton->setVisible(!embedded);
+}
+
+void SetupPage::resizeEvent(QResizeEvent* event) {
+    QWidget::resizeEvent(event);
+    // The label's width is only real once a layout has run, so the elision is
+    // recomputed here rather than at the moment the URL arrives.
+    updateLinkElide();
+}
+
 void SetupPage::onTerminalExited() {
+    // The link belonged to the process that has just ended. Whether the login
+    // worked or not that URL is spent, and offering it afterwards would send
+    // the user to a page that answers with an expired code.
+    clearLink();
     m_terminalLabel->setText("Finished. Re-checking…");
     // The reply to `system.setup_pty` came back the moment the terminal
     // opened; the fix is only done now.

@@ -143,7 +143,10 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     m_permission = new PermissionBar(this);
     outer->addWidget(m_permission);
 
-    auto* bottom = new QHBoxLayout();
+    // The composer as one widget rather than a bare layout, so the login gate
+    // can take its place without every child having to be hidden by hand.
+    m_composer = new QWidget(this);
+    auto* bottom = new QHBoxLayout(m_composer);
     bottom->setContentsMargins(4, 4, 4, 4);
     bottom->setSpacing(4);
     m_input = new PromptInput(this);
@@ -163,7 +166,32 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     buttons->addWidget(m_interrupt);
     buttons->addWidget(m_stop);
     bottom->addLayout(buttons, 0);
-    outer->addLayout(bottom);
+    outer->addWidget(m_composer);
+
+    // Shown in the composer's place until `claude_auth` passes. A button and a
+    // sentence, not a disabled prompt box: a greyed box invites the user to
+    // wait for something that is never going to happen on its own, whereas
+    // this says what is missing and leads to the one place it can be fixed.
+    m_loginGate = new QWidget(this);
+    auto* gateLayout = new QHBoxLayout(m_loginGate);
+    gateLayout->setContentsMargins(4, 4, 4, 4);
+    gateLayout->setSpacing(4);
+    auto* gateText = new QLabel(
+        QStringLiteral("Claude Code is not logged in, so this agent cannot answer yet."),
+        m_loginGate);
+    gateText->setWordWrap(true);
+    gateText->setEnabled(false);
+    gateLayout->addWidget(gateText, 1);
+    auto* loginButton =
+        new QPushButton(QStringLiteral("Log in to Claude Code") + QChar(kEllipsis), m_loginGate);
+    // Named so a test can find it without the view growing an accessor for it.
+    loginButton->setObjectName(QStringLiteral("bsClaudeLogin"));
+    loginButton->setToolTip(QStringLiteral("Open Settings on the Setup section"));
+    gateLayout->addWidget(loginButton, 0);
+    m_loginGate->hide();
+    outer->addWidget(m_loginGate);
+    QObject::connect(loginButton, &QPushButton::clicked, this,
+                     [this] { emit loginRequested(); });
 
     // Applied on the range change rather than on the append: the scroll bar's
     // maximum is still the old one while the new frame is being laid out.
@@ -311,6 +339,25 @@ void TranscriptView::onBusyChanged() {
     if (m_model.isNull()) {
         return;
     }
+    onStateChanged();
+}
+
+void TranscriptView::setClaudeLoggedIn(bool loggedIn) {
+    if (m_loggedIn == loggedIn) {
+        return;
+    }
+    m_loggedIn = loggedIn;
+    m_composer->setVisible(loggedIn);
+    m_loginGate->setVisible(!loggedIn);
+    // The permission bar stays where it is: answering Allow or Deny is not
+    // sending a prompt, and an agent that is already running can still be
+    // waiting on one when a token expires underneath it.
+    if (m_model.isNull()) {
+        return;
+    }
+    // The composer coming back has to arrive with the right busy state on it,
+    // which is whatever the model says now rather than what it said when the
+    // gate went up.
     onStateChanged();
 }
 

@@ -41,10 +41,25 @@ public:
     /// a pane that waits for something nobody asked for.
     void setStarting(bool starting);
 
+    /// Opens or closes the composer according to whether Claude Code is logged
+    /// in, per the daemon's `claude_auth` prerequisite.
+    ///
+    /// While it is closed the foot of the pane is a single "Log in to Claude
+    /// Code…" button instead of the prompt box. An agent runs `claude -p`, and
+    /// `-p` mode cannot log in: typing `/login` into it answers "login is not
+    /// available in this environment", so a composer offered here before the
+    /// login exists can only waste what the user typed. The login itself
+    /// happens in the setup terminal, which is a PTY and can.
+    void setClaudeLoggedIn(bool loggedIn);
+
 signals:
     /// The user pressed Start (or Restart). The area turns this into the
     /// workspace id the window needs; this view knows only its model.
     void startAgentRequested();
+
+    /// The user pressed "Log in to Claude Code…". The window answers by opening
+    /// Settings on its Setup section; this view knows nothing about dialogs.
+    void loginRequested();
 
 private:
     void rebuild();
@@ -78,6 +93,11 @@ private:
     QList<QWidget*> m_frames;
     QLabel* m_banner = nullptr;
     PermissionBar* m_permission = nullptr;
+    /// The prompt box and its three buttons as one widget, so the login gate
+    /// can replace the lot without touching any of them.
+    QWidget* m_composer = nullptr;
+    /// What stands in the composer's place until Claude Code is logged in.
+    QWidget* m_loginGate = nullptr;
     PromptInput* m_input = nullptr;
     QPushButton* m_interrupt = nullptr;
     QPushButton* m_stop = nullptr;
@@ -85,6 +105,9 @@ private:
     QPushButton* m_start = nullptr;
     /// See [`setStarting`].
     bool m_starting = false;
+    /// See [`setClaudeLoggedIn`]. True until told otherwise, so a view built
+    /// without a window around it behaves as it always did.
+    bool m_loggedIn = true;
     /// The agent id the pane had when the start was asked for. A different one
     /// arriving is the start answering, whether the pane had none before or was
     /// restarting one that exited.
