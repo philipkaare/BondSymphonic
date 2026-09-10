@@ -318,10 +318,13 @@ receive an unclaimed workspace.
 
 **Agents are owned by the daemon too, and a tab is rebuilt from its list.**
 `state.json` remembers which workspaces were in which group and nothing about
-what was running in them. `WorkspaceInfo.agents` carries one `AgentSummary` per
-agent the daemon has for that workspace — id, adapter, session id, and the
-non-secret half of the options it was started with — oldest first, ended agents
-included. `AgentTab::from_workspace_info` adopts the last of them, so a Claude
+what was running in them. `WorkspaceInfo.agent_records` carries one
+`AgentSummary` per agent the daemon has for that workspace — id, adapter, state,
+session id, and the non-secret half of the options it was started with — oldest
+first, ended agents included, in the same order as the bare ids in
+`WorkspaceInfo.agents`. A daemon too old to send the records leaves them empty,
+and the IDE then builds the terminal tab it always did.
+`AgentTab::from_workspace_info` adopts the last of them, so a Claude
 workspace comes back as a Claude tab whose transcript pane attaches to the same
 agent id, replays `agent.history`, reads back `exited`, and offers Restart with
 the model and permission mode the user originally chose. Without that the
