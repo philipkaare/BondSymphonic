@@ -187,19 +187,13 @@ impl Settings {
         }
     }
 
-    /// Dev builds: the daemon binary produced by scripts/build-daemon.ps1.
+    /// The daemon binary this build ships with: the copy `package.ps1` put
+    /// beside the exe, or the one `scripts\build-daemon.ps1` left in
+    /// `target\daemon\`. The order, and the `BS_DAEMON_BINARY` override in
+    /// front of it, live in the launcher — it is the module that installs the
+    /// binary, and the resolution is tested there.
     pub fn local_daemon_binary() -> Option<PathBuf> {
-        let exe = std::env::current_exe().ok()?;
-        let candidates = [
-            // packaged next to the IDE executable
-            exe.parent()?.join("bondsymphonic-daemon"),
-            // target\<profile>\..\daemon\bondsymphonic-daemon
-            exe.parent()?
-                .parent()?
-                .join("daemon")
-                .join("bondsymphonic-daemon"),
-        ];
-        candidates.into_iter().find(|p| p.exists())
+        crate::launcher::local_daemon_binary()
     }
 }
 

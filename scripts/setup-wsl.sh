@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
 # Provisions the bondsymphonic WSL distro. Idempotent.
+#
+#   setup-wsl.sh [user] [dev|runtime]
+#
+# `dev` (the default) also installs a Rust toolchain and the C toolchain cargo
+# needs, because a developer builds the daemon inside this distro. `runtime`
+# installs only what running the daemon needs: an end user gets the daemon as a
+# binary in the package and never compiles anything.
 set -euo pipefail
 USER_NAME="${1:-bs}"
+MODE="${2:-dev}"
+case "$MODE" in
+  dev|runtime) ;;
+  *) echo "setup-wsl: unknown mode '$MODE' (expected dev or runtime)" >&2; exit 2 ;;
+esac
+echo "setup-wsl: user '$USER_NAME', mode '$MODE'"
 
 export DEBIAN_FRONTEND=noninteractive
 # This host's WSL NAT only has broken/blackholed IPv6 routes to some Ubuntu
@@ -10,8 +23,14 @@ export DEBIAN_FRONTEND=noninteractive
 # fast instead of hanging.
 echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
 apt-get update -y
-apt-get install -y git bubblewrap build-essential curl ca-certificates pkg-config \
-    python3 socat unzip gh
+# What the daemon needs at run time: git for worktrees, bubblewrap for the
+# sandbox, python3 for the run configurations the IDE detects, gh for pull
+# requests, and curl/ca-certificates/unzip for the Claude Code installer.
+apt-get install -y git bubblewrap curl ca-certificates python3 socat unzip gh
+if [ "$MODE" = "dev" ]; then
+  # Only a build needs a C toolchain and pkg-config; cargo links with them.
+  apt-get install -y build-essential pkg-config
+fi
 
 # Non-root user
 if ! id "$USER_NAME" >/dev/null 2>&1; then
@@ -33,15 +52,20 @@ if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || ec
   sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 fi
 
-# Per-user tooling
-sudo -u "$USER_NAME" -H bash <<'EOS'
+# Per-user tooling. The mode arrives as a positional argument rather than
+# interpolated: the heredoc is quoted so the outer shell expands nothing inside
+# it, which is what keeps `$HOME` and `$PATH` the inner user's.
+sudo -u "$USER_NAME" -H bash -s -- "$MODE" <<'EOS'
 set -euo pipefail
+MODE="$1"
 cd "$HOME"
-if ! command -v cargo >/dev/null 2>&1; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile default
+if [ "$MODE" = "dev" ]; then
+  if ! command -v cargo >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile default
+  fi
+  source "$HOME/.cargo/env"
+  rustup default stable
 fi
-source "$HOME/.cargo/env"
-rustup default stable
 if ! command -v claude >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/claude" ]; then
   curl -fsSL https://claude.ai/install.sh | bash
 fi
@@ -54,4 +78,4 @@ else
   echo "bwrap: FAILED (user namespaces unavailable)"; exit 1
 fi
 EOS
-echo "setup-wsl: OK"
+echo "setup-wsl: OK ($MODE)"

@@ -307,6 +307,35 @@ appears by itself when something needed is missing, and Help > Setup… opens it
 Each failing item the IDE can fix has a button that runs the command in a terminal on the
 page, opens any login URL in your browser, and re-checks when it finishes.
 
+## Install from a package
+
+If somebody handed you a `BondSymphonic-<version>-win64.zip` rather than the source:
+
+```powershell
+Expand-Archive BondSymphonic-0.1.0-win64.zip -DestinationPath C:\Tools
+C:\Tools\BondSymphonic\install.ps1          # once
+C:\Tools\BondSymphonic\bondsymphonic-ide.exe
+```
+
+`install.ps1` creates the `bondsymphonic` WSL2 distro if it is not already there —
+Ubuntu 24.04 with git, bubblewrap, python3, Claude Code and gh, and **no Rust toolchain**,
+because the daemon is already in the folder as a binary — and then starts the IDE. Run it
+again any time; it changes nothing on a machine that is already set up. `-WhatIf` prints
+what it would do, and `-NoStart` provisions without launching.
+
+WSL2 itself is the one prerequisite the package cannot install for you. If `wsl --version`
+does not answer, run `wsl --install` in an elevated PowerShell and reboot first. The first
+install downloads about a gigabyte and takes a few minutes; signing in to Claude Code and
+GitHub happens afterwards inside the IDE, on its setup page.
+
+`bondsymphonic-ide.exe --version` prints the build and the daemon protocol it speaks, for
+example `bondsymphonic-ide 0.1.0 (protocol 1)`, and needs nothing else to work — it is the
+quickest way to check a package unzipped correctly.
+
+To build a package from a source checkout: `. .\scripts\env.ps1` then
+`.\scripts\package.ps1`. It builds the release IDE, builds the daemon in WSL, runs
+`windeployqt` over the executable, and writes `dist\BondSymphonic\` plus the zip beside it.
+
 ## The pieces behind `launch.ps1`
 
 1. `scripts\setup-windows.ps1` (elevated): Rust, VS 2022 Build Tools, CMake, Ninja, Python, Qt 6.9.2 msvc2022_64.

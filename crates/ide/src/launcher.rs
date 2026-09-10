@@ -28,6 +28,66 @@ pub struct DaemonProcess {
     pub token: String,
 }
 
+/// The file name the Linux daemon binary carries on both sides. No `.exe`: it
+/// is an ELF that only ever runs inside the distro, even while it sits on an
+/// NTFS volume next to a Windows executable.
+pub const DAEMON_FILE_NAME: &str = "bondsymphonic-daemon";
+
+/// Overrides which daemon binary this IDE installs into the distro. Used by
+/// tests, and by anyone who wants a package to run a daemon built elsewhere.
+pub const DAEMON_BINARY_ENV: &str = "BS_DAEMON_BINARY";
+
+/// The Linux daemon binary this build of the IDE ships with, or `None` when
+/// there is none to install and whatever is already in the distro must do.
+///
+/// See [`resolve_daemon_binary`] for the order.
+pub fn local_daemon_binary() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    resolve_daemon_binary(&exe, std::env::var_os(DAEMON_BINARY_ENV).as_deref())
+}
+
+/// The resolution order, split out from [`local_daemon_binary`] so it is
+/// testable without a real executable or a mutated environment:
+///
+/// 1. `BS_DAEMON_BINARY`, verbatim. An override that names a file which is not
+///    there is still the answer: a caller who set it meant that path, and
+///    quietly running some other daemon instead is how a test ends up proving
+///    nothing. `install_daemon` skips a missing binary anyway, so the outcome
+///    is "nothing installed", not a crash.
+/// 2. `<exe dir>\bondsymphonic-daemon` — the packaged layout `package.ps1`
+///    builds, where the daemon sits beside the exe in `dist\BondSymphonic\`.
+/// 3. `<exe dir>\..\daemon\bondsymphonic-daemon` — the development tree, where
+///    the exe is in `target\<profile>\` and `build-daemon.ps1` leaves the
+///    daemon in `target\daemon\`.
+///
+/// Packaged before development, so a package unzipped inside a checkout runs
+/// the daemon it shipped with rather than whatever the checkout last built.
+fn resolve_daemon_binary(exe: &Path, override_path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    if let Some(raw) = override_path {
+        // An empty variable is how a shell spells "unset"; `PathBuf::from("")`
+        // would otherwise become a relative path naming the current directory.
+        if !raw.is_empty() {
+            let path = PathBuf::from(raw);
+            if !path.exists() {
+                tracing::warn!(
+                    "{DAEMON_BINARY_ENV}={} does not exist; no daemon will be installed",
+                    path.display()
+                );
+            }
+            return Some(path);
+        }
+    }
+    let dir = exe.parent()?;
+    let packaged = dir.join(DAEMON_FILE_NAME);
+    if packaged.exists() {
+        return Some(packaged);
+    }
+    // `?` on the grandparent only after the packaged candidate has been tried,
+    // so an exe sitting at the root of a volume still finds its own daemon.
+    let dev = dir.parent()?.join("daemon").join(DAEMON_FILE_NAME);
+    dev.exists().then_some(dev)
+}
+
 /// Test hook: a loopback `host:port` to connect to instead of starting a daemon.
 pub const TEST_ADDR_ENV: &str = "BS_DAEMON_ADDR";
 /// Test hook: the handshake token used with [`TEST_ADDR_ENV`].
@@ -345,6 +405,93 @@ mod tests {
             "'/opt/bond symphonic/daemon'"
         );
         assert!(!quoted_distro_path("~/a/b").contains('"'));
+    }
+
+    /// A throwaway directory of this test's own, with the given tag.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bs-launcher-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent dir");
+        }
+        std::fs::write(path, b"not really an ELF").expect("fixture binary");
+    }
+
+    #[test]
+    fn resolves_the_daemon_binary_in_order() {
+        // A packaged tree: the exe and the daemon side by side in one folder.
+        // A dev tree: `target\<profile>\bondsymphonic-ide.exe` with the daemon
+        // one level up in `target\daemon\`, where build-daemon.ps1 leaves it.
+        let root = scratch("resolve");
+        let packaged_exe = root.join("BondSymphonic").join("bondsymphonic-ide.exe");
+        let packaged_daemon = root.join("BondSymphonic").join(DAEMON_FILE_NAME);
+        let dev_exe = root
+            .join("target")
+            .join("release")
+            .join("bondsymphonic-ide.exe");
+        let dev_daemon = root.join("target").join("daemon").join(DAEMON_FILE_NAME);
+        touch(&packaged_exe);
+        touch(&dev_exe);
+
+        // Nothing built yet: no candidate exists, and the launcher says so
+        // rather than naming a path that is not there.
+        assert_eq!(resolve_daemon_binary(&dev_exe, None), None);
+        assert_eq!(resolve_daemon_binary(&packaged_exe, None), None);
+
+        // The dev tree only.
+        touch(&dev_daemon);
+        assert_eq!(
+            resolve_daemon_binary(&dev_exe, None),
+            Some(dev_daemon.clone())
+        );
+        // The packaged exe never reaches back into a `target\daemon` of its
+        // own: `dist\BondSymphonic\..\daemon` is not a thing that exists.
+        assert_eq!(resolve_daemon_binary(&packaged_exe, None), None);
+
+        // Packaged: the copy beside the exe wins, and it is found even though
+        // this exe has no `target\daemon` above it.
+        touch(&packaged_daemon);
+        assert_eq!(
+            resolve_daemon_binary(&packaged_exe, None),
+            Some(packaged_daemon.clone())
+        );
+
+        // A daemon beside the exe outranks the dev tree above it, so a
+        // packaged folder unpacked inside a checkout still runs its own copy.
+        touch(&dev_exe.with_file_name(DAEMON_FILE_NAME));
+        assert_eq!(
+            resolve_daemon_binary(&dev_exe, None),
+            Some(dev_exe.with_file_name(DAEMON_FILE_NAME))
+        );
+
+        // The environment override outranks both, and is honoured verbatim:
+        // a test that points it at a path of its own gets that path, never a
+        // silent fallback to whatever the build tree happens to contain.
+        let elsewhere = root.join("elsewhere").join(DAEMON_FILE_NAME);
+        touch(&elsewhere);
+        assert_eq!(
+            resolve_daemon_binary(&packaged_exe, Some(elsewhere.as_os_str())),
+            Some(elsewhere.clone())
+        );
+        let missing = root.join("gone").join(DAEMON_FILE_NAME);
+        assert_eq!(
+            resolve_daemon_binary(&packaged_exe, Some(missing.as_os_str())),
+            Some(missing)
+        );
+
+        // An empty variable is how a shell spells "unset"; it must not become
+        // an override naming the current directory.
+        assert_eq!(
+            resolve_daemon_binary(&packaged_exe, Some(std::ffi::OsStr::new(""))),
+            Some(packaged_daemon)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

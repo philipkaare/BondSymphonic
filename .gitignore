@@ -1,4 +1,6 @@
 /target/
+# scripts\package.ps1 stages the redistributable folder and its zip here.
+/dist/
 /cpp/build/
 *.user
 .vs/
