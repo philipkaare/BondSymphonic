@@ -329,9 +329,26 @@ When a run declares port `P`, the daemon:
 4. Listens on `127.0.0.1:H` and bridges each accepted TCP connection to the Unix
    socket.
 
+**The status byte.** Before any of the application's own bytes, the forwarder
+writes exactly one byte on each accepted Unix connection: `1` once it holds the
+in-sandbox TCP connection, `0` when it could not get one (the connect attempt is
+on a 2 s clock). The host side reads that byte before it starts copying, and on
+`0`, on a read error, or after 5 s of silence it shuts the TCP connection down
+rather than leaving it open — so a browser is told "connection refused" instead
+of spinning on a port whose server is not there.
+
+The byte is also what makes readiness a fact rather than a guess. A TCP port on
+the host that accepts proves only that the bridge's own listener is up; a `1`
+from the far side of the namespace proves the application answered. The
+readiness poll (10.3) is therefore one round trip on the socket — connect, read
+the byte, close — with a 400 ms budget over both steps so a probe cannot spill
+into the next 500 ms tick. Nothing is written to the application, so probing a
+server that logs its requests does not fill the run's output with them.
+
 WSL2 forwards Windows `localhost:H` to the distro, so the IDE presents
-`http://localhost:H`. Bridging is bidirectional byte copying with per-connection
-tasks; no protocol awareness, so WebSockets and HMR work.
+`http://localhost:H`. Once the byte says `1`, bridging is bidirectional byte
+copying with per-connection tasks and no lifetime cap: no protocol awareness, so
+WebSockets and HMR work.
 
 ## 8. Agents
 
@@ -512,10 +529,24 @@ Guessed ports are flagged `port_guessed: true` so the IDE lets the user edit the
 ### 10.3 Manager
 `run.start` spawns the command through the sandbox with the run's env, plus
 `PORT=<port>` and `HOST=0.0.0.0`, sets up the bridge (7.3), and streams stdout/
-stderr lines as `run.output`. State: `starting` → `ready` (regex match or first
-successful TCP connect to the port inside the sandbox, polled every 500 ms) →
-`stopped`/`failed`. `run.stop` sends SIGTERM to the process group, SIGKILL after
-5 s, and tears down the bridge.
+stderr lines as `run.output`. `PORT` and `HOST` are pushed after the config's own
+env, so a repository cannot quietly redefine the two variables every run is
+promised. State: `starting` → `ready` (regex match, else the forwarder's status
+byte, polled every 500 ms) → `stopped`/`failed`. A configuration that sets
+`ready_regex` is saying the port alone is not good enough, so it is never made
+ready by a probe. `run.stop` sends SIGTERM to the process group, SIGKILL after
+5 s, and tears down the bridge; `workspace.destroy` stops every run first.
+
+**The noop backend has no bridge.** Without a network namespace the run is a
+plain child of the daemon and its port already is the host's, so `host_port` is
+the configuration's own port, the URL is `http://localhost:<port>`, no
+`fwd-<P>.sock` and no in-sandbox forwarder exist, and readiness is a direct TCP
+connect to `127.0.0.1:<port>` on the same 500 ms tick. This is the path Windows
+development takes, and the one the daemon's `run_integration` suite exercises on
+both hosts; the bridge path is covered by `sandbox_integration` under bwrap.
+A client must therefore take the URL from `run.start`'s reply or the `ready`
+event and never rebuild it from the configuration's port: under bwrap the two
+differ, and the host port changes on every start.
 
 ## 11. File service
 - Paths are joined to the worktree root and canonicalised; anything escaping the

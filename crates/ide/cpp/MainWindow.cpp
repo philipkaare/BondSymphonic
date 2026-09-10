@@ -381,6 +381,20 @@ void MainWindow::connectController() {
     // there rather than being shown over the wrong workspace.
     QObject::connect(m_controller, &AppController::networkDenied, m_runModel,
                      &RunPanelModel::noteDenied);
+    // Answering that toast from outside the panel. Only the workspace the panel
+    // is actually showing may be answered: an allow routed anywhere else would
+    // extend the allowlist of a workspace the user is not looking at, which is
+    // the one thing a network decision must never do behind their back.
+    QObject::connect(m_controller, &AppController::allowHostRequested, this,
+                     [this](const QString& workspaceId, const QString& host) {
+                         if (m_runModel->getWorkspaceId() != workspaceId) {
+                             qWarning("allow host not routed: the run panel is showing %s, not %s",
+                                      qUtf8Printable(m_runModel->getWorkspaceId()),
+                                      qUtf8Printable(workspaceId));
+                             return;
+                         }
+                         m_runModel->allowHost(host);
+                     });
     // `setWorkspace` publishes what it already knows and only then re-detects,
     // so the tab's own configuration is offered again each time the list
     // changes, until the model accepts it.

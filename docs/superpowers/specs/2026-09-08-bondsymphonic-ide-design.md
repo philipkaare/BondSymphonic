@@ -358,6 +358,40 @@ transcript grows one frame per item without bound today. A 2,000-item transcript
 would therefore be the first thing to push this measurement towards the target,
 and the collapse is the fix when it does.
 
+**Measured, Milestone 5 (2026-09-10).** The same machine and the same debug build
+against the real daemon in WSL. Two workspaces created for the measurement over
+one throwaway repository — the first running `python3 -m http.server 8000` from
+its `bondsymphonic.toml`, `ready`, with its port bridge up and its URL already
+fetched once from Windows; the second idle with no run — plus the workspace the
+daemon restored at startup, so three sandboxes were alive. No editor tab, no
+diff, no agent. Left idle for 60 s after the run reached `ready`:
+
+| | measured | M4 | target |
+|---|---|---|---|
+| `bondsymphonic-ide.exe` working set | 129.3 MB | 119.0 MB | < 150 MB |
+| `bondsymphonic-ide.exe` private bytes | 69.2 MB | 59.5 MB | — |
+| `bondsymphonic-daemon` RSS | 9.7 MB | 6.8 MB | < 30 MB |
+
+Both targets hold. The daemon is 2.9 MB above M4 for the obvious reason: this
+scenario has three sandboxes rather than two, each with a proxy listener of its
+own, and one of them also carries a bridge, a forwarder and a run supervisor.
+The per-workspace cost of the whole of Milestone 5 is therefore around a
+megabyte, which is what the design intends — the proxy and the bridge copy bytes
+between sockets and buffer nothing but one request head.
+
+Inside the distro the supervised tree came to roughly 90 MB across the three
+sandboxes: 39.3 MB in the seven `sandbox-init` helpers, 19.4 MB in the Python
+web server the run started, and the rest in `bwrap` and the shells. The web
+server is the single largest item and belongs to the user's own process, not to
+BondSymphonic.
+
+The IDE's 10 MB over M4 is not a controlled comparison either — M4 held a
+198-item transcript this run does not, and this run adds a Run panel with a live
+log — so the useful reading is only that a bridged run with its output streaming
+into the panel costs nothing that shows against a 150 MB target. The run log is
+capped at 2,000 lines per run in Rust and the same in the widget, so a run that
+prints for hours cannot move this number.
+
 ## 14. Testing (IDE-specific)
 
 - `model/` unit tests: transcript delta coalescing and tool-result matching; diff
@@ -369,21 +403,30 @@ and the collapse is the fix when it does.
   implementing the proto types).
 - `smoke.rs`: start the fake daemon, launch the real binary with
   `QT_QPA_PLATFORM=offscreen`, and drive it through `BS_SMOKE_SCRIPT` —
-  `create_claude,open_agent,send,allow,tree,open_file,open_diff,stop,create,open,close,destroy,quit`.
+  `create_claude,open_agent,send,allow,tree,open_file,open_diff,stop,create,detect,run_start,allow_host,run_stop,open,close,destroy,quit`.
   Two workspaces, because the two halves need different panes: the first is a
-  Claude tab and carries one whole agent turn, the second a terminal tab whose
-  PTY the `close`/`destroy` pair tears down. Every step that touches the agent
-  goes through the window rather than through the script's own client:
-  `open_file` and `open_diff` emit
+  Claude tab and carries one whole agent turn, the second a terminal tab that
+  also carries the run and the network denial, and whose PTY the
+  `close`/`destroy` pair tears down. Every step that touches the agent, the
+  editor or the denial toast goes through the window rather than through the
+  script's own client: `open_file` and `open_diff` emit
   `AppController::openFileRequested`/`openDiffRequested`, `allow` emits
-  `permissionReplyRequested`, `send` emits `agentSendRequested` and `stop`
-  emits `agentStopRequested` — all signals a person's click produces. So the
-  window builds the editor and diff tabs, answers the permission bar, and the
-  prompt and the stop leave `TranscriptModel::send`/`::stop`, which is what
+  `permissionReplyRequested`, `send` emits `agentSendRequested`, `stop`
+  emits `agentStopRequested`, `detect` calls `detectRunConfigs` (the invokable
+  the New Agent dialog calls) and `allow_host` emits `allowHostRequested` — all
+  signals a person's click produces. So the window builds the editor and diff
+  tabs, answers the permission bar, and the prompt, the stop and the allow leave
+  `TranscriptModel::send`/`::stop` and `RunPanelModel::allowHost`, which is what
   makes the "no failure warning" guards below able to fire at all. Only
-  `create*`, `open_agent`, `open`, `close` and `destroy` are the script's own
-  requests, because they stand in for a dialog rather than for a click on a
-  pane.
+  `create*`, `open_agent`, `run_start`, `run_stop`, `open`, `close` and
+  `destroy` are the script's own requests, because they stand in for a dialog or
+  for a button this suite cannot press rather than for a click on a pane. The
+  run is the script's for that reason — the Start button is a widget and no test
+  here touches the desktop — but everything the run provokes is the window's:
+  the fake daemon reports `starting` → one output line → `ready` on a **bridged**
+  host port that is not the configuration's own, and behind them a network
+  denial for `example.com`, which the window has to turn into a toast on the
+  workspace that raised it.
 
   The assertions are on the requests the fake daemon received, on the one
   permission reply it received, and on what the IDE logged.
@@ -408,12 +451,32 @@ and the collapse is the fix when it does.
     have already exited.
   - `system.setup_pty` never asked for: every prerequisite the fake daemon
     reports passes, so the setup page never appears and no login terminal opens.
+  - `repo.detect_run_configs`, `run.list`, `run.start`, `workspace.get`,
+    `workspace.set_allowlist` and `run.stop` in that order, after `agent.stop`
+    and before the script's `pty.open`. The first two are the Run panel's own,
+    issued when the second workspace's tab appears and the panel is pointed at
+    its worktree; the last four are the run and the answered toast.
+    `workspace.get` **before** `workspace.set_allowlist` is part of the claim:
+    `RunPanelModel::allowHost` reads the daemon's own list at the moment of the
+    click and extends it, rather than sending back a cached or empty one.
+  - The allowlist the daemon received is exactly the twelve defaults, in order,
+    with `example.com` appended. A list that replaced them would silently
+    un-allow every registry an agent needs and would still have satisfied the
+    journal.
   - No failure warning logged for any of `fs.read_file`, `workspace.diff`,
     `workspace.changes`, `fs.watch`, `agent.history`, `agent.send`,
-    `agent.permission_reply` or `agent.stop` — the journal shows a request
-    arrived, these show its reply was accepted. Each of these warnings is
-    logged by the IDE code that issued the request, so each is reachable only
-    because the corresponding step travels the production path.
+    `agent.permission_reply`, `agent.stop`, `repo.detect_run_configs`,
+    `run.list`, `workspace.get` or `workspace.set_allowlist` — the journal shows
+    a request arrived, these show its reply was accepted. Each of these warnings
+    is logged by the IDE code that issued the request, so each is reachable only
+    because the corresponding step travels the production path. `run.start` and
+    `run.stop` are not among them: the script issues those on its own client,
+    where a failure ends the step and leaves the process running, which the
+    exit-status assertion catches instead.
+  - No `allow host not routed`. The window answers `allowHostRequested` only
+    when the Run panel is showing exactly the workspace named, and logs that
+    line otherwise — so a `workspace.set_allowlist` reaching the daemon at all
+    is the proof the toast was up on the right tab.
 
   Runs in `cargo test` on Windows when Qt is present; skipped with a message
   otherwise.

@@ -9,6 +9,76 @@ Design: `docs/superpowers/specs/`. Plans: `docs/superpowers/plans/`.
 
 ## What works now
 
+Milestone 5: a workspace reaches the network only through an allowlisting proxy, and a
+web app it runs answers in the Windows browser.
+
+- **Network allowlist and proxy.** A sandbox has a network namespace with only loopback
+  in it, so nothing inside can reach the internet directly. The daemon runs a proxy per
+  workspace on a Unix socket, a shim inside the sandbox listens on `127.0.0.1:3128` and
+  pipes to it, and every process in the sandbox inherits `HTTP_PROXY`, `HTTPS_PROXY`,
+  `ALL_PROXY` (both cases of each) and `NO_PROXY=localhost,127.0.0.1`, which git, npm,
+  pip and cargo all honour. The proxy handles `CONNECT` for TLS and absolute-URI requests
+  for plain HTTP, checks the host against the workspace's allowlist, and refuses anything
+  else with a `403` whose body names the host and the config key to add it under. The
+  default list is `api.anthropic.com`, `*.anthropic.com`, `registry.npmjs.org`,
+  `*.npmjs.org`, `pypi.org`, `files.pythonhosted.org`, `crates.io`, `static.crates.io`,
+  `index.crates.io`, `github.com`, `*.github.com`, `*.githubusercontent.com`. A wildcard
+  matches sub-domains only: `*.npmjs.org` covers `registry.npmjs.org` but not
+  `npmjs.org`, and never `evilnpmjs.org`.
+- **Denial toast.** A refused connection reaches the IDE as an event carrying the host,
+  and the Run panel shows it as a toast on the workspace it was refused for — one host at
+  a time, queued per workspace, so a denial raised behind another tab waits rather than
+  appearing over the wrong workspace. **Allow host** reads that workspace's current
+  allowlist from the daemon, sends it back with the host added, and the daemon puts the new
+  list in front of the proxy at once — the next attempt goes through, with no restart of
+  anything — and writes it into the workspace registry, so it survives a daemon restart.
+  **Dismiss** clears the toast without allowing anything.
+- **Run configurations.** A repository's `bondsymphonic.toml` declares runs as
+  `[[run]]` blocks with `name`, `command`, `port` and optional `cwd`, `env` and
+  `ready_regex`, and extends the allowlist with `[network] allow = [...]`. With no such
+  file the daemon guesses from the marker files: `package.json` scripts `dev`, `start`
+  and `serve` invoked through the package manager the lockfile names (pnpm, yarn or npm)
+  with Vite's own `server.port` when the config spells one out and 5173, 3000 or 4200
+  otherwise; `docker compose up`, listed but greyed out; `cargo run` for a crate with a
+  `[[bin]]` or an axum/actix/rocket/warp dependency; Django's `manage.py runserver`; and
+  uvicorn or `flask run` from a `pyproject.toml`. A port that is an assumption is flagged,
+  and the panel labels it `(guessed :5173)` and says so in the tooltip.
+- **Run panel and the port bridge.** The bottom dock's Run tab follows the active tab: a
+  configuration combo, Start, Stop, the URL as a link, Open, and the run's output. Start
+  spawns the command inside the sandbox with the configuration's env plus `PORT` and
+  `HOST=0.0.0.0`; the daemon allocates a free port on the host's loopback, runs a
+  forwarder inside the sandbox and bridges the two, so `http://localhost:<port>` answers
+  from the Windows browser. The run goes `starting` → `ready` — on a `ready_regex` match,
+  or on the forwarder reporting that the app accepted a connection — and its stdout and
+  stderr stream into the panel's log, capped at 2,000 lines. Open launches the system
+  browser. Stop ends the process group and tears the bridge down, and destroying a
+  workspace stops its runs first. Bridging is raw bytes both ways, so WebSockets and
+  hot reload work through the same port.
+
+Known limits in Milestone 5:
+
+- **Plain HTTP is proxied one request head deep.** The first request on a connection is
+  parsed and checked; after that the connection is pinned to the host it was allowed and
+  everything else on it is copied through raw. A client that reuses one keep-alive
+  connection for a second host would reach the first one instead. TLS, which is what
+  agents and package managers actually use, has no such gap: `CONNECT` names the host up
+  front and the tunnel goes nowhere else. An `https://` absolute-URI request is refused
+  outright, because serving it would mean terminating TLS in the daemon.
+- **A guessed port is not editable in the IDE.** The panel says the port was guessed and
+  tells you to pin it in `bondsymphonic.toml`; there is no field to change it for one
+  start. Editing lands in Milestone 6.
+- **One run per configuration per workspace.** A second Start for the same configuration
+  is refused while the first is alive. Two different configurations in the same workspace
+  run side by side.
+- **No Docker.** A `docker-compose.yml` is detected and listed so you can see it was
+  found, but the entry is greyed out: there is no Docker daemon inside the sandbox, and
+  reaching the host's would hand the workspace a way straight out of it.
+- **`[claude] settings` in `bondsymphonic.toml` is parsed and ignored.** The key is
+  accepted so a file written for a later daemon still loads; nothing copies that settings
+  file into the sandbox yet.
+- **The daemon's allowlist is per workspace, not per agent.** Every process in a
+  workspace's sandbox shares one list, including the terminal you type in.
+
 Milestone 4: a New Agent tab can be a Claude Code agent running inside the workspace's
 sandbox, with its transcript, its tool permissions and its cost in the IDE — and logging
 in to Claude Code and GitHub happens on a setup page inside the IDE.
@@ -104,8 +174,7 @@ Known limits in Milestone 3:
 - Languages embedded in another (`<script>` in HTML, fenced code in Markdown) are not
   highlighted: tree-sitter injections are not wired up.
 
-Still placeholders: run configurations, and every agent adapter other than Claude Code and
-a plain terminal.
+Still placeholders: every agent adapter other than Claude Code and a plain terminal.
 
 ## Quick start (Windows 11)
 
@@ -186,8 +255,8 @@ find the Qt DLLs:
 
 ```powershell
 . .\scripts\env.ps1
-cargo test --workspace                                    # Windows; ide suites: lib, client, connection, diff, editor, model, qobject_smoke, router, smoke, transcript
-.\scripts\test-daemon.ps1                                 # daemon tests inside WSL (14 integration test files; unit tests: 45 on Windows, 48 on Linux)
+cargo test --workspace                                    # Windows; ide suites: lib, client, connection, diff, editor, model, qobject_smoke, router, run, smoke, transcript
+.\scripts\test-daemon.ps1                                 # daemon tests inside WSL (16 integration test files; daemon unit tests: 77 on Windows, 81 on Linux)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -212,8 +281,14 @@ are read once at startup and do nothing at all when unset, which is every ordina
   notification will; `open` opens a PTY; `tree` lists the
   workspace root; `open_file` and `open_diff` ask the window to open `README.md` as an
   editor tab and as a diff tab, through the same controller signals the Explorer's
-  double-click emits; `close` closes the script's PTY; `destroy` destroys the workspace;
-  `quit` ends the process with status 0 after letting the window settle.
+  double-click emits; `detect` asks for the repository's run configurations through the
+  invokable the New Agent dialog calls; `run_start` starts one and `run_stop` ends it, and
+  the fake daemon answers the start with a bridged host port, three state changes and a
+  network denial; `allow_host` answers the denial toast through
+  `AppController::requestAllowHost`, which the window routes to the Run panel's model only
+  when the panel is showing that workspace; `close` closes the script's PTY; `destroy`
+  destroys the workspace; `quit` ends the process with status 0 after letting the window
+  settle.
 
 The smoke test skips itself with a message when `QMAKE` is unset, since the IDE cannot
 start without the Qt runtime on PATH.

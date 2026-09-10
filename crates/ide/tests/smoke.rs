@@ -15,13 +15,17 @@
 //! signals the Explorer emits and fetch their contents (`fs.read_file`,
 //! `workspace.diff`) and their live-update watches (`fs.watch`,
 //! `workspace.changes`), panes whose process has exited are torn down without
-//! talking to the daemon about the PTYs it has already reaped, the Qt event
-//! loop is still responsive at the end (the `quit` step runs on it), and the
-//! process ends with status 0 well inside the time limit.
+//! talking to the daemon about the PTYs it has already reaped, a run
+//! configuration is detected and a run started and stopped on a bridged host
+//! port, the network denial the daemon reports behind it becomes a toast on the
+//! workspace that raised it and answering that toast sends the workspace's own
+//! allowlist back with the blocked host added, the Qt event loop is still
+//! responsive at the end (the `quit` step runs on it), and the process ends with
+//! status 0 well inside the time limit.
 
 use base64::Engine as _;
 use bondsymphonic_proto::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -39,7 +43,7 @@ const TOKEN: &str = "smoke-token";
 /// `close`/`destroy` pair only means something over a workspace whose pane is a
 /// terminal.
 const SCRIPT: &str = "create_claude,open_agent,send,allow,tree,open_file,open_diff,stop,create,\
-                      open,close,destroy,quit";
+                      detect,run_start,allow_host,run_stop,open,close,destroy,quit";
 /// The file `open_file` and `open_diff` act on, and the one entry of the fake
 /// `fs.list_dir` listing that is not a directory.
 const OPEN_PATH: &str = "README.md";
@@ -52,11 +56,45 @@ const REQUEST_ID: &str = "req-1";
 const TOOL_NAME: &str = "Bash";
 /// What the turn cost, so the assertion on the result frame has a number.
 const TURN_COST_USD: f64 = 0.002;
-/// The `quit` step alone waits 2 s, each of `open_agent`, `send` and `allow`
-/// another 1.5 s, and `create`, `create_claude`, `open_file`, `open_diff`,
-/// `stop` and `close` another 0.75 s each; the rest is a Qt startup on a cold
-/// cache.
-const RUN_LIMIT: Duration = Duration::from_secs(60);
+/// The one run configuration this daemon reports, and the run it starts from
+/// it. The port is the one the run listens on inside the sandbox.
+const RUN_CONFIG: &str = "web";
+const RUN_ID: &str = "run_smoke1";
+const RUN_PORT: u16 = 3000;
+/// The bridged port the daemon hands back. Deliberately not [`RUN_PORT`]: the
+/// URL the panel shows has to come from the daemon's reply, never be rebuilt
+/// from the configuration's own port.
+const HOST_PORT: u16 = 41873;
+const RUN_URL: &str = "http://localhost:41873";
+/// The one line the run prints before it reports itself ready.
+const RUN_OUTPUT_LINE: &str = "ready on 3000";
+/// The host the fake proxy refuses just after the run comes up. Not in
+/// [`DEFAULT_ALLOW`], which is what makes answering the toast a change.
+const DENIED_HOST: &str = "example.com";
+/// The allowlist a freshly created workspace carries, in the daemon spec's
+/// order (§7.1). Spelled out here rather than imported from the daemon crate:
+/// it is a fixture of what a daemon reports, and the assertion below is that
+/// the IDE sent this list *back* with one host added rather than replacing it
+/// with a stale or empty copy.
+const DEFAULT_ALLOW: [&str; 12] = [
+    "api.anthropic.com",
+    "*.anthropic.com",
+    "registry.npmjs.org",
+    "*.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "crates.io",
+    "static.crates.io",
+    "index.crates.io",
+    "github.com",
+    "*.github.com",
+    "*.githubusercontent.com",
+];
+/// The `quit` step alone waits 2 s, each of `open_agent`, `send`, `allow`,
+/// `run_start` and `allow_host` another 1.5 s, and `create`, `create_claude`,
+/// `open_file`, `open_diff`, `stop`, `detect` and `close` another 0.75 s each —
+/// about 16 s of deliberate waiting; the rest is a Qt startup on a cold cache.
+const RUN_LIMIT: Duration = Duration::from_secs(75);
 /// The methods the script must produce, in this order. `agent.history` is the
 /// window's own doing — only `TranscriptModel::attach` sends it, and the model
 /// only attaches because the window reacted to `agentStarted` — so its place
@@ -65,7 +103,13 @@ const RUN_LIMIT: Duration = Duration::from_secs(60);
 /// `workspace.diff` the diff tab loading its alignment, so their place in the
 /// sequence is what shows the two tabs opened in the order the script asked for
 /// them.
-const EXPECTED: [&str; 13] = [
+/// `repo.detect_run_configs` and `run.list` between `agent.stop` and
+/// `run.start` are the Run panel's own, issued when the second workspace's tab
+/// appears and the panel is pointed at its worktree; `workspace.get` and
+/// `workspace.set_allowlist` are `RunPanelModel::allowHost` answering the
+/// toast, in that order, because it reads the daemon's list before it sends one
+/// back.
+const EXPECTED: [&str; 19] = [
     "hello",
     "workspace.create",
     "agent.start",
@@ -76,6 +120,12 @@ const EXPECTED: [&str; 13] = [
     "fs.read_file",
     "workspace.diff",
     "agent.stop",
+    "repo.detect_run_configs",
+    "run.list",
+    "run.start",
+    "workspace.get",
+    "workspace.set_allowlist",
+    "run.stop",
     "pty.open",
     "pty.close",
     "workspace.destroy",
@@ -97,7 +147,7 @@ const WORK_TEXT: &str = "hello\nworld\n";
 /// `fs.write_file` is not among them: no step saves, so asserting on its
 /// warning would assert nothing. The fake daemon answers it anyway, so a future
 /// step that does save needs no change on the daemon side.
-const NO_WARNINGS: [&str; 11] = [
+const NO_WARNINGS: [&str; 16] = [
     "fs.read_file failed",
     "workspace.diff failed",
     "workspace.changes failed",
@@ -120,9 +170,27 @@ const NO_WARNINGS: [&str; 11] = [
     "permission reply not routed",
     "agent send not routed",
     "agent stop not routed",
+    // The Run panel's own, and the controller's. Each is logged by the call
+    // that issued the request: the panel detects and lists when the tab
+    // appears, the `detect` step goes through `AppController::detectRunConfigs`,
+    // and `allowHost` makes both of the last two. `run.start failed` and
+    // `run.stop failed` are deliberately *not* here: the script makes those two
+    // on its own client, where a failure ends the step and stops the script
+    // without quitting, which the exit-status assertion catches instead.
+    "repo.detect_run_configs failed",
+    "run.list failed",
+    "workspace.get failed",
+    "workspace.set_allowlist failed",
+    // The window refusing to answer a denial for a workspace the Run panel is
+    // not showing. This is what makes `allow_host` an assertion rather than a
+    // wish: `workspace.set_allowlist` reaches the daemon only after the window
+    // has matched the request against the panel's own workspace.
+    "allow host not routed",
 ];
 
-/// Every request method the fake daemon answered, in arrival order.
+/// A recorder the fake daemon appends to: every request method it answered in
+/// arrival order, every permission reply it received, or every allowlist it was
+/// handed.
 type Journal = Arc<Mutex<Vec<String>>>;
 
 #[test]
@@ -139,7 +207,7 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let (addr, journal, replies) = rt.block_on(fake_daemon());
+    let (addr, journal, replies, allowlists) = rt.block_on(fake_daemon());
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
         .env("QT_QPA_PLATFORM", "offscreen")
@@ -168,9 +236,10 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
     );
     let seen = journal.lock().expect("journal mutex").clone();
     let answered = replies.lock().expect("replies mutex").clone();
+    let allowed = allowlists.lock().expect("allowlists mutex").clone();
     let context = format!(
-        "requests: {seen:?}\npermission replies: {answered:?}\n--- stdout ---\n{out}\n\
-         --- stderr ---\n{err}"
+        "requests: {seen:?}\npermission replies: {answered:?}\nallowlists: {allowed:?}\n\
+         --- stdout ---\n{out}\n--- stderr ---\n{err}"
     );
     // Both pipes together. `tracing_subscriber::fmt()` writes to *stdout* by
     // default and `main` does not override the writer, so every warning the IDE
@@ -178,7 +247,10 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
     // assertion that read stderr alone would pass whatever was logged, which is
     // what the three terminal-warning assertions below used to do.
     let logs = format!("{out}\n{err}");
-    eprintln!("smoke: the fake daemon answered {seen:?}, permission replies {answered:?}");
+    eprintln!(
+        "smoke: the fake daemon answered {seen:?}, permission replies {answered:?}, allowlists \
+         {allowed:?}"
+    );
 
     let status =
         status.unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
@@ -231,6 +303,23 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
         vec![format!("{REQUEST_ID}:allow")],
         "the permission reply the fake daemon received was not a single allow for \
          {REQUEST_ID}\n{context}"
+    );
+    // What the `allow_host` step actually did. The journal shows a
+    // `workspace.set_allowlist` was sent; this shows what was in it. The IDE
+    // reads the daemon's own list at the moment of the click and appends to it,
+    // so the twelve defaults have to come back untouched and in order with the
+    // blocked host after them. A list that replaced them instead would silently
+    // un-allow every registry an agent needs, and would still have satisfied the
+    // journal.
+    let expected_allowlist: Vec<String> = DEFAULT_ALLOW
+        .iter()
+        .chain(std::iter::once(&DENIED_HOST))
+        .map(|h| (*h).to_owned())
+        .collect();
+    assert_eq!(
+        allowed,
+        vec![expected_allowlist.join(",")],
+        "the allowlist the fake daemon received was not the defaults plus {DENIED_HOST}\n{context}"
     );
     // A login terminal on the host is the one thing this run must never open,
     // and nothing in the script asks for one: every prerequisite the fake
@@ -327,7 +416,7 @@ fn wait_for(child: &mut std::process::Child, limit: Duration) -> Option<std::pro
     None
 }
 
-fn workspace(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
+fn workspace(id: &str, name: &str, state: WorkspaceState, allowlist: &[String]) -> WorkspaceInfo {
     WorkspaceInfo {
         id: WorkspaceId(id.to_owned()),
         name: name.to_owned(),
@@ -336,7 +425,7 @@ fn workspace(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
         branch: format!("bs/{name}/work"),
         worktree_path: format!("/wt/{id}"),
         created_at: "2026-09-09T10:00:00Z".to_owned(),
-        allowlist: Vec::new(),
+        allowlist: allowlist.to_vec(),
         state,
         agents: Vec::new(),
         runs: Vec::new(),
@@ -387,6 +476,42 @@ fn agent_state(
     )
 }
 
+/// A `run.state` event for `run_id`. The url travels on the `ready` transition
+/// and nowhere else, which is how a real daemon reports it.
+fn run_state(
+    workspace_id: &WorkspaceId,
+    run_id: &RunId,
+    state: RunState,
+    url: Option<String>,
+) -> ServerMessage {
+    ServerMessage::event(
+        Some(workspace_id.clone()),
+        Event::RunStateChanged {
+            run_id: run_id.clone(),
+            state,
+            url,
+            detail: None,
+        },
+    )
+}
+
+/// The single run configuration this daemon detects, whatever path is asked
+/// about. Its port is flagged as a guess, so the Run panel renders the label and
+/// the tooltip it keeps for that case.
+fn run_config() -> RunConfig {
+    RunConfig {
+        name: RUN_CONFIG.to_owned(),
+        command: "python3 -m http.server 3000".to_owned(),
+        port: RUN_PORT,
+        cwd: None,
+        env: BTreeMap::new(),
+        ready_regex: None,
+        source: RunConfigSource::Detected,
+        port_guessed: true,
+        disabled_reason: None,
+    }
+}
+
 fn entry(name: &str, is_dir: bool, size: u64) -> FileEntry {
     FileEntry {
         name: name.to_owned(),
@@ -402,7 +527,7 @@ fn entry(name: &str, is_dir: bool, size: u64) -> FileEntry {
 /// output for each PTY, an exit for each PTY it ends). Everything else is an
 /// explicit error, so an unexpected request shows up in the journal rather than
 /// hanging the IDE.
-async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal) {
+async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal, Journal) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     let journal: Journal = Arc::new(Mutex::new(Vec::new()));
@@ -412,6 +537,11 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal) {
     // answered and what it said, which is the whole point of the `allow` step.
     let replies: Journal = Arc::new(Mutex::new(Vec::new()));
     let recorded_replies = replies.clone();
+    // Every `workspace.set_allowlist` as its comma-joined host list. The method
+    // journal shows one was sent; this shows what the IDE put in it, which is
+    // the whole point of the `allow_host` step.
+    let allowlists: Journal = Arc::new(Mutex::new(Vec::new()));
+    let recorded_allowlists = allowlists.clone();
 
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept");
@@ -421,6 +551,15 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal) {
         // One workspace id per created name, so a repeated `create` is answered
         // consistently and `pty.open` can be checked against a known workspace.
         let mut workspaces: HashMap<String, String> = HashMap::new();
+        // The other direction, plus each workspace's allowlist as it stands, so
+        // `workspace.get` answers with what the last `workspace.set_allowlist`
+        // left behind rather than with the fixture.
+        let mut names: HashMap<String, String> = HashMap::new();
+        let mut allowed: HashMap<String, Vec<String>> = HashMap::new();
+        // The runs this daemon has handed out and the workspace they belong to,
+        // so `run.list` and the `run.state` events have somewhere to come from.
+        let mut runs: Vec<RunInfo> = Vec::new();
+        let mut run_workspace: Option<WorkspaceId> = None;
         let mut ptys = 0usize;
         // Every PTY handed out and the workspace it belongs to, so `pty.close`
         // can end all of them at once.
@@ -481,8 +620,15 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal) {
                 Request::WorkspaceCreate(p) => {
                     let ws_id = format!("ws_smoke{}", workspaces.len() + 1);
                     workspaces.insert(p.name.clone(), ws_id.clone());
-                    let creating = workspace(&ws_id, &p.name, WorkspaceState::Creating);
-                    let ready = workspace(&ws_id, &p.name, WorkspaceState::Ready);
+                    names.insert(ws_id.clone(), p.name.clone());
+                    // A real daemon gives a new workspace the default list,
+                    // extended by the repository's `bondsymphonic.toml`. There
+                    // is no toml here, so it is the twelve defaults exactly.
+                    let hosts: Vec<String> =
+                        DEFAULT_ALLOW.iter().map(|h| (*h).to_owned()).collect();
+                    allowed.insert(ws_id.clone(), hosts.clone());
+                    let creating = workspace(&ws_id, &p.name, WorkspaceState::Creating, &hosts);
+                    let ready = workspace(&ws_id, &p.name, WorkspaceState::Ready, &hosts);
                     // A real daemon answers while still creating and reports the
                     // rest through events; the tab has to survive both.
                     for info in [creating.clone(), ready] {
@@ -718,6 +864,103 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal) {
                         truncated: false,
                     },
                 )),
+                // What `RunPanelModel::allowHost` reads before it writes.
+                Request::WorkspaceGet(p) => {
+                    let ws = p.workspace_id.0.clone();
+                    match names.get(&ws) {
+                        Some(name) => {
+                            let hosts = allowed.get(&ws).cloned().unwrap_or_default();
+                            let info = workspace(&ws, name, WorkspaceState::Ready, &hosts);
+                            Some(ServerMessage::ok(id, &info))
+                        }
+                        None => Some(ServerMessage::err(id, RpcError::not_found(ws))),
+                    }
+                }
+                // The other half of the click. A real daemon persists the list
+                // and reports the new one as a `workspace.state` event, which is
+                // what refreshes every client; the assertion is on what arrived
+                // here.
+                Request::WorkspaceSetAllowlist(p) => {
+                    let ws = p.workspace_id.0.clone();
+                    recorded_allowlists
+                        .lock()
+                        .expect("allowlists mutex")
+                        .push(p.hosts.join(","));
+                    allowed.insert(ws.clone(), p.hosts.clone());
+                    if let Some(name) = names.get(&ws) {
+                        let info = workspace(&ws, name, WorkspaceState::Ready, &p.hosts);
+                        follow_ups.push(ServerMessage::event(
+                            Some(p.workspace_id.clone()),
+                            Event::WorkspaceStateChanged { info },
+                        ));
+                    }
+                    Some(ServerMessage::ok(id, &Empty {}))
+                }
+                // One configuration, whatever path is asked about: the New Agent
+                // dialog asks about the repository and the Run panel about the
+                // worktree, and both have to get a list they can render.
+                Request::RepoDetectRunConfigs(_) => Some(ServerMessage::ok(
+                    id,
+                    &DetectRunConfigsResult {
+                        configs: vec![run_config()],
+                    },
+                )),
+                // The run, on a bridged port, then the three events a real
+                // daemon reports it with -- and behind them the proxy refusing a
+                // host the run reached for, built with the same proto helper the
+                // daemon builds it with, so the IDE recognises it the same way.
+                Request::RunStart(p) => {
+                    let run_id = RunId(RUN_ID.to_owned());
+                    run_workspace = Some(p.workspace_id.clone());
+                    runs.push(RunInfo {
+                        run_id: run_id.clone(),
+                        config_name: p.config_name.clone(),
+                        state: RunState::Ready,
+                        host_port: HOST_PORT,
+                        url: RUN_URL.to_owned(),
+                    });
+                    follow_ups.push(run_state(
+                        &p.workspace_id,
+                        &run_id,
+                        RunState::Starting,
+                        None,
+                    ));
+                    follow_ups.push(ServerMessage::event(
+                        Some(p.workspace_id.clone()),
+                        Event::RunOutput {
+                            run_id: run_id.clone(),
+                            line: RUN_OUTPUT_LINE.to_owned(),
+                        },
+                    ));
+                    follow_ups.push(run_state(
+                        &p.workspace_id,
+                        &run_id,
+                        RunState::Ready,
+                        Some(RUN_URL.to_owned()),
+                    ));
+                    follow_ups.push(ServerMessage::event(
+                        Some(p.workspace_id.clone()),
+                        Event::network_denied(DENIED_HOST),
+                    ));
+                    Some(ServerMessage::ok(
+                        id,
+                        &RunStartResult {
+                            run_id,
+                            host_port: HOST_PORT,
+                            url: RUN_URL.to_owned(),
+                        },
+                    ))
+                }
+                Request::RunStop(p) => {
+                    runs.retain(|r| r.run_id != p.run_id);
+                    if let Some(ws) = run_workspace.clone() {
+                        follow_ups.push(run_state(&ws, &p.run_id, RunState::Stopped, None));
+                    }
+                    Some(ServerMessage::ok(id, &Empty {}))
+                }
+                Request::RunList(_) => {
+                    Some(ServerMessage::ok(id, &RunListResult { runs: runs.clone() }))
+                }
                 other => Some(ServerMessage::err(
                     id,
                     RpcError::internal(format!("not implemented: {}", other.method_name())),
@@ -749,7 +992,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal) {
         }
     });
 
-    (addr, journal, replies)
+    (addr, journal, replies, allowlists)
 }
 
 #[test]
@@ -768,6 +1011,8 @@ fn request_order_is_checked_as_a_subsequence() {
         "fs.list_dir",
         "fs.watch",
         "workspace.changes",
+        "repo.detect_run_configs",
+        "run.list",
         "agent.start",
         "agent.history",
         "agent.send",
@@ -779,7 +1024,13 @@ fn request_order_is_checked_as_a_subsequence() {
         "agent.stop",
         "workspace.create",
         "fs.list_dir",
+        "repo.detect_run_configs",
+        "run.list",
         "pty.open",
+        "run.start",
+        "workspace.get",
+        "workspace.set_allowlist",
+        "run.stop",
         "pty.open",
         "pty.close",
         "workspace.destroy",
@@ -798,6 +1049,12 @@ fn request_order_is_checked_as_a_subsequence() {
         "fs.read_file",
         "workspace.diff",
         "agent.stop",
+        "repo.detect_run_configs",
+        "run.list",
+        "run.start",
+        "workspace.get",
+        "workspace.set_allowlist",
+        "run.stop",
         "pty.close",
         "workspace.destroy",
     ]);
@@ -815,6 +1072,12 @@ fn request_order_is_checked_as_a_subsequence() {
         "workspace.diff",
         "fs.read_file",
         "agent.stop",
+        "repo.detect_run_configs",
+        "run.list",
+        "run.start",
+        "workspace.get",
+        "workspace.set_allowlist",
+        "run.stop",
         "pty.open",
         "pty.close",
         "workspace.destroy",
@@ -833,6 +1096,12 @@ fn request_order_is_checked_as_a_subsequence() {
         "fs.read_file",
         "workspace.diff",
         "agent.stop",
+        "repo.detect_run_configs",
+        "run.list",
+        "run.start",
+        "workspace.get",
+        "workspace.set_allowlist",
+        "run.stop",
         "pty.open",
         "pty.close",
         "workspace.destroy",
@@ -850,11 +1119,43 @@ fn request_order_is_checked_as_a_subsequence() {
         "fs.read_file",
         "workspace.diff",
         "agent.stop",
+        "repo.detect_run_configs",
+        "run.list",
+        "run.start",
+        "workspace.get",
+        "workspace.set_allowlist",
+        "run.stop",
         "pty.open",
         "pty.close",
         "workspace.destroy",
     ]);
     assert!(!contains_in_order(&unanswered, &EXPECTED));
+    // An "Allow host" that sent a list without reading the daemon's first would
+    // put `workspace.set_allowlist` ahead of `workspace.get`. The order is the
+    // claim: the IDE extends the workspace's own allowlist rather than
+    // replacing it with whatever it happened to be holding.
+    let allowlist_unread = journal(&[
+        "hello",
+        "workspace.create",
+        "agent.start",
+        "agent.history",
+        "agent.send",
+        "agent.permission_reply",
+        "fs.list_dir",
+        "fs.read_file",
+        "workspace.diff",
+        "agent.stop",
+        "repo.detect_run_configs",
+        "run.list",
+        "run.start",
+        "workspace.set_allowlist",
+        "workspace.get",
+        "run.stop",
+        "pty.open",
+        "pty.close",
+        "workspace.destroy",
+    ]);
+    assert!(!contains_in_order(&allowlist_unread, &EXPECTED));
     // A missing step is not a match either.
     let short = journal(&["hello", "workspace.create", "agent.start", "fs.list_dir"]);
     assert!(!contains_in_order(&short, &EXPECTED));

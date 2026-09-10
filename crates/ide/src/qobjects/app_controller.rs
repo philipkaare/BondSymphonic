@@ -405,11 +405,21 @@ pub mod qobject {
         #[qsignal]
         fn save_all_requested(self: Pin<&mut AppController>);
 
+        /// Someone in Rust asked the window to add `host` to `workspace_id`'s
+        /// allowlist, as if the toast's "Allow host" had been pressed.
+        #[qsignal]
+        fn allow_host_requested(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            host: QString,
+        );
+
         /// Asks the window to open `path` of `workspace_id` in an editor tab.
         ///
-        /// These six `request_*` invokables are the one path by which anything
-        /// on the Rust side reaches the window: the controller has no pointer
-        /// to it, and the window is the only thing that knows which tabs exist.
+        /// These seven `request_*` invokables are the one path by which
+        /// anything on the Rust side reaches the window: the controller has no
+        /// pointer to it, and the window is the only thing that knows which
+        /// tabs exist.
         /// The smoke script drives them today; the transcript's tool cards will
         /// drive them next.
         #[qinvokable]
@@ -456,6 +466,19 @@ pub mod qobject {
         /// Asks the window to save every dirty editor.
         #[qinvokable]
         fn request_save_all(self: Pin<&mut AppController>);
+
+        /// Asks the window to allow `host` for `workspace_id`, as if the user
+        /// had pressed "Allow host" on the network-denial toast.
+        ///
+        /// Routed through the window for the same reason the five above are:
+        /// the controller owns no `RunPanelModel`, and only the window knows
+        /// which workspace the panel is showing. The window refuses a request
+        /// for any other workspace, so an allow can never be applied to a
+        /// workspace the user is not looking at. Production API — Milestone 6's
+        /// notifications answer a denial the same way — with the smoke script
+        /// as its first caller.
+        #[qinvokable]
+        fn request_allow_host(self: Pin<&mut AppController>, workspace_id: QString, host: QString);
     }
 
     impl cxx_qt::Threading for AppController {}
@@ -1211,6 +1234,10 @@ impl qobject::AppController {
 
     pub fn request_save_all(self: Pin<&mut Self>) {
         self.save_all_requested();
+    }
+
+    pub fn request_allow_host(self: Pin<&mut Self>, workspace_id: QString, host: QString) {
+        self.allow_host_requested(workspace_id, host);
     }
 
     pub fn recheck_prereqs(self: Pin<&mut Self>) {

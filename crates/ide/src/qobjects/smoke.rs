@@ -5,7 +5,7 @@
 //! The variable holds a comma-separated step list, run in order once the daemon
 //! connection is up. `tests/smoke.rs` runs the real IDE binary offscreen against
 //! an in-process fake daemon with
-//! `create_claude,open_agent,send,allow,tree,open_file,open_diff,stop,create,open,close,destroy,quit`.
+//! `create_claude,open_agent,send,allow,tree,open_file,open_diff,stop,create,detect,run_start,allow_host,run_stop,open,close,destroy,quit`.
 //! The steps are:
 //!
 //! * `create` — create a workspace over the repository in `BS_SMOKE_REPO` and
@@ -33,6 +33,22 @@
 //!   the `EditorDocument` the window builds, not from this module.
 //! * `open_diff` — the same for `open_diff_requested`, which builds a
 //!   `DiffWidget` and makes it call `workspace.diff`.
+//! * `detect` — ask the daemon what the repository in `BS_SMOKE_REPO` can run,
+//!   through `AppController::detectRunConfigs` — the invokable the New Agent
+//!   dialog calls while the user is still typing the path. The Run panel makes
+//!   its own `repo.detect_run_configs` for the *worktree* when the tab appears;
+//!   this is the dialog's half of that pair.
+//! * `run_start` — start the run configuration [`RUN_CONFIG`] in the workspace
+//!   the last `create*` made. The daemon answers with a bridged host port and
+//!   then reports `starting` → output → `ready`, and the fake follows those with
+//!   a network denial for [`DENIED_HOST`], so the window's toast path runs on a
+//!   workspace that is on screen.
+//! * `allow_host` — answer that toast through
+//!   `AppController::requestAllowHost`, the production path Milestone 6's
+//!   desktop notifications will use: the window checks that the Run panel is
+//!   showing that workspace and calls `RunPanelModel::allowHost`, which reads
+//!   the daemon's own allowlist and sends it back with the host added.
+//! * `run_stop` — stop the run the last `run_start` made.
 //! * `close` — close the PTY the last `open` made. The fake daemon answers by
 //!   ending every PTY it has handed out, including the ones the window opened
 //!   for its own panes, so the steps after this one run against terminals whose
@@ -74,6 +90,24 @@ const OPEN_PATH: &str = "README.md";
 const OPEN_SETTLE: Duration = Duration::from_millis(750);
 const PTY_COLS: u16 = 80;
 const PTY_ROWS: u16 = 24;
+/// The run configuration `run_start` starts. The fake daemon reports exactly
+/// this one from `repo.detect_run_configs`, so it is also what the Run panel
+/// preselects.
+const RUN_CONFIG: &str = "web";
+/// The host the fake daemon's proxy refuses just after the run comes up. It is
+/// not in the default allowlist, which is what makes `allow_host` a change.
+const DENIED_HOST: &str = "example.com";
+/// How long `run_start` waits for `run.state`, `run.output` and the denial
+/// behind them to travel from the daemon through the router and onto the Qt
+/// thread, where the toast is raised.
+const RUN_SETTLE: Duration = Duration::from_millis(1_500);
+/// How long `allow_host` waits. The answer is two requests deep — the window
+/// asks the daemon for the workspace's current allowlist and only then sends it
+/// back with the host added — so this has to cover both round trips.
+const ALLOW_SETTLE: Duration = Duration::from_millis(1_500);
+/// How long `detect` waits for its reply, so the request it makes is in the
+/// journal before the next step's.
+const DETECT_SETTLE: Duration = Duration::from_millis(750);
 /// How long a `create*` step waits after announcing its workspace. The window
 /// builds the tab, the pane and the file tree on the Qt thread when it sees the
 /// signal, and a terminal pane opens its PTY only once Qt has laid it out and
@@ -109,6 +143,7 @@ pub(crate) async fn run(steps: Vec<String>, client: DaemonClient, qt: QtHandle) 
     let mut workspace: Option<WorkspaceId> = None;
     let mut pty: Option<PtyId> = None;
     let mut agent: Option<AgentId> = None;
+    let mut run: Option<RunId> = None;
     let mut created = 0usize;
     for step in steps {
         tracing::info!(target: "smoke", "step: {step}");
@@ -137,6 +172,12 @@ pub(crate) async fn run(steps: Vec<String>, client: DaemonClient, qt: QtHandle) 
             "tree" => tree(&client, workspace.as_ref()).await,
             "open_file" => open_editor(&qt, workspace.as_ref(), Pane::File).await,
             "open_diff" => open_editor(&qt, workspace.as_ref(), Pane::Diff).await,
+            "detect" => detect(&qt, &repo).await,
+            "run_start" => run_start(&client, workspace.as_ref())
+                .await
+                .map(|id| run = Some(id)),
+            "allow_host" => allow_host(&qt, workspace.as_ref()).await,
+            "run_stop" => run_stop(&client, run.take()).await,
             "close" => close(&client, pty.take()).await,
             "destroy" => destroy(&client, &qt, workspace.take()).await,
             "quit" => quit(&qt).await,
@@ -374,6 +415,76 @@ async fn open_editor(
     .map_err(|_| "the Qt thread is gone".to_owned())?;
     tokio::time::sleep(OPEN_SETTLE).await;
     tracing::info!(target: "smoke", "{} requested for {OPEN_PATH}", pane.step());
+    Ok(())
+}
+
+/// Asks the daemon what `repo` can run, through the controller invokable the
+/// New Agent dialog calls.
+///
+/// Nothing here reads the answer: it arrives as
+/// `AppController::runConfigsDetected`, which the dialog listens for. The step
+/// exists so `repo.detect_run_configs` reaches the wire from the *dialog's*
+/// path as well as from the Run panel's, and so a reply the IDE could not read
+/// would be logged as `repo.detect_run_configs failed`.
+async fn detect(qt: &QtHandle, repo: &str) -> Result<(), String> {
+    let repo = repo.to_owned();
+    qt.queue(move |q| q.detect_run_configs(QString::from(&repo)))
+        .map_err(|_| "the Qt thread is gone".to_owned())?;
+    tokio::time::sleep(DETECT_SETTLE).await;
+    Ok(())
+}
+
+/// Starts [`RUN_CONFIG`] in the workspace the last `create*` made.
+///
+/// On the script's own client, the way `create` and `open` make theirs: the Run
+/// panel's Start button is a widget, and this suite never touches the desktop.
+/// What the run is here for is everything that follows it — the `run.state` and
+/// `run.output` events, and the network denial the fake daemon sends behind
+/// them, which the window has to turn into a toast for the workspace on screen.
+async fn run_start(
+    client: &DaemonClient,
+    workspace: Option<&WorkspaceId>,
+) -> Result<RunId, String> {
+    let workspace_id = need(workspace, "run_start")?;
+    let res = client
+        .request::<RunStartResult>(Request::RunStart(RunStartParams {
+            workspace_id,
+            config_name: RUN_CONFIG.to_owned(),
+        }))
+        .await
+        .map_err(|e| e.to_string())?;
+    tracing::info!(target: "smoke", "run started {:?} on {}", res.run_id, res.url);
+    tokio::time::sleep(RUN_SETTLE).await;
+    Ok(res.run_id)
+}
+
+/// Answers the denial toast the way a click on "Allow host" does.
+///
+/// Through the window, not on this module's own client: `workspace.get` and
+/// `workspace.set_allowlist` have to leave `RunPanelModel::allowHost`, or the
+/// run proves only that the fake daemon answers a request the IDE never made.
+/// The window refuses the request unless the Run panel is showing exactly this
+/// workspace, and logs `allow host not routed` when it does — so a
+/// `workspace.set_allowlist` reaching the daemon at all is the proof the toast
+/// was up on the right tab.
+async fn allow_host(qt: &QtHandle, workspace: Option<&WorkspaceId>) -> Result<(), String> {
+    let workspace_id = need(workspace, "allow_host")?.to_string();
+    qt.queue(move |q| {
+        q.request_allow_host(QString::from(&workspace_id), QString::from(DENIED_HOST))
+    })
+    .map_err(|_| "the Qt thread is gone".to_owned())?;
+    tokio::time::sleep(ALLOW_SETTLE).await;
+    tracing::info!(target: "smoke", "allowed {DENIED_HOST}");
+    Ok(())
+}
+
+/// Stops the run the last `run_start` made.
+async fn run_stop(client: &DaemonClient, run: Option<RunId>) -> Result<(), String> {
+    let run_id = run.ok_or_else(|| "`run_stop` needs a `run_start` before it".to_owned())?;
+    client
+        .request_raw(Request::RunStop(RunIdParams { run_id }))
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
