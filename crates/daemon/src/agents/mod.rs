@@ -858,11 +858,11 @@ mod tests {
         assert_eq!(records.load()[0].session_id.as_deref(), Some("sess-2"));
     }
 
-    /// `ended()` needs a record for the same reason: an agent that dies the
+    /// `ended()` closes the record and is idempotent: an agent that dies the
     /// instant it starts must not come back from a restart as one the daemon
-    /// thinks it lost.
+    /// thinks it lost, and a second exit report must not move the timestamp.
     #[tokio::test]
-    async fn an_exit_reported_before_the_record_exists_leaves_it_open() {
+    async fn an_exit_closes_the_record_once_and_keeps_the_first_answer() {
         let dir = tempfile::tempdir().unwrap();
         let records = Arc::new(AgentRecords::new(dir.path().join("agents.json")));
         let ws: WorkspaceId = "ws_1".into();
