@@ -13,6 +13,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::task::{Poll, Waker};
 
+/// What [`NoopHandle::helper_exe`] answers with: a path chosen so that a spawn
+/// which should never have happened fails with an explanation.
+const NO_HELPERS: &str = "/nonexistent/the-no-sandbox-backend-has-no-in-sandbox-helpers";
+
 /// A killer closure registered with a handle so `shutdown` can reach the child.
 type Killer = Box<dyn Fn() + Send + Sync>;
 
@@ -121,13 +125,18 @@ impl SandboxHandle for NoopHandle {
         Ok(())
     }
 
-    /// There is no sandbox and so no bind: a child here is an ordinary child of
-    /// the daemon and sees the daemon's own binary at its own path. Under
-    /// `cargo test` that path is the test harness rather than the daemon, which
-    /// is harmless — nothing spawns a helper on this backend, because the
-    /// helpers exist to make up for what a real sandbox takes away.
+    /// A path that does not exist, on purpose.
+    ///
+    /// The helpers — the proxy shim, the port forwarder — exist only to make up
+    /// for what a real sandbox takes away, and this backend takes nothing away:
+    /// a child here is an ordinary child of the daemon, with the host's network
+    /// and the host's ports. So nothing should ever ask, and something that does
+    /// has a bug. `current_exe()` would answer it with the test harness under
+    /// `cargo test` and with the daemon itself in production, either of which
+    /// starts a process that quietly does the wrong thing; this fails at the
+    /// spawn instead, with the reason in the path.
     fn helper_exe(&self) -> PathBuf {
-        std::env::current_exe().unwrap_or_else(|_| "bondsymphonic-daemon".into())
+        PathBuf::from(NO_HELPERS)
     }
 }
 

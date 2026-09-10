@@ -60,20 +60,31 @@ pub const PROXY_LISTEN: &str = "127.0.0.1:3128";
 /// names and connects on the *host*.
 pub const PROXY_BYPASS: &str = "localhost,127.0.0.1";
 
-/// The daemon binary as the sandbox sees it.
-///
-/// Duplicated from `sandbox::linux_bwrap`, where it is private and behind
-/// `cfg(target_os = "linux")`, the same way [`sandbox_user`] duplicates
-/// `whoami`. It holds because the daemon is installed under the user's home
-/// (`~/.bondsymphonic/bin`) and built under it in development, and bwrap
-/// replaces `/home` with a tmpfs, so the binary is always bound in at this
-/// path rather than reachable at its own.
-pub const INIT_EXE_IN_SANDBOX: &str = "/tmp/.bs-init";
-
 /// How long the shim gets to bind its port before the workspace comes up
 /// anyway. Exceeded, the workspace is still usable — it simply has no route out
 /// until it is restarted — which beats refusing to open it at all.
 const SHIM_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Says out loud that a workspace has lost its way out of the sandbox.
+///
+/// A `tracing::warn!` reaches the daemon's stderr and nobody else, and every
+/// one of these leaves a workspace that is up and Ready with no network, which
+/// an agent then experiences as connection timeouts it cannot explain. The
+/// plan's rule is that a workspace failure arrives as a `workspace.state` event
+/// or an `RpcError`; this is neither serious enough to fail the workspace nor
+/// quiet enough to keep to ourselves, so it goes out as the same `daemon.log`
+/// warn the denial path uses, tagged with the workspace it belongs to.
+fn report_no_network(d: &Daemon, id: &WorkspaceId, detail: &str) {
+    tracing::warn!(ws = %id, "{detail}");
+    d.events.publish(
+        Some(id.clone()),
+        Event::DaemonLog {
+            level: LogLevel::Warn,
+            message: format!("this workspace has no network: {detail}"),
+            host: None,
+        },
+    );
+}
 
 /// The proxy variables every process in a bwrap sandbox inherits.
 ///
@@ -158,7 +169,8 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
     std::fs::write(layout.config_worktree(), b"").map_err(|e| RpcError::io(&e))?;
     // Before the sandbox, not after: the shim inside it connects to this socket
     // as its first act, and a sandbox that came up first would race it.
-    d.proxies
+    let proxy = d
+        .proxies
         .start(
             &ws.id,
             &d.dirs.run(&ws.id).join(PROXY_SOCKET_FILE),
@@ -170,12 +182,12 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
         Ok(h) => h,
         // Nothing will ever connect to that listener now.
         Err(e) => {
-            d.proxies.stop(&ws.id);
+            d.proxies.stop_generation(&ws.id, proxy);
             return Err(e);
         }
     };
     d.sandboxes.lock().insert(ws.id.clone(), handle.clone());
-    watch_sandbox(d, &ws.id, handle.clone());
+    watch_sandbox(d, &ws.id, handle.clone(), proxy);
     if d.backend.name() == BWRAP_BACKEND {
         start_shim(d, ws, &handle).await;
     }
@@ -191,8 +203,12 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
 /// as the process does; init takes the shim down with the sandbox in any case,
 /// since it is one of its children like any other.
 async fn start_shim(d: &Arc<Daemon>, ws: &Workspace, handle: &Arc<dyn SandboxHandle>) {
+    // Asked of the handle rather than assumed: bwrap binds the daemon binary in
+    // at a fixed path only when its real one is hidden by a tmpfs, and a
+    // hardcoded guess is right on one host and silently wrong on the next.
+    let helper = handle.helper_exe();
     let argv = [
-        INIT_EXE_IN_SANDBOX,
+        helper.to_string_lossy().as_ref(),
         "proxy-shim",
         "--socket",
         PROXY_SOCKET_IN_SANDBOX,
@@ -213,12 +229,21 @@ async fn start_shim(d: &Arc<Daemon>, ws: &Workspace, handle: &Arc<dyn SandboxHan
     {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(ws = %ws.id, "proxy shim did not start: {e}; this workspace has no network");
+            report_no_network(
+                d,
+                &ws.id,
+                &format!(
+                    "the proxy shim did not start from {}: {}",
+                    helper.display(),
+                    e.message
+                ),
+            );
             return;
         }
     };
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        tracing::warn!(ws = %ws.id, "proxy shim started without pipes; this workspace has no network");
+        (child.killer)();
+        report_no_network(d, &ws.id, "the proxy shim started without pipes");
         return;
     };
     let mut out = tokio::io::BufReader::new(stdout).lines();
@@ -237,7 +262,11 @@ async fn start_shim(d: &Arc<Daemon>, ws: &Workspace, handle: &Arc<dyn SandboxHan
     .await
     .unwrap_or(false);
     if !ready {
-        tracing::warn!(ws = %ws.id, "proxy shim never reported listening; this workspace may have no network");
+        report_no_network(
+            d,
+            &ws.id,
+            &format!("the proxy shim never reported listening on {PROXY_LISTEN}"),
+        );
     }
     let d = d.clone();
     let id = ws.id.clone();
@@ -258,8 +287,16 @@ async fn start_shim(d: &Arc<Daemon>, ws: &Workspace, handle: &Arc<dyn SandboxHan
         // A sandbox on its way down takes the shim with it, which is ordinary; a
         // shim that dies under a live sandbox has cost that workspace its
         // network and is worth saying so.
-        if d.sandboxes.lock().contains_key(&id) {
-            tracing::warn!(ws = %id, ?code, "proxy shim exited; this workspace has no network");
+        let alive = d.sandboxes.lock().contains_key(&id);
+        if alive {
+            report_no_network(
+                &d,
+                &id,
+                &match code {
+                    Some(c) => format!("the proxy shim exited with status {c}"),
+                    None => "the proxy shim is gone".to_string(),
+                },
+            );
         } else {
             tracing::debug!(ws = %id, ?code, "proxy shim exited with its sandbox");
         }
@@ -296,6 +333,7 @@ fn watch_sandbox(
     d: &Arc<Daemon>,
     id: &WorkspaceId,
     handle: Arc<dyn crate::sandbox::SandboxHandle>,
+    proxy: u64,
 ) {
     let Some(mut died) = handle.died() else {
         return;
@@ -321,8 +359,10 @@ fn watch_sandbox(
         // would hang a browser rather than refuse it.
         d.runs.stop_all_in(&id).await;
         // Nothing can reach the socket now that the sandbox holding the shim is
-        // gone, and a listener left behind would outlive the workspace.
-        d.proxies.stop(&id);
+        // gone, and a listener left behind would outlive the workspace. By
+        // generation, so a restart that has already re-bound the socket keeps
+        // the listener it is about to need.
+        d.proxies.stop_generation(&id, proxy);
         tracing::warn!(ws = %id, "sandbox died");
         let _ = d.set_state(&id, WorkspaceState::SandboxDown);
     });
@@ -634,6 +674,86 @@ pub fn parse_porcelain_v2(text: &str) -> Vec<GitStatusEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every way the shim can fail leaves a workspace that is up and Ready with
+    /// no way out of its sandbox, so each one has to reach the client rather
+    /// than only the daemon's stderr.
+    ///
+    /// The no-sandbox backend answers `helper_exe` with a path that does not
+    /// exist, which is the exact shape of the failure this guards against: a
+    /// host where the daemon binary is not where the shim was looked for.
+    #[tokio::test]
+    async fn a_shim_that_cannot_start_is_reported_to_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = crate::server::broadcast::EventBus::new(16);
+        let mut rx = events.subscribe();
+        let d = Daemon::new(
+            crate::workspace::DataDirs::new(dir.path()),
+            crate::sandbox::backend_for("noop"),
+            events,
+        )
+        .unwrap();
+        let ws = Workspace {
+            id: "ws_shimtest".into(),
+            name: "shimtest".into(),
+            repo_path: dir.path().into(),
+            base_branch: "main".into(),
+            branch: "bs/shimtest/work".into(),
+            worktree_path: dir.path().into(),
+            created_at: now_rfc3339(),
+            allowlist: vec![],
+            state: WorkspaceState::Ready,
+            agents: vec![],
+            runs: vec![],
+        };
+        let handle = d
+            .backend
+            .start(&SandboxSpec {
+                id: ws.id.clone(),
+                rw_binds: vec![],
+                ro_binds: vec![],
+                late_ro_binds: vec![],
+                home: dir.path().into(),
+                run_dir: dir.path().into(),
+                env: vec![],
+                cwd: dir.path().into(),
+            })
+            .await
+            .unwrap();
+
+        start_shim(&d, &ws, &handle).await;
+
+        match rx
+            .try_recv()
+            .expect("a daemon.log event for this workspace")
+        {
+            ServerMessage::Event {
+                workspace_id,
+                event:
+                    Event::DaemonLog {
+                        level,
+                        message,
+                        host,
+                    },
+            } => {
+                assert_eq!(workspace_id, Some(ws.id.clone()));
+                assert_eq!(level, LogLevel::Warn);
+                // The `host` field belongs to a denial; this is not one.
+                assert_eq!(host, None);
+                assert!(message.contains("has no network"), "{message}");
+                assert!(
+                    message.contains("the proxy shim did not start"),
+                    "{message}"
+                );
+                // The path it was looked for at, so the fix is in the message.
+                assert!(
+                    message.contains(&handle.helper_exe().display().to_string()),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a daemon.log warn, got {other:?}"),
+        }
+    }
 
     #[test]
     fn parses_porcelain_v2_lines() {

@@ -681,7 +681,30 @@ async fn bridge_into(
         .await
         .map_err(|e| RpcError::io(&e))?;
     let host_port = bridge.host_port;
-    let forwarder = start_forwarder(ws, handle, port).await;
+    let forwarder = match start_forwarder(ws, handle, port).await {
+        Ok(k) => k,
+        // A bridge with no far end can never carry anything, so the run would
+        // sit in `starting` until someone stopped it. Refusing the call says the
+        // same thing at the one moment a person is looking, and the workspace
+        // gets the notice too, since the forwarder is part of its plumbing
+        // rather than of this one run.
+        Err(detail) => {
+            teardown(Plumbing {
+                bridge: Some(bridge),
+                forwarder: None,
+            });
+            d.events.publish(
+                Some(ws.clone()),
+                Event::DaemonLog {
+                    level: LogLevel::Warn,
+                    message: format!("port {port} cannot be reached in this workspace: {detail}"),
+                    host: None,
+                },
+            );
+            return Err(RpcError::new(ErrorCode::SandboxError, detail));
+        }
+    };
+    let forwarder = Some(forwarder);
     Ok((
         host_port,
         Plumbing {
@@ -706,17 +729,20 @@ async fn bridge_into(
 
 /// Starts the forwarder inside the sandbox and waits for it to bind.
 ///
-/// A failure is logged rather than returned: readiness simply never arrives
-/// through a bridge with no far end, which the IDE shows as a run stuck in
-/// `starting` rather than as a URL that does not work.
+/// The error side is a sentence fit to show a person: it becomes the reason
+/// `run.start` refuses, because a bridge whose far end never came up cannot
+/// carry a thing and the run behind it would only ever be `starting`.
 #[cfg(unix)]
 async fn start_forwarder(
     ws: &WorkspaceId,
     handle: &Arc<dyn SandboxHandle>,
     port: u16,
-) -> Option<Box<dyn Fn() + Send + Sync>> {
+) -> Result<Box<dyn Fn() + Send + Sync>, String> {
+    // The handle's own answer, not a constant: bwrap binds the daemon binary in
+    // at a fixed path only when its real one is hidden by a tmpfs.
+    let helper = handle.helper_exe();
     let argv = vec![
-        crate::workspace::lifecycle::INIT_EXE_IN_SANDBOX.to_string(),
+        helper.to_string_lossy().into_owned(),
         "forward".to_string(),
         "--socket".to_string(),
         format!("/run/bs/fwd-{port}.sock"),
@@ -734,14 +760,18 @@ async fn start_forwarder(
     {
         Ok(c) => c,
         Err(e) => {
-            warn!(ws = %ws, port, "port forwarder did not start: {e}; this run will not be reachable");
-            return None;
+            warn!(ws = %ws, port, "port forwarder did not start: {e}");
+            return Err(format!(
+                "the port forwarder did not start from {}: {}",
+                helper.display(),
+                e.message
+            ));
         }
     };
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         warn!(ws = %ws, port, "port forwarder started without pipes");
         (child.killer)();
-        return None;
+        return Err("the port forwarder started without pipes".to_string());
     };
     let killer = child.killer;
     let mut exit = child.exit;
@@ -762,6 +792,10 @@ async fn start_forwarder(
     .unwrap_or(false);
     if !ready {
         warn!(ws = %ws, port, "port forwarder never reported listening");
+        killer();
+        return Err(format!(
+            "the port forwarder never reported listening on port {port} inside the sandbox"
+        ));
     }
     let id = ws.clone();
     tokio::spawn(async move {
@@ -780,7 +814,7 @@ async fn start_forwarder(
         let code = (&mut exit).await.ok();
         tracing::debug!(ws = %id, ?code, "port forwarder exited");
     });
-    Some(killer)
+    Ok(killer)
 }
 
 /// `command` as a process, run through a shell so the shell features a config

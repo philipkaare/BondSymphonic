@@ -242,6 +242,10 @@ struct Entry {
     /// Swapped under running connections by `workspace.set_allowlist`.
     allow: Arc<RwLock<Allowlist>>,
     socket: PathBuf,
+    /// Which call to [`ProxyRegistry::start`] this listener belongs to. A
+    /// workspace whose sandbox dies and is restarted has a watcher for each
+    /// start, and only the one whose generation still matches may stop it.
+    generation: u64,
     /// Ends the accept loop *and* every connection it started, so a workspace
     /// that goes away takes its open tunnels with it.
     cancel: tokio_util::sync::CancellationToken,
@@ -251,6 +255,8 @@ struct Entry {
 #[derive(Default)]
 pub struct ProxyRegistry {
     entries: Mutex<HashMap<WorkspaceId, Entry>>,
+    /// Handed out by [`ProxyRegistry::start`], never reused.
+    next_generation: std::sync::atomic::AtomicU64,
 }
 
 /// What one connection needs to decide where it may go and to say so.
@@ -267,14 +273,15 @@ impl ProxyRegistry {
     /// listening on `socket`.
     ///
     /// Called before the sandbox starts, so the socket is already there when
-    /// the shim inside it connects.
+    /// the shim inside it connects. Returns the generation of the listener the
+    /// caller now owns, for [`ProxyRegistry::stop_generation`].
     pub async fn start(
         &self,
         id: &WorkspaceId,
         socket: &Path,
         allow: Allowlist,
         events: EventBus,
-    ) -> Result<(), RpcError> {
+    ) -> Result<u64, RpcError> {
         self.start_now(id, socket, allow, events)
     }
 
@@ -285,14 +292,35 @@ impl ProxyRegistry {
         socket: &Path,
         allow: Allowlist,
         events: EventBus,
-    ) -> Result<(), RpcError> {
+    ) -> Result<u64, RpcError> {
         // One lock for the whole thing: nothing in here awaits, and a second
         // `start` for the same workspace must not be able to bind over a live
         // listener between the lookup and the insert.
         let mut entries = self.entries.lock();
-        if let Some(existing) = entries.get(id) {
-            *existing.allow.write() = allow;
-            return Ok(());
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(existing) = entries.get_mut(id) {
+            // A listener on the path the caller asked for is the one it wanted,
+            // whoever started it; it takes over the new allowlist and the new
+            // generation, so the previous owner's watcher can no longer stop it.
+            if existing.socket.as_path() == socket {
+                *existing.allow.write() = allow;
+                existing.generation = generation;
+                return Ok(generation);
+            }
+            // A different path means this is a different listener. Silently
+            // handing back the old one would leave the caller's socket file
+            // missing and its sandbox with no way out.
+            tracing::warn!(
+                ws = %id,
+                old = %existing.socket.display(),
+                new = %socket.display(),
+                "the workspace proxy moved; replacing the listener"
+            );
+            let old = entries.remove(id).expect("just looked it up");
+            old.cancel.cancel();
+            let _ = std::fs::remove_file(&old.socket);
         }
         // A socket file left by a daemon that did not exit cleanly would make
         // the bind fail; nothing else may live at this path.
@@ -319,11 +347,12 @@ impl ProxyRegistry {
             Entry {
                 allow,
                 socket: socket.to_path_buf(),
+                generation,
                 cancel,
             },
         );
         tracing::debug!(ws = %id, socket = %socket.display(), "workspace proxy listening");
-        Ok(())
+        Ok(generation)
     }
 
     /// Without Unix sockets there is no sandbox to proxy for either, so this is
@@ -336,9 +365,11 @@ impl ProxyRegistry {
         _socket: &Path,
         _allow: Allowlist,
         _events: EventBus,
-    ) -> Result<(), RpcError> {
+    ) -> Result<u64, RpcError> {
         tracing::debug!("the workspace proxy needs a unix socket; not started on this host");
-        Ok(())
+        Ok(self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Replaces the live allowlist. Connections already established keep the
@@ -350,11 +381,32 @@ impl ProxyRegistry {
         }
     }
 
-    /// Ends the listener, its connections and the socket file.
+    /// Ends the listener, its connections and the socket file. For a workspace
+    /// that is going away, where whatever is listening should stop whoever
+    /// started it.
     pub fn stop(&self, id: &WorkspaceId) {
         let Some(entry) = self.entries.lock().remove(id) else {
             return;
         };
+        entry.cancel.cancel();
+        let _ = std::fs::remove_file(&entry.socket);
+    }
+
+    /// The same, but only for the listener [`ProxyRegistry::start`] handed back
+    /// this `generation`.
+    ///
+    /// A sandbox that dies while a restart is already under way has a watcher
+    /// holding a stale view of the workspace: without this it would cancel the
+    /// listener the *new* sandbox is about to use and unlink its socket, and
+    /// the workspace would come up Ready with no way out. Mirrors the
+    /// `Arc::ptr_eq` check the sandbox map gets for the same reason.
+    pub fn stop_generation(&self, id: &WorkspaceId, generation: u64) {
+        let mut entries = self.entries.lock();
+        if entries.get(id).is_none_or(|e| e.generation != generation) {
+            return;
+        }
+        let entry = entries.remove(id).expect("just looked it up");
+        drop(entries);
         entry.cancel.cancel();
         let _ = std::fs::remove_file(&entry.socket);
     }
