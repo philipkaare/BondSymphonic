@@ -46,6 +46,14 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(unix)]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many connections one workspace may have in flight through its proxy.
+///
+/// The sandbox is the untrusted side of this socket, and a task per connection
+/// with nothing bounding the count lets a misbehaving agent pin the daemon that
+/// also serves the IDE. Well past what a package install or a browser-shaped
+/// client opens at once, and far short of anything the daemon cannot carry.
+pub const MAX_CONNECTIONS: usize = 256;
+
 /// The request line and headers of one proxied request.
 ///
 /// `head_len` counts the blank line, so `&buf[head_len..]` is the body (or the
@@ -66,7 +74,21 @@ pub struct RequestHead {
 /// the caller waiting on a client that has already finished — but as a head
 /// whose target [`target_host_port`] cannot resolve, which answers 400.
 pub fn parse_request_head(buf: &[u8]) -> Option<RequestHead> {
-    let end = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    parse_request_head_from(buf, 0)
+}
+
+/// The same, resuming the search for the blank line at `from`.
+///
+/// A reader that appends `n` bytes and re-scans from byte zero every time is
+/// quadratic in the size of the head, and the client driving it sits inside the
+/// sandbox: one byte per read over a 64 KiB budget is billions of comparisons
+/// for a single connection. Resuming from `len - n - 3` — three bytes back, so
+/// a terminator straddling the join is still seen — makes the whole read
+/// linear. `from` may safely be any value: it is clamped, and passing 0 is
+/// always correct, just slower.
+pub fn parse_request_head_from(buf: &[u8], from: usize) -> Option<RequestHead> {
+    let from = from.min(buf.len());
+    let end = from + buf[from..].windows(4).position(|w| w == b"\r\n\r\n")?;
     // Lossy rather than strict UTF-8: header values are bytes, and a request
     // that is complete must be answered rather than waited on.
     let text = String::from_utf8_lossy(&buf[..end]);
@@ -344,7 +366,27 @@ async fn accept_loop(
     ctx: ConnCtx,
     cancel: tokio_util::sync::CancellationToken,
 ) {
+    let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
+        // The permit is taken *before* accepting, so a workspace that has run
+        // out simply stops taking connections off the socket. The kernel's
+        // backlog then holds them, which is back-pressure rather than a refusal
+        // the client would have to understand.
+        if limit.available_permits() == 0 {
+            tracing::warn!(
+                ws = %ctx.workspace,
+                limit = MAX_CONNECTIONS,
+                "proxy connection limit reached; further connections wait"
+            );
+        }
+        let permit = tokio::select! {
+            _ = cancel.cancelled() => return,
+            p = Arc::clone(&limit).acquire_owned() => match p {
+                Ok(p) => p,
+                // Only when the semaphore is closed, which nothing does.
+                Err(_) => return,
+            },
+        };
         let accepted = tokio::select! {
             _ = cancel.cancelled() => return,
             a = listener.accept() => a,
@@ -354,6 +396,9 @@ async fn accept_loop(
                 let ctx = ctx.clone();
                 let cancel = cancel.clone();
                 tokio::spawn(async move {
+                    // Held for the life of the connection, so the count falls
+                    // again however this task ends.
+                    let _permit = permit;
                     // No timeout on the connection as a whole: a tunnel may
                     // legitimately be a WebSocket that lives for hours. Only
                     // the head, before anything is allowed, is on a clock.
@@ -384,13 +429,20 @@ async fn read_head(
     buf: &mut Vec<u8>,
 ) -> std::io::Result<Option<RequestHead>> {
     use tokio::io::AsyncReadExt;
+    // How much of the buffer has already been searched for the blank line. Kept
+    // across reads so the scan is linear in the head rather than quadratic; see
+    // [`parse_request_head_from`].
+    let mut scanned = 0usize;
     loop {
-        if let Some(head) = parse_request_head(buf) {
+        if let Some(head) = parse_request_head_from(buf, scanned) {
             return Ok(Some(head));
         }
         if buf.len() >= MAX_HEAD_BYTES {
             return Ok(None);
         }
+        // Three bytes back from the end, so a terminator split across this read
+        // and the next is still found.
+        scanned = buf.len().saturating_sub(3);
         let mut chunk = [0u8; 4096];
         match client.read(&mut chunk).await? {
             0 => return Ok(None),
@@ -593,6 +645,34 @@ mod tests {
         assert!(body.contains("evil.example"), "{body}");
         assert!(body.contains("bondsymphonic.toml"), "{body}");
         assert!(body.contains("[network] allow"), "{body}");
+    }
+
+    /// The read loop resumes its search where the last one stopped, so a head
+    /// that dribbles in one byte at a time must still be found — exactly once,
+    /// at the byte that completes the blank line.
+    #[test]
+    fn a_head_arriving_one_byte_at_a_time_is_found_where_it_ends() {
+        let text = "GET http://a/x HTTP/1.1\r\nHost: a\r\n\r\nbody";
+        let mut buf: Vec<u8> = Vec::new();
+        let mut found = None;
+        for (i, byte) in text.bytes().enumerate() {
+            // Mirrors `read_head`: the offset is taken before the bytes land.
+            let scanned = buf.len().saturating_sub(3);
+            buf.push(byte);
+            if let Some(head) = parse_request_head_from(&buf, scanned) {
+                found = Some((i, head));
+                break;
+            }
+        }
+        let (i, head) = found.expect("the head is complete before the body");
+        // The byte that completed it is the last of the blank line, and nothing
+        // of the body had arrived yet.
+        assert_eq!(i + 1, text.find("body").unwrap());
+        assert_eq!(head.head_len, text.find("body").unwrap());
+        assert_eq!(head.target, "http://a/x");
+        assert_eq!(head.headers, vec![("Host".to_string(), "a".to_string())]);
+        // Resuming from an offset can never find *more* than starting at zero.
+        assert_eq!(parse_request_head(text.as_bytes()), Some(head));
     }
 
     /// A client that never sends the blank line gets no request out of the

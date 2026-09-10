@@ -376,6 +376,21 @@ async fn a_sandboxed_process_reaches_the_host_only_through_the_allowlisting_prox
     )
     .await;
     assert_ne!(code, 0, "the host must be unreachable directly: {out}");
+    // The positive control for that probe: the same construct against the shim's
+    // own port must succeed. Without it a missing bash, or a bash built without
+    // `/dev/tcp`, would satisfy the assertion above just as well as a blocked
+    // route does, and the probe would prove nothing.
+    let (code, out) = run_in(
+        &daemon,
+        &ws.id,
+        &["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3128"],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        code, 0,
+        "bash and /dev/tcp must work in this sandbox, or the probe above proves nothing: {out}"
+    );
 
     // Through the proxy, once the host is allowed. `NO_PROXY` is cleared for
     // this probe only: the sandbox is told to reach loopback directly so the

@@ -66,6 +66,20 @@ fn exe_is_hidden(self_exe: &Path) -> bool {
     self_exe.starts_with("/home") || self_exe.starts_with("/tmp")
 }
 
+/// Where the daemon binary can be executed from inside the sandbox: the path it
+/// is bound in at when its own is hidden, and otherwise its own.
+///
+/// This is the single answer [`bwrap_args`] builds the `sandbox-init` argv from
+/// and [`SandboxHandle::helper_exe`] hands to everything else, so the two can
+/// never disagree about where the binary is.
+pub fn exe_in_sandbox(self_exe: &Path) -> PathBuf {
+    if exe_is_hidden(self_exe) {
+        PathBuf::from(INIT_EXE_IN_SANDBOX)
+    } else {
+        self_exe.to_path_buf()
+    }
+}
+
 /// Builds the `bwrap` argument vector for one workspace sandbox.
 ///
 /// Read-only binds are emitted before read-write ones so a writable subpath of
@@ -108,16 +122,10 @@ pub fn bwrap_args(
     .map(String::from)
     .collect();
     a.extend(["--bind".into(), s(&spec.home), home_in]);
-    let exe_in = if exe_is_hidden(self_exe) {
-        a.extend([
-            "--ro-bind".into(),
-            s(self_exe),
-            INIT_EXE_IN_SANDBOX.to_string(),
-        ]);
-        PathBuf::from(INIT_EXE_IN_SANDBOX)
-    } else {
-        self_exe.to_path_buf()
-    };
+    let exe_in = exe_in_sandbox(self_exe);
+    if exe_is_hidden(self_exe) {
+        a.extend(["--ro-bind".into(), s(self_exe), s(&exe_in)]);
+    }
     for (h, sb) in &spec.ro_binds {
         a.extend(["--ro-bind".into(), s(h), s(sb)]);
     }
@@ -160,6 +168,9 @@ struct BwrapHandle {
     spec: SandboxSpec,
     client: Arc<ExecClient>,
     base_env: Vec<(String, String)>,
+    /// The daemon binary as this sandbox sees it, from the same
+    /// [`exe_in_sandbox`] the argv was built with.
+    helper_exe: PathBuf,
     bwrap: tokio::sync::Mutex<tokio::process::Child>,
 }
 
@@ -280,6 +291,7 @@ impl SandboxBackend for BwrapBackend {
             spec: spec.clone(),
             client,
             base_env,
+            helper_exe: exe_in_sandbox(&self.self_exe),
             bwrap: tokio::sync::Mutex::new(child),
         }))
     }
@@ -291,6 +303,10 @@ impl SandboxHandle for BwrapHandle {
         self.client
             .spawn(&cmd, &self.base_env, &self.spec.cwd)
             .await
+    }
+
+    fn helper_exe(&self) -> PathBuf {
+        self.helper_exe.clone()
     }
 
     fn died(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
@@ -353,6 +369,50 @@ mod tests {
         );
         // A daemon outside /home and /tmp is reachable at its own path.
         assert!(!s.contains(INIT_EXE_IN_SANDBOX));
+    }
+
+    /// What `bwrap_args` executes and what a handle reports as its helper are
+    /// the same path in both branches, or the shim is spawned from somewhere
+    /// that does not exist and the workspace silently loses its network.
+    #[test]
+    fn the_helper_path_is_the_one_the_argv_executes_in_both_branches() {
+        let spec = SandboxSpec {
+            id: "ws_1".into(),
+            rw_binds: vec![],
+            ro_binds: vec![],
+            late_ro_binds: vec![],
+            home: "/data/homes/ws_1".into(),
+            run_dir: "/data/run/ws_1".into(),
+            env: vec![],
+            cwd: "/data/worktrees/ws_1".into(),
+        };
+        for exe in [
+            // Hidden: under the tmpfs bwrap puts over /home, which is where the
+            // daemon is installed and where cargo builds it.
+            Path::new("/home/bs/.bondsymphonic/bin/bondsymphonic-daemon"),
+            Path::new("/tmp/staged/bondsymphonic-daemon"),
+            // Reachable at its own path.
+            Path::new("/usr/local/bin/bondsymphonic-daemon"),
+            Path::new("/opt/bs/bondsymphonic-daemon"),
+        ] {
+            let helper = exe_in_sandbox(exe);
+            let args = bwrap_args(&spec, Path::new("/run/bs/exec.sock"), exe, "bs").join(" ");
+            assert!(
+                args.ends_with(&format!(
+                    "-- {} sandbox-init --socket /run/bs/exec.sock",
+                    helper.display()
+                )),
+                "{exe:?} is executed as {helper:?}: {args}"
+            );
+        }
+        assert_eq!(
+            exe_in_sandbox(Path::new("/home/bs/x/bondsymphonic-daemon")),
+            Path::new(INIT_EXE_IN_SANDBOX)
+        );
+        assert_eq!(
+            exe_in_sandbox(Path::new("/usr/bin/bondsymphonic-daemon")),
+            Path::new("/usr/bin/bondsymphonic-daemon")
+        );
     }
 
     #[test]

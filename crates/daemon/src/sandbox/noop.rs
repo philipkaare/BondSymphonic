@@ -120,6 +120,15 @@ impl SandboxHandle for NoopHandle {
         }
         Ok(())
     }
+
+    /// There is no sandbox and so no bind: a child here is an ordinary child of
+    /// the daemon and sees the daemon's own binary at its own path. Under
+    /// `cargo test` that path is the test harness rather than the daemon, which
+    /// is harmless — nothing spawns a helper on this backend, because the
+    /// helpers exist to make up for what a real sandbox takes away.
+    fn helper_exe(&self) -> PathBuf {
+        std::env::current_exe().unwrap_or_else(|_| "bondsymphonic-daemon".into())
+    }
 }
 
 // ---------------------------------------------------------------------------

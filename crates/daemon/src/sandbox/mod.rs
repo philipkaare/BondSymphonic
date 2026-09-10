@@ -106,6 +106,18 @@ pub trait SandboxHandle: Send + Sync {
     async fn spawn(&self, cmd: SandboxCommand) -> Result<SandboxChild, RpcError>;
     async fn shutdown(&self) -> Result<(), RpcError>;
 
+    /// The daemon's own binary, at the path it can be executed from *inside*
+    /// this sandbox.
+    ///
+    /// The daemon ships several helpers that run in the sandbox as subcommands
+    /// of itself — the proxy shim, and whatever follows it — and only the
+    /// backend knows where its binary ended up: bwrap binds it in at a fixed
+    /// path when the real one is hidden by a tmpfs, and leaves it where it is
+    /// otherwise. A caller that hardcodes either answer is right on one host and
+    /// silently wrong on the next, so the decision is asked for rather than
+    /// repeated.
+    fn helper_exe(&self) -> PathBuf;
+
     /// A watch that flips to `true` when this sandbox stops being usable, so a
     /// workspace whose sandbox dies underneath it can be reported rather than
     /// left claiming to be `Ready` until the next `pty.open` fails.
