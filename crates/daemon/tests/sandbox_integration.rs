@@ -1374,14 +1374,13 @@ async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
     // A rejected cwd is refused before any plumbing exists: no host port, no
     // forwarder and no socket may be left behind by the attempt.
     //
-    // Forwarders are counted rather than matched by name. A forwarder's argv
-    // carries the *sandbox-internal* socket path (`/run/bs/fwd-<run>.sock`), so
-    // nothing in it names this workspace, and `pgrep` searches the whole
-    // machine. What can be said exactly is that a refused start must not add
-    // one -- and [`FORWARDERS`], held for the length of this test, is what keeps
-    // a sibling test's forwarder out of the difference.
-    let forwarders_before: std::collections::HashSet<i32> =
-        pgrep_pids("forward --socket").into_iter().collect();
+    // The socket is what this asserts on, and deliberately not the process
+    // table. A forwarder's argv carries the *sandbox-internal* socket path
+    // (`/run/bs/fwd-<run>.sock`), so nothing in it names this workspace, and
+    // `pgrep` searches the whole machine: any count taken here can move because
+    // of a suite running in parallel. The socket file is this workspace's own
+    // and cannot, and a forwarder that got as far as running would have bound
+    // it.
     let escape = daemon
         .runs
         .start(
@@ -1407,15 +1406,7 @@ async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
         .collect();
     assert!(
         leftover.is_empty(),
-        "a refused start left sockets behind: {leftover:?}"
-    );
-    let appeared: Vec<i32> = pgrep_pids("forward --socket")
-        .into_iter()
-        .filter(|p| !forwarders_before.contains(p))
-        .collect();
-    assert!(
-        appeared.is_empty(),
-        "a refused start left a forwarder running: {appeared:?}"
+        "a refused start left a forwarder socket behind: {leftover:?}"
     );
     let started = daemon
         .runs

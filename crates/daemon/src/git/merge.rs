@@ -23,6 +23,19 @@ fn s(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
+/// A path in the form the filesystem itself uses, for comparing two paths that
+/// were spelled differently.
+///
+/// `git worktree list` prints forward slashes on Windows and the data root is
+/// built with backslashes; canonicalising both settles that, along with case
+/// and any symlink on the way. Falls back to the path as given when it does not
+/// resolve — a registration whose directory is already gone, say — which is
+/// safe here because the comparison is only ever used to *narrow* what gets
+/// removed.
+fn real(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 fn merged() -> MergeResult {
     MergeResult {
         ok: true,
@@ -67,7 +80,7 @@ pub async fn merge(
     // "already used by worktree" until a human deletes it — permanently, since
     // `worktree prune` only forgets registrations whose directory is *gone*.
     // With the lock held no live merge owns one, so every one of them is stale.
-    reap_scratch_worktrees(&git, &ws.repo_path).await;
+    reap_scratch_worktrees(&git, &ws.repo_path, &d.dirs.root).await;
 
     // Where the base branch gets to move. If the user happens to be sitting on
     // it, that is their checkout and the merge shows up in it. If they are
@@ -151,10 +164,12 @@ pub async fn merge(
 /// that will not go away is a reason to warn, and the `worktree add` that
 /// follows will produce the real error if it still matters.
 ///
-/// Matched by directory name rather than by full path. Registrations are
-/// per-repository, so a `merge-*` worktree registered *here* was created by this
-/// daemon for this repository, whatever data root it was running with.
-async fn reap_scratch_worktrees(git: &Git, repo: &Path) {
+/// A candidate has to be both named `merge-*` **and** sitting directly in
+/// `scratch_root`, the one directory [`crate::workspace::DataDirs::merge_worktree`]
+/// ever puts one in. The name alone is not a claim of ownership: a developer's
+/// own `git worktree add ../merge-upstream` is registered in the same
+/// repository, and reaping it would take their uncommitted work with it.
+async fn reap_scratch_worktrees(git: &Git, repo: &Path, scratch_root: &Path) {
     let listing = match git.run(repo, &["worktree", "list", "--porcelain"]).await {
         Ok(o) => o.stdout,
         Err(e) => {
@@ -162,14 +177,27 @@ async fn reap_scratch_worktrees(git: &Git, repo: &Path) {
             return;
         }
     };
+    let root = real(scratch_root);
     let stale: Vec<PathBuf> = listing
         .lines()
         .filter_map(|l| l.strip_prefix("worktree "))
         .map(|p| PathBuf::from(p.trim()))
         .filter(|p| {
-            p.file_name()
+            let named = p
+                .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("merge-"))
+                .is_some_and(|n| n.starts_with("merge-"));
+            // The name is not enough on its own. A developer's own
+            // `git worktree add ../merge-upstream` in this repository is
+            // registered here too, and force-removing it — along with whatever
+            // uncommitted work is in it — would be this daemon destroying data
+            // it was never asked to touch. Only what this daemon creates, in the
+            // one directory it creates it in, is a candidate.
+            let ours = p.parent().is_some_and(|parent| real(parent) == root);
+            if named && !ours {
+                tracing::debug!(path = %p.display(), "not a scratch worktree of this daemon; left alone");
+            }
+            named && ours
         })
         .collect();
     if stale.is_empty() {

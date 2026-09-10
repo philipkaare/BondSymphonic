@@ -368,6 +368,10 @@ pub fn repo_lock(repo: &Path) -> Arc<tokio::sync::Mutex<()>> {
 /// `workspace.destroy` would delete for good, and a `tracing::warn!` is not a
 /// channel any user reads. `flag` is `"merged"` or `"pushed"`, so the IDE can
 /// say that the work landed even though the call failed.
+///
+/// `data.reason` is `"objects_stranded"`, the same machine-readable tag
+/// `"base_dirty"` and `"conflict"` use, so the IDE branches on one field across
+/// every merge and PR outcome rather than on prose.
 pub fn objects_stranded(what: &str, flag: &str, detail: &str) -> RpcError {
     RpcError::new(
         ErrorCode::Internal,
@@ -377,7 +381,7 @@ pub fn objects_stranded(what: &str, flag: &str, detail: &str) -> RpcError {
              workspace: destroying it would delete objects the branch now points at."
         ),
     )
-    .with_data(serde_json::json!({ flag: true }))
+    .with_data(serde_json::json!({ "reason": "objects_stranded", flag: true }))
 }
 
 pub fn git_error(command: &str, exit_code: Option<i32>, stderr: &str) -> RpcError {

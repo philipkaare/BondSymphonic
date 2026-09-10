@@ -610,6 +610,13 @@ async fn a_merge_whose_objects_cannot_be_copied_out_is_an_error_not_a_warning() 
         Some(true),
         "{err:?}"
     );
+    // The same machine-readable field `base_dirty` and `conflict` use, so the
+    // IDE branches on one thing across every merge outcome.
+    assert_eq!(
+        err.data.as_ref().and_then(|d| d["reason"].as_str()),
+        Some("objects_stranded"),
+        "{err:?}"
+    );
     assert!(
         err.message.contains("Do not destroy this workspace"),
         "{err:?}"
@@ -699,6 +706,62 @@ async fn two_merges_of_one_repository_both_succeed() {
     assert_eq!(
         git_out(&repo, &["rev-list", "main..refs/heads/bs/beta/work"]),
         ""
+    );
+
+    cancel.cancel();
+}
+
+/// The reaper's blast radius. It force-removes worktrees, so what counts as
+/// "one of ours" has to be ownership and not a name: a developer's own
+/// `git worktree add ../merge-upstream` is registered in the same repository,
+/// and reaping it would take their uncommitted work with it.
+#[tokio::test]
+async fn reaping_scratch_worktrees_leaves_the_users_own_merge_named_worktree_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let data = dir.path().join("data");
+    let (port, token, daemon, cancel) = start_daemon(&data).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "alpha").await;
+    commit_in_ws(&daemon, &ws, &[("alpha.txt", "a\n")], "alpha work").await;
+
+    // The user's own worktree, named `merge-*` but nowhere near the daemon's
+    // data root, with work in it that exists only there.
+    let mine = dir.path().join("merge-mine");
+    git_ok(
+        &repo,
+        &["worktree", "add", "-b", "upstream", &mine.to_string_lossy()],
+    );
+    std::fs::write(mine.join("notes.txt"), "hours of work\n").unwrap();
+
+    // And a scratch worktree of the daemon's own, left by an earlier run.
+    let stale = data.join("merge-ws_killed");
+    git_ok(&repo, &["checkout", "-q", "-b", "elsewhere"]);
+    git_ok(
+        &repo,
+        &["worktree", "add", &stale.to_string_lossy(), "main"],
+    );
+
+    let res = merge(&mut c, &ws.id, MergeMode::Merge, None).await.unwrap();
+    assert!(res.ok, "{res:?}");
+
+    // Theirs is untouched, down to the uncommitted file and the registration.
+    assert!(mine.is_dir(), "the user's worktree was removed");
+    assert_eq!(
+        std::fs::read_to_string(mine.join("notes.txt")).unwrap(),
+        "hours of work\n"
+    );
+    let worktrees = git_out(&repo, &["worktree", "list", "--porcelain"]);
+    assert!(
+        worktrees.contains("merge-mine"),
+        "the user's worktree was unregistered: {worktrees}"
+    );
+    // The daemon's own was reaped, and so was the one this merge made.
+    assert!(!stale.exists(), "the stale scratch worktree was not reaped");
+    assert!(!worktrees.contains("merge-ws_killed"), "{worktrees}");
+    assert!(
+        !worktrees.contains(&format!("merge-{}", ws.id)),
+        "{worktrees}"
     );
 
     cancel.cancel();
