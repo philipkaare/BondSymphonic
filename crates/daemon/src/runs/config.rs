@@ -3,7 +3,7 @@
 //!
 //! Detection only ever *reads files*. It never runs `npm`, `cargo metadata` or
 //! anything else, because it is called on a path the user has just typed into
-//! the New Agent dialog â€” a repo nobody has vetted yet, outside any sandbox.
+//! the New Agent dialog — a repo nobody has vetted yet, outside any sandbox.
 //! Guessing a port wrongly is a small annoyance the IDE lets the user correct;
 //! executing a stranger's build script to find one is not.
 
@@ -24,7 +24,7 @@ pub const COMPOSE_DISABLED: &str = "Docker is not available inside the sandbox";
 
 /// A repo's `bondsymphonic.toml`.
 ///
-/// Every section is optional, so a repo can use the file for just one of them â€”
+/// Every section is optional, so a repo can use the file for just one of them —
 /// a `[network] allow` with no runs is a perfectly ordinary configuration.
 /// Unknown keys are accepted rather than rejected: an older daemon must keep
 /// reading a file written for a newer one instead of failing the workspace it
@@ -133,7 +133,7 @@ fn from_entry(e: &RunEntry) -> RunConfig {
 
 /// What a repo looks like it can run, from its marker files alone.
 ///
-/// The heuristics run in the daemon spec's order (Â§10.2) and the result keeps
+/// The heuristics run in the daemon spec's order (§10.2) and the result keeps
 /// that order, because the Run panel preselects the first entry: a `dev` script
 /// is a better first offer than the `docker compose up` that cannot even start.
 pub fn detect(root: &Path) -> Vec<RunConfig> {
@@ -234,8 +234,8 @@ fn node_port(root: &Path, script: &str) -> (u16, bool) {
 /// Whether a script invokes `tool`, as a whole word.
 ///
 /// Splitting on everything that is not part of a package name matches the tool
-/// however it is reached â€” `vite`, `node_modules/.bin/vite`, `cross-env FOO=1
-/// vite` â€” without `next` also matching a script called `next-thing`.
+/// however it is reached — `vite`, `node_modules/.bin/vite`, `cross-env FOO=1
+/// vite` — without `next` also matching a script called `next-thing`.
 fn mentions(script: &str, tool: &str) -> bool {
     script
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
@@ -264,14 +264,14 @@ fn vite_config(root: &Path) -> Option<String> {
 /// This is a regex over the source and not an evaluation of it: the file is
 /// TypeScript, and running it to ask would mean executing the repo. A config
 /// that computes its port from an env var simply has no literal to find, and
-/// the caller falls back to Vite's 5173 with `port_guessed` set â€” which is what
+/// the caller falls back to Vite's 5173 with `port_guessed` set — which is what
 /// that flag is for.
 ///
 /// The character class excludes *both* braces, which confines the match to the
 /// top level of the `server` object. Excluding only `}` would stop the match
 /// leaving the block but not stop it descending into a nested one, so
 /// `server: { hmr: { port: 24678 }, port: 5180 }` would answer with the HMR
-/// port â€” and the caller would then clear `port_guessed`, presenting a wrong
+/// port — and the caller would then clear `port_guessed`, presenting a wrong
 /// port as one read from the project's own config, with no invitation to the
 /// user to correct it. Reading nothing is the better failure: a `server` block
 /// with any nested object in front of its `port` falls back to the guess, in
@@ -368,8 +368,8 @@ fn detect_python(root: &Path, out: &mut Vec<RunConfig>) {
 
 /// The distribution names a `pyproject.toml` depends on, lowercased.
 ///
-/// Both layouts in the wild are read â€” PEP 621's `[project] dependencies` array
-/// of requirement strings and Poetry's `[tool.poetry.dependencies]` table â€” so
+/// Both layouts in the wild are read — PEP 621's `[project] dependencies` array
+/// of requirement strings and Poetry's `[tool.poetry.dependencies]` table — so
 /// a Poetry-managed FastAPI service is not mistaken for a plain library. A
 /// substring search over the file would have been shorter and would also have
 /// matched the word in a comment or in the project's own name.
