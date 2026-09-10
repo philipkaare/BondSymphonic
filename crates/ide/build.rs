@@ -28,6 +28,7 @@ fn main() {
         .file("src/qobjects/diff_document.rs")
         .file("src/qobjects/changes_model.rs")
         .file("src/qobjects/transcript_model.rs")
+        .file("src/qobjects/run_panel.rs")
         // Headers are run through moc, sources are compiled.
         .cpp_files([
             "cpp/GroupBar.h",

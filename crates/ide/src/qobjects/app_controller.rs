@@ -1,3 +1,11 @@
+// Two of the create invokables take seven arguments. A Qt invokable carries no
+// structs, so every field the New Agent dialog collected crosses the boundary
+// one by one; folding them into a JSON blob would only move the same list
+// behind a string C++ has to build and this file has to parse. The allow is
+// file-level because cxx-qt refuses any attribute but `doc` on the bridge
+// module, and the generated declarations trip the lint too.
+#![allow(clippy::too_many_arguments)]
+
 use crate::client::router::EventRouter;
 use crate::client::DaemonClient;
 use crate::launcher::{self, LaunchSpec};
@@ -126,12 +134,15 @@ pub mod qobject {
         #[qsignal]
         fn workspace_changed(self: Pin<&mut AppController>, info_json: QString);
 
-        /// A `create_workspace` call succeeded. `group`, `adapter`, `command`
-        /// and `options_json` are echoed back from the call so the UI can place
-        /// the new tab without tracking the in-flight request itself.
-        /// `options_json` is the agent's `AgentStartOptions` for a Claude
-        /// workspace and empty otherwise; it never carries the API key, which
-        /// the controller merges in when it builds the request.
+        /// A `create_workspace` call succeeded. `group`, `adapter`, `command`,
+        /// `options_json` and `run_config` are echoed back from the call so the
+        /// UI can place the new tab without tracking the in-flight request
+        /// itself. `options_json` is the agent's `AgentStartOptions` for a
+        /// Claude workspace and empty otherwise; it never carries the API key,
+        /// which the controller merges in when it builds the request.
+        /// `run_config` is the run configuration the user picked in the New
+        /// Agent dialog, or empty; the window stores it on the tab so the Run
+        /// panel opens on it.
         #[qsignal]
         fn workspace_created(
             self: Pin<&mut AppController>,
@@ -140,6 +151,7 @@ pub mod qobject {
             adapter: QString,
             command: QString,
             options_json: QString,
+            run_config: QString,
         );
 
         /// A `destroy_workspace` call succeeded, for the workspace with this id.
@@ -166,6 +178,18 @@ pub mod qobject {
         /// An `inspect_repo` call succeeded: a JSON `RepoInfo` for `path`.
         #[qsignal]
         fn repo_inspected(self: Pin<&mut AppController>, path: QString, info_json: QString);
+
+        /// A `detect_run_configs` call succeeded: a JSON array of `RunConfig`
+        /// for `path`. `path` is echoed back because the New Agent dialog can
+        /// have asked about a repository the user has since moved off.
+        #[qsignal]
+        fn run_configs_detected(self: Pin<&mut AppController>, path: QString, json: QString);
+
+        /// The workspace's proxy refused a connection: `host` is not on its
+        /// allowlist. The window routes this to the Run panel, which queues the
+        /// hosts and shows one toast at a time.
+        #[qsignal]
+        fn network_denied(self: Pin<&mut AppController>, workspace_id: QString, host: QString);
 
         /// The daemon dropped `count` events because a consumer fell behind.
         #[qsignal]
@@ -198,6 +222,36 @@ pub mod qobject {
             command: QString,
         );
 
+        /// Create a workspace, remembering the run configuration the user
+        /// picked. Identical to `createWorkspace` otherwise; the name is not
+        /// sent to the daemon, only echoed back in `workspaceCreated` so the
+        /// window can store it on the tab.
+        #[qinvokable]
+        fn create_workspace_with_run(
+            self: Pin<&mut AppController>,
+            repo_path: QString,
+            base_branch: QString,
+            name: QString,
+            group: QString,
+            adapter: QString,
+            command: QString,
+            run_config: QString,
+        );
+
+        /// `createWorkspaceWithAgent` plus the run configuration the user
+        /// picked, echoed back in `workspaceCreated`.
+        #[qinvokable]
+        fn create_workspace_with_agent_and_run(
+            self: Pin<&mut AppController>,
+            repo_path: QString,
+            base_branch: QString,
+            name: QString,
+            group: QString,
+            options_json: QString,
+            initial_prompt: QString,
+            run_config: QString,
+        );
+
         /// Create a workspace and start a Claude agent in it. Answers with
         /// `workspace_created` (adapter "claude"), then `agent_started`, then
         /// sends `initial_prompt` if it is not empty; any step can answer with
@@ -228,6 +282,19 @@ pub mod qobject {
         /// `operation_failed`.
         #[qinvokable]
         fn inspect_repo(self: Pin<&mut AppController>, path: QString);
+
+        /// Ask the daemon which run configurations a repository (or a
+        /// workspace's worktree) offers. Answers with `run_configs_detected`
+        /// or `operation_failed("repo.detect_run_configs", ...)`.
+        #[qinvokable]
+        fn detect_run_configs(self: Pin<&mut AppController>, path: QString);
+
+        /// Replace a workspace's network allowlist. `hosts_json` is a JSON
+        /// array of host patterns. Success is silent -- the daemon answers with
+        /// a `workspace.state` event carrying the new list -- and a failure
+        /// answers with `operation_failed("workspace.set_allowlist", ...)`.
+        #[qinvokable]
+        fn set_allowlist(self: Pin<&mut AppController>, workspace_id: QString, hosts_json: QString);
 
         /// Translates a Windows path to the WSL path the daemon expects, or
         /// returns an empty string if it is not a translatable path.
@@ -414,6 +481,21 @@ pub fn prereqs_blocking(items: &[PrereqStatus]) -> bool {
         .any(|item| !item.ok && BLOCKING_PREREQS.contains(&item.name.as_str()))
 }
 
+/// The workspace and host of a network denial, for an event that is one.
+///
+/// The proxy announces a refused connection as a warn-level `daemon.log`
+/// carrying the host, built by `Event::network_denied`; this recognises it
+/// through the matching proto helper, so neither end parses the message text.
+///
+/// An event with no workspace is the daemon talking about itself: there is no
+/// allowlist to offer to extend, so there is nothing for a toast to do and this
+/// answers `None`.
+pub fn network_denial(ws: &Option<WorkspaceId>, ev: &Event) -> Option<(String, String)> {
+    let host = ev.denied_host()?;
+    let workspace = ws.as_ref()?;
+    Some((workspace.0.clone(), host.to_owned()))
+}
+
 /// The four setup terminals, by the names the UI and the daemon both use.
 /// Anything else is refused here rather than sent on: the enum is the whole
 /// point of `system.setup_pty`, and a typo should fail loudly and locally.
@@ -463,7 +545,7 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
     while let Some((ws, ev)) = events.recv().await {
         // Every consumer sees the event before the controller acts on it, so a
         // terminal's output is never delayed behind UI work.
-        router.dispatch(ws, ev.clone());
+        router.dispatch(ws.clone(), ev.clone());
         // The daemon discarded events for this connection: every terminal has
         // a hole in it and says so. Recognised through the proto helper the
         // daemon builds the notice with, so the wording lives in one place.
@@ -471,6 +553,13 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
             let count = i64::try_from(count).unwrap_or(i64::MAX);
             let _ = qt.queue(move |q| q.output_dropped(count));
             continue;
+        }
+        // A workspace's proxy refused a connection. Recognised through the
+        // proto helper the daemon builds the notice with, like the drop notice
+        // above; the line is still logged by the `daemon.log` arm below.
+        if let Some((workspace, host)) = network_denial(&ws, &ev) {
+            let _ = qt
+                .queue(move |q| q.network_denied(QString::from(&workspace), QString::from(&host)));
         }
         match ev {
             Event::WorkspaceStateChanged { info } => {
@@ -786,6 +875,27 @@ impl qobject::AppController {
         adapter: QString,
         command: QString,
     ) {
+        self.create_workspace_with_run(
+            repo_path,
+            base_branch,
+            name,
+            group,
+            adapter,
+            command,
+            QString::from(""),
+        );
+    }
+
+    pub fn create_workspace_with_run(
+        self: Pin<&mut Self>,
+        repo_path: QString,
+        base_branch: QString,
+        name: QString,
+        group: QString,
+        adapter: QString,
+        command: QString,
+        run_config: QString,
+    ) {
         let qt = self.qt_thread();
         let params = WorkspaceCreateParams {
             repo_path: repo_path.to_string(),
@@ -793,8 +903,12 @@ impl qobject::AppController {
             name: name.to_string(),
         };
         // Echoed straight back on success: the controller keeps no tab state.
-        let (group, adapter, command) =
-            (group.to_string(), adapter.to_string(), command.to_string());
+        let (group, adapter, command, run_config) = (
+            group.to_string(),
+            adapter.to_string(),
+            command.to_string(),
+            run_config.to_string(),
+        );
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(message) => {
@@ -817,6 +931,7 @@ impl qobject::AppController {
                             QString::from(&adapter),
                             QString::from(&command),
                             QString::from(""),
+                            QString::from(&run_config),
                         )
                     });
                 }
@@ -834,6 +949,27 @@ impl qobject::AppController {
         options_json: QString,
         initial_prompt: QString,
     ) {
+        self.create_workspace_with_agent_and_run(
+            repo_path,
+            base_branch,
+            name,
+            group,
+            options_json,
+            initial_prompt,
+            QString::from(""),
+        );
+    }
+
+    pub fn create_workspace_with_agent_and_run(
+        self: Pin<&mut Self>,
+        repo_path: QString,
+        base_branch: QString,
+        name: QString,
+        group: QString,
+        options_json: QString,
+        initial_prompt: QString,
+        run_config: QString,
+    ) {
         let qt = self.qt_thread();
         let params = WorkspaceCreateParams {
             repo_path: repo_path.to_string(),
@@ -847,6 +983,7 @@ impl qobject::AppController {
         // in it: `start_options` merges the key into the request it builds and
         // never into this string.
         let echoed_options = options_json.to_string();
+        let run_config = run_config.to_string();
         let prompt = initial_prompt.to_string();
         let shared = match require_connection() {
             Ok(shared) => shared,
@@ -878,6 +1015,7 @@ impl qobject::AppController {
                     QString::from("claude"),
                     QString::from(""),
                     QString::from(&echoed_options),
+                    QString::from(&run_config),
                 )
             });
             start_agent_and_prompt(shared, qt, info.id, options, prompt).await;
@@ -956,6 +1094,74 @@ impl qobject::AppController {
                     });
                 }
                 Err(e) => report_failure(&qt, "repo.inspect", e.to_string()),
+            }
+        });
+    }
+
+    pub fn detect_run_configs(self: Pin<&mut Self>, path: QString) {
+        let qt = self.qt_thread();
+        let path = path.to_string();
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_failure(&qt, "repo.detect_run_configs", message.to_owned());
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            let params = RepoPathParams { path: path.clone() };
+            match shared
+                .client
+                .request::<DetectRunConfigsResult>(Request::RepoDetectRunConfigs(params))
+                .await
+            {
+                Ok(res) => {
+                    let json = serde_json::to_string(&res.configs).unwrap_or_else(|_| "[]".into());
+                    let _ = qt.queue(move |q| {
+                        q.run_configs_detected(QString::from(&path), QString::from(&json))
+                    });
+                }
+                Err(e) => report_failure(&qt, "repo.detect_run_configs", e.to_string()),
+            }
+        });
+    }
+
+    pub fn set_allowlist(self: Pin<&mut Self>, workspace_id: QString, hosts_json: QString) {
+        let qt = self.qt_thread();
+        let hosts: Vec<String> = match serde_json::from_str(&hosts_json.to_string()) {
+            Ok(hosts) => hosts,
+            Err(e) => {
+                // Refused here rather than sent on: an unparseable list would
+                // otherwise reach the daemon as an empty one and lock the
+                // workspace out of the network entirely.
+                report_failure(
+                    &qt,
+                    "workspace.set_allowlist",
+                    format!("host list is not a JSON array of strings: {e}"),
+                );
+                return;
+            }
+        };
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_failure(&qt, "workspace.set_allowlist", message.to_owned());
+                return;
+            }
+        };
+        let params = WorkspaceSetAllowlistParams {
+            workspace_id: WorkspaceId(workspace_id.to_string()),
+            hosts,
+        };
+        runtime().spawn(async move {
+            // Success is silent: the daemon answers with a `workspace.state`
+            // event carrying the new list, which is what refreshes the UI.
+            if let Err(e) = shared
+                .client
+                .request_raw(Request::WorkspaceSetAllowlist(params))
+                .await
+            {
+                report_failure(&qt, "workspace.set_allowlist", e.to_string());
             }
         });
     }

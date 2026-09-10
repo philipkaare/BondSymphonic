@@ -10,13 +10,14 @@
 use bondsymphonic_ide::highlight::theme::Theme;
 use bondsymphonic_ide::model::app_state::{AgentTab, TabStatus, Workspaces};
 use bondsymphonic_ide::model::file_tree::FileTree;
+use bondsymphonic_ide::qobjects::app_controller::network_denial;
 use bondsymphonic_ide::qobjects::changes_model::touches_workspace;
 use bondsymphonic_ide::qobjects::editor_document::{
     build_buffer, may_install_disk_text, normalise_line_separators, read_only_reason,
     HIGHLIGHT_MAX_BYTES,
 };
 use bondsymphonic_proto::{
-    AgentAdapterKind, Event, FileEntry, FileStatus, PtyId, ReadFileResult, WorkspaceId,
+    AgentAdapterKind, Event, FileEntry, FileStatus, LogLevel, PtyId, ReadFileResult, WorkspaceId,
     WorkspaceInfo, WorkspaceState,
 };
 
@@ -44,8 +45,10 @@ fn tab(info: &WorkspaceInfo) -> AgentTab {
         branch: info.branch.clone(),
         status: TabStatus::from_workspace_state(&info.state),
         detail: String::new(),
+        worktree_path: info.worktree_path.clone(),
         adapter: AgentAdapterKind::Terminal,
         command: None,
+        run_config: None,
         options_json: String::new(),
         agent_id: None,
         agent_status: None,
@@ -707,4 +710,82 @@ fn settings_round_trip_the_api_key_flag_and_permission_mode() {
 
     std::env::remove_var(SETTINGS_PATH_ENV);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Run panel needs two things off the tab the window switched to: which
+/// configuration the user picked when the workspace was created, and where the
+/// worktree is, because `repo.detect_run_configs` takes a path. Both are
+/// defaulted so a `session.json` written before Milestone 5 still loads.
+#[test]
+fn a_tab_carries_its_run_config_and_worktree_path_through_the_session_file() {
+    let mut model = Workspaces::new_default();
+    let one = info("ws_1", "alpha", WorkspaceState::Ready);
+    let mut t = tab(&one);
+    t.run_config = Some("dev".to_owned());
+    model.add_tab(0, t);
+
+    let json = model.to_json();
+    assert!(json.contains("\"run_config\":\"dev\""), "{json}");
+    assert!(json.contains("\"worktree_path\":\"/wt/alpha\""), "{json}");
+
+    let restored = Workspaces::from_json(&json).expect("state_json parses");
+    assert_eq!(restored, model);
+    let restored_tab = restored.active().expect("a tab");
+    assert_eq!(restored_tab.run_config.as_deref(), Some("dev"));
+    assert_eq!(restored_tab.worktree_path, "/wt/alpha");
+
+    // A session file from before either field existed still loads, with the
+    // tab simply having no run configuration and no path yet.
+    let old = r#"{"groups":[{"id":"grp_0","name":"Default","tabs":[
+        {"workspace_id":"ws_9","name":"old","repo_path":"/r","branch":"b",
+         "status":"Idle","detail":"","adapter":"terminal","command":null}]}],
+        "active_group":0,"active_tab":0}"#;
+    let loaded = Workspaces::from_json(old).expect("an old session file still loads");
+    let old_tab = &loaded.groups[0].tabs[0];
+    assert_eq!(old_tab.run_config, None);
+    assert_eq!(old_tab.worktree_path, "");
+}
+
+/// A workspace whose `worktree_path` was empty in a restored session heals as
+/// soon as the daemon says what it is, so the Run panel can detect against it.
+#[test]
+fn applying_workspace_info_fills_in_a_missing_worktree_path() {
+    let mut model = Workspaces::new_default();
+    let one = info("ws_1", "alpha", WorkspaceState::Ready);
+    let mut t = tab(&one);
+    t.worktree_path = String::new();
+    model.add_tab(0, t);
+    assert!(model.apply_workspace_info(&one).is_some());
+    assert_eq!(model.active().unwrap().worktree_path, "/wt/alpha");
+}
+
+/// The denial toast is driven by a `daemon.log` warn the proxy sends. Which
+/// workspace it belongs to comes from the envelope, and the host from the
+/// proto helper, so neither end parses the message text.
+#[test]
+fn a_denial_log_maps_onto_a_workspace_and_a_host() {
+    let denial = Event::network_denied("example.com");
+    assert_eq!(
+        network_denial(&Some(WorkspaceId("ws_1".into())), &denial),
+        Some(("ws_1".to_owned(), "example.com".to_owned()))
+    );
+
+    // No workspace: the daemon talking about itself. There is no allowlist to
+    // offer to extend, so there is no toast.
+    assert_eq!(network_denial(&None, &denial), None);
+
+    // An ordinary warn that happens to carry no host is not a denial.
+    let chatter = Event::DaemonLog {
+        level: LogLevel::Warn,
+        message: "something else went wrong".into(),
+        host: None,
+    };
+    assert_eq!(
+        network_denial(&Some(WorkspaceId("ws_1".into())), &chatter),
+        None
+    );
+    assert_eq!(
+        network_denial(&Some(WorkspaceId("ws_1".into())), &Event::events_dropped(3)),
+        None
+    );
 }

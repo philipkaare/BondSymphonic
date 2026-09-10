@@ -150,6 +150,36 @@ pub mod qobject {
         /// that is still alive in the daemon.
         #[qinvokable]
         fn tab_agent_id(self: &GroupModel, group_idx: i32, tab_idx: i32) -> QString;
+
+        /// Records the run configuration chosen for `workspace_id`, so the Run
+        /// panel opens on it whenever that tab becomes active. The empty name
+        /// clears it. False when the workspace is not tracked.
+        ///
+        /// A separate call rather than another `addTab` parameter: the name is
+        /// picked in the New Agent dialog and echoed back through
+        /// `workspaceCreated`, so it arrives with the tab, but a tab created any
+        /// other way must not have to pass one.
+        #[qinvokable]
+        fn set_tab_run_config(
+            self: Pin<&mut GroupModel>,
+            workspace_id: QString,
+            run_config: QString,
+        ) -> bool;
+
+        /// The run configuration recorded for one tab, or empty when it has
+        /// none.
+        #[qinvokable]
+        fn tab_run_config(self: &GroupModel, group_idx: i32, tab_idx: i32) -> QString;
+
+        /// The worktree path of one tab, or empty for an unknown tab. The Run
+        /// panel detects run configurations against this path.
+        #[qinvokable]
+        fn tab_worktree_path(self: &GroupModel, group_idx: i32, tab_idx: i32) -> QString;
+
+        /// The active tab's worktree path, or empty when there is no tab. What
+        /// `MainWindow` hands to `RunPanelModel::setWorkspace`.
+        #[qinvokable]
+        fn active_worktree_path(self: &GroupModel) -> QString;
     }
 }
 
@@ -317,8 +347,10 @@ impl qobject::GroupModel {
             branch: info.branch.clone(),
             status: TabStatus::from_workspace_state(&info.state),
             detail: state_detail(&info.state),
+            worktree_path: info.worktree_path.clone(),
             adapter: parse_adapter(&adapter.to_string()),
             command: (!command.is_empty()).then_some(command),
+            run_config: None,
             agent_id: None,
             agent_status: None,
             agent_detail: String::new(),
@@ -502,6 +534,48 @@ impl qobject::GroupModel {
             .and_then(|t| t.agent_id.as_ref())
         {
             Some(id) => QString::from(id.as_str()),
+            None => QString::from(""),
+        }
+    }
+
+    pub fn set_tab_run_config(
+        mut self: Pin<&mut Self>,
+        workspace_id: QString,
+        run_config: QString,
+    ) -> bool {
+        let id = WorkspaceId(workspace_id.to_string());
+        let name = run_config.to_string();
+        let Some((g, t)) = self.as_ref().rust().workspaces.find(&id) else {
+            return false;
+        };
+        {
+            let mut rust = self.as_mut().rust_mut();
+            rust.workspaces.groups[g].tabs[t].run_config = (!name.is_empty()).then_some(name);
+        }
+        self.publish();
+        true
+    }
+
+    pub fn tab_run_config(&self, group_idx: i32, tab_idx: i32) -> QString {
+        match self
+            .tab_at(group_idx, tab_idx)
+            .and_then(|t| t.run_config.as_deref())
+        {
+            Some(name) => QString::from(name),
+            None => QString::from(""),
+        }
+    }
+
+    pub fn tab_worktree_path(&self, group_idx: i32, tab_idx: i32) -> QString {
+        match self.tab_at(group_idx, tab_idx) {
+            Some(tab) => QString::from(&tab.worktree_path),
+            None => QString::from(""),
+        }
+    }
+
+    pub fn active_worktree_path(&self) -> QString {
+        match self.rust().workspaces.active() {
+            Some(tab) => QString::from(&tab.worktree_path),
             None => QString::from(""),
         }
     }

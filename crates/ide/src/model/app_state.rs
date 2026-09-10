@@ -146,8 +146,18 @@ pub struct AgentTab {
     pub status: TabStatus,
     /// `Error(detail)` text from the daemon, or empty for any other status.
     pub detail: String,
+    /// The workspace's worktree, from `WorkspaceInfo`. The Run panel detects
+    /// configurations against this path, since `repo.detect_run_configs` takes
+    /// a path rather than a workspace. Defaulted so a session saved before it
+    /// was carried still loads; `apply_workspace_info` fills it in again.
+    #[serde(default)]
+    pub worktree_path: String,
     pub adapter: AgentAdapterKind,
     pub command: Option<String>,
+    /// The run configuration chosen for this workspace, if any, so the Run
+    /// panel opens on it when the tab is selected.
+    #[serde(default)]
+    pub run_config: Option<String>,
     /// The agent running in this tab, once `agent.start` has answered.
     /// Defaulted rather than required so a session saved before agent tabs
     /// existed still loads.
@@ -346,6 +356,10 @@ impl Workspaces {
             };
         }
         tab.branch = info.branch.clone();
+        // Refreshed rather than set once: a tab restored from a session file
+        // written before this field existed has none, and the Run panel cannot
+        // detect anything without it.
+        tab.worktree_path = info.worktree_path.clone();
         Some((g, t))
     }
 
@@ -432,8 +446,10 @@ impl Workspaces {
                     WorkspaceState::Error(detail) => detail.clone(),
                     _ => String::new(),
                 },
+                worktree_path: info.worktree_path.clone(),
                 adapter: AgentAdapterKind::Terminal,
                 command: None,
+                run_config: None,
                 agent_id: None,
                 agent_status: None,
                 agent_detail: String::new(),

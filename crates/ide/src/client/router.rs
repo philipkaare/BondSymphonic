@@ -1,7 +1,7 @@
 //! Fans one daemon event stream out to the consumers that care about it.
 //!
 //! The reader loop in `AppController::start` owns the single [`EventStream`] the
-//! client hands back and calls [`EventRouter::dispatch`] for every event. Two
+//! client hands back and calls [`EventRouter::dispatch`] for every event. Four
 //! kinds of consumer subscribe here:
 //!
 //! * [`EventRouter::subscribe_all`] — every event, in order. Used for
@@ -9,12 +9,14 @@
 //! * [`EventRouter::subscribe_pty`] — only `pty.output`/`pty.exit` for one PTY.
 //! * [`EventRouter::subscribe_agent`] — only `agent.message`/`agent.state` for
 //!   one agent.
+//! * [`EventRouter::subscribe_run`] — only `run.output`/`run.state` for one
+//!   run.
 //!
-//! Both per-id kinds share one table keyed by `StreamKey`, so a PTY and an
-//! agent whose ids collide as strings still get separate streams.
+//! All three per-id kinds share one table keyed by `StreamKey`, so a PTY, an
+//! agent and a run whose ids collide as strings still get separate streams.
 //!
-//! A PTY's first output, and an agent's first messages, usually arrive before
-//! the widget that will display them has finished being constructed and
+//! A PTY's first output, an agent's first messages and a run's banner usually
+//! arrive before the widget that will display them has finished being constructed and
 //! subscribed, so unclaimed per-id events are parked in a short-lived *early
 //! buffer* and replayed on subscription.
 //!
@@ -22,7 +24,7 @@
 //!
 //! [`EventStream`]: crate::client::EventStream
 
-use bondsymphonic_proto::{AgentId, Event, PtyId, WorkspaceId};
+use bondsymphonic_proto::{AgentId, Event, PtyId, RunId, WorkspaceId};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -42,13 +44,14 @@ pub const EARLY_BUFFER_TTL: Duration = Duration::from_secs(5);
 /// anyway.
 pub const EARLY_BUFFER_CAP: usize = 256;
 
-/// What a per-id subscription is for. Two id spaces, one table: the daemon's
+/// What a per-id subscription is for. Three id spaces, one table: the daemon's
 /// prefixes make a collision unlikely, but nothing in the protocol forbids one
 /// and a terminal fed an agent's messages would be a mystery to debug.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum StreamKey {
     Pty(PtyId),
     Agent(AgentId),
+    Run(RunId),
 }
 
 #[derive(Default)]
@@ -117,6 +120,23 @@ impl EventRouter {
     /// a stopped agent's tail is not replayed onto a later transcript.
     pub fn unsubscribe_agent(&self, id: &AgentId) {
         self.unsubscribe_stream(&StreamKey::Agent(id.clone()));
+    }
+
+    /// Only `run.output`/`run.state` for `id`, with the same early-buffer
+    /// replay as [`EventRouter::subscribe_pty`]: a dev server prints its banner
+    /// (often the very line whose `ready_regex` marks it up) between
+    /// `run.start` returning and the Run panel subscribing with the id that
+    /// reply carried. Subscribing twice for the same id replaces the earlier
+    /// subscription.
+    pub fn subscribe_run(&self, id: &RunId) -> EventRx {
+        self.subscribe_stream(StreamKey::Run(id.clone()))
+    }
+
+    /// Ends the subscription for `id` and discards anything parked for it. The
+    /// panel calls this when a run stops, so a finished run's tail cannot be
+    /// replayed into the log of a later run of the same configuration.
+    pub fn unsubscribe_run(&self, id: &RunId) {
+        self.unsubscribe_stream(&StreamKey::Run(id.clone()));
     }
 
     fn subscribe_stream(&self, key: StreamKey) -> EventRx {
@@ -189,6 +209,9 @@ fn stream_key_of(event: &Event) -> Option<StreamKey> {
         }
         Event::AgentMessage { agent_id, .. } | Event::AgentStateChanged { agent_id, .. } => {
             Some(StreamKey::Agent(agent_id.clone()))
+        }
+        Event::RunOutput { run_id, .. } | Event::RunStateChanged { run_id, .. } => {
+            Some(StreamKey::Run(run_id.clone()))
         }
         _ => None,
     }

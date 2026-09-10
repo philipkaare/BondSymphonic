@@ -137,3 +137,85 @@ async fn pty_and_agent_keys_do_not_collide() {
     ));
     assert!(agent.try_recv().is_err());
 }
+
+fn run_out(run: &str, line: &str) -> Event {
+    Event::RunOutput {
+        run_id: run.into(),
+        line: line.into(),
+    }
+}
+
+/// A dev server prints its banner between `run.start` returning and the panel
+/// subscribing with the id that reply carried, so a run's first output is
+/// parked and replayed exactly as a PTY's is.
+#[tokio::test]
+async fn routes_by_run_and_replays_early_output() {
+    let r = EventRouter::new();
+    r.dispatch(Some("ws_1".into()), run_out("run_a", "VITE ready"));
+    r.dispatch(Some("ws_1".into()), run_out("run_b", "other run"));
+    r.dispatch(None, out("pty_a", "not a run"));
+
+    let mut a = r.subscribe_run(&"run_a".into());
+    r.dispatch(
+        Some("ws_1".into()),
+        Event::RunStateChanged {
+            run_id: "run_a".into(),
+            state: RunState::Ready,
+            url: Some("http://localhost:41873".into()),
+            detail: None,
+        },
+    );
+    r.dispatch(Some("ws_1".into()), run_out("run_a", "GET /"));
+
+    let got: Vec<String> = [a.recv().await, a.recv().await, a.recv().await]
+        .into_iter()
+        .flatten()
+        .map(|(_, e)| match e {
+            Event::RunOutput { line, .. } => line,
+            Event::RunStateChanged { state, .. } => format!("{state:?}"),
+            _ => "?".into(),
+        })
+        .collect();
+    assert_eq!(got, vec!["VITE ready", "Ready", "GET /"]);
+    assert!(
+        a.try_recv().is_err(),
+        "another run's output and a PTY's bytes must not reach run_a"
+    );
+}
+
+#[tokio::test]
+async fn unsubscribing_a_run_closes_the_receiver_and_drops_its_buffer() {
+    let r = EventRouter::new();
+    r.dispatch(None, run_out("run_x", "stale"));
+    r.unsubscribe_run(&"run_x".into());
+    let mut x = r.subscribe_run(&"run_x".into());
+    assert!(
+        x.try_recv().is_err(),
+        "unsubscribe discards the early buffer"
+    );
+    r.unsubscribe_run(&"run_x".into());
+    r.dispatch(None, run_out("run_x", "after"));
+    assert!(x.recv().await.is_none(), "channel closed after unsubscribe");
+}
+
+/// Three id spaces, one table. A run, a PTY and an agent that happen to share
+/// an id string are different streams.
+#[tokio::test]
+async fn run_pty_and_agent_keys_do_not_collide() {
+    let r = EventRouter::new();
+    let mut pty = r.subscribe_pty(&"x".into());
+    let mut agent = r.subscribe_agent(&"x".into());
+    let mut run = r.subscribe_run(&"x".into());
+    r.dispatch(None, out("x", "pty bytes"));
+    r.dispatch(None, agent_msg("x", 1, "agent words"));
+    r.dispatch(None, run_out("x", "run line"));
+    assert!(matches!(pty.try_recv(), Ok((_, Event::PtyOutput { .. }))));
+    assert!(pty.try_recv().is_err());
+    assert!(matches!(
+        agent.try_recv(),
+        Ok((_, Event::AgentMessage { .. }))
+    ));
+    assert!(agent.try_recv().is_err());
+    assert!(matches!(run.try_recv(), Ok((_, Event::RunOutput { .. }))));
+    assert!(run.try_recv().is_err());
+}
