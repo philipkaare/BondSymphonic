@@ -15,6 +15,7 @@ fn info(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
         allowlist: vec![],
         state,
         agents: vec![],
+        agent_records: vec![],
         runs: vec![],
     }
 }
@@ -415,6 +416,7 @@ fn agent(id: &str, adapter: AgentAdapterKind) -> AgentSummary {
     AgentSummary {
         id: AgentId(id.to_owned()),
         adapter,
+        state: AgentState::Exited,
         session_id: None,
         command: None,
         model: None,
@@ -429,7 +431,7 @@ fn agent(id: &str, adapter: AgentAdapterKind) -> AgentSummary {
 #[test]
 fn a_tab_built_from_the_daemons_list_adopts_the_workspaces_agent() {
     let mut w = info("ws_1", "alpha", WorkspaceState::Ready);
-    w.agents = vec![AgentSummary {
+    w.agent_records = vec![AgentSummary {
         model: Some("opus".into()),
         permission_mode: Some("acceptEdits".into()),
         session_id: Some("sess-1".into()),
@@ -455,7 +457,7 @@ fn a_tab_built_from_the_daemons_list_adopts_the_workspaces_agent() {
 #[test]
 fn the_latest_agent_is_the_one_the_tab_reattaches_to() {
     let mut w = info("ws_1", "alpha", WorkspaceState::Ready);
-    w.agents = vec![
+    w.agent_records = vec![
         agent("ag_old", AgentAdapterKind::Claude),
         agent("ag_new", AgentAdapterKind::Claude),
     ];
@@ -480,7 +482,7 @@ fn a_workspace_with_no_agents_is_still_a_terminal_tab() {
 #[test]
 fn an_agent_started_with_no_options_leaves_the_options_empty() {
     let mut w = info("ws_1", "alpha", WorkspaceState::Ready);
-    w.agents = vec![agent("ag_1", AgentAdapterKind::Claude)];
+    w.agent_records = vec![agent("ag_1", AgentAdapterKind::Claude)];
     let tab = AgentTab::from_workspace_info(&w);
     assert_eq!(tab.agent_id, Some(AgentId("ag_1".into())));
     assert_eq!(tab.options_json, "");
@@ -492,7 +494,7 @@ fn an_agent_started_with_no_options_leaves_the_options_empty() {
 #[test]
 fn a_restored_session_brings_back_the_claude_tab_with_its_agent() {
     let mut w = info("ws_1", "alpha", WorkspaceState::Ready);
-    w.agents = vec![agent("ag_1", AgentAdapterKind::Claude)];
+    w.agent_records = vec![agent("ag_1", AgentAdapterKind::Claude)];
     let persisted = vec![PersistedGroup {
         name: "Backend".to_owned(),
         workspace_ids: vec!["ws_1".to_owned()],

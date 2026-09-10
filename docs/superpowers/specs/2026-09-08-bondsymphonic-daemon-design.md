@@ -96,18 +96,27 @@ struct Workspace {
     created_at: DateTime,
     allowlist: Vec<HostPattern>,
     state: WorkspaceState,     // Creating | Ready | SandboxDown | Error(String) | Destroying
-    agents: Vec<AgentSummary>, // oldest first, ended agents included
+    agents: Vec<AgentId>,             // oldest first, ended agents included
+    agent_records: Vec<AgentSummary>, // the same agents, in the same order
     runs: Vec<RunId>,
 }
 ```
 
-`AgentSummary` is `{id, adapter, session_id, command, model, permission_mode}`:
-the id alone does not let a client that restarted rebuild the tab, since it
-cannot tell a Claude agent whose transcript is still being served from a plain
-terminal. The three option fields are the non-secret half of what the agent was
-started with, so a client can offer "start another one like this"; there is
-deliberately no field the user's API key could travel in, which is what stops a
-call site leaking it by forgetting to clear it.
+`AgentSummary` is `{id, adapter, state, session_id, command, model,
+permission_mode}`: the id alone does not let a client that restarted rebuild the
+tab, since it cannot tell a Claude agent whose transcript is still being served
+from a plain terminal. The three option fields are the non-secret half of what
+the agent was started with, so a client can offer "start another one like this";
+there is deliberately no field the user's API key could travel in, which is what
+stops a call site leaking it by forgetting to clear it. An unset option is left
+out of the wire form rather than written as `null`.
+
+The two lists are the same agents in the same order, and they are two lists
+rather than one changed list so that a daemon and a client of different vintages
+still understand each other. An older client reads `agents` off a newer daemon
+exactly as it always did and ignores the key beside it; a newer client reading an
+older daemon finds `agent_records` defaulted to empty, which it must read as
+"nothing is known about these agents" rather than as "there are none".
 
 **Create** (`workspace.create`):
 1. Validate repo (`git rev-parse --git-common-dir`), base branch exists.

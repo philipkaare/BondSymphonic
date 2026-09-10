@@ -1068,15 +1068,11 @@ async fn a_claude_agent_streams_a_turn_from_inside_the_sandbox() {
     assert_eq!(states.first(), Some(&AgentState::Working), "{states:?}");
     assert_eq!(states.last(), Some(&AgentState::Idle), "{states:?}");
 
-    let summaries = daemon.agents.summaries_of(&ws.id);
-    assert_eq!(
-        summaries.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
-        vec![ag]
-    );
+    assert_eq!(daemon.agents.agents_of(&ws.id), vec![ag]);
     // `destroy` stops the agent before the sandbox goes; the worktree carries
     // the copied fake, so it needs the forced path.
     lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
-    assert!(daemon.agents.summaries_of(&ws.id).is_empty());
+    assert!(daemon.agents.agents_of(&ws.id).is_empty());
     std::env::remove_var("BS_CLAUDE_BIN");
 }
 

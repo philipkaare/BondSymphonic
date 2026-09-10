@@ -252,9 +252,9 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
     (addr, journal)
 }
 
-/// The workspace the daemon has, with the agent it ran in it. `agents` is the
-/// whole point: the adapter is what rebuilds the pane, and the id is what the
-/// pane attaches to.
+/// The workspace the daemon has, with the agent it ran in it. `agent_records`
+/// is the whole point: the adapter is what rebuilds the pane, and the id is what
+/// the pane attaches to.
 fn workspace() -> WorkspaceInfo {
     WorkspaceInfo {
         id: WorkspaceId(WS_ID.to_owned()),
@@ -266,9 +266,13 @@ fn workspace() -> WorkspaceInfo {
         created_at: "2026-09-10T10:00:00Z".to_owned(),
         allowlist: Vec::new(),
         state: WorkspaceState::Ready,
-        agents: vec![AgentSummary {
+        // Both lists, the way the daemon sends them: the bare ids an older
+        // client would read, and the records this one rebuilds the tab from.
+        agents: vec![AgentId(AGENT_ID.to_owned())],
+        agent_records: vec![AgentSummary {
             id: AgentId(AGENT_ID.to_owned()),
             adapter: AgentAdapterKind::Claude,
+            state: AgentState::Exited,
             session_id: Some(SESSION_ID.to_owned()),
             command: None,
             model: Some(MODEL.to_owned()),

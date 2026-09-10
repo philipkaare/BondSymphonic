@@ -352,7 +352,9 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                         let info = workspace(&ws_id, &p.name);
                         follow_ups.push(ServerMessage::event(
                             Some(WorkspaceId(ws_id.clone())),
-                            Event::WorkspaceStateChanged { info: info.clone() },
+                            Event::WorkspaceStateChanged {
+                                info: Box::new(info.clone()),
+                            },
                         ));
                         ServerMessage::ok(id, &info)
                     }
@@ -472,6 +474,7 @@ fn workspace(id: &str, name: &str) -> WorkspaceInfo {
         allowlist: Vec::new(),
         state: WorkspaceState::Ready,
         agents: Vec::new(),
+        agent_records: Vec::new(),
         runs: Vec::new(),
     }
 }

@@ -302,8 +302,8 @@ impl AgentTab {
     /// [`Workspaces::from_persisted`] rebuilds a restored group from.
     ///
     /// Nothing local is invented -- no command, no run configuration -- but the
-    /// agent is not local: `WorkspaceInfo.agents` is the daemon's own list, and
-    /// the tab adopts the last of them. That is what makes an agent survive an
+    /// agent is not local: `WorkspaceInfo.agent_records` is the daemon's own
+    /// list, and the tab adopts the last of them. That is what makes an agent survive an
     /// *IDE* restart as well as a daemon one. Without it every Claude workspace
     /// came back as a terminal tab bound to no agent, and the transcript the
     /// daemon was still serving had no pane in the UI that could reach it.
@@ -314,7 +314,10 @@ impl AgentTab {
     /// the one worth coming back to -- its transcript replays and its Restart
     /// resumes the session.
     pub fn from_workspace_info(info: &WorkspaceInfo) -> AgentTab {
-        let agent = info.agents.last();
+        // `agent_records` rather than `agents`: the bare ids beside it say
+        // nothing about the adapter, and a daemon too old to send the records
+        // leaves them empty, which is the terminal tab this built before.
+        let agent = info.agent_records.last();
         AgentTab {
             workspace_id: info.id.clone(),
             name: info.name.clone(),

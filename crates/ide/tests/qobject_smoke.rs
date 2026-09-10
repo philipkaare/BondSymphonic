@@ -17,8 +17,8 @@ use bondsymphonic_ide::qobjects::editor_document::{
     HIGHLIGHT_MAX_BYTES,
 };
 use bondsymphonic_proto::{
-    AgentAdapterKind, AgentId, AgentSummary, Event, FileEntry, FileStatus, LogLevel, PtyId,
-    ReadFileResult, WorkspaceId, WorkspaceInfo, WorkspaceState,
+    AgentAdapterKind, AgentId, AgentState, AgentSummary, Event, FileEntry, FileStatus, LogLevel,
+    PtyId, ReadFileResult, WorkspaceId, WorkspaceInfo, WorkspaceState,
 };
 
 fn info(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
@@ -33,6 +33,7 @@ fn info(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
         allowlist: Vec::new(),
         state,
         agents: Vec::new(),
+        agent_records: Vec::new(),
         runs: Vec::new(),
     }
 }
@@ -212,9 +213,10 @@ fn active_tab_json_round_trips() {
 #[test]
 fn a_restored_agent_tab_crosses_the_boundary_with_its_adapter_and_agent() {
     let mut listed = info("ws_1", "alpha", WorkspaceState::Ready);
-    listed.agents = vec![AgentSummary {
+    listed.agent_records = vec![AgentSummary {
         id: AgentId("ag_1".to_owned()),
         adapter: AgentAdapterKind::Claude,
+        state: AgentState::Exited,
         session_id: Some("sess-1".to_owned()),
         command: None,
         model: Some("claude-opus-5".to_owned()),

@@ -147,7 +147,9 @@ impl Daemon {
     /// through this.
     pub fn workspace_info(&self, ws: &Workspace) -> WorkspaceInfo {
         let mut info = ws.info();
-        info.agents = self.agents.summaries_of(&ws.id);
+        info.agent_records = self.agents.records_of(&ws.id);
+        // The same agents by id, for a client older than the records field.
+        info.agents = info.agent_records.iter().map(|a| a.id.clone()).collect();
         info.runs = self.runs.runs_of(&ws.id);
         info
     }
@@ -156,7 +158,7 @@ impl Daemon {
         self.events.publish(
             Some(ws.id.clone()),
             Event::WorkspaceStateChanged {
-                info: self.workspace_info(ws),
+                info: Box::new(self.workspace_info(ws)),
             },
         );
     }

@@ -40,6 +40,7 @@ fn info(id: &str, name: &str) -> WorkspaceInfo {
         allowlist: Vec::new(),
         state: WorkspaceState::Ready,
         agents: Vec::new(),
+        agent_records: Vec::new(),
         runs: Vec::new(),
     }
 }

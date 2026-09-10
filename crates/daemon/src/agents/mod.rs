@@ -343,7 +343,7 @@ impl StartedWith {
 
 struct Agent {
     entry: Arc<AgentEntry>,
-    /// Insertion order, so `summaries_of` reports agents in the order they were
+    /// Insertion order, so `records_of` reports agents in the order they were
     /// started rather than in whatever order the map happens to hold them.
     /// Restored agents are numbered first, in the order they were started, so a
     /// restart does not reshuffle a workspace's tabs.
@@ -389,7 +389,7 @@ const ENDED_BEFORE_RESTART: &str = "the agent ended before the daemon restarted"
 /// Every agent the daemon is running, and the requests that reach them.
 ///
 /// The manager owns the list, not the workspace registry: an agent is a live
-/// process, and the registry is a file that survives restarts. `summaries_of` is
+/// process, and the registry is a file that survives restarts. `records_of` is
 /// what puts them back into [`WorkspaceInfo`].
 pub struct AgentManager {
     events: EventBus,
@@ -673,16 +673,19 @@ impl AgentManager {
         })
     }
 
-    /// The agents belonging to `ws`, oldest first.
+    /// The agents belonging to `ws`, oldest first, with everything a client
+    /// needs to rebuild a tab for one.
     ///
-    /// Each carries its adapter and the non-secret half of the options it was
-    /// started with, because the id alone does not let a client that restarted
-    /// rebuild the tab: it cannot tell a Claude agent, whose transcript this
-    /// daemon is still serving and whose session is still resumable, from a
-    /// plain terminal. Oldest first, and restored agents were given their
-    /// ordinals before any new one could take theirs, so the last entry is the
-    /// workspace's most recent agent whether or not this daemon started it.
-    pub fn summaries_of(&self, ws: &WorkspaceId) -> Vec<AgentSummary> {
+    /// The id alone does not let a client that restarted do that: it cannot
+    /// tell a Claude agent, whose transcript this daemon is still serving and
+    /// whose session is still resumable, from a plain terminal. So each entry
+    /// carries the adapter, the current state, the session id and the
+    /// non-secret half of the options the agent was started with.
+    ///
+    /// Oldest first, and restored agents were given their ordinals before any
+    /// new one could take theirs, so the last entry is the workspace's most
+    /// recent agent whether or not this daemon started it.
+    pub fn records_of(&self, ws: &WorkspaceId) -> Vec<AgentSummary> {
         let mut found: Vec<(u64, AgentSummary)> = self
             .agents
             .lock()
@@ -694,6 +697,7 @@ impl AgentManager {
                     AgentSummary {
                         id: id.clone(),
                         adapter: a.entry.adapter,
+                        state: a.entry.state().0,
                         session_id: a.entry.session_id.lock().clone(),
                         command: a.started_with.command.clone(),
                         model: a.started_with.model.clone(),
@@ -704,6 +708,13 @@ impl AgentManager {
             .collect();
         found.sort_by_key(|(ordinal, _)| *ordinal);
         found.into_iter().map(|(_, summary)| summary).collect()
+    }
+
+    /// The same agents as [`records_of`](AgentManager::records_of), by id alone
+    /// and in the same order. `WorkspaceInfo` carries both, so a client older
+    /// than the records field still reads the list it has always read.
+    pub fn agents_of(&self, ws: &WorkspaceId) -> Vec<AgentId> {
+        self.records_of(ws).into_iter().map(|a| a.id).collect()
     }
 
     /// Stops and forgets every agent in `ws`. Called before a workspace's

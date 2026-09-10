@@ -13,7 +13,13 @@ pub enum Event {
         host: Option<String>,
     },
     #[serde(rename = "workspace.state")]
-    WorkspaceStateChanged { info: WorkspaceInfo },
+    /// Boxed because `WorkspaceInfo` is much the largest payload in the
+    /// protocol -- seven strings and three lists -- and every `ServerMessage`,
+    /// including the ordinary responses, would otherwise be sized for it.
+    /// A state change is also the rarest of these events; the common ones
+    /// (`pty.output`, `agent.message`) stay small and pay nothing. `Box`
+    /// serialises as the value it holds, so the wire form is unchanged.
+    WorkspaceStateChanged { info: Box<WorkspaceInfo> },
     #[serde(rename = "agent.state")]
     AgentStateChanged {
         agent_id: AgentId,
@@ -129,7 +135,7 @@ impl Event {
                 host: None,
             },
             WorkspaceStateChanged {
-                info: WorkspaceInfo {
+                info: Box::new(WorkspaceInfo {
                     id: "ws_1".into(),
                     name: "a".into(),
                     repo_path: "/r".into(),
@@ -140,8 +146,9 @@ impl Event {
                     allowlist: vec![],
                     state: WorkspaceState::Error("x".into()),
                     agents: vec![],
+                    agent_records: vec![],
                     runs: vec![],
-                },
+                }),
             },
             AgentStateChanged {
                 agent_id: "ag_1".into(),

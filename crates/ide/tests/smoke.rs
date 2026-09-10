@@ -633,6 +633,7 @@ fn workspace(id: &str, name: &str, state: WorkspaceState, allowlist: &[String]) 
         allowlist: allowlist.to_vec(),
         state,
         agents: Vec::new(),
+        agent_records: Vec::new(),
         runs: Vec::new(),
     }
 }
@@ -878,7 +879,9 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journals) {
                         for info in [creating.clone(), ready] {
                             follow_ups.push(ServerMessage::event(
                                 Some(WorkspaceId(ws_id.clone())),
-                                Event::WorkspaceStateChanged { info },
+                                Event::WorkspaceStateChanged {
+                                    info: Box::new(info),
+                                },
                             ));
                         }
                         Some(ServerMessage::ok(id, &creating))
@@ -1129,7 +1132,9 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journals) {
                             let info = workspace(&ws, name, WorkspaceState::Ready, &p.hosts);
                             follow_ups.push(ServerMessage::event(
                                 Some(p.workspace_id.clone()),
-                                Event::WorkspaceStateChanged { info },
+                                Event::WorkspaceStateChanged {
+                                    info: Box::new(info),
+                                },
                             ));
                         }
                         Some(ServerMessage::ok(id, &Empty {}))

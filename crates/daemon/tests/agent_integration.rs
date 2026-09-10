@@ -242,11 +242,13 @@ async fn claude_agent_streams_a_turn_and_records_history() {
         .await
         .unwrap();
     let info: WorkspaceInfo = serde_json::from_value(v).unwrap();
-    assert_eq!(info.agents.len(), 1);
-    assert_eq!(info.agents[0].id, ag);
-    // The adapter travels with the id: it is what lets a client that restarted
-    // rebuild this as a Claude tab rather than as a terminal.
-    assert_eq!(info.agents[0].adapter, AgentAdapterKind::Claude);
+    // The list an older client reads is unchanged: bare ids.
+    assert_eq!(info.agents, vec![ag.clone()]);
+    // And beside it, the record that lets a client which restarted rebuild this
+    // as a Claude tab rather than as a terminal.
+    assert_eq!(info.agent_records.len(), 1);
+    assert_eq!(info.agent_records[0].id, ag);
+    assert_eq!(info.agent_records[0].adapter, AgentAdapterKind::Claude);
 
     c.call(Request::AgentStop(AgentIdParams {
         agent_id: ag.clone(),

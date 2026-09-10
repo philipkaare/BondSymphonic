@@ -36,11 +36,13 @@ impl Workspace {
             created_at: self.created_at.clone(),
             allowlist: self.allowlist.clone(),
             state: self.state.clone(),
-            // Left empty here and filled in by `Daemon::workspace_info`, which
-            // is the only path a `WorkspaceInfo` reaches a client by: the
-            // registry is a file and knows nothing about adapters, sessions or
-            // which of a workspace's agents are still running.
+            // Both agent lists are left empty here and filled in by
+            // `Daemon::workspace_info`, which is the only path a
+            // `WorkspaceInfo` reaches a client by: the registry is a file and
+            // knows nothing about adapters, sessions or which of a workspace's
+            // agents are still running.
             agents: Vec::new(),
+            agent_records: Vec::new(),
             runs: self.runs.clone(),
         }
     }

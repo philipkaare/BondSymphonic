@@ -65,36 +65,47 @@ pub enum WorkspaceState {
     Destroying,
 }
 
-/// One agent a workspace has, as clients see it in [`WorkspaceInfo::agents`].
+/// One agent a workspace has, as clients see it in
+/// [`WorkspaceInfo::agent_records`].
 ///
 /// The id alone was not enough to bring a tab back: a client that restarts sees
 /// the workspace and its agents in `workspace.list`, and without the adapter it
 /// cannot tell a Claude agent -- whose transcript the daemon is still serving,
-/// and whose session is still resumable -- from a plain terminal. `adapter`,
-/// `model` and `permission_mode` are what rebuild the pane; `session_id` is what
-/// a resume needs, and is repeated here rather than only in the transcript so a
-/// client can tell a resumable agent from one that never got a session.
+/// and whose session is still resumable -- from a plain terminal. `adapter` and
+/// the two option fields are what rebuild the pane, `state` says whether the
+/// agent is still running, and `session_id` is what a resume needs -- repeated
+/// here rather than left only in the transcript so a client can tell a
+/// resumable agent from one that never got a session.
 ///
-/// There is deliberately no field an API key could travel in. The daemon holds
-/// the options an agent was started with, and those carry the user's key; this
-/// is the subset that is safe to hand back, so the key cannot reach a client
-/// through a call site that forgot to clear it. A client that wants to start
-/// another agent like this one fills the key in itself, which is what
-/// `agent.start` has always expected.
+/// There is deliberately no field an API key could travel in. `options` on the
+/// daemon's own `AgentRecord` is a full [`AgentStartOptions`], which carries
+/// the user's key; the three fields below are that struct with `api_key`
+/// stripped and `resume_session` left out, expressed as separate fields so
+/// there is no key-shaped hole for a future call site to forget to clear. A
+/// client starting another agent like this one supplies the key itself, which
+/// is what `agent.start` has always expected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSummary {
     pub id: AgentId,
     pub adapter: AgentAdapterKind,
+    /// What the agent is doing now. A restored agent is `Exited`, which is what
+    /// puts its pane on Restart rather than on a prompt box.
+    pub state: AgentState,
     /// The last session the agent reported, or `None` for one that never
     /// reported a session. What `resume_session` takes.
-    #[serde(default)]
+    ///
+    /// This and the three below are left out of the wire form when they are
+    /// unset rather than written as `null`: a record for an agent started with
+    /// nothing is `{id, adapter, state}`, and a client cannot mistake "the
+    /// daemon chose the default" for "the user asked for null".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     /// The command a terminal agent was started with, if it was given one.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
 }
 
@@ -110,9 +121,22 @@ pub struct WorkspaceInfo {
     pub allowlist: Vec<String>,
     #[serde(flatten)]
     pub state: WorkspaceState,
-    /// The workspace's agents, oldest first, running and ended alike. The last
-    /// is the one a client restoring this workspace's tab reattaches to.
-    pub agents: Vec<AgentSummary>,
+    /// The workspace's agents by id, oldest first, running and ended alike.
+    ///
+    /// Kept as bare ids beside [`WorkspaceInfo::agent_records`], which holds the
+    /// same agents in the same order with everything else about them. Two lists
+    /// rather than one changed list, so a daemon and a client of different
+    /// vintages still understand each other: an older client reads `agents` off
+    /// a newer daemon exactly as before, and a newer client reading an older
+    /// daemon finds `agent_records` defaulted to empty instead of failing to
+    /// parse the reply at all.
+    pub agents: Vec<AgentId>,
+    /// The same agents, with the adapter, state, session and start options a
+    /// client needs to rebuild a tab for one. Empty from a daemon too old to
+    /// send it, which a client must read as "nothing is known about them"
+    /// rather than as "there are none" -- `agents` is the list.
+    #[serde(default)]
+    pub agent_records: Vec<AgentSummary>,
     pub runs: Vec<RunId>,
 }
 

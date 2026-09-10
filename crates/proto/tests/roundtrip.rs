@@ -379,3 +379,80 @@ fn run_start_defaults_its_port_override_to_none() {
     let back: Request = serde_json::from_value(v).unwrap();
     assert_eq!(back, overridden);
 }
+
+/// `agent_records` was added after the first daemons shipped, and both
+/// directions of the version skew have to keep working.
+///
+/// Forward: a client built against this crate reads an older daemon's
+/// `WorkspaceInfo`, which has `agents` and no `agent_records`. The reply must
+/// parse, with the records empty — which a client reads as "nothing is known
+/// about these agents", not as "there are none".
+///
+/// Backward: an older client reads a newer daemon's answer. `agents` is still
+/// the same array of ids it always was, so the field it looks at is unchanged,
+/// and the extra key beside it is ignored the way serde ignores any unknown
+/// field. That is why this is a second list rather than a changed one.
+#[test]
+fn workspace_info_carries_agent_records_beside_the_plain_ids() {
+    let old = r#"{
+        "id":"ws_1","name":"alpha","repo_path":"/r","base_branch":"main",
+        "branch":"bs/alpha/work","worktree_path":"/wt","created_at":"t",
+        "allowlist":[],"state":"ready","agents":["ag_1"],"runs":[]
+    }"#;
+    let info: WorkspaceInfo = serde_json::from_str(old).expect("an older daemon's reply parses");
+    assert_eq!(info.agents, vec![AgentId("ag_1".into())]);
+    assert!(
+        info.agent_records.is_empty(),
+        "a daemon that does not send them leaves them empty"
+    );
+
+    let full = WorkspaceInfo {
+        agents: vec![AgentId("ag_1".into())],
+        agent_records: vec![AgentSummary {
+            id: AgentId("ag_1".into()),
+            adapter: AgentAdapterKind::Claude,
+            state: AgentState::Exited,
+            session_id: Some("sess-1".into()),
+            command: None,
+            model: Some("claude-opus-5".into()),
+            permission_mode: Some("acceptEdits".into()),
+        }],
+        ..info
+    };
+    let v = serde_json::to_value(&full).unwrap();
+    // What an older client reads is untouched: the same key, the same array of
+    // bare id strings.
+    assert_eq!(v["agents"], serde_json::json!(["ag_1"]));
+    assert_eq!(v["agent_records"][0]["adapter"], "claude");
+    assert_eq!(v["agent_records"][0]["state"], "exited");
+    assert_eq!(v["agent_records"][0]["session_id"], "sess-1");
+    // The one field that must never appear, however the daemon built the record.
+    assert!(
+        v["agent_records"][0].get("api_key").is_none(),
+        "the API key has no field to travel in: {v}"
+    );
+    let back: WorkspaceInfo = serde_json::from_value(v).unwrap();
+    assert_eq!(back, full);
+
+    // An unset option is left out rather than written as null, so a record for
+    // an agent started with nothing is `{id, adapter, state}`.
+    let bare = WorkspaceInfo {
+        agent_records: vec![AgentSummary {
+            id: AgentId("ag_1".into()),
+            adapter: AgentAdapterKind::Terminal,
+            state: AgentState::Idle,
+            session_id: None,
+            command: None,
+            model: None,
+            permission_mode: None,
+        }],
+        ..full
+    };
+    let v = serde_json::to_value(&bare).unwrap();
+    let record = v["agent_records"][0].as_object().unwrap();
+    let mut keys: Vec<&str> = record.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["adapter", "id", "state"], "{v}");
+    let back: WorkspaceInfo = serde_json::from_value(v).unwrap();
+    assert_eq!(back, bare);
+}
