@@ -7,11 +7,13 @@ use crate::git::{
     worktree::{self, Layout},
 };
 use crate::ids::new_id;
-use crate::sandbox::SandboxSpec;
+use crate::net::allowlist::{Allowlist, HostPattern};
+use crate::sandbox::{SandboxCommand, SandboxHandle, SandboxSpec};
 use crate::workspace::{now_rfc3339, Workspace};
 use bondsymphonic_proto::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::io::AsyncBufReadExt;
 
 /// The account whose `/home/<user>` the bwrap backend mounts the sandbox home at.
 ///
@@ -39,6 +41,63 @@ pub async fn layout_for(d: &Daemon, ws: &Workspace) -> Result<Layout, RpcError> 
 /// this module does not have to be conditional on the target OS.
 const BWRAP_BACKEND: &str = "linux_bwrap";
 
+/// The workspace's proxy socket, in the host's run directory. The sandbox has
+/// that directory bound at `/run/bs`, so the same file is
+/// [`PROXY_SOCKET_IN_SANDBOX`] from inside.
+pub const PROXY_SOCKET_FILE: &str = "proxy.sock";
+
+/// Where the proxy socket appears inside the sandbox.
+pub const PROXY_SOCKET_IN_SANDBOX: &str = "/run/bs/proxy.sock";
+
+/// Where the shim listens inside the sandbox, and therefore what the proxy
+/// environment points at. Loopback only: it is the sandbox's own network
+/// namespace, so nothing outside it can reach this port whatever the number.
+pub const PROXY_LISTEN: &str = "127.0.0.1:3128";
+
+/// Hosts the sandbox reaches directly rather than through the proxy. Loopback
+/// is where the port bridge puts a workspace's own services, and sending those
+/// through the daemon would be both pointless and wrong: the proxy resolves
+/// names and connects on the *host*.
+pub const PROXY_BYPASS: &str = "localhost,127.0.0.1";
+
+/// The daemon binary as the sandbox sees it.
+///
+/// Duplicated from `sandbox::linux_bwrap`, where it is private and behind
+/// `cfg(target_os = "linux")`, the same way [`sandbox_user`] duplicates
+/// `whoami`. It holds because the daemon is installed under the user's home
+/// (`~/.bondsymphonic/bin`) and built under it in development, and bwrap
+/// replaces `/home` with a tmpfs, so the binary is always bound in at this
+/// path rather than reachable at its own.
+const INIT_EXE_IN_SANDBOX: &str = "/tmp/.bs-init";
+
+/// How long the shim gets to bind its port before the workspace comes up
+/// anyway. Exceeded, the workspace is still usable — it simply has no route out
+/// until it is restarted — which beats refusing to open it at all.
+const SHIM_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The proxy variables every process in a bwrap sandbox inherits.
+///
+/// Both spellings of each name: curl reads `http_proxy` in lower case only,
+/// while most other tools read the upper-case form, and a workspace where curl
+/// silently had no network would be a mystery to debug.
+fn proxy_env() -> Vec<(String, String)> {
+    let url = format!("http://{PROXY_LISTEN}");
+    let mut env: Vec<(String, String)> = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .iter()
+    .map(|k| ((*k).to_string(), url.clone()))
+    .collect();
+    env.push(("NO_PROXY".into(), PROXY_BYPASS.into()));
+    env.push(("no_proxy".into(), PROXY_BYPASS.into()));
+    env
+}
+
 pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
     let same = |p: &Path| (p.to_path_buf(), p.to_path_buf());
     let mut rw_binds = vec![same(&ws.worktree_path), same(&layout.objects_dir)];
@@ -62,6 +121,13 @@ pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
     let late_ro_binds = vec![same(&layout.config_worktree())];
     let mut env = layout.sandbox_git_env();
     env.push(("BS_WORKSPACE".into(), ws.id.to_string()));
+    // Only where the sandbox actually has a network namespace of its own. The
+    // no-sandbox backend runs processes as plain children of the daemon, which
+    // already have the host's network; pointing those at a proxy that exists to
+    // make up for the loss of one would take away what they have.
+    if d.backend.name() == BWRAP_BACKEND {
+        env.extend(proxy_env());
+    }
     SandboxSpec {
         id: ws.id.clone(),
         rw_binds,
@@ -90,10 +156,134 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
     // lost: git only writes this file for features (sparse-checkout) the
     // read-only bind rules out inside the sandbox anyway.
     std::fs::write(layout.config_worktree(), b"").map_err(|e| RpcError::io(&e))?;
-    let handle = d.backend.start(&spec_for(d, ws, &layout)).await?;
+    // Before the sandbox, not after: the shim inside it connects to this socket
+    // as its first act, and a sandbox that came up first would race it.
+    d.proxies
+        .start(
+            &ws.id,
+            &d.dirs.run(&ws.id).join(PROXY_SOCKET_FILE),
+            Allowlist::from_strings(&ws.allowlist),
+            d.events.clone(),
+        )
+        .await?;
+    let handle = match d.backend.start(&spec_for(d, ws, &layout)).await {
+        Ok(h) => h,
+        // Nothing will ever connect to that listener now.
+        Err(e) => {
+            d.proxies.stop(&ws.id);
+            return Err(e);
+        }
+    };
     d.sandboxes.lock().insert(ws.id.clone(), handle.clone());
-    watch_sandbox(d, &ws.id, handle);
+    watch_sandbox(d, &ws.id, handle.clone());
+    if d.backend.name() == BWRAP_BACKEND {
+        start_shim(d, ws, &handle).await;
+    }
     Ok(())
+}
+
+/// Starts the in-sandbox half of the proxy and waits for it to be listening.
+///
+/// A failure here is logged rather than returned: the workspace still works,
+/// with no route out of the sandbox, and that is a far better outcome than
+/// refusing to open it. The child is owned by the task this spawns, so its
+/// `killer` — and with it the daemon's hold on the shim — lives exactly as long
+/// as the process does; init takes the shim down with the sandbox in any case,
+/// since it is one of its children like any other.
+async fn start_shim(d: &Arc<Daemon>, ws: &Workspace, handle: &Arc<dyn SandboxHandle>) {
+    let argv = [
+        INIT_EXE_IN_SANDBOX,
+        "proxy-shim",
+        "--socket",
+        PROXY_SOCKET_IN_SANDBOX,
+        "--listen",
+        PROXY_LISTEN,
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    let mut child = match handle
+        .spawn(SandboxCommand {
+            argv,
+            env: vec![],
+            cwd: None,
+            pty: None,
+        })
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(ws = %ws.id, "proxy shim did not start: {e}; this workspace has no network");
+            return;
+        }
+    };
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        tracing::warn!(ws = %ws.id, "proxy shim started without pipes; this workspace has no network");
+        return;
+    };
+    let mut out = tokio::io::BufReader::new(stdout).lines();
+    let mut err = tokio::io::BufReader::new(stderr).lines();
+    // The shim announces its bind, so the first request out of the sandbox
+    // cannot arrive before the port exists.
+    let ready = tokio::time::timeout(SHIM_READY_TIMEOUT, async {
+        while let Ok(Some(line)) = out.next_line().await {
+            if line.starts_with(crate::net::shim::READY_LINE) {
+                return true;
+            }
+            tracing::debug!(ws = %ws.id, "proxy-shim: {line}");
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    if !ready {
+        tracing::warn!(ws = %ws.id, "proxy shim never reported listening; this workspace may have no network");
+    }
+    let d = d.clone();
+    let id = ws.id.clone();
+    tokio::spawn(async move {
+        tokio::join!(
+            async {
+                while let Ok(Some(line)) = out.next_line().await {
+                    tracing::debug!(ws = %id, "proxy-shim: {line}");
+                }
+            },
+            async {
+                while let Ok(Some(line)) = err.next_line().await {
+                    tracing::warn!(ws = %id, "proxy-shim: {line}");
+                }
+            }
+        );
+        let code = (&mut child.exit).await.ok();
+        // A sandbox on its way down takes the shim with it, which is ordinary; a
+        // shim that dies under a live sandbox has cost that workspace its
+        // network and is worth saying so.
+        if d.sandboxes.lock().contains_key(&id) {
+            tracing::warn!(ws = %id, ?code, "proxy shim exited; this workspace has no network");
+        } else {
+            tracing::debug!(ws = %id, ?code, "proxy shim exited with its sandbox");
+        }
+    });
+}
+
+/// Replaces a workspace's allowlist: validated, persisted, applied to the live
+/// proxy and announced.
+///
+/// Every pattern is checked before anything is written, so a list with one
+/// mistake in it leaves the old list in place rather than half-applying it. What
+/// gets stored is the canonical form [`HostPattern`] produces, so the IDE sees
+/// back exactly what the proxy will match.
+pub fn set_allowlist(d: &Daemon, id: &WorkspaceId, hosts: &[String]) -> Result<Empty, RpcError> {
+    let mut patterns = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        let pattern = HostPattern::parse(host).map_err(RpcError::invalid_params)?;
+        patterns.push(pattern.as_str().to_string());
+    }
+    let ws = d.registry.update(id, |w| w.allowlist = patterns.clone())?;
+    d.proxies
+        .set_allowlist(id, Allowlist::from_strings(&ws.allowlist));
+    d.emit_state(&ws);
+    Ok(Empty {})
 }
 
 /// Reports a sandbox that dies on its own as `SandboxDown`.
@@ -126,6 +316,9 @@ fn watch_sandbox(
             return;
         }
         d.sandboxes.lock().remove(&id);
+        // Nothing can reach the socket now that the sandbox holding the shim is
+        // gone, and a listener left behind would outlive the workspace.
+        d.proxies.stop(&id);
         tracing::warn!(ws = %id, "sandbox died");
         let _ = d.set_state(&id, WorkspaceState::SandboxDown);
     });
@@ -329,6 +522,9 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
     if let Some(h) = handle {
         let _ = h.shutdown().await;
     }
+    // After the sandbox, so a last request is answered rather than cut off, and
+    // before the directories go, since the socket file lives in one of them.
+    d.proxies.stop(id);
     if let Some(layout) = layout.as_ref() {
         if let Err(e) = worktree::remove(&d.git, layout).await {
             // The ptys are closed and the sandbox is down, so the workspace must not be

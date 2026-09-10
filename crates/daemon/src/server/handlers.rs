@@ -62,6 +62,12 @@ impl Handler for WorkspaceHandler {
                 ok(lifecycle::destroy(d, &p.workspace_id, p.force).await?)
             }
             Request::WorkspaceStatus(p) => ok(lifecycle::status(d, &p.workspace_id).await?),
+            // Replaces the effective list outright rather than extending the
+            // defaults: this is the user saying what the workspace may reach,
+            // and taking a host away has to be possible.
+            Request::WorkspaceSetAllowlist(p) => {
+                ok(lifecycle::set_allowlist(d, &p.workspace_id, &p.hosts)?)
+            }
             Request::WorkspaceChanges(p) => ok(changes::changes(d, &p.workspace_id).await?),
             Request::WorkspaceDiff(p) => ok(changes::diff(d, &p.workspace_id, &p.path).await?),
             Request::AgentStart(p) => ok(d.agents.start(d, p).await?),

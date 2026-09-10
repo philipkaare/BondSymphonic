@@ -40,6 +40,9 @@ pub struct Daemon {
     pub watchers: Watchers,
     /// The running agents, which is where `WorkspaceInfo.agents` comes from.
     pub agents: AgentManager,
+    /// One allowlisting proxy per live workspace: the only route out of a
+    /// sandbox, and the only place the allowlist is enforced.
+    pub proxies: crate::net::proxy::ProxyRegistry,
     /// The handle the setup terminals (`system.setup_pty`) run under: not a
     /// sandbox at all, but the daemon user's own home and environment. See
     /// [`Daemon::host`]. Built on first use, because most daemons never open a
@@ -66,6 +69,7 @@ impl Daemon {
             ptys: PtyManager::new(events),
             watchers: Watchers::default(),
             agents,
+            proxies: crate::net::proxy::ProxyRegistry::default(),
             host: tokio::sync::OnceCell::new(),
         }))
     }

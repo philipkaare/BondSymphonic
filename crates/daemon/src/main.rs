@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bondsymphonic_daemon::daemon::Daemon;
+use bondsymphonic_daemon::net;
 use bondsymphonic_daemon::sandbox;
 use bondsymphonic_daemon::server::dispatch::SystemHandler;
 use bondsymphonic_daemon::server::handlers::WorkspaceHandler;
@@ -39,10 +40,21 @@ enum Cmd {
         #[arg(long)]
         socket: PathBuf,
     },
+    /// Internal: forward the sandbox's proxy port to the daemon's socket. Not
+    /// for direct use.
+    ProxyShim {
+        /// The workspace's proxy socket, as seen from inside the sandbox.
+        #[arg(long)]
+        socket: PathBuf,
+        /// Address to listen on inside the sandbox.
+        #[arg(long, default_value = "127.0.0.1:3128")]
+        listen: String,
+    },
 }
 
 /// Synchronous so `sandbox-init` never starts a tokio runtime: it is PID 1
-/// inside the sandbox and runs on blocking std plus threads.
+/// inside the sandbox and runs on blocking std plus threads. The proxy shim is
+/// an ordinary async program, so it builds a runtime of its own.
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.cmd {
@@ -50,6 +62,12 @@ fn main() -> Result<()> {
         Some(Cmd::SandboxInit { ref socket }) => return sandbox::init::run(socket),
         #[cfg(not(target_os = "linux"))]
         Some(Cmd::SandboxInit { .. }) => anyhow::bail!("sandbox-init is Linux only"),
+        Some(Cmd::ProxyShim {
+            ref socket,
+            ref listen,
+        }) => {
+            return tokio::runtime::Runtime::new()?.block_on(net::shim::run(socket, listen));
+        }
         None => {}
     }
     tokio::runtime::Runtime::new()?.block_on(serve(args))
