@@ -257,9 +257,19 @@ pub fn seed_claude_files_from(
             // merged with this workspace's trust entry. Straight into `home`,
             // which `ensure_real_dir` has just made a real directory.
             let to = home.join(rel);
-            let body =
-                claude_json_with_trust(std::fs::read_to_string(&from).ok().as_deref(), worktree);
-            let _ = clear_destination(&to);
+            // A file that is there but unreadable is not the same as one that is
+            // not there: the trust entry survives either way, but the second case
+            // silently drops the user's account and onboarding state, so it is
+            // said out loud the way every other seeding failure is.
+            let source = match std::fs::read_to_string(&from) {
+                Ok(s) => Some(s),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    tracing::warn!(from = %from.display(), error = %e, "could not read the daemon user's .claude.json; seeding a fresh one");
+                    None
+                }
+            };
+            let body = claude_json_with_trust(source.as_deref(), worktree);
             match write_private(&to, &body) {
                 Ok(()) => seeded.push(rel),
                 Err(e) => {
@@ -686,5 +696,29 @@ mod tests {
                 "source {source}"
             );
         }
+    }
+
+    /// A `.claude.json` that is there but cannot be read is not the same as one
+    /// that is absent: the trust entry still has to land, and the daemon says so
+    /// in the log rather than silently dropping the user's account state. A
+    /// directory at the source path is the portable way to make the read fail.
+    #[test]
+    fn a_source_claude_json_that_cannot_be_read_still_yields_a_trusted_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src-home");
+        let dst = dir.path().join("ws-home");
+        let worktree = dir.path().join("wt");
+        std::fs::create_dir_all(src.join(".claude.json")).unwrap();
+
+        let seeded = seed_claude_files_from(&src, &dst, &worktree);
+
+        assert_eq!(seeded, vec![".claude.json"]);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dst.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            v["projects"][worktree.to_string_lossy().as_ref()]["hasTrustDialogAccepted"],
+            true
+        );
     }
 }

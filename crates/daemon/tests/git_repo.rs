@@ -270,3 +270,162 @@ async fn init_repo_runs_no_hooks() {
     );
     assert_eq!(log_line(&fresh, "--format=%s"), "Initial commit");
 }
+
+// ---------------------------------------------------------------------------
+// Fix round 1: this path, not an enclosing one; and what may be written to
+// ---------------------------------------------------------------------------
+
+/// A directory with a `.git` file git cannot make sense of. Git fails on it with
+/// its general fatal (exit 128) *on what is meant to be a repository*, which is
+/// the case the "not a repository" classifier has to tell apart from a folder
+/// that is simply not one.
+fn dir_with_a_broken_gitfile(dir: &std::path::Path) -> std::path::PathBuf {
+    let broken = dir.join("broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join(".git"), "this is not a gitfile\n").unwrap();
+    broken
+}
+
+/// The classifier decides whether the daemon may *write*, so it has to mean
+/// exactly one thing. Exit 128 is git's general fatal and is shared with
+/// failures that happen on real repositories; only git's own wording says the
+/// path is not a repository at all.
+#[tokio::test]
+async fn only_gits_own_wording_counts_as_not_a_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = Git::new();
+    let plain = dir.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+
+    let err = repo::common_dir(&git, &plain).await.unwrap_err();
+    assert!(repo::is_not_a_repository(&err), "{err:?}");
+
+    let broken = dir_with_a_broken_gitfile(dir.path());
+    let err = repo::common_dir(&git, &broken).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::GitError);
+    assert!(
+        !repo::is_not_a_repository(&err),
+        "a repository git cannot read is not an empty folder: {err:?}"
+    );
+}
+
+/// `rev-parse` searches upwards, so the question "is this a repository" answered
+/// naively is really about the nearest enclosing one. A plain folder inside a
+/// repository would otherwise be reported with its parent's branches, dirty
+/// state and remotes, and the dialog would offer them as if they were the
+/// folder's own.
+#[tokio::test]
+async fn inspect_says_a_folder_inside_a_repository_is_not_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let outer = init_repo(dir.path());
+    let inside = outer.join("sub").join("deeper");
+    std::fs::create_dir_all(&inside).unwrap();
+    let git = Git::new();
+
+    let info = repo::inspect(&git, &inside).await.unwrap();
+    assert!(
+        !info.is_repo,
+        "the folder is not a repository, its parent is"
+    );
+    assert!(info.exists);
+    assert!(info.branches.is_empty(), "{:?}", info.branches);
+    assert_eq!(info.default_branch, "main");
+
+    // A folder that does not exist inside a repository answers the same way,
+    // with `exists` false, which is what `create` then acts on.
+    let missing = outer.join("not-yet");
+    let info = repo::inspect(&git, &missing).await.unwrap();
+    assert!(!info.is_repo);
+    assert!(!info.exists);
+
+    // And the repository itself still answers as one.
+    assert!(repo::inspect(&git, &outer).await.unwrap().is_repo);
+}
+
+/// So `init_repo` there makes a repository of its own rather than returning
+/// "already a repository" about somebody else's.
+#[tokio::test]
+async fn init_repo_inside_a_repository_makes_a_repository_of_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let outer = init_repo(dir.path());
+    let git = git_without_an_identity(dir.path());
+    let outer_head = repo::head_commit(&git, &outer, "HEAD").await.unwrap();
+    let inside = outer.join("nested");
+
+    repo::init_repo(&git, &inside).await.unwrap();
+
+    assert!(inside.join(".git").is_dir(), "its own git directory");
+    assert!(repo::is_repo_root(&git, &inside).await.unwrap());
+    assert_eq!(log_line(&inside, "--format=%s"), "Initial commit");
+    assert_eq!(
+        repo::head_commit(&git, &outer, "HEAD").await.unwrap(),
+        outer_head,
+        "the enclosing repository must not be touched"
+    );
+}
+
+/// Two targets `init_if_missing` must never act on, whatever a client sends: a
+/// filesystem root, and the home of the user the daemon runs as — the home whose
+/// credentials and git config the daemon reads.
+#[test]
+fn a_root_and_the_daemon_users_home_are_refused_as_init_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home").join("someone");
+    std::fs::create_dir_all(&home).unwrap();
+
+    assert!(repo::init_target_refusal(&home, Some(&home)).is_some());
+    assert!(
+        repo::init_target_refusal(&home.join("code"), Some(&home)).is_none(),
+        "a directory inside the home is where people keep their code"
+    );
+
+    let root = std::path::Path::new(&home)
+        .ancestors()
+        .last()
+        .unwrap()
+        .to_path_buf();
+    assert!(
+        repo::init_target_refusal(&root, Some(&home)).is_some(),
+        "{}",
+        root.display()
+    );
+    assert!(repo::init_target_refusal(std::path::Path::new("/"), None).is_some());
+}
+
+/// The guard is wired into `init_repo` itself, not only into its callers.
+#[tokio::test]
+async fn init_repo_refuses_a_filesystem_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = git_without_an_identity(dir.path());
+    let root = dir.path().ancestors().last().unwrap();
+
+    let err = repo::init_repo(&git, root).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidParams);
+    assert!(
+        err.message.contains("refusing to initialise"),
+        "{}",
+        err.message
+    );
+}
+
+/// An existing folder with files in it is *allowed*: "I have some code, make it
+/// a project" is the ordinary case, and the empty commit adds nothing to the
+/// index, so those files stay untracked and none of them is committed.
+#[tokio::test]
+async fn init_repo_accepts_a_folder_that_already_has_files_in_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let existing = dir.path().join("some-code");
+    std::fs::create_dir_all(&existing).unwrap();
+    std::fs::write(existing.join("main.rs"), "fn main() {}\n").unwrap();
+    let git = git_without_an_identity(dir.path());
+
+    repo::init_repo(&git, &existing).await.unwrap();
+
+    let info = repo::inspect(&git, &existing).await.unwrap();
+    assert!(info.is_repo);
+    assert!(
+        info.is_dirty,
+        "the files are still there, and still untracked"
+    );
+    assert_eq!(log_line(&existing, "--format=%s"), "Initial commit");
+}

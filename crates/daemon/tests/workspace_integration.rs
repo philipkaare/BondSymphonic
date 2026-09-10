@@ -938,3 +938,155 @@ async fn a_new_workspace_home_trusts_its_own_worktree() {
 
     cancel.cancel();
 }
+
+/// The failure this pass was written after was a `repo.inspect` that timed out
+/// on a large repository. A create that reads *any* git failure as "not a
+/// repository yet" would answer that by running `git init` and an empty commit
+/// over the user's repository. Only git's own "not a git repository" may lead to
+/// a write; a repository git cannot read is a repository.
+#[tokio::test]
+async fn create_does_not_initialise_when_git_fails_for_another_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let broken = dir.path().join("broken-repo");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join(".git"), "this is not a gitfile\n").unwrap();
+    let (port, token, _daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+
+    let err = c
+        .call(Request::WorkspaceCreate(WorkspaceCreateParams {
+            repo_path: broken.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: "alpha".into(),
+            init_if_missing: true,
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::GitError);
+    assert!(
+        !err.message.contains("not a git repository"),
+        "this is a repository git could not read: {}",
+        err.message
+    );
+    // The error is the one from asking *whether* it is a repository. An error
+    // from `git init` here would mean the daemon had already decided to write.
+    assert!(
+        err.data.as_ref().unwrap()["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("git rev-parse"),
+        "{:?}",
+        err.data
+    );
+    assert_eq!(
+        std::fs::read_to_string(broken.join(".git")).unwrap(),
+        "this is not a gitfile\n",
+        "nothing may be initialised over it"
+    );
+    assert!(!broken.join(".git").is_dir());
+
+    cancel.cancel();
+}
+
+/// `rev-parse` searches upwards, so a new folder inside somebody's repository
+/// looks like a repository unless the question is asked about the folder itself.
+/// Adopting the parent would make the workspace a worktree of a repository the
+/// user did not pick, with a `bs/<name>/work` branch in it — the opposite of the
+/// "this folder will be initialised" the dialog showed.
+#[tokio::test]
+async fn create_initialises_a_folder_inside_a_repository_rather_than_adopting_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let outer = common::init_repo(dir.path());
+    let inside = outer.join("new-thing");
+    let (port, token, _daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+
+    let ws: WorkspaceInfo = serde_json::from_value(
+        c.call(Request::WorkspaceCreate(WorkspaceCreateParams {
+            repo_path: inside.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: "alpha".into(),
+            init_if_missing: true,
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(ws.state, WorkspaceState::Ready);
+    assert!(inside.join(".git").is_dir(), "a repository of its own");
+    let branches = std::process::Command::new("git")
+        .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
+        .current_dir(&outer)
+        .output()
+        .unwrap();
+    let branches = String::from_utf8_lossy(&branches.stdout);
+    assert!(
+        !branches.contains("bs/"),
+        "the enclosing repository must be untouched: {branches}"
+    );
+
+    cancel.cancel();
+}
+
+/// Without the flag, a folder inside a repository is refused rather than
+/// silently adopted, so the answer agrees with the one `repo.inspect` gives for
+/// the same path.
+#[tokio::test]
+async fn create_refuses_a_folder_inside_a_repository_without_the_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let outer = common::init_repo(dir.path());
+    let inside = outer.join("sub");
+    std::fs::create_dir_all(&inside).unwrap();
+    let (port, token, _daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+
+    let err = c
+        .call(Request::WorkspaceCreate(WorkspaceCreateParams {
+            repo_path: inside.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: "alpha".into(),
+            init_if_missing: false,
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::InvalidParams);
+    assert!(
+        err.message.contains("inside a git repository"),
+        "{}",
+        err.message
+    );
+
+    cancel.cancel();
+}
+
+/// The daemon's data directory holds every worktree, sandbox home, object store
+/// and the registry itself. A `git init` and a commit in there would make all of
+/// it one repository, and a stale default in a path box is an ordinary way to
+/// get there.
+#[tokio::test]
+async fn create_refuses_to_initialise_inside_the_daemons_data_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let (port, token, _daemon, cancel) = start_daemon(&data).await;
+    let mut c = Client::connect(port, &token).await;
+    let inside_the_data_dir = data.join("worktrees").join("ws_made_up");
+
+    let err = c
+        .call(Request::WorkspaceCreate(WorkspaceCreateParams {
+            repo_path: inside_the_data_dir.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: "alpha".into(),
+            init_if_missing: true,
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::InvalidParams);
+    assert!(err.message.contains("data directory"), "{}", err.message);
+    assert!(!inside_the_data_dir.join(".git").exists());
+
+    cancel.cancel();
+}

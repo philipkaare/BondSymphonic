@@ -162,7 +162,20 @@ in it, and "not a repository yet" is an ordinary starting point there. Two path
 shapes stay `InvalidParams`, because neither can become a repository and
 answering "it will be created" to them would have the daemon build a directory
 tree nobody named: a path that exists and is not a directory, and one whose
-parent directory is itself missing.
+parent directory is itself missing. A path that cannot be read at all — a
+permission error rather than "nothing there" — is an `IoError`, not `exists:
+false`.
+
+**"Is a repository" means *this* directory.** `git rev-parse` searches upwards,
+so the naive question is really about the nearest enclosing repository. Both
+callers ask about the path itself instead, by comparing `rev-parse
+--show-toplevel` with it: a plain folder inside a repository answers `is_repo:
+false` rather than borrowing its parent's branches, dirty state and remotes, and
+`workspace.create` initialises such a folder as a repository of its own instead
+of making it a worktree of a repository the user did not pick. Without
+`init_if_missing`, that folder is `InvalidParams` naming the situation. A bare
+repository is not a repository for this purpose either; nothing in the daemon
+supports one as a workspace source.
 
 `is_repo` defaults to **true** when it is absent from the wire, which is the only
 value that keeps a newer IDE honest against an older daemon: a daemon without
@@ -183,6 +196,24 @@ the daemon's empty directory (5.4), because `git init` copies `init.templateDir`
 that is already a repository is left exactly as it is; the flag is off by default
 so that a client which does not know about it cannot initialise anything, its
 user never having been shown that a folder was about to become a repository.
+
+**Only "not a git repository" may lead to a write.** `workspace.create` acts on
+the flag when the folder is absent, when git says in as many words that the path
+is not a repository (exit 128 *and* that wording), or when git answered about an
+enclosing repository. Every other failure — a timeout, a git that cannot be
+spawned, a `safe.directory` ownership refusal, an unreadable gitfile — goes back
+to the client untouched, because each of those happens on a repository that is
+really there, and initialising over one would put an empty commit into somebody's
+work on the strength of a transient failure. The 30-second `repo.inspect` timeout
+that opened this pass is exactly such a failure.
+
+**Targets that are refused outright**, whatever the flag says: a filesystem root,
+the home directory of the user the daemon runs as, the daemon's own data
+directory (or anything under it, which is every worktree, sandbox home, object
+store and the registry), and a registered workspace worktree. A directory *inside*
+the home is allowed, and so is a folder that already has files in it — "I have
+some code, make it a project" is the ordinary case, and the empty commit adds
+nothing to the index, so those files stay untracked.
 
 **Destroy**: stop agents, runs, PTYs; tear down sandbox; `git worktree remove
 --force`; `git branch -D bs/<name>/work`; delete `homes/`, `caches/`, transcripts;

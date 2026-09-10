@@ -433,6 +433,42 @@ async fn seed_home(d: &Daemon, ws: &Workspace) {
     }
 }
 
+/// Refuses to initialise a repository inside the daemon's own data directory,
+/// or on top of a workspace worktree.
+///
+/// [`repo::init_target_refusal`] covers the targets any caller must refuse — a
+/// filesystem root, the daemon user's home. This is the one that needs to know
+/// where this daemon keeps its things: `~/.bondsymphonic` holds every worktree,
+/// sandbox home, object store and the registry itself, and a `git init` plus a
+/// commit in there would make the daemon's own state a repository — with a
+/// worktree's `.git` file, an agent's credentials and another workspace's
+/// objects inside it. Every registered worktree lives under that root, so one
+/// check covers both; the registry is consulted anyway, because a worktree path
+/// that predates a change of data directory would not.
+fn refuse_writing_into_the_daemons_own_directories(
+    d: &Daemon,
+    path: &Path,
+) -> Result<(), RpcError> {
+    let target = repo::canonical_ish(path);
+    let refuse = |what: &str| {
+        Err(RpcError::invalid_params(format!(
+            "refusing to initialise a git repository at {}: it is {what}",
+            path.display()
+        )))
+    };
+    if target.starts_with(repo::canonical_ish(&d.dirs.root)) {
+        return refuse("inside the daemon's own data directory");
+    }
+    if d.registry
+        .list()
+        .iter()
+        .any(|ws| repo::canonical_ish(&ws.worktree_path) == target)
+    {
+        return refuse("a workspace worktree");
+    }
+    Ok(())
+}
+
 pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<WorkspaceInfo, RpcError> {
     let repo_path = PathBuf::from(&p.repo_path);
     if p.name.is_empty()
@@ -444,13 +480,53 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
             "workspace name must be a single path-safe word",
         ));
     }
-    // A folder that is not a repository is an error unless the client asked for
-    // it to become one. The IDE only sets the flag after telling the user, in
-    // the New Agent dialog, that the folder will be initialised — so the error
-    // an older client sees is the one it always saw.
-    let git_common = match repo::common_dir(&d.git, &repo_path).await {
-        Ok(c) => c,
-        Err(e) if p.init_if_missing => {
+    // Is this path a repository of its own? Three answers, and only the first
+    // two are allowed to lead to a write:
+    //
+    // * yes — use it, exactly as before;
+    // * no, and git said so in as many words, or it answered about an enclosing
+    //   repository — the folder is not a repository, so `init_if_missing` may
+    //   make it one;
+    // * git failed for some other reason — a timeout, a missing binary, an
+    //   ownership refusal, an unreadable gitfile. Every one of those happens *on
+    //   a real repository*, so the error goes back untouched. Initialising here
+    //   would put an empty commit into somebody's work on the strength of a
+    //   transient failure.
+    //
+    // Why the path is not usable as it stands, kept for the client that did not
+    // ask for it to be initialised. `None` beside `existing: None` means the
+    // folder is simply not there yet.
+    let mut not_a_repo: Option<RpcError> = None;
+    let existing: Option<PathBuf> = if !repo::exists_as_directory(&repo_path)? {
+        // Asked before git, because git run in a directory that does not exist
+        // fails on the spawn — with no exit code, and so indistinguishable from a
+        // git that could not be started at all.
+        None
+    } else {
+        match repo::common_dir(&d.git, &repo_path).await {
+            Ok(c) if repo::is_repo_root(&d.git, &repo_path).await? => Some(c),
+            // Inside an enclosing repository, but not one itself. Adopting the
+            // parent would make the folder a worktree of a repository the user
+            // did not pick, which is the opposite of what the dialog offered.
+            Ok(_) => {
+                not_a_repo = Some(RpcError::invalid_params(format!(
+                    "{} is inside a git repository but is not one itself; pick the repository, \
+                     or create this folder as a repository of its own",
+                    repo_path.display()
+                )));
+                None
+            }
+            Err(e) if repo::is_not_a_repository(&e) => {
+                not_a_repo = Some(e);
+                None
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let git_common = match existing {
+        Some(c) => c,
+        None if p.init_if_missing => {
+            refuse_writing_into_the_daemons_own_directories(d, &repo_path)?;
             // `core.hooksPath` pinned at the daemon's empty directory: `git init`
             // copies `init.templateDir` into the new repository, hooks included,
             // and the commit that follows would run them (daemon design §5.4).
@@ -458,11 +534,22 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
                 .git
                 .clone()
                 .with_config("core.hooksPath", &d.dirs.no_hooks().to_string_lossy());
-            tracing::info!(repo = %repo_path.display(), "initialising a folder that is not a repository: {}", e.message);
+            let why = not_a_repo
+                .as_ref()
+                .map(|e| e.message.clone())
+                .unwrap_or_else(|| "the folder is not there".to_string());
+            tracing::info!(repo = %repo_path.display(), "initialising a folder that is not a repository: {why}");
             repo::init_repo(&git, &repo_path).await?;
             repo::common_dir(&d.git, &repo_path).await?
         }
-        Err(e) => return Err(e),
+        // The error an older client sees is the one it always saw: the IDE sets
+        // the flag only after telling the user, in the New Agent dialog, that the
+        // folder will be initialised.
+        None => {
+            return Err(not_a_repo.unwrap_or_else(|| {
+                RpcError::invalid_params(format!("{} does not exist", repo_path.display()))
+            }))
+        }
     };
     if d.registry.find_by_name(&repo_path, &p.name).is_some() {
         return Err(RpcError::new(
