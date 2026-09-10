@@ -271,6 +271,21 @@ async fn bwrap_workspace_protects_main_branch_and_shared_objects() {
     assert_eq!(code, 0, "{out}");
     assert_eq!(out.trim(), "bs/sb/work");
 
+    // Writing the workspace's own ref: allowed, and it really moves. The
+    // commit above proves git *can* advance the branch through a commit; daemon
+    // design §13 asks for the direct ref write too, because that is the
+    // operation `refs/heads` being read-only would take away, and it is the one
+    // a rebase or a reset inside the sandbox depends on.
+    let (code, out) = run_in(
+        &handle,
+        &format!(
+            "cd '{wt}' && first=$(git rev-parse HEAD)              && git -c user.name=a -c user.email=a@a commit -q --allow-empty -m second              && git update-ref refs/heads/bs/sb/work $first              && test \"$(git rev-parse refs/heads/bs/sb/work)\" = \"$first\"              && echo moved"
+        ),
+    )
+    .await;
+    assert_eq!(code, 0, "the workspace's own ref must be writable: {out}");
+    assert!(out.contains("moved"), "{out}");
+
     // Moving main: denied (refs/heads is read-only).
     let (code, out) = run_in(
         &handle,

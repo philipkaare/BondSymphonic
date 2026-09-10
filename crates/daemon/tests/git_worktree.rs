@@ -28,7 +28,7 @@ async fn create_makes_branch_worktree_and_writable_dirs() {
     let git = Git::new();
     let layout = layout_for(dir.path(), &repo_path, "agent-1").await;
 
-    worktree::create(&git, &layout, "main").await.unwrap();
+    worktree::create(&layout, "main").await.unwrap();
 
     assert!(layout.worktree_path.join("README.md").exists());
     assert!(
@@ -44,7 +44,7 @@ async fn create_makes_branch_worktree_and_writable_dirs() {
     assert_eq!(layout.rw_git_paths().len(), 3);
 
     // Creating again is a Conflict.
-    let err = worktree::create(&git, &layout, "main").await.unwrap_err();
+    let err = worktree::create(&layout, "main").await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Conflict);
 }
 
@@ -54,7 +54,7 @@ async fn commits_in_worktree_go_to_private_objects_and_daemon_can_read_them() {
     let repo_path = common::init_repo(dir.path());
     let git = Git::new();
     let layout = layout_for(dir.path(), &repo_path, "agent-2").await;
-    worktree::create(&git, &layout, "main").await.unwrap();
+    worktree::create(&layout, "main").await.unwrap();
 
     let shared_objects_dir = layout.git_common.join("objects");
     let shared_count_before = walkdir_count(&shared_objects_dir);
@@ -121,12 +121,12 @@ async fn commits_in_worktree_go_to_private_objects_and_daemon_can_read_them() {
         .unwrap();
     assert_eq!(subject.stdout.trim(), "agent commit");
 
-    worktree::remove(&git, &layout).await.unwrap();
+    worktree::remove(&layout).await.unwrap();
     assert!(!layout.worktree_path.exists());
     assert!(!repo::branch_exists(&git, &repo_path, "bs/agent-2/work")
         .await
         .unwrap());
-    worktree::remove(&git, &layout).await.unwrap(); // idempotent
+    worktree::remove(&layout).await.unwrap(); // idempotent
 }
 
 fn walkdir_count(p: &std::path::Path) -> usize {
@@ -142,4 +142,72 @@ fn walkdir_count(p: &std::path::Path) -> usize {
         }
     }
     n
+}
+
+/// Creating and removing a workspace worktree runs none of the repository's own
+/// hooks.
+///
+/// `git worktree add` fires `post-checkout` and, with the branch it creates,
+/// `reference-transaction`; `git branch -D` on the way out fires
+/// `reference-transaction` again. Those hooks are arbitrary code out of the
+/// user's repository, and neither call is the user typing a git command: they
+/// happen when the IDE opens or closes a workspace. Both go through
+/// `Layout::daemon_git`, which pins `core.hooksPath` at the daemon's own empty
+/// directory.
+#[tokio::test]
+async fn create_and_remove_run_no_repository_hooks() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_path = common::init_repo(dir.path());
+    let marker = dir.path().join("hooks-fired.txt");
+    for hook in [
+        "post-checkout",
+        "reference-transaction",
+        "post-index-change",
+    ] {
+        common::install_hook(
+            &repo_path,
+            hook,
+            &format!("echo {hook} >> '{}'", common::sh_path(&marker)),
+        );
+    }
+    let git = Git::new();
+    let layout = layout_for(dir.path(), &repo_path, "hooked").await;
+    std::fs::create_dir_all(&layout.no_hooks_dir).unwrap();
+
+    worktree::create(&layout, "main").await.unwrap();
+    assert!(
+        !marker.exists(),
+        "worktree create ran repository hooks: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+
+    worktree::remove(&layout).await.unwrap();
+    assert!(
+        !marker.exists(),
+        "worktree remove ran repository hooks: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+    assert!(!repo::branch_exists(&git, &repo_path, "bs/hooked/work")
+        .await
+        .unwrap());
+
+    // The hooks themselves work: without this the assertions above would pass
+    // just as well on a host where git never runs hooks at all.
+    let plain = dir.path().join("plain");
+    let out = std::process::Command::new("git")
+        .args(["worktree", "add", "-b", "control", &plain.to_string_lossy()])
+        .arg("main")
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let fired = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert!(
+        fired.contains("post-checkout"),
+        "the control worktree must fire the hook, or this test proves nothing: {fired:?}"
+    );
 }

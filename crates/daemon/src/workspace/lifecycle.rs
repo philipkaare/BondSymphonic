@@ -492,14 +492,14 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
         objects_dir: d.dirs.objects(&id),
         no_hooks_dir: d.dirs.no_hooks(),
     };
-    if let Err(e) = worktree::create(&d.git, &layout, &p.base_branch).await {
+    if let Err(e) = worktree::create(&layout, &p.base_branch).await {
         // `worktree::create` pre-creates ref, reflog and object directories, and
         // `git worktree add` can fail halfway; `worktree::remove` is idempotent and
         // clears all of it. The one failure it must not answer is `Conflict`, which
         // means the branch already existed: that branch predates this workspace and
         // is not ours to delete, and `create` rejects it before touching anything.
         if e.code != ErrorCode::Conflict {
-            let _ = worktree::remove(&d.git, &layout).await;
+            let _ = worktree::remove(&layout).await;
         }
         // The client has already seen `Creating`. Tell it why the workspace failed, then
         // send the terminal `Destroying` event a real destroy ends on, so the workspace
@@ -623,7 +623,7 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
     let repo_lock = crate::git::repo_lock(&ws.repo_path);
     let _repo_guard = repo_lock.lock().await;
     if let Some(layout) = layout.as_ref() {
-        if let Err(e) = worktree::remove(&d.git, layout).await {
+        if let Err(e) = worktree::remove(layout).await {
             // The ptys are closed and the sandbox is down, so the workspace must not be
             // left stranded in `Destroying`: a client would wait on a state that never
             // arrives.

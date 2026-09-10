@@ -306,3 +306,63 @@ async fn diff(c: &mut Client, ws: &WorkspaceId, path: &str) -> DiffResult {
         .unwrap();
     serde_json::from_value(v).unwrap()
 }
+
+/// Paths above ASCII survive `workspace.changes` and `workspace.diff` intact.
+///
+/// Every git command that prints a path obeys `core.quotePath`, which is on by
+/// default and renders each non-ASCII byte as an octal escape inside double
+/// quotes. The IDE opens what this list gives it, so a quoted name is a file it
+/// cannot find; the daemon turns the option off for every path-listing call.
+/// Both a committed change and an untracked file are checked, because they come
+/// from two different commands (`git diff` and `git status`).
+#[tokio::test]
+async fn non_ascii_paths_are_reported_the_way_they_are_spelled_on_disk() {
+    const TRACKED: &str = "håndbog.md";
+    const UNTRACKED: &str = "æøå-notat.txt";
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    std::fs::write(repo.join(TRACKED), "fælles\n").unwrap();
+    commit_all(&repo, &[], "base");
+
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "utf8").await;
+    let wt = std::path::Path::new(&ws.worktree_path).to_path_buf();
+    let env = lifecycle::layout_for(&daemon, &daemon.workspace(&ws.id).unwrap())
+        .await
+        .unwrap()
+        .sandbox_git_env();
+
+    std::fs::write(wt.join(TRACKED), "fælles\nnyt\n").unwrap();
+    commit_all(&wt, &env, "edit");
+    std::fs::write(wt.join(UNTRACKED), "hej\n").unwrap();
+
+    let res: ChangesResult = serde_json::from_value(
+        c.call(Request::WorkspaceChanges(WorkspaceIdParams {
+            workspace_id: ws.id.clone(),
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let paths: Vec<&str> = res.files.iter().map(|f| f.path.as_str()).collect();
+    assert!(
+        paths.contains(&TRACKED),
+        "the committed change must keep its name: {paths:?}"
+    );
+    assert!(
+        paths.contains(&UNTRACKED),
+        "the untracked file must keep its name: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.starts_with('"')),
+        "no path may come back quoted and escaped: {paths:?}"
+    );
+
+    // And the name the list gives is a name `workspace.diff` accepts.
+    let d = diff(&mut c, &ws.id, TRACKED).await;
+    assert_eq!(d.base_text, "fælles\n");
+    assert_eq!(d.work_text, "fælles\nnyt\n");
+
+    cancel.cancel();
+}

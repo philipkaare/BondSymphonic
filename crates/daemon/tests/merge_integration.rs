@@ -1011,3 +1011,46 @@ async fn reaping_scratch_worktrees_leaves_the_users_own_merge_named_worktree_alo
 
     cancel.cancel();
 }
+
+/// A conflicting path whose name is not ASCII comes back spelled the way it is
+/// spelled on disk.
+///
+/// `git diff --name-only` is one of the commands that obeys `core.quotePath`,
+/// which defaults to *on*: every byte above 0x7f is rendered as a C-style octal
+/// escape and the whole name is wrapped in double quotes. A conflict list in
+/// that form is useless to the IDE — it cannot open the file, and the user is
+/// shown `"h\303\245ndbog.md"` where their file manager shows `håndbog.md`. The
+/// daemon turns the option off for every path-listing call.
+#[tokio::test]
+async fn a_conflict_on_a_non_ascii_path_is_reported_unescaped() {
+    const NAME: &str = "håndbog.md";
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    std::fs::write(repo.join(NAME), "fælles\n").unwrap();
+    commit_all(&repo, &[], "base");
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let alpha = create_ws(&mut c, &repo, "alpha").await;
+    let beta = create_ws(&mut c, &repo, "beta").await;
+
+    commit_in_ws(&daemon, &alpha, &[(NAME, "alfa\n")], "alpha").await;
+    commit_in_ws(&daemon, &beta, &[(NAME, "beta\n")], "beta").await;
+    assert!(
+        merge(&mut c, &alpha.id, MergeMode::Merge, None)
+            .await
+            .unwrap()
+            .ok
+    );
+
+    let res = merge(&mut c, &beta.id, MergeMode::Merge, None)
+        .await
+        .unwrap();
+    assert!(!res.ok, "{res:?}");
+    assert_eq!(
+        res.conflicts,
+        vec![NAME.to_string()],
+        "the conflict must name the file, not its octal escape"
+    );
+
+    cancel.cancel();
+}

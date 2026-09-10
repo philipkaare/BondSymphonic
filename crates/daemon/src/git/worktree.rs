@@ -83,6 +83,7 @@ impl Layout {
         Git::new()
             .with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", s(&self.objects_dir))
             .with_config("core.hooksPath", &s(&self.no_hooks_dir))
+            .with_config(QUOTE_PATH.0, QUOTE_PATH.1)
     }
 
     /// [`Layout::daemon_git`] with the repository's own hooks left in place, for
@@ -93,7 +94,9 @@ impl Layout {
     /// remote with nothing behind them. A push is also the one daemon-side git
     /// operation the user explicitly asked for by name, through **Create PR**.
     pub fn daemon_push_git(&self) -> Git {
-        Git::new().with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", s(&self.objects_dir))
+        Git::new()
+            .with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", s(&self.objects_dir))
+            .with_config(QUOTE_PATH.0, QUOTE_PATH.1)
     }
 
     /// Git for daemon-side commands that run *against a workspace worktree*.
@@ -114,13 +117,30 @@ impl Layout {
             // Not in the list below: an empty `core.hooksPath` does not disable
             // hooks, it moves them to the filesystem root, so this one needs a
             // real directory that is always empty.
-            .with_config("core.hooksPath", &s(&self.no_hooks_dir));
+            .with_config("core.hooksPath", &s(&self.no_hooks_dir))
+            .with_config(QUOTE_PATH.0, QUOTE_PATH.1);
         for key in NEUTRALISED_CONFIG {
             git = git.with_config(key, "");
         }
         git
     }
 }
+
+/// `core.quotePath=false`, applied to every `Git` this module builds.
+///
+/// Git's default is to print any path byte above 0x7f as a C-style octal escape
+/// and wrap the whole name in double quotes, so `håndbog.md` reaches the client
+/// as `"hÃ¥ndbog.md"`. Every path-listing command obeys it —
+/// `diff --name-only` for the conflict list, `diff --name-status`,
+/// `status --porcelain`, `worktree list` — and the IDE opens what those lists
+/// give it, so a quoted name is a file it cannot find and a name the user does
+/// not recognise. Set on the `Git` rather than at each call site so a command
+/// added later cannot be forgotten; it changes nothing for a pure-ASCII tree.
+///
+/// It is *not* the same thing as the `-z` some of those calls already pass: `-z`
+/// suppresses quoting where git supports it, and several of these commands have
+/// no `-z` at all. Both are kept.
+const QUOTE_PATH: (&str, &str) = ("core.quotePath", "false");
 
 /// Config keys whose value git executes as a command, cleared on the command
 /// line for every daemon-side worktree command.
@@ -166,7 +186,15 @@ fn s(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-pub async fn create(git: &Git, layout: &Layout, base_branch: &str) -> Result<(), RpcError> {
+/// Creates the workspace's branch and worktree.
+///
+/// Through [`Layout::daemon_git`], so none of the repository's own hooks run.
+/// `git worktree add` fires `post-checkout` and, for the branch it creates,
+/// `reference-transaction`; neither is the user typing a git command. Opening a
+/// workspace in the IDE must not execute code out of the repository being
+/// opened, on a schedule nobody chose and with no way to see it happen.
+pub async fn create(layout: &Layout, base_branch: &str) -> Result<(), RpcError> {
+    let git = &layout.daemon_git();
     if repo::branch_exists(git, &layout.repo, &layout.branch).await? {
         return Err(RpcError::new(
             ErrorCode::Conflict,
@@ -209,7 +237,13 @@ pub async fn create(git: &Git, layout: &Layout, base_branch: &str) -> Result<(),
     Ok(())
 }
 
-pub async fn remove(git: &Git, layout: &Layout) -> Result<(), RpcError> {
+/// Removes the worktree, its registration and its branch.
+///
+/// Through [`Layout::daemon_git`] for the same reason as [`create`]: the
+/// `branch -D` at the end fires `reference-transaction`, and a destroy is the
+/// last moment at which running the repository's code would be welcome.
+pub async fn remove(layout: &Layout) -> Result<(), RpcError> {
+    let git = &layout.daemon_git();
     let ignore_missing = |r: Result<super::GitOutput, RpcError>| match r {
         Ok(_) => Ok(()),
         Err(e) => {

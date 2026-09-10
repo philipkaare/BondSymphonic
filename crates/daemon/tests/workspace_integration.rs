@@ -575,3 +575,224 @@ async fn the_repo_config_extends_the_allowlist_and_a_broken_one_does_not_block_c
     assert_eq!(found.configs[0].source, RunConfigSource::Detected);
     cancel.cancel();
 }
+
+/// A `[[run]]` block that is missing its `port` costs the repo that one entry
+/// and nothing else.
+///
+/// The whole file used to be discarded: `port` was a required field, so one
+/// forgotten line turned a repo with three configured runs into a repo the Run
+/// panel offered detection for. The entries that do parse are kept, and the one
+/// that does not comes back as a line in `warnings` so the IDE can say which.
+#[tokio::test]
+async fn a_run_entry_without_a_port_is_reported_and_the_others_still_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, _daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+
+    std::fs::write(
+        repo.join("bondsymphonic.toml"),
+        "[[run]]\nname = \"web\"\ncommand = \"npm run dev\"\nport = 3000\n\n\
+         [[run]]\nname = \"api\"\ncommand = \"cargo run -p api\"\n\n\
+         [[run]]\nname = \"docs\"\ncommand = \"mkdocs serve\"\nport = 8000\n",
+    )
+    .unwrap();
+    // Detection would find this, and must not be reached: the file still
+    // declares runs that parse.
+    std::fs::write(repo.join("manage.py"), "#!/usr/bin/env python\n").unwrap();
+
+    let found: DetectRunConfigsResult = serde_json::from_value(
+        c.call(Request::RepoDetectRunConfigs(RepoPathParams {
+            path: repo.to_string_lossy().into(),
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let names: Vec<&str> = found.configs.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["web", "docs"], "{:?}", found.configs);
+    assert_eq!(found.configs[0].source, RunConfigSource::ConfigFile);
+    assert_eq!(found.warnings.len(), 1, "{:?}", found.warnings);
+    let w = &found.warnings[0];
+    assert!(w.contains("api"), "the warning must name the entry: {w}");
+    assert!(w.contains("port"), "and say what is missing: {w}");
+
+    // A file whose runs all parse warns about nothing.
+    std::fs::write(
+        repo.join("bondsymphonic.toml"),
+        "[[run]]\nname = \"web\"\ncommand = \"npm run dev\"\nport = 3000\n",
+    )
+    .unwrap();
+    let found: DetectRunConfigsResult = serde_json::from_value(
+        c.call(Request::RepoDetectRunConfigs(RepoPathParams {
+            path: repo.to_string_lossy().into(),
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+
+    cancel.cancel();
+}
+
+/// The chain daemon design §13 asks `workspace_integration` to walk, end to
+/// end and in one test: a temp repo, a workspace, a commit made the way the
+/// sandbox makes it, `workspace.changes`, `workspace.merge`, the base branch
+/// holding the work, the objects readable *without* the workspace's private
+/// object directory, and a destroy that takes every per-workspace directory and
+/// every agent record and transcript with it.
+///
+/// The last two steps are the ones worth having. A merge that leaves the
+/// commits behind in `objects/<ws>/` looks like a success and breaks the user's
+/// own `git log main` the moment the workspace is destroyed, and a destroy that
+/// leaves a home or a cache behind grows the data directory forever.
+#[tokio::test]
+async fn the_full_workspace_chain_from_create_to_a_destroy_that_leaves_nothing() {
+    use bondsymphonic_daemon::agents::persist::{AgentRecord, AgentRecords};
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let data = dir.path().join("data");
+    let (port, token, daemon, cancel) = start_daemon(&data).await;
+    let mut c = Client::connect(port, &token).await;
+
+    let ws = create_ws(&mut c, &repo, "chain").await;
+    let wt = std::path::Path::new(&ws.worktree_path).to_path_buf();
+    let layout = lifecycle::layout_for(&daemon, &daemon.workspace(&ws.id).unwrap())
+        .await
+        .unwrap();
+
+    // The commit is made with the environment the sandbox gives git, so its
+    // objects land in the workspace's private directory and nowhere else.
+    std::fs::write(wt.join("feature.txt"), "from the sandbox\n").unwrap();
+    commit_all(&wt, &layout.sandbox_git_env(), "sandboxed work");
+    let tip = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&wt)
+            .envs(layout.sandbox_git_env())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let (shard, rest) = tip.split_at(2);
+    assert!(
+        layout.objects_dir.join(shard).join(rest).is_file(),
+        "the commit must start out in the workspace's private object store"
+    );
+
+    // `workspace.changes` sees it.
+    let changed: ChangesResult = serde_json::from_value(
+        c.call(Request::WorkspaceChanges(WorkspaceIdParams {
+            workspace_id: ws.id.clone(),
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        changed
+            .files
+            .iter()
+            .any(|f| f.path == "feature.txt" && f.status == FileStatus::Added),
+        "{:?}",
+        changed.files
+    );
+
+    // Records and a transcript, as an agent that ran in this workspace would
+    // have left them. Written through the same file the daemon uses, so the
+    // destroy path finds them exactly as it finds a real agent's.
+    let records = AgentRecords::new(daemon.dirs.agents_file());
+    records.upsert(AgentRecord {
+        agent_id: "ag_chain".into(),
+        workspace_id: ws.id.clone(),
+        adapter: AgentAdapterKind::Claude,
+        session_id: Some("sess-chain".into()),
+        options: AgentStartOptions {
+            command: None,
+            resume_session: None,
+            model: None,
+            permission_mode: None,
+            api_key: None,
+        },
+        started_at: "2026-09-10T10:00:00Z".into(),
+        ended_at: None,
+    });
+    let transcript = daemon.dirs.transcripts.join("ag_chain.ndjson");
+    std::fs::write(&transcript, "{\"kind\":\"text\"}\n").unwrap();
+
+    // Merge, and the base branch has the work.
+    let res: MergeResult = serde_json::from_value(
+        c.call(Request::WorkspaceMerge(WorkspaceMergeParams {
+            workspace_id: ws.id.clone(),
+            mode: MergeMode::Merge,
+            message: None,
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(res.ok, "{res:?}");
+
+    // Read the way the *user's* git reads it: no alternate object directory in
+    // the environment at all. This is what proves the merge copied the objects
+    // out of the workspace rather than leaving the base branch pointing into it.
+    let plain = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(plain(&["show", "main:feature.txt"]), "from the sandbox");
+    assert!(plain(&["rev-list", "--objects", "main"]).contains(&tip));
+
+    // Destroy, and nothing of this workspace is left anywhere.
+    c.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+        workspace_id: ws.id.clone(),
+        force: true,
+    }))
+    .await
+    .unwrap();
+
+    for (what, path) in [
+        ("worktree", daemon.dirs.worktree(&ws.id)),
+        ("objects", daemon.dirs.objects(&ws.id)),
+        ("home", daemon.dirs.home(&ws.id)),
+        ("cache", daemon.dirs.cache(&ws.id)),
+        ("run dir", daemon.dirs.run(&ws.id)),
+    ] {
+        assert!(
+            !path.exists(),
+            "{what} survived the destroy: {}",
+            path.display()
+        );
+    }
+    assert!(
+        records.load().is_empty(),
+        "the agent record survived the destroy"
+    );
+    assert!(
+        !transcript.exists(),
+        "the transcript survived the destroy: {}",
+        transcript.display()
+    );
+    assert!(daemon.registry.list().is_empty());
+
+    // And the base branch still reads without the workspace behind it.
+    assert_eq!(plain(&["show", "main:feature.txt"]), "from the sandbox");
+
+    cancel.cancel();
+}

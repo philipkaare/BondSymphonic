@@ -260,3 +260,123 @@ pub fn commit_all(worktree: &Path, env: &[(String, String)], message: &str) {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Port guard: ending a test's own web app, and never anybody else's.
+// ---------------------------------------------------------------------------
+
+/// Kills whatever *this test's* run left listening on a port, once the test is
+/// over, however it ended.
+///
+/// A `#[tokio::test]` whose body panics drops its runtime while the run's web
+/// server is still alive, and on Windows tokio waits for a child process on a
+/// blocking thread that the drop then waits for in turn — so one failed
+/// assertion hangs the whole test binary instead of reporting. The guard turns
+/// that back into an ordinary failure and leaves nothing behind for the next
+/// test to trip over.
+///
+/// It kills **by process id**, and only ids it watched appear on the port while
+/// it was running. Killing "whatever is listening on the port" at teardown is a
+/// different and much worse thing: a test port is an ephemeral number the
+/// operating system hands out, the run under test may already have exited, and
+/// on a developer's own machine the process that has the number by then can be
+/// anything at all. Two rules keep this honest:
+///
+/// * Whatever already held the port when the guard was made is somebody else's
+///   and is never killed.
+/// * The port is watched for the life of the guard rather than sampled once,
+///   because a run is `ready` before it binds when its readiness comes from a
+///   `ready_regex`, and because a run can rebind.
+///
+/// Windows only. On Unix the no-sandbox backend puts every child in a process
+/// group of its own, the daemon's own teardown reaches all of it, and a runtime
+/// drop does not block on a surviving child — so the guard is inert and costs a
+/// struct.
+pub struct PortGuard {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    watcher: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PortGuard {
+    pub fn new(port: u16) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        if !cfg!(windows) {
+            return Self {
+                stop,
+                seen,
+                watcher: None,
+            };
+        }
+        // Taken before the run is started, so every one of these is a process
+        // that was here first.
+        let theirs = listeners_on(port);
+        let (s, v) = (stop.clone(), seen.clone());
+        let watcher = std::thread::spawn(move || {
+            while !s.load(std::sync::atomic::Ordering::Relaxed) {
+                for pid in listeners_on(port) {
+                    if theirs.contains(&pid) {
+                        continue;
+                    }
+                    let mut g = v.lock().unwrap();
+                    if !g.contains(&pid) {
+                        g.push(pid);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+        Self {
+            stop,
+            seen,
+            watcher: Some(watcher),
+        }
+    }
+}
+
+impl Drop for PortGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.watcher.take() {
+            let _ = h.join();
+        }
+        for pid in self.seen.lock().unwrap().iter() {
+            // `/T` for the tree: `cmd /C python …` is a child of the shell the
+            // daemon started it through. A pid that has already exited is not an
+            // error worth reporting — the ordinary case is a test that stopped
+            // its own run.
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", pid])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// The process ids listening on `port` right now, as strings, because that is
+/// what `taskkill` takes and nothing here does arithmetic on them.
+fn listeners_on(port: u16) -> Vec<String> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    let Ok(out) = std::process::Command::new("netstat")
+        .args(["-ano", "-p", "tcp"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let needle = format!(":{port}");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            // proto, local address, remote address, state, pid
+            if f.len() < 5 || f[3] != "LISTENING" || !f[1].ends_with(&needle) {
+                return None;
+            }
+            Some(f[4].to_string())
+        })
+        .collect()
+}

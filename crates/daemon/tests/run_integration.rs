@@ -14,14 +14,29 @@
 mod common;
 
 use bondsymphonic_proto::*;
-use common::{create_ws, init_repo, start_daemon, Client};
+use common::{create_ws, init_repo, start_daemon, Client, PortGuard};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// How long a `python -m http.server` gets to bind its port. The daemon probes
-/// every 500 ms, so this is generous even on a cold interpreter.
-const READY: Duration = Duration::from_secs(20);
+/// How long a run gets to reach `ready`.
+///
+/// A ceiling on a wait for the run's own `ready` event, not a sleep: every test
+/// here returns the moment the event arrives, so raising the number costs
+/// nothing on a healthy host and buys the one thing that matters — the suite
+/// runs on a machine that is also building the workspace, and a cold Python
+/// starting under that load took more than the 20 s this used to allow, which
+/// is the flake Milestone 6 saw. Sixty seconds is the daemon's own git timeout,
+/// and a run that has not bound a port in a minute is a failure worth reporting
+/// as one.
+const READY: Duration = Duration::from_secs(60);
+
+/// The same ceiling for the other run events a test waits on: a line of output,
+/// `stopped`, `failed`. Each of these waits also returns the moment its event
+/// arrives, so the number is only ever paid by a run that is genuinely stuck,
+/// and a machine that is slow enough to make a 20 s ceiling fail is a machine,
+/// not a bug.
+const SETTLED: Duration = READY;
 
 /// The interpreter to run the test web app with, or `None` on a host with
 /// none. Windows ships a `python3` App Execution Alias that is not an
@@ -59,53 +74,6 @@ fn blank_line() -> &'static str {
         "echo."
     } else {
         "echo"
-    }
-}
-
-/// Kills whatever is still listening on a test's port once the test is over,
-/// however it ended.
-///
-/// A `#[tokio::test]` whose body panics drops its runtime while the run's web
-/// server is still alive, and on Windows tokio waits for a child process on a
-/// blocking thread that the drop then waits for in turn — so one failed
-/// assertion hangs the whole test binary instead of reporting. The guard turns
-/// that back into an ordinary failure, and leaves nothing behind for the next
-/// test to trip over.
-struct PortGuard(u16);
-
-impl Drop for PortGuard {
-    fn drop(&mut self) {
-        kill_listener(self.0);
-    }
-}
-
-/// Ends whatever holds `port`, tree and all.
-///
-/// Windows only: on Unix the no-sandbox backend puts every child in a process
-/// group of its own and the daemon's own teardown reaches all of it, and a
-/// runtime drop there does not block on a surviving child.
-fn kill_listener(port: u16) {
-    if !cfg!(windows) {
-        return;
-    }
-    let Ok(out) = std::process::Command::new("netstat")
-        .args(["-ano", "-p", "tcp"])
-        .output()
-    else {
-        return;
-    };
-    let needle = format!(":{port}");
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        // proto, local address, remote address, state, pid
-        if f.len() < 5 || f[3] != "LISTENING" || !f[1].ends_with(&needle) {
-            continue;
-        }
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", f[4]])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
     }
 }
 
@@ -278,7 +246,7 @@ async fn a_web_run_becomes_ready_streams_its_output_and_stops() {
     let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
     let mut c = Client::connect(p, &token).await;
     let ws = create_ws(&mut c, &repo, "runs").await;
-    let _guard = PortGuard(port);
+    let _guard = PortGuard::new(port);
 
     let started = start_run(&mut c, &ws.id, "web").await.unwrap();
     assert_eq!(started.host_port, port, "the noop backend does not bridge");
@@ -323,7 +291,7 @@ async fn a_web_run_becomes_ready_streams_its_output_and_stops() {
         .await
         .unwrap_or_else(|| panic!("no answer on {port}"));
     assert!(body.contains("200"), "{body}");
-    let evs = run_events(&mut c, &started.run_id, Duration::from_secs(10), |e| {
+    let evs = run_events(&mut c, &started.run_id, SETTLED, |e| {
         output(e).iter().any(|l| l.contains("GET /"))
     })
     .await;
@@ -343,7 +311,7 @@ async fn a_web_run_becomes_ready_streams_its_output_and_stops() {
     }))
     .await
     .unwrap();
-    let evs = run_events(&mut c, &started.run_id, Duration::from_secs(10), |e| {
+    let evs = run_events(&mut c, &started.run_id, SETTLED, |e| {
         has_state(e, RunState::Stopped)
     })
     .await;
@@ -494,7 +462,7 @@ async fn two_configs_sharing_a_port_are_two_independent_runs() {
     }))
     .await
     .unwrap();
-    let evs = run_events(&mut c, &dev.run_id, Duration::from_secs(10), |e| {
+    let evs = run_events(&mut c, &dev.run_id, SETTLED, |e| {
         has_state(e, RunState::Stopped)
     })
     .await;
@@ -534,7 +502,7 @@ async fn a_run_that_exits_before_it_is_ready_fails_with_its_exit_code() {
     let ws = create_ws(&mut c, &repo, "boom").await;
 
     let started = start_run(&mut c, &ws.id, "boom").await.unwrap();
-    let evs = run_events(&mut c, &started.run_id, Duration::from_secs(20), |e| {
+    let evs = run_events(&mut c, &started.run_id, SETTLED, |e| {
         has_state(e, RunState::Failed)
     })
     .await;
@@ -597,7 +565,7 @@ async fn a_run_gets_port_host_and_its_configured_environment_in_its_cwd() {
     let ws = create_ws(&mut c, &repo, "envcheck").await;
 
     let started = start_run(&mut c, &ws.id, "envcheck").await.unwrap();
-    let evs = run_events(&mut c, &started.run_id, Duration::from_secs(20), |e| {
+    let evs = run_events(&mut c, &started.run_id, SETTLED, |e| {
         !output(e).is_empty() && has_state(e, RunState::Failed)
     })
     .await;
@@ -659,7 +627,7 @@ port = {configured}
     );
     assert_eq!(started.url, format!("http://localhost:{overridden}"));
 
-    let evs = run_events(&mut c, &started.run_id, Duration::from_secs(20), |e| {
+    let evs = run_events(&mut c, &started.run_id, SETTLED, |e| {
         !output(e).is_empty() && has_state(e, RunState::Failed)
     })
     .await;
@@ -726,7 +694,7 @@ async fn a_blank_output_line_does_not_end_the_stream_or_strand_a_ready_regex() {
     let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
     let mut c = Client::connect(p, &token).await;
     let ws = create_ws(&mut c, &repo, "banner").await;
-    let _guard = PortGuard(port);
+    let _guard = PortGuard::new(port);
 
     let started = start_run(&mut c, &ws.id, "banner").await.unwrap();
     let evs = run_events(&mut c, &started.run_id, READY, |e| {
@@ -798,7 +766,7 @@ async fn destroy_stops_a_ready_run_before_it_replies() {
     let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
     let mut c = Client::connect(p, &token).await;
     let ws = create_ws(&mut c, &repo, "destroyed").await;
-    let _guard = PortGuard(port);
+    let _guard = PortGuard::new(port);
 
     let started = start_run(&mut c, &ws.id, "web").await.unwrap();
     run_events(&mut c, &started.run_id, READY, |e| {

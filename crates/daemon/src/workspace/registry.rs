@@ -151,16 +151,18 @@ impl Registry {
     }
 }
 
+/// Writes the whole registry, atomically.
+///
+/// The registry is the daemon's only record of which workspaces exist and where
+/// their worktrees are; a half-written one at the next start means workspaces
+/// the user can neither open nor destroy, with their worktrees and object
+/// directories left on disk. [`crate::util::atomic::write_atomic`] is what makes
+/// the file on disk either the previous registry or this one.
 fn save_locked(inner: &Inner) -> Result<()> {
-    if let Some(dir) = inner.path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = inner.path.with_extension("json.tmp");
     let data = FileFormat {
         version: FORMAT_VERSION,
         workspaces: inner.workspaces.clone(),
     };
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&data)?)?;
-    std::fs::rename(&tmp, &inner.path)?;
+    crate::util::atomic::write_atomic(&inner.path, &serde_json::to_vec_pretty(&data)?)?;
     Ok(())
 }

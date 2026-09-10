@@ -41,11 +41,23 @@ pub struct RepoConfig {
 
 /// One `[[run]]` block: a command the Run panel can start, and the port it
 /// serves on so the daemon can bridge it back to the host browser.
+///
+/// Every field is optional *to serde* and the ones a run cannot do without are
+/// required by [`validate`]. That split is the whole point: a serde-required
+/// field makes one incomplete block a parse error for the entire document, and
+/// the daemon used to answer a repo with three good runs and one typo by
+/// pretending the file did not exist. Read leniently and validated per entry, a
+/// bad block costs that block and produces a line the IDE can show.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct RunEntry {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub command: String,
-    pub port: u16,
+    /// Absent when the block does not name one. There is no default worth
+    /// guessing: the port is what the run is bridged, probed and opened on.
+    #[serde(default)]
+    pub port: Option<u16>,
     /// Relative to the worktree root. `None` means the root itself.
     #[serde(default)]
     pub cwd: Option<String>,
@@ -96,32 +108,114 @@ pub fn load_repo_config(root: &Path) -> Result<Option<RepoConfig>, String> {
     }
 }
 
+/// What a repo can run, plus everything the user needs told about the parts of
+/// its configuration that were ignored.
+///
+/// `warnings` reaches the IDE as `DetectRunConfigsResult.warnings` and is shown
+/// beside the run list. It is empty for the common case of a repo with no
+/// config file, or one whose config file is entirely fine.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RepoRuns {
+    pub configs: Vec<RunConfig>,
+    pub warnings: Vec<String>,
+}
+
 /// The run configurations for a repo: what its `bondsymphonic.toml` declares,
 /// or what detection can find.
 ///
-/// The file wins whenever it declares any run, because a repo that took the
-/// trouble to write one down does not want a guessed `npm run dev` next to it.
-/// A file that fails to parse falls back to detection with a warning rather
-/// than answering nothing, so a stray comma in the config cannot make the Run
-/// panel look like the repo has nothing to run.
-pub fn configs_for(root: &Path) -> Vec<RunConfig> {
-    match load_repo_config(root) {
-        Ok(Some(cfg)) if !cfg.run.is_empty() => cfg.run.iter().map(from_entry).collect(),
-        Ok(_) => detect(root),
+/// The file wins whenever it declares a run that parses, because a repo that
+/// took the trouble to write one down does not want a guessed `npm run dev`
+/// next to it. Detection is the fallback in three cases, each of them reported
+/// rather than silent: no file at all, a file with no usable `[[run]]`, and a
+/// file that will not parse. A single block that does not parse costs that
+/// block and nothing more.
+pub fn configs_for(root: &Path) -> RepoRuns {
+    let cfg = match load_repo_config(root) {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => {
+            return RepoRuns {
+                configs: detect(root),
+                warnings: Vec::new(),
+            }
+        }
         Err(e) => {
             tracing::warn!(root = %root.display(), error = %e, "unreadable repo config, detecting runs instead");
-            detect(root)
+            return RepoRuns {
+                configs: detect(root),
+                // The `toml` crate's message carries the offending line and a
+                // caret, and the user cannot fix what they are not shown. It
+                // used to go to the daemon log and nowhere a person would look.
+                warnings: vec![format!(
+                    "{e} — the file was ignored and the runs below were detected instead"
+                )],
+            };
+        }
+    };
+    let (configs, warnings) = validate(&cfg.run);
+    if configs.is_empty() {
+        // The file declared runs and none of them survived, or it declared none
+        // at all. Either way the Run panel would otherwise be empty, and what
+        // the tree says the repo can run is a better answer than nothing.
+        return RepoRuns {
+            configs: detect(root),
+            warnings,
+        };
+    }
+    RepoRuns { configs, warnings }
+}
+
+/// Turns the blocks a file declared into the runs the protocol carries, with one
+/// warning per block that had to be dropped.
+///
+/// The rules are the ones a run cannot do without: a name to ask for it by, a
+/// command to start, and a port to bridge and probe it on. Everything else a
+/// block says is optional and defaulted.
+///
+/// Blocks are numbered from one, because that is how a person counts `[[run]]`
+/// sections in their own file, and the name is quoted alongside when there is
+/// one, since that is the string they will search for.
+fn validate(entries: &[RunEntry]) -> (Vec<RunConfig>, Vec<String>) {
+    let mut configs: Vec<RunConfig> = Vec::new();
+    let mut warnings = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let name = e.name.trim();
+        let which = match name {
+            "" => format!("[[run]] #{}", i + 1),
+            n => format!("[[run]] #{} ({n:?})", i + 1),
+        };
+        let problem = if name.is_empty() {
+            Some("has no name")
+        } else if e.command.trim().is_empty() {
+            Some("has no command")
+        } else if e.port.is_none() {
+            Some("has no port")
+        } else if e.port == Some(0) {
+            // Zero is the operating system's "pick one for me", and a run whose
+            // port nobody knows can be neither bridged nor opened in a browser.
+            Some("has port 0, which is not a port a run can be started on")
+        } else if configs.iter().any(|c| c.name == name) {
+            // `run.start` looks a config up by name, so a repeat is a run the
+            // user can never reach. The first one wins, as it does in the list.
+            Some("repeats the name of an earlier entry")
+        } else {
+            None
+        };
+        match problem {
+            Some(why) => warnings.push(format!("{CONFIG_FILE}: {which} {why}; it is not offered")),
+            None => configs.push(from_entry(e)),
         }
     }
+    (configs, warnings)
 }
 
 /// A configured run, as the protocol carries it. Nothing here is a guess: the
-/// port is the one the user wrote.
+/// port is the one the user wrote. Only ever reached for an entry [`validate`]
+/// has accepted, which is what makes the `port` unwrap sound.
 fn from_entry(e: &RunEntry) -> RunConfig {
     RunConfig {
-        name: e.name.clone(),
+        name: e.name.trim().to_string(),
         command: e.command.clone(),
-        port: e.port,
+        port: e.port.expect("validate rejects an entry with no port"),
         cwd: e.cwd.clone(),
         env: e.env.clone(),
         ready_regex: e.ready_regex.clone(),
@@ -426,7 +520,9 @@ mod tests {
 
     #[test]
     fn toml_runs_win_over_detection() {
-        let v = configs_for(&repo("with-toml"));
+        let r = configs_for(&repo("with-toml"));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let v = r.configs;
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].name, "web");
         assert_eq!(v[0].command, "npm run dev -- --port 3000");
@@ -447,6 +543,85 @@ mod tests {
         assert_eq!(c.claude.settings.as_deref(), Some(".claude/settings.json"));
         assert!(load_repo_config(&repo("vite-app")).unwrap().is_none());
     }
+    /// One incomplete `[[run]]` block costs that block and nothing else.
+    ///
+    /// It used to cost the whole file: `port` was required at the serde level,
+    /// so a repo that forgot one line got detection instead of the two runs it
+    /// had written down, with the reason only in the daemon log.
+    #[test]
+    fn an_entry_that_cannot_be_used_is_reported_and_the_rest_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        // Detection would find this; it must not be reached while the file
+        // still has runs that parse.
+        std::fs::write(dir.path().join("manage.py"), "#!/usr/bin/env python\n").unwrap();
+        std::fs::write(
+            dir.path().join("bondsymphonic.toml"),
+            "[[run]]\nname = \"web\"\ncommand = \"npm run dev\"\nport = 3000\n\n\
+             [[run]]\nname = \"api\"\ncommand = \"cargo run -p api\"\n\n\
+             [[run]]\nname = \"docs\"\ncommand = \"mkdocs serve\"\nport = 8000\n",
+        )
+        .unwrap();
+
+        let r = configs_for(dir.path());
+        assert_eq!(
+            r.configs
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["web", "docs"]
+        );
+        assert_eq!(r.configs[0].source, RunConfigSource::ConfigFile);
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        let w = &r.warnings[0];
+        assert!(w.contains("#2"), "the block must be numbered: {w}");
+        assert!(w.contains("api"), "and named: {w}");
+        assert!(w.contains("has no port"), "and the reason given: {w}");
+    }
+
+    /// The other ways one block can be unusable, each costing only itself.
+    #[test]
+    fn every_unusable_entry_is_named_once_and_the_first_of_a_repeat_wins() {
+        let entries = |toml: &str| {
+            let cfg: RepoConfig = toml::from_str(toml).unwrap();
+            validate(&cfg.run)
+        };
+        let (configs, warnings) = entries(
+            "[[run]]\ncommand = \"a\"\nport = 1\n\n\
+             [[run]]\nname = \"b\"\nport = 2\n\n\
+             [[run]]\nname = \"c\"\ncommand = \"c\"\nport = 0\n\n\
+             [[run]]\nname = \"d\"\ncommand = \"first\"\nport = 4\n\n\
+             [[run]]\nname = \"d\"\ncommand = \"second\"\nport = 5\n",
+        );
+        assert_eq!(
+            configs.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["d"]
+        );
+        assert_eq!(configs[0].command, "first", "the first of a repeat wins");
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert!(warnings[0].contains("has no name"), "{warnings:?}");
+        assert!(warnings[1].contains("has no command"), "{warnings:?}");
+        assert!(warnings[2].contains("port 0"), "{warnings:?}");
+        assert!(warnings[3].contains("repeats the name"), "{warnings:?}");
+    }
+
+    /// A file whose every run is unusable still leaves detection to answer, and
+    /// still says why the file did not.
+    #[test]
+    fn a_file_whose_runs_are_all_unusable_falls_back_but_keeps_its_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manage.py"), "#!/usr/bin/env python\n").unwrap();
+        std::fs::write(
+            dir.path().join("bondsymphonic.toml"),
+            "[[run]]\nname = \"web\"\ncommand = \"npm run dev\"\n",
+        )
+        .unwrap();
+        let r = configs_for(dir.path());
+        assert_eq!(r.configs.len(), 1);
+        assert_eq!(r.configs[0].name, "django");
+        assert_eq!(r.configs[0].source, RunConfigSource::Detected);
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    }
+
     #[test]
     fn a_broken_toml_is_an_error_naming_the_line() {
         let dir = tempfile::tempdir().unwrap();
@@ -487,7 +662,9 @@ mod tests {
     fn an_empty_directory_detects_nothing() {
         let dir = tempfile::tempdir().unwrap();
         assert!(detect(dir.path()).is_empty());
-        assert!(configs_for(dir.path()).is_empty());
+        let r = configs_for(dir.path());
+        assert!(r.configs.is_empty());
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
     /// A config file the daemon cannot read must not make the repo look empty:
@@ -498,10 +675,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("bondsymphonic.toml"), "[[run]\nname = 1").unwrap();
         std::fs::write(dir.path().join("manage.py"), "#!/usr/bin/env python\n").unwrap();
-        let v = configs_for(dir.path());
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].name, "django");
-        assert_eq!(v[0].source, RunConfigSource::Detected);
+        let r = configs_for(dir.path());
+        assert_eq!(r.configs.len(), 1);
+        assert_eq!(r.configs[0].name, "django");
+        assert_eq!(r.configs[0].source, RunConfigSource::Detected);
+        // And the reason is carried to the client rather than only logged.
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(
+            r.warnings[0].contains("bondsymphonic.toml"),
+            "{:?}",
+            r.warnings
+        );
 
         // A file that parses but declares no run is the same fallback, without
         // the warning: `[network]`-only configs are an ordinary thing to write.
@@ -513,7 +697,7 @@ mod tests {
         let cfg = load_repo_config(dir.path()).unwrap().unwrap();
         assert!(cfg.run.is_empty());
         assert_eq!(cfg.network.allow, vec!["a.example".to_string()]);
-        assert_eq!(configs_for(dir.path())[0].name, "django");
+        assert_eq!(configs_for(dir.path()).configs[0].name, "django");
     }
 
     /// The detection order is the order the spec lists the heuristics in, and

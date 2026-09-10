@@ -233,11 +233,16 @@ impl RunManager {
         // repo's: the workspace is a checkout of a branch of its own, and a run
         // config an agent added there is the one the user is looking at.
         let worktree = ws.worktree_path.clone();
+        // Only the runs that parsed; the warnings belong to
+        // `repo.detect_run_configs`, which is where a person is looking at the
+        // list. A name that reaches here and is not in it was either never
+        // declared or was dropped, and both are the same `not_found` below.
         let configs =
             tokio::task::spawn_blocking(move || crate::runs::config::configs_for(&worktree))
                 .await
                 .map_err(|e| RpcError::internal(e.to_string()))?;
         let config = configs
+            .configs
             .into_iter()
             .find(|c| c.name == p.config_name)
             .ok_or_else(|| {

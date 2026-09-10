@@ -1,5 +1,5 @@
 use anyhow::Result;
-use bondsymphonic_daemon::daemon::Daemon;
+use bondsymphonic_daemon::daemon::{Daemon, InstanceLock, InstanceLockError, BUSY_EXIT_CODE};
 use bondsymphonic_daemon::net;
 use bondsymphonic_daemon::sandbox;
 use bondsymphonic_daemon::server::dispatch::SystemHandler;
@@ -99,6 +99,29 @@ async fn serve(args: Args) -> Result<()> {
             .unwrap_or_else(|| PathBuf::from(".bondsymphonic"))
     });
     std::fs::create_dir_all(&data_dir)?;
+
+    // Before anything in the data directory is read or written, and before the
+    // port line goes out: a second daemon must not restore workspaces, start
+    // sandboxes or answer a client on a data directory that is already owned.
+    // Bound to this scope, so the lock lives exactly as long as the daemon and
+    // is dropped by the operating system even when the daemon is killed.
+    //
+    // The message goes to stderr rather than through `tracing`, and the exit
+    // status is its own, because both are read by the IDE's launcher: it
+    // restarts a daemon that exits, and this is the one exit that restarting
+    // cannot fix.
+    let _instance = match InstanceLock::acquire(&data_dir) {
+        Ok(lock) => lock,
+        Err(e @ InstanceLockError::Busy(_)) => {
+            eprintln!("{e}");
+            std::process::exit(BUSY_EXIT_CODE);
+        }
+        // A lock file that cannot be opened at all is an ordinary startup
+        // failure: it says nothing about another daemon, and the launcher's
+        // retry is as reasonable a response to it as to a port it could not
+        // bind.
+        Err(e) => return Err(e.into()),
+    };
 
     let backend_name = if args.no_sandbox || !cfg!(target_os = "linux") {
         "noop"

@@ -70,13 +70,30 @@ bondsymphonic-daemon forward --socket PATH --port N     # in-sandbox forwarder
 bondsymphonic-daemon proxy-shim --socket PATH           # (see 7.2)
 ```
 
-On start: load registry, bind `127.0.0.1:0`, generate a 32-byte random token,
-print `{"port":N,"token":"hex"}` as a single stdout line, then serve. Logs go to
-stderr and `~/.bondsymphonic/daemon.log`. The daemon exits when it receives
+On start: take the data directory's instance lock (below), load registry, bind
+`127.0.0.1:0`, generate a 32-byte random token, print `{"port":N,"token":"hex"}`
+as a single stdout line, then serve. Logs go to stderr and
+`~/.bondsymphonic/daemon.log`. The daemon exits when it receives
 `system.shutdown` or when stdin closes (the IDE holds stdin open; if the IDE dies,
 the daemon stops all sandboxes and exits).
 
+**One daemon per data directory.** Before anything in the data directory is read
+or written, the daemon takes an advisory exclusive lock on
+`<data_dir>/daemon.lock` and holds it for its whole life. A daemon that finds the
+lock held prints `another bondsymphonic-daemon owns <data_dir>` on stderr and
+exits with status **2** — its own code, because the IDE's launcher restarts a
+daemon that exits and this is the one exit restarting cannot fix. Two daemons on
+one data directory would each rewrite the other's `workspaces.json` and
+`agents.json`, restore the other's workspaces into sandboxes of their own, and
+race each other's merges and destroys over the same object stores.
+
+The lock is on an open file (`flock(LOCK_EX|LOCK_NB)` on Unix, a zero share mode
+on Windows), so the operating system releases it when the process ends however it
+ends. Nothing has to be cleaned up by hand and a `daemon.lock` left on disk means
+nothing on its own.
+
 Data directory default: `~/.bondsymphonic/` containing `workspaces.json`,
+`agents.json`, `daemon.lock`,
 `worktrees/<ws_id>/`, `homes/<ws_id>/`, `caches/<ws_id>/`, `transcripts/<agent_id>.ndjson`,
 `daemon.log`.
 
@@ -132,7 +149,14 @@ older daemon finds `agent_records` defaulted to empty, which it must read as
 remove from registry. With `force=false`, refuse if the worktree has uncommitted
 changes or unmerged commits and return `Conflict` with details.
 
-**Registry** is rewritten atomically (write temp, rename) after every change.
+**Registry** is rewritten atomically after every change, and so is `agents.json`
+(8.5): the bytes go to a sibling temporary whose name is unique per call
+(`.<file>.<pid>.<n>.tmp`), are flushed to the device with `sync_all`, and only
+then replace the file with a rename, with a best-effort fsync of the directory
+afterwards on Unix. The unique name matters as much as the rename: one fixed
+`<file>.tmp` is shared by every writer and by every earlier run of the daemon, so
+two saves at once can rename each other's half-written file into place, and one
+leftover at that name wedges the writer for good.
 On startup, each registered workspace is validated: if the worktree directory or
 the branch is gone, the workspace is marked `Error` rather than deleted, so the
 user can decide.
@@ -227,6 +251,15 @@ would hand the user a base branch that stops being readable when they clean up.
   remotes on request).
 - `git gc` / `pack-refs` inside the sandbox fail harmlessly.
 
+**Creating and removing a worktree runs no repository hooks.** `git worktree add`
+fires `post-checkout` and, for the branch it creates, `reference-transaction`;
+the `git branch -D` on the way out fires `reference-transaction` again. Neither
+call is the user typing a git command — they happen when the IDE opens or closes
+a workspace — so both go through the same pinned `Git` the rest of the daemon
+side uses, with `core.hooksPath` set to an empty daemon-owned directory (5.4).
+Opening a workspace must not execute code out of the repository being opened. The
+one exception stays the `pre-push` of **Create PR**, for the reason 5.4 gives.
+
 A `--no-git-protect` daemon flag mounts `.git` read-write for troubleshooting;
 `check_prereqs` reports whether protection is active.
 
@@ -236,6 +269,13 @@ A `--no-git-protect` daemon flag mounts `.git` read-write for troubleshooting;
   status `added|modified|deleted|renamed|untracked`.
 - `workspace.diff {path}`: returns base text (`git show <merge-base>:<path>`, empty
   if absent) and working-tree text. The IDE computes and renders the diff.
+- Every daemon-side git that can print a path runs with `-c core.quotePath=false`.
+  Git's default is to render each path byte above 0x7f as a C-style octal escape
+  and wrap the name in double quotes, so `håndbog.md` would reach the IDE as
+  `"h\303\245ndbog.md"` — a file the IDE cannot open and a name the user does not
+  recognise. It is set on the `Git` itself rather than per call, so a command
+  added later cannot be forgotten, and it applies to the conflict list of 5.4
+  (`git diff --name-only --diff-filter=U`) as much as to the lists here.
 
 ### 5.4 Merge, rebase, squash
 Run in the main repo by the daemon, never inside a sandbox:
@@ -740,6 +780,20 @@ allow = ["*.mycompany.com"]
 settings = ".claude/settings.json"   # optional
 ```
 
+**A bad `[[run]]` block costs that block and nothing else.** `name`, `command`
+and a non-zero `port` are what a run cannot do without, and they are checked per
+entry rather than by the parser: a block that is missing one of them, or that
+repeats a name an earlier block used, is dropped and reported as one line in
+`repo.detect_run_configs`'s `warnings`, while every other block loads. Requiring
+them at the parse level made one forgotten line discard the whole file and answer
+with detection instead, with the reason only in the daemon log.
+
+The same list carries the parse error of a file that will not parse at all, which
+is still a fall back to detection. `warnings` is for people: the IDE shows it
+beside the run list, and nothing in the daemon reads it. `run.start` sees only
+the entries that survived, so a name that was dropped is `NotFound` like any
+other name the repo never declared.
+
 ### 10.2 Auto-detection (when no file, or `repo.detect_run_configs` asks)
 Ordered heuristics, each yielding `RunConfig {name, command, port, source:
 "detected"}`:
@@ -810,12 +864,21 @@ shell command.
 - Integration (`tests/`, Linux only, `#[cfg(target_os = "linux")]`):
   - `workspace_integration`: temp repo → create → commit inside worktree via
     sandboxed `git` → `changes` lists it → `merge` succeeds and base contains it →
-    `repack` made objects visible → destroy cleans everything.
+    the objects were **absorbed** (5.2), so the base branch reads through a git
+    carrying no `GIT_ALTERNATE_OBJECT_DIRECTORIES` → destroy cleans everything:
+    worktree, private objects, home, cache, run directory, agent records and
+    transcripts. One test walks the whole chain and asserts each directory is
+    gone. (Earlier drafts said "`repack` made objects visible"; `repack -a -d` is
+    not what the daemon does, and 5.2 says why.)
   - `sandbox_integration`: sandboxed `touch /etc/x` fails; `touch $HOME/x`
-    succeeds; `git update-ref refs/heads/main` inside fails; write to
-    `refs/heads/bs/<name>/work` succeeds.
+    succeeds; `git update-ref refs/heads/main <sha>` inside fails;
+    `git update-ref refs/heads/bs/<name>/work <sha>` inside succeeds.
   - `network_integration`: a local TCP server on the host is unreachable directly
-    from the sandbox; reachable via proxy only when allowlisted; a `python -m
-    http.server` inside the sandbox is reachable on the bridged host port.
+    from the sandbox; reachable via proxy only when allowlisted. The third case —
+    a `python3 -m http.server` inside the sandbox reachable on the bridged host
+    port — lives in `sandbox_integration` beside the rest of the bridge tests,
+    because it needs a real workspace and a real run rather than a bare sandbox.
+  - `instance_lock`: a second daemon on one data directory exits 2 with the
+    message of 3, and the directory is free again once the first one is gone.
 - Tests skip with a clear message (not fail) when `bwrap` is unavailable, so
   `cargo test` on a bare CI box still passes the non-sandbox tests.

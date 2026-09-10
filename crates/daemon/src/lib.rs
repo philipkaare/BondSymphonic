@@ -11,4 +11,5 @@ pub mod runs;
 pub mod sandbox;
 pub mod server;
 pub mod setup;
+pub mod util;
 pub mod workspace;

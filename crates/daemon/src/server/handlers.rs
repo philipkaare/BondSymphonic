@@ -46,25 +46,25 @@ impl Handler for WorkspaceHandler {
                 // configurations: creating a workspace from this repo extends
                 // what its agent may reach, and the dialog that offers Create
                 // is the last place a person can see that before it happens.
-                let (configs, network_allow) = tokio::task::spawn_blocking(move || {
+                let (runs, network_allow) = tokio::task::spawn_blocking(move || {
                     let root = std::path::Path::new(&p.path);
-                    let configs = crate::runs::config::configs_for(root);
+                    let runs = crate::runs::config::configs_for(root);
                     let allow = crate::runs::config::load_repo_config(root)
                         .ok()
                         .flatten()
                         .map(|c| c.network.allow)
                         .unwrap_or_default();
-                    (configs, allow)
+                    (runs, allow)
                 })
                 .await
                 .map_err(|e| RpcError::internal(e.to_string()))?;
                 ok(DetectRunConfigsResult {
-                    configs,
+                    configs: runs.configs,
                     network_allow,
-                    // Filled in Milestone 7 Task 2, where a `[[run]]` entry
-                    // that cannot be parsed becomes one line here instead of
-                    // taking the whole file down with it.
-                    warnings: Vec::new(),
+                    // One line per `[[run]]` block that had to be dropped, or
+                    // per file that would not parse. The IDE shows these beside
+                    // the run list; nothing else in the daemon reads them.
+                    warnings: runs.warnings,
                 })
             }
             Request::WorkspaceCreate(p) => ok(lifecycle::create(d, p).await?),

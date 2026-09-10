@@ -144,3 +144,43 @@ fn a_registry_file_without_a_version_is_treated_as_the_oldest_one() {
         bondsymphonic_daemon::net::allowlist::DEFAULT_ALLOW.len()
     );
 }
+
+/// A daemon killed mid-write leaves whatever it was writing behind. If the
+/// writer always uses the same sibling name, one such leftover — or one
+/// concurrent writer — is enough to make every later save write over the other
+/// one's half-finished file, or fail outright and never recover.
+///
+/// The directory is the version of that leftover no write can clear on its own,
+/// which is what makes this a fixed test rather than a race: a writer that
+/// reuses one fixed name can never save again, and one that picks a unique name
+/// per call is unaffected. The rename itself is still what makes the file whole
+/// or untouched and never half of either.
+#[test]
+fn a_leftover_at_the_old_fixed_temporary_name_does_not_wedge_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workspaces.json");
+    let reg = Registry::load(&path).unwrap();
+    let squatter = dir.path().join("workspaces.json.tmp");
+    std::fs::create_dir(&squatter).unwrap();
+
+    reg.insert(sample("ws_00000001", "a")).unwrap();
+    assert_eq!(Registry::load(&path).unwrap().list().len(), 1);
+
+    reg.insert(sample("ws_00000002", "b")).unwrap();
+    let names: Vec<String> = Registry::load(&path)
+        .unwrap()
+        .list()
+        .into_iter()
+        .map(|w| w.name)
+        .collect();
+    assert_eq!(names, vec!["a", "b"]);
+
+    let left: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "workspaces.json" && n != "workspaces.json.tmp")
+        .collect();
+    assert!(left.is_empty(), "a temporary was left behind: {left:?}");
+    assert!(squatter.is_dir(), "and what was in the way is untouched");
+}

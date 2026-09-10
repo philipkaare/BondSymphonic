@@ -240,9 +240,10 @@ impl AgentRecords {
         removed
     }
 
-    /// Writes the file: a temporary beside it, then a rename over it, so a
-    /// daemon killed mid-write leaves either the old file or the new one and
-    /// never half of either.
+    /// Writes the file through [`crate::util::atomic::write_atomic`]: a unique
+    /// temporary beside it, synced, then renamed over it, so a daemon killed
+    /// mid-write leaves either the old file or the new one and never half of
+    /// either.
     ///
     /// A failure is logged rather than propagated. Losing the record of an
     /// agent costs the IDE its history after the next restart; refusing to
@@ -254,16 +255,11 @@ impl AgentRecords {
     }
 
     fn write(&self, records: &[AgentRecord]) -> std::io::Result<()> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
         let data = FileFormat {
             version: FORMAT_VERSION,
             agents: records.to_vec(),
         };
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&data)?)?;
-        std::fs::rename(&tmp, &self.path)
+        crate::util::atomic::write_atomic(&self.path, &serde_json::to_vec_pretty(&data)?)
     }
 }
 
@@ -487,6 +483,42 @@ mod tests {
             "the evidence must survive"
         );
         assert!(!dir.path().join("agents.json.tmp").exists());
+    }
+
+    /// A leftover at the one name a fixed sibling temporary would use must not
+    /// wedge the writer for good.
+    ///
+    /// A daemon killed mid-write leaves its temporary behind, and a records
+    /// file is rewritten on every agent start, session id and exit. A directory
+    /// at that name is the leftover no write can clear on its own: a writer
+    /// that reuses one fixed name can never record another agent, while one
+    /// that picks a unique name per call carries on.
+    #[test]
+    fn a_leftover_at_the_old_fixed_temporary_name_does_not_wedge_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.json");
+        let squatter = dir.path().join("agents.json.tmp");
+        std::fs::create_dir(&squatter).unwrap();
+
+        let records = AgentRecords::new(&path);
+        records.upsert(record("ag_1", "ws_1"));
+        records.upsert(record("ag_2", "ws_1"));
+        assert_eq!(
+            records
+                .load()
+                .iter()
+                .map(|r| r.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ag_1", "ag_2"]
+        );
+        assert!(squatter.is_dir(), "what was in the way is untouched");
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "agents.json" && n != "agents.json.tmp")
+            .collect();
+        assert!(left.is_empty(), "a temporary was left behind: {left:?}");
     }
 
     /// The tmp file is never left where a later `load` could pick it up, and

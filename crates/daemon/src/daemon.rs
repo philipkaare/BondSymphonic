@@ -15,8 +15,143 @@ use crate::workspace::{lifecycle, DataDirs, Workspace};
 use bondsymphonic_proto::*;
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// One daemon per data directory, enforced with an advisory lock on
+/// `<data_dir>/daemon.lock`.
+///
+/// Two daemons on one data directory is not a slow start, it is two owners of
+/// one registry, one agents file and one set of worktrees: each rewrites the
+/// other's state, each restores the other's workspaces into sandboxes of its
+/// own, and the second one's `workspace.destroy` deletes objects the first
+/// one's merge is copying out. The IDE's launcher restarts the daemon whenever
+/// it exits, and a user who starts a second IDE — or whose first one is still
+/// shutting down — is exactly how the second daemon gets started.
+///
+/// The lock is *advisory* and taken on an open file, which is what makes it
+/// self-healing: a daemon that is killed, or whose machine loses power, drops
+/// it when the operating system closes the handle. Nothing has to be cleaned up
+/// by hand, and a `daemon.lock` left on disk means nothing on its own.
+///
+/// The handle is held for the daemon's whole life and released when the process
+/// ends. It is deliberately not stored in [`Daemon`]: it belongs to the process,
+/// not to the shared state, and a test that builds a `Daemon` over a temporary
+/// directory must not have to take a lock to do it.
+pub struct InstanceLock {
+    /// Kept only to hold the lock open; the lock is the file descriptor.
+    _file: std::fs::File,
+}
+
+/// Why a data directory could not be claimed.
+#[derive(Debug)]
+pub enum InstanceLockError {
+    /// Another live daemon holds it.
+    Busy(PathBuf),
+    /// The lock file itself could not be opened or locked.
+    Io(PathBuf, std::io::Error),
+}
+
+impl std::fmt::Display for InstanceLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy(dir) => write!(f, "another bondsymphonic-daemon owns {}", dir.display()),
+            Self::Io(path, e) => write!(f, "cannot lock {}: {e}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for InstanceLockError {}
+
+/// The exit status a daemon that lost the race for its data directory ends with.
+///
+/// Its own code, not the 1 every other startup failure uses: the IDE's launcher
+/// restarts a daemon that exits, and "someone else already owns this" is the one
+/// failure that restarting cannot fix.
+pub const BUSY_EXIT_CODE: i32 = 2;
+
+impl InstanceLock {
+    pub fn path_in(data_dir: &Path) -> PathBuf {
+        data_dir.join("daemon.lock")
+    }
+
+    /// Claims `data_dir` for this process, or says who has it.
+    ///
+    /// The directory is created first: this runs before anything else in the
+    /// data directory is touched, so on a first start there is nothing there yet.
+    pub fn acquire(data_dir: &Path) -> Result<Self, InstanceLockError> {
+        let path = Self::path_in(data_dir);
+        if let Err(e) = std::fs::create_dir_all(data_dir) {
+            return Err(InstanceLockError::Io(path, e));
+        }
+        lock_exclusive(&path).map_err(|e| match e {
+            LockFailure::Busy => InstanceLockError::Busy(data_dir.to_path_buf()),
+            LockFailure::Io(e) => InstanceLockError::Io(path, e),
+        })
+    }
+}
+
+enum LockFailure {
+    Busy,
+    Io(std::io::Error),
+}
+
+/// Opens `path` and takes an exclusive lock on it without waiting.
+///
+/// Two different mechanisms, because the platforms have nothing in common here
+/// and neither needs a dependency:
+///
+/// * **Unix:** `flock(LOCK_EX | LOCK_NB)`. The lock belongs to the open file
+///   description, so it survives `exec` and is dropped by the kernel when the
+///   last descriptor for it closes — including when the process is killed.
+/// * **Windows:** the file is opened with a share mode of zero, which is the
+///   platform's own way of saying "only this handle". A second opener gets
+///   `ERROR_SHARING_VIOLATION`, and the claim ends when the handle closes.
+#[cfg(unix)]
+fn lock_exclusive(path: &Path) -> Result<InstanceLock, LockFailure> {
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(LockFailure::Io)?;
+    // SAFETY: `file` is open for the whole call and `flock` only takes a file
+    // descriptor and a flag word.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(InstanceLock { _file: file });
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(c) if c == libc::EWOULDBLOCK || c == libc::EAGAIN => Err(LockFailure::Busy),
+        _ => Err(LockFailure::Io(e)),
+    }
+}
+
+#[cfg(windows)]
+fn lock_exclusive(path: &Path) -> Result<InstanceLock, LockFailure> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    /// `ERROR_SHARING_VIOLATION`: someone else has the file open and did not
+    /// share it. That someone is the daemon that got here first.
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(path)
+    {
+        Ok(file) => Ok(InstanceLock { _file: file }),
+        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Err(LockFailure::Busy),
+        Err(e) => Err(LockFailure::Io(e)),
+    }
+}
 
 /// The handle the setup terminals run under, with the home it was built with.
 ///
