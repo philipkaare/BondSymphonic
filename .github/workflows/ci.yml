@@ -1,18 +1,91 @@
 name: ci
 on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  # The daemon only builds and runs on Linux: its sandbox is bubblewrap and its
+  # worktrees live on a Linux filesystem. This job is the gate for proto and
+  # daemon, and it owns the workspace-wide `cargo fmt` check as well.
   linux:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with: { components: clippy }
-      - run: sudo apt-get update && sudo apt-get install -y bubblewrap
-      - run: cargo test -p bondsymphonic-proto -p bondsymphonic-daemon
-      - run: cargo clippy -p bondsymphonic-proto -p bondsymphonic-daemon -- -D warnings
-  windows-proto:
+        with: { components: "clippy, rustfmt" }
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the daemon's runtime prerequisites
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap python3
+      # Every sandbox and network test skips with a printed reason when bwrap
+      # cannot create a user namespace, so a runner that blocks them would give
+      # a green job in which none of them ran. Ubuntu 24.04 restricts
+      # unprivileged user namespaces through AppArmor; relax that and then
+      # insist the check passes, so the log always says which suites ran.
+      - name: Check bubblewrap user namespaces
+        run: |
+          set -u
+          if bwrap --ro-bind / / --unshare-all true; then
+            echo "bwrap: user namespaces work -- the sandbox and network suites will RUN"
+            exit 0
+          fi
+          echo "bwrap: user namespaces blocked, relaxing kernel.apparmor_restrict_unprivileged_userns"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          if bwrap --ro-bind / / --unshare-all true; then
+            echo "bwrap: user namespaces work after the sysctl -- the sandbox and network suites will RUN"
+            exit 0
+          fi
+          echo "bwrap: user namespaces STILL BLOCKED -- the sandbox and network suites would SKIP" >&2
+          exit 1
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Test proto and daemon
+        run: cargo test -p bondsymphonic-proto -p bondsymphonic-daemon
+      - name: Clippy proto and daemon
+        run: cargo clippy -p bondsymphonic-proto -p bondsymphonic-daemon --all-targets -- -D warnings
+
+  # The IDE only builds on Windows: cxx-qt against the msvc2022_64 Qt kit, the
+  # keyring against the Windows credential store. This job also covers proto on
+  # Windows, which is what the old `windows-proto` job did on its own.
+  windows-ide:
     runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      # The Qt-backed tests create real QWidgets; the runner has no display.
+      QT_QPA_PLATFORM: offscreen
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p bondsymphonic-proto
+        with: { components: "clippy, rustfmt" }
+      - name: Install Qt 6.9.2 (msvc2022_64)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.9.2'
+          arch: 'win64_msvc2022_64'
+          cache: true
+      - uses: Swatinem/rust-cache@v2
+      # cxx-qt-build locates moc, rcc and the Qt headers through QMAKE. The
+      # install action exports QT_ROOT_DIR for the kit it unpacked; derive the
+      # qmake path from it and fail loudly if the kit is not where we expect,
+      # rather than letting the build fall back to some other Qt. The bin
+      # directory also goes on PATH so the test executables find Qt6Core.dll
+      # and friends at run time.
+      - name: Point QMAKE at the installed Qt
+        shell: pwsh
+        run: |
+          $qtBin = Join-Path $env:QT_ROOT_DIR 'bin'
+          $qmake = Join-Path $qtBin 'qmake.exe'
+          if (-not (Test-Path $qmake)) { throw "qmake not found at $qmake (QT_ROOT_DIR=$env:QT_ROOT_DIR)" }
+          "QMAKE=$qmake" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $qtBin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & $qmake -query QT_VERSION
+      - name: Format
+        run: cargo fmt --all -- --check
+      # `require-qt` turns each test's "QMAKE unset, skipping" escape hatch into
+      # a panic. Without it a runner that lost its Qt installation would report
+      # a green job in which every test that needs the runtime did nothing.
+      - name: Test proto and the IDE
+        run: cargo test -p bondsymphonic-proto -p bondsymphonic-ide --features bondsymphonic-ide/require-qt
+      - name: Clippy the IDE
+        run: cargo clippy -p bondsymphonic-ide --all-targets -- -D warnings
