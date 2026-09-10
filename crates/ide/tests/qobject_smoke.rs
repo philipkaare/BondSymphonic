@@ -1131,10 +1131,9 @@ fn a_qmake_on_the_path_counts_even_with_the_variable_unset() {
 fn complaints_about_the_repo_config_are_summarised_for_the_panel() {
     use bondsymphonic_ide::qobjects::run_panel::warning_status;
 
-    const NO_PORT: &str =
-        r#"bondsymphonic.toml: [[run]] #2 ("api") has no port; it is not offered"#;
+    const NO_PORT: &str = "bondsymphonic.toml: [[run]] #2 ('api') has no port; it is not offered";
     const NO_COMMAND: &str =
-        r#"bondsymphonic.toml: [[run]] #3 ("web") has no command; it is not offered"#;
+        "bondsymphonic.toml: [[run]] #3 ('web') has no command; it is not offered";
 
     assert_eq!(warning_status(&[]), "");
     // One complaint is the daemon's finished sentence, which already names the

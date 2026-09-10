@@ -458,8 +458,7 @@ fn a_denial_is_answered_for_the_workspace_it_was_raised_for() {
 /// worktree whose file is clean takes the previous worktree's complaints down.
 #[test]
 fn detection_warnings_are_held_per_workspace_and_replaced_on_the_next_detection() {
-    const NO_PORT: &str =
-        r#"bondsymphonic.toml: [[run]] #2 ("api") has no port; it is not offered"#;
+    const NO_PORT: &str = "bondsymphonic.toml: [[run]] #2 ('api') has no port; it is not offered";
 
     let mut runs = WorkspaceRuns::default();
     assert!(runs.warnings.is_empty());

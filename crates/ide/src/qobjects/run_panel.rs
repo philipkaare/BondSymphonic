@@ -216,7 +216,7 @@ const CONFIG_FILE: &str = "bondsymphonic.toml";
 ///
 /// A single complaint is shown as the daemon wrote it. Each entry is already a
 /// finished sentence naming the file
-/// (`bondsymphonic.toml: [[run]] #2 ("api") has no port; it is not offered`),
+/// (`bondsymphonic.toml: [[run]] #2 ('api') has no port; it is not offered`),
 /// so anything this added would be said twice.
 ///
 /// Several are counted rather than joined, and counted as *problems* rather
