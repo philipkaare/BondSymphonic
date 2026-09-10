@@ -59,6 +59,16 @@ QString statusDot() {
     return QString(QChar(0x25CF));
 }
 
+/// U+2022, the bullet, at the *tail* of a tab whose agent wants the user --
+/// today, one blocked on a permission request in a tab that is not in front.
+///
+/// A second glyph rather than a colour: the head dot already carries the
+/// daemon's status, and an agent waiting to be allowed a tool is still
+/// perfectly healthy. The tab's tooltip says what it is waiting for.
+QString attentionDot() {
+    return QStringLiteral(" ") + QString(QChar(0x2022));
+}
+
 } // namespace
 
 GroupBar::GroupBar(GroupModel* model, QWidget* parent) : QWidget(parent), m_model(model) {
@@ -196,6 +206,11 @@ void GroupBar::rebuild() {
                                        : statusDot() + QLatin1Char(' ') + name;
         if (!name.isEmpty() && !branch.isEmpty()) {
             label += separator() + branch;
+        }
+        // Last, so it is the same distance from the tab's edge whether or not
+        // the branch is spelled out beside the name.
+        if (!tabJson.value(QStringLiteral("attention")).toString().isEmpty()) {
+            label += attentionDot();
         }
         m_agentTabs->setTabText(i, label);
         m_agentTabs->setTabToolTip(i, m_model->tabTooltip(m_displayGroup, i));

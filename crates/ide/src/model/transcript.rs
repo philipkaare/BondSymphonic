@@ -32,6 +32,16 @@ const BASH_SUMMARY_MAX: usize = 80;
 /// Longest rendering of an unrecognised system message's data, in characters.
 const SYSTEM_DATA_MAX: usize = 200;
 
+/// How many live items one agent's transcript keeps before the oldest are
+/// folded away, per IDE design §13.
+///
+/// The transcript view builds one widget per item, so an uncapped list is one
+/// widget per message for the life of the tab -- tens of thousands on a day-long
+/// session, all of them laid out on every resize. Nothing is thrown away: what
+/// comes off the top goes into [`TranscriptItem::Earlier`], which puts it all
+/// back when the user clicks it.
+pub const MAX_LIVE_ITEMS: usize = 2_000;
+
 /// The `System` subtype the daemon records an answered permission request
 /// under. Wire format, shared with `crates/daemon/src/agents/claude.rs` by
 /// value: the two crates share `bondsymphonic-proto`, not this string's
@@ -69,6 +79,13 @@ pub enum TranscriptItem {
     System {
         text: String,
     },
+    /// The fold: `count` older items held out of the list, and the label the
+    /// view paints on the button that puts them back. Only ever the first item,
+    /// and only ever one.
+    Earlier {
+        count: usize,
+        text: String,
+    },
 }
 
 /// A tool call waiting for the user's answer. Everything the permission bar
@@ -96,6 +113,10 @@ pub enum LiveEvent {
 pub enum Applied {
     Appended(usize),
     Changed(usize),
+    /// The item list was rebuilt around the message rather than extended, so
+    /// every index the view is holding has moved. Only [`MAX_LIVE_ITEMS`]
+    /// folding produces this, and the view answers it with a full rebuild.
+    Reset,
     Nothing,
 }
 
@@ -103,6 +124,11 @@ pub enum Applied {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Transcript {
     pub items: Vec<TranscriptItem>,
+    /// What the fold has taken off the top, oldest first, and whether the user
+    /// has asked for it back. Private: the view reads `items`, and these two
+    /// only ever move through [`Transcript::expand_earlier`].
+    earlier: Vec<TranscriptItem>,
+    earlier_expanded: bool,
     pub state: AgentState,
     /// The daemon's explanation of the state, or empty.
     pub state_detail: String,
@@ -123,6 +149,8 @@ impl Default for Transcript {
     fn default() -> Self {
         Self {
             items: Vec::new(),
+            earlier: Vec::new(),
+            earlier_expanded: false,
             state: AgentState::Idle,
             state_detail: String::new(),
             cost_usd: 0.0,
@@ -461,7 +489,77 @@ impl Transcript {
 
     fn push(&mut self, item: TranscriptItem) -> Applied {
         self.items.push(item);
+        if self.fold_earlier() {
+            // Every index moved, so the appended-at-N the caller would
+            // otherwise get would name the wrong row.
+            return Applied::Reset;
+        }
         Applied::Appended(self.items.len() - 1)
+    }
+
+    /// Moves the oldest live items into `earlier` until at most
+    /// [`MAX_LIVE_ITEMS`] are left, and keeps the block that stands for them
+    /// at the head of the list. True when anything moved.
+    ///
+    /// Does nothing once the user has expanded the block: they asked to see the
+    /// whole conversation, and re-folding it under them would make the button
+    /// undo itself.
+    fn fold_earlier(&mut self) -> bool {
+        if self.earlier_expanded {
+            return false;
+        }
+        let had_block = matches!(self.items.first(), Some(TranscriptItem::Earlier { .. }));
+        let start = usize::from(had_block);
+        let live = self.items.len() - start;
+        if live <= MAX_LIVE_ITEMS {
+            return false;
+        }
+        let moved: Vec<TranscriptItem> = self
+            .items
+            .drain(start..start + (live - MAX_LIVE_ITEMS))
+            .collect();
+        self.earlier.extend(moved);
+        let block = earlier_block(self.earlier.len());
+        if had_block {
+            self.items[0] = block;
+        } else {
+            self.items.insert(0, block);
+        }
+        true
+    }
+
+    /// Puts every folded item back, in order, and stops folding for the rest of
+    /// this transcript's life. False when nothing is being held back.
+    ///
+    /// The cap is a default for a list nobody asked to read all of, not a
+    /// quota: a user who clicked "load earlier" has said which they want, and
+    /// a second fold would take it away again while they were reading.
+    pub fn expand_earlier(&mut self) -> bool {
+        if self.earlier.is_empty() {
+            return false;
+        }
+        if matches!(self.items.first(), Some(TranscriptItem::Earlier { .. })) {
+            self.items.remove(0);
+        }
+        let mut all = std::mem::take(&mut self.earlier);
+        all.append(&mut self.items);
+        self.items = all;
+        self.earlier_expanded = true;
+        true
+    }
+
+    /// How many items are folded away, for a caller that wants to say so
+    /// without reading the block out of `items`.
+    pub fn earlier_count(&self) -> usize {
+        self.earlier.len()
+    }
+}
+
+/// The block that stands for `count` folded items.
+fn earlier_block(count: usize) -> TranscriptItem {
+    TranscriptItem::Earlier {
+        count,
+        text: format!("Load earlier ({count})"),
     }
 }
 

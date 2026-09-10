@@ -156,6 +156,18 @@ pub mod qobject {
         #[qinvokable]
         fn configs_json(self: &RunPanelModel) -> QString;
 
+        /// What `repo.detect_run_configs` refused to load for this workspace,
+        /// one line per `[[run]]` entry, joined with newlines. Empty when the
+        /// file was clean or there was none. The panel hangs this on the
+        /// configuration combo as its tooltip.
+        #[qinvokable]
+        fn config_warnings(self: &RunPanelModel) -> QString;
+
+        /// The same, as the one line the panel shows under the row:
+        /// "1 run config ignored: ...". Empty when there is nothing to say.
+        #[qinvokable]
+        fn config_warning_status(self: &RunPanelModel) -> QString;
+
         /// The selected configuration as a JSON `RunConfig`, or the literal
         /// `null`. The port hint is read out of this.
         #[qinvokable]
@@ -186,6 +198,21 @@ struct Subscription {
     unsubscribe: Option<Unsubscribe>,
     /// The connection this was taken on; see [`needs_resubscribe`].
     generation: u64,
+}
+
+/// The one line the panel shows under its row for run configurations the
+/// daemon refused to load: "1 run config ignored: <reason>".
+///
+/// Pure, so the wording is settled without a Qt event loop. The reasons are the
+/// daemon's own sentences, joined rather than summarised: the user's next move
+/// is to open `bondsymphonic.toml` and fix the entry each one names, and a
+/// count on its own would not tell them which.
+pub fn warning_status(warnings: &[String]) -> String {
+    match warnings.len() {
+        0 => String::new(),
+        1 => format!("1 run config ignored: {}", warnings[0]),
+        n => format!("{n} run configs ignored: {}", warnings.join("; ")),
+    }
 }
 
 /// Whether a run has to be subscribed to now.
@@ -265,8 +292,8 @@ fn report(qt: &QtHandle, message: String) {
 /// state of the panel, and a run list that could not be read must not leave a
 /// stale one behind claiming another workspace's runs.
 async fn detect_and_list(shared: Shared, qt: QtHandle, workspace: String, worktree: String) {
-    let configs = if worktree.is_empty() {
-        Vec::new()
+    let (configs, warnings) = if worktree.is_empty() {
+        (Vec::new(), Vec::new())
     } else {
         let params = RepoPathParams {
             path: worktree.clone(),
@@ -276,10 +303,10 @@ async fn detect_and_list(shared: Shared, qt: QtHandle, workspace: String, worktr
             .request::<DetectRunConfigsResult>(Request::RepoDetectRunConfigs(params))
             .await
         {
-            Ok(res) => res.configs,
+            Ok(res) => (res.configs, res.warnings),
             Err(e) => {
                 report(&qt, format!("repo.detect_run_configs failed: {e}"));
-                Vec::new()
+                (Vec::new(), Vec::new())
             }
         }
     };
@@ -297,7 +324,7 @@ async fn detect_and_list(shared: Shared, qt: QtHandle, workspace: String, worktr
             Vec::new()
         }
     };
-    let _ = qt.queue(move |q| q.apply_detection(workspace, configs, runs));
+    let _ = qt.queue(move |q| q.apply_detection(workspace, configs, warnings, runs));
 }
 
 /// Follows one run until it finishes or the panel lets go of it.
@@ -629,6 +656,20 @@ impl qobject::RunPanelModel {
         }
     }
 
+    pub fn config_warnings(&self) -> QString {
+        match self.current() {
+            Some(entry) => QString::from(&entry.warnings.join("\n")),
+            None => QString::from(""),
+        }
+    }
+
+    pub fn config_warning_status(&self) -> QString {
+        match self.current() {
+            Some(entry) => QString::from(&warning_status(&entry.warnings)),
+            None => QString::from(""),
+        }
+    }
+
     pub fn selected_config_json(&self) -> QString {
         match self.current() {
             Some(entry) => QString::from(&entry.selected_config_json()),
@@ -696,6 +737,7 @@ impl qobject::RunPanelModel {
         mut self: Pin<&mut Self>,
         workspace: String,
         configs: Vec<RunConfig>,
+        warnings: Vec<String>,
         runs: Vec<RunInfo>,
     ) {
         self.as_mut().end_request();
@@ -707,6 +749,7 @@ impl qobject::RunPanelModel {
                 return;
             };
             entry.set_configs(configs);
+            entry.set_warnings(warnings);
             entry.apply_list(runs);
         }
         // The daemon's list is authoritative: a run it no longer has is one

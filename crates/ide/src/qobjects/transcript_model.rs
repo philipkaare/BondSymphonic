@@ -142,6 +142,12 @@ pub mod qobject {
         /// as null, so the daemon starts a fresh session.
         #[qinvokable]
         fn restart_options_json(self: &TranscriptModel) -> QString;
+
+        /// Puts the items the transcript folded away back on the list, and
+        /// emits `resetItems()` when there were any. This is what the "load
+        /// earlier" block's button calls.
+        #[qinvokable]
+        fn expand_earlier(self: Pin<&mut TranscriptModel>) -> bool;
     }
 
     impl cxx_qt::Threading for TranscriptModel {}
@@ -481,6 +487,14 @@ impl qobject::TranscriptModel {
         ))
     }
 
+    pub fn expand_earlier(mut self: Pin<&mut Self>) -> bool {
+        if !self.as_mut().rust_mut().transcript.expand_earlier() {
+            return false;
+        }
+        self.reset_items();
+        true
+    }
+
     pub fn set_collapsed(mut self: Pin<&mut Self>, index: i32, collapsed: bool) {
         let Ok(i) = usize::try_from(index) else {
             return;
@@ -504,6 +518,9 @@ impl qobject::TranscriptModel {
         match applied {
             Applied::Appended(i) => self.as_mut().item_appended(index_of(i)),
             Applied::Changed(i) => self.as_mut().item_changed(index_of(i)),
+            // The transcript folded its oldest items away, so every index the
+            // view holds has moved and only a rebuild is correct.
+            Applied::Reset => self.as_mut().reset_items(),
             Applied::Nothing => {}
         }
         self.sync_pending();
@@ -690,8 +707,14 @@ impl qobject::TranscriptModel {
 ///
 /// A string that is not a JSON object is replaced by one rather than refused:
 /// the point of the call is to produce options that can start an agent, and
-/// the daemon's own defaults are a working agent. `None` for the session
-/// removes the key instead of writing null, so the request asks for a fresh
+/// the daemon's own defaults are a working agent.
+///
+/// `session` is the id the transcript last saw, and it wins when there is one:
+/// it is the newer of the two. `None` leaves whatever `resume_session` the
+/// options already carry, which for a restored tab is the id the daemon
+/// reported in `AgentSummary` -- the daemon holds a resumable id even when the
+/// transcript is damaged, empty or was never served. A tab with neither ends up
+/// with the key absent rather than null, so the request asks for a fresh
 /// session rather than for one named "nothing".
 pub fn restart_options(options_json: &str, session: Option<&str>) -> String {
     let mut options = serde_json::from_str::<serde_json::Value>(options_json)
@@ -706,8 +729,18 @@ pub fn restart_options(options_json: &str, session: Option<&str>) -> String {
                     serde_json::Value::String(session.to_owned()),
                 );
             }
+            // The tab's own id is the fallback, so nothing is removed here.
+            // A key holding null or a non-string is dropped rather than sent:
+            // the daemon would refuse it, and "resume nothing" is not what a
+            // hand-edited session file meant.
             None => {
-                map.remove("resume_session");
+                let usable = map
+                    .get("resume_session")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| !id.is_empty());
+                if !usable {
+                    map.remove("resume_session");
+                }
             }
         }
     }

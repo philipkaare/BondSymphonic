@@ -447,3 +447,30 @@ fn a_denial_is_answered_for_the_workspace_it_was_raised_for() {
         "no toast on screen, but this workspace queued the host"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Run configurations the daemon could not load (M7 Task 3).
+// ---------------------------------------------------------------------------
+
+/// `repo.detect_run_configs` answers with one `warnings` line per `[[run]]`
+/// entry it refused, and loads the rest. The panel holds them beside the
+/// configurations they were detected with, so switching to a worktree whose
+/// file is clean takes the previous worktree's complaints down.
+#[test]
+fn detection_warnings_are_held_per_workspace_and_replaced_on_the_next_detection() {
+    let mut runs = WorkspaceRuns::default();
+    assert!(runs.warnings.is_empty());
+
+    runs.set_configs(vec![config("dev", 5173)]);
+    runs.set_warnings(vec!["run \"api\": no port".to_owned()]);
+    assert_eq!(runs.warnings, vec!["run \"api\": no port".to_owned()]);
+    assert_eq!(
+        runs.selected.as_deref(),
+        Some("dev"),
+        "the good entry loads"
+    );
+
+    // The next detection is the whole answer, so a fixed file clears the line.
+    runs.set_warnings(Vec::new());
+    assert!(runs.warnings.is_empty());
+}

@@ -153,6 +153,16 @@ private:
     /// only frames it.
     void updateCostLabel();
     void updateWorkspaceStatus();
+    /// Marks or unmarks the tab whose agent just changed state, so a permission
+    /// request raised by an agent the user is *not* looking at is visible from
+    /// wherever they are: a dot on that tab and a line in the status bar.
+    ///
+    /// Driven by `agent.state` rather than by the permission bar, because the
+    /// bar lives on the workspace's own pane and a tab that has never been
+    /// opened has no pane at all. The daemon moves the agent off
+    /// `waiting_permission` as soon as a reply reaches it, which is what takes
+    /// the mark down again.
+    void noteAgentAttention(const QString& agentId, const QString& state);
     /// The tab the group model has selected, or an empty object when none is.
     QJsonObject activeTab() const;
     /// The workspace the Explorer, the panes and a newly opened file belong to.
@@ -213,6 +223,10 @@ private:
     QLabel* m_daemonLabel = nullptr;
     QLabel* m_sandboxLabel = nullptr;
     QLabel* m_branchLabel = nullptr;
+    /// "<agent> is waiting for permission" for the first tab that is asking,
+    /// or hidden. The sentence is the model's, so it and the tab's tooltip
+    /// cannot word it differently.
+    QLabel* m_attentionLabel = nullptr;
     QLabel* m_costLabel = nullptr;
     /// The status bar's way back to the setup page, shown only while a
     /// non-blocking prerequisite is failing.

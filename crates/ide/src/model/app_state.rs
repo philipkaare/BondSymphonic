@@ -277,6 +277,29 @@ pub struct AgentTab {
     /// used to say.
     #[serde(default)]
     pub op_error: Option<String>,
+    /// Why this tab wants the user, as the sentence both the tab bar and the
+    /// status bar show, or empty for a tab that is not asking for anything.
+    ///
+    /// Today the only writer is a permission request raised by an agent in a
+    /// tab the user is *not* looking at: the permission bar lives on the
+    /// workspace's own pane, so without this the question is invisible until
+    /// they happen to switch to it. Held as the finished sentence rather than
+    /// as a flag so the dot and the hint cannot word it differently.
+    ///
+    /// Not persisted as anything meaningful: a session file written while a
+    /// question was open reloads against a daemon that has since answered or
+    /// forgotten it, and `agent.state` says what is true now.
+    #[serde(default)]
+    pub attention: String,
+}
+
+/// The sentence a tab carries while its agent is waiting to be allowed a tool.
+///
+/// One function so the tab's dot, its tooltip and the status bar hint are the
+/// same words; `name` is the workspace's, which is what the user named the
+/// agent and what the tab is labelled with.
+pub fn permission_attention(name: &str) -> String {
+    format!("{name} is waiting for permission")
 }
 
 impl AgentTab {
@@ -338,6 +361,7 @@ impl AgentTab {
             agent_detail: String::new(),
             options_json: agent.map(restart_options_json).unwrap_or_default(),
             op_error: None,
+            attention: String::new(),
         }
     }
 }
@@ -348,15 +372,22 @@ impl AgentTab {
 /// Only the keys that are set, so an agent started with nothing leaves the
 /// field empty -- which is what `TranscriptModel::restartOptions` reads as
 /// "the daemon's defaults", and is honest about there being no choice to
-/// restore. `resume_session` is deliberately not seeded from the summary: the
-/// transcript replay recovers the session id from the messages themselves, and
-/// that is the id a Restart resumes from.
+/// restore.
+///
+/// `resume_session` is seeded from the summary and then *overridden* by the
+/// transcript when the replay finds a newer id. The transcript is the better
+/// source when it has one, but it is not always able to have one: a history
+/// the daemon could not serve, or one that never reached a `result` message,
+/// leaves it with nothing while the daemon still holds the id the agent
+/// reported. Restarting into a fresh session there loses the conversation the
+/// user is looking at, which is the one thing Restart exists to keep.
 fn restart_options_json(agent: &AgentSummary) -> String {
     let mut options = serde_json::Map::new();
     for (key, value) in [
         ("command", &agent.command),
         ("model", &agent.model),
         ("permission_mode", &agent.permission_mode),
+        ("resume_session", &agent.session_id),
     ] {
         if let Some(value) = value {
             options.insert(key.to_owned(), serde_json::Value::String(value.clone()));
@@ -382,6 +413,20 @@ pub struct Workspaces {
     pub groups: Vec<Group>,
     pub active_group: usize,
     pub active_tab: usize,
+    /// The next number [`Workspaces::allocate_group_id`] will try.
+    ///
+    /// A group id is the handle the C++ side holds between two reads of
+    /// `state_json` -- the tab bar keeps one per strip -- so the model must
+    /// never hand the same id to two groups. The old scheme numbered a group
+    /// by its position (`grp_<len>`), which does exactly that the first time a
+    /// group in the middle is closed and another is made: the survivors keep
+    /// the ids they were built with, and `len` has gone backwards.
+    ///
+    /// Carried through `state_json` (defaulted for a file written before it
+    /// existed) so a round trip cannot reset it; `allocate_group_id` skips any
+    /// number already in use, which is what makes a defaulted 0 safe.
+    #[serde(default)]
+    next_group_id: usize,
 }
 
 impl Workspaces {
@@ -418,6 +463,7 @@ impl Workspaces {
             groups: Vec::new(),
             active_group: 0,
             active_tab: 0,
+            next_group_id: 0,
         };
         for persisted in groups {
             let mut tabs = Vec::new();
@@ -430,8 +476,9 @@ impl Workspaces {
                 }
                 tabs.push(AgentTab::from_workspace_info(info));
             }
+            let id = model.allocate_group_id();
             model.groups.push(Group {
-                id: format!("grp_{}", model.groups.len()),
+                id,
                 name: persisted.name.clone(),
                 tabs,
             });
@@ -495,6 +542,24 @@ impl Workspaces {
             }],
             active_group: 0,
             active_tab: 0,
+            next_group_id: 1,
+        }
+    }
+
+    /// A group id no group in this model is using, and a counter that has
+    /// moved past it.
+    ///
+    /// The loop is what makes the field's `#[serde(default)]` safe: a
+    /// `state.json` written before the counter existed deserialises with 0
+    /// beside groups already called `grp_0` and `grp_1`, and this walks past
+    /// them rather than reissuing one.
+    fn allocate_group_id(&mut self) -> String {
+        loop {
+            let id = format!("grp_{}", self.next_group_id);
+            self.next_group_id += 1;
+            if !self.groups.iter().any(|g| g.id == id) {
+                return id;
+            }
         }
     }
 
@@ -511,7 +576,7 @@ impl Workspaces {
         if let Some(existing) = self.groups.iter().position(|g| g.name == name) {
             return existing;
         }
-        let id = format!("grp_{}", self.groups.len());
+        let id = self.allocate_group_id();
         self.groups.push(Group {
             id,
             name: name.to_owned(),
@@ -709,6 +774,53 @@ impl Workspaces {
     /// to keep are still live in the daemon. A group being closed that *is*
     /// "Unsorted" is refused, because the tabs would have nowhere to go and
     /// the next `reconcile` would only make it again.
+    /// Marks the tab for `ws` as wanting the user, with `text` as the sentence
+    /// both the tab bar and the status bar show. False when that workspace is
+    /// not tracked, or when it already carries exactly this text.
+    ///
+    /// Separate from [`Workspaces::set_workspace_error`] because the two mean
+    /// different things and are answered differently: an error is a failed
+    /// request the user has to dismiss, and this is a question the agent is
+    /// blocked on, which goes away by itself as soon as it is answered.
+    pub fn set_workspace_attention(&mut self, ws: &WorkspaceId, text: &str) -> bool {
+        let Some((g, t)) = self.find(ws) else {
+            return false;
+        };
+        if self.groups[g].tabs[t].attention == text {
+            return false;
+        }
+        self.groups[g].tabs[t].attention = text.to_owned();
+        true
+    }
+
+    /// Takes the attention mark off `ws`. False when that workspace is not
+    /// tracked or was not carrying one, so a caller that clears on every state
+    /// change does not repaint the tab bar for nothing.
+    pub fn clear_workspace_attention(&mut self, ws: &WorkspaceId) -> bool {
+        let Some((g, t)) = self.find(ws) else {
+            return false;
+        };
+        if self.groups[g].tabs[t].attention.is_empty() {
+            return false;
+        }
+        self.groups[g].tabs[t].attention.clear();
+        true
+    }
+
+    /// The sentence for the status bar: the first tab, in the user's own group
+    /// and tab order, that is asking for something. `None` when nothing is.
+    ///
+    /// One line rather than a list: two agents waiting at once is possible, and
+    /// the dots on their tabs are what says how many. The status bar is a
+    /// pointer at the nearest one, not a summary.
+    pub fn attention(&self) -> Option<&str> {
+        self.groups
+            .iter()
+            .flat_map(|g| g.tabs.iter())
+            .map(|t| t.attention.as_str())
+            .find(|text| !text.is_empty())
+    }
+
     pub fn remove_group(&mut self, name: &str) -> bool {
         let Some(idx) = self.groups.iter().position(|g| g.name == name) else {
             return false;
@@ -970,6 +1082,7 @@ mod tests {
             agent_detail: String::new(),
             options_json: String::new(),
             op_error: None,
+            attention: String::new(),
         }
     }
 
@@ -1043,6 +1156,7 @@ mod tests {
             }],
             active_group: 0,
             active_tab: 0,
+            next_group_id: 1,
         };
         assert!(model.remove_group("Only"));
         assert_eq!(model.groups.len(), 1);

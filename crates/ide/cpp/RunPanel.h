@@ -64,6 +64,10 @@ private:
     /// Rebuilds the combo from `configsJson()` and puts it back on whatever the
     /// model says is selected.
     void rebuildConfigs();
+    /// Shows what the daemon refused to load out of `bondsymphonic.toml`: the
+    /// reasons as the combo's tooltip, and "N run config(s) ignored: ..." on
+    /// its own line under the row. Both go away when the file is clean.
+    void updateWarnings();
     /// Moves the combo onto `selectedConfig` without telling the model about a
     /// selection it made itself.
     void syncSelection();
@@ -126,6 +130,9 @@ private:
     QLabel* m_url = nullptr;
     QPushButton* m_open = nullptr;
     QLabel* m_status = nullptr;
+    /// The `[[run]]` entries the daemon could not load, or hidden when there
+    /// are none. Kept apart from `m_status`, which is the run's own news.
+    QLabel* m_warnings = nullptr;
     QFrame* m_toast = nullptr;
     QLabel* m_toastText = nullptr;
     QPushButton* m_allow = nullptr;

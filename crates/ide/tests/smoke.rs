@@ -303,11 +303,7 @@ impl Journals {
 
 #[test]
 fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
-    if std::env::var_os("QMAKE").is_none() {
-        eprintln!(
-            "smoke: skipped because QMAKE is unset, so the Qt runtime the IDE needs is not on \
-             PATH. Dot-source scripts\\env.ps1 and run again."
-        );
+    if bondsymphonic_ide::testing::skip_without_qt("smoke") {
         return;
     }
 

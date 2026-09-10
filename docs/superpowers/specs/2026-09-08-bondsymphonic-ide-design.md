@@ -241,9 +241,11 @@ using the same `RustHighlighter`.
 
 - `TranscriptModel` keeps `Vec<TranscriptItem>`: `User(text)`,
   `Assistant(text, streaming: bool)`, `ToolUse{id, name, input_json, result?,
-  is_error?, collapsed}`, `Result{cost, duration, turns}`, `System(text)`.
-  `assistant_delta` events append to the last streaming Assistant item;
-  `tool_result` attaches to the matching `ToolUse` by id.
+  is_error?, collapsed}`, `Result{cost, duration, turns}`, `System(text)` and
+  `Earlier{count, text}`. `assistant_delta` events append to the last streaming
+  Assistant item; `tool_result` attaches to the matching `ToolUse` by id.
+  `Earlier` is the fold described in §13: at most one, always first, and only
+  ever produced by the cap.
 - `TranscriptView` is a `QScrollArea` with a vertical layout of message frames.
   Assistant text is rendered as Markdown-lite (code fences, inline code, bold,
   lists) via Qt's Markdown support in `QLabel`/`QTextDocument`. Tool cards show
@@ -254,6 +256,16 @@ using the same `RustHighlighter`.
   tool name, summary, Allow / Deny buttons, and an "Always allow this tool for
   this session" checkbox (implemented by the IDE auto-answering subsequent
   requests for the same tool name).
+- The bar is on the workspace's own pane, so a request raised by an agent in a
+  tab that is **not** in front would otherwise be invisible until the user
+  happened to switch to it. Milestone 7: the window marks that tab instead --
+  `GroupModel::setWorkspaceAttention(ws, text)` puts a bullet after its label
+  and the sentence "<agent> is waiting for permission" in the status bar and in
+  the tab's tooltip; `clearWorkspaceAttention(ws)` takes both down. It is driven
+  by `agent.state` rather than by the bar, because a tab the user has never
+  opened has no pane at all, and it is cleared when the agent leaves
+  `waiting_permission` (which is what a reply reaching the daemon causes) or
+  when the user selects that tab.
 - Input box: multi-line, Enter sends, Shift+Enter newline. Disabled while the
   agent is working, except an Interrupt button.
 - On tab open, `agent.history` replays into the model before live events are
@@ -362,7 +374,18 @@ terminal tab bound to no agent. There is deliberately no field in
 
 - Qt Widgets only; no QtQuick, QtWebEngine, or QtNetwork modules linked.
 - Transcript items above 2,000 per agent are collapsed into a "load earlier"
-  block to bound widget count.
+  block to bound widget count. **Implemented in Milestone 7**
+  (`model::transcript::MAX_LIVE_ITEMS`): the oldest items move into the
+  transcript's own `earlier` list and a single `TranscriptItem::Earlier` block
+  labelled "Load earlier (N)" takes their place at the head, so the view never
+  holds more than 2,001 frames however long the session runs. Nothing is
+  discarded: clicking the block calls `TranscriptModel::expandEarlier`, which
+  puts every item back and stops folding for the rest of that tab's life -- a
+  user who asked to read the whole conversation must not have it taken away
+  again while they are reading. A fold during a live message reports
+  `Applied::Reset` rather than `Appended(n)`, because every index the view is
+  holding has moved. `model_tests.rs` pins the cap by feeding 2,500 messages
+  through and asserting the live count.
 - Terminal scrollback 10,000 lines per session.
 - Highlight trees are dropped for editor tabs not visible for 5 minutes and
   rebuilt on focus.
@@ -638,3 +661,28 @@ process, not BondSymphonic's.
 
   Runs in `cargo test` on Windows when Qt is present; skipped with a message
   otherwise.
+
+- **Qt-less runs skip loudly (`require-qt`).** `smoke.rs`, `reconnect_tests.rs`
+  and `restore_tests.rs` launch the IDE binary, so they need the Qt runtime on
+  `PATH` and cannot run without it. Each begins with
+  `bondsymphonic_ide::testing::skip_without_qt(<suite>)`, the one place that
+  decision is made: with `QMAKE` unset it prints
+  `SKIP: <suite>: QMAKE is unset, ...` on stdout and the test returns, so a
+  developer who has not dot-sourced `scripts\env.ps1` still gets a useful run of
+  the pure-Rust suites and can see, with `--nocapture`, exactly which tests did
+  nothing.
+
+  The `require-qt` cargo feature turns that skip into a panic. CI's Windows job
+  builds with it (`cargo test -p bondsymphonic-ide --features require-qt`, or
+  `--features bondsymphonic-ide/require-qt` when the invocation names more than
+  one package), so a build machine that has lost its Qt installation fails the
+  job instead of reporting a green run in which every test that needs the
+  runtime quietly passed without doing anything. The feature is off by default
+  and adds no code to the shipped binary.
+
+  `qobject_smoke.rs` and the other pure-Rust suites deliberately have no such
+  guard: they exercise library functions that need no Qt runtime, and skipping
+  them on a Qt-less machine would lose real coverage rather than protect it.
+  (Every test binary links Qt because the crate does, so a machine that cannot
+  load the Qt libraries at all fails to start them, which is a visible failure
+  and not a silent pass.)

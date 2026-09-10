@@ -36,6 +36,11 @@ const char* kStopped = "stopped";
 /// panel and re-reading `logText` show the same thing.
 constexpr int kLogLines = 2000;
 
+/// The combo's tooltip when the daemon had nothing to complain about. The
+/// warnings, when there are any, are appended to it rather than replacing it.
+const QString kConfigTip =
+    QStringLiteral("Run configuration, from bondsymphonic.toml or detected");
+
 /// The glyphs the state column uses: a run coming up, one serving, one that
 /// ended badly, and nothing running.
 const QString kGlyphStarting = QStringLiteral("◌");
@@ -126,7 +131,7 @@ void RunPanel::buildTopRow(QVBoxLayout* outer) {
     m_configs->setObjectName("RunConfigCombo");
     m_configs->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     m_configs->setMinimumContentsLength(16);
-    m_configs->setToolTip("Run configuration, from bondsymphonic.toml or detected");
+    m_configs->setToolTip(kConfigTip);
     row->addWidget(m_configs, 0);
 
     m_port = new QSpinBox(this);
@@ -164,6 +169,16 @@ void RunPanel::buildTopRow(QVBoxLayout* outer) {
     m_open->setToolTip("Open the running application in the system browser");
     row->addWidget(m_open, 0);
     outer->addLayout(row);
+
+    // Above the run's own status line and separate from it: an ignored `[[run]]`
+    // entry is a fact about the repository's file, not news about a run, and
+    // the two must not take turns in one label.
+    m_warnings = new QLabel(this);
+    m_warnings->setObjectName("RunWarningsLabel");
+    m_warnings->setTextFormat(Qt::PlainText);
+    m_warnings->setWordWrap(true);
+    m_warnings->setVisible(false);
+    outer->addWidget(m_warnings);
 
     m_status = new QLabel(this);
     m_status->setObjectName("RunStatusLabel");
@@ -291,7 +306,31 @@ void RunPanel::rebuildConfigs() {
     }
     m_configs->clear();
     runpanel::appendConfigItems(m_configs, m_model->configsJson());
+    updateWarnings();
     syncSelection();
+}
+
+void RunPanel::updateWarnings() {
+    if (m_model.isNull()) {
+        return;
+    }
+    // The daemon loads the `[[run]]` entries it can parse and reports the rest
+    // instead of discarding the whole file. An entry that is not in the combo
+    // and was not complained about leaves the user staring at a file they
+    // believe is correct, so both halves of the answer are shown: the reasons
+    // on the combo the entries are missing from, and one line under the row.
+    const QString detail = m_model->configWarnings();
+    m_configs->setToolTip(detail.isEmpty() ? kConfigTip
+                                           : kConfigTip + QStringLiteral("\n\n") + detail);
+    const QString status = m_model->configWarningStatus();
+    m_warnings->setText(status);
+    m_warnings->setToolTip(detail);
+    m_warnings->setVisible(!status.isEmpty());
+    if (!status.isEmpty()) {
+        tint(m_warnings, theme::renamed());
+    } else {
+        untint(m_warnings);
+    }
 }
 
 void RunPanel::syncSelection() {

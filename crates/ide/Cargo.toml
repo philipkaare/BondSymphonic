@@ -12,6 +12,14 @@ path = "src/main.rs"
 [lib]
 path = "src/lib.rs"
 
+[features]
+# CI's Windows job turns the Qt-less skip in the integration tests into a
+# panic. A build machine that lost its Qt installation must fail the job, not
+# report a green run in which every test that needs the runtime quietly did
+# nothing. Off by default so a developer without Qt still gets a useful run of
+# the pure-Rust suites.
+require-qt = []
+
 [dependencies]
 bondsymphonic-proto = { path = "../proto" }
 cxx = "1"

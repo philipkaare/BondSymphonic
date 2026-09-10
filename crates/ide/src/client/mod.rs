@@ -35,22 +35,32 @@ pub enum ClientError {
 }
 
 /// How long a request waits for its response before failing with [`ClientError::Timeout`].
-/// Matches the launcher's port-line timeout. Overridable per client with
+///
+/// A heuristic, not a derivation: it is the same thirty seconds the launcher
+/// gives the daemon to print its port line, chosen because it is comfortably
+/// above the daemon's typical worst case for an ordinary method and short
+/// enough that a hung daemon is reported rather than waited on. Nothing on the
+/// daemon side guarantees it. Overridable per client with
 /// [`DaemonClient::with_request_timeout`].
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What `workspace.merge` gets instead.
 ///
-/// The daemon allows itself 60 s per git command (`git::GIT_TIMEOUT`) and a merge
-/// is more than one of them, so 30 s is a wait shorter than the answer it is
-/// waiting for.
+/// Also a heuristic, sized above the daemon's typical worst case rather than
+/// computed from it: the daemon allows itself 60 s per git command
+/// (`git::GIT_TIMEOUT`) and a merge is more than one of them, so the 30 s
+/// default is a wait shorter than the answer it is waiting for. Two minutes is
+/// the round number above that, not a bound the daemon promises -- a merge on a
+/// repository large enough to exceed it still ends in a client-side timeout for
+/// an operation that is going to succeed.
 pub const MERGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// What `workspace.create_pr` gets instead.
 ///
-/// A pull request is `git push` (60 s) followed by `gh pr create` (120 s,
-/// `git::pr::GH_TIMEOUT`), so the daemon is willing to spend three minutes on a
-/// call the 30 s default abandons after thirty seconds. Abandoning it is worse
+/// A heuristic again, above the daemon's typical worst case: a pull request is
+/// `git push` (60 s) followed by `gh pr create` (120 s, `git::pr::GH_TIMEOUT`),
+/// so the daemon is willing to spend three minutes on a call the 30 s default
+/// abandons after thirty seconds. Abandoning it is worse
 /// than waiting: the push has already happened and the pull request is already
 /// being opened, so the user is shown "Pull request failed" for one that
 /// succeeded, and the retry that invites answers "a pull request for branch
@@ -61,9 +71,9 @@ pub const CREATE_PR_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 ///
 /// Keyed on the method name rather than passed in at each call site, so a wait
 /// cannot be forgotten at a new caller of an already-slow method: the two
-/// entries below are the two the daemon's own budget outlasts the default. A
-/// method this build has never heard of gets the default, which is the right
-/// answer for one whose cost nobody here knows.
+/// entries below are the two whose typical worst case on the daemon outlasts
+/// the default. A method this build has never heard of gets the default, which
+/// is the right answer for one whose cost nobody here knows.
 pub fn default_timeout_for(method: &str) -> Duration {
     match method {
         "workspace.merge" => MERGE_REQUEST_TIMEOUT,

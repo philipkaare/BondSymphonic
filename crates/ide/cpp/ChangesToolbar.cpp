@@ -25,6 +25,20 @@ constexpr int kMaxNamedConflicts = 6;
 const char* const kReasonBaseDirty = "base_dirty";
 const char* const kReasonObjectsStranded = "objects_stranded";
 
+/// What the Discard confirmation says is about to be lost.
+///
+/// A count the daemon could not give (-1) is left out rather than guessed at:
+/// "its 0 changed files will be lost" is the one wording that would talk a user
+/// into a discard they did not mean.
+QString discardWarning(int files) {
+    if (files < 0) {
+        return QStringLiteral("Its changed files and any unmerged commits will be lost.");
+    }
+    return QStringLiteral("Its %1 changed file%2 and any unmerged commits will be lost.")
+        .arg(files)
+        .arg(files == 1 ? QString() : QStringLiteral("s"));
+}
+
 } // namespace
 
 QString changestoolbar::conflictList(const QString& conflictsJson) {
@@ -236,24 +250,34 @@ void ChangesToolbar::onDiscard() {
     if (m_workspaceId.isEmpty()) {
         return;
     }
-    const int files = changedFiles();
-    // A count the daemon could not give is left out rather than guessed at:
-    // "its 0 changed files will be lost" is the one wording that would talk a
-    // user into a discard they did not mean.
-    const QString what = files < 0
-                             ? QStringLiteral("Its changed files and any unmerged commits will be "
-                                              "lost.")
-                             : QStringLiteral("Its %1 changed file%2 and any unmerged commits will "
-                                              "be lost.")
-                                   .arg(files)
-                                   .arg(files == 1 ? QString() : QStringLiteral("s"));
+    // The count this box names is the one thing that talks a user out of a
+    // discard they did not mean, so it is asked for here -- rather than on
+    // every `changesLoaded`, which put one `workspace.summary` on the wire per
+    // burst of agent output for a number nothing was showing.
+    const QString workspaceId = m_workspaceId;
+    requestSummary(workspaceId);
+
     QMessageBox box(this);
     box.setIcon(QMessageBox::Warning);
     box.setWindowTitle(QStringLiteral("Discard workspace"));
     box.setText(QStringLiteral("Discard %1?").arg(m_name));
-    box.setInformativeText(what);
+    box.setInformativeText(discardWarning(changedFiles()));
     box.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
     box.setDefaultButton(QMessageBox::Cancel);
+    // `exec` runs its own event loop, so the answer to the request above
+    // arrives while the box is up and the sentence is rewritten under the
+    // user rather than being one tab switch out of date. The connection is
+    // scoped to the box, so it is gone the moment the box is.
+    if (!m_controller.isNull()) {
+        QObject::connect(m_controller, &AppController::workspaceSummarized, &box,
+                         [this, &box, workspaceId](const QString& answered, const QString&) {
+                             // `onSummarized` is connected first and has
+                             // already recorded the count by the time this runs.
+                             if (answered == workspaceId) {
+                                 box.setInformativeText(discardWarning(changedFilesFor(answered)));
+                             }
+                         });
+    }
     if (box.exec() != QMessageBox::Yes) {
         return;
     }

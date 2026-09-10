@@ -390,6 +390,27 @@ void TranscriptView::refreshBanner() {
 
 QWidget* TranscriptView::makeFrame(const QJsonObject& item, int index) {
     const QString kind = item.value(QStringLiteral("kind")).toString();
+    if (kind == QStringLiteral("earlier")) {
+        // The fold. One widget standing for however many items the model took
+        // off the top of a long conversation; clicking it puts them all back.
+        auto* frame = new QFrame(m_scroll->widget());
+        frame->setProperty(kKindProperty, kind);
+        frame->setFrameShape(QFrame::NoFrame);
+        auto* layout = new QHBoxLayout(frame);
+        layout->setContentsMargins(6, 2, 6, 2);
+        auto* button = new QPushButton(item.value(QStringLiteral("text")).toString(), frame);
+        button->setObjectName(QStringLiteral("TranscriptLoadEarlier"));
+        button->setFlat(true);
+        layout->addWidget(button, 0);
+        layout->addStretch(1);
+        QObject::connect(button, &QPushButton::clicked, this, [this] {
+            if (!m_model.isNull()) {
+                // Answers with `resetItems`, which rebuilds this whole column.
+                m_model->expandEarlier();
+            }
+        });
+        return frame;
+    }
     if (kind == QStringLiteral("tool_use")) {
         auto* card = new ToolCard(item, m_scroll->widget());
         QObject::connect(card, &ToolCard::collapsedChanged, this, [this, index](bool collapsed) {

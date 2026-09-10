@@ -341,10 +341,12 @@ void ExplorerDock::onLoadFailed(const QString& path, const QString& message) {
 }
 
 void ExplorerDock::onChangesLoaded(const QString& json) {
-    // The list moved, so what a Discard would cost has moved with it. The
-    // toolbar asks the daemon rather than counting these rows: "dirty" is the
-    // daemon's judgement and the rows are only its changed files.
-    m_changesToolbar->refreshSummary();
+    // No `refreshSummary()` here. The model reloads itself from every
+    // `fs.changed` event, so an agent writing files put one `workspace.summary`
+    // on the wire per keystroke's worth of output -- for a number nothing is
+    // showing at the time. The toolbar asks on the two occasions the answer is
+    // about to be read instead: when the active tab moves (`setWorkspace`) and
+    // immediately before the Discard confirmation opens.
     m_changeItems->removeRows(0, m_changeItems->rowCount());
     const bool dark = theme::isDark(palette());
     const QJsonArray files = QJsonDocument::fromJson(json.toUtf8()).array();

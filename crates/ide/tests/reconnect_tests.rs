@@ -122,11 +122,7 @@ type Journal = Arc<Mutex<Vec<String>>>;
 
 #[test]
 fn the_ide_reconnects_after_the_daemon_drops_the_connection() {
-    if std::env::var_os("QMAKE").is_none() {
-        eprintln!(
-            "reconnect: skipped because QMAKE is unset, so the Qt runtime the IDE needs is not \
-             on PATH. Dot-source scripts\\env.ps1 and run again."
-        );
+    if bondsymphonic_ide::testing::skip_without_qt("reconnect") {
         return;
     }
 
@@ -531,11 +527,7 @@ const MISMATCH_LIMIT: Duration = Duration::from_secs(60);
 
 #[test]
 fn a_protocol_mismatch_stops_the_connection_loop_instead_of_backing_off() {
-    if std::env::var_os("QMAKE").is_none() {
-        eprintln!(
-            "protocol mismatch: skipped because QMAKE is unset, so the Qt runtime the IDE needs \
-             is not on PATH. Dot-source scripts\\env.ps1 and run again."
-        );
+    if bondsymphonic_ide::testing::skip_without_qt("protocol mismatch") {
         return;
     }
 

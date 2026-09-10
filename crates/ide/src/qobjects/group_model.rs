@@ -132,6 +132,51 @@ pub mod qobject {
         #[qinvokable]
         fn clear_workspace_error(self: Pin<&mut GroupModel>, workspace_id: QString) -> bool;
 
+        /// Marks `workspace_id`'s tab as wanting the user, with `text` as the
+        /// sentence the tab's tooltip and the status bar show. What the window
+        /// calls when an agent in a tab that is *not* in front asks to be
+        /// allowed a tool: the permission bar is on that workspace's own pane
+        /// and cannot be seen from here.
+        ///
+        /// False for a workspace this model does not track, and for one that
+        /// already carries exactly this text -- so a caller that marks on every
+        /// state event does not repaint the tab bar for nothing.
+        #[qinvokable]
+        fn set_workspace_attention(
+            self: Pin<&mut GroupModel>,
+            workspace_id: QString,
+            text: QString,
+        ) -> bool;
+
+        /// Takes the mark off again: the question was answered, or the user
+        /// switched to that tab and can see it. False when there was none.
+        #[qinvokable]
+        fn clear_workspace_attention(self: Pin<&mut GroupModel>, workspace_id: QString) -> bool;
+
+        /// The sentence for the status bar -- the first tab, in the user's own
+        /// order, that is asking for something -- or empty when none is.
+        #[qinvokable]
+        fn attention_text(self: &GroupModel) -> QString;
+
+        /// What `setWorkspaceAttention` should be given for an agent that is
+        /// blocked on a permission request, for the workspace called `name`.
+        ///
+        /// Here rather than in the window so the dot's tooltip and the status
+        /// bar's line are one string built in one place.
+        #[qinvokable]
+        fn permission_attention(self: &GroupModel, name: QString) -> QString;
+
+        /// The workspace whose tab is running `agent_id`, or empty. The window
+        /// gets agent state events keyed by agent, and the attention calls
+        /// above are keyed by workspace.
+        #[qinvokable]
+        fn agent_workspace_id(self: &GroupModel, agent_id: QString) -> QString;
+
+        /// `workspace_id`'s tab name, or empty. The window builds the
+        /// attention sentence out of it.
+        #[qinvokable]
+        fn workspace_name(self: &GroupModel, workspace_id: QString) -> QString;
+
         /// Removes the group named `name`, moving whatever tabs it still holds
         /// into "Unsorted". What "Close group" does once the per-workspace
         /// merges and discards it asked for have all succeeded.
@@ -429,6 +474,7 @@ impl qobject::GroupModel {
             agent_detail: String::new(),
             options_json: options_json.to_string(),
             op_error: None,
+            attention: String::new(),
         };
         self.as_mut().rust_mut().workspaces.add_tab(group_idx, tab);
         self.publish();
@@ -534,6 +580,73 @@ impl qobject::GroupModel {
             self.publish();
         }
         cleared
+    }
+
+    pub fn set_workspace_attention(
+        mut self: Pin<&mut Self>,
+        workspace_id: QString,
+        text: QString,
+    ) -> bool {
+        let id = WorkspaceId(workspace_id.to_string());
+        let text = text.to_string();
+        let marked = self
+            .as_mut()
+            .rust_mut()
+            .workspaces
+            .set_workspace_attention(&id, &text);
+        if marked {
+            self.publish();
+        }
+        marked
+    }
+
+    pub fn clear_workspace_attention(mut self: Pin<&mut Self>, workspace_id: QString) -> bool {
+        let id = WorkspaceId(workspace_id.to_string());
+        let cleared = self
+            .as_mut()
+            .rust_mut()
+            .workspaces
+            .clear_workspace_attention(&id);
+        if cleared {
+            self.publish();
+        }
+        cleared
+    }
+
+    pub fn attention_text(&self) -> QString {
+        QString::from(self.rust().workspaces.attention().unwrap_or_default())
+    }
+
+    pub fn permission_attention(&self, name: QString) -> QString {
+        QString::from(&crate::model::app_state::permission_attention(
+            &name.to_string(),
+        ))
+    }
+
+    pub fn agent_workspace_id(&self, agent_id: QString) -> QString {
+        let id = AgentId(agent_id.to_string());
+        match self
+            .rust()
+            .workspaces
+            .find_agent(&id)
+            .and_then(|(g, t)| self.rust().workspaces.groups.get(g)?.tabs.get(t))
+        {
+            Some(tab) => QString::from(tab.workspace_id.as_str()),
+            None => QString::from(""),
+        }
+    }
+
+    pub fn workspace_name(&self, workspace_id: QString) -> QString {
+        let id = WorkspaceId(workspace_id.to_string());
+        match self
+            .rust()
+            .workspaces
+            .find(&id)
+            .and_then(|(g, t)| self.rust().workspaces.groups.get(g)?.tabs.get(t))
+        {
+            Some(tab) => QString::from(tab.name.as_str()),
+            None => QString::from(""),
+        }
     }
 
     pub fn remove_group(mut self: Pin<&mut Self>, name: QString) -> bool {
@@ -642,6 +755,12 @@ impl qobject::GroupModel {
             text.push('\n');
             text.push_str(detail);
         }
+        // Last, because it is the newest thing about the tab and the reason the
+        // user is hovering over a dot they did not expect.
+        if !tab.attention.is_empty() {
+            text.push('\n');
+            text.push_str(&tab.attention);
+        }
         QString::from(&text)
     }
 
@@ -741,6 +860,7 @@ mod tests {
             agent_detail: String::new(),
             options_json: String::new(),
             op_error: Some("Merge stopped: conflicts in README.md".to_owned()),
+            attention: String::new(),
         }
     }
 

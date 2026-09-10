@@ -8,7 +8,7 @@
 //! out of `state_json`.
 
 use bondsymphonic_ide::highlight::theme::Theme;
-use bondsymphonic_ide::model::app_state::{AgentTab, TabStatus, Workspaces};
+use bondsymphonic_ide::model::app_state::{permission_attention, AgentTab, TabStatus, Workspaces};
 use bondsymphonic_ide::model::file_tree::FileTree;
 use bondsymphonic_ide::qobjects::app_controller::network_denial;
 use bondsymphonic_ide::qobjects::changes_model::touches_workspace;
@@ -56,6 +56,7 @@ fn tab(info: &WorkspaceInfo) -> AgentTab {
         agent_status: None,
         agent_detail: String::new(),
         op_error: None,
+        attention: String::new(),
     }
 }
 
@@ -929,13 +930,42 @@ fn restart_options_carry_the_tab_options_and_the_last_session() {
     assert_eq!(value["future_field"], 7);
 }
 
+/// The transcript is the first place a session id is looked for, and the tab
+/// is the second. A history the daemon could not serve, or one that never got
+/// as far as a `result` message, leaves the transcript with no id while the
+/// daemon still holds the one the agent reported -- and that id is on the tab,
+/// put there by `AgentTab::from_workspace_info` out of `AgentSummary`.
+///
+/// Restarting into a fresh session there loses the conversation the user is
+/// looking at, which is the one thing Restart exists to keep.
 #[test]
-fn restart_options_without_a_session_ask_for_a_fresh_one() {
+fn restart_options_fall_back_to_the_session_id_the_tab_carries() {
     use bondsymphonic_ide::qobjects::transcript_model::restart_options;
 
-    // No session seen: the key is absent, not null. A null would be a request
-    // to resume a session named nothing.
-    let merged = restart_options(r#"{"model":"opus","resume_session":"stale"}"#, None);
+    let merged = restart_options(r#"{"model":"opus","resume_session":"sess-daemon"}"#, None);
+    let value: serde_json::Value = serde_json::from_str(&merged).expect("an object");
+    assert_eq!(value["model"], "opus");
+    assert_eq!(
+        value["resume_session"], "sess-daemon",
+        "with no id in the transcript the tab's own is what a Restart resumes"
+    );
+
+    // The transcript still wins when it has one: it is the newer of the two.
+    let merged = restart_options(
+        r#"{"model":"opus","resume_session":"sess-daemon"}"#,
+        Some("sess-newer"),
+    );
+    let value: serde_json::Value = serde_json::from_str(&merged).expect("an object");
+    assert_eq!(value["resume_session"], "sess-newer");
+}
+
+#[test]
+fn restart_options_with_no_session_anywhere_ask_for_a_fresh_one() {
+    use bondsymphonic_ide::qobjects::transcript_model::restart_options;
+
+    // Neither side has one: the key is absent, not null. A null would be a
+    // request to resume a session named nothing.
+    let merged = restart_options(r#"{"model":"opus"}"#, None);
     let value: serde_json::Value = serde_json::from_str(&merged).expect("an object");
     assert_eq!(value["model"], "opus");
     assert!(value.get("resume_session").is_none());
@@ -954,4 +984,121 @@ fn restart_options_survive_a_tab_with_no_options_at_all() {
         assert_eq!(value["resume_session"], "sess-9", "for {options:?}");
         assert!(value.is_object(), "for {options:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// A permission raised in a background tab (M4 deferral, closed in M7 Task 3).
+// ---------------------------------------------------------------------------
+
+/// `GroupModel::setWorkspaceAttention` and `clearWorkspaceAttention` across the
+/// boundary: the window sets a line of text on the tab whose agent is waiting,
+/// the tab bar reads it back out of `state_json` to paint its dot, and the
+/// status bar reads `attentionText` for the sentence.
+///
+/// The text is the model's, not the window's invention: one wording for the dot
+/// and the hint means the two cannot drift.
+#[test]
+fn attention_crosses_the_boundary_and_shows_up_in_the_state_json() {
+    let alpha = info("ws_1", "alpha", WorkspaceState::Ready);
+    let beta = info("ws_2", "beta", WorkspaceState::Ready);
+    let mut model = Workspaces::new_default();
+    model.add_tab(0, tab(&alpha));
+    model.add_tab(0, tab(&beta));
+
+    let hint = permission_attention("beta");
+    assert_eq!(hint, "beta is waiting for permission");
+    assert!(model.set_workspace_attention(&beta.id, &hint));
+
+    let restored = Workspaces::from_json(&model.to_json()).expect("state json round trips");
+    let (g, t) = restored.find(&beta.id).expect("beta is tracked");
+    assert_eq!(restored.groups[g].tabs[t].attention, hint);
+    assert_eq!(restored.attention(), Some(hint.as_str()));
+    // The tab that is not waiting says nothing, and its tooltip is unchanged.
+    let (ag, at) = restored.find(&alpha.id).expect("alpha is tracked");
+    assert!(restored.groups[ag].tabs[at].attention.is_empty());
+
+    let mut restored = restored;
+    assert!(restored.clear_workspace_attention(&beta.id));
+    assert_eq!(restored.attention(), None);
+    let _ = (g, t, ag, at);
+}
+
+/// An older `state.json`, written before tabs carried attention (or before the
+/// group-id counter), still loads: the new fields default rather than failing
+/// the whole restore and throwing away the user's groups.
+#[test]
+fn state_json_without_attention_still_loads() {
+    let alpha = info("ws_1", "alpha", WorkspaceState::Ready);
+    let mut model = Workspaces::new_default();
+    model.add_tab(0, tab(&alpha));
+    // The file as an older build wrote it: the two keys added in Milestone 7
+    // taken back out again.
+    let mut older: serde_json::Value =
+        serde_json::from_str(&model.to_json()).expect("the model serialises");
+    older
+        .as_object_mut()
+        .expect("an object")
+        .remove("next_group_id");
+    for group in older["groups"].as_array_mut().expect("groups") {
+        for t in group["tabs"].as_array_mut().expect("tabs") {
+            t.as_object_mut().expect("a tab").remove("attention");
+        }
+    }
+    let older = older.to_string();
+    assert!(!older.contains("attention"), "the fixture is a pre-M7 file");
+    assert!(!older.contains("next_group_id"));
+
+    let restored = Workspaces::from_json(&older).expect("an older state file still loads");
+    assert_eq!(restored.attention(), None);
+    assert_eq!(restored.groups[0].id, "grp_0");
+    // And the counter picks up past the ids the file already carries rather
+    // than reissuing `grp_0`.
+    let mut restored = restored;
+    restored.add_group("Second");
+    assert_ne!(restored.groups[1].id, restored.groups[0].id);
+}
+
+// ---------------------------------------------------------------------------
+// The Qt-less skip (M7 Task 3).
+// ---------------------------------------------------------------------------
+
+/// The guard the four Qt-dependent suites use. With `QMAKE` set -- which is
+/// every run that got far enough to link this binary against Qt -- it answers
+/// `false` and the suite runs; the skip half is what `require-qt` turns into a
+/// panic in CI, and cannot be exercised from inside a test that needs the
+/// runtime itself.
+#[test]
+fn the_qt_guard_does_not_skip_when_qmake_is_set() {
+    if std::env::var_os("QMAKE").is_none() {
+        // Not reachable on a machine that can run this binary at all, but the
+        // assertion below would be a lie there, so it is not made.
+        return;
+    }
+    assert!(!bondsymphonic_ide::testing::skip_without_qt("self-check"));
+}
+
+// ---------------------------------------------------------------------------
+// Run configurations the daemon refused to load (M7 Task 3, daemon Task 2).
+// ---------------------------------------------------------------------------
+
+/// `repo.detect_run_configs` answers with a `warnings` line per `[[run]]` entry
+/// it could not parse. Silently loading the rest is what the daemon used to do
+/// with the whole file; the panel is where the user finds out that an entry
+/// they wrote is not in the combo.
+#[test]
+fn ignored_run_configs_are_summarised_for_the_panel() {
+    use bondsymphonic_ide::qobjects::run_panel::warning_status;
+
+    assert_eq!(warning_status(&[]), "");
+    assert_eq!(
+        warning_status(&["run \"api\": no port".to_owned()]),
+        "1 run config ignored: run \"api\": no port"
+    );
+    assert_eq!(
+        warning_status(&[
+            "run \"api\": no port".to_owned(),
+            "run \"web\": no port".to_owned()
+        ]),
+        "2 run configs ignored: run \"api\": no port; run \"web\": no port"
+    );
 }

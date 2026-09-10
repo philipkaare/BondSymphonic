@@ -37,6 +37,7 @@ fn tab(id: &str, name: &str) -> AgentTab {
         agent_status: None,
         agent_detail: String::new(),
         op_error: None,
+        attention: String::new(),
     }
 }
 
@@ -513,5 +514,217 @@ fn a_restored_session_brings_back_the_claude_tab_with_its_agent() {
     assert_eq!(
         fresh.groups[g].tabs[t].agent_id,
         Some(AgentId("ag_1".into()))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Group ids survive a restore, a rename and a removal (M7 Task 3).
+// ---------------------------------------------------------------------------
+
+/// Group ids are the handle the C++ side holds on to between two reads of
+/// `state_json`, so the model must never hand the same id to two groups.
+///
+/// The positional scheme did: `grp_<len>` is `grp_1` both for the second group
+/// ever added and for the group added after the second of three was removed.
+/// A restore made that worse by seeding the ids from the persisted order, so
+/// the very first group the user closed after a restart put the model into that
+/// state. A rename is in here too because renaming is what the user does before
+/// closing a group, and the id must not move with the name.
+#[test]
+fn group_ids_are_unique_across_a_restore_a_rename_and_a_removal() {
+    let list = vec![
+        info("ws_1", "alpha", WorkspaceState::Ready),
+        info("ws_2", "beta", WorkspaceState::Ready),
+        info("ws_3", "gamma", WorkspaceState::Ready),
+    ];
+    let persisted = vec![
+        PersistedGroup {
+            name: "Frontend".to_owned(),
+            workspace_ids: vec!["ws_1".to_owned()],
+        },
+        PersistedGroup {
+            name: "Backend".to_owned(),
+            workspace_ids: vec!["ws_2".to_owned()],
+        },
+        PersistedGroup {
+            name: "Platform".to_owned(),
+            workspace_ids: vec!["ws_3".to_owned()],
+        },
+    ];
+    let mut w = Workspaces::from_persisted(&persisted, &list, Some("ws_1"));
+    let restored: Vec<String> = w.groups.iter().map(|g| g.id.clone()).collect();
+    assert_eq!(restored.len(), 3);
+
+    // A rename keeps the id: the C++ side is still holding the one it read.
+    assert!(w.rename_group(0, "Web"));
+    assert_eq!(w.groups[0].id, restored[0], "a rename must not move the id");
+    assert_eq!(w.groups[0].name, "Web");
+
+    // Closing a group and making another must not reissue an id that is still
+    // in use. The tab in the closed group moves to "Unsorted", which is itself
+    // a group this has to number.
+    assert!(w.remove_group("Backend"));
+    w.add_group("Mobile");
+    let ids: Vec<&str> = w.groups.iter().map(|g| g.id.as_str()).collect();
+    let mut unique: Vec<&str> = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "duplicate group ids in {ids:?}");
+    // And the groups that did not move still answer to the ids they were read
+    // with, which is the whole point of not deriving them from the position.
+    assert_eq!(w.groups[0].id, restored[0]);
+    assert_eq!(
+        w.groups
+            .iter()
+            .find(|g| g.name == "Platform")
+            .map(|g| &g.id),
+        Some(&restored[2])
+    );
+}
+
+/// The counter travels with the model through `state_json`, so a round trip
+/// cannot reset it and start handing out ids that are already taken.
+#[test]
+fn a_serialised_model_keeps_handing_out_fresh_group_ids() {
+    let mut w = Workspaces::new_default();
+    w.add_group("Frontend");
+    w.add_group("Backend");
+    let restored = Workspaces::from_json(&w.to_json()).expect("state json round trips");
+    let mut restored = restored;
+    assert!(restored.remove_group("Frontend"));
+    restored.add_group("Platform");
+    let ids: Vec<&str> = restored.groups.iter().map(|g| g.id.as_str()).collect();
+    let mut unique = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "duplicate group ids in {ids:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Restart resumes from the daemon's session id (M7 Task 3).
+// ---------------------------------------------------------------------------
+
+/// The transcript is the first place a resumable session id is looked for, but
+/// it is not the only one: a history that could not be read, or one that never
+/// carried a `result` message, leaves the transcript with no id at all while
+/// the daemon still holds the one the agent reported. The tab carries that id
+/// so a Restart resumes instead of quietly beginning a fresh conversation.
+#[test]
+fn a_restored_tab_carries_the_daemons_session_id_for_a_restart() {
+    let mut w = info("ws_1", "alpha", WorkspaceState::Ready);
+    w.agent_records = vec![AgentSummary {
+        session_id: Some("sess-daemon".into()),
+        model: Some("opus".into()),
+        ..agent("ag_1", AgentAdapterKind::Claude)
+    }];
+    let tab = AgentTab::from_workspace_info(&w);
+    let options: serde_json::Value = serde_json::from_str(&tab.options_json).expect("an object");
+    assert_eq!(options["resume_session"], "sess-daemon");
+    assert_eq!(options["model"], "opus");
+}
+
+// ---------------------------------------------------------------------------
+// A permission raised in a background tab asks for attention (M7 Task 3).
+// ---------------------------------------------------------------------------
+
+/// The permission bar lives on the workspace's own pane, so a question raised
+/// by an agent in a tab the user is not looking at is invisible until they
+/// happen to switch to it. The tab model carries a line of attention text for
+/// exactly that: the tab bar paints a dot, the status bar shows the sentence.
+#[test]
+fn workspace_attention_is_set_and_cleared_by_workspace_id() {
+    let mut w = Workspaces::new_default();
+    w.add_tab(0, tab("ws_1", "alpha"));
+    w.add_tab(0, tab("ws_2", "beta"));
+    let beta = WorkspaceId("ws_2".into());
+
+    assert_eq!(w.attention(), None, "nothing is waiting to begin with");
+    assert!(w.set_workspace_attention(&beta, &permission_attention("beta")));
+    assert_eq!(
+        w.attention(),
+        Some("beta is waiting for permission"),
+        "the status bar hint names the agent that is waiting"
+    );
+    let (g, t) = w.find(&beta).expect("beta is tracked");
+    assert_eq!(
+        w.groups[g].tabs[t].attention,
+        "beta is waiting for permission"
+    );
+
+    assert!(w.clear_workspace_attention(&beta));
+    assert_eq!(w.attention(), None);
+    assert!(
+        !w.clear_workspace_attention(&beta),
+        "clearing twice is not a change"
+    );
+    assert!(
+        !w.set_workspace_attention(&WorkspaceId("ws_missing".into()), "x"),
+        "a workspace this model does not track cannot be marked"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A long transcript collapses above 2,000 items (IDE design §13, M7 Task 3).
+// ---------------------------------------------------------------------------
+
+/// One frame per item is what the transcript view builds, so a session that
+/// runs for a day would eventually hold tens of thousands of widgets. IDE
+/// design §13 claims the list is capped at 2,000; this is the cap.
+///
+/// The oldest items are not thrown away, they are folded into one "load
+/// earlier" block that puts them all back when the user clicks it.
+#[test]
+fn a_long_transcript_folds_its_oldest_items_into_one_load_earlier_block() {
+    use bondsymphonic_ide::model::transcript::{Transcript, TranscriptItem, MAX_LIVE_ITEMS};
+    use bondsymphonic_proto::{AgentMessage, AgentMessageBody};
+
+    let fixture: Vec<AgentMessage> = (0..2_500)
+        .map(|seq| AgentMessage {
+            seq,
+            ts: "2026-09-09T10:00:00Z".to_owned(),
+            body: AgentMessageBody::UserText {
+                text: format!("message {seq}"),
+            },
+        })
+        .collect();
+
+    let mut t = Transcript::default();
+    for message in &fixture {
+        t.apply(message);
+    }
+
+    assert!(
+        t.items.len() <= MAX_LIVE_ITEMS + 1,
+        "{} live items after 2,500 messages",
+        t.items.len()
+    );
+    assert_eq!(MAX_LIVE_ITEMS, 2_000, "the number IDE design §13 claims");
+
+    // The block is first, it counts what it is holding, and its label is the
+    // one the view paints.
+    let folded = 2_500 - (t.items.len() - 1);
+    match &t.items[0] {
+        TranscriptItem::Earlier { count, text } => {
+            assert_eq!(*count, folded);
+            assert_eq!(text, &format!("Load earlier ({folded})"));
+        }
+        other => panic!("the first item is not a load-earlier block: {other:?}"),
+    }
+    // Nothing was lost: the newest message is still the last live item.
+    assert!(matches!(
+        t.items.last(),
+        Some(TranscriptItem::User { text }) if text == "message 2499"
+    ));
+
+    // Clicking it puts every message back, block and all.
+    assert!(t.expand_earlier(), "the block expands");
+    assert_eq!(t.items.len(), 2_500);
+    assert!(matches!(
+        &t.items[0],
+        TranscriptItem::User { text } if text == "message 0"
+    ));
+    assert!(
+        !t.expand_earlier(),
+        "a transcript holding nothing back does not claim to have expanded"
     );
 }

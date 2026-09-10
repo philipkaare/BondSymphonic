@@ -12,6 +12,7 @@
 #include "RunPanel.h"
 #include "SettingsDialog.h"
 #include "SetupPage.h"
+#include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
@@ -387,10 +388,24 @@ void MainWindow::buildStatusBar() {
             QDesktopServices::openUrl(QUrl(m_opUrl));
         }
     });
+    // Amber, and beside the branch rather than at the right: an agent blocked
+    // on a question is waiting for this user, and the dot on its tab is the
+    // only other place that is said.
+    m_attentionLabel = new QLabel(this);
+    m_attentionLabel->setObjectName("AttentionLabel");
+    m_attentionLabel->setTextFormat(Qt::PlainText);
+    m_attentionLabel->setVisible(false);
+    {
+        QPalette attentionPalette = m_attentionLabel->palette();
+        attentionPalette.setColor(QPalette::WindowText,
+                                  theme::ink(theme::renamed(), theme::isDark(palette())));
+        m_attentionLabel->setPalette(attentionPalette);
+    }
     statusBar()->addWidget(m_daemonLabel);
     statusBar()->addWidget(m_sandboxLabel);
     statusBar()->addWidget(m_setupLabel);
     statusBar()->addWidget(m_branchLabel);
+    statusBar()->addWidget(m_attentionLabel);
     statusBar()->addPermanentWidget(m_opLabel);
     statusBar()->addPermanentWidget(m_costLabel);
     updateCostLabel();
@@ -556,6 +571,7 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::agentStateChanged, this,
                      [this](const QString& agentId, const QString& state, const QString& detail) {
                          m_groupModel->setAgentStatus(agentId, state, detail);
+                         noteAgentAttention(agentId, state);
                      });
     // The daemon discarded events, so every terminal has a hole in it and says so.
     QObject::connect(m_controller, &AppController::outputDropped, this, [this](::std::int64_t) {
@@ -1032,6 +1048,10 @@ void MainWindow::onActiveTabChanged() {
         return;
     }
     const QString workspaceId = active.value("workspace_id").toString();
+    // Whatever this tab was asking for, the user is now looking at it. Answers
+    // `false` when there was no mark, so this does not republish the model on
+    // every tab change.
+    m_groupModel->clearWorkspaceAttention(workspaceId);
     m_explorer->setWorkspace(workspaceId);
     // After `setWorkspace`, which clears the header when it is handed an empty
     // id, and on every model change rather than only on a switch, so a branch
@@ -1126,6 +1146,11 @@ void MainWindow::updateWorkspaceStatus() {
     const int group = m_groupModel->activeGroupIndex();
     const int tab = m_groupModel->activeTabIndex();
     const QJsonObject active = activeTab();
+    // Whichever tab is in front, and whether there is one at all: the point of
+    // the line is a tab the user is *not* on.
+    const QString attention = m_groupModel->attentionText();
+    m_attentionLabel->setText(attention);
+    m_attentionLabel->setVisible(!attention.isEmpty());
     if (active.isEmpty()) {
         m_branchLabel->setText("branch: -");
         m_sandboxLabel->setText(m_sandboxIdleText);
@@ -1134,5 +1159,25 @@ void MainWindow::updateWorkspaceStatus() {
     m_branchLabel->setText(QString("branch: %1").arg(active.value("branch").toString()));
     // The word itself comes from the model; this only frames it.
     m_sandboxLabel->setText(QString("sandbox: %1").arg(m_groupModel->statusWord(group, tab)));
+}
+
+void MainWindow::noteAgentAttention(const QString& agentId, const QString& state) {
+    const QString workspaceId = m_groupModel->agentWorkspaceId(agentId);
+    if (workspaceId.isEmpty()) {
+        return;
+    }
+    // Only a tab the user is not looking at: the permission bar is already on
+    // the pane in front of them, and a dot on the tab they are reading would be
+    // pointing at itself.
+    const bool background = workspaceId != activeWorkspaceId();
+    if (background && state == QLatin1String("waiting_permission")) {
+        // The sentence is the model's, so the tab's tooltip and this cannot
+        // word it differently.
+        m_groupModel->setWorkspaceAttention(
+            workspaceId,
+            m_groupModel->permissionAttention(m_groupModel->workspaceName(workspaceId)));
+    } else {
+        m_groupModel->clearWorkspaceAttention(workspaceId);
+    }
 }
 

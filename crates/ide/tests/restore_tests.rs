@@ -39,11 +39,7 @@ type Journal = Arc<Mutex<Vec<String>>>;
 
 #[test]
 fn a_listed_claude_agent_comes_back_as_a_claude_tab_with_its_transcript() {
-    if std::env::var_os("QMAKE").is_none() {
-        eprintln!(
-            "restore: skipped because QMAKE is unset, so the Qt runtime the IDE needs is not on \
-             PATH. Dot-source scripts\\env.ps1 and run again."
-        );
+    if bondsymphonic_ide::testing::skip_without_qt("restore") {
         return;
     }
 

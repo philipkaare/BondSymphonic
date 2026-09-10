@@ -154,6 +154,15 @@ pub struct WorkspaceRuns {
     /// Hosts the proxy blocked and the user has not answered for yet, oldest
     /// first. The head is the one the toast is showing.
     pub denied_hosts: Vec<String>,
+    /// One line per `[[run]]` entry the daemon refused to load, from the same
+    /// `repo.detect_run_configs` answer the configurations came in.
+    ///
+    /// The daemon used to discard the whole file over one bad entry; it now
+    /// loads the rest and says which it dropped. An entry that is not in the
+    /// combo and was not complained about leaves the user staring at a file
+    /// they believe is correct, so the panel shows these rather than logging
+    /// them.
+    pub warnings: Vec<String>,
 }
 
 impl WorkspaceRuns {
@@ -177,6 +186,14 @@ impl WorkspaceRuns {
                 .find(|c| c.disabled_reason.is_none())
                 .map(|c| c.name.clone())
         });
+    }
+
+    /// Installs the warnings from the same detection `set_configs` took its
+    /// list from. Replaces rather than appends: one detection is the whole
+    /// answer for a worktree, so a file the user has since fixed stops
+    /// complaining.
+    pub fn set_warnings(&mut self, warnings: Vec<String>) {
+        self.warnings = warnings;
     }
 
     /// Points the combo at `name`. The empty name detaches the selection.
