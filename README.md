@@ -143,7 +143,7 @@ sandboxes, and edits, saves and diffs the files in them.
   leaves the other running. When the daemon has to drop events, the affected screens show
   an `[output dropped]` marker instead of quietly losing bytes.
 - **Explorer.** The Files tab lists the workspace's worktree one directory at a time, as
-  they are expanded, and the toolbar's Refresh reloads it in place.
+  they are expanded, and the Refresh button in the Explorer header reloads it in place.
 - **Editing.** Double-clicking a file in the Files tab opens it in a tab of the centre
   pane, with tree-sitter syntax highlighting for Rust, JavaScript, TypeScript, TSX,
   Python, JSON, TOML, YAML, HTML, CSS, Markdown, Bash, C, C++ and Go. Other extensions

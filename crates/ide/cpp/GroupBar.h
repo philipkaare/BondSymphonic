@@ -25,7 +25,7 @@ public:
     QString currentGroupName() const;
 
 signals:
-    /// The `+` button, or "New agent…" from the agent tab context menu.
+    /// The New agent button, or "New agent…" from the agent tab context menu.
     void newAgentRequested();
     /// "Destroy workspace…" on the agent tab for this workspace id.
     void destroyRequested(const QString& workspaceId);

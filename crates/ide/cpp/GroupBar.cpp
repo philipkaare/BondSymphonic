@@ -64,8 +64,11 @@ GroupBar::GroupBar(GroupModel* model, QWidget* parent) : QWidget(parent), m_mode
     // A fill of its own, so the two rows read as one band of agents rather than
     // as whatever happens to sit above the editor.
     setAutoFillBackground(true);
-    QPalette barPalette = palette();
-    barPalette.setColor(QPalette::Window, theme::band(palette()));
+    // Derived from the unwashed palette, and kept for the captions below: once
+    // the band colour is installed, `palette()` would hand back the wash.
+    const QPalette basePalette = palette();
+    QPalette barPalette = basePalette;
+    barPalette.setColor(QPalette::Window, theme::band(basePalette));
     setPalette(barPalette);
 
     auto* layout = new QVBoxLayout(this);
@@ -82,7 +85,7 @@ GroupBar::GroupBar(GroupModel* model, QWidget* parent) : QWidget(parent), m_mode
     captionFont.setBold(true);
     caption->setFont(captionFont);
     QPalette captionPalette = caption->palette();
-    captionPalette.setColor(QPalette::WindowText, theme::muted(palette()));
+    captionPalette.setColor(QPalette::WindowText, theme::muted(basePalette));
     caption->setPalette(captionPalette);
     captionRow->addWidget(caption, 0, Qt::AlignVCenter);
 
@@ -113,7 +116,7 @@ GroupBar::GroupBar(GroupModel* model, QWidget* parent) : QWidget(parent), m_mode
     m_emptyLabel = new QLabel(QStringLiteral("No agents in this group yet"), this);
     m_emptyLabel->setObjectName(QStringLiteral("GroupBarEmptyLabel"));
     QPalette emptyPalette = m_emptyLabel->palette();
-    emptyPalette.setColor(QPalette::WindowText, theme::muted(palette()));
+    emptyPalette.setColor(QPalette::WindowText, theme::muted(basePalette));
     m_emptyLabel->setPalette(emptyPalette);
     m_emptyLabel->setVisible(false);
     agentRow->addWidget(m_emptyLabel, 0, Qt::AlignVCenter);
