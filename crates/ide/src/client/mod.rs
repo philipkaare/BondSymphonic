@@ -24,6 +24,12 @@ pub enum ClientError {
     Rpc(RpcError),
     #[error("disconnected")]
     Disconnected,
+    /// The daemon on the other end speaks another version of the wire
+    /// protocol. Its own variant rather than an `Rpc` error, because the answer
+    /// is not to retry: the two builds are a pair and one of them has to be
+    /// replaced. `client` is what this build speaks.
+    #[error("daemon speaks protocol {daemon}, this IDE speaks {client}")]
+    ProtocolMismatch { daemon: u32, client: u32 },
     #[error("request timed out")]
     Timeout,
 }
@@ -184,12 +190,41 @@ impl DaemonClient {
             _reader_guard: Arc::new(ReaderGuard(Some(reader_handle))),
         };
 
-        let hello: HelloResult = client
+        let hello: HelloResult = match client
             .request(Request::Hello(HelloParams {
                 token: token.into(),
                 client_version: client_version.into(),
+                protocol_version: Some(PROTOCOL_VERSION),
             }))
-            .await?;
+            .await
+        {
+            Ok(hello) => hello,
+            // The daemon is the one that spotted the mismatch: it is newer than
+            // this IDE and refused the version we sent. Its typed error carries
+            // both numbers, so the reply is reported as a mismatch rather than
+            // as an opaque `invalid_params`.
+            Err(ClientError::Rpc(e)) => {
+                return match protocol_mismatch_versions(&e) {
+                    Some((daemon, _)) => Err(ClientError::ProtocolMismatch {
+                        daemon,
+                        client: PROTOCOL_VERSION,
+                    }),
+                    None => Err(ClientError::Rpc(e)),
+                };
+            }
+            Err(e) => return Err(e),
+        };
+        // The other direction: the daemon answered happily, on a protocol this
+        // IDE does not speak. Stopping at the handshake is the point -- every
+        // request after it would fail one field at a time, and none of those
+        // failures would say why.
+        let daemon = peer_protocol_version(hello.protocol_version);
+        if daemon != PROTOCOL_VERSION {
+            return Err(ClientError::ProtocolMismatch {
+                daemon,
+                client: PROTOCOL_VERSION,
+            });
+        }
         Ok((client, hello, ev_rx))
     }
 

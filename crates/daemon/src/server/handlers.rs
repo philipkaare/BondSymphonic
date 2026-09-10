@@ -61,6 +61,10 @@ impl Handler for WorkspaceHandler {
                 ok(DetectRunConfigsResult {
                     configs,
                     network_allow,
+                    // Filled in Milestone 7 Task 2, where a `[[run]]` entry
+                    // that cannot be parsed becomes one line here instead of
+                    // taking the whole file down with it.
+                    warnings: Vec::new(),
                 })
             }
             Request::WorkspaceCreate(p) => ok(lifecycle::create(d, p).await?),

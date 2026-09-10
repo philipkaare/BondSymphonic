@@ -326,6 +326,7 @@ fn detect_run_configs_carries_the_repo_network_allow() {
             disabled_reason: None,
         }],
         network_allow: vec!["assets.example.test".into(), "*.example.test".into()],
+        warnings: vec![],
     };
     let v = serde_json::to_value(&result).unwrap();
     assert_eq!(v["network_allow"][0], "assets.example.test");
@@ -455,4 +456,98 @@ fn workspace_info_carries_agent_records_beside_the_plain_ids() {
     assert_eq!(keys, ["adapter", "id", "state"], "{v}");
     let back: WorkspaceInfo = serde_json::from_value(v).unwrap();
     assert_eq!(back, bare);
+}
+
+/// The Milestone 7 version gate. `hello` carries `protocol_version` in both
+/// directions, and both directions of the version skew keep working.
+///
+/// Forward: a pre-M7 daemon answers `hello` without the field, and a pre-M7
+/// client sends one without it. Neither is a decode error; an absent field
+/// means the peer speaks version 1, which is the version everything before
+/// this spoke.
+///
+/// Backward: an older peer reading a newer one's `hello` sees one extra key
+/// beside the ones it knows and ignores it, which is why this is an added
+/// field rather than a changed one.
+#[test]
+fn hello_carries_the_protocol_version_in_both_directions() {
+    let params: HelloParams =
+        serde_json::from_str(r#"{"token":"t","client_version":"0.1.0"}"#).expect("pre-M7 hello");
+    assert_eq!(params.protocol_version, None);
+    assert_eq!(peer_protocol_version(params.protocol_version), 1);
+
+    let result: HelloResult = serde_json::from_str(
+        r#"{"daemon_version":"0.1.0","capabilities":{"sandbox_backend":"noop",
+            "git_protect":false,"adapters":[]}}"#,
+    )
+    .expect("pre-M7 hello result");
+    assert_eq!(result.protocol_version, None);
+    assert_eq!(peer_protocol_version(result.protocol_version), 1);
+
+    let params = HelloParams {
+        token: "t".into(),
+        client_version: "0.1.0".into(),
+        protocol_version: Some(PROTOCOL_VERSION),
+    };
+    let v = serde_json::to_value(&params).unwrap();
+    assert_eq!(v["protocol_version"], PROTOCOL_VERSION);
+    let back: HelloParams = serde_json::from_value(v).unwrap();
+    assert_eq!(back, params);
+
+    let result = HelloResult {
+        protocol_version: Some(PROTOCOL_VERSION),
+        ..result
+    };
+    let v = serde_json::to_value(&result).unwrap();
+    assert_eq!(v["protocol_version"], PROTOCOL_VERSION);
+    let back: HelloResult = serde_json::from_value(v).unwrap();
+    assert_eq!(back, result);
+}
+
+/// The mismatch error is built on one side and read on the other, so its shape
+/// is pinned here rather than in either of them.
+#[test]
+fn the_protocol_mismatch_error_carries_both_versions() {
+    let err = RpcError::protocol_mismatch(1, 99);
+    assert_eq!(err.code, ErrorCode::InvalidParams);
+    assert_eq!(
+        err.message,
+        "protocol version 99 is not supported (daemon speaks 1)"
+    );
+    let data = err.data.clone().expect("the reason travels in data");
+    assert_eq!(data["reason"], PROTOCOL_MISMATCH_REASON);
+    assert_eq!(data["daemon"], 1);
+    assert_eq!(data["client"], 99);
+    assert_eq!(protocol_mismatch_versions(&err), Some((1, 99)));
+
+    // Any other error, however it is shaped, is not a mismatch.
+    assert_eq!(protocol_mismatch_versions(&RpcError::unauthorized()), None);
+    assert_eq!(
+        protocol_mismatch_versions(
+            &RpcError::invalid_params("nope").with_data(serde_json::json!({"reason": "other"}))
+        ),
+        None
+    );
+}
+
+/// Added by Task 1 so the daemon can fill it in Task 2: a reply from a daemon
+/// that predates the field carries no warnings, which is "nothing was ignored"
+/// rather than a broken answer.
+#[test]
+fn detect_run_configs_defaults_its_warnings_to_empty() {
+    let old: DetectRunConfigsResult =
+        serde_json::from_str(r#"{"configs":[],"network_allow":[]}"#).unwrap();
+    assert!(old.warnings.is_empty());
+
+    let result = DetectRunConfigsResult {
+        warnings: vec!["bondsymphonic.toml: [[run]] \"web\" has no port".into()],
+        ..old
+    };
+    let v = serde_json::to_value(&result).unwrap();
+    assert_eq!(
+        v["warnings"][0],
+        "bondsymphonic.toml: [[run]] \"web\" has no port"
+    );
+    let back: DetectRunConfigsResult = serde_json::from_value(v).unwrap();
+    assert_eq!(back, result);
 }

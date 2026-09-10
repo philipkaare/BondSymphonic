@@ -154,7 +154,11 @@ fn quoted_distro_path(path: &str) -> String {
 /// holds different content. Comparing `--version` is useless here: every workspace crate
 /// stays at 0.1.0 through development, so a rebuilt daemon would never be reinstalled and
 /// the IDE would silently keep running a stale binary. The two files are hashed instead.
-pub async fn ensure_installed(spec: &LaunchSpec) -> Result<()> {
+///
+/// Idempotent, and called for its own sake as well as by [`launch`]: a
+/// handshake refused over the protocol version is answered by reinstalling the
+/// daemon this IDE ships with, and that is this step on its own.
+pub async fn install_daemon(spec: &LaunchSpec) -> Result<()> {
     let Some(local) = &spec.local_daemon_binary else {
         return Ok(());
     };
@@ -205,7 +209,7 @@ pub async fn ensure_installed(spec: &LaunchSpec) -> Result<()> {
 }
 
 pub async fn launch(spec: &LaunchSpec) -> Result<DaemonProcess> {
-    ensure_installed(spec).await?;
+    install_daemon(spec).await?;
     let (prog, args) = command_for(spec);
     let mut child = Command::new(&prog)
         .args(&args)

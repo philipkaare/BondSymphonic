@@ -36,6 +36,7 @@ async fn fake_daemon(token: &'static str) -> std::net::SocketAddr {
                                 git_protect: false,
                                 adapters: vec![],
                             },
+                            protocol_version: Some(PROTOCOL_VERSION),
                         },
                     );
                     w.write_all(codec::encode(&ok).as_bytes()).await.unwrap();
@@ -104,6 +105,7 @@ async fn fake_daemon_signaling_eof(
                                 git_protect: false,
                                 adapters: vec![],
                             },
+                            protocol_version: Some(PROTOCOL_VERSION),
                         },
                     );
                     w.write_all(codec::encode(&ok).as_bytes()).await.unwrap();
@@ -146,6 +148,7 @@ async fn fake_daemon_delayed_prereqs(token: &'static str) -> std::net::SocketAdd
                                 git_protect: false,
                                 adapters: vec![],
                             },
+                            protocol_version: Some(PROTOCOL_VERSION),
                         },
                     );
                     w.lock()
@@ -302,6 +305,7 @@ async fn fake_daemon_silent_after_hello(token: &'static str) -> std::net::Socket
                                 git_protect: false,
                                 adapters: vec![],
                             },
+                            protocol_version: Some(PROTOCOL_VERSION),
                         },
                     );
                     w.write_all(codec::encode(&ok).as_bytes()).await.unwrap();
@@ -348,6 +352,7 @@ async fn fake_daemon_flooding_events(token: &'static str) -> std::net::SocketAdd
                                 git_protect: false,
                                 adapters: vec![],
                             },
+                            protocol_version: Some(PROTOCOL_VERSION),
                         },
                     );
                     w.write_all(codec::encode(&ok).as_bytes()).await.unwrap();
@@ -560,4 +565,111 @@ async fn an_explicit_wait_overrides_the_per_method_one() {
         matches!(err, ClientError::Timeout),
         "expected ClientError::Timeout, got {err:?}"
     );
+}
+
+/// A daemon that answers `hello` with a protocol version of its own choosing,
+/// or refuses the client's the way the real one does. `answer` picks which.
+async fn fake_daemon_speaking(token: &'static str, answer: MismatchAnswer) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut r = BufReader::new(r);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            let ClientMessage::Request { id, request } = codec::decode(line.trim_end()).unwrap();
+            let msg = match (&request, answer) {
+                (Request::Hello(p), MismatchAnswer::Answers(version)) if p.token == token => {
+                    ServerMessage::ok(
+                        id,
+                        &HelloResult {
+                            daemon_version: "9.9.9".into(),
+                            capabilities: Capabilities {
+                                sandbox_backend: "noop".into(),
+                                git_protect: false,
+                                adapters: vec![],
+                            },
+                            protocol_version: version,
+                        },
+                    )
+                }
+                (Request::Hello(p), MismatchAnswer::Refuses(daemon)) if p.token == token => {
+                    let client = peer_protocol_version(p.protocol_version);
+                    ServerMessage::err(id, RpcError::protocol_mismatch(daemon, client))
+                }
+                _ => ServerMessage::err(id, RpcError::unauthorized()),
+            };
+            w.write_all(codec::encode(&msg).as_bytes()).await.unwrap();
+        }
+    });
+    addr
+}
+
+#[derive(Clone, Copy)]
+enum MismatchAnswer {
+    /// Answers the handshake, naming this protocol version (or none at all).
+    Answers(Option<u32>),
+    /// Refuses the handshake the way a newer daemon refuses an older IDE.
+    Refuses(u32),
+}
+
+/// A daemon one version ahead answers the handshake perfectly well; every
+/// request after it is what would fail, one field at a time. The client stops
+/// at the handshake instead, with both numbers, so the controller can say
+/// which two pieces do not match.
+#[tokio::test]
+async fn a_daemon_on_another_protocol_version_fails_the_handshake() {
+    let addr = fake_daemon_speaking("secret", MismatchAnswer::Answers(Some(2))).await;
+    let err = DaemonClient::connect(addr, "secret", "0.1.0")
+        .await
+        .err()
+        .expect("a daemon speaking protocol 2 must not be accepted");
+    assert!(
+        matches!(
+            err,
+            ClientError::ProtocolMismatch {
+                daemon: 2,
+                client: 1
+            }
+        ),
+        "expected ProtocolMismatch {{ daemon: 2, client: 1 }}, got {err:?}"
+    );
+}
+
+/// The other direction: the daemon is the one that spots the mismatch and says
+/// so in its error. The client reads its own error back out of that reply
+/// rather than reporting an opaque `invalid_params`.
+#[tokio::test]
+async fn a_daemon_that_refuses_our_version_is_reported_as_a_mismatch() {
+    let addr = fake_daemon_speaking("secret", MismatchAnswer::Refuses(7)).await;
+    let err = DaemonClient::connect(addr, "secret", "0.1.0")
+        .await
+        .err()
+        .expect("a refused handshake must not be accepted");
+    assert!(
+        matches!(
+            err,
+            ClientError::ProtocolMismatch {
+                daemon: 7,
+                client: 1
+            }
+        ),
+        "expected ProtocolMismatch {{ daemon: 7, client: 1 }}, got {err:?}"
+    );
+}
+
+/// A daemon built before the field existed answers without it. That is a
+/// version 1 daemon, which is what this IDE speaks, so the handshake stands.
+#[tokio::test]
+async fn a_pre_m7_daemon_still_connects() {
+    let addr = fake_daemon_speaking("secret", MismatchAnswer::Answers(None)).await;
+    let (_client, hello, _events) = DaemonClient::connect(addr, "secret", "0.1.0")
+        .await
+        .expect("a daemon that sends no protocol version speaks version 1");
+    assert_eq!(hello.protocol_version, None);
 }

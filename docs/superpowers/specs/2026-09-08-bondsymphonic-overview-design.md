@@ -114,6 +114,10 @@ future VS Code extension and the future Linux/macOS builds cheap.
 - Newline-delimited JSON (NDJSON). One message per line, UTF-8.
 - The first client message must be `hello` carrying the token; anything else
   closes the connection. This stops other local processes from driving the daemon.
+- `hello` also carries the wire protocol version, both ways. The IDE and the
+  daemon are shipped as a pair, so a pair that does not match is refused at the
+  handshake instead of failing later on a field one of the two has never heard
+  of. See 6.3.
 - Multiple authenticated connections are permitted; events are broadcast to all.
 
 ### 6.2 Message envelope
@@ -143,7 +147,23 @@ Grouped by namespace. Params and results are summarised; exact fields live in th
 crate.
 
 **system**
-- `hello {token, client_version}` → `{daemon_version, capabilities}`
+- `hello {token, client_version, protocol_version}` →
+  `{daemon_version, capabilities, protocol_version}`. `protocol_version` is
+  `bondsymphonic_proto::PROTOCOL_VERSION`, which is `1`. Both fields are
+  optional on the wire: a peer that sends none predates the field, and is
+  treated as speaking version 1, which is what everything before Milestone 7
+  spoke.
+  - A daemon that is sent another version answers
+    `InvalidParams` with
+    `data {"reason": "protocol_mismatch", "daemon": M, "client": N}` and closes
+    the connection after the reply, exactly as it does for a bad token.
+  - An IDE that reads another version back — or is refused with that error —
+    stops at the handshake, puts
+    `daemon: protocol mismatch (daemon M, IDE N)` in the status bar, and does
+    not enter the reconnect backoff: every attempt would be refused the same
+    way. When the launcher owns the daemon it reinstalls the copy the IDE ships
+    with and retries once first, which is the mismatch a developer actually
+    hits (a stale binary in the distro).
 - `system.check_prereqs` → list of `{name, ok, detail, fix_hint}` for git, bwrap,
   user-namespace support, claude, gh
 - `system.shutdown`
@@ -151,7 +171,10 @@ crate.
 **repo**
 - `repo.inspect {path}` → `{default_branch, branches[], is_dirty, remotes[]}`
 - `repo.detect_run_configs {path}` → `RunConfig[]` (from `bondsymphonic.toml` or
-  auto-detection, with `source` field)
+  auto-detection, with `source` field), plus `network_allow[]` and `warnings[]`.
+  `warnings` is one line per part of the repository's `bondsymphonic.toml` that
+  could not be used; it is optional on the wire and empty from a daemon that
+  finds nothing to report.
 
 **workspace**
 - `workspace.create {repo_path, base_branch, name}` → `WorkspaceInfo`

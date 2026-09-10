@@ -17,7 +17,13 @@ macro_rules! params {
 
 params!(HelloParams {
     token: String,
-    client_version: String
+    client_version: String,
+    /// The wire protocol the client speaks ([`crate::PROTOCOL_VERSION`]).
+    ///
+    /// `None` is a client built before the field existed, which speaks version
+    /// 1; [`crate::peer_protocol_version`] is the one place that is decided.
+    #[serde(default)]
+    protocol_version: Option<u32>
 });
 params!(SetupPtyParams {
     action: SetupAction,
@@ -222,6 +228,7 @@ impl Request {
             Hello(HelloParams {
                 token: "t".into(),
                 client_version: "0.1.0".into(),
+                protocol_version: Some(crate::PROTOCOL_VERSION),
             }),
             SystemCheckPrereqs {},
             SystemShutdown {},
@@ -356,6 +363,12 @@ impl Request {
 pub struct HelloResult {
     pub daemon_version: String,
     pub capabilities: Capabilities,
+    /// The wire protocol the daemon speaks ([`crate::PROTOCOL_VERSION`]).
+    ///
+    /// `None` is a daemon built before the field existed, which speaks version
+    /// 1; [`crate::peer_protocol_version`] is the one place that is decided.
+    #[serde(default)]
+    pub protocol_version: Option<u32>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckPrereqsResult {
@@ -373,6 +386,14 @@ pub struct DetectRunConfigsResult {
     /// the field simply adds nothing.
     #[serde(default)]
     pub network_allow: Vec<String>,
+    /// One line per part of the repository's `bondsymphonic.toml` that could
+    /// not be used, so a mistake in it is reported rather than silently
+    /// dropping the entry it appears in.
+    ///
+    /// `serde(default)` because a daemon that predates the field warns about
+    /// nothing, which is not the same as a broken answer.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceListResult {

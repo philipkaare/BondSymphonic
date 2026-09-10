@@ -7,7 +7,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::client::router::EventRouter;
-use crate::client::DaemonClient;
+use crate::client::{ClientError, DaemonClient};
 use crate::launcher::{self, LaunchSpec};
 use crate::model::app_state::{
     agent_state_word, compose_status, ConnectionState, Workspaces, UNSORTED_GROUP,
@@ -1395,7 +1395,9 @@ async fn supervise(spec: LaunchSpec, qt: QtHandle, process: ProcessHandle) {
         }
         let mut drain = match connect_once(&spec, &qt, &process, attempt).await {
             Ok(drain) => drain,
-            Err(message) => {
+            Err(failure) => {
+                let fatal = matches!(failure, ConnectFailure::Fatal(_));
+                let message = failure.into_message();
                 // A quit that arrived while this attempt was in flight. Nothing
                 // to report and nothing to retry: the window is going, and the
                 // error state below would put a sentence about quitting in a
@@ -1404,14 +1406,15 @@ async fn supervise(spec: LaunchSpec, qt: QtHandle, process: ProcessHandle) {
                     tracing::info!("{message}");
                     return;
                 }
-                if attempt == 0 {
-                    // The very first launch never came up. That is not a lost
-                    // connection but a machine that cannot run the daemon at
-                    // all -- a missing distro, a bad path, a binary that will
-                    // not start -- and retrying it every second would only
-                    // repeat the same sentence behind a status bar that says
-                    // "reconnecting". The error text and the setup page are
-                    // the answer to that one instead.
+                if fatal || attempt == 0 {
+                    // Either the very first launch never came up -- a machine
+                    // that cannot run the daemon at all: a missing distro, a
+                    // bad path, a binary that will not start -- or the failure
+                    // is one no retry can change, which is a daemon speaking
+                    // another protocol version. Retrying either every second
+                    // would only repeat the same sentence behind a status bar
+                    // that says "reconnecting". The error text and the setup
+                    // page are the answer to both instead.
                     tracing::error!("{message}");
                     let _ = qt.queue(move |mut q| {
                         q.as_mut().set_state(ConnectionState::Error);
@@ -1490,6 +1493,34 @@ async fn wait_for_process(process: &ProcessHandle) -> &'static str {
     }
 }
 
+/// Why one connection attempt did not produce a connection.
+///
+/// The distinction is what the backoff loop reads: a daemon that is not up yet
+/// is worth trying again, and a daemon speaking another version of the protocol
+/// is not -- every attempt would be refused in exactly the same way, behind a
+/// status bar claiming something was being tried.
+enum ConnectFailure {
+    /// Worth another attempt on the backoff schedule.
+    Retryable(String),
+    /// Nothing left to try: the status bar says this and the loop ends.
+    Fatal(String),
+}
+
+impl ConnectFailure {
+    fn into_message(self) -> String {
+        match self {
+            Self::Retryable(m) | Self::Fatal(m) => m,
+        }
+    }
+}
+
+/// What the status bar says when the IDE and the daemon do not speak the same
+/// protocol. Both numbers are in it: which half is out of date is the user's
+/// next question, and only the pair of versions answers it.
+pub fn mismatch_status(daemon: u32, client: u32) -> String {
+    format!("daemon: protocol mismatch (daemon {daemon}, IDE {client})")
+}
+
 /// One launch-connect-resync cycle. `attempt` is 0 for the first connection of
 /// the run and counts the reconnects after that.
 ///
@@ -1500,53 +1531,61 @@ async fn connect_once(
     qt: &QtHandle,
     process: &ProcessHandle,
     attempt: u32,
-) -> Result<tokio::task::JoinHandle<()>, String> {
+) -> Result<tokio::task::JoinHandle<()>, ConnectFailure> {
     let first = attempt == 0;
-    // Checked here as well as in `supervise`'s backoff sleep, because that check
-    // is followed by a `launch` that takes seconds: a quit announced inside that
-    // window would otherwise start one more daemon for an IDE on its way out.
-    // Checked before the launch rather than after it, so nothing is started that
-    // then has to be shut down.
-    if quitting() {
-        return Err("the IDE is quitting; no daemon was launched".to_owned());
-    }
-    // `test_endpoint` is the `BS_DAEMON_ADDR` test hook and is `None` in every
-    // ordinary run, which then launches the daemon inside WSL. Under the hook
-    // a reconnect only reconnects: there is no daemon of ours to relaunch, and
-    // the fake one is expected to be listening on the same port again.
-    let (addr, token) = match launcher::test_endpoint() {
-        Some((addr, token)) => {
-            if first {
-                tracing::warn!(
-                    "{} is set: connecting to {addr} instead of launching a daemon",
-                    launcher::TEST_ADDR_ENV
-                );
-            }
-            (addr, token)
+    // A protocol mismatch is answered by reinstalling the daemon this IDE
+    // ships with, once. The flag is what makes it once: the reinstall is a
+    // no-op when the copy in the distro already matches the local one, so a
+    // second refusal is a pair that really cannot talk, and nothing here can
+    // change that.
+    let mut reinstalled = false;
+    let (client, hello, events) = loop {
+        // Checked here as well as in `supervise`'s backoff sleep, because that check
+        // is followed by a `launch` that takes seconds: a quit announced inside that
+        // window would otherwise start one more daemon for an IDE on its way out.
+        // Checked before the launch rather than after it, so nothing is started that
+        // then has to be shut down.
+        if quitting() {
+            return Err(ConnectFailure::Retryable(
+                "the IDE is quitting; no daemon was launched".to_owned(),
+            ));
         }
-        None => {
-            if first {
-                let _ = qt.queue(|q| q.set_state(ConnectionState::Launching));
+        // `test_endpoint` is the `BS_DAEMON_ADDR` test hook and is `None` in every
+        // ordinary run, which then launches the daemon inside WSL. Under the hook
+        // a reconnect only reconnects: there is no daemon of ours to relaunch, and
+        // the fake one is expected to be listening on the same port again.
+        let (addr, token, launcher_owns_the_daemon) = match launcher::test_endpoint() {
+            Some((addr, token)) => {
+                if first && !reinstalled {
+                    tracing::warn!(
+                        "{} is set: connecting to {addr} instead of launching a daemon",
+                        launcher::TEST_ADDR_ENV
+                    );
+                }
+                (addr, token, false)
             }
-            let daemon = launcher::launch(spec)
-                .await
-                .map_err(|e| format!("daemon: launch failed: {e:#}"))?;
-            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], daemon.port));
-            let token = daemon.token.clone();
-            *process.lock().await = Some(daemon);
-            (addr, token)
+            None => {
+                if first {
+                    let _ = qt.queue(|q| q.set_state(ConnectionState::Launching));
+                }
+                let daemon = launcher::launch(spec).await.map_err(|e| {
+                    ConnectFailure::Retryable(format!("daemon: launch failed: {e:#}"))
+                })?;
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], daemon.port));
+                let token = daemon.token.clone();
+                *process.lock().await = Some(daemon);
+                (addr, token, true)
+            }
+        };
+        // Only on the first connection: a reconnect's status text is
+        // "daemon: reconnecting (attempt N)", and overwriting it with "connecting"
+        // would take away the count the user is watching.
+        if first {
+            let _ = qt.queue(|q| q.set_state(ConnectionState::Connecting));
         }
-    };
-    // Only on the first connection: a reconnect's status text is
-    // "daemon: reconnecting (attempt N)", and overwriting it with "connecting"
-    // would take away the count the user is watching.
-    if first {
-        let _ = qt.queue(|q| q.set_state(ConnectionState::Connecting));
-    }
 
-    let (client, hello, events) =
         match DaemonClient::connect(addr, &token, env!("CARGO_PKG_VERSION")).await {
-            Ok(connected) => connected,
+            Ok(connected) => break connected,
             Err(e) => {
                 // A daemon we just launched but cannot talk to. Reaped here
                 // rather than left as an orphan behind every failed attempt.
@@ -1554,9 +1593,29 @@ async fn connect_once(
                 if let Some(orphan) = orphan {
                     orphan.shutdown().await;
                 }
-                return Err(format!("daemon: connect failed: {e}"));
+                let ClientError::ProtocolMismatch { daemon, client } = e else {
+                    return Err(ConnectFailure::Retryable(format!(
+                        "daemon: connect failed: {e}"
+                    )));
+                };
+                let text = mismatch_status(daemon, client);
+                // Nothing of ours to replace under the test hook, and nothing
+                // to replace twice. Either way the pair cannot talk, so the
+                // loop stops here rather than backing off against a refusal
+                // that would be the same every time.
+                if !launcher_owns_the_daemon || reinstalled {
+                    return Err(ConnectFailure::Fatal(text));
+                }
+                reinstalled = true;
+                tracing::warn!("{text}; reinstalling the daemon this IDE ships with");
+                if let Err(e) = launcher::install_daemon(spec).await {
+                    return Err(ConnectFailure::Fatal(format!(
+                        "{text}; reinstalling the daemon failed: {e:#}"
+                    )));
+                }
             }
-        };
+        }
+    };
 
     // Published before any event is dispatched, so a QObject woken by the
     // first `workspaces_listed` -- or by the generation change this publish

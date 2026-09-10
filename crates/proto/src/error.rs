@@ -51,4 +51,38 @@ impl RpcError {
     pub fn io(e: &std::io::Error) -> Self {
         Self::new(ErrorCode::IoError, e.to_string())
     }
+
+    /// The daemon's answer to a `hello` from a client speaking another version
+    /// of the protocol.
+    ///
+    /// Both numbers travel in `data` beside a fixed reason, so the client can
+    /// name them in its status bar without parsing the message, and the
+    /// message says the same thing for anyone reading a log.
+    pub fn protocol_mismatch(daemon: u32, client: u32) -> Self {
+        Self::new(
+            ErrorCode::InvalidParams,
+            format!("protocol version {client} is not supported (daemon speaks {daemon})"),
+        )
+        .with_data(serde_json::json!({
+            "reason": PROTOCOL_MISMATCH_REASON,
+            "daemon": daemon,
+            "client": client,
+        }))
+    }
+}
+
+/// The `data.reason` a [`RpcError::protocol_mismatch`] carries. Written by the
+/// daemon, matched by the client.
+pub const PROTOCOL_MISMATCH_REASON: &str = "protocol_mismatch";
+
+/// The two versions out of a [`RpcError::protocol_mismatch`], or `None` when
+/// `err` is any other error.
+pub fn protocol_mismatch_versions(err: &RpcError) -> Option<(u32, u32)> {
+    let data = err.data.as_ref()?;
+    if data.get("reason")?.as_str()? != PROTOCOL_MISMATCH_REASON {
+        return None;
+    }
+    let daemon = u32::try_from(data.get("daemon")?.as_u64()?).ok()?;
+    let client = u32::try_from(data.get("client")?.as_u64()?).ok()?;
+    Some((daemon, client))
 }

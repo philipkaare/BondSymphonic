@@ -51,6 +51,7 @@ async fn hello_with_good_token_returns_version() {
         Request::Hello(HelloParams {
             token,
             client_version: "0.1.0".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
         }),
     )
     .await;
@@ -62,6 +63,9 @@ async fn hello_with_good_token_returns_version() {
         } => {
             let hr: HelloResult = codec::parse_result(v).unwrap();
             assert_eq!(hr.daemon_version, env!("CARGO_PKG_VERSION"));
+            // The answer names the protocol as well as the build, so a client
+            // one version ahead can tell the two apart.
+            assert_eq!(hr.protocol_version, Some(PROTOCOL_VERSION));
         }
         other => panic!("unexpected {other:?}"),
     }
@@ -78,6 +82,7 @@ async fn bad_token_gets_unauthorized_and_disconnect() {
         Request::Hello(HelloParams {
             token: "nope".into(),
             client_version: "0.1.0".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
         }),
     )
     .await;
@@ -117,6 +122,7 @@ async fn unimplemented_method_returns_internal_error() {
         Request::Hello(HelloParams {
             token,
             client_version: "0.1.0".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
         }),
     )
     .await;
@@ -146,6 +152,7 @@ async fn shutdown_request_stops_server() {
         Request::Hello(HelloParams {
             token,
             client_version: "0.1.0".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
         }),
     )
     .await;
@@ -174,6 +181,7 @@ async fn events_are_broadcast_to_authenticated_clients() {
         Request::Hello(HelloParams {
             token,
             client_version: "0.1.0".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
         }),
     )
     .await;
@@ -216,6 +224,7 @@ async fn server_survives_aborted_connection_and_accepts_next() {
         Request::Hello(HelloParams {
             token,
             client_version: "0.1.0".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
         }),
     )
     .await;
@@ -266,6 +275,7 @@ async fn a_slow_request_does_not_block_a_fast_one() {
         Request::Hello(HelloParams {
             token,
             client_version: "0.1.0".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
         }),
     )
     .await;
@@ -386,6 +396,7 @@ async fn an_event_published_after_a_reply_is_queued_is_written_after_it() {
         Request::Hello(HelloParams {
             token,
             client_version: "0.1.0".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
         }),
     )
     .await;
@@ -444,6 +455,7 @@ async fn a_lagging_client_is_told_how_many_events_it_missed() {
         Request::Hello(HelloParams {
             token,
             client_version: "0.1.0".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
         }),
     )
     .await;
@@ -563,6 +575,7 @@ async fn a_lag_that_happens_during_the_pre_reply_flush_is_still_reported() {
         Request::Hello(HelloParams {
             token,
             client_version: "0.1.0".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
         }),
     )
     .await;
@@ -614,6 +627,90 @@ async fn a_lag_that_happens_during_the_pre_reply_flush_is_still_reported() {
     send(&mut w, 3, Request::SystemCheckPrereqs {}).await;
     match recv(&mut r).await.unwrap() {
         ServerMessage::Response { id: 3, .. } => {}
+        other => panic!("unexpected {other:?}"),
+    }
+    cancel.cancel();
+}
+
+/// Writes a line the typed `ClientMessage` cannot build. A `hello` from a peer
+/// that predates `protocol_version` has no such key at all, and the typed form
+/// always writes one.
+async fn send_line(w: &mut tokio::net::tcp::OwnedWriteHalf, line: &str) {
+    w.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+}
+
+/// The Milestone 7 gate: a client speaking another version of the protocol is
+/// told so, by name and with both numbers, instead of failing later on a
+/// decode error nobody can act on. The connection goes with the reply, the way
+/// a bad token's does: nothing this pair could agree on comes next.
+#[tokio::test]
+async fn hello_with_another_protocol_version_is_refused_and_the_socket_closes() {
+    let (port, token, cancel, _h) = start().await;
+    let (mut r, mut w) = connect(port).await;
+    send(
+        &mut w,
+        1,
+        Request::Hello(HelloParams {
+            token,
+            client_version: "0.1.0".into(),
+            protocol_version: Some(99),
+        }),
+    )
+    .await;
+    match recv(&mut r).await.unwrap() {
+        ServerMessage::Response {
+            id: 1,
+            error: Some(e),
+            ..
+        } => {
+            assert_eq!(e.code, ErrorCode::InvalidParams);
+            let data = e.data.clone().expect("the reason travels in data");
+            assert_eq!(data["reason"], "protocol_mismatch");
+            assert_eq!(data["daemon"], PROTOCOL_VERSION);
+            assert_eq!(data["client"], 99);
+            assert_eq!(protocol_mismatch_versions(&e), Some((PROTOCOL_VERSION, 99)));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(recv(&mut r).await.is_none(), "connection should be closed");
+    cancel.cancel();
+}
+
+/// A `hello` with no `protocol_version` at all is a client built before the
+/// field existed. It speaks version 1, which is this daemon's version, so it
+/// is accepted -- and the answer tells it which version it just reached.
+#[tokio::test]
+async fn hello_without_a_protocol_version_is_accepted_as_version_one() {
+    let (port, token, cancel, _h) = start().await;
+    let (mut r, mut w) = connect(port).await;
+    let line = serde_json::json!({
+        "type": "request",
+        "id": 1,
+        "method": "hello",
+        "params": { "token": token, "client_version": "0.1.0" }
+    })
+    .to_string();
+    assert!(
+        !line.contains("protocol_version"),
+        "the pre-M7 hello must not carry the field: {line}"
+    );
+    send_line(&mut w, &line).await;
+    match recv(&mut r).await.unwrap() {
+        ServerMessage::Response {
+            id: 1,
+            result: Some(v),
+            error: None,
+        } => {
+            let hr: HelloResult = codec::parse_result(v).unwrap();
+            assert_eq!(hr.protocol_version, Some(PROTOCOL_VERSION));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    // Accepted means authenticated: the next request is answered rather than
+    // rejected, and the socket is still up.
+    send(&mut w, 2, Request::SystemCheckPrereqs {}).await;
+    match recv(&mut r).await.unwrap() {
+        ServerMessage::Response { id: 2, error, .. } => assert!(error.is_none(), "{error:?}"),
         other => panic!("unexpected {other:?}"),
     }
     cancel.cancel();

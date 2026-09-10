@@ -322,6 +322,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                                     AgentAdapterKind::Claude,
                                 ],
                             },
+                            protocol_version: Some(PROTOCOL_VERSION),
                         },
                     ),
                     Request::Hello(_) => ServerMessage::err(id, RpcError::unauthorized()),
@@ -431,6 +432,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                         &DetectRunConfigsResult {
                             configs: vec![],
                             network_allow: vec![],
+                            warnings: vec![],
                         },
                     ),
                     Request::RunList(_) => ServerMessage::ok(id, &RunListResult { runs: vec![] }),
@@ -511,4 +513,192 @@ fn wait_for(child: &mut std::process::Child, limit: Duration) -> Option<std::pro
     let _ = child.kill();
     let _ = child.wait();
     None
+}
+
+// ---------------------------------------------------------------------------
+// The version gate. A daemon the IDE cannot talk to is not a daemon that is
+// down: retrying it is retrying the same refusal every second for the rest of
+// the session, so the loop stops and says which two pieces do not match.
+// ---------------------------------------------------------------------------
+
+/// What the status bar must say when the pair does not match, and the text
+/// that must never appear beside it.
+const MISMATCH_TEXT: &str = "daemon: protocol mismatch (daemon 2, IDE 1)";
+const RECONNECTING_PREFIX: &str = "daemon: reconnecting (attempt";
+/// The mismatch is decided by the handshake, so a cold Qt start is all this
+/// waits for.
+const MISMATCH_LIMIT: Duration = Duration::from_secs(60);
+
+#[test]
+fn a_protocol_mismatch_stops_the_connection_loop_instead_of_backing_off() {
+    if std::env::var_os("QMAKE").is_none() {
+        eprintln!(
+            "protocol mismatch: skipped because QMAKE is unset, so the Qt runtime the IDE needs \
+             is not on PATH. Dot-source scripts\\env.ps1 and run again."
+        );
+        return;
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let (addr, journal) = rt.block_on(fake_daemon_speaking_protocol_two());
+
+    let config = std::env::temp_dir().join(format!("bs-mismatch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&config);
+    std::fs::create_dir_all(&config).expect("mismatch config dir");
+
+    // `BS_DAEMON_ADDR` is set, so the launcher owns no daemon: there is nothing
+    // to reinstall and the first refusal is the last word.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+        .env("QT_QPA_PLATFORM", "offscreen")
+        .env("BS_DAEMON_ADDR", addr.to_string())
+        .env("BS_DAEMON_TOKEN", TOKEN)
+        .env("BS_SETTINGS_PATH", config.join("settings.json"))
+        .env("BS_STATE_PATH", config.join("state.json"))
+        .env("BS_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the IDE binary starts");
+
+    let out = drain_live(child.stdout.take().expect("stdout is piped"));
+    let err = drain_live(child.stderr.take().expect("stderr is piped"));
+    let logs = |()| format!("{}\n{}", read(&out), read(&err));
+    // No script can run without a connection, so this run never quits by
+    // itself: it is watched until the status bar has said its piece, given a
+    // moment to prove nothing follows, and then stopped.
+    let saw = wait_for_text(&mut child, &out, &err, MISMATCH_TEXT, MISMATCH_LIMIT);
+    std::thread::sleep(Duration::from_secs(2));
+    let _ = child.kill();
+    let _ = child.wait();
+    let logs = logs(());
+    let seen = journal.lock().expect("journal mutex").clone();
+    let context = format!("requests: {seen:?}\n--- logs ---\n{logs}");
+
+    assert!(
+        saw,
+        "the status bar never said {MISMATCH_TEXT:?} within {MISMATCH_LIMIT:?}\n{context}"
+    );
+    assert!(
+        !logs.contains("panicked at"),
+        "the IDE logged a panic\n{context}"
+    );
+    // The whole point: no schedule was started, so the user is not watching a
+    // counter climb against a daemon that will refuse every attempt alike.
+    assert!(
+        !logs.contains(RECONNECTING_PREFIX),
+        "the IDE entered the backoff loop after a protocol mismatch\n{context}"
+    );
+    let hellos = seen.iter().filter(|m| *m == "hello").count();
+    assert_eq!(
+        hellos, 1,
+        "the handshake was tried more than once against a daemon that cannot match\n{context}"
+    );
+
+    let _ = std::fs::remove_dir_all(&config);
+}
+
+/// A daemon that answers the handshake claiming protocol 2. Everything else it
+/// refuses: nothing should get that far.
+async fn fake_daemon_speaking_protocol_two() -> (std::net::SocketAddr, Journal) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+    let recorded = journal.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let recorded = recorded.clone();
+            tokio::spawn(async move {
+                let (r, mut w) = stream.into_split();
+                let mut r = BufReader::new(r);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                    let ClientMessage::Request { id, request } =
+                        codec::decode(line.trim_end()).expect("decode");
+                    recorded
+                        .lock()
+                        .expect("journal mutex")
+                        .push(request.method_name().to_owned());
+                    let reply = match request {
+                        Request::Hello(p) if p.token == TOKEN => ServerMessage::ok(
+                            id,
+                            &HelloResult {
+                                daemon_version: "0.0.0-fake".into(),
+                                capabilities: Capabilities {
+                                    sandbox_backend: "noop".into(),
+                                    git_protect: false,
+                                    adapters: vec![],
+                                },
+                                protocol_version: Some(2),
+                            },
+                        ),
+                        other => ServerMessage::err(
+                            id,
+                            RpcError::internal(format!("not implemented: {}", other.method_name())),
+                        ),
+                    };
+                    if w.write_all(codec::encode(&reply).as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, journal)
+}
+
+/// Like [`drain`], but the text read so far can be looked at while the child is
+/// still running, which is what a run that never exits by itself needs.
+fn drain_live(mut pipe: impl Read + Send + 'static) -> Arc<Mutex<String>> {
+    let text = Arc::new(Mutex::new(String::new()));
+    let sink = text.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = pipe.read(&mut buf) {
+            if n == 0 {
+                return;
+            }
+            sink.lock()
+                .expect("log mutex")
+                .push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    });
+    text
+}
+
+fn read(text: &Arc<Mutex<String>>) -> String {
+    text.lock().expect("log mutex").clone()
+}
+
+/// Waits until `needle` appears in either pipe, the child exits, or the limit
+/// passes. Returns whether it was seen.
+fn wait_for_text(
+    child: &mut std::process::Child,
+    out: &Arc<Mutex<String>>,
+    err: &Arc<Mutex<String>>,
+    needle: &str,
+    limit: Duration,
+) -> bool {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if read(out).contains(needle) || read(err).contains(needle) {
+            return true;
+        }
+        if child.try_wait().expect("try_wait").is_some() {
+            return read(out).contains(needle) || read(err).contains(needle);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
 }

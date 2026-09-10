@@ -174,6 +174,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                                     AgentAdapterKind::Claude,
                                 ],
                             },
+                            protocol_version: Some(PROTOCOL_VERSION),
                         },
                     ),
                     Request::Hello(_) => ServerMessage::err(id, RpcError::unauthorized()),
@@ -233,6 +234,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                         &DetectRunConfigsResult {
                             configs: vec![],
                             network_allow: vec![],
+                            warnings: vec![],
                         },
                     ),
                     Request::RunList(_) => ServerMessage::ok(id, &RunListResult { runs: vec![] }),

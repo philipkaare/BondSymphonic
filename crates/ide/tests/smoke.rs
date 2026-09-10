@@ -833,6 +833,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journals) {
                                     AgentAdapterKind::Claude,
                                 ],
                             },
+                            protocol_version: Some(PROTOCOL_VERSION),
                         },
                     )),
                     Request::Hello(_) => Some(ServerMessage::err(id, RpcError::unauthorized())),
@@ -1209,6 +1210,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journals) {
                         &DetectRunConfigsResult {
                             configs: vec![run_config()],
                             network_allow: vec![],
+                            warnings: vec![],
                         },
                     )),
                     // The run, on a bridged port, then the three events a real

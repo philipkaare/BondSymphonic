@@ -43,10 +43,27 @@ impl Handler for SystemHandler {
             if p.token != self.token {
                 return Err(RpcError::unauthorized());
             }
+            // The version gate, after the token so an unauthenticated peer
+            // learns nothing about this build. A client on another version is
+            // refused here rather than left to fail on the first field one of
+            // the two has never heard of; the connection loop closes the
+            // socket after the reply, because this connection stays
+            // unauthenticated.
+            let client = peer_protocol_version(p.protocol_version);
+            if client != PROTOCOL_VERSION {
+                tracing::warn!(
+                    daemon = PROTOCOL_VERSION,
+                    client,
+                    client_version = %p.client_version,
+                    "refused a client speaking another protocol version"
+                );
+                return Err(RpcError::protocol_mismatch(PROTOCOL_VERSION, client));
+            }
             ctx.authenticated.store(true, Ordering::SeqCst);
             return ok(HelloResult {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                 capabilities: self.capabilities.clone(),
+                protocol_version: Some(PROTOCOL_VERSION),
             });
         }
         if !ctx.is_authenticated() {

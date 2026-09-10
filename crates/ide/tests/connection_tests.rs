@@ -51,6 +51,7 @@ async fn fake_daemon(
                             git_protect: false,
                             adapters: vec![],
                         },
+                        protocol_version: Some(PROTOCOL_VERSION),
                     },
                 ),
                 other => ServerMessage::err(

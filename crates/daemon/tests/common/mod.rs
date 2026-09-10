@@ -135,6 +135,7 @@ impl Client {
             .call(Request::Hello(HelloParams {
                 token: token.into(),
                 client_version: "t".into(),
+                protocol_version: Some(PROTOCOL_VERSION),
             }))
             .await
             .unwrap();
