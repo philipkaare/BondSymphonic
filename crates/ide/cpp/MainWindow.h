@@ -227,6 +227,11 @@ private:
     /// or hidden. The sentence is the model's, so it and the tab's tooltip
     /// cannot word it differently.
     QLabel* m_attentionLabel = nullptr;
+    /// The workspace that was in front before the current one, or empty. Kept
+    /// because switching *away* from a tab whose agent is waiting produces no
+    /// event of its own -- nothing about the agent changed, only the selection
+    /// -- so the tab being left has to be named on the way past.
+    QString m_previousWorkspaceId;
     QLabel* m_costLabel = nullptr;
     /// The status bar's way back to the setup page, shown only while a
     /// non-blocking prerequisite is failing.

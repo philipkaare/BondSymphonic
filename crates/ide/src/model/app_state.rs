@@ -766,14 +766,6 @@ impl Workspaces {
         true
     }
 
-    /// Removes the group named `name`, moving whatever tabs it still holds
-    /// into [`UNSORTED_GROUP`]. False when there is no such group.
-    ///
-    /// The tabs move rather than going with the group: closing a group is a
-    /// decision about the group, and the workspaces in it that the user chose
-    /// to keep are still live in the daemon. A group being closed that *is*
-    /// "Unsorted" is refused, because the tabs would have nowhere to go and
-    /// the next `reconcile` would only make it again.
     /// Marks the tab for `ws` as wanting the user, with `text` as the sentence
     /// both the tab bar and the status bar show. False when that workspace is
     /// not tracked, or when it already carries exactly this text.
@@ -807,6 +799,45 @@ impl Workspaces {
         true
     }
 
+    /// Re-decides who is asking for attention across a tab change: the tab the
+    /// user has just selected stops asking, and the tab they have just left
+    /// starts, if its agent is still blocked on a permission request.
+    ///
+    /// `previous` is the workspace that was in front before the change, or
+    /// `None` when there was none. True when anything moved, so the caller only
+    /// republishes the model when the tab bar has something new to paint.
+    ///
+    /// The second half is the whole reason this exists rather than living in
+    /// the window's `agent.state` handler. An agent asks for permission while
+    /// its own tab is in front, so nothing is marked -- correctly, the bar is
+    /// right there. The user then switches away, and **no state event fires**:
+    /// the agent has not changed, only the selection has. Without this the tab
+    /// they just left carries no bullet and the status bar no hint, and the
+    /// question is exactly as invisible as it was before any of this was built.
+    ///
+    /// The agent's own status is the source, not a flag kept beside it: it is
+    /// the daemon's word, already on the tab and already restored with the
+    /// session, so a switch cannot disagree with what the tab bar's glyph says.
+    pub fn refresh_attention(&mut self, previous: Option<&WorkspaceId>) -> bool {
+        let active = self.active().map(|t| t.workspace_id.clone());
+        let mut changed = false;
+        if let Some(active) = &active {
+            changed |= self.clear_workspace_attention(active);
+        }
+        let Some(previous) = previous.filter(|id| Some(*id) != active.as_ref()) else {
+            return changed;
+        };
+        let Some((g, t)) = self.find(previous) else {
+            return changed;
+        };
+        let tab = &self.groups[g].tabs[t];
+        if tab.agent_status != Some(TabStatus::WaitingPermission) {
+            return changed;
+        }
+        let text = permission_attention(&tab.name);
+        changed | self.set_workspace_attention(previous, &text)
+    }
+
     /// The sentence for the status bar: the first tab, in the user's own group
     /// and tab order, that is asking for something. `None` when nothing is.
     ///
@@ -821,6 +852,14 @@ impl Workspaces {
             .find(|text| !text.is_empty())
     }
 
+    /// Removes the group named `name`, moving whatever tabs it still holds
+    /// into [`UNSORTED_GROUP`]. False when there is no such group.
+    ///
+    /// The tabs move rather than going with the group: closing a group is a
+    /// decision about the group, and the workspaces in it that the user chose
+    /// to keep are still live in the daemon. A group being closed that *is*
+    /// "Unsorted" is refused, because the tabs would have nowhere to go and
+    /// the next `reconcile` would only make it again.
     pub fn remove_group(&mut self, name: &str) -> bool {
         let Some(idx) = self.groups.iter().position(|g| g.name == name) else {
             return false;

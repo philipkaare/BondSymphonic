@@ -1039,6 +1039,9 @@ void MainWindow::onActiveTabChanged() {
     const QJsonObject active = activeTab();
     updateWindowTitle(active);
     if (active.isEmpty()) {
+        // No tab at all: there is nothing to switch away *to*, and the id held
+        // here may name a workspace that has just been destroyed.
+        m_previousWorkspaceId.clear();
         m_agentArea->showPlaceholder();
         m_shellArea->showPlaceholder();
         m_explorer->setWorkspace(QString());
@@ -1048,10 +1051,23 @@ void MainWindow::onActiveTabChanged() {
         return;
     }
     const QString workspaceId = active.value("workspace_id").toString();
-    // Whatever this tab was asking for, the user is now looking at it. Answers
-    // `false` when there was no mark, so this does not republish the model on
-    // every tab change.
-    m_groupModel->clearWorkspaceAttention(workspaceId);
+    // Both halves of the tab change at once, and the model decides both: the
+    // tab now in front stops asking, because the user is looking at it, and the
+    // tab just left starts if its agent is still blocked on a question. The
+    // second is not reachable from `agentStateChanged` -- switching away
+    // changes the selection, not the agent -- and it is the case the whole
+    // feature exists for. Answers `false` when neither moved, so an ordinary
+    // tab change does not republish the model.
+    //
+    // The member is moved on *before* the call, not after: a `refreshAttention`
+    // that changes something republishes the model, which re-enters this
+    // function synchronously. Re-entering with the id already updated makes
+    // that second pass a no-op on both halves, so the recursion is one level
+    // deep by construction rather than by the model happening to answer
+    // `false` twice.
+    const QString previousWorkspaceId = m_previousWorkspaceId;
+    m_previousWorkspaceId = workspaceId;
+    m_groupModel->refreshAttention(previousWorkspaceId);
     m_explorer->setWorkspace(workspaceId);
     // After `setWorkspace`, which clears the header when it is handed an empty
     // id, and on every model change rather than only on a switch, so a branch

@@ -666,11 +666,22 @@ process, not BondSymphonic's.
   and `restore_tests.rs` launch the IDE binary, so they need the Qt runtime on
   `PATH` and cannot run without it. Each begins with
   `bondsymphonic_ide::testing::skip_without_qt(<suite>)`, the one place that
-  decision is made: with `QMAKE` unset it prints
-  `SKIP: <suite>: QMAKE is unset, ...` on stdout and the test returns, so a
+  decision is made: with no Qt reachable it prints
+  `SKIP: <suite>: neither QMAKE nor a qmake on PATH, ...` on **stderr**, where
+  every other skip in the repository reports itself, and the test returns. A
   developer who has not dot-sourced `scripts\env.ps1` still gets a useful run of
   the pure-Rust suites and can see, with `--nocapture`, exactly which tests did
   nothing.
+
+  "Reachable" is `QMAKE`, **or** a `qmake` on `PATH`, because `cxx-qt-build`
+  accepts either. Probing only the variable would skip real coverage on a host
+  that builds and runs the suite perfectly well but reached its Qt some other
+  way -- and under `require-qt` would fail a job that should have been green.
+  Finding `qmake` on `PATH` also means `<Qt>\bin` is on `PATH`, which is where
+  the runtime libraries the launched binary needs actually live. The search is
+  `testing::path_has_qmake`, which takes the `PATH` value rather than reading
+  the environment so it can be tested: on Windows a host with no `qmake` has no
+  Qt DLLs either, so the test binary would not load far enough to run it.
 
   The `require-qt` cargo feature turns that skip into a panic. CI's Windows job
   builds with it (`cargo test -p bondsymphonic-ide --features require-qt`, or

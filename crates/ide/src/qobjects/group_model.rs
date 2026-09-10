@@ -153,6 +153,21 @@ pub mod qobject {
         #[qinvokable]
         fn clear_workspace_attention(self: Pin<&mut GroupModel>, workspace_id: QString) -> bool;
 
+        /// Re-decides attention across a tab change: the newly active tab stops
+        /// asking, and `previous_workspace_id` -- the tab just left -- starts,
+        /// if its agent is still blocked on a permission request. The empty
+        /// string means there was no previous tab.
+        ///
+        /// The window calls this instead of clearing by hand, because the case
+        /// the feature exists for produces no `agent.state` event at all: an
+        /// agent asks while its own tab is in front, and the user then switches
+        /// away. Nothing about the agent changed, so nothing would fire.
+        ///
+        /// False when nothing moved, so a tab change with no question open does
+        /// not republish the model.
+        #[qinvokable]
+        fn refresh_attention(self: Pin<&mut GroupModel>, previous_workspace_id: QString) -> bool;
+
         /// The sentence for the status bar -- the first tab, in the user's own
         /// order, that is asking for something -- or empty when none is.
         #[qinvokable]
@@ -611,6 +626,20 @@ impl qobject::GroupModel {
             self.publish();
         }
         cleared
+    }
+
+    pub fn refresh_attention(mut self: Pin<&mut Self>, previous_workspace_id: QString) -> bool {
+        let previous = previous_workspace_id.to_string();
+        let previous = (!previous.is_empty()).then_some(WorkspaceId(previous));
+        let moved = self
+            .as_mut()
+            .rust_mut()
+            .workspaces
+            .refresh_attention(previous.as_ref());
+        if moved {
+            self.publish();
+        }
+        moved
     }
 
     pub fn attention_text(&self) -> QString {

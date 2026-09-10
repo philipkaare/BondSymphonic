@@ -1062,19 +1062,58 @@ fn state_json_without_attention_still_loads() {
 // The Qt-less skip (M7 Task 3).
 // ---------------------------------------------------------------------------
 
-/// The guard the four Qt-dependent suites use. With `QMAKE` set -- which is
-/// every run that got far enough to link this binary against Qt -- it answers
-/// `false` and the suite runs; the skip half is what `require-qt` turns into a
-/// panic in CI, and cannot be exercised from inside a test that needs the
-/// runtime itself.
+/// The guard the three binary-launching suites use. This host reached Qt one
+/// way or the other -- it linked and started this very binary against it -- so
+/// the guard must not skip.
 #[test]
-fn the_qt_guard_does_not_skip_when_qmake_is_set() {
-    if std::env::var_os("QMAKE").is_none() {
-        // Not reachable on a machine that can run this binary at all, but the
-        // assertion below would be a lie there, so it is not made.
-        return;
-    }
+fn the_qt_guard_does_not_skip_on_a_host_that_has_qt() {
     assert!(!bondsymphonic_ide::testing::skip_without_qt("self-check"));
+}
+
+/// The half of the probe that `QMAKE` usually short-circuits.
+///
+/// `cxx-qt-build` accepts a bare `qmake` on `PATH` as well as the variable, so
+/// a host that builds and runs the suite perfectly well but never dot-sourced
+/// `scripts\env.ps1` must not have real coverage skipped out from under it --
+/// nor, under `require-qt`, fail a job that would otherwise be green.
+///
+/// Driven through the value rather than the process environment: changing this
+/// process's `PATH` would race every other thread in the binary, and on Windows
+/// the search is otherwise unreachable, because a host with no `qmake` also has
+/// no Qt DLLs and this binary would not have loaded.
+#[test]
+fn a_qmake_on_the_path_counts_even_with_the_variable_unset() {
+    use bondsymphonic_ide::testing::path_has_qmake;
+    use std::ffi::OsString;
+
+    let root = std::env::temp_dir().join(format!("bs-qmake-probe-{}", std::process::id()));
+    let with = root.join("qt-bin");
+    let without = root.join("empty");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&with).expect("probe dir");
+    std::fs::create_dir_all(&without).expect("probe dir");
+    // Contents are never read -- `cxx-qt-build` is what runs it, not this.
+    std::fs::write(with.join("qmake.exe"), b"").expect("fake qmake");
+
+    let joined = |dirs: &[&std::path::Path]| -> OsString {
+        std::env::join_paths(dirs.iter().map(|d| d.to_path_buf())).expect("a PATH")
+    };
+
+    assert!(!path_has_qmake(None), "no PATH at all is no Qt");
+    assert!(!path_has_qmake(Some(&OsString::new())));
+    assert!(!path_has_qmake(Some(&joined(&[without.as_path()]))));
+    assert!(path_has_qmake(Some(&joined(&[with.as_path()]))));
+    // Found wherever it sits in the list, not only at the front.
+    assert!(path_has_qmake(Some(&joined(&[
+        without.as_path(),
+        with.as_path()
+    ]))));
+    // A directory named but not present is skipped rather than fatal.
+    assert!(!path_has_qmake(Some(&joined(&[root
+        .join("gone")
+        .as_path()]))));
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,4 +1149,103 @@ fn complaints_about_the_repo_config_are_summarised_for_the_panel() {
         warning_status(&[NO_PORT.to_owned(), NO_COMMAND.to_owned()]),
         "2 problems with bondsymphonic.toml"
     );
+
+    // A file that does not parse at all is a *single* warning carrying the
+    // `toml` crate's message, offending line and caret -- for a file that may
+    // have declared any number of runs. It is shown as the daemon wrote it,
+    // newlines and all; the label wraps and the combo's tooltip carries the
+    // same text, which is where a caret diagram actually reads.
+    let parse_error = concat!(
+        "bondsymphonic.toml: TOML parse error at line 3, column 1\n",
+        "  |\n",
+        "3 | port =\n",
+        "  | ^\n",
+        "invalid string — the file was ignored and the runs below were detected instead"
+    );
+    assert_eq!(warning_status(&[parse_error.to_owned()]), parse_error);
+    // And two of anything is still counted, never joined into one line.
+    assert_eq!(
+        warning_status(&[parse_error.to_owned(), NO_PORT.to_owned()]),
+        "2 problems with bondsymphonic.toml"
+    );
+}
+
+/// The transition the feature exists for, and the one the first attempt missed.
+///
+/// An agent asks for permission while its own tab is in front, so nothing is
+/// marked -- correctly, the bar is right there. The user then switches away,
+/// and **no `agent.state` event fires**: the agent has not changed, only the
+/// selection has. `refresh_attention` is what re-decides on a tab change, so
+/// the tab just left picks up its bullet and the status bar its hint.
+#[test]
+fn switching_away_from_a_waiting_agent_marks_the_tab_it_left() {
+    let alpha = info("ws_1", "alpha", WorkspaceState::Ready);
+    let beta = info("ws_2", "beta", WorkspaceState::Ready);
+    let mut model = Workspaces::new_default();
+    model.add_tab(0, tab(&alpha));
+    model.add_tab(0, tab(&beta));
+
+    // alpha is in front and its agent asks. The window marks nothing, because
+    // the pane the user is looking at is showing the bar itself.
+    model.set_active(0, 0);
+    model.groups[0].tabs[0].agent_id = Some(AgentId("ag_1".into()));
+    model.set_agent_status(
+        &AgentId("ag_1".into()),
+        TabStatus::WaitingPermission,
+        "Bash",
+    );
+    assert_eq!(model.attention(), None, "the tab in front is not marked");
+
+    // The user switches to beta. Nothing about ag_1 changed, so only this call
+    // can notice.
+    model.set_active(0, 1);
+    assert!(
+        model.refresh_attention(Some(&alpha.id)),
+        "switching away is a change to the tab bar"
+    );
+    assert_eq!(model.attention(), Some("alpha is waiting for permission"));
+    let (g, t) = model.find(&alpha.id).expect("alpha is tracked");
+    assert_eq!(
+        model.groups[g].tabs[t].attention,
+        "alpha is waiting for permission"
+    );
+
+    // Switching back takes it down: the user can see the bar again.
+    model.set_active(0, 0);
+    assert!(model.refresh_attention(Some(&beta.id)));
+    assert_eq!(model.attention(), None);
+
+    // And an agent that is no longer waiting is not marked on the way past --
+    // this is what stops every tab change leaving a trail of bullets behind it.
+    model.set_agent_status(&AgentId("ag_1".into()), TabStatus::Working, "");
+    model.set_active(0, 1);
+    assert!(
+        !model.refresh_attention(Some(&alpha.id)),
+        "a working agent asks for nothing, so nothing is republished"
+    );
+    assert_eq!(model.attention(), None);
+}
+
+/// A tab change with no previous tab, and one that names the tab now in front,
+/// are both no-ops rather than mistakes: the first is the session's very first
+/// selection, the second is what a republish re-entering the window produces.
+#[test]
+fn refreshing_attention_without_a_previous_tab_changes_nothing() {
+    let alpha = info("ws_1", "alpha", WorkspaceState::Ready);
+    let mut model = Workspaces::new_default();
+    model.add_tab(0, tab(&alpha));
+    model.set_active(0, 0);
+    model.groups[0].tabs[0].agent_id = Some(AgentId("ag_1".into()));
+    model.set_agent_status(
+        &AgentId("ag_1".into()),
+        TabStatus::WaitingPermission,
+        "Bash",
+    );
+
+    assert!(!model.refresh_attention(None));
+    assert!(
+        !model.refresh_attention(Some(&alpha.id)),
+        "the tab in front is never marked, however it is named"
+    );
+    assert_eq!(model.attention(), None);
 }

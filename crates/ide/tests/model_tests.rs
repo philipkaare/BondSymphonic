@@ -727,4 +727,28 @@ fn a_long_transcript_folds_its_oldest_items_into_one_load_earlier_block() {
         !t.expand_earlier(),
         "a transcript holding nothing back does not claim to have expanded"
     );
+
+    // Sticky: messages arriving after the click do not fold the list back up.
+    // The cap is a default for a conversation nobody asked to read all of, and
+    // a second fold would take the earlier half away while the user was still
+    // reading it.
+    for seq in 2_500..2_600 {
+        t.apply(&AgentMessage {
+            seq,
+            ts: "2026-09-09T10:00:00Z".to_owned(),
+            body: AgentMessageBody::UserText {
+                text: format!("message {seq}"),
+            },
+        });
+    }
+    assert_eq!(
+        t.items.len(),
+        2_600,
+        "an expanded transcript stays expanded"
+    );
+    assert!(matches!(
+        &t.items[0],
+        TranscriptItem::User { text } if text == "message 0"
+    ));
+    assert_eq!(t.earlier_count(), 0);
 }
