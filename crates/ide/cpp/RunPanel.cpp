@@ -333,9 +333,16 @@ void RunPanel::syncPort() {
 
     m_port->setEnabled(guessed && !workspaceId.isEmpty());
     m_port->setVisible(!config.isEmpty());
+    // The box shows the port the next run will actually use -- the override if
+    // there is one, else the configuration's own -- rather than starting blank,
+    // so it reads as an adjustment to a real number. Spinning down to `auto`
+    // (or typing the configuration's own port back) is what clears the
+    // override and hands the choice back to the guess.
     m_port->setToolTip(
-        guessed ? QStringLiteral("The daemon guessed this port. Change it to run on another one; "
-                                 "`auto` uses the guess.")
+        guessed ? QStringLiteral("The port the next run will use. The daemon guessed %1; change "
+                                 "this to run on another one, or set it to `auto` to go back to "
+                                 "the guess.")
+                      .arg(configured)
                 : QStringLiteral("This port comes from the repository's bondsymphonic.toml and is "
                                  "not overridden here."));
 }

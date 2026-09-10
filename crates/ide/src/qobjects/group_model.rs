@@ -178,9 +178,14 @@ pub mod qobject {
         #[qinvokable]
         fn tab_status(self: &GroupModel, group_idx: i32, tab_idx: i32) -> i32;
 
-        /// The tab status as a word ("idle", "working", "waiting", "error",
-        /// "done", "creating", "sandbox down"), so the C++ side never switches
-        /// on the numeric code. Empty for an unknown tab.
+        /// The workspace's own status as a word ("idle", "working", "waiting",
+        /// "error", "done", "creating", "sandbox down"), so the C++ side never
+        /// switches on the numeric code. Empty for an unknown tab.
+        ///
+        /// The daemon's status, never the operation-error overlay `tabStatus`
+        /// carries: the status bar frames this as "sandbox: <word>", and a
+        /// merge that conflicted says nothing about the sandbox. The red glyph
+        /// for that lives on the tab, which is where it can be dismissed.
         #[qinvokable]
         fn status_word(self: &GroupModel, group_idx: i32, tab_idx: i32) -> QString;
 
@@ -591,10 +596,15 @@ impl qobject::GroupModel {
         }
     }
 
-    // The three below report the tab's *displayed* status, which is the
-    // daemon's own unless a failed merge, pull request or discard is showing
-    // on it. `stateJson` keeps carrying the underlying one, so nothing that
-    // reads the model back loses what the daemon actually said.
+    // `tab_label`, `tab_status` and `tab_tooltip` report the tab's *displayed*
+    // status: the daemon's own, unless a failed merge, pull request or discard
+    // is showing on it. They are the tab bar's, and the tab bar is where an
+    // error the user has to dismiss belongs.
+    //
+    // `status_word` deliberately does not. Its one caller frames it as
+    // "sandbox: <word>", and a merge conflict says nothing about the sandbox,
+    // which is running perfectly. `stateJson` carries the underlying status
+    // too, so nothing that reads the model back loses what the daemon said.
     pub fn tab_label(&self, group_idx: i32, tab_idx: i32) -> QString {
         match self.tab_at(group_idx, tab_idx) {
             Some(tab) => QString::from(&format!("{} {}", tab.display_status().glyph(), tab.name)),
@@ -610,7 +620,7 @@ impl qobject::GroupModel {
 
     pub fn status_word(&self, group_idx: i32, tab_idx: i32) -> QString {
         match self.tab_at(group_idx, tab_idx) {
-            Some(tab) => QString::from(status_text(tab.display_status())),
+            Some(tab) => QString::from(status_text(tab.status)),
             None => QString::from(""),
         }
     }
@@ -705,5 +715,48 @@ impl qobject::GroupModel {
         let json = self.as_ref().rust().workspaces.to_json();
         self.as_mut().set_state_json(QString::from(&json));
         self.changed();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bondsymphonic_proto::AgentAdapterKind;
+
+    fn tab_with_error() -> AgentTab {
+        AgentTab {
+            workspace_id: WorkspaceId("ws_x".to_owned()),
+            name: "x".to_owned(),
+            repo_path: "/r".to_owned(),
+            branch: "bs/x/work".to_owned(),
+            base_branch: "main".to_owned(),
+            status: TabStatus::Working,
+            detail: String::new(),
+            worktree_path: String::new(),
+            adapter: AgentAdapterKind::Terminal,
+            command: None,
+            run_config: None,
+            agent_id: None,
+            agent_status: None,
+            agent_detail: String::new(),
+            options_json: String::new(),
+            op_error: Some("Merge stopped: conflicts in README.md".to_owned()),
+        }
+    }
+
+    /// The two consumers of a tab's status read different things off it, and
+    /// which one gets the operation-error overlay is not a detail.
+    ///
+    /// `tabStatus` and `tabLabel` are the tab bar's: a failed merge has to be
+    /// visible from a group the user is not looking at, and dismissible.
+    /// `statusWord` is the status bar's, which frames it as
+    /// "sandbox: <word>" -- and a merge that conflicted says nothing about the
+    /// sandbox, which is running perfectly. Reporting "sandbox: error" there
+    /// sends the user to the setup page over a conflict in a text file.
+    #[test]
+    fn the_status_bar_word_is_the_sandbox_status_not_the_operation_error() {
+        let tab = tab_with_error();
+        assert_eq!(status_text(tab.display_status()), "error");
+        assert_eq!(status_text(tab.status), "working");
     }
 }

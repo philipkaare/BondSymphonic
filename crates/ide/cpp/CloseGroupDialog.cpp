@@ -132,6 +132,14 @@ void CloseGroupRunner::next() {
         if (!m_model.isNull()) {
             m_model->removeGroup(m_groupName);
         }
+        // Before anything else can run: `deleteLater` disconnects nothing, and
+        // every one of the three handlers below indexes `m_steps` at
+        // `m_current` after checking only that it is not negative. An answer
+        // for some other workspace -- a merge the user started from the
+        // toolbar, finishing in this same pass -- would otherwise read one
+        // past the end. -1 is the "no step is running" the handlers already
+        // understand, and the failure path has always set it.
+        m_current = -1;
         emit finished(true, QString(), QString());
         deleteLater();
         return;

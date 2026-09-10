@@ -30,13 +30,20 @@ const char* const kReasonObjectsStranded = "objects_stranded";
 QString changestoolbar::conflictList(const QString& conflictsJson) {
     const QJsonArray paths = QJsonDocument::fromJson(conflictsJson.toUtf8()).array();
     QStringList named;
+    int usable = 0;
+    for (const QJsonValue& value : paths) {
+        usable += value.toString().isEmpty() ? 0 : 1;
+    }
     for (const QJsonValue& value : paths) {
         const QString path = value.toString();
         if (path.isEmpty()) {
             continue;
         }
         if (named.size() == kMaxNamedConflicts) {
-            named.append(QStringLiteral("and %1 more").arg(paths.size() - kMaxNamedConflicts));
+            // Counted from the paths this phrase could have named, not from the
+            // raw array: an empty entry was never going to be listed, and
+            // counting it would claim conflicts that are not there.
+            named.append(QStringLiteral("and %1 more").arg(usable - kMaxNamedConflicts));
             break;
         }
         named.append(path);
@@ -107,9 +114,7 @@ void ChangesToolbar::setWorkspace(const QString& workspaceId, const QString& nam
     m_name = name;
     m_branch = branch;
     m_baseBranch = baseBranch;
-    if (!workspaceId.isEmpty()) {
-        m_branchOf.insert(workspaceId, { branch, baseBranch });
-    }
+    noteBranches(workspaceId, branch, baseBranch);
     updateActions();
     if (moved) {
         refreshSummary();
@@ -128,7 +133,18 @@ void ChangesToolbar::requestSummary(const QString& workspaceId) {
 }
 
 int ChangesToolbar::changedFiles() const {
-    return m_changedFiles.value(m_workspaceId, -1);
+    return changedFilesFor(m_workspaceId);
+}
+
+int ChangesToolbar::changedFilesFor(const QString& workspaceId) const {
+    return m_changedFiles.value(workspaceId, -1);
+}
+
+void ChangesToolbar::noteBranches(const QString& workspaceId, const QString& branch,
+                                  const QString& baseBranch) {
+    if (!workspaceId.isEmpty()) {
+        m_branchOf.insert(workspaceId, { branch, baseBranch });
+    }
 }
 
 void ChangesToolbar::updateActions() {
@@ -254,7 +270,12 @@ void ChangesToolbar::onMergeFinished(const QString& workspaceId, bool ok,
     const QString base = branches.value(1);
     if (ok) {
         emit workspaceRecovered(workspaceId);
-        emit statusMessage(QStringLiteral("Merged %1 into %2").arg(branch, base), QString());
+        // Silent rather than "Merged  into ": a workspace this toolbar has
+        // never shown and nobody seeded has no branch names to report, and a
+        // line with two holes in it says less than none.
+        if (!branch.isEmpty() && !base.isEmpty()) {
+            emit statusMessage(QStringLiteral("Merged %1 into %2").arg(branch, base), QString());
+        }
         requestSummary(workspaceId);
         return;
     }
@@ -269,10 +290,11 @@ void ChangesToolbar::onMergeFinished(const QString& workspaceId, bool ok,
                                     : QStringLiteral("Merge stopped: conflicts in %1%2%3")
                                           .arg(paths, dash, tail);
     // `conflict` is the only reason the daemon sends with a result today. A
-    // newer daemon's word is shown rather than swallowed, so an IDE that does
-    // not know it still says which one it was.
+    // newer daemon's word is appended rather than swallowed or substituted:
+    // the same answer still carried the file list, and an IDE that does not
+    // recognise the word must not throw away the paths that came with it.
     if (!reason.isEmpty() && reason != QLatin1String("conflict")) {
-        title = QStringLiteral("Merge stopped (%1)%2%3").arg(reason, dash, tail);
+        title += QStringLiteral(" (%1)").arg(reason);
     }
     emit workspaceError(workspaceId, title, QString(), QString());
 }

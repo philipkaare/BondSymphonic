@@ -69,18 +69,11 @@ MainWindow::MainWindow(AppController* controller, GroupModel* groupModel, FileTr
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
-    // First, before anything else can fail or ask a question: the connection
-    // this close is about to drop must not read as a loss, or the reconnect
-    // loop relaunches a daemon inside WSL for an IDE that is on its way out.
-    m_controller->prepareQuit();
-    // Second: whatever was changed in the last half second is still sitting on
-    // its debounce timer, and there is no half second left.
-    m_controller->flushState();
     // Already answered, or there is nothing to lose. `hasUnsavedEditors` is the
     // whole test: a clean editor and a diff pane have nothing on them that the
     // file on disk does not.
     if (m_closeState == CloseState::Confirmed || !m_editorArea->hasUnsavedEditors()) {
-        QMainWindow::closeEvent(event);
+        commitClose(event);
         return;
     }
     if (m_closeState == CloseState::WaitingForSaves) {
@@ -92,7 +85,7 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     switch (m_editorArea->askUnsavedAll()) {
     case EditorArea::Unsaved::Discard:
         m_closeState = CloseState::Confirmed;
-        QMainWindow::closeEvent(event);
+        commitClose(event);
         return;
     case EditorArea::Unsaved::Save:
         // Armed before the writes go out, not after: a save that lands while
@@ -107,6 +100,19 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         event->ignore();
         return;
     }
+}
+
+void MainWindow::commitClose(QCloseEvent* event) {
+    // Only the two branches that really close reach here, so a cancelled close
+    // leaves a fully working IDE. Order matters within them: `prepareQuit`
+    // first, because the connection this close is about to drop must not read
+    // as a loss -- the reconnect loop would otherwise relaunch a daemon inside
+    // WSL for an IDE on its way out -- and `flushState` second, because a
+    // change made in the last half second is still on its debounce timer and
+    // there is no half second left. Nothing between the two can refuse.
+    m_controller->prepareQuit();
+    m_controller->flushState();
+    QMainWindow::closeEvent(event);
 }
 
 void MainWindow::moveEvent(QMoveEvent* event) {
@@ -173,13 +179,11 @@ void MainWindow::buildMenus() {
     file->addSeparator();
     file->addAction("Se&ttings…", this, &MainWindow::onSettings);
     file->addSeparator();
-    file->addAction("E&xit", this, [this] {
-        // `close()` reaches `closeEvent`, which does this too; saying it here
-        // as well costs nothing (it is idempotent) and means the intent is
-        // recorded even if a close is refused and retried.
-        m_controller->prepareQuit();
-        close();
-    });
+    // Straight to `close()`: Exit is the same close the title bar's button
+    // makes, and `closeEvent` is the one place that decides whether it happens
+    // and announces the quit once it has. Announcing it here as well would
+    // stop the IDE reconnecting after an Exit the user then cancelled.
+    file->addAction("E&xit", this, &QWidget::close);
 
     auto* edit = menuBar()->addMenu("&Edit");
     addEditAction(edit, "&Undo", QKeySequence::Undo, &QPlainTextEdit::undo);
@@ -744,23 +748,36 @@ void MainWindow::onCloseGroup(int groupIndex) {
     const QJsonArray tabs =
         groupIndex < groups.size() ? groups.at(groupIndex).toObject().value("tabs").toArray()
                                    : QJsonArray();
+    ChangesToolbar* toolbar = m_explorer->changesToolbar();
     QList<CloseGroupChoice> workspaces;
     for (const QJsonValue& value : tabs) {
         const QJsonObject tab = value.toObject();
         CloseGroupChoice choice;
         choice.workspaceId = tab.value("workspace_id").toString();
         choice.name = tab.value("name").toString();
-        if (!choice.workspaceId.isEmpty()) {
-            workspaces.append(choice);
+        if (choice.workspaceId.isEmpty()) {
+            continue;
         }
+        // Two things the toolbar only learns from a workspace being the active
+        // tab, and a group can hold workspaces that never have been: the
+        // branches its status line names after a merge, and the changed-file
+        // count the discard confirmation below has to state. The answers land
+        // while the modal dialog's own event loop is running.
+        toolbar->noteBranches(choice.workspaceId, tab.value("branch").toString(),
+                              tab.value("base_branch").toString());
+        toolbar->requestSummary(choice.workspaceId);
+        workspaces.append(choice);
     }
 
     CloseGroupDialog dialog(groupName, workspaces, this);
     if (dialog.exec() != QDialog::Accepted) {
         return;
     }
-    auto* runner = new CloseGroupRunner(m_controller, m_groupModel, groupName, dialog.choices(),
-                                        this);
+    const QList<CloseGroupChoice> choices = dialog.choices();
+    if (!confirmDiscards(choices)) {
+        return;
+    }
+    auto* runner = new CloseGroupRunner(m_controller, m_groupModel, groupName, choices, this);
     QObject::connect(runner, &CloseGroupRunner::finished, this,
                      [this, groupName](bool ok, const QString&, const QString& message) {
                          // A stop is already on the workspace's own banner and
@@ -775,6 +792,49 @@ void MainWindow::onCloseGroup(int groupIndex) {
                              QString());
                      });
     runner->start();
+}
+
+bool MainWindow::confirmDiscards(const QList<CloseGroupChoice>& choices) {
+    ChangesToolbar* toolbar = m_explorer->changesToolbar();
+    QStringList doomed;
+    for (const CloseGroupChoice& choice : choices) {
+        if (choice.action != CloseGroupAction::Discard) {
+            continue;
+        }
+        const int files = toolbar->changedFilesFor(choice.workspaceId);
+        // A count the daemon could not give is left out rather than guessed
+        // at, exactly as the toolbar's own Discard does: "0 changed files" is
+        // the one wording that would talk a user into a discard.
+        doomed.append(files < 0
+                          ? QStringLiteral("%1 (its changed files)").arg(choice.name)
+                          : QStringLiteral("%1 (%2 changed file%3)")
+                                .arg(choice.name)
+                                .arg(files)
+                                .arg(files == 1 ? QString() : QStringLiteral("s")));
+    }
+    if (doomed.isEmpty()) {
+        return true;
+    }
+    // The combo says which workspaces are to be destroyed; this says what that
+    // costs. A discard is the one choice in the dialog that cannot be undone,
+    // and the plan requires a confirmation naming the workspace and what goes
+    // with it before any of them.
+    QMessageBox box(this);
+    box.setIcon(QMessageBox::Warning);
+    box.setWindowTitle(QStringLiteral("Discard workspaces"));
+    box.setText(doomed.size() == 1
+                    ? QStringLiteral("Discard %1?").arg(doomed.first())
+                    : QStringLiteral("Discard %1 workspaces?").arg(doomed.size()));
+    box.setInformativeText(
+        QStringLiteral("%1\n\nTheir changed files and any unmerged commits will be lost. This "
+                       "cannot be undone.")
+            .arg(doomed.join(QLatin1Char('\n'))));
+    box.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
+    box.setDefaultButton(QMessageBox::Cancel);
+    // Cancel abandons the whole run, merges included: the user answered a
+    // question about the group, and half-closing it behind a refused answer
+    // would be worse than doing nothing.
+    return box.exec() == QMessageBox::Yes;
 }
 
 // ---------------------------------------------------------------------------
@@ -820,6 +880,7 @@ void MainWindow::onStateLoaded(const QString& json) {
     const QJsonObject open = state.value("open_editors").toObject();
     const QJsonObject active = state.value("active_editor").toObject();
     m_editorsToRestore.clear();
+    m_activeEditorToRestore.clear();
     for (auto it = open.constBegin(); it != open.constEnd(); ++it) {
         QStringList paths;
         for (const QJsonValue& value : it.value().toArray()) {
@@ -828,14 +889,17 @@ void MainWindow::onStateLoaded(const QString& json) {
                 paths.append(path);
             }
         }
-        // The active one last, so it is the tab left in front when the others
-        // have been opened around it.
-        const QString front = active.value(it.key()).toString();
-        if (!front.isEmpty() && paths.removeAll(front) > 0) {
-            paths.append(front);
+        if (paths.isEmpty()) {
+            continue;
         }
-        if (!paths.isEmpty()) {
-            m_editorsToRestore.insert(it.key(), paths);
+        m_editorsToRestore.insert(it.key(), paths);
+        // Kept beside the list rather than reordered into it: the list is the
+        // tab order, and moving the active path to the end of it would bring a
+        // session's second tab back as its fourth. `restoreEditorsFor` opens in
+        // this order and activates the front one afterwards.
+        const QString front = active.value(it.key()).toString();
+        if (!front.isEmpty() && paths.contains(front)) {
+            m_activeEditorToRestore.insert(it.key(), front);
         }
     }
     m_restoring = false;
@@ -886,6 +950,7 @@ void MainWindow::noteEditorState() {
 
 void MainWindow::restoreEditorsFor(const QString& workspaceId) {
     const QStringList paths = m_editorsToRestore.take(workspaceId);
+    const QString front = m_activeEditorToRestore.take(workspaceId);
     if (paths.isEmpty()) {
         return;
     }
@@ -895,6 +960,12 @@ void MainWindow::restoreEditorsFor(const QString& workspaceId) {
     m_restoringEditors = true;
     for (const QString& path : paths) {
         m_editorArea->openFile(workspaceId, path);
+    }
+    // Last, and in place: `openFile` on a path that is already open activates
+    // its tab rather than adding another, so the session's front tab comes back
+    // in front without its position in the row changing.
+    if (!front.isEmpty()) {
+        m_editorArea->openFile(workspaceId, front);
     }
     m_restoringEditors = false;
     // Once, at the end: the list that is now open is the list that was
@@ -1027,6 +1098,13 @@ void MainWindow::onWorkspaceDestroyed(const QString& workspaceId) {
     m_shellArea->removeWorkspace(workspaceId);
     m_editorArea->closeWorkspace(workspaceId);
     m_groupModel->removeWorkspace(workspaceId);
+    // The window's own bookkeeping for it. Harmless to leave -- the Rust side
+    // has already forgotten the workspace, and a note for a dead one is a
+    // no-op -- but a long session should not accumulate an entry per workspace
+    // it has destroyed.
+    m_editorsToRestore.remove(workspaceId);
+    m_activeEditorToRestore.remove(workspaceId);
+    m_notedEditors.remove(workspaceId);
     // After the model change, so the tab this rebinds to is the one that
     // survived rather than the one that has just gone.
     rebindCost();

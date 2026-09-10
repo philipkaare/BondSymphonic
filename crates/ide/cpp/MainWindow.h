@@ -9,9 +9,12 @@
 #include <QString>
 #include <QStringList>
 
+#include "CloseGroupDialog.h"
+
 class AgentArea;
 class AppController;
 class ChangesModel;
+class ChangesToolbar;
 class EditorArea;
 class ExplorerDock;
 class FileTreeModel;
@@ -46,11 +49,9 @@ protected:
     /// Exit, which calls `close()` -- so this is the one place the question has
     /// to be put.
     ///
-    /// `AppController::prepareQuit()` is its first statement and `flushState()`
-    /// its second. Without the first, the connection this close is about to
-    /// drop reads as a loss and the IDE relaunches a daemon inside WSL on its
-    /// way out; without the second, a change made in the last half second is
-    /// still on its debounce timer when the process goes.
+    /// Only the branches that really close announce the quit, through
+    /// [`commitClose`]. A close the user cancels must leave a fully working
+    /// IDE, and there is no way back from `AppController::prepareQuit()`.
     void closeEvent(QCloseEvent* event) override;
 
     /// Both record the window's geometry, debounced in Rust, so a window the
@@ -63,6 +64,14 @@ private:
     /// window is `WaitingForSaves` between a "Save All" answer and the last
     /// write landing, and `Confirmed` once it may close without asking again.
     enum class CloseState { Idle, WaitingForSaves, Confirmed };
+
+    /// Announces the quit, writes any pending state and lets the close through.
+    ///
+    /// The one place the IDE says it is quitting. `prepareQuit()` cannot be
+    /// undone, so it must not run on a path that can still be refused: an Exit
+    /// the user cancels at the unsaved-editors prompt would otherwise leave a
+    /// running IDE whose reconnect loop never relaunches the daemon again.
+    void commitClose(QCloseEvent* event);
 
     /// Watches the editor area until nothing is dirty, then closes the window.
     /// A failed write cancels the wait instead: the edit is still only in the
@@ -131,6 +140,11 @@ private:
     /// Asks what to do with each workspace in the group at `groupIndex` and
     /// runs the answers.
     void onCloseGroup(int groupIndex);
+    /// Puts one confirmation in front of a close-group run that would destroy
+    /// anything, naming each workspace and what goes with it. True when there
+    /// is nothing to destroy, or the user said yes; false cancels the whole
+    /// run, merges included.
+    bool confirmDiscards(const QList<CloseGroupChoice>& choices);
     /// Points the status bar's cost at the active tab's transcript, dropping
     /// the watch on the tab before it. A tab with no transcript costs nothing.
     void rebindCost();
@@ -225,10 +239,12 @@ private:
     /// overwrite the layout that is about to be restored.
     bool m_restoring = true;
     /// Editors to reopen per workspace, from `state.json`, taken out of the map
-    /// the first time that workspace's tab is shown. `{workspace: paths}` with
-    /// the active one first in the list, so restoring in order leaves the right
-    /// tab in front.
+    /// the first time that workspace's tab is shown. The list is the saved tab
+    /// order and is restored in it.
     QHash<QString, QStringList> m_editorsToRestore;
+    /// Which of those was in front, kept apart from the order so restoring it
+    /// does not move its tab.
+    QHash<QString, QString> m_activeEditorToRestore;
     /// The workspaces whose editor lists were last recorded, so a workspace
     /// that has just lost its last tab has its entry emptied rather than left
     /// describing tabs that are gone.

@@ -57,6 +57,23 @@ public:
     /// invalidated is that workspace's.
     void requestSummary(const QString& workspaceId);
 
+    /// The changed-file count last reported for `workspaceId`, or -1 when the
+    /// daemon has not been asked or could not answer.
+    ///
+    /// The close-group dialog names the same number in its own confirmation,
+    /// and both must come from the same place: two ways of counting what a
+    /// discard costs is one way too many.
+    int changedFilesFor(const QString& workspaceId) const;
+
+    /// Records a workspace's branch and base branch without making it current.
+    ///
+    /// The toolbar learns these from `setWorkspace`, i.e. only for workspaces
+    /// that have been the active tab. A close-group run merges workspaces that
+    /// may never have been, and the line it writes into the status bar has to
+    /// name the branches that moved.
+    void noteBranches(const QString& workspaceId, const QString& branch,
+                      const QString& baseBranch);
+
 signals:
     /// Something to put in the status bar. `url` is empty for a plain message;
     /// when it is set the window shows the text as a link to it.
