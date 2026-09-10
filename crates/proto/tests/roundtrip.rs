@@ -301,3 +301,34 @@ fn agent_start_options_debug_redacts_the_api_key() {
     let v = serde_json::to_value(&options).unwrap();
     assert_eq!(v["api_key"], "sk-ant-secret-value");
 }
+
+/// The repository's own network additions travel with the detected run
+/// configurations, so the New Agent dialog can name them before the workspace
+/// that would inherit them exists.
+#[test]
+fn detect_run_configs_carries_the_repo_network_allow() {
+    // Added after the first daemons shipped: a reply without the field is a
+    // repository that adds nothing, not a broken answer.
+    let old: DetectRunConfigsResult = serde_json::from_str(r#"{"configs":[]}"#).unwrap();
+    assert!(old.configs.is_empty());
+    assert!(old.network_allow.is_empty());
+
+    let result = DetectRunConfigsResult {
+        configs: vec![RunConfig {
+            name: "web".into(),
+            command: "npm run dev".into(),
+            port: 5173,
+            port_guessed: true,
+            cwd: None,
+            env: Default::default(),
+            ready_regex: None,
+            source: RunConfigSource::Detected,
+            disabled_reason: None,
+        }],
+        network_allow: vec!["assets.example.test".into(), "*.example.test".into()],
+    };
+    let v = serde_json::to_value(&result).unwrap();
+    assert_eq!(v["network_allow"][0], "assets.example.test");
+    let back: DetectRunConfigsResult = serde_json::from_value(v).unwrap();
+    assert_eq!(back, result);
+}

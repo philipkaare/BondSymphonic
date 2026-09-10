@@ -76,6 +76,15 @@ impl HostPattern {
                 "host pattern {s:?} may only wildcard a whole leading label, as *.example.com"
             ));
         }
+        // A wildcard has to leave a registrable name behind it. `*.com` reads
+        // like an ordinary entry and grants every host in a whole top-level
+        // domain, which is exactly the pattern a one-click "Allow host" on a
+        // denial the sandbox chose the text of would produce.
+        if literal.len() != lower.len() && !literal.contains('.') {
+            return Err(format!(
+                "host pattern {s:?} wildcards a whole top-level domain; use at least *.example.com"
+            ));
+        }
         Ok(HostPattern(lower))
     }
 
@@ -99,6 +108,22 @@ impl HostPattern {
     /// workspace registry.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The literal IP address this entry *is*, if it is one rather than a name.
+    ///
+    /// Only IPv4 can appear: [`HostPattern::parse`] rejects the colons an IPv6
+    /// literal is written with, because a pattern carrying a colon is
+    /// indistinguishable from a `host:port` that would match nothing. The proxy
+    /// uses this to tell "the user allowed `127.0.0.1`" from "a name the
+    /// repository allowed happens to resolve there".
+    pub fn as_ip(&self) -> Option<std::net::IpAddr> {
+        // A wildcard is never an address, and `"1.2.3.4".parse()` would not
+        // see the `*.` in front of it anyway; checked so the intent is plain.
+        if self.0.starts_with("*.") {
+            return None;
+        }
+        self.0.parse().ok()
     }
 }
 
@@ -144,6 +169,19 @@ impl Allowlist {
     /// Whether any pattern covers `host`.
     pub fn allows(&self, host: &str) -> bool {
         self.patterns.iter().any(|p| p.matches(host))
+    }
+
+    /// Whether some entry is the literal address `addr`.
+    ///
+    /// This is what permits a destination the proxy otherwise refuses as
+    /// private: allowing `127.0.0.1` by writing that address down is a
+    /// deliberate act, whereas a *name* the repository added resolving to
+    /// loopback is the attack the refusal exists for. See
+    /// [`crate::net::proxy`].
+    pub fn allows_literal_addr(&self, addr: &std::net::IpAddr) -> bool {
+        self.patterns
+            .iter()
+            .any(|p| p.as_ip().as_ref() == Some(addr))
     }
 
     /// The patterns as text, in order, for the registry and the IDE.
@@ -204,7 +242,18 @@ mod tests {
     }
     #[test]
     fn invalid_patterns_are_rejected() {
-        for bad in ["", " ", "*", "foo.*", "a/b", "host:80", "*.", "*bar.com"] {
+        for bad in [
+            "",
+            " ",
+            "*",
+            "foo.*",
+            "a/b",
+            "host:80",
+            "*.",
+            "*bar.com",
+            "*.com",
+            "*.localhost",
+        ] {
             assert!(HostPattern::parse(bad).is_err(), "{bad:?}");
         }
     }
@@ -236,6 +285,40 @@ mod tests {
         assert_eq!(v.len(), DEFAULT_ALLOW.len() + 1);
         assert_eq!(v.last().unwrap(), "*.mycompany.com");
         assert_eq!(effective(None).len(), DEFAULT_ALLOW.len());
+    }
+
+    /// A wildcard must leave a registrable name behind it: `*.com` would hand
+    /// the sandbox every `.com` host from one click on a denial toast whose
+    /// text the sandbox chose.
+    #[test]
+    fn a_wildcard_needs_more_than_a_top_level_domain_behind_it() {
+        for bad in ["*.com", "*.CO", "*.internal"] {
+            let err = HostPattern::parse(bad).unwrap_err();
+            assert!(err.contains("top-level domain"), "{bad}: {err}");
+        }
+        for ok in ["*.example.com", "*.a.b.c", "*.co.uk"] {
+            assert!(HostPattern::parse(ok).is_ok(), "{ok}");
+        }
+        // A bare name with no dot is still an ordinary exact entry: an
+        // intranet host called `build` is a host, not a wildcard.
+        assert!(HostPattern::parse("build").is_ok());
+    }
+
+    /// The proxy needs to tell an entry that *is* an address from one that
+    /// merely resolves to one; only the former may reach a private network.
+    #[test]
+    fn a_literal_address_entry_is_recognised_as_one() {
+        assert_eq!(
+            HostPattern::parse("127.0.0.1").unwrap().as_ip(),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        assert_eq!(HostPattern::parse("localhost").unwrap().as_ip(), None);
+        assert_eq!(HostPattern::parse("*.example.com").unwrap().as_ip(), None);
+        let list = Allowlist::from_strings(&["127.0.0.1".to_string(), "localhost".to_string()]);
+        assert!(list.allows_literal_addr(&"127.0.0.1".parse().unwrap()));
+        // The name resolving there is not the same permission.
+        assert!(!list.allows_literal_addr(&"::1".parse().unwrap()));
+        assert!(!list.allows_literal_addr(&"10.0.0.5".parse().unwrap()));
     }
 
     /// The list is what the sandbox is held to, so the ways a host can be

@@ -303,7 +303,30 @@ without namespace support (with a loud warning in the UI), and via
 `files.pythonhosted.org`, `crates.io`, `static.crates.io`, `index.crates.io`,
 `github.com`, `*.github.com`, `*.githubusercontent.com`. The repo's
 `bondsymphonic.toml` `[network] allow = [...]` extends it; `workspace.set_allowlist`
-overrides it at runtime.
+overrides it at runtime (at most 256 entries of at most 253 bytes each). A
+wildcard must leave a registrable name behind it, so `*.example.com` is a pattern
+and `*.com` is refused.
+
+A repository extends the allowlist at creation without anyone necessarily having
+read it, so the list is a list of *names* the user may not have chosen. Two rules
+follow, and both are the boundary rather than hygiene:
+
+- **The address, not the name, is what is allowed.** After resolving, any address
+  that is loopback, link-local (`169.254/16`, `fe80::/10` — this is where the
+  cloud metadata endpoint lives), private (`10/8`, `172.16/12`, `192.168/16`),
+  unique-local (`fc00::/7`), unspecified or multicast is dropped, in either
+  address family and through the IPv4-mapped form. If nothing is left the request
+  is refused `403` with a body saying the destination is private. The one
+  exception is an allowlist entry that *is* that literal address: writing
+  `127.0.0.1` down is a thing only a person does.
+- **A denied host is validated before it is published.** The sandbox chooses the
+  text of a request's target, and a denial travels into the IDE's toast and from
+  there into the allowlist. A target that is not a plain ASCII hostname (labels
+  1–63 of letters, digits and `-`; at most 253 in all) or an IP literal is
+  answered `400` and produces no denial event.
+
+Repeated denials of one host in one workspace are coalesced to one `daemon.log`
+warn per 5 s. The `403` is still sent every time.
 
 ### 7.2 Proxy
 Per workspace, the daemon listens on a Unix socket
@@ -314,18 +337,25 @@ pipes to the Unix socket. The sandbox env sets `HTTP_PROXY`, `HTTPS_PROXY`,
 `ALL_PROXY`, `NO_PROXY=localhost,127.0.0.1`, and git/npm/pip/cargo honour those.
 
 The proxy implements HTTP `CONNECT` (for TLS) and plain absolute-URI `GET/POST`
-forwarding. It checks the target host against the allowlist before connecting and
-answers `403` with a body naming the host and the config key to add it. Every
-denial is emitted as `daemon.log {level: warn}` so the IDE can surface it.
+forwarding. It checks the target host against the allowlist and then its
+resolved addresses against the address rules of 7.1 before connecting, and
+answers `403` with a body naming the host and either the config key to add it or
+the reason the destination is refused. Every denial is emitted as
+`daemon.log {level: warn}` so the IDE can surface it, coalesced per host per
+workspace as 7.1 says.
 
 ### 7.3 Port bridge (web apps)
 When a run declares port `P`, the daemon:
 1. Allocates a free host port `H`.
-2. Creates `~/.bondsymphonic/run/<id>/fwd-P.sock`, bound into the sandbox at
-   `/run/bs/fwd-P.sock`.
+2. Creates `~/.bondsymphonic/run/<id>/fwd-<run_id>.sock`, bound into the sandbox
+   at `/run/bs/fwd-<run_id>.sock`. Keyed by the **run**, not by the port:
+   detection routinely yields several configurations sharing one port (`dev`,
+   `start` and `serve` out of one `package.json`), and a port-named socket would
+   have the second run unlink the first one's live socket, leaving run 1's bridge
+   on run 2's forwarder and either stop taking both down.
 3. Spawns inside the sandbox `bondsymphonic-daemon forward --socket
-   /run/bs/fwd-P.sock --port P`, which accepts on the Unix socket and connects to
-   `127.0.0.1:P`.
+   /run/bs/fwd-<run_id>.sock --port P`, which accepts on the Unix socket and
+   connects to `127.0.0.1:P`.
 4. Listens on `127.0.0.1:H` and bridges each accepted TCP connection to the Unix
    socket.
 
@@ -495,7 +525,8 @@ Resize forwards `TIOCSWINSZ`. Idle PTYs cost one task each.
 name = "web"
 command = "npm run dev -- --port 3000"
 port = 3000
-cwd = "."               # optional, relative to worktree
+cwd = "."               # optional, relative to worktree (an absolute path, or
+                        # one climbing out with "..", is InvalidParams)
 env = { NODE_ENV = "development" }
 ready_regex = "Local:.*http"   # optional, marks state "ready"
 
@@ -524,7 +555,9 @@ Ordered heuristics, each yielding `RunConfig {name, command, port, source:
 - `manage.py` → `python manage.py runserver 0.0.0.0:8000`, port 8000.
 - `pyproject.toml` with `fastapi`/`flask` → `uvicorn`/`flask run`, port 8000/5000.
 
-Guessed ports are flagged `port_guessed: true` so the IDE lets the user edit them.
+Guessed ports are flagged `port_guessed: true`. Editing the port in the IDE is
+deferred to M6: as of M5 the flag only spells the guess out in the run-config
+combo and its tooltip, and the way to pin a port is `bondsymphonic.toml`.
 
 ### 10.3 Manager
 `run.start` spawns the command through the sandbox with the run's env, plus
@@ -540,7 +573,7 @@ ready by a probe. `run.stop` sends SIGTERM to the process group, SIGKILL after
 **The noop backend has no bridge.** Without a network namespace the run is a
 plain child of the daemon and its port already is the host's, so `host_port` is
 the configuration's own port, the URL is `http://localhost:<port>`, no
-`fwd-<P>.sock` and no in-sandbox forwarder exist, and readiness is a direct TCP
+`fwd-<run_id>.sock` and no in-sandbox forwarder exist, and readiness is a direct TCP
 connect to `127.0.0.1:<port>` on the same 500 ms tick. This is the path Windows
 development takes, and the one the daemon's `run_integration` suite exercises on
 both hosts; the bridge path is covered by `sandbox_integration` under bwrap.

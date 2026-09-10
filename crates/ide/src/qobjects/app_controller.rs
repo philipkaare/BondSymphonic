@@ -197,9 +197,12 @@ pub mod qobject {
         #[qsignal]
         fn repo_inspected(self: Pin<&mut AppController>, path: QString, info_json: QString);
 
-        /// A `detect_run_configs` call succeeded: a JSON array of `RunConfig`
-        /// for `path`. `path` is echoed back because the New Agent dialog can
-        /// have asked about a repository the user has since moved off.
+        /// A `detect_run_configs` call succeeded: the `DetectRunConfigsResult`
+        /// for `path` as JSON, an object with `configs` (an array of
+        /// `RunConfig`) and `network_allow` (the hosts the repository's own
+        /// `bondsymphonic.toml` would add to the workspace's allowlist).
+        /// `path` is echoed back because the New Agent dialog can have asked
+        /// about a repository the user has since moved off.
         #[qsignal]
         fn run_configs_detected(self: Pin<&mut AppController>, path: QString, json: QString);
 
@@ -1157,7 +1160,12 @@ impl qobject::AppController {
                 .await
             {
                 Ok(res) => {
-                    let json = serde_json::to_string(&res.configs).unwrap_or_else(|_| "[]".into());
+                    // The whole result, not just the array: the dialog also has
+                    // to name the hosts this repository would add to the
+                    // workspace's network allowlist. Readers that only want the
+                    // configurations take `configs` out of the object.
+                    let json = serde_json::to_string(&res)
+                        .unwrap_or_else(|_| r#"{"configs":[],"network_allow":[]}"#.into());
                     let _ = qt.queue(move |q| {
                         q.run_configs_detected(QString::from(&path), QString::from(&json))
                     });

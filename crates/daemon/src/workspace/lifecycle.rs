@@ -303,6 +303,17 @@ async fn start_shim(d: &Arc<Daemon>, ws: &Workspace, handle: &Arc<dyn SandboxHan
     });
 }
 
+/// The most patterns one workspace's allowlist may hold.
+///
+/// Only the local IDE can call `workspace.set_allowlist`, so this is hygiene
+/// rather than a boundary: the proxy walks the list once per connection, and a
+/// list nobody could have meant to write should be refused where it is typed
+/// rather than paid for on every request afterwards.
+const MAX_ALLOWLIST_ENTRIES: usize = 256;
+
+/// The longest one entry may be: the maximum length of a DNS name.
+const MAX_HOST_LEN: usize = 253;
+
 /// Replaces a workspace's allowlist: validated, persisted, applied to the live
 /// proxy and announced.
 ///
@@ -311,8 +322,20 @@ async fn start_shim(d: &Arc<Daemon>, ws: &Workspace, handle: &Arc<dyn SandboxHan
 /// gets stored is the canonical form [`HostPattern`] produces, so the IDE sees
 /// back exactly what the proxy will match.
 pub fn set_allowlist(d: &Daemon, id: &WorkspaceId, hosts: &[String]) -> Result<Empty, RpcError> {
+    if hosts.len() > MAX_ALLOWLIST_ENTRIES {
+        return Err(RpcError::invalid_params(format!(
+            "an allowlist may hold at most {MAX_ALLOWLIST_ENTRIES} entries, not {}",
+            hosts.len()
+        )));
+    }
     let mut patterns = Vec::with_capacity(hosts.len());
     for host in hosts {
+        if host.len() > MAX_HOST_LEN {
+            return Err(RpcError::invalid_params(format!(
+                "allowlist entry is {} bytes; a host name is at most {MAX_HOST_LEN}",
+                host.len()
+            )));
+        }
         let pattern = HostPattern::parse(host).map_err(RpcError::invalid_params)?;
         patterns.push(pattern.as_str().to_string());
     }

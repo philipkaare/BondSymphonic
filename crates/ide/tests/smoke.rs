@@ -903,6 +903,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal, Journal, Journal) {
                     id,
                     &DetectRunConfigsResult {
                         configs: vec![run_config()],
+                        network_allow: vec![],
                     },
                 )),
                 // The run, on a bridged port, then the three events a real

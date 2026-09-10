@@ -213,6 +213,99 @@ async fn the_proxy_forwards_allowed_hosts_and_refuses_everything_else() {
     cancel.cancel();
 }
 
+/// The allowlist holds names, and a name is not a destination.
+///
+/// A repository the user has not read can put `assets.example.test` on the list
+/// at creation and point it at the host's loopback or at `169.254.169.254`.
+/// `localhost` stands in for that here: an ordinary name, on the list, that
+/// resolves somewhere the sandbox must not reach. The `["127.0.0.1"]` case
+/// above is the other half of the rule - an address written out is a person
+/// saying they meant it.
+#[tokio::test]
+async fn a_name_that_resolves_to_a_private_address_is_refused_and_bad_targets_are_not_denials() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "private").await;
+    let upstream = ok_server().await;
+    let sock = daemon.dirs.run(&ws.id).join("proxy.sock");
+    c.drain_events();
+
+    // The name is on the list, and the proxy still refuses where it points.
+    set_allowlist(&mut c, &ws.id, &["localhost"]).await.unwrap();
+    let mut s = UnixStream::connect(&sock).await.unwrap();
+    s.write_all(
+        format!("GET http://localhost:{upstream}/ HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let reply = read_all(&mut s).await;
+    assert!(reply.starts_with("HTTP/1.1 403 Forbidden"), "{reply}");
+    assert!(
+        reply.contains("private address"),
+        "the body must say why, not repeat the allowlist advice: {reply}"
+    );
+
+    // The same request again inside the coalescing interval: still refused,
+    // still 403, but the IDE is told once.
+    let mut s = UnixStream::connect(&sock).await.unwrap();
+    s.write_all(
+        format!("GET http://localhost:{upstream}/ HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let again = read_all(&mut s).await;
+    assert!(again.starts_with("HTTP/1.1 403 Forbidden"), "{again}");
+
+    // A target that is not a hostname at all is a malformed request, not a
+    // denial: `*.com` in a toast is one click from an allowlist entry covering
+    // every `.com` host, and the sandbox chose that text.
+    let mut s = UnixStream::connect(&sock).await.unwrap();
+    s.write_all(b"CONNECT *.com:443 HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+    let bad = read_all(&mut s).await;
+    assert!(bad.starts_with("HTTP/1.1 400 Bad Request"), "{bad}");
+
+    // A round trip, so everything published has certainly been delivered.
+    let _ = c
+        .call(Request::WorkspaceGet(WorkspaceIdParams {
+            workspace_id: ws.id.clone(),
+        }))
+        .await
+        .unwrap();
+    let denials: Vec<String> = c
+        .drain_events()
+        .into_iter()
+        .filter_map(|(_, e)| e.denied_host().map(str::to_string))
+        .collect();
+    assert_eq!(
+        denials,
+        vec!["localhost".to_string()],
+        "one notice for the refused name, and nothing at all for the malformed target"
+    );
+
+    // And the allowlist itself refuses a wildcard with no registrable name
+    // behind it, so the same host cannot get in by the other door.
+    let err = set_allowlist(&mut c, &ws.id, &["*.com"]).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidParams);
+    // As does a list nobody could have meant to write.
+    let many: Vec<String> = (0..300).map(|i| format!("h{i}.example")).collect();
+    let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+    let err = set_allowlist(&mut c, &ws.id, &refs).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidParams);
+    assert!(err.message.contains("256"), "{}", err.message);
+
+    c.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+        workspace_id: ws.id.clone(),
+        force: true,
+    }))
+    .await
+    .unwrap();
+    cancel.cancel();
+}
+
 // ---------------------------------------------------------------------------
 // The sandbox side: only where bubblewrap can create user namespaces.
 // ---------------------------------------------------------------------------

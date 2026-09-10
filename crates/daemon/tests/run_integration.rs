@@ -134,6 +134,13 @@ fn write_repo_config(repo: &Path, toml: &str) {
         "import sys\nfor i in range(20000):\n    print('filler', i)\nprint('boom-marker')\nsys.stdout.flush()\nsys.exit(3)\n",
     )
     .unwrap();
+    // A process that is "ready" without binding anything, so two runs can be
+    // alive at once on one port.
+    std::fs::write(
+        repo.join("hold.py"),
+        "import sys, time\nprint('holding', flush=True)\ntime.sleep(60)\n",
+    )
+    .unwrap();
     common::commit_all(repo, &[], "config");
 }
 
@@ -363,7 +370,7 @@ async fn run_start_refuses_an_unknown_config_a_disabled_one_and_a_bad_regex() {
     write_repo_config(
         &repo,
         &format!(
-            "[[run]]\nname = \"bad\"\ncommand = \"true\"\nport = {port}\nready_regex = \"(\"\n"
+            "[[run]]\nname = \"bad\"\ncommand = \"true\"\nport = {port}\nready_regex = \"(\"\n\n[[run]]\nname = \"escape\"\ncommand = \"true\"\nport = {port}\ncwd = \"/etc\"\n"
         ),
     );
     // Detection would otherwise never see a compose file next to a toml that
@@ -383,6 +390,15 @@ async fn run_start_refuses_an_unknown_config_a_disabled_one_and_a_bad_regex() {
         "the message must name the regex: {bad:?}"
     );
 
+    // An absolute `cwd` would replace the worktree base rather than extend it,
+    // so the repository's own file could point a run at any path on the host.
+    let escape = start_run(&mut c, &ws.id, "escape").await.unwrap_err();
+    assert_eq!(escape.code, ErrorCode::InvalidParams, "{escape:?}");
+    assert!(
+        escape.message.contains("relative"),
+        "the message must say what is wrong with it: {escape:?}"
+    );
+
     // A repo whose only config is a disabled one.
     let dir2 = tempfile::tempdir().unwrap();
     let repo2 = init_repo(dir2.path());
@@ -393,6 +409,95 @@ async fn run_start_refuses_an_unknown_config_a_disabled_one_and_a_bad_regex() {
     assert_eq!(disabled.code, ErrorCode::InvalidParams, "{disabled:?}");
     assert!(disabled.message.contains("Docker"), "{disabled:?}");
 
+    cancel.cancel();
+}
+
+/// Two configurations that share a port are two runs that do not touch each
+/// other.
+///
+/// Detection produces exactly this shape - `dev`, `start` and `serve` out of one
+/// `package.json`, all with the same guessed port - so it is the ordinary case,
+/// not a contrived one. The bridged half of the claim (one forwarder socket per
+/// run) is asserted in `sandbox_integration.rs`, where there is a sandbox to
+/// bridge into; here the point is that nothing in the manager is keyed on the
+/// port.
+#[tokio::test]
+async fn two_configs_sharing_a_port_are_two_independent_runs() {
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let port = free_port();
+    write_repo_config(
+        &repo,
+        &format!(
+            "[[run]]\nname = \"dev\"\ncommand = \"{py} hold.py\"\nport = {port}\nready_regex = \"holding\"\n\n[[run]]\nname = \"serve\"\ncommand = \"{py} hold.py\"\nport = {port}\nready_regex = \"holding\"\n"
+        ),
+    );
+    let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(p, &token).await;
+    let ws = create_ws(&mut c, &repo, "sameport").await;
+
+    let dev = start_run(&mut c, &ws.id, "dev").await.unwrap();
+    let serve = start_run(&mut c, &ws.id, "serve").await.unwrap();
+    assert_ne!(
+        dev.run_id, serve.run_id,
+        "the second start must be its own run, not a refusal or a reuse"
+    );
+
+    // Both runs in one pass. `run_events` keeps only the run it was asked
+    // about and drops the rest, so waiting for these one after the other would
+    // throw away whichever `ready` arrived while the other was being waited on.
+    let wanted = [dev.run_id.clone(), serve.run_id.clone()];
+    let mut ready: Vec<RunId> = Vec::new();
+    let deadline = Instant::now() + READY;
+    while ready.len() < wanted.len() && Instant::now() < deadline {
+        for (_, ev) in c.drain_events() {
+            if let Event::RunStateChanged {
+                run_id,
+                state: RunState::Ready,
+                ..
+            } = &ev
+            {
+                if wanted.contains(run_id) && !ready.contains(run_id) {
+                    ready.push(run_id.clone());
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let _ = c.call(Request::WorkspaceList {}).await;
+    }
+    for run in &wanted {
+        assert!(ready.contains(run), "{run} never became ready: {ready:?}");
+    }
+    let runs = list_runs(&mut c, &ws.id).await;
+    assert_eq!(runs.len(), 2, "{runs:?}");
+
+    // Stopping one leaves the other exactly as it was: a stop keyed on the port
+    // would have taken both.
+    c.call(Request::RunStop(RunIdParams {
+        run_id: dev.run_id.clone(),
+    }))
+    .await
+    .unwrap();
+    let evs = run_events(&mut c, &dev.run_id, Duration::from_secs(10), |e| {
+        has_state(e, RunState::Stopped)
+    })
+    .await;
+    assert!(has_state(&evs, RunState::Stopped), "{:?}", states(&evs));
+
+    let runs = list_runs(&mut c, &ws.id).await;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].run_id, serve.run_id);
+    assert_eq!(runs[0].state, RunState::Ready, "{runs:?}");
+
+    c.call(Request::RunStop(RunIdParams {
+        run_id: serve.run_id.clone(),
+    }))
+    .await
+    .unwrap();
     cancel.cancel();
 }
 

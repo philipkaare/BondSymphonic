@@ -59,6 +59,9 @@ private:
     void inspectRepo();
     void onRepoInspected(const QString& path, const QString& infoJson);
     void onRunConfigsDetected(const QString& path, const QString& json);
+    /// Raises or hides the note naming the hosts the repository's own
+    /// `bondsymphonic.toml` would add to the new workspace's allowlist.
+    void showNetworkAllow(const QString& json);
     void onInspectFailed(const QString& op, const QString& message);
     void onGroupChanged(int index);
     /// Shows the fields the selected adapter has and hides the rest.
@@ -76,6 +79,13 @@ private:
     QLineEdit* m_claudeModel = nullptr;
     QComboBox* m_permissionMode = nullptr;
     QComboBox* m_runConfig = nullptr;
+    /// Names the hosts this repository's own `bondsymphonic.toml` would add to
+    /// the new workspace's network allowlist, or is hidden when it adds none.
+    ///
+    /// Creating a workspace applies `[network] allow` from a file the user may
+    /// never have opened, so this is the one place before Create where that is
+    /// visible. Plain text: the repository chose the strings.
+    QLabel* m_networkNote = nullptr;
     QPlainTextEdit* m_initialPrompt = nullptr;
     QComboBox* m_group = nullptr;
     QLineEdit* m_newGroup = nullptr;

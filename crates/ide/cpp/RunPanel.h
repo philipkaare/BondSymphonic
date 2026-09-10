@@ -14,9 +14,13 @@ class RunPanelModel;
 
 namespace runpanel {
 
-/// Appends one item per run configuration in `configsJson` (the array
-/// `RunPanelModel::configsJson` and `AppController::runConfigsDetected` both
-/// carry) to `combo`, without clearing what is already there.
+/// Appends one item per run configuration in `configsJson` to `combo`, without
+/// clearing what is already there.
+///
+/// Takes either shape the two sources use: the bare array
+/// `RunPanelModel::configsJson` answers, or the `DetectRunConfigsResult` object
+/// `AppController::runConfigsDetected` carries, whose `configs` member is that
+/// same array.
 ///
 /// The item's text is the configuration's name, with the port spelled out when
 /// the daemon only guessed it; its user data is the name, which is what
@@ -81,6 +85,13 @@ private:
     /// Greys the toast's two buttons out while an `allowHost` is on its way, so
     /// the offer cannot be answered twice while it is out.
     void setToastBusy(bool busy);
+    /// The `allowHost` for `host` failed: re-arm its buttons and say why, in
+    /// the toast itself.
+    ///
+    /// Bound to the model's `denialFailed` rather than to the model-wide
+    /// `busy`, so an unrelated `run.start` finishing mid-allow cannot re-arm an
+    /// offer whose answer is still out.
+    void onDenialFailed(const QString& host, const QString& message);
     void onAllowClicked();
     void onDismissClicked();
     void openUrl();
@@ -102,6 +113,9 @@ private:
     /// The host the toast is offering, or empty when it is down. The queue is
     /// the model's, one host at a time; this is only the one on screen.
     QString m_deniedHost;
+    /// Why the last `allowHost` for the host on screen failed, or empty. Shown
+    /// in the toast, so the reason sits with the offer it belongs to.
+    QString m_denialError;
     /// Set when the log widget is showing a workspace that is no longer the
     /// one on screen, so the next repaint refills it even if the run id has
     /// not changed (both workspaces having no run).

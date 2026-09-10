@@ -41,13 +41,28 @@ impl Handler for WorkspaceHandler {
             // Detection walks a directory the user has just picked, on whatever
             // filesystem it lives on, so it goes to the blocking pool rather
             // than stalling every other request behind a slow stat.
-            Request::RepoDetectRunConfigs(p) => ok(DetectRunConfigsResult {
-                configs: tokio::task::spawn_blocking(move || {
-                    crate::runs::config::configs_for(std::path::Path::new(&p.path))
+            Request::RepoDetectRunConfigs(p) => {
+                // The repository's `[network] allow` travels with the
+                // configurations: creating a workspace from this repo extends
+                // what its agent may reach, and the dialog that offers Create
+                // is the last place a person can see that before it happens.
+                let (configs, network_allow) = tokio::task::spawn_blocking(move || {
+                    let root = std::path::Path::new(&p.path);
+                    let configs = crate::runs::config::configs_for(root);
+                    let allow = crate::runs::config::load_repo_config(root)
+                        .ok()
+                        .flatten()
+                        .map(|c| c.network.allow)
+                        .unwrap_or_default();
+                    (configs, allow)
                 })
                 .await
-                .map_err(|e| RpcError::internal(e.to_string()))?,
-            }),
+                .map_err(|e| RpcError::internal(e.to_string()))?;
+                ok(DetectRunConfigsResult {
+                    configs,
+                    network_allow,
+                })
+            }
             Request::WorkspaceCreate(p) => ok(lifecycle::create(d, p).await?),
             Request::WorkspaceList {} => ok(WorkspaceListResult {
                 workspaces: d

@@ -348,6 +348,15 @@ pub struct CheckPrereqsResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DetectRunConfigsResult {
     pub configs: Vec<RunConfig>,
+    /// The hosts the repository's own `bondsymphonic.toml` `[network] allow`
+    /// adds to the workspace's allowlist, exactly as written there.
+    ///
+    /// A repository the user has not read extends what its agent may reach the
+    /// moment the workspace is created, so the New Agent dialog says so before
+    /// the user clicks Create. `serde(default)` because a daemon that predates
+    /// the field simply adds nothing.
+    #[serde(default)]
+    pub network_allow: Vec<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceListResult {

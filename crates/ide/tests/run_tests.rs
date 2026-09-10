@@ -295,6 +295,40 @@ fn denied_hosts_are_a_queue_that_de_dups_and_advances() {
     assert!(runs.denied_hosts.is_empty());
 }
 
+/// A loop in the sandbox naming a new host every time must not grow the queue
+/// without bound: the user answers these one toast at a time, so a queue past a
+/// couple of dozen is one nobody will ever reach the end of.
+#[test]
+fn the_denial_queue_is_bounded_and_drops_the_oldest() {
+    let mut runs = WorkspaceRuns::default();
+    let cap = WorkspaceRuns::MAX_DENIED;
+    for i in 0..cap {
+        assert!(runs.note_denied(&format!("h{i}.evil")));
+    }
+    assert_eq!(runs.denied_hosts.len(), cap);
+    assert_eq!(runs.current_denial(), Some("h0.evil"));
+
+    // One past the cap: the queue stays the same length and the oldest goes.
+    assert!(runs.note_denied("newest.evil"));
+    assert_eq!(runs.denied_hosts.len(), cap);
+    assert_eq!(runs.current_denial(), Some("h1.evil"));
+    assert_eq!(
+        runs.denied_hosts.last().map(String::as_str),
+        Some("newest.evil")
+    );
+
+    for i in 0..1000 {
+        runs.note_denied(&format!("flood{i}.evil"));
+    }
+    assert_eq!(runs.denied_hosts.len(), cap);
+    assert_eq!(
+        runs.denied_hosts.last().map(String::as_str),
+        Some("flood999.evil")
+    );
+    // Nothing that was pushed out is still claimed to be queued.
+    assert!(!runs.clear_denied("h0.evil"));
+}
+
 /// The three JSON accessors are the whole contract with the C++ panel: the
 /// combo, the run list and the port hint are read out of these strings.
 #[test]

@@ -299,13 +299,30 @@ impl WorkspaceRuns {
             .find(|r| &r.config_name == name && r.is_live())
     }
 
+    /// The most blocked hosts one workspace queues at a time.
+    ///
+    /// The queue is answered one toast at a time by a person, so anything past
+    /// a couple of dozen is a queue nobody will ever reach the end of. A loop
+    /// in the sandbox asking for `a1.evil`, `a2.evil`, ... would otherwise grow
+    /// this without bound and make the duplicate scan quadratic while it did.
+    /// The daemon coalesces repeats of one host; this is the bound on
+    /// *distinct* ones.
+    pub const MAX_DENIED: usize = 32;
+
     /// Queues a blocked host. Returns whether it is new: a page that fetches
     /// the same blocked host forty times must produce one toast, not forty.
+    ///
+    /// At [`WorkspaceRuns::MAX_DENIED`] the oldest is dropped. The newest host
+    /// is the one the user is most likely to be looking at the consequences of,
+    /// and an unanswerable queue is worse than a short one.
     pub fn note_denied(&mut self, host: &str) -> bool {
         if self.denied_hosts.iter().any(|h| h == host) {
             return false;
         }
         self.denied_hosts.push(host.to_owned());
+        while self.denied_hosts.len() > Self::MAX_DENIED {
+            self.denied_hosts.remove(0);
+        }
         true
     }
 

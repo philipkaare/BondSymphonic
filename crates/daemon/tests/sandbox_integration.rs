@@ -1128,6 +1128,139 @@ async fn wait_for_run_state(
     }
 }
 
+/// Two configurations that share a port get a forwarder socket each.
+///
+/// Detection emits `dev`, `start` and `serve` from one `package.json`, all with
+/// the same guessed port, so this is the ordinary case. A socket named for the
+/// port would have the second run unlink the first one's live socket, leaving
+/// run 1's bridge pointing at run 2's forwarder and either stop killing both.
+#[tokio::test]
+async fn two_bwrap_runs_on_one_port_get_a_socket_and_a_bridge_each() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    if !std::path::Path::new("/usr/bin/python3").exists() {
+        eprintln!("SKIP: /usr/bin/python3 is missing");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    // One port, two configurations. Only one of them can actually bind it
+    // inside the sandbox; the other is ready by its output, which is exactly
+    // how a repository with three aliases for one dev server behaves.
+    let port = free_port();
+    std::fs::write(
+        repo.join("hold.py"),
+        "import sys, time\nprint('holding', flush=True)\ntime.sleep(60)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("bondsymphonic.toml"),
+        format!(
+            "[[run]]\nname = \"dev\"\ncommand = \"python3 hold.py\"\nport = {port}\nready_regex = \"holding\"\n\n[[run]]\nname = \"serve\"\ncommand = \"python3 hold.py\"\nport = {port}\nready_regex = \"holding\"\n"
+        ),
+    )
+    .unwrap();
+    common::commit_all(&repo, &[], "config");
+
+    let (daemon, ws, _layout) = bwrap_workspace(dir.path(), &repo, "twoports").await;
+    let mut events = daemon.events.subscribe();
+    let mut started = Vec::new();
+    for name in ["dev", "serve"] {
+        started.push(
+            daemon
+                .runs
+                .start(
+                    &daemon,
+                    bondsymphonic_proto::RunStartParams {
+                        workspace_id: ws.id.clone(),
+                        config_name: name.into(),
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{name} did not start: {e}")),
+        );
+    }
+    assert_ne!(started[0].run_id, started[1].run_id);
+    assert_ne!(
+        started[0].host_port, started[1].host_port,
+        "each run is reached on a host port of its own"
+    );
+
+    let sockets: Vec<std::path::PathBuf> = started
+        .iter()
+        .map(|r| {
+            daemon
+                .dirs
+                .run(&ws.id)
+                .join(format!("fwd-{}.sock", r.run_id))
+        })
+        .collect();
+    assert_ne!(
+        sockets[0], sockets[1],
+        "the two forwarders must not share a socket path"
+    );
+    for socket in &sockets {
+        assert!(socket.exists(), "{} was never bound", socket.display());
+    }
+
+    // Both runs off one pass over the stream. `wait_for_run_state` drops every
+    // message that is not the run it was asked about, so waiting for these one
+    // after the other would throw away whichever `ready` landed first.
+    let wanted: Vec<bondsymphonic_proto::RunId> =
+        started.iter().map(|r| r.run_id.clone()).collect();
+    let mut ready: Vec<bondsymphonic_proto::RunId> = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while ready.len() < wanted.len() {
+        let Ok(Ok(msg)) = tokio::time::timeout_at(deadline, events.recv()).await else {
+            break;
+        };
+        if let ServerMessage::Event {
+            event:
+                Event::RunStateChanged {
+                    run_id,
+                    state: bondsymphonic_proto::RunState::Ready,
+                    ..
+                },
+            ..
+        } = msg
+        {
+            if wanted.contains(&run_id) && !ready.contains(&run_id) {
+                ready.push(run_id);
+            }
+        }
+    }
+    for run in &wanted {
+        assert!(ready.contains(run), "{run} never became ready: {ready:?}");
+    }
+
+    // Stopping the first leaves the second's socket, forwarder and bridge
+    // exactly as they were.
+    daemon.runs.stop(&started[0].run_id).await.unwrap();
+    wait_until(std::time::Duration::from_secs(5), || !sockets[0].exists()).await;
+    assert!(
+        !sockets[0].exists(),
+        "the stopped run must take its own socket"
+    );
+    assert!(
+        sockets[1].exists(),
+        "and must leave the other run's socket alone"
+    );
+    let survivor = format!("fwd-{}[.]sock", started[1].run_id);
+    assert!(
+        pgrep(&survivor),
+        "the other forwarder must still be running"
+    );
+    let live = daemon.runs.list(&ws.id);
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(live[0].run_id, started[1].run_id);
+    assert_eq!(live[0].state, bondsymphonic_proto::RunState::Ready);
+
+    daemon.runs.stop(&started[1].run_id).await.unwrap();
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+}
+
 #[tokio::test]
 async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
     if !bwrap_available() {
@@ -1171,7 +1304,10 @@ async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
         started.url,
         format!("http://localhost:{}", started.host_port)
     );
-    let socket = daemon.dirs.run(&ws.id).join(format!("fwd-{port}.sock"));
+    let socket = daemon
+        .dirs
+        .run(&ws.id)
+        .join(format!("fwd-{}.sock", started.run_id));
 
     let seen = wait_for_run_state(
         &mut events,
@@ -1190,9 +1326,9 @@ async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
         "the forwarder must bind {}",
         socket.display()
     );
-    // The socket path carries this test's own port, so it names exactly one
+    // The socket path carries this run's own id, so it names exactly one
     // process on the machine however many sandboxes other suites are running.
-    let forwarder = format!("fwd-{port}[.]sock");
+    let forwarder = format!("fwd-{}[.]sock", started.run_id);
     assert!(pgrep(&forwarder), "the forwarder must be running");
 
     // Through the bridge, from the host, exactly as the Windows browser does.

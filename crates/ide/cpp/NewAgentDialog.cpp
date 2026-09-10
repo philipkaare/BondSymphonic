@@ -17,6 +17,7 @@
 #include <QLineEdit>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QStringList>
 #include <QVBoxLayout>
 
 namespace {
@@ -117,6 +118,14 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model, QWi
     m_runConfig->addItem(kNoRunConfig, QString());
     m_runConfig->setToolTip("How the Run panel starts this workspace's application");
     form->addRow("Run config:", m_runConfig);
+
+    m_networkNote = new QLabel(this);
+    m_networkNote->setWordWrap(true);
+    // The repository wrote these host names, so they are shown as text and
+    // never as markup.
+    m_networkNote->setTextFormat(Qt::PlainText);
+    m_networkNote->hide();
+    form->addRow(QString(), m_networkNote);
 
     m_group = new QComboBox(this);
     for (int g = 0; g < m_model->groupCount(); ++g) {
@@ -238,6 +247,11 @@ void NewAgentDialog::inspectRepo() {
         return;
     }
     m_pendingPath = path;
+    // The note belongs to the repository that was inspected, so it goes down
+    // with that repository rather than surviving into the answer for another
+    // one -- or into no answer at all, if detection fails.
+    m_networkNote->clear();
+    m_networkNote->hide();
     m_status->setText(QString("Inspecting %1…").arg(path));
     m_controller->inspectRepo(path);
     // Alongside, not after: the two answers are independent and the run
@@ -266,6 +280,32 @@ void NewAgentDialog::onRepoInspected(const QString& path, const QString& infoJso
     updateOkEnabled();
 }
 
+void NewAgentDialog::showNetworkAllow(const QString& json) {
+    const QJsonArray allow = QJsonDocument::fromJson(json.toUtf8())
+                                 .object()
+                                 .value("network_allow")
+                                 .toArray();
+    QStringList hosts;
+    for (const QJsonValue& value : allow) {
+        const QString host = value.toString();
+        if (!host.isEmpty()) {
+            hosts.append(host);
+        }
+    }
+    if (hosts.isEmpty()) {
+        m_networkNote->clear();
+        m_networkNote->hide();
+        return;
+    }
+    // Creating the workspace applies this list; saying so here is the last
+    // point at which anyone sees it before it takes effect.
+    m_networkNote->setText(
+        QStringLiteral("This repository adds %1 host%2 to the network allowlist: %3")
+            .arg(hosts.size())
+            .arg(hosts.size() == 1 ? QString() : QStringLiteral("s"), hosts.join(QStringLiteral(", "))));
+    m_networkNote->show();
+}
+
 void NewAgentDialog::onRunConfigsDetected(const QString& path, const QString& json) {
     // A late answer for a repository the user has since edited away from would
     // offer configurations from the wrong tree.
@@ -276,6 +316,7 @@ void NewAgentDialog::onRunConfigsDetected(const QString& path, const QString& js
     m_runConfig->clear();
     m_runConfig->addItem(kNoRunConfig, QString());
     runpanel::appendConfigItems(m_runConfig, json);
+    showNetworkAllow(json);
     // The first runnable configuration is the offer, matching what the Run
     // panel preselects once the workspace exists. A re-detection that still has
     // what the user picked keeps it.

@@ -24,7 +24,19 @@ web app it runs answers in the Windows browser.
   `*.npmjs.org`, `pypi.org`, `files.pythonhosted.org`, `crates.io`, `static.crates.io`,
   `index.crates.io`, `github.com`, `*.github.com`, `*.githubusercontent.com`. A wildcard
   matches sub-domains only: `*.npmjs.org` covers `registry.npmjs.org` but not
-  `npmjs.org`, and never `evilnpmjs.org`.
+  `npmjs.org`, and never `evilnpmjs.org`, and it has to leave a registrable name
+  behind it — `*.com` is refused.
+- **The address is what is allowed, not the name.** A repository's own
+  `[network] allow` extends the list when the workspace is created, so the list can hold
+  names nobody vetted. After resolving a host, the proxy drops every address that is
+  loopback, link-local (169.254/16 and fe80::/10, where the cloud metadata endpoint
+  lives), private (10/8, 172.16/12, 192.168/16), unique-local (fc00::/7), unspecified or
+  multicast, and refuses the request with a `403` saying the destination is private. The
+  exception is an allowlist entry that *is* that literal address: writing `127.0.0.1`
+  down is something only a person does. A request whose target is not a plain hostname
+  or an address — `CONNECT *.com:443`, say — is a `400`, and never becomes a denial the
+  toast could offer to allow. Repeats of one denial are coalesced to one notice per host
+  per workspace every five seconds.
 - **Denial toast.** A refused connection reaches the IDE as an event carrying the host,
   and the Run panel shows it as a toast on the workspace it was refused for — one host at
   a time, queued per workspace, so a denial raised behind another tab waits rather than
@@ -35,7 +47,9 @@ web app it runs answers in the Windows browser.
   **Dismiss** clears the toast without allowing anything.
 - **Run configurations.** A repository's `bondsymphonic.toml` declares runs as
   `[[run]]` blocks with `name`, `command`, `port` and optional `cwd`, `env` and
-  `ready_regex`, and extends the allowlist with `[network] allow = [...]`. With no such
+  `ready_regex`, and extends the allowlist with `[network] allow = [...]` — which the New
+  Agent dialog names ("This repository adds 2 hosts to the network allowlist: ...") before
+  you click Create, since creating the workspace is what applies it. With no such
   file the daemon guesses from the marker files: `package.json` scripts `dev`, `start`
   and `serve` invoked through the package manager the lockfile names (pnpm, yarn or npm)
   with Vite's own `server.port` when the config spells one out and 5173, 3000 or 4200
@@ -77,7 +91,11 @@ Known limits in Milestone 5:
   accepted so a file written for a later daemon still loads; nothing copies that settings
   file into the sandbox yet.
 - **The daemon's allowlist is per workspace, not per agent.** Every process in a
-  workspace's sandbox shares one list, including the terminal you type in.
+  workspace's sandbox shares one list, including the terminal you type in. It holds at
+  most 256 entries.
+- **The denial queue is capped at 32 hosts per workspace.** Past that the oldest
+  unanswered host is dropped: the queue is answered one toast at a time by a person, and
+  a longer one is a queue nobody reaches the end of.
 
 Milestone 4: a New Agent tab can be a Claude Code agent running inside the workspace's
 sandbox, with its transcript, its tool permissions and its cost in the IDE — and logging

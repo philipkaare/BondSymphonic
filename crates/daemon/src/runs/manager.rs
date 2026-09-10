@@ -260,12 +260,20 @@ impl RunManager {
         let _claim = self.claim(&ws.id, &config.name)?;
         let handle = d.sandbox(&ws.id)?;
 
+        // Minted before the bridge rather than after the spawn, because the
+        // forwarder's socket is named for the run. Detection routinely yields
+        // several configurations on one port (`dev`, `start` and `serve` out of
+        // one `package.json`), and a socket named for the port would have the
+        // second run unlink the first one's live socket and the first stop take
+        // the second's bridge down with it.
+        let id: RunId = new_id(RunId::PREFIX).as_str().into();
+
         // On a sandbox with a network namespace of its own the app's port is
         // unreachable from here, so it gets a host port and a forwarder; on the
         // no-sandbox backend the process is a plain child of the daemon and its
         // port already is the host's.
         let (host_port, plumbing, readiness_source) = if d.backend.name() == BWRAP_BACKEND {
-            bridge_into(d, &ws.id, &handle, config.port).await?
+            bridge_into(d, &ws.id, &id, &handle, config.port).await?
         } else {
             (config.port, Plumbing::none(), ReadinessSource::Port)
         };
@@ -280,7 +288,29 @@ impl RunManager {
         // two variables the daemon promises every run.
         env.push(("PORT".into(), config.port.to_string()));
         env.push(("HOST".into(), "0.0.0.0".into()));
-        let cwd = ws.worktree_path.join(config.cwd.as_deref().unwrap_or("."));
+        // `Path::join` with an absolute right-hand side *replaces* the base, so
+        // a `cwd` of `/etc` in the repository's own toml would run the command
+        // there. Under bwrap the sandbox confines it; on the no-sandbox backend
+        // it is an arbitrary host path, and either way it is not what a relative
+        // working directory means.
+        let cwd_rel = std::path::Path::new(config.cwd.as_deref().unwrap_or("."));
+        // `is_relative` alone is not enough on Windows, where `/etc` has no
+        // drive prefix and so counts as relative while `join` still throws the
+        // base directory away. A `..` climbs out of the worktree by the same
+        // reasoning, so it is refused here too.
+        let escapes = cwd_rel.has_root()
+            || !cwd_rel.is_relative()
+            || cwd_rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir));
+        if escapes {
+            return Err(RpcError::invalid_params(format!(
+                "run config {}: cwd {} must be a relative path inside the worktree",
+                config.name,
+                cwd_rel.display()
+            )));
+        }
+        let cwd = ws.worktree_path.join(cwd_rel);
 
         let mut child = match handle
             .spawn(SandboxCommand {
@@ -304,7 +334,6 @@ impl RunManager {
             return Err(RpcError::internal("backend returned no pipes for the run"));
         };
 
-        let id: RunId = new_id(RunId::PREFIX).as_str().into();
         let exit_rx = child.exit;
         let exit: Shared<futures::future::BoxFuture<'static, i32>> =
             async move { exit_rx.await.unwrap_or(-1) }.boxed().shared();
@@ -713,15 +742,35 @@ async fn is_ready(run: &Arc<Run>, readiness: &ReadinessSource) -> bool {
     }
 }
 
+/// The forwarder socket's file name, the one place the two ends agree on it:
+/// the host bridge connects to `<run_dir>/<this>` and the forwarder inside the
+/// sandbox binds `/run/bs/<this>`.
+///
+/// Keyed by the run rather than by the port. Run ids are minted by the daemon
+/// out of a fixed alphabet, so this is always a plain file name.
+///
+/// Only the bridged path uses it, and that path needs Unix sockets.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn forwarder_socket_name(run: &RunId) -> String {
+    format!("fwd-{run}.sock")
+}
+
 /// Starts the host bridge and the in-sandbox forwarder for `port`.
+///
+/// The socket is named for `run`, not for the port. Two configurations of one
+/// repository routinely carry the same port, and a port-named socket would make
+/// the two runs share one forwarder: the second bind would unlink the first
+/// run's live socket, and the first stop would take the second run's bridge
+/// down with it.
 #[cfg(unix)]
 async fn bridge_into(
     d: &Daemon,
     ws: &WorkspaceId,
+    run: &RunId,
     handle: &Arc<dyn SandboxHandle>,
     port: u16,
 ) -> Result<(u16, Plumbing, ReadinessSource), RpcError> {
-    let socket = d.dirs.run(ws).join(format!("fwd-{port}.sock"));
+    let socket = d.dirs.run(ws).join(forwarder_socket_name(run));
     // A file left by a run that did not shut down cleanly would make the
     // forwarder's bind fail inside the sandbox, where nothing can say so.
     let _ = std::fs::remove_file(&socket);
@@ -729,7 +778,7 @@ async fn bridge_into(
         .await
         .map_err(|e| RpcError::io(&e))?;
     let host_port = bridge.host_port;
-    let forwarder = match start_forwarder(ws, handle, port).await {
+    let forwarder = match start_forwarder(ws, run, handle, port).await {
         Ok(k) => k,
         // A bridge with no far end can never carry anything, so the run would
         // sit in `starting` until someone stopped it. Refusing the call says the
@@ -741,6 +790,11 @@ async fn bridge_into(
                 bridge: Some(bridge),
                 forwarder: None,
             });
+            // The forwarder may have bound before it was killed, and a run that
+            // never started must leave nothing behind in the workspace's run
+            // directory. `Bridge::stop` unlinks the same path; doing it again
+            // here covers a forwarder that won the race with its own killer.
+            let _ = std::fs::remove_file(&socket);
             d.events.publish(
                 Some(ws.clone()),
                 Event::DaemonLog {
@@ -769,6 +823,7 @@ async fn bridge_into(
 async fn bridge_into(
     _d: &Daemon,
     _ws: &WorkspaceId,
+    _run: &RunId,
     _handle: &Arc<dyn SandboxHandle>,
     _port: u16,
 ) -> Result<(u16, Plumbing, ReadinessSource), RpcError> {
@@ -783,6 +838,7 @@ async fn bridge_into(
 #[cfg(unix)]
 async fn start_forwarder(
     ws: &WorkspaceId,
+    run: &RunId,
     handle: &Arc<dyn SandboxHandle>,
     port: u16,
 ) -> Result<Box<dyn Fn() + Send + Sync>, String> {
@@ -793,7 +849,7 @@ async fn start_forwarder(
         helper.to_string_lossy().into_owned(),
         "forward".to_string(),
         "--socket".to_string(),
-        format!("/run/bs/fwd-{port}.sock"),
+        format!("/run/bs/{}", forwarder_socket_name(run)),
         "--port".to_string(),
         port.to_string(),
     ];

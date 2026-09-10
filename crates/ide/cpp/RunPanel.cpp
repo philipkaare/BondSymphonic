@@ -56,7 +56,12 @@ void untint(QLabel* label) {
 } // namespace
 
 void runpanel::appendConfigItems(QComboBox* combo, const QString& configsJson) {
-    const QJsonArray configs = QJsonDocument::fromJson(configsJson.toUtf8()).array();
+    // Two callers, two shapes: the model answers a bare array, while the
+    // controller carries the daemon's whole `DetectRunConfigsResult` because
+    // the dialog needs its `network_allow` as well.
+    const QJsonDocument doc = QJsonDocument::fromJson(configsJson.toUtf8());
+    const QJsonArray configs =
+        doc.isArray() ? doc.array() : doc.object().value("configs").toArray();
     // A plain QComboBox is backed by a QStandardItemModel; the cast is what
     // makes an individual row greyed out and unpickable. A model that is not
     // one leaves every row enabled rather than dropping the entries.
@@ -233,15 +238,12 @@ void RunPanel::connectModel() {
     QObject::connect(model, &RunPanelModel::selectedConfigChanged, this, &RunPanel::syncSelection);
     QObject::connect(model, &RunPanelModel::stateChanged, this, &RunPanel::updateRow);
     QObject::connect(model, &RunPanelModel::runsChanged, this, &RunPanel::updateRow);
-    QObject::connect(model, &RunPanelModel::busyChanged, this, [this] {
-        updateRow();
-        // A failed `allowHost` leaves its toast up so the offer is not lost;
-        // once nothing is in flight the buttons have to work again. A
-        // successful one has already taken the toast down.
-        if (!m_model.isNull() && !m_model->getBusy()) {
-            setToastBusy(false);
-        }
-    });
+    // Only the row: the toast's buttons are armed by the answer to its own
+    // `allowHost`, not by the model-wide busy flag. An unrelated `run.start`
+    // finishing mid-allow would otherwise re-arm the offer and let a second
+    // click send a duplicate `set_allowlist`.
+    QObject::connect(model, &RunPanelModel::busyChanged, this, &RunPanel::updateRow);
+    QObject::connect(model, &RunPanelModel::denialFailed, this, &RunPanel::onDenialFailed);
     QObject::connect(model, &RunPanelModel::outputAppended, this, &RunPanel::onOutputAppended);
     // The queue, and which host is being offered from it, are the model's. The
     // panel raises exactly what it is told to and takes it down when told,
@@ -410,12 +412,15 @@ void RunPanel::showToast(const QString& host) {
         return;
     }
     m_deniedHost = host;
+    // A new offer starts clean: the previous host's failure is not this one's.
+    m_denialError.clear();
     setToastBusy(false);
     m_toast->show();
 }
 
 void RunPanel::hideToast() {
     m_deniedHost.clear();
+    m_denialError.clear();
     setToastBusy(false);
     m_toastText->clear();
     m_toast->hide();
@@ -428,10 +433,26 @@ void RunPanel::setToastBusy(bool busy) {
         return;
     }
     // The wording is part of the state: a toast whose buttons came back after a
-    // failed allow must stop claiming the host is being allowed.
-    m_toastText->setText(busy
-                             ? QStringLiteral("Allowing %1…").arg(m_deniedHost)
-                             : QStringLiteral("Blocked network access to %1").arg(m_deniedHost));
+    // failed allow must stop claiming the host is being allowed, and must say
+    // what went wrong where the offer it belongs to is.
+    if (busy) {
+        m_toastText->setText(QStringLiteral("Allowing %1…").arg(m_deniedHost));
+        return;
+    }
+    const QString blocked = QStringLiteral("Blocked network access to %1").arg(m_deniedHost);
+    m_toastText->setText(m_denialError.isEmpty()
+                             ? blocked
+                             : QStringLiteral("%1 — %2").arg(blocked, m_denialError));
+}
+
+void RunPanel::onDenialFailed(const QString& host, const QString& message) {
+    // A denial answered while another workspace's toast is up: the model has
+    // already moved on, and re-arming this one would arm the wrong offer.
+    if (host != m_deniedHost) {
+        return;
+    }
+    m_denialError = message;
+    setToastBusy(false);
 }
 
 void RunPanel::onAllowClicked() {
@@ -439,6 +460,7 @@ void RunPanel::onAllowClicked() {
     if (host.isEmpty() || m_model.isNull()) {
         return;
     }
+    m_denialError.clear();
     // The toast stays up until the model says the host really is allowed: the
     // daemon has to be asked what its allowlist is and then told the new one,
     // and a call that fails must not look like one that worked. Only the

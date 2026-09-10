@@ -83,6 +83,15 @@ pub mod qobject {
         #[qsignal]
         fn error_occurred(self: Pin<&mut RunPanelModel>, message: QString);
 
+        /// An `allowHost` for `host` failed, and its toast is still up.
+        ///
+        /// Separate from `errorOccurred` and from the model-wide `busy`,
+        /// because the toast's buttons are armed by the answer to *this* call:
+        /// an unrelated `run.start` finishing mid-allow would otherwise re-arm
+        /// the offer and let a second click send a duplicate `set_allowlist`.
+        #[qsignal]
+        fn denial_failed(self: Pin<&mut RunPanelModel>, host: QString, message: QString);
+
         /// Points the panel at a workspace and its worktree: detects the run
         /// configurations for `worktree_path`, lists the workspace's runs and
         /// subscribes to each of them. The empty id detaches. Naming the
@@ -460,6 +469,15 @@ impl qobject::RunPanelModel {
 
     pub fn allow_host(mut self: Pin<&mut Self>, host: QString) {
         let host = host.to_string();
+        // Defence in depth: the daemon refuses to publish a denial whose host
+        // is not a plain name or an address, and `HostPattern::parse` refuses a
+        // wildcard with only a top-level domain behind it. Neither has to hold
+        // for this click to be safe, so the wildcard stops here as well.
+        if host.contains('*') {
+            self.as_mut()
+                .deny_failed(&host, "a blocked host is never a pattern");
+            return;
+        }
         let Some(workspace) = self.as_ref().denial_owner_of(&host) else {
             tracing::debug!("allowHost: no workspace has {host:?} blocked");
             return;
@@ -467,7 +485,8 @@ impl qobject::RunPanelModel {
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(message) => {
-                self.fail(message);
+                let message = message.to_owned();
+                self.as_mut().deny_failed(&host, &message);
                 return;
             }
         };
@@ -488,8 +507,12 @@ impl qobject::RunPanelModel {
             {
                 Ok(info) => info.allowlist,
                 Err(e) => {
-                    report(&qt, format!("workspace.get failed: {e}"));
-                    let _ = qt.queue(|q| q.end_request());
+                    let message = format!("workspace.get failed: {e}");
+                    let host = host.clone();
+                    let _ = qt.queue(move |mut q| {
+                        q.as_mut().end_request();
+                        q.deny_failed(&host, &message);
+                    });
                     return;
                 }
             };
@@ -514,8 +537,11 @@ impl qobject::RunPanelModel {
                     });
                 }
                 Err(e) => {
-                    report(&qt, format!("workspace.set_allowlist failed: {e}"));
-                    let _ = qt.queue(|q| q.end_request());
+                    let message = format!("workspace.set_allowlist failed: {e}");
+                    let _ = qt.queue(move |mut q| {
+                        q.as_mut().end_request();
+                        q.deny_failed(&host, &message);
+                    });
                 }
             }
         });
@@ -911,6 +937,15 @@ impl qobject::RunPanelModel {
     /// Raises `errorOccurred` from the Qt thread.
     fn fail(self: Pin<&mut Self>, message: &str) {
         tracing::warn!("run panel: {message}");
+        self.error_occurred(QString::from(message));
+    }
+
+    /// Reports a failed `allowHost` on its own signal as well as the panel's
+    /// error line, so the toast can re-arm exactly its own buttons.
+    fn deny_failed(mut self: Pin<&mut Self>, host: &str, message: &str) {
+        tracing::warn!("run panel: allowHost {host}: {message}");
+        self.as_mut()
+            .denial_failed(QString::from(host), QString::from(message));
         self.error_occurred(QString::from(message));
     }
 
