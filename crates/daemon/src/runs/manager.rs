@@ -257,6 +257,33 @@ impl RunManager {
             None => None,
         };
 
+        // Validated before the claim and the bridge: on bwrap a rejected cwd
+        // would otherwise leave a bound host port, a forwarder and a socket
+        // behind for every attempt.
+        // `Path::join` with an absolute right-hand side *replaces* the base, so
+        // a `cwd` of `/etc` in the repository's own toml would run the command
+        // there. Under bwrap the sandbox confines it; on the no-sandbox backend
+        // it is an arbitrary host path, and either way it is not what a relative
+        // working directory means.
+        let cwd_rel = std::path::Path::new(config.cwd.as_deref().unwrap_or("."));
+        // `is_relative` alone is not enough on Windows, where `/etc` has no
+        // drive prefix and so counts as relative while `join` still throws the
+        // base directory away. A `..` climbs out of the worktree by the same
+        // reasoning, so it is refused here too.
+        let escapes = cwd_rel.has_root()
+            || !cwd_rel.is_relative()
+            || cwd_rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir));
+        if escapes {
+            return Err(RpcError::invalid_params(format!(
+                "run config {}: cwd {} must be a relative path inside the worktree",
+                config.name,
+                cwd_rel.display()
+            )));
+        }
+        let cwd = ws.worktree_path.join(cwd_rel);
+
         let _claim = self.claim(&ws.id, &config.name)?;
         let handle = d.sandbox(&ws.id)?;
 
@@ -288,29 +315,6 @@ impl RunManager {
         // two variables the daemon promises every run.
         env.push(("PORT".into(), config.port.to_string()));
         env.push(("HOST".into(), "0.0.0.0".into()));
-        // `Path::join` with an absolute right-hand side *replaces* the base, so
-        // a `cwd` of `/etc` in the repository's own toml would run the command
-        // there. Under bwrap the sandbox confines it; on the no-sandbox backend
-        // it is an arbitrary host path, and either way it is not what a relative
-        // working directory means.
-        let cwd_rel = std::path::Path::new(config.cwd.as_deref().unwrap_or("."));
-        // `is_relative` alone is not enough on Windows, where `/etc` has no
-        // drive prefix and so counts as relative while `join` still throws the
-        // base directory away. A `..` climbs out of the worktree by the same
-        // reasoning, so it is refused here too.
-        let escapes = cwd_rel.has_root()
-            || !cwd_rel.is_relative()
-            || cwd_rel
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir));
-        if escapes {
-            return Err(RpcError::invalid_params(format!(
-                "run config {}: cwd {} must be a relative path inside the worktree",
-                config.name,
-                cwd_rel.display()
-            )));
-        }
-        let cwd = ws.worktree_path.join(cwd_rel);
 
         let mut child = match handle
             .spawn(SandboxCommand {

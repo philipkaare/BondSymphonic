@@ -1277,7 +1277,7 @@ async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
     std::fs::write(
         repo.join("bondsymphonic.toml"),
         format!(
-            "[[run]]\nname = \"web\"\ncommand = \"python3 -m http.server {port} --bind 127.0.0.1\"\nport = {port}\n"
+            "[[run]]\nname = \"web\"\ncommand = \"python3 -m http.server {port} --bind 127.0.0.1\"\nport = {port}\n\n[[run]]\nname = \"escape\"\ncommand = \"true\"\nport = {port}\ncwd = \"/etc\"\n"
         ),
     )
     .unwrap();
@@ -1285,6 +1285,39 @@ async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
 
     let (daemon, ws, _layout) = bwrap_workspace(dir.path(), &repo, "bridged").await;
     let mut events = daemon.events.subscribe();
+
+    // A rejected cwd is refused before any plumbing exists: no host port, no
+    // forwarder and no socket may be left behind by the attempt.
+    let escape = daemon
+        .runs
+        .start(
+            &daemon,
+            bondsymphonic_proto::RunStartParams {
+                workspace_id: ws.id.clone(),
+                config_name: "escape".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        escape.code,
+        bondsymphonic_proto::ErrorCode::InvalidParams,
+        "{escape:?}"
+    );
+    let leftover: Vec<_> = std::fs::read_dir(daemon.dirs.run(&ws.id))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("fwd-"))
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "a refused start left sockets behind: {leftover:?}"
+    );
+    assert!(
+        !pgrep("forward --socket"),
+        "a refused start left a forwarder running"
+    );
     let started = daemon
         .runs
         .start(
