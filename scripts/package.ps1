@@ -89,7 +89,13 @@ Write-Host "package: deploying the Qt runtime"
 # --no-translations, --no-system-d3d-compiler, --no-opengl-sw and
 # --no-quick-import: BondSymphonic is English-only Qt Widgets with no QML, and
 # the software OpenGL fallback alone is ~20 MB the widgets never touch.
-& $windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw --no-quick-import (Join-Path $stage $exeName)
+#
+# --no-compiler-runtime because the CRT is deployed further down, from the
+# toolset the exe was actually linked with. Without it windeployqt tries the
+# same job off VCINSTALLDIR, which is not set outside a developer prompt, and
+# prints "Warning: Cannot find Visual Studio installation directory,
+# VCINSTALLDIR is not set." on a run where nothing is wrong.
+& $windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw --no-quick-import --no-compiler-runtime (Join-Path $stage $exeName)
 if ($LASTEXITCODE -ne 0) { throw "windeployqt failed with exit code $LASTEXITCODE" }
 $ErrorActionPreference = "Stop"
 
@@ -140,28 +146,42 @@ $linked = "{0}.{1:00}" -f $peBytes[$optionalHeader + 2], $peBytes[$optionalHeade
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere; the Visual C++ runtime cannot be located" }
-# `Microsoft.VC1*.CRT` rather than a pinned `Microsoft.VC143.CRT`: the folder is
-# named after the toolset, so a Visual Studio that moves to VC144 would
-# otherwise find nothing here and the package would ship without a CRT until
-# somebody edited this line.
+# `-all -products *` and no `-requires`: every instance on the machine is
+# searched, not the newest one that advertises a component. A build machine
+# can easily carry the toolset that linked the exe in one instance and the
+# redistributable in another, and `-latest` picks by install date, which has
+# nothing to do with either.
+#
+# `Microsoft.VC1*.CRT` rather than a pinned `Microsoft.VC143.CRT`: that folder
+# is named after the toolset, and the 14.5x toolsets are still shipping theirs
+# as VC143 while a later one will not be. The glob matches whichever it is.
 $ErrorActionPreference = "Continue"
-$crtDlls = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Redist.14.Latest -find "VC\Redist\MSVC\*\x64\Microsoft.VC1*.CRT\*.dll"
+$crtDlls = & $vswhere -all -products * -find "VC\Redist\MSVC\*\x64\Microsoft.VC1*.CRT\*.dll"
 $ErrorActionPreference = "Stop"
-if (-not $crtDlls) {
-  throw "no Visual C++ redistributable found (the exe is linked with toolset $linked). Install the 'C++ Redistributable MSMs / Redist' component in the Visual Studio Installer, then run this again."
-}
 
-# Several toolsets can be installed side by side. Prefer the one the exe was
-# linked with -- a newer CRT than the binaries were built against usually works,
-# but "usually" is not something to ship.
-$byToolset = $crtDlls | Group-Object { ($_ -split '\\Redist\\MSVC\\')[1] -replace '\\.*$', '' }
-$chosen = $byToolset | Where-Object { $_.Name.StartsWith("$linked.") -or $_.Name -eq $linked }
-if (-not $chosen) {
-  $chosen = $byToolset | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
-  Write-Warning "no VC++ redistributable for toolset $linked; using $($chosen.Name), which the exe was not linked against"
-} else {
-  $chosen = @($chosen)[0]
+# Several toolsets can be installed side by side, so the DLLs are grouped by the
+# version directory they sit in. Names that are not versions (the old `v143`
+# alias directories) cannot be compared and are dropped here rather than
+# crashing the cast below.
+$byToolset = $crtDlls |
+  Group-Object { ($_ -split '\\Redist\\MSVC\\')[1] -replace '\\.*$', '' } |
+  Where-Object { $_.Name -match '^\d+(\.\d+){1,3}$' }
+
+# The CRT must be at least the toolset the exe was linked with: within major 14
+# a newer runtime serves an older binary, and an older one does not. Shipping
+# 14.44 to a 14.51 binary is a package that fails to load on a clean machine,
+# and it used to happen here behind nothing but a warning. The highest
+# qualifying version wins, because it is the one that also serves anything else
+# in the package built against a newer toolset.
+$linkedVersion = [version]$linked
+$eligible = $byToolset | Where-Object {
+  ([version]$_.Name).Major -eq $linkedVersion.Major -and [version]$_.Name -ge $linkedVersion
 }
+if (-not $eligible) {
+  $found = if ($byToolset) { ($byToolset.Name | Sort-Object) -join ', ' } else { "none" }
+  throw "no Visual C++ redistributable for toolset $linked or newer (the exe is linked with $linked; found: $found). Install the 'C++ Redistributable MSMs / Redist' component for the Visual Studio instance carrying toolset $linked, then run this again."
+}
+$chosen = $eligible | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
 Write-Host "package: VC++ runtime $($chosen.Name) (exe linked with $linked), $($chosen.Count) DLLs"
 $chosen.Group | ForEach-Object { Copy-Item $_ $stage }
 
