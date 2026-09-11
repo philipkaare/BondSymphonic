@@ -472,6 +472,15 @@ pub mod qobject {
         /// the three failures that are routed rather than shown each have a
         /// signal of their own below. Those are emitted **alongside** this one,
         /// not instead of it.
+        ///
+        /// Both halves of such a pair go out from inside **one** queued
+        /// closure, and that is a contract with the window rather than a
+        /// convenience. `MainWindow::noteFailureRouted` records a routed
+        /// failure so the `operationFailed` behind it does not report the same
+        /// thing twice, and expires the record at the end of the turn of the
+        /// event loop that delivered it. Splitting a reporter into two queued
+        /// closures would let that expiry fire between the two signals, and the
+        /// failure would be reported twice.
         #[qsignal]
         fn operation_failed(self: Pin<&mut AppController>, op: QString, message: QString);
 
@@ -1363,6 +1372,10 @@ fn report_failure(qt: &QtHandle, op: &'static str, message: String) {
 
 /// The same for a prerequisite check, which also gets its own signal so a
 /// consumer does not have to recognise it by the method name.
+///
+/// One queue call, not two: see the note on the `operation_failed` signal for
+/// why a typed failure and the `operationFailed` behind it have to reach the
+/// window in the same turn of its event loop.
 fn report_prereqs_failure(qt: &QtHandle, message: String) {
     tracing::warn!("system.check_prereqs failed: {message}");
     let _ = qt.queue(move |mut q| {
@@ -1377,6 +1390,8 @@ fn report_prereqs_failure(qt: &QtHandle, message: String) {
 /// The same for a repository inspection, which carries the path it was asked
 /// about: a dialog showing one repository must not report a failure for
 /// another it has since moved off.
+///
+/// One queue call, as above.
 fn report_inspect_failure(qt: &QtHandle, path: String, message: String) {
     tracing::warn!("repo.inspect failed for {path}: {message}");
     let _ = qt.queue(move |mut q| {
@@ -1389,6 +1404,8 @@ fn report_inspect_failure(qt: &QtHandle, path: String, message: String) {
 /// The same for a failure that belongs to one workspace but is reported as a
 /// plain `operationFailed` today: both go out, so a consumer can move onto the
 /// typed one without the other changing under it.
+///
+/// One queue call, as above.
 fn report_workspace_op_failure(
     qt: &QtHandle,
     workspace: String,
