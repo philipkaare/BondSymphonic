@@ -701,7 +701,7 @@ A `CONNECT` pins its connection: once the tunnel is up, everything the client
 sends goes to the one host it was allowed. A plain-HTTP connection is not one
 decision but a sequence of them, because a keep-alive client's next request
 names its own host. So plain HTTP is served **one request at a time** — read one
-head, decide the host from the absolute-form URI or `Host`, run the same checks,
+head, decide the host from the absolute-form URI alone, run the same checks,
 open a connection to *that* host, forward the request in origin form with the
 hop-by-hop headers stripped and `Connection: close` added, relay the body by its
 `Content-Length` or chunked framing, relay the response until the upstream
@@ -709,7 +709,18 @@ closes, then go round for the next request. The added `Connection: close` is
 what delimits the response without the proxy having to parse response framing. A
 head whose body framing is ambiguous (a non-chunked transfer coding, a
 non-numeric or contradictory `Content-Length`) is answered `400` and the
-connection is closed, rather than guessed at.
+connection is closed, rather than guessed at. So is a head that carries a bare
+`LF`, a lone `CR` or a `NUL` inside a header name or value, or a header name
+that is not a token: the head is split on CRLF here, so those bytes survive
+inside a field and an origin that ends a line on a bare `LF` would read a second
+request where this proxy checked one.
+
+There is no fallback to the `Host` header: a request whose target is not an
+absolute-form `http://` URI has no host this proxy will serve and is answered
+`400`. `Host` is the field a smuggled request most easily disagrees with the URI
+about, so the authority the allowlist cleared is the authority the socket is
+opened to, and the `Host` sent upstream is rewritten from that URI rather than
+copied from the client.
 
 An exchange is answered only while there is still a response to answer with: the
 two directions are counted as they are relayed, and a `400` or a `408` is

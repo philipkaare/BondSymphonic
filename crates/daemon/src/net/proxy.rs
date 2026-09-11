@@ -11,9 +11,18 @@
 //! Two shapes of request arrive here, both of them ordinary proxy traffic:
 //! `CONNECT host:port` for TLS (everything an agent does), and an absolute-URI
 //! request (`GET http://host/path`) for plain HTTP. Either way the host is
-//! resolved from the request, checked against the workspace's live allowlist,
-//! and the request is then either carried to that one host or refused with a
-//! 403 that says which host and where to allow it.
+//! taken from the request line - the authority of the absolute-form URI, or
+//! the authority a `CONNECT` names - checked against the workspace's live
+//! allowlist, and the request is then either carried to that one host or
+//! refused with a 403 that says which host and where to allow it.
+//!
+//! There is deliberately no fallback to the `Host` header. An origin-form
+//! request (`GET /path`) has no URI authority, so it is a 400 rather than a
+//! request routed by a header: `Host` is the one field a smuggled or confused
+//! request can most easily disagree with the URI about, and the authority the
+//! allowlist cleared must be the authority the socket was opened to. For the
+//! same reason the `Host` sent upstream is rewritten from the URI rather than
+//! copied from the client.
 //!
 //! A `CONNECT` pins its connection: once the tunnel is up, everything the
 //! client sends goes to the one host it was allowed. A plain-HTTP connection
