@@ -40,11 +40,11 @@ QColor statusColour(int status, bool dark) {
         return QColor(0x2f, 0x80, 0xed); // working
     case 2:
         return QColor(0xf2, 0xa9, 0x00); // waiting for permission
-    case 3:
+    case GroupBar::kStatusError:
         // The IDE's one red. `theme` has no "error" of its own; a line that is
         // gone and an agent that failed are the same judgement, so the accent
         // is read from there rather than written out again here.
-        return theme::ink(theme::removed(), dark); // error
+        return theme::ink(theme::removed(), dark);
     case 4:
         return QColor(0x27, 0xae, 0x60); // done
     case 5:
@@ -232,6 +232,9 @@ void GroupBar::rebuild() {
         m_agentTabs->addTab(QString());
     }
     const QJsonArray tabsJson = displayedTabsJson();
+    // Once for the whole row: the palette does not change between two tabs of
+    // the same rebuild, and `isDark` reads and compares colours.
+    const bool dark = theme::isDark(palette());
     for (int i = 0; i < tabs; ++i) {
         const QJsonObject tabJson = i < tabsJson.size() ? tabsJson.at(i).toObject() : QJsonObject();
         const QString name = tabJson.value(QStringLiteral("name")).toString();
@@ -251,8 +254,8 @@ void GroupBar::rebuild() {
         }
         m_agentTabs->setTabText(i, label);
         m_agentTabs->setTabToolTip(i, m_model->tabTooltip(m_displayGroup, i));
-        m_agentTabs->setTabTextColor(
-            i, statusColour(m_model->tabStatus(m_displayGroup, i), theme::isDark(palette())));
+        m_agentTabs->setTabTextColor(i,
+                                     statusColour(m_model->tabStatus(m_displayGroup, i), dark));
     }
     // An empty group is a strip with nothing on it; the label says which of the
     // two it is, where the tabs would have been.
@@ -347,6 +350,13 @@ void GroupBar::openGroupMenu(int index, const QPoint& globalPos) {
         // sits at the old index now is the same bug one layer down.
         const int target = groupIndexOf(groupName);
         if (target < 0) {
+            // Closed, or renamed by something else, while the input dialog was
+            // up. Told rather than dropped, for the same reason as the refusal
+            // below: the user typed a new name and pressed OK, and a menu item
+            // that silently does nothing reads as a bug in the IDE.
+            QMessageBox::information(this, QStringLiteral("Rename group"),
+                                     QStringLiteral("There is no longer a group called \"%1\".")
+                                         .arg(groupName));
             return;
         }
         if (!m_model->renameGroup(target, name.trimmed())) {

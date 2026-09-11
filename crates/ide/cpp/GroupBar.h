@@ -21,6 +21,12 @@ class QToolButton;
 class GroupBar : public QWidget {
     Q_OBJECT
 public:
+    /// `GroupModel::tabStatus`'s code for an agent or workspace in error: the
+    /// one status this bar paints in the theme's red. Named here because the
+    /// window's seam has to find a tab in error too, and the two files spelling
+    /// the number separately is how they come to disagree.
+    static constexpr int kStatusError = 3;
+
     explicit GroupBar(GroupModel* model, QWidget* parent = nullptr);
 
     /// Name of the group whose tabs are currently shown, or empty when there is
