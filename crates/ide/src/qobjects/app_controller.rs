@@ -2281,8 +2281,16 @@ impl qobject::AppController {
         let options = start_options(&options_json.to_string());
         let shared = match require_connection() {
             Ok(shared) => shared,
+            // Named, like the in-flight failure in `start_agent_and_prompt`:
+            // the pane that is showing "starting the agent" is this
+            // workspace's, and it is the one that has to stop saying so.
             Err(message) => {
-                report_failure(&qt, "agent.start", message.to_owned());
+                report_workspace_op_failure(
+                    &qt,
+                    workspace.to_string(),
+                    "agent.start",
+                    message.to_owned(),
+                );
                 return;
             }
         };
@@ -2489,8 +2497,13 @@ impl qobject::AppController {
         let qt = self.qt_thread();
         let shared = match require_connection() {
             Ok(shared) => shared,
+            // The commonest way a prerequisite check fails, and the reason the
+            // typed signal exists: closing Settings re-checks on the way out,
+            // and during a reconnect there is no daemon to answer. It must
+            // reach the window as a prerequisite failure rather than as an
+            // unrecognised operation, which is what a modal box is put over.
             Err(message) => {
-                report_failure(&qt, "system.check_prereqs", message.to_owned());
+                report_prereqs_failure(&qt, message.to_owned());
                 return;
             }
         };
