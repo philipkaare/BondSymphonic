@@ -6,6 +6,7 @@
 //! one cannot make that assumption and does not; see [`super::unix`].
 
 use super::*;
+use crate::util::fs_retry::is_sharing_violation;
 
 /// Lists the directory at `rel`, directories first, then case-insensitive by
 /// name. Skips `.git`. `status` is always `Unchanged` at this milestone.
@@ -84,11 +85,18 @@ pub(super) fn write_file(root: &Path, rel: &str, content: &str) -> Result<Empty,
 }
 
 /// Renames `from` to `to`, retrying briefly when the destination is
-/// transiently locked (a sharing or lock violation, or the `PermissionDenied` that
-/// wraps them) by another process or thread's own open handle on the same path -
-/// most often another writer's concurrent temp-file rename to this same destination.
-/// Up to 20 attempts, 5 ms apart, so a brief hold clears without surfacing an error to
-/// the caller; any other error, or persistence past 20 attempts, is returned as-is.
+/// transiently locked by another process or thread's own open handle on the
+/// same path - most often another writer's concurrent temp-file rename to this
+/// same destination. Any other error, or persistence past the budget, is
+/// returned as-is.
+///
+/// What counts as "somebody still has it open" is
+/// [`crate::util::fs_retry::is_sharing_violation`], shared with the worktree
+/// removal that waits for the same Windows behaviour. The budget is not
+/// shared, and deliberately: 20 attempts 5 ms apart, because what this waits
+/// for is another writer's rename onto this name, which is over in well under
+/// a millisecond. The removal waits for the kernel to reap a killed process's
+/// handles, which is slower and gets a second; `fs_retry` says why.
 fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut attempts = 0;
     loop {
@@ -101,9 +109,4 @@ fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
     }
-}
-
-fn is_sharing_violation(e: &std::io::Error) -> bool {
-    matches!(e.kind(), std::io::ErrorKind::PermissionDenied)
-        || matches!(e.raw_os_error(), Some(32) | Some(33) | Some(5))
 }
