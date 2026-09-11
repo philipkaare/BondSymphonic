@@ -19,6 +19,7 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QVariant>
 
@@ -44,6 +45,14 @@ constexpr char16_t kEllipsis = 0x2026;
 
 /// How much smaller than the pane's font the result and system lines are.
 constexpr qreal kSmallTextScale = 0.85;
+
+/// How long changed frames are collected before they are repainted.
+///
+/// Long enough that a fast stream costs twenty repaints a second rather than
+/// one per delta, short enough that the answer still appears to arrive as it is
+/// written. It bounds the lag of every in-place update, not just a streamed
+/// one, which is why it is a fraction of a reading pause and not a second.
+constexpr int kCoalesceMs = 50;
 
 /// The daemon's state words this view reacts to. Anything else is a state it
 /// has nothing to say about, which is the right answer for a word added later.
@@ -103,6 +112,17 @@ QString bodyText(const QJsonObject& item) {
         return resultLine(item);
     }
     return item.value(QStringLiteral("text")).toString();
+}
+
+/// How an assistant answer's label is painted: as Markdown once the answer is
+/// finished, as plain text while it is still arriving.
+///
+/// Qt reparses the whole Markdown document and relays the label out on every
+/// `setText`, so rendering a half-written answer costs that for each delta and
+/// throws the result away a few milliseconds later. Plain text says the same
+/// words; the formatting lands with the last one.
+Qt::TextFormat assistantFormat(const QJsonObject& item) {
+    return item.value(QStringLiteral("streaming")).toBool() ? Qt::PlainText : Qt::MarkdownText;
 }
 
 } // namespace
@@ -193,6 +213,11 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     QObject::connect(loginButton, &QPushButton::clicked, this,
                      [this] { emit loginRequested(); });
 
+    m_coalesce = new QTimer(this);
+    m_coalesce->setSingleShot(true);
+    m_coalesce->setInterval(kCoalesceMs);
+    QObject::connect(m_coalesce, &QTimer::timeout, this, &TranscriptView::flushChangedItems);
+
     // Applied on the range change rather than on the append: the scroll bar's
     // maximum is still the old one while the new frame is being laid out.
     QObject::connect(m_scroll->verticalScrollBar(), &QScrollBar::rangeChanged, this,
@@ -274,8 +299,7 @@ void TranscriptView::rebuild() {
     if (m_model.isNull()) {
         return;
     }
-    const QJsonArray items =
-        QJsonDocument::fromJson(m_model->itemsJson().toUtf8()).array();
+    const QJsonArray items = readItems();
     for (int i = 0; i < items.size(); ++i) {
         QWidget* frame = makeFrame(items.at(i).toObject(), i);
         m_frames.append(frame);
@@ -315,9 +339,30 @@ void TranscriptView::onItemChanged(int index) {
         return;
     }
     // A growing answer at the foot should keep following; one further up must
-    // not drag the view away from what is being read.
+    // not drag the view away from what is being read. Read now rather than at
+    // the flush: this is where the scroll bar still describes what the user was
+    // looking at when the change arrived.
     m_stickToBottom = atBottom();
-    updateFrame(index, itemAt(index));
+    // Marked, not applied. Nothing is read out of the model here: a streamed
+    // answer lands as one of these per delta, and the item is only worth
+    // reading once per repaint.
+    m_changedItems.insert(index);
+    if (!m_coalesce->isActive()) {
+        m_coalesce->start();
+    }
+}
+
+void TranscriptView::flushChangedItems() {
+    if (m_changedItems.isEmpty()) {
+        return;
+    }
+    const QList<int> indices = m_changedItems.values();
+    m_changedItems.clear();
+    for (const int index : indices) {
+        if (index >= 0 && index < m_frames.size()) {
+            updateFrame(index, itemAt(index));
+        }
+    }
 }
 
 void TranscriptView::onPermissionRequested() {
@@ -381,8 +426,9 @@ void TranscriptView::onStateChanged() {
     const QString state = m_model->getState();
     const bool working = state == QString::fromUtf8(kStateWorking);
     const bool exited = state == QString::fromUtf8(kStateExited);
-    // A model that has never been attached answers `idle` and `not busy`, which
-    // would leave the box live in the seconds `agent.start` takes. `send` then
+    // A model that has never been attached answers `unavailable` and `not
+    // busy`, which is neither working nor exited: without the id below the box
+    // would stay live through the seconds `agent.start` takes. `send` then
     // drops the text, because there is no agent to send it to, and the prompt
     // the user typed while waiting disappears without a word. Waiting for the
     // id is the one condition that covers the box and both buttons.
@@ -482,8 +528,9 @@ QWidget* TranscriptView::makeFrame(const QJsonObject& item, int index) {
         label->setTextFormat(Qt::PlainText);
     } else if (kind == QStringLiteral("assistant")) {
         // The answer is Markdown, and Qt renders it: code spans, lists and
-        // emphasis are the shape the model writes in.
-        label->setTextFormat(Qt::MarkdownText);
+        // emphasis are the shape the model writes in. Not while it is still
+        // arriving, though; see `assistantFormat`.
+        label->setTextFormat(assistantFormat(item));
     } else {
         applySmallGrey(label, kind == QStringLiteral("system"));
         label->setTextFormat(Qt::PlainText);
@@ -506,6 +553,15 @@ void TranscriptView::updateFrame(int index, const QJsonObject& item) {
     } else if (frame->property(kKindProperty).toString() == kind) {
         QLabel* label = bodyLabel(frame);
         if (label != nullptr) {
+            if (kind == QStringLiteral("assistant")) {
+                // The one crossing that matters: the last delta of an answer is
+                // followed by the finished text with `streaming` false, and
+                // that is where the Markdown is rendered -- once.
+                const Qt::TextFormat format = assistantFormat(item);
+                if (label->textFormat() != format) {
+                    label->setTextFormat(format);
+                }
+            }
             label->setText(bodyText(item));
             return;
         }
@@ -530,9 +586,39 @@ void TranscriptView::clearFrames() {
         frame->deleteLater();
     }
     m_frames.clear();
+    // The indices waiting for a repaint named frames that no longer exist.
+    m_changedItems.clear();
+    m_coalesce->stop();
+}
+
+int TranscriptView::jsonReadCount() const { return m_jsonReads; }
+
+QJsonArray TranscriptView::readItems() const {
+    ++m_jsonReads;
+#if defined(BS_WIDGET_TESTS)
+    if (m_testItemsSet) {
+        return QJsonDocument::fromJson(
+                   (QStringLiteral("[") + m_testItems.join(QLatin1Char(',')) +
+                    QStringLiteral("]"))
+                       .toUtf8())
+            .array();
+    }
+#endif
+    if (m_model.isNull()) {
+        return QJsonArray();
+    }
+    return QJsonDocument::fromJson(m_model->itemsJson().toUtf8()).array();
 }
 
 QJsonObject TranscriptView::itemAt(int index) const {
+    ++m_jsonReads;
+#if defined(BS_WIDGET_TESTS)
+    if (m_testItemsSet) {
+        return index >= 0 && index < m_testItems.size()
+                   ? QJsonDocument::fromJson(m_testItems.at(index).toUtf8()).object()
+                   : QJsonObject();
+    }
+#endif
     if (m_model.isNull()) {
         return QJsonObject();
     }
@@ -544,8 +630,130 @@ QJsonObject TranscriptView::itemAt(int index) const {
     return QJsonDocument::fromJson(json.toUtf8()).object();
 }
 
+#if defined(BS_WIDGET_TESTS)
+
+void TranscriptView::setTestItems(const QStringList& items) {
+    m_testItems = items;
+    m_testItemsSet = true;
+}
+
+int TranscriptView::frameCount() const { return m_frames.size(); }
+
+QWidget* TranscriptView::frameAt(int index) const {
+    return index >= 0 && index < m_frames.size() ? m_frames.at(index) : nullptr;
+}
+
+#endif // BS_WIDGET_TESTS
+
 bool TranscriptView::atBottom() const {
     const QScrollBar* bar = m_scroll->verticalScrollBar();
     const int lineHeight = QFontMetrics(font()).lineSpacing();
     return bar->value() >= bar->maximum() - lineHeight;
 }
+
+// --- offscreen test entries --------------------------------------------------
+//
+// See the note in `EditorArea.cpp`. `bs_widget_test_begin` must have run first.
+#if defined(BS_WIDGET_TESTS)
+#include <QCoreApplication>
+#include <QLatin1Char>
+#include <QThread>
+#include <cstdint>
+
+namespace {
+
+/// One assistant item as the model serialises it, `streaming` telling the view
+/// whether more of it is still coming.
+QString assistantItem(const QString& text, bool streaming) {
+    QJsonObject item;
+    item.insert(QStringLiteral("kind"), QStringLiteral("assistant"));
+    item.insert(QStringLiteral("text"), text);
+    item.insert(QStringLiteral("streaming"), streaming);
+    return QString::fromUtf8(QJsonDocument(item).toJson(QJsonDocument::Compact));
+}
+
+/// How many deltas the check streams. A real answer of a few hundred words
+/// arrives in about this many.
+constexpr int kStreamedDeltas = 2000;
+
+/// The most reads the whole episode may cost. One for the rebuild, a handful
+/// for the repaints the timer allows, one for the finished answer -- and
+/// nowhere near one per delta, which is the thing that was wrong.
+constexpr int kReadBudget = 16;
+
+/// Lets the coalescing timer fire and the flush it schedules run.
+void settle() {
+    QThread::msleep(kCoalesceMs * 3);
+    QCoreApplication::processEvents();
+}
+
+} // namespace
+
+/// Two thousand deltas of one answer. The view used to read the item back out
+/// of the model, parse it and re-render its Markdown for every one of them,
+/// which is quadratic in the length of the answer and is what made a long reply
+/// slow down the whole window as it was written.
+extern "C" std::int32_t bs_widget_test_transcript_coalesces_a_streamed_answer() {
+    // A model with no daemon behind it: the view is driven through the same
+    // signals the model emits, and the items it reads come from the seam,
+    // because filling a real transcript needs an agent.
+    TranscriptModel model;
+    TranscriptView view(&model);
+    view.resize(480, 320);
+
+    QString text = QStringLiteral("A");
+    QStringList items;
+    items.append(assistantItem(text, true));
+    view.setTestItems(items);
+    model.resetItems();
+    if (view.frameCount() != 1) {
+        return 1;
+    }
+
+    const int before = view.jsonReadCount();
+    for (int i = 0; i < kStreamedDeltas; ++i) {
+        text += QLatin1Char('x');
+        items[0] = assistantItem(text, true);
+        view.setTestItems(items);
+        model.itemChanged(0);
+    }
+    settle();
+
+    const int reads = view.jsonReadCount() - before;
+    if (reads > kReadBudget) {
+        // The count is the report: 2000 says the view read the item for every
+        // delta, which is the defect this check is about.
+        return 100 + (reads > 1000 ? 1000 : reads);
+    }
+
+    QLabel* label = bodyLabel(view.frameAt(0));
+    if (label == nullptr) {
+        return 2;
+    }
+    // Every delta is in the text the user is left looking at: coalescing may
+    // skip repaints, never content.
+    if (label->text() != text) {
+        return 3;
+    }
+    // Still arriving, so still plain: the Markdown parse is what costs, and
+    // nothing about a half-written answer is worth paying it for.
+    if (label->textFormat() != Qt::PlainText) {
+        return 4;
+    }
+
+    // The finished answer. This is the one that renders.
+    items[0] = assistantItem(text, false);
+    view.setTestItems(items);
+    model.itemChanged(0);
+    settle();
+    label = bodyLabel(view.frameAt(0));
+    if (label == nullptr || label->text() != text) {
+        return 5;
+    }
+    if (label->textFormat() != Qt::MarkdownText) {
+        return 6;
+    }
+    return 0;
+}
+
+#endif // BS_WIDGET_TESTS

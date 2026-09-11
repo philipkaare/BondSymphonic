@@ -1,16 +1,20 @@
 #pragma once
 #include <QList>
 #include <QPointer>
+#include <QSet>
 #include <QString>
+#include <QStringList>
 #include <QWidget>
 
 class PermissionBar;
 class PromptInput;
 class TranscriptModel;
+class QJsonArray;
 class QJsonObject;
 class QLabel;
 class QPushButton;
 class QScrollArea;
+class QTimer;
 class QVBoxLayout;
 
 /// One Claude agent's conversation: the frames, the permission bar and the
@@ -26,6 +30,14 @@ class QVBoxLayout;
 /// Frames are built once and updated in place. `resetItems` is the only thing
 /// that rebuilds, which is what makes replaying a long history one layout pass
 /// rather than one per message.
+///
+/// A streaming answer is the one case where the model talks faster than a
+/// person reads: every delta is an `itemChanged` for the same item, and
+/// answering each of them with a read, a parse and a Markdown render made a
+/// long answer cost time in the square of its length. Changes are collected and
+/// applied on a short timer instead, and the growing text is painted as plain
+/// text until the item is finished -- so the Markdown is parsed once, for the
+/// answer the user is left looking at.
 class TranscriptView : public QWidget {
     Q_OBJECT
 public:
@@ -51,6 +63,22 @@ public:
     /// login exists can only waste what the user typed. The login itself
     /// happens in the setup terminal, which is a PTY and can.
     void setClaudeLoggedIn(bool loggedIn);
+
+    /// How many times the view has read transcript JSON out of the model and
+    /// parsed it, whether one item or the whole list. Test seam: what says that
+    /// a streamed answer costs a handful of reads rather than one per delta.
+    int jsonReadCount() const;
+
+#if defined(BS_WIDGET_TESTS)
+    /// Test seam: the transcript the view reads, one JSON object per item,
+    /// standing in for the model's. The offscreen checks have no daemon to fill
+    /// a `TranscriptModel`, and the streaming check needs an item that grows.
+    /// See the entries at the foot of `TranscriptView.cpp`.
+    void setTestItems(const QStringList& items);
+    /// The frames on show, for a check that reads one back.
+    int frameCount() const;
+    QWidget* frameAt(int index) const;
+#endif
 
 signals:
     /// The user pressed Start (or Restart). The area turns this into the
@@ -80,8 +108,14 @@ private:
     void updateFrame(int index, const QJsonObject& item);
     /// Drops every frame. The stretch at the foot of the column stays.
     void clearFrames();
+    /// Repaints every frame marked by [`onItemChanged`] since the last flush,
+    /// one read per frame however many deltas landed on it.
+    void flushChangedItems();
+    /// The whole transcript as an array, for a rebuild. Counted; see
+    /// [`jsonReadCount`].
+    QJsonArray readItems() const;
     /// One item as an object, or an empty object for an index the model does
-    /// not have.
+    /// not have. Counted; see [`jsonReadCount`].
     QJsonObject itemAt(int index) const;
     /// Whether the view is within one line of the foot of the scroll.
     bool atBottom() const;
@@ -118,4 +152,21 @@ private:
     bool m_stickToBottom = true;
     /// The last `errorOccurred` message, cleared when the user sends again.
     QString m_requestError;
+    /// The frames one or more `itemChanged` have landed on since the last
+    /// flush. A streamed answer puts the same index in here hundreds of times
+    /// and is read back once.
+    QSet<int> m_changedItems;
+    /// Applies [`m_changedItems`]. Single-shot, started by the first change of
+    /// a burst: an answer that streams for a minute repaints twenty times a
+    /// second instead of on every delta, and a lone change -- a tool card
+    /// folded, a result landing -- costs one interval nobody can see.
+    QTimer* m_coalesce = nullptr;
+    /// See [`jsonReadCount`]. Mutable because reading an item is const.
+    mutable int m_jsonReads = 0;
+#if defined(BS_WIDGET_TESTS)
+    /// See [`setTestItems`]. Empty, and never consulted, unless a check has
+    /// installed one.
+    QStringList m_testItems;
+    bool m_testItemsSet = false;
+#endif
 };
