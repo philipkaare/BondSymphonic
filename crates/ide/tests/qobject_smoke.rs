@@ -1440,9 +1440,16 @@ fn a_workspace_name_must_be_one_path_safe_word() {
 /// is the daemon's answer to "can Claude Code run without a login prompt", and
 /// `-p` mode cannot log in, so a composer offered with neither credential only
 /// ever produces "login is not available in this environment".
+///
+/// Driven through the two functions that actually ship, in the composition
+/// that ships. The gate is decided in two moments -- the daemon's half when a
+/// prerequisite answer is decoded, the credential store's half whenever the
+/// gate is recomposed, because a key stored between two checks has to count --
+/// so a single function taking both at once had no caller left after that
+/// split, and this test passed over code that ran nowhere.
 #[test]
 fn claude_login_is_read_off_the_claude_auth_prerequisite() {
-    use bondsymphonic_ide::qobjects::app_controller::claude_logged_in;
+    use bondsymphonic_ide::qobjects::app_controller::{claude_auth_ok, claude_gate_open};
     use bondsymphonic_proto::PrereqStatus;
 
     fn item(name: &str, ok: bool) -> PrereqStatus {
@@ -1453,38 +1460,50 @@ fn claude_login_is_read_off_the_claude_auth_prerequisite() {
             fix_hint: None,
         }
     }
+    /// The whole gate, exactly as `run_prereq_check` and
+    /// `refresh_claude_logged_in` compose it between them.
+    fn gate(items: &[PrereqStatus], api_key_set: bool) -> bool {
+        claude_gate_open(claude_auth_ok(items), api_key_set)
+    }
     const NO_KEY: bool = false;
     const KEY: bool = true;
 
-    assert!(claude_logged_in(
+    assert!(gate(
         &[item("claude", true), item("claude_auth", true)],
         NO_KEY
     ));
-    assert!(!claude_logged_in(
+    assert!(!gate(
         &[item("claude", true), item("claude_auth", false)],
         NO_KEY
     ));
     // No answer is not a yes: a daemon that never reported the item leaves the
     // gate shut rather than opening a composer that cannot send.
-    assert!(!claude_logged_in(&[item("claude", true)], NO_KEY));
-    assert!(!claude_logged_in(&[], NO_KEY));
+    assert!(!gate(&[item("claude", true)], NO_KEY));
+    assert!(!gate(&[], NO_KEY));
 
     // A stored API key is the other credential. The daemon's `claude_auth`
     // cannot see it -- it answers from `claude auth status` and the daemon's own
     // environment -- so a gate on that alone would shut a user out of every
     // composer while their agents ran perfectly on the key.
-    assert!(claude_logged_in(
+    assert!(gate(
         &[item("claude", true), item("claude_auth", false)],
         KEY
     ));
-    assert!(claude_logged_in(&[], KEY));
+    assert!(gate(&[], KEY));
     // And removing the key shuts it again when nothing else vouches for Claude.
-    assert!(!claude_logged_in(
+    assert!(!gate(
         &[item("claude", true), item("claude_auth", false)],
         NO_KEY
     ));
     // Either credential alone is enough; neither is not.
-    assert!(claude_logged_in(&[item("claude_auth", true)], KEY));
+    assert!(gate(&[item("claude_auth", true)], KEY));
+
+    // The daemon's half on its own, which is the value the controller keeps
+    // between checks: `claude`, the CLI being runnable at all, is a different
+    // prerequisite and never vouches for a login.
+    assert!(claude_auth_ok(&[item("claude_auth", true)]));
+    assert!(!claude_auth_ok(&[item("claude", true)]));
+    assert!(!claude_auth_ok(&[]));
 }
 
 /// Settings opens on Setup by itself when a blocking prerequisite fails, and
@@ -1506,8 +1525,9 @@ fn setup_opens_itself_once_per_run_of_blocking_failures() {
     // Nor does any later check, for as long as the same failure stands.
     assert!(!should_auto_open_setup(true, true));
 
-    // Nothing blocking: no dialog, and the window clears its flag on this
-    // answer, which is what re-arms the rule.
+    // Nothing blocking: no dialog, and the "already shown" half is cleared on
+    // this answer, which is what re-arms the rule. `SetupPrompt::checked` does
+    // that now; the window used to hold the flag itself.
     assert!(!should_auto_open_setup(false, true));
     assert!(!should_auto_open_setup(false, false));
 
@@ -1764,6 +1784,10 @@ mod task_15_setup_prompt {
 /// through `from_workspace_info` and apply the same `TabChoices`, which is what
 /// this pins -- and it is reachable without a Qt event loop, which the
 /// invokable is not.
+///
+/// What it pins is the pair, not the invokable: `addTab` needs a Qt event loop,
+/// so an edit that hand-rolled the seventeen fields inside it again would not
+/// be caught here. The smoke suite is what covers the invokable itself.
 mod task_15_add_tab {
     use bondsymphonic_ide::model::app_state::AgentTab;
     use bondsymphonic_ide::qobjects::group_model::TabChoices;

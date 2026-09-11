@@ -398,7 +398,7 @@ pub mod qobject {
         #[qsignal]
         fn workspace_changed(self: Pin<&mut AppController>, info_json: QString);
 
-        /// A `create_workspace` call succeeded. `group`, `adapter`, `command`,
+        /// A create succeeded. `group`, `adapter`, `command`,
         /// `options_json` and `run_config` are echoed back from the call so the
         /// UI can place the new tab without tracking the in-flight request
         /// itself. `options_json` is the agent's `AgentStartOptions` for a
@@ -1049,8 +1049,24 @@ pub fn prereqs_blocking(items: &[PrereqStatus]) -> bool {
 /// in. `claude --version` working is `claude`; this is the token behind it.
 pub const CLAUDE_AUTH_PREREQ: &str = "claude_auth";
 
-/// Whether a Claude agent can answer a prompt: the daemon's `claude_auth`
-/// prerequisite passes, **or** this IDE has an Anthropic API key stored.
+/// The daemon's half of the composer gate: whether its `claude_auth`
+/// prerequisite passed.
+///
+/// Read here, once, where the daemon's answer is decoded, and kept on the
+/// controller afterwards -- the list itself is not held in a form anything can
+/// re-examine, and re-parsing the JSON to ask again is what AL4 removed.
+///
+/// An item that is not in the list at all counts as not logged in. A daemon
+/// that never reported it has told the IDE nothing, and a shut gate with a
+/// button on it costs one click, where an open one costs a lost prompt.
+pub fn claude_auth_ok(items: &[PrereqStatus]) -> bool {
+    items
+        .iter()
+        .any(|item| item.name == CLAUDE_AUTH_PREREQ && item.ok)
+}
+
+/// Whether a Claude agent can answer a prompt: [`claude_auth_ok`], **or** this
+/// IDE has an Anthropic API key stored.
 ///
 /// The gate on the chat composer, and it takes two inputs because there are two
 /// ways to run Claude Code. An agent runs `claude -p`, which cannot log in --
@@ -1068,14 +1084,13 @@ pub const CLAUDE_AUTH_PREREQ: &str = "claude_auth";
 /// dialog whose next section tells them the key is what to use instead of a
 /// login.
 ///
-/// An item that is not in the list at all counts as not logged in. A daemon
-/// that never reported it has told the IDE nothing, and a shut gate with a
-/// button on it costs one click, where an open one costs a lost prompt.
-pub fn claude_logged_in(items: &[PrereqStatus], api_key_set: bool) -> bool {
-    api_key_set
-        || items
-            .iter()
-            .any(|item| item.name == CLAUDE_AUTH_PREREQ && item.ok)
+/// Two arguments rather than the prerequisite list, because the two halves are
+/// not decided at the same moment: the daemon's arrives with a check, and the
+/// key can be stored or removed between two of them with no daemon round trip
+/// at all. [`AppController::refresh_claude_logged_in`] is what puts them
+/// together, and it is the only caller.
+pub fn claude_gate_open(claude_auth_ok: bool, api_key_set: bool) -> bool {
+    api_key_set || claude_auth_ok
 }
 
 /// Whether a prerequisite answer should open the Settings dialog on Setup by
@@ -1246,7 +1261,7 @@ pub struct AppControllerRust {
     /// pointing at objects the discard deleted.
     busy: crate::model::app_state::BusyWorkspaces,
     /// Whether the daemon's last prerequisite check said Claude Code is logged
-    /// in. Backs the `claudeLoggedIn` property; see [`claude_logged_in`] for
+    /// in. Backs the `claudeLoggedIn` property; see [`claude_gate_open`] for
     /// what the transcript panes do with it.
     claude_logged_in: bool,
     /// The last `prereqs_checked` payload, so a setup page built later can
@@ -1256,7 +1271,7 @@ pub struct AppControllerRust {
     /// the list is parsed rather than parsed again in C++ to be counted; it is
     /// what the status bar's "Set up…" link is shown on.
     prereqs_any_failed: bool,
-    /// The daemon's half of [`claude_logged_in`], from the same answer. Kept so
+    /// The daemon's half of [`claude_gate_open`], from the same answer. Kept so
     /// a key stored or removed later recomputes the gate without re-reading
     /// the list.
     claude_auth_ok: bool,
@@ -1615,9 +1630,7 @@ async fn run_prereq_check(client: &DaemonClient, qt: &QtHandle) -> bool {
         json,
         any_failed: !failures.is_empty(),
         blocked: prereqs_blocking(&items),
-        claude_auth_ok: items
-            .iter()
-            .any(|item| item.name == CLAUDE_AUTH_PREREQ && item.ok),
+        claude_auth_ok: claude_auth_ok(&items),
     };
     let _ = qt.queue(move |mut q| {
         q.as_mut().apply_prereqs(answer);
@@ -1641,7 +1654,7 @@ struct PrereqAnswer {
     any_failed: bool,
     /// Whether any of what failed is one the IDE cannot work around.
     blocked: bool,
-    /// The daemon's half of [`claude_logged_in`]; the key half is read from the
+    /// The daemon's half of [`claude_gate_open`]; the key half is read from the
     /// credential store whenever the gate is recomposed.
     claude_auth_ok: bool,
 }
@@ -2621,11 +2634,13 @@ impl qobject::AppController {
     /// key-only user pressing "Log in to Claude Code…" after they had just
     /// supplied the credential in the section below it.
     ///
-    /// The daemon's half of [`claude_logged_in`] was decided when its answer
+    /// The daemon's half of [`claude_gate_open`] was decided when its answer
     /// was decoded, so this re-reads the credential store and not the list.
     fn refresh_claude_logged_in(mut self: Pin<&mut Self>) {
-        let logged_in =
-            self.as_ref().rust().claude_auth_ok || crate::qobjects::settings::api_key_set();
+        let logged_in = claude_gate_open(
+            self.as_ref().rust().claude_auth_ok,
+            crate::qobjects::settings::api_key_set(),
+        );
         self.as_mut().set_claude_logged_in(logged_in);
     }
 
@@ -3004,30 +3019,32 @@ impl qobject::AppController {
             "workspace.create_pr",
             workspace,
             |shared, qt, workspace| async move {
-            match shared
-                .client
-                .request::<CreatePrResult>(Request::WorkspaceCreatePr(params))
-                .await
-            {
-                Ok(result) => {
-                    tracing::info!(%workspace, url = %result.url, "workspace.create_pr answered");
-                    let _ = qt.queue(move |mut q| {
-                        q.as_mut().end_workspace_op(&workspace);
-                        q.pr_created(QString::from(&workspace), QString::from(&result.url))
-                    });
+                match shared
+                    .client
+                    .request::<CreatePrResult>(Request::WorkspaceCreatePr(params))
+                    .await
+                {
+                    Ok(result) => {
+                        let url = result.url;
+                        tracing::info!(%workspace, %url, "workspace.create_pr answered");
+                        let _ = qt.queue(move |mut q| {
+                            q.as_mut().end_workspace_op(&workspace);
+                            q.pr_created(QString::from(&workspace), QString::from(&url))
+                        });
+                    }
+                    Err(e) => {
+                        let (message, data) = failure_parts(&e);
+                        end_workspace_op_with_failure(
+                            &qt,
+                            workspace,
+                            "workspace.create_pr",
+                            message,
+                            data,
+                        );
+                    }
                 }
-                Err(e) => {
-                    let (message, data) = failure_parts(&e);
-                    end_workspace_op_with_failure(
-                        &qt,
-                        workspace,
-                        "workspace.create_pr",
-                        message,
-                        data,
-                    );
-                }
-            }
-        });
+            },
+        );
     }
 
     pub fn discard_workspace(self: Pin<&mut Self>, workspace_id: QString) {

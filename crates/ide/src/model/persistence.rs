@@ -487,9 +487,7 @@ impl StateStore {
     pub fn update<R>(&self, f: impl FnOnce(&mut StateFile) -> R) -> u64 {
         let mut inner = self.lock();
         f(&mut inner.state);
-        inner.dirty = true;
-        inner.token = inner.token.wrapping_add(1);
-        inner.token
+        Self::mark_dirty(&mut inner)
     }
 
     /// Changes the state only when `f` reports that it changed something, and
@@ -502,12 +500,19 @@ impl StateStore {
     /// the whole file per status event.
     pub fn update_changed(&self, f: impl FnOnce(&mut StateFile) -> bool) -> Option<u64> {
         let mut inner = self.lock();
-        if !f(&mut inner.state) {
-            return None;
-        }
+        f(&mut inner.state).then(|| Self::mark_dirty(&mut inner))
+    }
+
+    /// Marks the state unwritten and mints the token whose timer may write it.
+    ///
+    /// The one place either happens. They are one step, not two: a state marked
+    /// dirty under a token that was not minted with it would be written by an
+    /// earlier change's timer, which is the debounce answering for a change it
+    /// never saw.
+    fn mark_dirty(inner: &mut Inner) -> u64 {
         inner.dirty = true;
         inner.token = inner.token.wrapping_add(1);
-        Some(inner.token)
+        inner.token
     }
 
     /// Writes iff there is something to write and `token` is still the newest
