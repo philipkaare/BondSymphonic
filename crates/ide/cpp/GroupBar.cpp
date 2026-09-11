@@ -461,6 +461,7 @@ void GroupBar::armMenuTest() {
 void GroupBar::runMenuTests() {
     const QByteArray stateUtf8 = m_model->getStateJson().toUtf8();
     for (const QString& step : m_menuTestSteps) {
+        bool ran = true;
         if (step == QLatin1String("destroy")) {
             // The second tab of the group on show, with that group's tabs
             // reversed under the menu.
@@ -468,13 +469,36 @@ void GroupBar::runMenuTests() {
                 bsMenuTestStateWithTabsReversed(rustStr(stateUtf8), m_displayGroup));
             m_menuTestChoice = QStringLiteral("Destroy workspace…");
             openAgentMenu(1, QPoint());
+        } else if (step == QLatin1String("destroy-gone")) {
+            // The same tab, taken out of the model altogether under the menu:
+            // the workspace was destroyed while the question was being read.
+            // The bar still emits the id and the name it resolved before the
+            // menu, and what the window does with a workspace it can no longer
+            // find is the whole of this step.
+            m_menuTestState = menuTestFixture(
+                bsMenuTestStateWithoutTab(rustStr(stateUtf8), m_displayGroup, 1));
+            m_menuTestChoice = QStringLiteral("Destroy workspace…");
+            openAgentMenu(1, QPoint());
         } else if (step == QLatin1String("close-group")) {
             // The second group, brought to the front under the menu.
             m_menuTestState = menuTestFixture(bsMenuTestStateWithGroupsRotated(rustStr(stateUtf8)));
             m_menuTestChoice = QStringLiteral("Close group…");
             openGroupMenu(1, QPoint());
+        } else {
+            // A word for one of the seam's other reports, which are armed in
+            // the window and have nothing to do with a menu.
+            ran = false;
         }
         m_menuTestChoice.clear();
         m_menuTestState.clear();
+        if (ran) {
+            // After the menu, not inside it: the window's handler runs within
+            // `openAgentMenu`, so a step reported here has already printed
+            // whatever it was going to print -- including the nothing that
+            // `destroy-gone` expects. This is what the script's `quit` step
+            // waits for instead of a fixed delay.
+            const QByteArray name = step.toUtf8();
+            bsMenuTestReported(rustStr(name));
+        }
     }
 }

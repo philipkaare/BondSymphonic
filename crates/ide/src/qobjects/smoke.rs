@@ -83,7 +83,8 @@ use crate::client::DaemonClient;
 use crate::qobjects::app_controller::{connection_generation, shared, QtHandle};
 use bondsymphonic_proto::*;
 use cxx_qt_lib::QString;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// The comma-separated step list. Unset in every ordinary run.
@@ -689,16 +690,11 @@ async fn quit(qt: &QtHandle) -> Result<(), String> {
     // is however long the daemon takes to answer `workspace.list` -- not
     // something a fixed delay can know, and a run that ended in the middle of a
     // menu would fail on a missing line rather than on what it is checking.
-    let deadline = Instant::now() + MENU_TEST_LIMIT;
-    let wanted = menu_test_steps();
-    while menu_test_reports() < wanted && Instant::now() < deadline {
-        tokio::time::sleep(MENU_TEST_POLL).await;
-    }
-    if menu_test_reports() < wanted {
+    let wanted = menu_test_wanted();
+    if !await_menu_test_steps(&wanted, Instant::now() + MENU_TEST_LIMIT).await {
         tracing::warn!(
             target: "smoke",
-            "quitting with {}/{wanted} menu seam reports",
-            menu_test_reports()
+            "quitting with menu seam steps {wanted:?} unfinished"
         );
     }
     // The settle proper: every step's answer reaches the window through the Qt
@@ -763,31 +759,88 @@ pub fn menu_test_state_with_groups_rotated(state_json: &str) -> String {
     state.to_string()
 }
 
-/// How many seam steps have printed their report. Bumped from C++, read by
-/// `quit`.
-static MENU_TEST_REPORTS: AtomicUsize = AtomicUsize::new(0);
-
-/// Called from `MainWindow::announceMenuTest` for each menu step it answers.
-pub fn menu_test_reported() {
-    MENU_TEST_REPORTS.fetch_add(1, Ordering::Relaxed);
+/// The displayed group with one tab taken out of it, as one `GroupModel` state
+/// JSON.
+///
+/// The fixture for a menu whose workspace is destroyed while it is up -- by
+/// another IDE, or by the agent's own workspace going away. The id and the name
+/// the bar resolved before the menu are still the ones it emits; what has
+/// changed is that the window can no longer find that workspace, which is
+/// exactly the case its guard is about.
+pub fn menu_test_state_without_tab(state_json: &str, group: i32, tab: i32) -> String {
+    let Ok(mut state) = serde_json::from_str::<serde_json::Value>(state_json) else {
+        return String::new();
+    };
+    let (Ok(group), Ok(tab)) = (usize::try_from(group), usize::try_from(tab)) else {
+        return String::new();
+    };
+    let Some(tabs) = state
+        .get_mut("groups")
+        .and_then(|g| g.as_array_mut())
+        .and_then(|groups| groups.get_mut(group))
+        .and_then(|entry| entry.get_mut("tabs"))
+        .and_then(|t| t.as_array_mut())
+    else {
+        return String::new();
+    };
+    if tab >= tabs.len() {
+        return String::new();
+    }
+    tabs.remove(tab);
+    state.to_string()
 }
 
-fn menu_test_reports() -> usize {
-    MENU_TEST_REPORTS.load(Ordering::Relaxed)
+/// The menu steps `GroupBar` opens a menu for. Every other word in
+/// `BS_MENU_TEST` arms something that reports as the window is built, long
+/// before any script step runs, and waiting for those would be waiting for
+/// something that has already happened.
+const MENU_STEPS: [&str; 3] = ["destroy", "close-group", "destroy-gone"];
+
+/// The steps that have run, by name. A set rather than a count: the reports do
+/// not arrive in the order the steps were asked for, a step can only run once,
+/// and counting anything that was not one of the steps asked for is how the
+/// wait came to be satisfied by a signal that had nothing to do with a menu.
+static MENU_TEST_RAN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Called from `GroupBar::runMenuTests` once each step it was given has run.
+///
+/// The bar rather than the window, and the step rather than the report: a step
+/// can legitimately produce no printed line -- `destroy-gone` exists to check
+/// that a destroy for a workspace that has gone says nothing at all -- and the
+/// bar is what knows the step finished either way. It calls this after the
+/// menu returns, and the window's handler runs inside that menu, so a step that
+/// has reported here has already printed whatever it was going to print.
+pub fn menu_test_reported(step: &str) {
+    if !MENU_STEPS.contains(&step) {
+        return;
+    }
+    if let Ok(mut ran) = MENU_TEST_RAN.lock() {
+        ran.insert(step.to_owned());
+    }
 }
 
-/// How many menu steps `BS_MENU_TEST` asked for, which is how many reports
-/// `quit` waits for. Only the two that open a menu count: the seam's other
-/// steps report from the window as it is built and are long past by the time
-/// any script step runs.
-fn menu_test_steps() -> usize {
+/// Whether every step in `wanted` has run.
+fn menu_test_done(wanted: &BTreeSet<String>) -> bool {
+    match MENU_TEST_RAN.lock() {
+        Ok(ran) => wanted.is_subset(&ran),
+        // A poisoned lock is a panic in another thread, which the run is going
+        // to fail on anyway; waiting for a set nobody can read would only turn
+        // that into a timeout.
+        Err(_) => true,
+    }
+}
+
+/// The menu steps `BS_MENU_TEST` asked for, which are the ones `quit` waits
+/// for.
+fn menu_test_wanted() -> BTreeSet<String> {
     let Ok(raw) = std::env::var(MENU_TEST_ENV) else {
-        return 0;
+        return BTreeSet::new();
     };
     raw.split(',')
         .map(str::trim)
-        .filter(|step| *step == "destroy" || *step == "close-group")
-        .count()
+        .filter(|step| MENU_STEPS.contains(step))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The bridge those three cross. Plain `cxx`, not `cxx-qt`: none of this is a
@@ -799,9 +852,27 @@ pub mod seam {
         fn menu_test_state_with_tabs_reversed(state_json: &str, group: i32) -> String;
         #[cxx_name = "bsMenuTestStateWithGroupsRotated"]
         fn menu_test_state_with_groups_rotated(state_json: &str) -> String;
+        #[cxx_name = "bsMenuTestStateWithoutTab"]
+        fn menu_test_state_without_tab(state_json: &str, group: i32, tab: i32) -> String;
         #[cxx_name = "bsMenuTestReported"]
-        fn menu_test_reported();
+        fn menu_test_reported(step: &str);
     }
+}
+
+/// Waits until every step in `wanted` has run, or until `deadline`. Answers
+/// whether they all did.
+///
+/// Split out of [`quit`] so a test can drive it: the defect it exists to stop
+/// is a wait that returns before the seam has run, and that is only visible in
+/// how long it takes.
+async fn await_menu_test_steps(wanted: &BTreeSet<String>, deadline: Instant) -> bool {
+    while !menu_test_done(wanted) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(MENU_TEST_POLL).await;
+    }
+    true
 }
 
 /// The workspace a step operates on, or an error naming what is missing.
@@ -852,6 +923,74 @@ mod tests {
     fn a_group_that_is_not_there_builds_no_fixture() {
         assert!(menu_test_state_with_tabs_reversed(STATE, 7).is_empty());
         assert!(menu_test_state_with_tabs_reversed("not json", 0).is_empty());
+    }
+
+    #[test]
+    fn the_gone_fixture_takes_the_clicked_tab_out_of_the_group_on_show() {
+        let moved = menu_test_state_without_tab(STATE, 0, 1);
+        assert_eq!(ids(&moved, 0), ["ws_1"]);
+        // The other group keeps its own tab: the fixture is about one index.
+        assert_eq!(ids(&moved, 1), ["ws_3"]);
+        // A tab or a group that is not there builds nothing, so the seam
+        // installs nothing rather than emptying the model.
+        assert!(menu_test_state_without_tab(STATE, 0, 9).is_empty());
+        assert!(menu_test_state_without_tab(STATE, 9, 0).is_empty());
+        assert!(menu_test_state_without_tab("not json", 0, 0).is_empty());
+    }
+
+    /// The wait `quit` makes before ending the run must be satisfied by the
+    /// steps it asked for and by nothing else.
+    ///
+    /// It was satisfied by anything: the counter was bumped by every seam
+    /// announcement, and `model-changed` fires on the first workspace the
+    /// daemon reports -- long before a menu can open, and repeatedly. Two of
+    /// those reached the count the two menu steps were supposed to, the wait
+    /// returned at once, and the run went back to resting on a fixed delay.
+    #[test]
+    fn the_quit_wait_is_satisfied_by_the_menu_steps_and_by_nothing_else() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a tokio runtime");
+        rt.block_on(async {
+            let wanted: BTreeSet<String> = ["destroy".to_owned(), "close-group".to_owned()]
+                .into_iter()
+                .collect();
+
+            // What the window announces as it is built, over and over. None of
+            // it is a menu step, and none of it may end the wait.
+            for _ in 0..8 {
+                menu_test_reported("model-changed");
+                menu_test_reported("layout-recorded");
+                menu_test_reported("widgets");
+            }
+            assert!(
+                !await_menu_test_steps(&wanted, Instant::now() + Duration::from_millis(120)).await,
+                "the wait ended on announcements that were not menu steps"
+            );
+
+            // One of the two, which is still not both.
+            menu_test_reported("destroy");
+            assert!(
+                !await_menu_test_steps(&wanted, Instant::now() + Duration::from_millis(120)).await,
+                "the wait ended with one of its two steps still to run"
+            );
+
+            // The second one, arriving late, is what releases it.
+            let started = Instant::now();
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                menu_test_reported("close-group");
+            });
+            assert!(
+                await_menu_test_steps(&wanted, Instant::now() + Duration::from_secs(5)).await,
+                "the wait timed out on a step that did run"
+            );
+            assert!(
+                started.elapsed() >= Duration::from_millis(100),
+                "the wait returned before the step it was waiting for"
+            );
+        });
     }
 
     #[test]
