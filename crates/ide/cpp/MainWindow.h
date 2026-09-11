@@ -267,7 +267,11 @@ private:
     /// `operationFailed` alongside each typed failure signal, in the same step
     /// and straight after it, for as long as both are sent; without this the
     /// catch-all would put a box over a failure that has already been reported
-    /// where it belongs. See [`takeRoutedFailure`].
+    /// where it belongs.
+    ///
+    /// Consumed by the `operationFailed` that follows it, and dropped at the
+    /// end of the turn either way, so a signal that stops being paired costs
+    /// nothing here. See [`noteFailureRouted`] and [`takeRoutedFailure`].
     QString m_routedFailure;
     bool m_routedFailureSet = false;
     QSplitter* m_centerSplitter = nullptr;

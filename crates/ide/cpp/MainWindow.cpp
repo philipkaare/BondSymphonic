@@ -1277,6 +1277,22 @@ void MainWindow::restoreEditorsFor(const QString& workspaceId) {
 void MainWindow::noteFailureRouted(const QString& message) {
     m_routedFailure = message;
     m_routedFailureSet = true;
+    // Valid for the rest of this turn of the event loop and no longer. Each
+    // emitter sends the typed signal and its `operationFailed` from inside one
+    // queued closure, so the pair is delivered before control returns to the
+    // event loop and this fires strictly after it.
+    //
+    // A record still standing when it does is one whose `operationFailed` was
+    // never sent -- which is what dropping a pairing looks like -- and leaving
+    // it would let it swallow the next unrelated failure carrying the same
+    // text. Not far-fetched: every request refused for want of a connection
+    // carries the same sentence, whatever it was asking for. This is what lets
+    // either side drop a pairing without the other having to change in the
+    // same commit.
+    QTimer::singleShot(0, this, [this] {
+        m_routedFailureSet = false;
+        m_routedFailure.clear();
+    });
 }
 
 bool MainWindow::takeRoutedFailure(const QString& message) {
@@ -1286,7 +1302,8 @@ bool MainWindow::takeRoutedFailure(const QString& message) {
     // typed signal and the `operationFailed` inside one `qt.queue` closure, so
     // the pair arrives as one step on this thread and nothing can be
     // interleaved between them. A second failure cannot reach the record
-    // before the `operationFailed` that clears it.
+    // before the `operationFailed` that clears it, and a pairing that is
+    // dropped leaves a record that expires on its own; see `noteFailureRouted`.
     const bool routed = m_routedFailureSet && m_routedFailure == message;
     m_routedFailureSet = false;
     m_routedFailure.clear();
