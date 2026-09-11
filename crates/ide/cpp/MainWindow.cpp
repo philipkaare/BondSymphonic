@@ -1289,6 +1289,17 @@ void MainWindow::noteFailureRouted(const QString& message) {
     // carries the same sentence, whatever it was asking for. This is what lets
     // either side drop a pairing without the other having to change in the
     // same commit.
+    //
+    // One window remains, and it is one iteration of the event loop wide: a
+    // zero timer is drained after the events already posted, not in strict FIFO
+    // with them, so a dropped pairing's record outlives every event queued
+    // alongside it. A second, unrelated failure carrying identical text and
+    // queued in that same iteration would still be swallowed. Bounded rather
+    // than unbounded, which is what this replaced, and not reachable today
+    // while every emitter queues the pair in one closure. Stamping the record
+    // with a monotonic turn counter and comparing it in `takeRoutedFailure`
+    // would close it exactly, and would close the mirror-image window on the
+    // Rust side too; a timer cannot.
     QTimer::singleShot(0, this, [this] {
         m_routedFailureSet = false;
         m_routedFailure.clear();
