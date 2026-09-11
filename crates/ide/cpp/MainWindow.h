@@ -102,19 +102,10 @@ private:
     void buildStatusBar();
     void connectController();
     void onConnectionStateChanged();
-    /// File > New Agent. Asks the daemon about the repository the dialog will
-    /// open on *before* opening it, so the base-branch combo is filled the
-    /// moment the dialog appears.
-    ///
-    /// The dialog used to open first and fill itself in later, which on a large
-    /// repository reached through `/mnt/c` meant a branch list that was still
-    /// empty when the user pressed Create.
+    /// File > New Agent. Opens the dialog; the dialog inspects the repository
+    /// it opens on and reports that inspection in its own status line, so the
+    /// window neither waits for the daemon nor duplicates the pipeline.
     void onNewAgent();
-    /// Builds and runs the New Agent dialog, seeded with an inspection the
-    /// window already has. `distroPath` empty means there was nothing to
-    /// inspect; otherwise exactly one of `infoJson` and `error` is set.
-    void openNewAgentDialog(const QString& initialPath, const QString& distroPath,
-                            const QString& infoJson, const QString& error);
     void onAbout();
     /// "Destroy workspace..." from the agent tab's context menu. Both strings
     /// are the bar's reading of the tab that was clicked, taken before its menu
@@ -122,7 +113,29 @@ private:
     /// asks about, so the question and the act cannot name different
     /// workspaces however much the model has moved since.
     void onDestroyRequested(const QString& workspaceId, const QString& workspaceName);
+    /// Whether `workspaceId` has an operation running, having said so if it
+    /// has. Asked twice by a destroy -- before the confirmation and after it --
+    /// because a merge can start while the question is on screen.
+    bool isWorkspaceBusyOrSaidSo(const QString& workspaceId);
+    /// A `system.check_prereqs` that did not answer. Logged, never shown.
+    void onPrereqsCheckFailed(const QString& message);
+    /// A `repo.inspect` that did not answer, naming the path. Logged: the New
+    /// Agent dialog reports its own inspections in its own status line.
+    void onRepoInspectFailed(const QString& path, const QString& message);
+    /// A failure belonging to one workspace, naming it and the daemon method.
+    void onWorkspaceOpFailed(const QString& workspaceId, const QString& op,
+                             const QString& message);
+    /// The catch-all: a failure with no family of its own.
     void onOperationFailed(const QString& op, const QString& message);
+    /// Puts `message` in front of the user, parented so a modal New Agent
+    /// dialog can still be closed. The one place a failure becomes a box.
+    void reportFailure(const QString& op, const QString& message);
+    /// Records that a typed signal has taken responsibility for `message`, so
+    /// the `operationFailed` that follows it does not report it again.
+    void noteFailureRouted(const QString& message);
+    /// Whether `message` is the failure a typed signal just took. Consumes the
+    /// record either way: it stands for exactly one `operationFailed`.
+    bool takeRoutedFailure(const QString& message);
     void onActiveTabChanged();
     /// Names the active workspace in the title bar: `<name> -- <branch> --
     /// BondSymphonic`, with em dashes, or the plain application name when no
@@ -242,19 +255,16 @@ private:
     /// The New Agent dialog while it is up, so daemon failures can be parented
     /// to it rather than to a window the modal dialog is blocking.
     QPointer<NewAgentDialog> m_newAgentDialog;
-    /// Whether the `repo.inspect` that precedes the dialog is still out. A
-    /// second New Agent while one is being prepared would start a second
-    /// inspection and open two dialogs when both answered.
-    bool m_newAgentPending = false;
     /// The Settings dialog while it is up, so a second request raises it
     /// instead of opening another one over it.
     QPointer<SettingsDialog> m_settingsDialog;
-    /// Whether Settings has already been shown during the current run of
-    /// blocking prerequisite failures. See `AppController::shouldAutoOpenSetup`:
-    /// closing the dialog re-checks, so without this a machine that is still
-    /// blocked reopens it every time it is closed. Cleared the moment nothing
-    /// blocks any more, so a later failure opens it again.
-    bool m_setupShownForBlock = false;
+    /// The failure a typed signal has just routed. `AppController` emits
+    /// `operationFailed` alongside each typed failure signal, in the same step
+    /// and straight after it, for as long as both are sent; without this the
+    /// catch-all would put a box over a failure that has already been reported
+    /// where it belongs. See [`takeRoutedFailure`].
+    QString m_routedFailure;
+    bool m_routedFailureSet = false;
     QSplitter* m_centerSplitter = nullptr;
     /// The centre pane: one tab per open file.
     EditorArea* m_editorArea = nullptr;
@@ -295,13 +305,6 @@ private:
     QLabel* m_opLabel = nullptr;
     /// The URL behind that line, so the click has something to open.
     QString m_opUrl;
-    /// What that line said before "Reading repository…" took it over: the
-    /// rendered text, its tooltip and the URL behind it. A pull request's
-    /// answer is a link the user may still want, and opening New Agent is no
-    /// reason to lose it.
-    QString m_opTextBeforeInspect;
-    QString m_opTipBeforeInspect;
-    QString m_opUrlBeforeInspect;
     /// What the sandbox label shows when no tab is selected: normally a dash,
     /// or the prerequisite warning once the controller has reported one.
     QString m_sandboxIdleText;

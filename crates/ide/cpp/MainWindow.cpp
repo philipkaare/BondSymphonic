@@ -11,6 +11,7 @@
 #include "NewAgentDialog.h"
 #include "RunPanel.h"
 #include "SettingsDialog.h"
+#include "SetupPage.h"
 #include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
@@ -64,11 +65,6 @@ QString menuTest() {
     return qEnvironmentVariable("BS_MENU_TEST");
 }
 
-/// `GroupModel::tabStatus`'s code for an agent or workspace in error, which is
-/// the one status painted in the theme's red. `GroupBar` holds the mapping; the
-/// seam only has to find a tab that has this status.
-constexpr int kTabStatusError = 3;
-
 /// How Qt's text formats are spelled in a test line. `QLabel`'s default is
 /// `AutoText`, which is what makes an unset format worth reporting at all.
 const char* textFormatWord(Qt::TextFormat format) {
@@ -83,11 +79,6 @@ const char* textFormatWord(Qt::TextFormat format) {
         return "AutoText";
     }
 }
-
-/// What the operation label says while the New Agent dialog's repository is
-/// being read. Named because it is both written and compared: the previous
-/// message is only put back if this is still what the label shows.
-const QString kReadingRepository = QStringLiteral("Reading repository…");
 
 } // namespace
 
@@ -334,7 +325,7 @@ void MainWindow::buildCentral() {
             }
             const int group = m_groupModel->activeGroupIndex();
             for (int i = 0; i < m_groupModel->tabCount(group); ++i) {
-                if (m_groupModel->tabStatus(group, i) == kTabStatusError) {
+                if (m_groupModel->tabStatus(group, i) == GroupBar::kStatusError) {
                     m_seamWidgetsReported = true;
                     reportSeamWidgets();
                     return;
@@ -392,7 +383,7 @@ void MainWindow::reportSeamWidgets() {
     QString colour = QStringLiteral("missing");
     if (tabs != nullptr) {
         for (int i = 0; i < tabs->count(); ++i) {
-            if (m_groupModel->tabStatus(group, i) == kTabStatusError) {
+            if (m_groupModel->tabStatus(group, i) == GroupBar::kStatusError) {
                 colour = tabs->tabTextColor(i).name();
                 break;
             }
@@ -442,7 +433,17 @@ void MainWindow::openSettings(bool onSetup) {
     // process exits would otherwise keep a stale `claude_auth: false` and go on
     // being offered the login button. Asking again here is what makes the
     // composer come back without an IDE restart.
-    m_controller->recheckPrereqs();
+    //
+    // Only when something was run that could have changed an answer. Every
+    // other visit -- a permission mode, an API key, a look at the rows -- left
+    // the prerequisites exactly as the last check found them, and asking anyway
+    // put a request on the wire and re-ran the whole auto-open decision on a
+    // machine that is still blocked. The page is what runs those things, so it
+    // is what is asked.
+    const SetupPage* setup = dialog.findChild<SetupPage*>();
+    if (setup != nullptr && setup->ranAction()) {
+        m_controller->recheckPrereqs();
+    }
 }
 
 void MainWindow::onPrereqsChecked(const QString& json) {
@@ -757,6 +758,20 @@ void MainWindow::connectController() {
             session->noteOutputDropped();
         }
     });
+    // The three failure families that are routed rather than shown, each on a
+    // signal of its own: which one a failure belongs to is the controller's to
+    // say, and a window that told them apart by comparing the daemon's method
+    // name was one rename away from putting a modal box over a dialog that had
+    // already reported the same failure in place.
+    QObject::connect(m_controller, &AppController::prereqsCheckFailed, this,
+                     &MainWindow::onPrereqsCheckFailed);
+    QObject::connect(m_controller, &AppController::repoInspectFailed, this,
+                     &MainWindow::onRepoInspectFailed);
+    QObject::connect(m_controller, &AppController::workspaceOpFailed, this,
+                     &MainWindow::onWorkspaceOpFailed);
+    // Connected after them: the typed signal for a failure is emitted first,
+    // and this catch-all is what the failures with no family of their own
+    // arrive on.
     QObject::connect(m_controller, &AppController::operationFailed, this, &MainWindow::onOperationFailed);
     QObject::connect(m_groupModel, &GroupModel::changed, this, &MainWindow::updateWorkspaceStatus);
     QObject::connect(m_groupModel, &GroupModel::changed, this, &MainWindow::onActiveTabChanged);
@@ -855,101 +870,21 @@ void MainWindow::onConnectionStateChanged() {
 }
 
 void MainWindow::onNewAgent() {
-    if (m_newAgentPending) {
-        // An inspection is already out for the dialog that is being prepared.
-        return;
-    }
     if (!m_newAgentDialog.isNull()) {
         m_newAgentDialog->raise();
         m_newAgentDialog->activateWindow();
         return;
     }
-    const QString initialPath = NewAgentDialog::initialRepoPath(m_controller);
-    const QString distroPath =
-        initialPath.isEmpty() ? QString() : m_controller->wslPath(initialPath);
-    if (distroPath.isEmpty()) {
-        // Nothing to ask about: a first run has no recent repository, and a
-        // path the launcher cannot translate is one the daemon could not read
-        // either. The dialog opens empty, as it always did.
-        openNewAgentDialog(initialPath, QString(), QString(), QString());
-        return;
-    }
-
-    m_newAgentPending = true;
-    QApplication::setOverrideCursor(Qt::WaitCursor);
-    // The permanent label rather than `showMessage`: a temporary status-bar
-    // message hides every widget in the row, including the sandbox label, for
-    // as long as it is up -- and on a large repository that is a while. What
-    // the label already said is put back afterwards: the last merge or pull
-    // request is often a link, and borrowing the line is not a reason to lose
-    // it.
-    m_opTextBeforeInspect = m_opLabel->text();
-    m_opTipBeforeInspect = m_opLabel->toolTip();
-    m_opUrlBeforeInspect = m_opUrl;
-    showOperationMessage(kReadingRepository, QString());
-    // One shot. The guard object owns both connections, so whichever answer
-    // arrives first takes the other one down with it and a later, unrelated
-    // `operationFailed` cannot open a second dialog.
-    auto* guard = new QObject(this);
-    QObject::connect(m_controller, &AppController::repoInspected, guard,
-                     [this, guard, initialPath, distroPath](const QString& path,
-                                                            const QString& infoJson) {
-                         if (path != distroPath) {
-                             return;
-                         }
-                         // Disconnected before the deletion, not by it: the
-                         // dialog below runs a nested event loop, and a
-                         // deferred delete is not what stops the other
-                         // connection firing inside it.
-                         guard->disconnect();
-                         guard->deleteLater();
-                         openNewAgentDialog(initialPath, distroPath, infoJson, QString());
-                     });
-    QObject::connect(m_controller, &AppController::operationFailed, guard,
-                     [this, guard, initialPath, distroPath](const QString& op,
-                                                            const QString& message) {
-                         if (op != QLatin1String("repo.inspect")) {
-                             return;
-                         }
-                         guard->disconnect();
-                         guard->deleteLater();
-                         // A failure still opens the dialog, carrying the
-                         // reason: the user came here to make a workspace, and
-                         // the path is theirs to correct.
-                         openNewAgentDialog(initialPath, distroPath, QString(), message);
-                     });
-    m_controller->inspectRepo(distroPath);
-}
-
-void MainWindow::openNewAgentDialog(const QString& initialPath, const QString& distroPath,
-                                    const QString& infoJson, const QString& error) {
-    if (m_newAgentPending) {
-        m_newAgentPending = false;
-        QApplication::restoreOverrideCursor();
-        // Only while the line is still the one this borrowed. A merge or a pull
-        // request that finished while the repository was being read has written
-        // its own answer there since, and that is newer news than what was
-        // stashed. The comparison holds because the text carries no markup, so
-        // `showOperationMessage`'s escaping left it unchanged.
-        if (m_opLabel->text() == kReadingRepository) {
-            // Put back verbatim rather than through `showOperationMessage`,
-            // which escapes what it is given: the stashed text is already the
-            // rendered HTML, and re-escaping it would show the markup.
-            m_opUrl = m_opUrlBeforeInspect;
-            m_opLabel->setText(m_opTextBeforeInspect);
-            m_opLabel->setToolTip(m_opTipBeforeInspect);
-            m_opLabel->setVisible(!m_opTextBeforeInspect.isEmpty());
-        }
-        m_opTextBeforeInspect.clear();
-        m_opTipBeforeInspect.clear();
-        m_opUrlBeforeInspect.clear();
-    }
-    NewAgentDialog dialog(m_controller, m_groupModel, initialPath, this);
+    // Opened straight away, with no inspection in front of it. The window used
+    // to ask the daemon about the repository first and open the dialog on the
+    // answer, which meant a wait cursor, a borrowed status line, a guard object
+    // and a second copy of the pipeline the dialog already has -- and, on a
+    // repository reached through `/mnt/c`, a menu item that appeared to do
+    // nothing for several seconds. The dialog inspects its own path now and
+    // says so in its own status line, with a Cancel button beside it.
+    NewAgentDialog dialog(m_controller, m_groupModel,
+                          NewAgentDialog::initialRepoPath(m_controller), this);
     dialog.setGroup(m_groupBar->currentGroupName());
-    if (!distroPath.isEmpty()) {
-        // Replayed, because the answer arrived before this dialog existed.
-        dialog.applyInspection(distroPath, infoJson, error);
-    }
     m_newAgentDialog = &dialog;
     const int result = dialog.exec();
     m_newAgentDialog = nullptr;
@@ -972,15 +907,13 @@ void MainWindow::openNewAgentDialog(const QString& initialPath, const QString& d
 }
 
 void MainWindow::onDestroyRequested(const QString& workspaceId, const QString& workspaceName) {
-    // The Changes toolbar greys its own Discard out while an operation is
-    // running; this menu is the other way to the same call, and a destroy that
-    // lands while a merge is still absorbing objects out of the workspace is
-    // what leaves the base branch pointing at commits that no longer exist.
-    if (m_controller->isWorkspaceBusy(workspaceId)) {
-        QMessageBox::information(
-            this, QStringLiteral("Destroy workspace"),
-            QStringLiteral("This workspace has a merge, pull request or discard running. "
-                           "Wait for it to finish, then try again."));
+    // Destroyed by something else while the menu was up -- another IDE, or the
+    // agent's own workspace going away. Nothing is left to ask about, and the
+    // same silence is what `onCloseGroup` answers a group that has gone with.
+    if (workspaceId.isEmpty() || m_groupModel->workspaceName(workspaceId).isEmpty()) {
+        return;
+    }
+    if (isWorkspaceBusyOrSaidSo(workspaceId)) {
         return;
     }
     // Named, not "this workspace": the menu that led here has been closed for
@@ -1005,7 +938,29 @@ void MainWindow::onDestroyRequested(const QString& workspaceId, const QString& w
     if (box.exec() != QMessageBox::Yes) {
         return;
     }
+    // Asked again, because the question was on screen for as long as it took to
+    // read it and a merge can have started in that time. This is the same
+    // defect one layer up that the Changes toolbar was fixed for: the check
+    // before a modal says nothing about the moment after it.
+    if (isWorkspaceBusyOrSaidSo(workspaceId)) {
+        return;
+    }
     m_controller->destroyWorkspace(workspaceId, force->isChecked());
+}
+
+bool MainWindow::isWorkspaceBusyOrSaidSo(const QString& workspaceId) {
+    // The Changes toolbar greys its own Discard out while an operation is
+    // running; this menu is the other way to the same call, and a destroy that
+    // lands while a merge is still absorbing objects out of the workspace is
+    // what leaves the base branch pointing at commits that no longer exist.
+    if (!m_controller->isWorkspaceBusy(workspaceId)) {
+        return false;
+    }
+    QMessageBox::information(
+        this, QStringLiteral("Destroy workspace"),
+        QStringLiteral("This workspace has a merge, pull request or discard running. "
+                       "Wait for it to finish, then try again."));
+    return true;
 }
 
 TranscriptModel* MainWindow::activeAgentModel(const QString& agentId, const char* what) {
@@ -1297,35 +1252,82 @@ void MainWindow::restoreEditorsFor(const QString& workspaceId) {
     noteEditorState();
 }
 
-void MainWindow::onOperationFailed(const QString& op, const QString& message) {
+void MainWindow::noteFailureRouted(const QString& message) {
+    m_routedFailure = message;
+    m_routedFailureSet = true;
+}
+
+bool MainWindow::takeRoutedFailure(const QString& message) {
+    const bool routed = m_routedFailureSet && m_routedFailure == message;
+    m_routedFailureSet = false;
+    m_routedFailure.clear();
+    return routed;
+}
+
+void MainWindow::onPrereqsCheckFailed(const QString& message) {
+    noteFailureRouted(message);
+    // Never a box. The commonest way to see this is closing Settings during a
+    // reconnect: the close re-checks and the daemon is not there to answer. The
+    // status bar is already saying the connection is down, and the checks are
+    // re-run on every reconnect, so there is nothing for the user to do with a
+    // modal about it.
+    qWarning("prerequisite check failed: %s", qUtf8Printable(message));
+}
+
+void MainWindow::onRepoInspectFailed(const QString& path, const QString& message) {
+    noteFailureRouted(message);
+    // The New Agent dialog asks for every inspection there is and reports the
+    // answer in its own status line, where the path that failed is the one the
+    // user can correct. A box here would say the same thing twice, the second
+    // time over a modal dialog.
+    qWarning("repository inspection failed for %s: %s", qUtf8Printable(path),
+             qUtf8Printable(message));
+}
+
+void MainWindow::onWorkspaceOpFailed(const QString& workspaceId, const QString& op,
+                                     const QString& message) {
+    noteFailureRouted(message);
     if (op == QLatin1String("agent.start")) {
         // The pane must stop saying it is starting something. The signal names
-        // the operation and not the workspace, and only one start is ever in
-        // flight, so every mark comes down.
+        // the workspace, so only the pane that asked comes out of it.
+        m_agentArea->setStarting(workspaceId, false);
+    }
+    reportFailure(op, message);
+}
+
+void MainWindow::onOperationFailed(const QString& op, const QString& message) {
+    // Every typed failure signal is followed by an `operationFailed` for the
+    // same failure, emitted in the same step for as long as both are sent. The
+    // failure has already found its home by then, and a box here would be a
+    // second report of it.
+    if (takeRoutedFailure(message)) {
+        return;
+    }
+    // The two compatibility branches below are the failures `AppController`
+    // still reports on this signal alone, both on the path where the request
+    // never reaches the daemon because there is no connection. They go when
+    // those two call sites report through the typed signals as the rest do.
+    if (op == QLatin1String("agent.start")) {
+        // No workspace is named, so every mark comes down; only one start is
+        // ever in flight.
         m_agentArea->clearStarting();
     }
     if (op == QLatin1String("system.check_prereqs")) {
-        // Never a box. The commonest way to see this is closing Settings during
-        // a reconnect: `openSettings` re-checks on the way out and the daemon
-        // is not there to answer. The status bar is already saying the
-        // connection is down, and the checks are re-run on every reconnect, so
-        // there is nothing for the user to do with a modal about it.
-        qWarning("prerequisite check failed: %s", qUtf8Printable(message));
+        onPrereqsCheckFailed(message);
+        // Routed, not deferred: nothing follows this one.
+        takeRoutedFailure(message);
         return;
     }
-    if (m_newAgentPending && op == QLatin1String("repo.inspect")) {
-        // The inspection that precedes the New Agent dialog. It is about to be
-        // reported inside the dialog it opens, so a box here would say the same
-        // thing twice, the second time over a modal dialog.
-        return;
-    }
-    // The New Agent dialog reports its own inspection failures inline, and while
-    // it is up it is modal, so a box parented to this window could not be closed.
+    reportFailure(op, message);
+}
+
+void MainWindow::reportFailure(const QString& op, const QString& message) {
+    // The New Agent dialog reports its own lookups inline, and while it is up
+    // it is modal, so a box parented to this window could not be closed.
     if (!m_newAgentDialog.isNull()) {
-        // Both of the dialog's own lookups: it reports them in place, and a
-        // repository with no detectable run configuration is a normal answer
-        // rather than something to put a box over.
-        if (op == "repo.inspect" || op == "repo.detect_run_configs") {
+        if (op == QLatin1String("repo.detect_run_configs")) {
+            // A repository with no detectable run configuration is a normal
+            // answer; the dialog says so on the Run config row.
             return;
         }
         QMessageBox::warning(m_newAgentDialog, op, message);
