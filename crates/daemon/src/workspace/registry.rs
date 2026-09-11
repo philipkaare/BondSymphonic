@@ -154,11 +154,44 @@ impl Registry {
 /// the user can neither open nor destroy, with their worktrees and object
 /// directories left on disk. [`crate::util::atomic::write_atomic`] is what makes
 /// the file on disk either the previous registry or this one.
+/// The write itself is an `fsync`, and every caller is a request handler on one
+/// of the daemon's tokio workers: `workspace.create`, a state change, a
+/// destroy. A worker inside `sync_all` is a worker polling nothing at all, so on
+/// a busy disk one workspace update stalls every other connection the daemon is
+/// serving. [`without_stalling_the_runtime`] is what keeps the rest moving.
+///
+/// The registry keeps its synchronous API rather than handing the write to a
+/// queue: a caller told that a workspace was updated has to have been told so by
+/// a file that really was written, and the error has to come back to the request
+/// that caused it.
 fn save_locked(inner: &Inner) -> Result<()> {
     let data = FileFormat {
         version: FORMAT_VERSION,
         workspaces: inner.workspaces.clone(),
     };
-    crate::util::atomic::write_atomic(&inner.path, &serde_json::to_vec_pretty(&data)?)?;
+    let bytes = serde_json::to_vec_pretty(&data)?;
+    without_stalling_the_runtime(|| crate::util::atomic::write_atomic(&inner.path, &bytes))?;
     Ok(())
+}
+
+/// Runs `f` here and now, telling the runtime it is about to lose this worker.
+///
+/// `block_in_place` hands the worker's other tasks to a sibling thread for the
+/// duration, which is exactly what a synchronous `fsync` in the middle of a
+/// request wants. It is also only available on a multi-threaded runtime -- a
+/// single-threaded one has no sibling to hand them to -- and asking for it
+/// anywhere else is a panic rather than a fallback.
+///
+/// So the flavour is asked rather than assumed. The daemon builds a
+/// multi-threaded runtime and gets the hand-off; the unit tests build whatever
+/// `#[tokio::test]` gives them, and `Registry::load` runs from `main` before
+/// there is a runtime at all, and both of those simply do the write here, where
+/// there is nothing else on this thread to hold up.
+fn without_stalling_the_runtime<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(rt) if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }

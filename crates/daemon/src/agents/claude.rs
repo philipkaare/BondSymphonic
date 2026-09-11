@@ -741,7 +741,7 @@ impl AgentAdapter for ClaudeAdapter {
                             sink.message(body).await;
                         }
                         Parsed::State(state, detail) => sink.state(state, detail).await,
-                        Parsed::SessionId(id) => sink.session_id(id),
+                        Parsed::SessionId(id) => sink.session_id(id).await,
                         Parsed::Nothing => {}
                     }
                 }
@@ -760,7 +760,7 @@ impl AgentAdapter for ClaudeAdapter {
             // The process is gone whichever way the state went, so the record
             // is closed here rather than only on the `Exited` announcement: an
             // agent that died mid-turn stays in `Error` and never announces one.
-            sink.ended();
+            sink.ended().await;
             // An error result already said why the turn failed, and that is the
             // more useful of the two messages -- so it becomes the exit's
             // detail rather than replacing the exit. An agent left in `Error`

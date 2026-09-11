@@ -184,3 +184,60 @@ fn a_leftover_at_the_old_fixed_temporary_name_does_not_wedge_the_writer() {
     assert!(left.is_empty(), "a temporary was left behind: {left:?}");
     assert!(squatter.is_dir(), "and what was in the way is untouched");
 }
+
+/// The registry is written from request handlers running on the daemon's
+/// runtime, so the `fsync` is moved off the worker rather than left to stall
+/// every other connection while a busy disk finishes.
+///
+/// The mechanism for that is only available on a multi-threaded runtime, which
+/// is what the daemon builds — and asking for it anywhere else is a panic, not
+/// a fallback. The unit tests build whatever `#[tokio::test]` gives them and
+/// `Registry::load` is called from `main` before any runtime exists at all, so
+/// all three have to write the file.
+#[test]
+fn the_registry_is_written_from_either_runtime_and_from_none() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // No runtime: the daemon's own startup path.
+    let bare = dir.path().join("bare.json");
+    let reg = Registry::load(&bare).unwrap();
+    reg.insert(sample("ws_00000001", "a")).unwrap();
+    assert_eq!(Registry::load(&bare).unwrap().list().len(), 1);
+
+    for (name, rt) in [
+        (
+            "multi_thread",
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap(),
+        ),
+        (
+            "current_thread",
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        ),
+    ] {
+        let path = dir.path().join(format!("{name}.json"));
+        rt.block_on(async {
+            let reg = Registry::load(&path).unwrap();
+            reg.insert(sample("ws_00000001", "a")).unwrap();
+            reg.update(&"ws_00000001".into(), |w| {
+                w.state = WorkspaceState::Error("boom".into())
+            })
+            .unwrap();
+            reg.remove(&"ws_00000001".into()).unwrap();
+            reg.insert(sample("ws_00000002", "b")).unwrap();
+        });
+        let names: Vec<String> = Registry::load(&path)
+            .unwrap()
+            .list()
+            .into_iter()
+            .map(|w| w.name)
+            .collect();
+        assert_eq!(names, vec!["b"], "on the {name} runtime");
+    }
+}

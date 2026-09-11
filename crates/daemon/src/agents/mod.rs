@@ -240,6 +240,27 @@ impl AgentEntry {
     }
 }
 
+/// Runs one records-file write on a thread whose job is to block, and waits for
+/// it there.
+///
+/// Every mutation of the records file is a read-modify-write that ends in an
+/// `fsync` — milliseconds on a busy disk, unbounded on a failing one. The
+/// callers are the task reading an agent's stdout and the handler answering
+/// `agent.start`, both on tokio workers, and a worker inside `sync_all` is a
+/// worker polling nothing at all: one slow disk stalls every other connection
+/// the daemon is serving.
+///
+/// Awaited rather than abandoned, so the writes still happen in the order they
+/// were asked for. That ordering is load-bearing: `agent.start` records the
+/// agent before it spawns the process precisely so the first session id the
+/// reader sees has a record to land in, and a write that could overtake another
+/// would give that back.
+async fn off_the_runtime(what: &'static str, f: impl FnOnce() + Send + 'static) {
+    if let Err(e) = tokio::task::spawn_blocking(f).await {
+        warn!(error = %e, "{what} panicked");
+    }
+}
+
 /// The single path by which an adapter reports what its agent did.
 ///
 /// Numbering, timestamping, persistence and publication happen here and only
@@ -334,7 +355,7 @@ impl AgentSink {
         // Before the event: a client that reacts to `Exited` by restarting the
         // daemon must not find the record still open.
         if state == AgentState::Exited {
-            self.ended();
+            self.ended().await;
         }
         *self.entry.state.lock() = (state, detail.clone());
         // After the state itself, so anyone who sees a new epoch also sees the
@@ -355,7 +376,7 @@ impl AgentSink {
     /// Recorded as well as remembered: it is the one thing a client needs to
     /// carry a conversation across a daemon restart, by starting a new agent
     /// with `options.resume_session`.
-    pub fn session_id(&self, id: String) {
+    pub async fn session_id(&self, id: String) {
         // The CLI reports the session on every `init` line, which is once per
         // turn on a resumed conversation, and the record is a file: nothing is
         // written unless the id actually moved.
@@ -368,9 +389,14 @@ impl AgentSink {
         if !changed {
             return;
         }
-        if let Some(records) = &self.records {
-            records.update(&self.agent_id, |r| r.session_id = Some(id));
-        }
+        let Some(records) = self.records.clone() else {
+            return;
+        };
+        let agent = self.agent_id.clone();
+        off_the_runtime("recording an agent's session id", move || {
+            records.update(&agent, |r| r.session_id = Some(id))
+        })
+        .await;
     }
 
     /// The agent's process is gone: closes its transcript file and its record,
@@ -379,17 +405,21 @@ impl AgentSink {
     ///
     /// Idempotent, and it keeps the first answer: the moment the process ended
     /// is what the record wants, not the moment somebody noticed again.
-    pub fn ended(&self) {
+    pub async fn ended(&self) {
         // Ahead of the record, and ahead of the early return below: an agent
         // with no record on disk still holds a file descriptor, and a daemon
         // that runs for a week must not keep one per agent it has ever run.
         self.store.ended(&self.agent_id);
-        let Some(records) = &self.records else {
+        let Some(records) = self.records.clone() else {
             return;
         };
-        records.update(&self.agent_id, |r| {
-            r.ended_at.get_or_insert_with(now_rfc3339);
-        });
+        let agent = self.agent_id.clone();
+        off_the_runtime("closing an agent's record", move || {
+            records.update(&agent, |r| {
+                r.ended_at.get_or_insert_with(now_rfc3339);
+            })
+        })
+        .await;
     }
 
     pub fn agent_id(&self) -> &AgentId {
@@ -701,7 +731,7 @@ impl AgentManager {
         // flag, no login -- has a record for `ended()` to close, instead of
         // coming back as one the daemon claims to have lost at restart.
         let started_with = StartedWith::from_options(&p.options);
-        self.records.upsert(AgentRecord {
+        let record = AgentRecord {
             agent_id: id.clone(),
             workspace_id: ws.id.clone(),
             adapter: p.adapter,
@@ -709,12 +739,19 @@ impl AgentManager {
             options: p.options,
             started_at: now_rfc3339(),
             ended_at: None,
-        });
+        };
+        let records = self.records.clone();
+        off_the_runtime("recording a started agent", move || records.upsert(record)).await;
         // Registered only once it is really running, so a failed start leaves
         // no agent behind for the IDE to find -- and no record either, since
         // nothing ever ran under this id.
         if let Err(e) = adapter.start().await {
-            self.records.remove(&id);
+            let records = self.records.clone();
+            let gone = id.clone();
+            off_the_runtime("taking back a failed start's record", move || {
+                records.remove(&gone)
+            })
+            .await;
             return Err(e);
         }
         self.agents.lock().insert(
@@ -1089,9 +1126,9 @@ mod tests {
         // The wrong order: the agent speaks, and only then is it recorded.
         let entry = Arc::new(AgentEntry::new(ws.clone(), AgentAdapterKind::Claude));
         let s = sink(&entry);
-        s.session_id("sess-1".into());
+        s.session_id("sess-1".into()).await;
         records.upsert(blank());
-        s.session_id("sess-1".into());
+        s.session_id("sess-1".into()).await;
         assert_eq!(
             records.load()[0].session_id,
             None,
@@ -1104,12 +1141,12 @@ mod tests {
         let entry = Arc::new(AgentEntry::new(ws.clone(), AgentAdapterKind::Claude));
         let s = sink(&entry);
         records.upsert(blank());
-        s.session_id("sess-1".into());
+        s.session_id("sess-1".into()).await;
         assert_eq!(records.load()[0].session_id.as_deref(), Some("sess-1"));
-        s.session_id("sess-1".into());
+        s.session_id("sess-1".into()).await;
         assert_eq!(records.load()[0].session_id.as_deref(), Some("sess-1"));
         // And a session that really does move is followed.
-        s.session_id("sess-2".into());
+        s.session_id("sess-2".into()).await;
         assert_eq!(records.load()[0].session_id.as_deref(), Some("sess-2"));
     }
 
@@ -1152,7 +1189,7 @@ mod tests {
         let closed = records.load()[0].ended_at.clone();
         assert!(closed.is_some(), "the exit must close the record");
         // Idempotent, and it keeps the first answer.
-        sink.ended();
+        sink.ended().await;
         assert_eq!(records.load()[0].ended_at, closed);
     }
 
