@@ -314,7 +314,12 @@ fn package_manager(root: &Path) -> &'static str {
 /// writes its port down somewhere this code can read; everything else falls
 /// back to the framework default.
 fn node_port(root: &Path, script: &str) -> (u16, bool) {
-    if mentions(script, "vite") || vite_config(root).is_some() {
+    // The *script*, not the repository. A `vite.config.*` in the root used to be
+    // enough on its own, which handed Vite's port to every script a
+    // `package.json` declared: the `start` that runs `node server.js` beside a
+    // Vite front end was reported as serving on 5173, and with `port_guessed`
+    // cleared the Run panel did not even offer to correct it.
+    if invokes_vite(script) {
         return match vite_config(root).as_deref().and_then(vite_port) {
             Some(p) => (p, false),
             None => (5173, true),
@@ -327,6 +332,67 @@ fn node_port(root: &Path, script: &str) -> (u16, bool) {
         return (4200, true);
     }
     (3000, true)
+}
+
+/// Whether a `package.json` script actually runs Vite, rather than merely
+/// naming it.
+///
+/// The command is what counts: `vite` as the program being invoked, directly or
+/// through one of the package runners, in any of the commands the script
+/// chains. `echo vite`, `npm run vite-build` and `node scripts/vite-warmup.js`
+/// all contain the word and none of them starts a Vite dev server, so none of
+/// them may be handed its port.
+fn invokes_vite(script: &str) -> bool {
+    script.split(['&', '|', ';']).any(segment_runs_vite)
+}
+
+/// The runners that stand in front of the command they run, with the
+/// subcommands they take, so `npx vite` and `pnpm exec vite` are Vite while
+/// `npm run dev` is whatever `dev` turns out to be.
+const RUNNERS: [&str; 6] = ["npx", "npm", "pnpm", "yarn", "bun", "cross-env"];
+const RUNNER_SUBCOMMANDS: [&str; 3] = ["exec", "dlx", "run"];
+
+/// Whether one command out of a script -- one link of its `&&` chain -- runs
+/// Vite.
+fn segment_runs_vite(segment: &str) -> bool {
+    for word in segment.split_whitespace() {
+        // `NODE_ENV=development vite`: a shell assignment is a prefix to the
+        // command rather than the command.
+        if is_env_assignment(word) {
+            continue;
+        }
+        // A flag belongs to the runner already stepped over, as in `npx -y vite`.
+        if word.starts_with('-') {
+            continue;
+        }
+        let name = program_name(word);
+        if name == "vite" {
+            return true;
+        }
+        if RUNNERS.contains(&name) || RUNNER_SUBCOMMANDS.contains(&name) {
+            continue;
+        }
+        // Anything else is the program this command runs, and it is not Vite.
+        return false;
+    }
+    false
+}
+
+/// Whether `word` is a shell variable assignment rather than a command.
+fn is_env_assignment(word: &str) -> bool {
+    match word.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+/// The program a command word names: `node_modules/.bin/vite` is `vite`.
+fn program_name(word: &str) -> &str {
+    word.rsplit(['/', '\\']).next().unwrap_or(word)
 }
 
 /// Whether a script invokes `tool`, as a whole word.
@@ -783,6 +849,70 @@ mod tests {
         std::fs::write(dir.path().join("vite.config.js"), "export default {}").unwrap();
         let v = detect(dir.path());
         assert_eq!((v[0].port, v[0].port_guessed), (5173, true));
+    }
+
+    /// The Vite port belongs to the scripts that actually run Vite.
+    ///
+    /// A `vite.config.*` anywhere in the repo used to hand its `server.port` to
+    /// every script `package.json` declared, `port_guessed` cleared: a `start`
+    /// that runs `node server.js` was reported as serving on Vite's port, and
+    /// because the port looked read rather than guessed the Run panel did not
+    /// even offer to correct it.
+    #[test]
+    fn the_vite_port_is_only_given_to_the_scripts_that_run_vite() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("vite.config.ts"),
+            "export default { server: { port: 5173 } }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite","start":"node server.js"}}"#,
+        )
+        .unwrap();
+        let v = detect(dir.path());
+        let dev = v.iter().find(|c| c.name == "dev").expect("dev script");
+        assert_eq!(
+            (dev.port, dev.port_guessed),
+            (5173, false),
+            "the script that runs vite is served by the vite config"
+        );
+        let start = v.iter().find(|c| c.name == "start").expect("start script");
+        assert_eq!(
+            (start.port, start.port_guessed),
+            (3000, true),
+            "a plain node server is not vite, and its port is the guess it is"
+        );
+    }
+
+    /// Which spellings count as running Vite, and which only mention it.
+    #[test]
+    fn a_script_runs_vite_when_vite_is_the_command_it_invokes() {
+        for yes in [
+            "vite",
+            "vite --host",
+            "node_modules/.bin/vite",
+            "npx vite",
+            "npx -y vite --port 4000",
+            "pnpm exec vite",
+            "pnpm dlx vite",
+            "yarn vite",
+            "cross-env NODE_ENV=development vite",
+            "NODE_ENV=development vite",
+        ] {
+            assert!(invokes_vite(yes), "{yes:?} runs vite");
+        }
+        for no in [
+            "node server.js",
+            "next dev",
+            "npm run vite-build",
+            "node scripts/vite-warmup.js",
+            "echo vite",
+            "",
+        ] {
+            assert!(!invokes_vite(no), "{no:?} does not run vite");
+        }
     }
 
     /// Python projects declare dependencies in two shapes and dress the names

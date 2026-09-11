@@ -84,6 +84,39 @@ fn free_port() -> u16 {
     l.local_addr().unwrap().port()
 }
 
+/// A command whose *direct child* does not go on the first signal, so a stop
+/// really does spend its termination grace with the run still alive.
+///
+/// The direct child is the shell, and it is the shell that has to be deaf: a
+/// Python process that ignores SIGTERM behind a shell that does not is no use,
+/// because the shell dies, its exit is the run's exit, and the daemon is done
+/// with the run in milliseconds while the Python goes on holding the port. On
+/// Windows there is no signal to ignore -- the teardown kills the whole tree
+/// outright -- so a plain sleep is all there is to ask for, and the window a
+/// restart can land in is the teardown itself.
+fn deaf_command(py: &str) -> String {
+    if cfg!(windows) {
+        format!("{py} hold.py")
+    } else {
+        "trap '' TERM; echo holding; sleep 30".to_string()
+    }
+}
+
+/// A port nothing is listening on right now on IPv6 loopback, or `None` on a
+/// host where `[::1]` cannot be bound at all.
+fn free_port_v6() -> Option<u16> {
+    let l = std::net::TcpListener::bind("[::1]:0").ok()?;
+    Some(l.local_addr().ok()?.port())
+}
+
+/// The first terminal state in `events`, with its detail.
+fn terminal(events: &[Event]) -> Option<(RunState, Option<String>)> {
+    states(events)
+        .into_iter()
+        .find(|(s, _, _)| matches!(s, RunState::Stopped | RunState::Failed))
+        .map(|(s, _, detail)| (s, detail))
+}
+
 /// Writes `bondsymphonic.toml` and the helper script into `repo` and commits
 /// them, so the workspace's worktree carries both.
 fn write_repo_config(repo: &Path, toml: &str) {
@@ -813,5 +846,424 @@ async fn destroy_stops_a_ready_run_before_it_replies() {
         "the web app must be gone with the workspace"
     );
 
+    cancel.cancel();
+}
+
+/// Stopping a run that has not become ready yet is a stop, not a failure.
+///
+/// The supervisor is sitting on the run's exit while `stop` kills it, so both
+/// paths see the same death and race to announce it. The supervisor used to win
+/// that race about as often as it lost it and call a run the user had just
+/// stopped `failed`, with an exit code and the last of its output as the
+/// explanation for something that needed none.
+#[tokio::test]
+async fn stopping_a_run_that_is_still_starting_reports_it_as_stopped() {
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let port = free_port();
+    // `hold.py` binds nothing, so the run never leaves `starting` on its own and
+    // every stop below lands in exactly the window this is about.
+    write_repo_config(
+        &repo,
+        &format!("[[run]]\nname = \"held\"\ncommand = \"{py} hold.py\"\nport = {port}\n"),
+    );
+    let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(p, &token).await;
+    let ws = create_ws(&mut c, &repo, "stopwhilestarting").await;
+
+    for attempt in 1..=20 {
+        let started = start_run(&mut c, &ws.id, "held").await.unwrap();
+        c.call(Request::RunStop(RunIdParams {
+            run_id: started.run_id.clone(),
+        }))
+        .await
+        .unwrap();
+        let evs = run_events(&mut c, &started.run_id, SETTLED, |e| terminal(e).is_some()).await;
+        let (state, detail) = terminal(&evs)
+            .unwrap_or_else(|| panic!("attempt {attempt}: no terminal state: {:?}", states(&evs)));
+        assert_eq!(
+            state,
+            RunState::Stopped,
+            "attempt {attempt}: a run the user stopped is stopped, not failed: {:?}",
+            states(&evs)
+        );
+        assert_eq!(
+            detail, None,
+            "attempt {attempt}: a stop needs no explanation"
+        );
+        assert!(
+            list_runs(&mut c, &ws.id).await.is_empty(),
+            "attempt {attempt}: the stopped run must be out of the list"
+        );
+    }
+
+    cancel.cancel();
+}
+
+/// A start that arrives while the previous run of the same configuration is
+/// still being killed is refused, rather than handed the port the old process
+/// has not let go of yet.
+///
+/// `stop` takes the run out of the list before it signals anything, so for the
+/// whole termination grace the manager looked as though nothing was running.
+#[tokio::test]
+async fn a_restart_during_the_stop_grace_is_refused() {
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let port = free_port();
+    write_repo_config(
+        &repo,
+        &format!(
+            "[[run]]\nname = \"deaf\"\ncommand = \"{}\"\nport = {port}\n",
+            deaf_command(py)
+        ),
+    );
+    let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut a = Client::connect(p, &token).await;
+    let mut b = Client::connect(p, &token).await;
+    let ws = create_ws(&mut a, &repo, "restartgrace").await;
+
+    let started = start_run(&mut a, &ws.id, "deaf").await.unwrap();
+    // The command goes deaf before it prints, so its line is the proof that a
+    // stop arriving from here finds a process that will not simply go.
+    let up = run_events(&mut a, &started.run_id, SETTLED, |e| {
+        output(e).iter().any(|l| l.contains("holding"))
+    })
+    .await;
+    assert!(
+        output(&up).iter().any(|l| l.contains("holding")),
+        "the run never got going: {:?}",
+        states(&up)
+    );
+    // The stop is left in flight on its own connection: the second client asks
+    // for the same configuration while it is still running.
+    let stop = a
+        .send(Request::RunStop(RunIdParams {
+            run_id: started.run_id.clone(),
+        }))
+        .await;
+    // Taking the run out of the list is the first thing `stop` does, so once it
+    // is gone from here the stop is inside its termination grace and the racing
+    // start below is the one this test is about.
+    let deadline = Instant::now() + SETTLED;
+    while !list_runs(&mut b, &ws.id).await.is_empty() {
+        assert!(Instant::now() < deadline, "the stop never began");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let again = start_run(&mut b, &ws.id, "deaf").await.unwrap_err();
+    assert_eq!(
+        again.code,
+        ErrorCode::Conflict,
+        "a restart during the grace must be refused: {again:?}"
+    );
+    assert_eq!(
+        again
+            .data
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(|r| r.as_str()),
+        Some("run_stopping"),
+        "and say which of the two conflicts it is: {again:?}"
+    );
+
+    let mut ignored = Vec::new();
+    a.recv_response(stop, &mut ignored).await.unwrap();
+    // With the stop finished the configuration is startable again.
+    let third = start_run(&mut b, &ws.id, "deaf").await.unwrap();
+    b.call(Request::RunStop(RunIdParams {
+        run_id: third.run_id,
+    }))
+    .await
+    .unwrap();
+
+    cancel.cancel();
+}
+
+/// A service that listens on IPv6 loopback alone is ready when it answers
+/// there. Probing only `127.0.0.1` left such a run in `starting` for ever, and
+/// `localhost` resolves to `::1` first on a modern host, so the URL the daemon
+/// handed back worked in the browser while the daemon said the run was not up.
+#[tokio::test]
+async fn a_service_on_ipv6_loopback_becomes_ready() {
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let Some(port) = free_port_v6() else {
+        eprintln!("SKIP: no IPv6 loopback on this host");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    write_repo_config(
+        &repo,
+        &format!(
+            "[[run]]\nname = \"v6\"\ncommand = \"{py} -m http.server {port} --bind ::1\"\nport = {port}\n"
+        ),
+    );
+    let (p, token, _d, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(p, &token).await;
+    let ws = create_ws(&mut c, &repo, "ipv6").await;
+
+    let started = start_run(&mut c, &ws.id, "v6").await.unwrap();
+    let evs = run_events(&mut c, &started.run_id, READY, |e| {
+        has_state(e, RunState::Ready)
+    })
+    .await;
+    let became_ready = has_state(&evs, RunState::Ready);
+    let seen = states(&evs);
+
+    // Stopped before a single assertion, and no `PortGuard` here: the guard
+    // reads `netstat -p tcp`, which on Windows lists IPv4 alone, so an
+    // IPv6-only server is invisible to it. An assertion that fired first would
+    // leave that server running, its pipes open, and the test runtime waiting
+    // on the reader task holding them for ever -- a hung suite instead of a
+    // failed test. The daemon's own stop is what ends this run, on every host.
+    c.call(Request::RunStop(RunIdParams {
+        run_id: started.run_id.clone(),
+    }))
+    .await
+    .unwrap();
+    let after = run_events(&mut c, &started.run_id, SETTLED, |e| {
+        has_state(e, RunState::Stopped)
+    })
+    .await;
+    cancel.cancel();
+
+    assert!(
+        became_ready,
+        "a run reachable only on ::1 must still become ready: {seen:?}"
+    );
+    assert!(has_state(&after, RunState::Stopped), "{:?}", states(&after));
+}
+
+/// A `run.start` that is already past the workspace's readiness check when a
+/// `workspace.destroy` sweeps that workspace's runs must not leave one behind.
+///
+/// The destroy stops every run it can see and then takes the sandbox and the
+/// worktree away. A start that registers its run a moment later was never seen,
+/// so its process outlived the workspace, went on holding the port, and
+/// announced state changes for a workspace the client had already been told was
+/// gone.
+#[tokio::test]
+async fn a_start_that_races_a_destroy_leaves_no_run_behind() {
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (p, token, d, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut a = Client::connect(p, &token).await;
+    let mut b = Client::connect(p, &token).await;
+
+    // The window is however long the start spends between its readiness check
+    // and registering the run, which is a process spawn; the delays sweep the
+    // destroy across it.
+    for attempt in 0..8u64 {
+        let home = dir.path().join(format!("race{attempt}"));
+        std::fs::create_dir_all(&home).unwrap();
+        let repo = init_repo(&home);
+        let port = free_port();
+        write_repo_config(
+            &repo,
+            &format!(
+                "[[run]]\nname = \"web\"\ncommand = \"{py} -m http.server {port} --bind 127.0.0.1\"\nport = {port}\n"
+            ),
+        );
+        let ws = create_ws(&mut a, &repo, &format!("race{attempt}")).await;
+        let mut guard = PortGuard::new(port);
+
+        let start = a
+            .send(Request::RunStart(RunStartParams {
+                workspace_id: ws.id.clone(),
+                config_name: "web".into(),
+                port: None,
+            }))
+            .await;
+        tokio::time::sleep(Duration::from_millis(attempt * 5)).await;
+        b.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+            workspace_id: ws.id.clone(),
+            force: true,
+        }))
+        .await
+        .unwrap();
+        let mut events = Vec::new();
+        let started = a
+            .recv_response(start, &mut events)
+            .await
+            .map(|v| serde_json::from_value::<RunStartResult>(v).unwrap());
+
+        // Whatever the start answered, the workspace is gone and nothing of it
+        // may still be running.
+        assert!(
+            d.runs.runs_of(&ws.id).is_empty(),
+            "attempt {attempt}: a run outlived its workspace: {started:?}"
+        );
+        // A moment for anything the losing path would still have published.
+        let quiet = Instant::now() + Duration::from_millis(750);
+        let mut after: Vec<Event> = events.into_iter().map(|(_, e)| e).collect();
+        while Instant::now() < quiet {
+            let _ = a.call(Request::WorkspaceList {}).await;
+            after.extend(a.drain_events().into_iter().map(|(_, e)| e));
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if let Ok(started) = &started {
+            let failed: Vec<&Event> = after
+                .iter()
+                .filter(|e| run_of(e) == Some(&started.run_id))
+                .filter(|e| {
+                    matches!(
+                        e,
+                        Event::RunStateChanged {
+                            state: RunState::Failed,
+                            ..
+                        }
+                    )
+                })
+                .collect();
+            assert!(
+                failed.is_empty(),
+                "attempt {attempt}: a workspace that is gone must not report a failed run: {failed:?}"
+            );
+        }
+        guard.disarm();
+        assert!(
+            http_get(port).await.is_none(),
+            "attempt {attempt}: the web app must be gone with its workspace ({started:?})"
+        );
+    }
+
+    cancel.cancel();
+}
+
+/// A `run.start` that is already past the workspace's readiness check when that
+/// workspace is marked for destruction is refused, and leaves nothing behind.
+///
+/// The end-to-end race above is the bug as a user meets it; this is the same
+/// window held open on purpose. `workspace.destroy` marks the workspace
+/// `Destroying` and *then* sweeps its runs, so a start that registers its run
+/// after the sweep was never seen by it: the process outlived the workspace,
+/// went on holding the port, and announced state changes for a workspace the
+/// client had already been told was gone. Marking the state here is that first
+/// half of a destroy on its own, at a moment the start cannot have seen it.
+#[tokio::test]
+async fn a_start_whose_workspace_is_marked_for_destruction_is_refused() {
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let port = free_port();
+    write_repo_config(
+        &repo,
+        &format!(
+            "[[run]]
+name = \"web\"
+command = \"{py} -m http.server {port} --bind 127.0.0.1\"
+port = {port}
+"
+        ),
+    );
+    let (p, token, d, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(p, &token).await;
+    let ws = create_ws(&mut c, &repo, "marked").await;
+    let mut guard = PortGuard::new(port);
+
+    // The window runs from the start's own readiness check to the moment it
+    // registers its run, and how long that takes is a config read and a process
+    // spawn -- a couple of milliseconds, and a different couple on every host.
+    // The delay sweeps the mark across it: too early and the start is refused
+    // before it began, too late and it finishes first, and one workspace put
+    // back to `Ready` between attempts is all it takes to try again.
+    let mut landed_in_the_window = false;
+    for micros in (0..12_000).step_by(250) {
+        d.set_state(&ws.id, WorkspaceState::Ready).unwrap();
+        let _ = c.drain_events();
+        let start = c
+            .send(Request::RunStart(RunStartParams {
+                workspace_id: ws.id.clone(),
+                config_name: "web".into(),
+                port: None,
+            }))
+            .await;
+        tokio::time::sleep(Duration::from_micros(micros)).await;
+        d.set_state(&ws.id, WorkspaceState::Destroying).unwrap();
+
+        let mut events = Vec::new();
+        let answer = c.recv_response(start, &mut events).await;
+        let reason: Option<String> = answer.as_ref().err().and_then(|e| {
+            e.data
+                .as_ref()
+                .and_then(|v| v.get("reason"))
+                .and_then(|r| r.as_str())
+                .map(str::to_owned)
+        });
+        if let Ok(v) = answer {
+            // The whole start landed ahead of the mark, which is not this
+            // test's subject. Its run still has to go before the next attempt:
+            // a live run left behind a panicking test keeps the runtime waiting
+            // on its pipes instead of letting the test fail.
+            let started: RunStartResult = serde_json::from_value(v).unwrap();
+            c.call(Request::RunStop(RunIdParams {
+                run_id: started.run_id.clone(),
+            }))
+            .await
+            .unwrap();
+            let evs = run_events(&mut c, &started.run_id, SETTLED, |e| {
+                has_state(e, RunState::Stopped)
+            })
+            .await;
+            assert!(has_state(&evs, RunState::Stopped), "{:?}", states(&evs));
+        }
+        assert!(
+            d.runs.runs_of(&ws.id).is_empty(),
+            "a run outlived the workspace it belonged to ({micros} us)"
+        );
+        if reason.as_deref() != Some("workspace_not_ready") {
+            // Refused before it ever began, or finished before the mark.
+            continue;
+        }
+
+        // This is the one: the start was past its own check and the check after
+        // the insert caught it. Nothing of that run may be left -- and since the
+        // client was told the start did not happen, not one word may be said
+        // about a run whose id it was never given.
+        landed_in_the_window = true;
+        let mut seen: Vec<Event> = events.into_iter().map(|(_, e)| e).collect();
+        let quiet = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < quiet {
+            let _ = c.call(Request::WorkspaceList {}).await;
+            seen.extend(c.drain_events().into_iter().map(|(_, e)| e));
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let announced: Vec<&Event> = seen
+            .iter()
+            .filter(|e| matches!(e, Event::RunStateChanged { .. }))
+            .collect();
+        assert!(
+            announced.is_empty(),
+            "a start that was refused announced a run: {announced:?}"
+        );
+        assert!(
+            http_get(port).await.is_none(),
+            "the web app must not have been left running"
+        );
+        break;
+    }
+
+    guard.disarm();
+    assert!(
+        landed_in_the_window,
+        "no attempt reached the check after the insert; the sweep needs widening"
+    );
     cancel.cancel();
 }

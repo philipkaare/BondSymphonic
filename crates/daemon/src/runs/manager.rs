@@ -34,7 +34,7 @@ use bondsymphonic_proto::*;
 use futures::future::Shared;
 use futures::FutureExt;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
@@ -93,6 +93,8 @@ const BWRAP_BACKEND: &str = "linux_bwrap";
 const ENDED_MEMORY: usize = 64;
 
 type Tail = Arc<Mutex<VecDeque<String>>>;
+/// The claimed `(workspace, config)` pairs, each with its run's stopping flag.
+type Claims = Arc<Mutex<HashMap<(WorkspaceId, String), Arc<AtomicBool>>>>;
 type Runs = Arc<Mutex<HashMap<RunId, Arc<Run>>>>;
 type Ended = Arc<Mutex<VecDeque<RunId>>>;
 
@@ -128,6 +130,19 @@ struct Run {
     /// Claimed by whichever of the supervisor and `stop` gets there first, so
     /// one run publishes exactly one terminal state.
     finished: Arc<AtomicBool>,
+    /// Set the moment the run is taken out of the list to be ended, before
+    /// anything is signalled. The supervisor is sitting on the same exit as the
+    /// stop and either of them may see it first, so this is what tells whoever
+    /// announces the death that it was a stop and not a failure.
+    ///
+    /// The same flag the run's [`Claim`] carries, which is what makes a
+    /// `run.start` arriving during the termination grace a `run_stopping`
+    /// conflict rather than a second process on a port the first one still
+    /// holds.
+    stopping: Arc<AtomicBool>,
+    /// The `(workspace, config)` reservation, held from before the process is
+    /// spawned until its teardown is over. See [`release_claim`].
+    claim: Mutex<Option<Claim>>,
     /// The stdout and stderr readers, drained then abandoned by whichever path
     /// ends the run.
     readers: Mutex<Vec<JoinHandle<()>>>,
@@ -159,6 +174,14 @@ impl Plumbing {
 }
 
 impl Run {
+    /// Marks the run as on its way out. Called under no lock, immediately after
+    /// the run is taken out of [`RunManager::runs`] and before anything is
+    /// signalled, so there is no moment in which the run is neither listed nor
+    /// known to be stopping.
+    fn begin_stopping(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
     fn info(&self) -> RunInfo {
         RunInfo {
             run_id: self.id.clone(),
@@ -179,21 +202,27 @@ impl Run {
 pub struct RunManager {
     events: EventBus,
     runs: Runs,
-    /// `(workspace, config)` pairs whose run is being started right now, so two
-    /// `run.start` calls that arrive together cannot both pass the conflict
-    /// check while neither is in `runs` yet.
-    claims: Arc<Mutex<HashSet<(WorkspaceId, String)>>>,
+    /// Every `(workspace, config)` pair that is spoken for, with the flag that
+    /// says whether its run is on its way out. A pair is claimed from before its
+    /// process is spawned until after its teardown is over, which covers both
+    /// the window in which two `run.start` calls could pass the conflict check
+    /// while neither run is in `runs` yet, and the termination grace in which
+    /// the old process still holds the port.
+    claims: Claims,
     /// The last [`ENDED_MEMORY`] runs to end, so `stop` can answer a race
     /// differently from a mistake. See [`RunManager::stop`].
     ended: Ended,
     next_ordinal: AtomicU64,
 }
 
-/// Holds a `(workspace, config)` claim for as long as a start is in flight, and
-/// releases it however that start ends.
+/// Holds a `(workspace, config)` claim for as long as its run exists, and
+/// releases it however that run ends.
 struct Claim {
-    claims: Arc<Mutex<HashSet<(WorkspaceId, String)>>>,
+    claims: Claims,
     key: (WorkspaceId, String),
+    /// Shared with the run, which sets it when it starts stopping. Read by
+    /// [`RunManager::claim`] to tell the two conflicts apart.
+    stopping: Arc<AtomicBool>,
 }
 
 impl Drop for Claim {
@@ -207,7 +236,7 @@ impl RunManager {
         Self {
             events,
             runs: Arc::new(Mutex::new(HashMap::new())),
-            claims: Arc::new(Mutex::new(HashSet::new())),
+            claims: Arc::new(Mutex::new(HashMap::new())),
             ended: Arc::new(Mutex::new(VecDeque::new())),
             next_ordinal: AtomicU64::new(0),
         }
@@ -271,32 +300,18 @@ impl RunManager {
 
         // Validated before the claim and the bridge: on bwrap a rejected cwd
         // would otherwise leave a bound host port, a forwarder and a socket
-        // behind for every attempt.
-        // `Path::join` with an absolute right-hand side *replaces* the base, so
-        // a `cwd` of `/etc` in the repository's own toml would run the command
-        // there. Under bwrap the sandbox confines it; on the no-sandbox backend
-        // it is an arbitrary host path, and either way it is not what a relative
-        // working directory means.
-        let cwd_rel = std::path::Path::new(config.cwd.as_deref().unwrap_or("."));
-        // `is_relative` alone is not enough on Windows, where `/etc` has no
-        // drive prefix and so counts as relative while `join` still throws the
-        // base directory away. A `..` climbs out of the worktree by the same
-        // reasoning, so it is refused here too.
-        let escapes = cwd_rel.has_root()
-            || !cwd_rel.is_relative()
-            || cwd_rel
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir));
-        if escapes {
+        // behind for every attempt. What counts as inside the worktree, and why
+        // it is not simply "relative", is in [`cwd_is_contained`].
+        let cwd_rel = config.cwd.as_deref().unwrap_or(".");
+        if !cwd_is_contained(&ws.worktree_path, cwd_rel) {
             return Err(RpcError::invalid_params(format!(
-                "run config {}: cwd {} must be a relative path inside the worktree",
+                "run config {}: cwd {cwd_rel} must be a relative path inside the worktree",
                 config.name,
-                cwd_rel.display()
             )));
         }
         let cwd = ws.worktree_path.join(cwd_rel);
 
-        let _claim = self.claim(&ws.id, &config.name)?;
+        let claim = self.claim(&ws.id, &config.name)?;
         let handle = d.sandbox(&ws.id)?;
 
         // Minted before the bridge rather than after the spawn, because the
@@ -374,6 +389,8 @@ impl RunManager {
             exit,
             tail: tail.clone(),
             finished: Arc::new(AtomicBool::new(false)),
+            stopping: claim.stopping.clone(),
+            claim: Mutex::new(Some(claim)),
             readers: Mutex::new(Vec::new()),
             supervisor: Mutex::new(None),
             plumbing: Mutex::new(Some(plumbing)),
@@ -402,6 +419,29 @@ impl RunManager {
         // Registered before the first event, so a client that reacts to
         // `starting` by calling `run.list` always finds the run there.
         self.runs.lock().insert(id.clone(), run.clone());
+
+        // The workspace was read at the top of this call and everything since
+        // has been a spawn: a `workspace.destroy` that began in the meantime has
+        // already swept the runs it could see, and this one was not among them
+        // because it was not in `runs` yet. Reading the state again *after* the
+        // insert closes that window from this side, and the two orderings cover
+        // each other -- either the sweep finds the run in the list, or this
+        // finds the workspace no longer `Ready`.
+        if !still_ready(d, &p.workspace_id) {
+            // `finished` first: nothing has been announced for this run, and so
+            // nothing may be, by this teardown or by a destroy sweeping the same
+            // run at the same time. The caller is told the start did not happen,
+            // which is the whole of the story.
+            run.finished.store(true, Ordering::SeqCst);
+            self.runs.lock().remove(&id);
+            stop_run(&run, &self.events).await;
+            return Err(RpcError::invalid_params(format!(
+                "workspace {} is no longer ready",
+                p.workspace_id
+            ))
+            .with_data(serde_json::json!({ "reason": "workspace_not_ready" })));
+        }
+
         publish(&self.events, &run, RunState::Starting, None, None);
 
         let supervisor = tokio::spawn(supervise(
@@ -437,6 +477,11 @@ impl RunManager {
                 Err(RpcError::not_found(format!("run {id}")))
             };
         };
+        // Out of the list and known to be stopping, with nothing in between: a
+        // `run.start` for the same configuration is answered `run_stopping`
+        // from this moment on rather than being told, for the length of the
+        // termination grace, that nothing is running.
+        run.begin_stopping();
         // Before the teardown rather than after it, so a second `run.stop` that
         // arrives during the termination grace is answered as the race it is.
         retire(&self.ended, id);
@@ -478,6 +523,7 @@ impl RunManager {
             ids.into_iter().filter_map(|id| runs.remove(&id)).collect()
         };
         for run in &victims {
+            run.begin_stopping();
             retire(&self.ended, &run.id);
         }
         // Together rather than one after another: each one may wait out the
@@ -485,27 +531,34 @@ impl RunManager {
         futures::future::join_all(victims.iter().map(|run| stop_run(run, &self.events))).await;
     }
 
-    /// Reserves `(workspace, config)` for the duration of a start, refusing a
-    /// second run of the same configuration in the same workspace.
+    /// Reserves `(workspace, config)` for the life of a run, refusing a second
+    /// run of the same configuration in the same workspace.
+    ///
+    /// The reservation outlives the run's process: it is given back only once
+    /// the teardown is complete, so a Stop followed straight by a Start is
+    /// refused rather than handed a port the dying process has not let go of.
     fn claim(&self, ws: &WorkspaceId, config: &str) -> Result<Claim, RpcError> {
         let key = (ws.clone(), config.to_string());
         // One lock over both checks: a run that is already registered and one
         // that is still starting are the same conflict.
         let mut claims = self.claims.lock();
+        if let Some(held) = claims.get(&key) {
+            return Err(conflict(ws, config, held.load(Ordering::SeqCst)));
+        }
         let running = self
             .runs
             .lock()
             .values()
             .any(|r| r.workspace_id == *ws && r.config_name == config);
-        if running || !claims.insert(key.clone()) {
-            return Err(RpcError::new(
-                ErrorCode::Conflict,
-                format!("run config {config} is already running in workspace {ws}"),
-            ));
+        if running {
+            return Err(conflict(ws, config, false));
         }
+        let stopping = Arc::new(AtomicBool::new(false));
+        claims.insert(key.clone(), stopping.clone());
         Ok(Claim {
             claims: self.claims.clone(),
             key,
+            stopping,
         })
     }
 
@@ -546,6 +599,52 @@ impl RunManager {
             }
         })
     }
+}
+
+/// Whether a configured `cwd` names a directory inside the worktree.
+///
+/// `Path::join` with an absolute right-hand side *replaces* the base, so a `cwd`
+/// of `/etc` in a repository's own toml would run the command there. Under
+/// bubblewrap the sandbox confines it; on the no-sandbox backend it is an
+/// arbitrary host path, and either way it is not what a relative working
+/// directory means.
+fn cwd_is_contained(base: &std::path::Path, cwd: &str) -> bool {
+    // Read as text before the host's own parser sees it. `bondsymphonic.toml`
+    // is written on the machine the IDE runs on and read by the daemon in the
+    // distro, so a Windows path has to be refused by a Linux daemon too, where
+    // `C:secret` is an ordinary directory name and `Path` finds nothing wrong
+    // with it at all.
+    //
+    // `C:secret` is the spelling this is really about. It is Windows'
+    // *drive-relative* form: no root, so it counts as relative, and `join`
+    // still throws the base away and leaves the command wherever that drive's
+    // current directory happens to point. `C:\x` and a UNC `\\server\share`
+    // are the same hole in another dress.
+    if cwd.starts_with('/') || cwd.starts_with('\\') {
+        return false;
+    }
+    let bytes = cwd.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return false;
+    }
+    if cwd.split(['/', '\\']).any(|part| part == "..") {
+        return false;
+    }
+    // Then the host's own reading, for the spellings the text above does not
+    // name: a prefix or a root by any other syntax, and a `..` the split missed.
+    if std::path::Path::new(cwd).components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::ParentDir
+        )
+    }) {
+        return false;
+    }
+    // And last the arithmetic itself: whatever it looked like, a `join` that
+    // does not land under the worktree is not a relative working directory.
+    base.join(cwd).starts_with(base)
 }
 
 /// Moves a run's state and announces it. The run's own record is updated first,
@@ -612,8 +711,9 @@ async fn supervise(
         }
     }
     // A probe that came good while `stop` was tearing the run down must not
-    // announce a URL for a run that has already stopped.
-    if run.finished.load(Ordering::SeqCst) {
+    // announce a URL for a run that is on its way out, whether the teardown has
+    // reached its terminal state yet or is still in the termination grace.
+    if run.finished.load(Ordering::SeqCst) || run.stopping.load(Ordering::SeqCst) {
         return;
     }
     publish(&events, &run, RunState::Ready, Some(run.url.clone()), None);
@@ -649,7 +749,18 @@ async fn finish(
     runs.lock().remove(&run.id);
     retire(ended, &run.id);
     teardown_run(run);
-    publish(events, run, state, None, Some(exit_detail(code, &run.tail)));
+    // A run that was being stopped did not fail, however it died: the
+    // supervisor is watching the very exit the stop asked for, and it wins this
+    // race about as often as it loses it. Nor does a stop need an explanation --
+    // the exit status of a process that was signalled says nothing useful, and
+    // the last lines of its output explain something the user already did.
+    let (state, detail) = if run.stopping.load(Ordering::SeqCst) {
+        (RunState::Stopped, None)
+    } else {
+        (state, Some(exit_detail(code, &run.tail)))
+    };
+    publish(events, run, state, None, detail);
+    release_claim(run);
 }
 
 /// Lets the reader tasks finish, then abandons whichever did not.
@@ -684,6 +795,11 @@ fn teardown(plumbing: Plumbing) {
 /// Ends one run's process and its plumbing, and announces `stopped` unless the
 /// supervisor got there first.
 async fn stop_run(run: &Arc<Run>, events: &EventBus) {
+    // Before anything is killed. The supervisor is sitting on the same exit and
+    // may see it first; this is what tells it that the death it is watching was
+    // asked for. Its callers set it as the run leaves the list, and setting it
+    // again here is what makes the guarantee this function's own.
+    run.begin_stopping();
     // Before the signal, while the shell is still there to be walked: on
     // Windows the tree is what has to go, and the signal would take the shell
     // out from under it. A no-op everywhere else.
@@ -709,6 +825,48 @@ async fn stop_run(run: &Arc<Run>, events: &EventBus) {
         // status of a process that was signalled says nothing useful.
         publish(events, run, RunState::Stopped, None, None);
     }
+    // Last of all. Between the run leaving the list and this line the old
+    // process is still dying and still holds its port, and a `run.start` for the
+    // same configuration in that window is told `run_stopping` rather than being
+    // handed a port it cannot bind.
+    release_claim(run);
+}
+
+/// Gives a run's `(workspace, config)` back, so it can be started again. Called
+/// once the process is gone and its plumbing with it, by whichever of the two
+/// teardown paths got there; the second call has nothing left to give back.
+fn release_claim(run: &Run) {
+    let claim = run.claim.lock().take();
+    // Outside the lock above: dropping a claim takes the manager's `claims`,
+    // and the two must never be held at once.
+    drop(claim);
+}
+
+/// The answer to a `run.start` for a `(workspace, config)` that is spoken for,
+/// with `data.reason` saying which of the two ways it is taken -- a run that is
+/// up, or one that is still going down and has not let its port go.
+fn conflict(ws: &WorkspaceId, config: &str, stopping: bool) -> RpcError {
+    let (reason, message) = if stopping {
+        (
+            "run_stopping",
+            format!("run config {config} in workspace {ws} is still stopping"),
+        )
+    } else {
+        (
+            "run_running",
+            format!("run config {config} is already running in workspace {ws}"),
+        )
+    };
+    RpcError::new(ErrorCode::Conflict, message).with_data(serde_json::json!({ "reason": reason }))
+}
+
+/// Whether `ws` is still a workspace a run may be started in.
+///
+/// Read fresh out of the registry rather than from the [`Workspace`] a handler
+/// is holding: between that read and here a `workspace.destroy` may have marked
+/// it `Destroying`, or finished and taken it away altogether.
+fn still_ready(d: &Daemon, ws: &WorkspaceId) -> bool {
+    matches!(d.workspace(ws), Ok(w) if w.state == WorkspaceState::Ready)
 }
 
 /// Ends the whole process tree on Windows, where there are no process groups.
@@ -738,25 +896,45 @@ async fn kill_tree(run: &Run) {
     let _ = run;
 }
 
+/// Whether something accepts a connection at `addr` right now. Connected and
+/// dropped with nothing sent, so probing a server that logs its requests does
+/// not fill the run's output with them.
+async fn accepts(addr: (&str, u16)) -> bool {
+    tokio::net::TcpStream::connect(addr).await.is_ok()
+}
+
 async fn is_ready(run: &Arc<Run>, readiness: &ReadinessSource) -> bool {
     match readiness {
         ReadinessSource::Regex(hit) => hit.load(Ordering::SeqCst),
         ReadinessSource::Port => {
             // No sandbox between here and the process: the port it bound is the
-            // host's. Connect and close, with nothing sent, so probing a server
-            // that logs its requests does not fill the run's output with them.
+            // host's.
+            //
+            // Both loopbacks, and either one is enough. A server that binds
+            // `localhost` binds whichever of the two its runtime resolves
+            // first, and on a modern host that is `::1`: probing `127.0.0.1`
+            // alone left such a run `starting` for ever while the URL the
+            // daemon handed back worked perfectly well in a browser.
+            //
+            // Asked at the same time rather than one after the other. Windows
+            // does not refuse a connection to the loopback that is *not*
+            // listening; it sits on it for about two seconds, which is five
+            // times this whole probe's budget, so a sequential pair would time
+            // out before it ever reached the address the server is on.
             //
             // This proves the port answers, not who is behind it. A run whose
             // own bind lost the port to something already listening can be seen
             // as ready for the moment before its exit is observed. The bridged
             // probe has no such hole: the socket it goes through belongs to
             // this run's forwarder alone.
-            tokio::time::timeout(
-                PROBE_BUDGET,
-                tokio::net::TcpStream::connect(("127.0.0.1", run.host_port)),
-            )
+            tokio::time::timeout(PROBE_BUDGET, async {
+                tokio::select! {
+                    true = accepts(("127.0.0.1", run.host_port)) => true,
+                    true = accepts(("::1", run.host_port)) => true,
+                    else => false,
+                }
+            })
             .await
-            .map(|r| r.is_ok())
             .unwrap_or(false)
         }
         #[cfg(unix)]
@@ -1058,6 +1236,34 @@ fn push_capped(buf: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool) {
 mod tests {
     use super::*;
 
+    /// A service that listens on one loopback is reachable there and nowhere
+    /// else, and the readiness probe has to ask both.
+    ///
+    /// `localhost` resolves to `::1` first on a modern host, so a dev server
+    /// that binds by name binds the address the old probe never asked about,
+    /// and the run sat in `starting` for ever while the URL the daemon handed
+    /// back worked in a browser.
+    #[tokio::test]
+    async fn readiness_asks_both_loopbacks() {
+        let Ok(v6) = std::net::TcpListener::bind("[::1]:0") else {
+            eprintln!("SKIP: no IPv6 loopback on this host");
+            return;
+        };
+        let port = v6.local_addr().unwrap().port();
+        assert!(accepts(("::1", port)).await, "bound on ::1, so it accepts");
+        // Slow on purpose, and the reason [`is_ready`] asks the two at once:
+        // Windows does not refuse the loopback that is not listening, it sits
+        // on the attempt for about two seconds.
+        assert!(
+            !accepts(("127.0.0.1", port)).await,
+            "and nothing is listening on the other loopback"
+        );
+
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        assert!(accepts(("127.0.0.1", port)).await, "and the same both ways");
+    }
+
     #[test]
     fn a_command_runs_through_a_shell() {
         let argv = shell_argv("npm run dev -- --port 3000");
@@ -1118,6 +1324,40 @@ mod tests {
         // The rest of that line is dropped rather than becoming one of its own.
         assert_eq!(lines.next().await.as_deref(), Some("last"));
         assert_eq!(lines.next().await, None);
+    }
+
+    /// A `cwd` has to stay inside the worktree, and not every spelling that
+    /// leaves it starts with a slash.
+    ///
+    /// `C:secret` is Windows' *drive-relative* form: `has_root` is false, so the
+    /// old guard let it through, and `Path::join` then threw the worktree away
+    /// and left the command running wherever that drive's current directory
+    /// happens to point. `D:foo/bar` and a UNC `\\server\share` are the same
+    /// hole. The same `bondsymphonic.toml` is read by a daemon on either host,
+    /// so all of them are refused on both.
+    #[test]
+    fn a_cwd_that_leaves_the_worktree_is_refused_on_every_host() {
+        let base = std::path::Path::new(if cfg!(windows) {
+            r"C:\work\ws"
+        } else {
+            "/work/ws"
+        });
+        for ok in ["sub/dir", "sub", ".", ""] {
+            assert!(cwd_is_contained(base, ok), "{ok:?} is inside the worktree");
+        }
+        for escape in [
+            "C:secret",
+            "D:foo/bar",
+            r"\\server\share",
+            "/abs",
+            "..",
+            "sub/../../up",
+        ] {
+            assert!(
+                !cwd_is_contained(base, escape),
+                "{escape:?} leaves the worktree and must be refused"
+            );
+        }
     }
 
     #[test]
