@@ -31,6 +31,8 @@ inline bool isDark(const QPalette& palette) {
 /// A line or a file that is new: green. Also the IDE's one "in place", which
 /// is the same judgement told about something that is not a line: the tick on
 /// a prerequisite the daemon found.
+///
+/// A fill, like every accent here. Drawn as text it goes through `ink` first.
 inline QColor added() {
     return QColor(0x2e, 0xa0, 0x43);
 }
@@ -40,6 +42,8 @@ inline QColor added() {
 /// failed, a prerequisite that is missing, a terminal that could not be
 /// reached. There is deliberately no separate error colour -- a second red
 /// would only be this one drifting.
+///
+/// A fill, like every accent here. Drawn as text it goes through `ink` first.
 inline QColor removed() {
     return QColor(0xd0, 0x39, 0x33);
 }

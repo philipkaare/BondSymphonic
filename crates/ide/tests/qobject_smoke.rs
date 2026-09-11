@@ -844,6 +844,7 @@ fn the_first_workspace_list_restores_the_persisted_arrangement() {
     let group = |name: &str, ids: &[&str]| PersistedGroup {
         name: name.to_owned(),
         workspace_ids: ids.iter().map(|s| (*s).to_owned()).collect(),
+        ..PersistedGroup::default()
     };
     // No path: nothing this test does can reach a file at all.
     let store = StateStore::new(None);
@@ -1391,28 +1392,46 @@ fn the_real_claude_sign_in_url_opens_the_browser() {
 }
 
 /// The rule the daemon enforces after the dialog has closed, moved to where
-/// the user is still typing. Exactly the daemon's four conditions, so the
-/// dialog can never accept a name `workspace.create` then refuses.
+/// the user is still typing -- and now literally the same rule rather than a
+/// second one that agreed with it most of the time.
+///
+/// `validateWorkspaceName` asks `bondsymphonic_proto::workspace_name::validate`,
+/// which is what `workspace.create` asks on the daemon's side too, so the
+/// dialog cannot accept a name the create then refuses. The IDE's own rule --
+/// empty, a `/`, a `..`, any whitespace -- let `fix.the.bug` through, and git
+/// refused the ref long after the dialog had closed.
 #[test]
 fn a_workspace_name_must_be_one_path_safe_word() {
-    use bondsymphonic_ide::qobjects::app_controller::validate_workspace_name;
+    use bondsymphonic_proto::workspace_name::{validate, MAX_LEN};
 
-    assert!(validate_workspace_name("agent-1").is_ok());
-    assert!(validate_workspace_name("agent_1").is_ok());
-    assert!(validate_workspace_name("fix.the.bug").is_ok());
+    assert!(validate("agent-1").is_ok());
+    assert!(validate("agent_1").is_ok());
+    assert!(validate("a").is_ok());
+    assert!(validate(&"a".repeat(MAX_LEN)).is_ok());
 
-    // Empty, whitespace anywhere, a path separator, or a parent reference.
-    assert!(validate_workspace_name("").is_err());
-    assert!(validate_workspace_name("my agent").is_err());
-    assert!(validate_workspace_name("agent\t1").is_err());
-    assert!(validate_workspace_name("feature/x").is_err());
-    assert!(validate_workspace_name("..").is_err());
-    assert!(validate_workspace_name("a..b").is_err());
+    // Empty, whitespace anywhere, a path separator, a parent reference, a dot
+    // the IDE's old rule allowed and git then choked on, a leading dash that
+    // reads as an option to everything the name is pasted into, and a name too
+    // long to be the directory it is about to become.
+    assert!(validate("").is_err());
+    assert!(validate("my agent").is_err());
+    assert!(validate("agent\t1").is_err());
+    assert!(validate("feature/x").is_err());
+    assert!(validate("..").is_err());
+    assert!(validate("a..b").is_err());
+    assert!(validate("fix.the.bug").is_err());
+    assert!(validate("-dashed").is_err());
+    assert!(validate(&"a".repeat(MAX_LEN + 1)).is_err());
 
     // One sentence, so the dialog can show it verbatim under the field.
     assert_eq!(
-        validate_workspace_name("my agent").unwrap_err(),
-        "Use a single word: letters, digits, - or _"
+        validate("my agent").unwrap_err(),
+        "use letters, digits, - or _"
+    );
+    assert_eq!(validate("").unwrap_err(), "name is empty");
+    assert_eq!(
+        validate(&"a".repeat(MAX_LEN + 1)).unwrap_err(),
+        "name is too long (64 max)"
     );
 }
 
@@ -1578,5 +1597,82 @@ mod cpp_widgets {
             failed.is_empty(),
             "offscreen widget checks failed: {failed:?}"
         );
+    }
+}
+
+/// Task 10: an `agent.state` event that arrives before the `agent.start` that
+/// named its agent.
+///
+/// The daemon answers `agent.start` on one channel and streams `agent.state`
+/// on another, so the first state can reach the IDE before the reply that says
+/// which workspace the agent belongs to. The tab does not know the agent yet,
+/// the model drops the event, and the agent then works in silence until it
+/// happens to change state again -- which, for an agent that goes straight to
+/// work and stays there, is when it finishes.
+mod task_10 {
+    use bondsymphonic_ide::model::app_state::{parse_agent_state, TabStatus, Workspaces};
+    use bondsymphonic_ide::qobjects::app_controller::RecentAgentStates;
+    use bondsymphonic_proto::{AgentId, WorkspaceState};
+
+    #[test]
+    fn an_agent_state_that_beat_the_start_reply_lands_once_the_tab_knows_the_agent() {
+        let ws = super::info("ws_1", "alpha", WorkspaceState::Ready);
+        let mut model = Workspaces::new_default();
+        model.add_tab(0, super::tab(&ws));
+        let agent = AgentId("ag_1".to_owned());
+
+        // The event arrives first. No tab is running that agent, so the model
+        // has nowhere to put it -- which is correct, and is why the controller
+        // has to keep it.
+        assert!(model
+            .set_agent_status(&agent, TabStatus::Working, "editing main.rs")
+            .is_none());
+        let mut recent = RecentAgentStates::default();
+        recent.note(agent.as_str(), "working", "editing main.rs");
+
+        // `agent.start` answers: the tab learns the agent, and the state that
+        // was held is replayed onto it.
+        assert!(model.set_agent(&ws.id, agent.clone()));
+        let (word, detail) = recent.take(agent.as_str()).expect("the state was held");
+        let state = parse_agent_state(&word).expect("a daemon state word");
+        assert!(model
+            .set_agent_status(&agent, TabStatus::from_agent_state(&state), &detail)
+            .is_some());
+
+        let tab = model.active().expect("the tab");
+        assert_eq!(tab.display_status(), TabStatus::Working);
+        assert_eq!(tab.display_status().glyph(), "\u{25cf}");
+        assert_eq!(tab.detail, "editing main.rs");
+
+        // Replayed once. A second announcement for the same agent has nothing
+        // left to apply, so nothing stale is pushed onto a tab that has moved on.
+        assert!(recent.take(agent.as_str()).is_none());
+    }
+
+    /// The buffer is fed by every `agent.state` the daemon sends, including
+    /// ones for agents this IDE never started, so it has to forget as well as
+    /// remember.
+    #[test]
+    fn the_held_agent_states_stay_bounded_and_keep_only_the_newest() {
+        let mut recent = RecentAgentStates::default();
+        for n in 0..RecentAgentStates::CAPACITY + 8 {
+            recent.note(&format!("ag_{n}"), "working", "");
+        }
+        assert!(
+            recent.take("ag_0").is_none(),
+            "the oldest agent must have been evicted"
+        );
+        let newest = format!("ag_{}", RecentAgentStates::CAPACITY + 7);
+        assert!(recent.take(&newest).is_some(), "the newest is still held");
+
+        // One entry per agent: a second state replaces the first rather than
+        // queueing behind it, so a replay applies what is true now.
+        recent.note("ag_x", "working", "");
+        recent.note("ag_x", "idle", "done");
+        assert_eq!(
+            recent.take("ag_x"),
+            Some(("idle".to_owned(), "done".to_owned()))
+        );
+        assert!(recent.take("ag_x").is_none());
     }
 }

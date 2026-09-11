@@ -9,9 +9,7 @@
 use crate::client::router::EventRouter;
 use crate::client::{ClientError, DaemonClient};
 use crate::launcher::{self, LaunchSpec};
-use crate::model::app_state::{
-    agent_state_word, compose_status, ConnectionState, Workspaces, UNSORTED_GROUP,
-};
+use crate::model::app_state::{agent_state_word, compose_status, ConnectionState, Workspaces};
 use crate::model::persistence::{self, StateFile, StateStore};
 use crate::qobjects::settings::Settings;
 use crate::qobjects::smoke;
@@ -300,11 +298,9 @@ pub fn restore_workspaces(store: &StateStore, list: &[WorkspaceInfo]) -> (Worksp
 /// see for itself, so groups survive a restart even before the C++ side wires
 /// that signal up.
 fn note_workspace_created(group: &str, workspace: &str, repo_path: &str) {
-    let group = if group.is_empty() {
-        UNSORTED_GROUP
-    } else {
-        group
-    };
+    // The same rule `GroupModel::addTab` files the tab itself under, so the tab
+    // the user sees and the entry saved for it name one group.
+    let group = crate::qobjects::group_model::group_or_unsorted(group);
     note_state(|s| {
         s.add_to_group(group, workspace);
         s.note_recent(repo_path);
@@ -612,11 +608,14 @@ pub mod qobject {
         fn open_setup_pty(self: Pin<&mut AppController>, action: QString, cols: i32, rows: i32);
 
         /// Empty when `name` is one `workspace.create` will accept, and
-        /// otherwise the single sentence to show under the field.
+        /// otherwise the sentence to show under the field, worded by the rule
+        /// itself and shown verbatim.
         ///
-        /// The New Agent dialog calls it on every keystroke. The rule lives in
-        /// Rust, next to the create it guards, so the dialog and the daemon
-        /// cannot disagree about what a workspace may be called.
+        /// The New Agent dialog calls it on every keystroke. The rule is
+        /// `bondsymphonic_proto::workspace_name::validate`, the one both the
+        /// IDE and the daemon ask, so the dialog cannot accept a name the
+        /// create then refuses -- which is what a rule of the IDE's own used
+        /// to do to `fix.the.bug`.
         #[qinvokable]
         fn validate_workspace_name(self: &AppController, name: QString) -> QString;
 
@@ -1071,32 +1070,6 @@ pub fn should_auto_open_setup(blocked: bool, already_shown: bool) -> bool {
     blocked && !already_shown
 }
 
-/// The message the New Agent dialog shows under an unusable name.
-///
-/// One sentence, and the same one whichever rule was broken: the four rules
-/// together are "one path-safe word", and naming which of them a half-typed
-/// name is currently failing would change the text under the field on nearly
-/// every keystroke.
-pub const WORKSPACE_NAME_HINT: &str = "Use a single word: letters, digits, - or _";
-
-/// Whether `name` is a name `workspace.create` will accept.
-///
-/// Exactly the daemon's own four conditions (`workspace::lifecycle::create`),
-/// deliberately duplicated rather than inferred: the daemon is the authority
-/// and keeps its check, and this is the same rule moved to where the user is
-/// still typing. Before it existed, a name with a space was refused after the
-/// dialog had closed and everything typed into it was gone.
-pub fn validate_workspace_name(name: &str) -> Result<(), &'static str> {
-    if name.is_empty()
-        || name.contains('/')
-        || name.contains("..")
-        || name.contains(char::is_whitespace)
-    {
-        return Err(WORKSPACE_NAME_HINT);
-    }
-    Ok(())
-}
-
 /// The workspace and host of a network denial, for an event that is one.
 ///
 /// The proxy announces a refused connection as a warn-level `daemon.log`
@@ -1122,6 +1095,86 @@ fn parse_setup_action(action: &str) -> Option<SetupAction> {
         "install_claude" => Some(SetupAction::InstallClaude),
         "install_gh" => Some(SetupAction::InstallGh),
         _ => None,
+    }
+}
+
+/// The last `agent.state` seen for each of the most recent agents, so a state
+/// that reached the IDE before `agent.start` answered can still be applied once
+/// a tab knows which agent it is running.
+///
+/// The reply and the event travel on different channels -- one comes back on
+/// the request the IDE issued, the other arrives on the daemon's event stream
+/// -- so the daemon can announce that an agent is working before the IDE has
+/// been told which workspace that agent belongs to. The window binds the tab to
+/// the agent in its `agentStarted` slot, so until that has run there is no tab
+/// the event can reach and the model drops it. A Claude agent that goes
+/// straight to work and stays there emits nothing else until it is finished, so
+/// what the user sees is a tab that reads "idle" for the whole turn.
+///
+/// Nothing is withheld to make this work: the event is delivered when it
+/// arrives, exactly as before, and this only keeps a copy to offer again. That
+/// matters for the tabs rebuilt from `workspace.list`, which know their agent
+/// from the start and never get an `agentStarted` at all.
+///
+/// Bounded, and the bound is the point: every `agent.state` the daemon sends is
+/// offered to this, including states for agents this IDE never started, and an
+/// agent that is never announced would otherwise hold its entry for the life of
+/// the process.
+#[derive(Debug, Default)]
+pub struct RecentAgentStates {
+    /// Oldest first, one entry per agent, each holding the newest state seen.
+    held: std::collections::VecDeque<(String, String, String)>,
+}
+
+impl RecentAgentStates {
+    /// How many agents are remembered at once. A handful would cover the race
+    /// this exists for; this is generous enough that a daemon with many live
+    /// agents cannot push a pending one out before its start answers, and small
+    /// enough to be a rounding error beside one workspace list.
+    pub const CAPACITY: usize = 64;
+
+    /// Records the newest state for `agent`, replacing any earlier one.
+    pub fn note(&mut self, agent: &str, state: &str, detail: &str) {
+        self.held.retain(|(id, _, _)| id != agent);
+        self.held
+            .push_back((agent.to_owned(), state.to_owned(), detail.to_owned()));
+        while self.held.len() > Self::CAPACITY {
+            self.held.pop_front();
+        }
+    }
+
+    /// Takes the state held for `agent`, if there is one.
+    ///
+    /// Taken rather than read: it is replayed once, and replaying it a second
+    /// time would push a state the tab has already moved past back onto it.
+    pub fn take(&mut self, agent: &str) -> Option<(String, String)> {
+        let idx = self.held.iter().position(|(id, _, _)| id == agent)?;
+        let (_, state, detail) = self.held.remove(idx)?;
+        Some((state, detail))
+    }
+}
+
+/// What the connection state becomes the instant a connection ends, before
+/// anything slow is done about it.
+///
+/// Published in the same queued step that drops the dead client rather than
+/// after the old daemon has been reaped. `shutdown` closes the daemon's stdin
+/// and waits for the process to go, which takes as long as the daemon takes to
+/// exit, and for every millisecond of that window [`require_connection`] is
+/// already failing: a status bar still reading "daemon: connected" over it is
+/// the IDE claiming a connection each of its own operations is refusing.
+///
+/// `next` is the attempt the loop is about to make, so the number the user is
+/// watching does not jump when the backoff starts counting it.
+pub fn state_after_loss(quitting: bool, fatal: bool, next: u32) -> ConnectionState {
+    match (quitting, fatal) {
+        // The IDE is on its way out: nothing is reconnected, and the bar says
+        // the connection is gone rather than that something is being tried.
+        (true, _) => ConnectionState::Lost,
+        // Nothing a relaunch can get past. The sentence explaining it follows
+        // once the old daemon has been reaped.
+        (false, true) => ConnectionState::Error,
+        (false, false) => ConnectionState::Reconnecting { attempt: next },
     }
 }
 
@@ -1159,6 +1212,9 @@ pub struct AppControllerRust {
     /// The last `prereqs_checked` payload, so a setup page built later can
     /// draw its rows without waiting for another check. See `prereqs_json`.
     prereqs_json: QString,
+    /// `agent.state` events kept for a moment in case the `agent.start` that
+    /// names their agent has not answered yet. See [`RecentAgentStates`].
+    recent_agent_states: RecentAgentStates,
 }
 
 impl Default for AppControllerRust {
@@ -1177,6 +1233,7 @@ impl Default for AppControllerRust {
             // in the seconds before the first `system.check_prereqs` answers.
             claude_logged_in: false,
             prereqs_json: QString::from(""),
+            recent_agent_states: RecentAgentStates::default(),
         }
     }
 }
@@ -1322,7 +1379,16 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
                 let id = agent_id.to_string();
                 let word = agent_state_word(state);
                 let detail = detail.unwrap_or_default();
-                let _ = qt.queue(move |q| {
+                let _ = qt.queue(move |mut q| {
+                    // Kept as well as delivered. A tab that already knows this
+                    // agent -- one the user started a while ago, one rebuilt
+                    // from the workspace list -- applies it now; one whose
+                    // `agent.start` has not answered yet has nowhere to put it,
+                    // and is given it again by `announce_agent_started`.
+                    q.as_mut()
+                        .rust_mut()
+                        .recent_agent_states
+                        .note(&id, word, &detail);
                     q.agent_state_changed(
                         QString::from(&id),
                         QString::from(word),
@@ -1351,22 +1417,64 @@ pub fn api_key_for_start() -> Option<String> {
     crate::qobjects::settings::api_key()
 }
 
-/// Runs `system.check_prereqs` and reports the answer twice: the whole list as
+/// How long to wait before the single `system.check_prereqs` retry.
+///
+/// A daemon that has just come up can be a moment away from being able to
+/// answer: the check shells out to `git`, `bwrap`, `claude` and `gh`, and a
+/// distro still starting its services can refuse the first one. A check that
+/// failed used to stay failed for the session -- the setup page stayed empty,
+/// `claudeLoggedIn` stayed false, and every Claude composer stayed shut behind
+/// a "Log in to Claude Code…" button -- until the user found a "Re-check" they
+/// had no reason to look for. Long enough to be worth waiting out, short enough
+/// that the page fills before the user has finished reading it.
+const PREREQ_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// Runs `system.check_prereqs`, and runs it once more after
+/// [`PREREQ_RETRY_DELAY`] if the daemon could not answer.
+///
+/// One retry, not a loop. A daemon that cannot answer twice, five seconds
+/// apart, is not warming up, and the ordinary re-check points take it from
+/// there: a setup terminal exiting, the "Re-check" button, closing Settings,
+/// and the next connection.
+async fn check_prereqs(client: DaemonClient, qt: QtHandle) {
+    if run_prereq_check(&client, &qt).await {
+        return;
+    }
+    // On its own task: a reconnect awaits this call before announcing itself,
+    // and holding the whole re-sync for five seconds over a check nothing else
+    // depends on would leave the window's banner up for no reason.
+    let generation = connection_generation();
+    runtime().spawn(async move {
+        tokio::time::sleep(PREREQ_RETRY_DELAY).await;
+        // A connection that has since been replaced has already run its own
+        // check, and an IDE on its way out has no setup page to fill.
+        if quitting() || connection_generation() != generation {
+            return;
+        }
+        tracing::info!("re-running the prerequisite check the daemon could not answer");
+        run_prereq_check(&client, &qt).await;
+    });
+}
+
+/// One `system.check_prereqs`, reporting the answer twice: the whole list as
 /// `prereqs_checked`, which is what the setup page draws, and the failures as
 /// one sentence in `prereq_warning`, which is what the status bar shows.
 ///
 /// Both are queued from the same closure, `prereqs_checked` first, so the
 /// window has already decided which of the two views it is in by the time the
 /// warning text reaches it.
-async fn check_prereqs(client: DaemonClient, qt: QtHandle) {
+///
+/// Answers whether the daemon answered at all, which is what decides whether
+/// the caller retries. A list full of failing prerequisites is an answer.
+async fn run_prereq_check(client: &DaemonClient, qt: &QtHandle) -> bool {
     let items = match client
         .request::<CheckPrereqsResult>(Request::SystemCheckPrereqs {})
         .await
     {
         Ok(res) => res.items,
         Err(e) => {
-            report_failure(&qt, "system.check_prereqs", e.to_string());
-            return;
+            report_failure(qt, "system.check_prereqs", e.to_string());
+            return false;
         }
     };
     let failures: Vec<String> = items
@@ -1402,6 +1510,7 @@ async fn check_prereqs(client: DaemonClient, qt: QtHandle) {
             q.prereq_warning(QString::from(&failures.join("\n")));
         }
     });
+    true
 }
 
 /// Parses the options a dialog built and merges the stored API key in. An
@@ -1461,7 +1570,7 @@ async fn start_agent_and_prompt(
         }
     };
     let (ws, id) = (workspace.to_string(), agent_id.to_string());
-    let _ = qt.queue(move |q| q.agent_started(QString::from(&ws), QString::from(&id)));
+    let _ = qt.queue(move |q| q.announce_agent_started(&ws, &id));
 
     if initial_prompt.is_empty() {
         return;
@@ -1597,13 +1706,28 @@ async fn supervise(spec: LaunchSpec, qt: QtHandle, process: ProcessHandle) {
         // daemon is the one ending no relaunch can improve on.
         let fatal = matches!(ended, ConnectFailure::Fatal(_));
         let reason = ended.into_message();
+        // How long the connection lasted is what decides whether the schedule
+        // starts over. A daemon that answers `hello` and dies a second later is
+        // crash-looping, not recovering, and must not be able to hold the
+        // backoff at one second for the rest of the session.
+        //
+        // Worked out here rather than at the bottom of the loop because the
+        // status published below names the attempt this produces.
+        let held = connected_at.elapsed();
+        let next = next_attempt(attempt, held);
 
         // The dead client goes first: an operation attempted in the gap then
         // fails at once, with a reason, instead of issuing a request nobody
         // will answer.
         on_connection_lost();
-        let _ = qt.queue(|mut q| {
+        let losing = state_after_loss(quitting(), fatal, next);
+        let _ = qt.queue(move |mut q| {
             q.as_mut().rust_mut().client = None;
+            // The same step, so the property can never say "connected" while
+            // the handle every operation reaches for is already gone -- and
+            // before the reaping below, which waits for the daemon process to
+            // exit and can take seconds. See [`state_after_loss`].
+            q.set_state(losing);
         });
         // The old child is reaped rather than left behind: `shutdown` closes
         // its stdin, which is how the daemon is asked to exit, and then kills
@@ -1626,13 +1750,8 @@ async fn supervise(spec: LaunchSpec, qt: QtHandle, process: ProcessHandle) {
             });
             return;
         }
-        // How long the connection lasted is what decides whether the schedule
-        // starts over. A daemon that answers `hello` and dies a second later is
-        // crash-looping, not recovering, and must not be able to hold the
-        // backoff at one second for the rest of the session.
-        let held = connected_at.elapsed();
         tracing::warn!("{reason} after {held:?}");
-        attempt = next_attempt(attempt, held);
+        attempt = next;
     }
 }
 
@@ -1944,8 +2063,8 @@ impl qobject::AppController {
         // this is the only guard on a caller that is not the dialog, and a name
         // stopped here fails with the sentence the user was already shown
         // rather than with the daemon's wording for the same thing.
-        if let Err(hint) = validate_workspace_name(&params.name) {
-            report_failure(&qt, "workspace.create", hint.to_owned());
+        if let Err(hint) = workspace_name::validate(&params.name) {
+            report_failure(&qt, "workspace.create", hint);
             return;
         }
         // Echoed straight back on success: the controller keeps no tab state.
@@ -2030,8 +2149,8 @@ impl qobject::AppController {
         };
         // As in `create_workspace_with_run`: the rule lives in one place and is
         // applied wherever a create is built, not only where one is typed.
-        if let Err(hint) = validate_workspace_name(&params.name) {
-            report_failure(&qt, "workspace.create", hint.to_owned());
+        if let Err(hint) = workspace_name::validate(&params.name) {
+            report_failure(&qt, "workspace.create", hint);
             return;
         }
         let group = group.to_string();
@@ -2354,9 +2473,9 @@ impl qobject::AppController {
     }
 
     pub fn validate_workspace_name(&self, name: QString) -> QString {
-        match validate_workspace_name(&name.to_string()) {
+        match workspace_name::validate(&name.to_string()) {
             Ok(()) => QString::from(""),
-            Err(hint) => QString::from(hint),
+            Err(hint) => QString::from(&hint),
         }
     }
 
@@ -2410,7 +2529,19 @@ impl qobject::AppController {
 
     pub fn set_default_permission_mode(&self, mode: QString) {
         let mode = mode.to_string();
-        let mut settings = Settings::load();
+        // `try_load`, not `load`. This writes the whole object back, so a
+        // `settings.json` that could not be read has to stop it: answering with
+        // the defaults and saving them is how one bad character in a
+        // hand-edited file used to cost the user their distro, their daemon
+        // path and their log level, because they had changed the permission
+        // mode in a combo box afterwards.
+        let mut settings = match Settings::try_load() {
+            Ok(settings) => settings,
+            Err(e) => {
+                tracing::warn!("the default permission mode was not recorded: {e}");
+                return;
+            }
+        };
         if settings.default_permission_mode == mode {
             return;
         }
@@ -2440,6 +2571,32 @@ impl qobject::AppController {
         self.as_mut().set_daemon_version(version);
         let state = self.as_ref().current_state();
         self.refresh_status(state);
+    }
+
+    /// Announces that `workspace_id` is now running `agent_id`, then applies the
+    /// last `agent.state` that reached the IDE before this reply did.
+    ///
+    /// The replay is the whole reason this is not a bare `agentStarted` emit.
+    /// The window binds the tab to the agent in its `agentStarted` slot, so
+    /// until that has run there is no tab an `agent.state` can reach and the
+    /// model drops it; a state that overtook the reply has to be offered again
+    /// afterwards or it is lost, and a Claude agent that goes straight to work
+    /// and stays there says nothing else until it has finished. Delivered after
+    /// the signal, in the same Qt-thread step, so the tab it is meant for
+    /// certainly exists by then.
+    fn announce_agent_started(mut self: Pin<&mut Self>, workspace_id: &str, agent_id: &str) {
+        self.as_mut()
+            .agent_started(QString::from(workspace_id), QString::from(agent_id));
+        let replay = self.as_mut().rust_mut().recent_agent_states.take(agent_id);
+        let Some((state, detail)) = replay else {
+            return;
+        };
+        tracing::info!("agent {agent_id} reported {state} before its start answered; applying it");
+        self.agent_state_changed(
+            QString::from(agent_id),
+            QString::from(&state),
+            QString::from(&detail),
+        );
     }
 
     pub fn prepare_quit(&self) {
@@ -2500,6 +2657,24 @@ impl qobject::AppController {
     }
 
     pub fn note_groups(&self, json: QString) {
+        // Nothing is recorded until the first `workspace.list` has answered and
+        // the restore has run. Until then the model on screen is the one-group
+        // placeholder `GroupModel` starts life as: no restore has happened, so
+        // it has never been told the user's groups, and what it reports is not
+        // an arrangement the user made. Recording it replaces Feature-A and
+        // Feature-B in `state.json` with "Default" plus whatever the user has
+        // created in the meantime -- and the groups are gone before the daemon
+        // has said a word. A daemon that is slow to start, or that refuses the
+        // list twice, is exactly when a user creates a workspace to get on with
+        // something.
+        //
+        // The restore sets the flag before it emits `workspacesRestored`, so
+        // the very first arrangement the window reports back -- the restored one
+        // -- is recorded, and every mutation after it as before.
+        if !self.rust().first_list_done {
+            tracing::debug!("noteGroups: ignored before the first workspace list");
+            return;
+        }
         let json = json.to_string();
         match serde_json::from_str::<persistence::PersistedGroups>(&json) {
             Ok(reported) => {

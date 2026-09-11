@@ -7,8 +7,8 @@
 //! the C++ side never has to parse that JSON just to paint a tab: it asks for
 //! the label, the tooltip, the status word and the counts directly.
 
-use crate::model::app_state::{parse_agent_state, AgentTab, TabStatus, Workspaces};
-use crate::model::persistence::PersistedGroups;
+use crate::model::app_state::{parse_agent_state, AgentTab, TabStatus, Workspaces, UNSORTED_GROUP};
+use crate::model::persistence::{PersistedGroup, PersistedGroups};
 use bondsymphonic_proto::{AgentAdapterKind, AgentId, WorkspaceId, WorkspaceInfo, WorkspaceState};
 
 #[cxx_qt::bridge]
@@ -31,6 +31,20 @@ pub mod qobject {
         /// than to `stateJsonChanged`.
         #[qsignal]
         fn changed(self: Pin<&mut GroupModel>);
+
+        /// Emitted, after `changed`, only when the mutation altered what
+        /// `groupsJson` reports: a group's name, which tabs it holds, the order
+        /// of either, or which tab is in front.
+        ///
+        /// The signal exists because `changed` is not a usable trigger for
+        /// writing `state.json`. It fires for every status glyph, every agent
+        /// heartbeat and every attention mark -- none of which the arrangement
+        /// file records -- so a window that recorded the arrangement on
+        /// `changed` re-read, re-serialised and re-scheduled a write of the
+        /// whole file dozens of times a minute while nothing about it had
+        /// changed. This fires when there is something to write.
+        #[qsignal]
+        fn arrangement_changed(self: Pin<&mut GroupModel>);
 
         /// Replaces the whole model from a serialised `Workspaces` (session
         /// restore). An unparseable or empty string installs the default
@@ -65,8 +79,13 @@ pub mod qobject {
 
         /// Adds a tab for the `WorkspaceInfo` in `info_json` to the group named
         /// `group_name`, creating that group if it does not exist, and makes it
-        /// active. A workspace that is already tracked is refreshed in place
-        /// instead of being duplicated. `adapter` is "claude" or "terminal";
+        /// active. An empty `group_name` is not a group called "": it means the
+        /// caller named none, and the new tab is filed under "Unsorted" --
+        /// where `AppController::noteGroups` records it too. A workspace that
+        /// is already tracked is refreshed in place instead of being
+        /// duplicated, and an empty `group_name` then leaves it in whatever
+        /// group it is already in rather than dragging it out of one the user
+        /// chose. `adapter` is "claude" or "terminal";
         /// an empty `command` means the adapter default. `options_json` is the
         /// `AgentStartOptions` a Claude tab was started with, kept on the tab so
         /// the agent can be started again with them; empty for anything else.
@@ -303,6 +322,14 @@ use cxx_qt_lib::QString;
 pub struct GroupModelRust {
     state_json: QString,
     workspaces: Workspaces,
+    /// The arrangement as `groupsJson` last reported it.
+    ///
+    /// Kept so [`qobject::GroupModel::publish`] can tell a change to the groups
+    /// from a change to a tab's status without every mutation having to declare
+    /// which it was -- a declaration that would be wrong the first time someone
+    /// added a mutation and copied the wrong neighbour. Maintained in exactly
+    /// one place, and only when it actually moves.
+    arrangement: Arrangement,
 }
 
 impl Default for GroupModelRust {
@@ -310,9 +337,67 @@ impl Default for GroupModelRust {
         let workspaces = Workspaces::new_default();
         Self {
             state_json: QString::from(&workspaces.to_json()),
+            arrangement: arrangement_of(&workspaces),
             workspaces,
         }
     }
+}
+
+/// What `groupsJson` reports: every group by name with its workspace ids in
+/// order, and the workspace whose tab is in front.
+pub type Arrangement = (Vec<PersistedGroup>, Option<String>);
+
+/// The arrangement of a model, which is the whole of what `state.json` records
+/// about the tab bar and the only thing `arrangementChanged` fires on.
+pub fn arrangement_of(workspaces: &Workspaces) -> Arrangement {
+    (
+        workspaces.persisted_groups(),
+        workspaces.active().map(|tab| tab.workspace_id.0.clone()),
+    )
+}
+
+/// The group a tab belongs in when the caller named one, and [`UNSORTED_GROUP`]
+/// when it did not.
+///
+/// An empty name is not the name of a group: it means the caller supplied none.
+/// Making one anyway produced a nameless strip in the tab bar that the user
+/// could not have created and could not remove, while
+/// `AppController::note_workspace_created` recorded the very same workspace
+/// under "Unsorted" -- so the tab the user saw and the entry saved for it
+/// disagreed, and the next restart moved the tab. Both callers route through
+/// this, which is what keeps them from disagreeing again.
+pub fn group_or_unsorted(name: &str) -> &str {
+    if name.is_empty() {
+        UNSORTED_GROUP
+    } else {
+        name
+    }
+}
+
+/// The index of the group a new tab for `group_name` belongs in, creating the
+/// group when the model does not have it yet.
+pub fn group_index_for(workspaces: &mut Workspaces, group_name: &str) -> usize {
+    let name = group_or_unsorted(group_name);
+    match workspaces.groups.iter().position(|g| g.name == name) {
+        Some(idx) => idx,
+        None => workspaces.add_group(name),
+    }
+}
+
+/// The status the daemon's own record for `agent_id` implies, or `None` when
+/// the `WorkspaceInfo` says nothing about that agent.
+///
+/// For a tab rebuilt from `workspace.list`: it carries an agent id taken from
+/// `agent_records` and no `agent.state` has ever been seen for it, so the model
+/// falls back to `Idle` when the workspace goes `Ready`. The daemon said what
+/// the agent was doing in the same message, and painting a working agent's tab
+/// idle over its own record is a worse answer than the fallback exists to give.
+pub fn agent_record_status(info: &WorkspaceInfo, agent_id: Option<&AgentId>) -> Option<TabStatus> {
+    let agent_id = agent_id?;
+    info.agent_records
+        .iter()
+        .find(|record| &record.id == agent_id)
+        .map(|record| TabStatus::from_agent_state(&record.state))
 }
 
 /// Qt hands indices in as `i32`; anything negative is simply out of range.
@@ -378,10 +463,13 @@ impl qobject::GroupModel {
     }
 
     pub fn groups_json(&self) -> QString {
-        let workspaces = &self.rust().workspaces;
+        // Through `arrangement_of`, so what this reports and what
+        // `arrangementChanged` fires on are one definition rather than two that
+        // can drift.
+        let (groups, active_workspace) = arrangement_of(&self.rust().workspaces);
         let reported = PersistedGroups {
-            groups: workspaces.persisted_groups(),
-            active_workspace: workspaces.active().map(|tab| tab.workspace_id.0.clone()),
+            groups,
+            active_workspace,
         };
         QString::from(&serde_json::to_string(&reported).unwrap_or_default())
     }
@@ -460,16 +548,12 @@ impl qobject::GroupModel {
             return true;
         }
 
-        let existing = self
-            .as_ref()
-            .rust()
-            .workspaces
-            .groups
-            .iter()
-            .position(|g| g.name == name);
-        let group_idx = match existing {
-            Some(idx) => idx,
-            None => self.as_mut().rust_mut().workspaces.add_group(&name),
+        // A create that carried no group is filed under "Unsorted", which is
+        // where `AppController::note_workspace_created` records it in
+        // `state.json` -- not into a group named after the empty string.
+        let group_idx = {
+            let mut rust = self.as_mut().rust_mut();
+            group_index_for(&mut rust.workspaces, &name)
         };
         let command = command.to_string();
         let tab = AgentTab {
@@ -501,12 +585,31 @@ impl qobject::GroupModel {
             tracing::warn!("apply_workspace_info: unparseable workspace info");
             return false;
         };
-        let applied = self
-            .as_mut()
-            .rust_mut()
-            .workspaces
-            .apply_workspace_info(&info)
-            .is_some();
+        let placed = {
+            let mut rust = self.as_mut().rust_mut();
+            let placed = rust.workspaces.apply_workspace_info(&info);
+            // A tab rebuilt from `workspace.list` has an agent id and has never
+            // been sent an `agent.state` for it, so the model hands the badge
+            // back as `Idle` the moment the workspace reads `Ready`. The daemon
+            // said what that agent is doing in this very message: prefer its
+            // record over the fallback, and leave a tab that has heard from its
+            // agent directly alone.
+            //
+            // Only while the workspace itself is `Ready`, which is the one
+            // state in which the badge belongs to the agent at all: a sandbox
+            // that is down or a workspace that failed is news about the
+            // workspace, and an agent record says nothing about either.
+            if let (Some((g, t)), WorkspaceState::Ready) = (placed, &info.state) {
+                let tab = &mut rust.workspaces.groups[g].tabs[t];
+                if tab.agent_status.is_none() {
+                    if let Some(status) = agent_record_status(&info, tab.agent_id.as_ref()) {
+                        tab.status = status;
+                    }
+                }
+            }
+            placed
+        };
+        let applied = placed.is_some();
         if applied {
             self.publish();
         }
@@ -859,17 +962,31 @@ impl qobject::GroupModel {
 
     /// Re-serialises the model into `state_json` and announces the change.
     /// Every mutation ends here, so the two never drift apart.
+    ///
+    /// `arrangementChanged` follows `changed` when, and only when, the groups
+    /// themselves moved. Decided here by comparing against the copy the Rust
+    /// state carries rather than by each mutation saying so, because the
+    /// mutations are where it would be got wrong: the rule is one comparison in
+    /// one place, and a new invokable inherits it by calling `publish` at all.
     fn publish(mut self: Pin<&mut Self>) {
         let json = self.as_ref().rust().workspaces.to_json();
         self.as_mut().set_state_json(QString::from(&json));
-        self.changed();
+        let now = arrangement_of(&self.as_ref().rust().workspaces);
+        let moved = now != self.as_ref().rust().arrangement;
+        if moved {
+            self.as_mut().rust_mut().arrangement = now;
+        }
+        self.as_mut().changed();
+        if moved {
+            self.arrangement_changed();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bondsymphonic_proto::AgentAdapterKind;
+    use bondsymphonic_proto::{AgentAdapterKind, AgentState, AgentSummary};
 
     fn tab_with_error() -> AgentTab {
         AgentTab {
@@ -907,5 +1024,137 @@ mod tests {
         let tab = tab_with_error();
         assert_eq!(status_text(tab.display_status()), "error");
         assert_eq!(status_text(tab.status), "working");
+    }
+
+    fn info(id: &str, name: &str) -> WorkspaceInfo {
+        WorkspaceInfo {
+            id: WorkspaceId(id.to_owned()),
+            name: name.to_owned(),
+            repo_path: "/repo".to_owned(),
+            base_branch: "main".to_owned(),
+            branch: format!("bs/{name}/work"),
+            worktree_path: format!("/wt/{id}"),
+            created_at: "2026-09-11T10:00:00Z".to_owned(),
+            allowlist: Vec::new(),
+            state: WorkspaceState::Ready,
+            agents: Vec::new(),
+            agent_records: Vec::new(),
+            runs: Vec::new(),
+        }
+    }
+
+    /// A create that carries no group is not a create into a group called "".
+    /// The controller has always filed one under "Unsorted" in `state.json`;
+    /// the model used to make a nameless group beside it instead, so the tab
+    /// the user could see and the entry that was saved for it disagreed about
+    /// where it lived, and the next restart moved the tab.
+    #[test]
+    fn a_tab_with_no_group_is_filed_under_unsorted() {
+        let mut model = Workspaces::new_default();
+        let idx = group_index_for(&mut model, "");
+        assert_eq!(model.groups[idx].name, UNSORTED_GROUP);
+        assert!(
+            !model.groups.iter().any(|g| g.name.is_empty()),
+            "no group may be named the empty string: {:?}",
+            model.groups.iter().map(|g| &g.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            group_index_for(&mut model, ""),
+            idx,
+            "the Unsorted group is reused rather than made twice"
+        );
+        // A name the user did supply is still their name, made if it is new.
+        let named = group_index_for(&mut model, "Feature-A");
+        assert_eq!(model.groups[named].name, "Feature-A");
+        assert_eq!(group_index_for(&mut model, "Feature-A"), named);
+    }
+
+    /// What `arrangementChanged` fires on, and what it deliberately does not.
+    ///
+    /// The signal exists so the window can record the arrangement without
+    /// writing `state.json` on every agent heartbeat. So the rule is exactly
+    /// "what `groupsJson` reports has changed": group names, membership, order
+    /// and the tab in front. A status, a detail or an attention mark is none of
+    /// those.
+    #[test]
+    fn only_a_change_to_the_groups_themselves_is_an_arrangement_change() {
+        let one = info("ws_1", "alpha");
+        let two = info("ws_2", "beta");
+        let mut model = Workspaces::new_default();
+        model.add_tab(0, AgentTab::from_workspace_info(&one));
+        model.add_tab(0, AgentTab::from_workspace_info(&two));
+        let agent = AgentId("ag_1".to_owned());
+        assert!(model.set_agent(&one.id, agent.clone()));
+
+        let before = arrangement_of(&model);
+        assert!(model
+            .set_agent_status(&agent, TabStatus::Working, "busy")
+            .is_some());
+        assert!(model.set_workspace_attention(&one.id, "alpha is waiting for permission"));
+        assert!(model.set_workspace_error(&one.id, "merge stopped"));
+        assert_eq!(
+            arrangement_of(&model),
+            before,
+            "a status, an error or an attention mark is not an arrangement change"
+        );
+
+        // Membership, names and order are.
+        model.add_group("Feature-A");
+        let after_group = arrangement_of(&model);
+        assert_ne!(after_group, before, "a new group is an arrangement change");
+        assert!(model.move_tab_to_group(&one.id, "Feature-A"));
+        let after_move = arrangement_of(&model);
+        assert_ne!(after_move, after_group, "a moved tab is one too");
+        assert!(model.remove_group("Feature-A"));
+        let after_remove = arrangement_of(&model);
+        assert_ne!(after_remove, after_move, "and so is a closed group");
+
+        // The tab in front is part of what is written, so switching tabs is an
+        // arrangement change as well: without it the session would come back on
+        // whichever tab happened to be first. To `one`, because `two` was added
+        // last and is the tab already in front -- selecting the tab that is
+        // already selected changes nothing, and asserting it did would only
+        // prove the assertion was never run.
+        assert_eq!(
+            model.active().map(|tab| tab.workspace_id.clone()),
+            Some(two.id.clone()),
+            "the last tab added is the one in front"
+        );
+        let (g, t) = model.find(&one.id).expect("alpha is tracked");
+        assert!(model.set_active(g, t));
+        assert_ne!(arrangement_of(&model), after_remove);
+    }
+
+    /// A tab rebuilt from the daemon's list carries an agent it has never heard
+    /// a state event for. The daemon says what that agent is doing in the very
+    /// same `WorkspaceInfo`, so a workspace update must not paint the tab idle
+    /// while the record beside it says the agent is working.
+    #[test]
+    fn a_restored_tab_takes_its_status_from_the_daemons_agent_record() {
+        let mut info = info("ws_1", "alpha");
+        let agent = AgentId("ag_1".to_owned());
+        info.agent_records = vec![AgentSummary {
+            id: agent.clone(),
+            adapter: AgentAdapterKind::Claude,
+            state: AgentState::Working,
+            session_id: None,
+            command: None,
+            model: None,
+            permission_mode: None,
+        }];
+
+        assert_eq!(
+            agent_record_status(&info, Some(&agent)),
+            Some(TabStatus::Working)
+        );
+        // An agent the records do not name, and a daemon too old to send any:
+        // nothing is derived, and the workspace's own status stands.
+        assert_eq!(
+            agent_record_status(&info, Some(&AgentId("ag_other".to_owned()))),
+            None
+        );
+        assert_eq!(agent_record_status(&info, None), None);
+        info.agent_records.clear();
+        assert_eq!(agent_record_status(&info, Some(&agent)), None);
     }
 }

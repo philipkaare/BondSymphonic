@@ -1,4 +1,5 @@
 #pragma once
+#include <QColor>
 #include <QFont>
 #include <QJsonArray>
 #include <QPointer>
@@ -36,6 +37,12 @@ public:
 
     QSize sizeHint() const override;
     QSize minimumSizeHint() const override;
+
+    /// The colour the error banner's text is drawn in.
+    ///
+    /// Its own function so the painter and the check that the palette is
+    /// honoured read the same expression rather than two copies of it.
+    QColor errorInk() const;
 
     /// How many times the widget has parsed the session's grid.
     ///

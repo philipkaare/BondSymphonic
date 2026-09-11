@@ -702,3 +702,47 @@ fn wait_for_text(
     }
     false
 }
+
+/// Task 10: what the status bar says the moment a connection ends.
+mod task_10 {
+    use bondsymphonic_ide::model::app_state::ConnectionState;
+    use bondsymphonic_ide::qobjects::app_controller::{next_attempt, state_after_loss};
+    use std::time::Duration;
+
+    /// The gap between a connection ending and the next attempt starting is not
+    /// instant: the old daemon is reaped first, and `shutdown` closes its stdin
+    /// and waits for the process to go. For all of that window the shared
+    /// client is already gone and every operation fails with "daemon connection
+    /// lost" -- so a status bar still reading "connected" is the IDE claiming a
+    /// connection it is refusing to use. The state moves in the same step that
+    /// drops the client, before anything slow happens.
+    #[test]
+    fn a_lost_connection_reads_as_reconnecting_before_the_old_daemon_is_reaped() {
+        // An ordinary loss: the loop is going to try again, and the number it
+        // reports is the attempt it is about to make, so the bar does not jump
+        // when the backoff starts counting it.
+        let next = next_attempt(0, Duration::from_secs(3600));
+        assert_eq!(
+            state_after_loss(false, false, next),
+            ConnectionState::Reconnecting { attempt: next }
+        );
+        assert_eq!(
+            state_after_loss(false, false, 4),
+            ConnectionState::Reconnecting { attempt: 4 }
+        );
+        // Whatever else it is, it is never still connected.
+        for attempt in [1, 2, 30] {
+            assert_ne!(
+                state_after_loss(false, false, attempt),
+                ConnectionState::Connected
+            );
+        }
+
+        // Nothing will be tried again: an IDE on its way out says so plainly,
+        // and a daemon whose data directory belongs to another daemon is an
+        // error the user has to go and fix.
+        assert_eq!(state_after_loss(true, false, 1), ConnectionState::Lost);
+        assert_eq!(state_after_loss(true, true, 1), ConnectionState::Lost);
+        assert_eq!(state_after_loss(false, true, 1), ConnectionState::Error);
+    }
+}

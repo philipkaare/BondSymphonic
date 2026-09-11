@@ -15,6 +15,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QPalette>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QScrollArea>
@@ -272,7 +273,11 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
     // again here: a prerequisite that is in place is the same green as a line
     // that was added, and one that is missing the same red as a line that is
     // gone, which is the red `GroupBar` already puts on a failed agent.
-    const QColor glyphColour = ok ? theme::added() : theme::removed();
+    //
+    // Through `ink`, because the glyph is text. The theme's accents are picked
+    // as fills for a light background and sit too close to a dark one.
+    const QColor glyphColour =
+        theme::ink(ok ? theme::added() : theme::removed(), theme::isDark(palette()));
     glyph->setStyleSheet(QStringLiteral("color:%1").arg(glyphColour.name()));
     glyph->setFixedWidth(glyph->fontMetrics().horizontalAdvance(kBad) * 2);
     layout->addWidget(glyph);
@@ -491,6 +496,12 @@ namespace {
 const char* const kMarkupPrereq =
     "[{\"name\":\"claude\",\"ok\":false,\"detail\":\"<b>x</b>\",\"fix_hint\":\"\"}]";
 
+/// One prerequisite the daemon found and one it did not, so a single payload
+/// draws both glyphs.
+const char* const kMixedPrereqs =
+    "[{\"name\":\"git\",\"ok\":true,\"detail\":\"2.43.0\",\"fix_hint\":\"\"},"
+    "{\"name\":\"claude\",\"ok\":false,\"detail\":\"not installed\",\"fix_hint\":\"\"}]";
+
 /// The page's fix button for that row, or null.
 QPushButton* fixButton(const SetupPage& page) {
     for (QPushButton* button : page.findChildren<QPushButton*>()) {
@@ -502,6 +513,52 @@ QPushButton* fixButton(const SetupPage& page) {
 }
 
 } // namespace
+
+/// The tick and the cross are the theme's accents, lifted for a dark palette:
+/// `theme` picks its accents as fills for a light background, and `ink` is the
+/// one way one of them becomes text.
+extern "C" std::int32_t bs_widget_test_setup_page_glyphs_are_inked_accents() {
+    // Without this the checks below would pass on an implementation that never
+    // lifted anything, because the two colours each compares would be equal.
+    if (theme::ink(theme::added(), true) == theme::added()) {
+        return 1;
+    }
+    for (const bool dark : { false, true }) {
+        AppController controller;
+        SetupPage page(&controller);
+        QPalette palette = page.palette();
+        // `theme::isDark` reads `Base`. Set before the rows are built: each row
+        // resolves its glyph colour as it is made.
+        palette.setColor(QPalette::Base,
+                         dark ? QColor(0x1e, 0x1e, 0x1e) : QColor(0xff, 0xff, 0xff));
+        page.setPalette(palette);
+        if (theme::isDark(page.palette()) != dark) {
+            return dark ? 2 : 3;
+        }
+        controller.prereqsChecked(QString::fromUtf8(kMixedPrereqs));
+
+        QString okSheet;
+        QString badSheet;
+        for (QLabel* label : page.findChildren<QLabel*>()) {
+            if (label->text() == kOk) {
+                okSheet = label->styleSheet();
+            } else if (label->text() == kBad) {
+                badSheet = label->styleSheet();
+            }
+        }
+        const QString wantOk =
+            QStringLiteral("color:%1").arg(theme::ink(theme::added(), dark).name());
+        const QString wantBad =
+            QStringLiteral("color:%1").arg(theme::ink(theme::removed(), dark).name());
+        if (okSheet != wantOk) {
+            return dark ? 4 : 5;
+        }
+        if (badSheet != wantBad) {
+            return dark ? 6 : 7;
+        }
+    }
+    return 0;
+}
 
 /// A detail the daemon wrote is shown as the text it is.
 extern "C" std::int32_t bs_widget_test_setup_page_detail_is_plain_text() {

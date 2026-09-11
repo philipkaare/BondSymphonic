@@ -183,6 +183,18 @@ const QJsonArray& TerminalWidget::rows() {
     return m_parsedRows;
 }
 
+QColor TerminalWidget::errorInk() const {
+    // `theme::removed` is the IDE's one red: a line that is gone, an agent that
+    // failed and a terminal that could not be reached are the same judgement,
+    // and `GroupBar` reads it from there for its error tabs too.
+    //
+    // Through `ink`, because this is text. The theme's accents are picked as
+    // fills for a light background and sit too close to a dark one; the banner
+    // is drawn over `palette().base()`, which is exactly the colour
+    // `theme::isDark` asks about.
+    return theme::ink(theme::removed(), theme::isDark(palette()));
+}
+
 void TerminalWidget::invalidateRows() {
     m_parsedRowsValid = false;
 }
@@ -320,10 +332,7 @@ void TerminalWidget::paintError(QPainter& painter) {
     const QFontMetrics metrics(font);
     const QRect box = metrics.boundingRect(rect(), Qt::AlignCenter | Qt::TextWordWrap, message);
     painter.fillRect(box.adjusted(-8, -4, 8, 4), palette().base());
-    // `theme::removed` is the IDE's one red: a line that is gone, an agent
-    // that failed and a terminal that could not be reached are the same
-    // judgement, and `GroupBar` already reads it from there for its error tabs.
-    painter.setPen(theme::removed());
+    painter.setPen(errorInk());
     painter.drawText(rect(), Qt::AlignCenter | Qt::TextWordWrap, message);
 }
 
@@ -436,6 +445,34 @@ bool TerminalWidget::focusNextPrevChild(bool) {
 // --- offscreen test entries --------------------------------------------------
 //
 // See the note in `EditorArea.cpp`. `bs_widget_test_begin` must have run first.
+
+/// The banner over an unreachable terminal is drawn in the theme's red, lifted
+/// for a dark palette: `theme` picks its accents as fills for a light
+/// background, and `ink` is the one way one of them becomes text.
+extern "C" std::int32_t bs_widget_test_terminal_error_ink_follows_the_palette() {
+    // Without this the check below would pass on an implementation that never
+    // lifted anything, because the two colours it compares would be equal.
+    if (theme::ink(theme::removed(), true) == theme::removed()) {
+        return 1;
+    }
+    TerminalSession session;
+    TerminalWidget widget(&session);
+    for (const bool dark : { false, true }) {
+        QPalette palette = widget.palette();
+        // `theme::isDark` reads `Base`, which is the pane's own background and
+        // the only theme signal there is.
+        palette.setColor(QPalette::Base,
+                         dark ? QColor(0x1e, 0x1e, 0x1e) : QColor(0xff, 0xff, 0xff));
+        widget.setPalette(palette);
+        if (theme::isDark(widget.palette()) != dark) {
+            return dark ? 2 : 3;
+        }
+        if (widget.errorInk() != theme::ink(theme::removed(), dark)) {
+            return dark ? 4 : 5;
+        }
+    }
+    return 0;
+}
 
 /// One frame, a hundred repaints. The cursor blinks twice a second over a
 /// shell that has printed nothing, and every one of those repaints used to
