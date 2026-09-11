@@ -102,13 +102,10 @@ fn open_child_dir(parent: &OwnedFd, name: &OsStr, create: bool) -> Result<OwnedF
             Err(e) => return Err(io_err(e)),
         }
     }
-    Err(RpcError::io(&std::io::Error::new(
-        std::io::ErrorKind::Other,
-        format!(
-            "{} kept changing shape under the write",
-            name.to_string_lossy()
-        ),
-    )))
+    Err(RpcError::io(&std::io::Error::other(format!(
+        "{} kept changing shape under the write",
+        name.to_string_lossy()
+    ))))
 }
 
 /// Walks from `root` to the directory that holds the last component of
