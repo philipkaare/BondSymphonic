@@ -3,12 +3,21 @@ use cxx_qt_build::CxxQtBuilder;
 fn main() {
     embed_windows_icon();
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    // The offscreen widget checks at the foot of several .cpp files -- they
+    // build widgets, leak a QApplication and assert -- are test code, and the
+    // shipped IDE has no caller for any of them. `cargo test` builds the dev
+    // profile, so keying on the profile compiles them for every run of the
+    // suites and for none of the packaged executables.
+    let widget_tests = std::env::var("PROFILE").as_deref() != Ok("release");
     let builder = CxxQtBuilder::new();
     // SAFETY: the closure only adds a preprocessor define; it does not change
     // include paths, flags or files in a way that could conflict with cxx-qt.
     let builder = unsafe {
         builder.cc_builder(move |cc| {
             cc.define("BS_IDE_VERSION", format!("\"{version}\"").as_str());
+            if widget_tests {
+                cc.define("BS_WIDGET_TESTS", None);
+            }
             // MSVC otherwise reads these sources in the system code page, and
             // the glyphs in the setup page's rows are UTF-8 in the file.
             cc.flag_if_supported("/utf-8");

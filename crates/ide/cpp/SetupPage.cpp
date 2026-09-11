@@ -486,6 +486,12 @@ int SetupPage::terminalRows() const {
 
 // --- offscreen test entries --------------------------------------------------
 //
+// Compiled only into a development build: this is test code -- it builds
+// widgets, leaks a QApplication and asserts -- and a shipped IDE has no caller
+// for any of it. `build.rs` defines `BS_WIDGET_TESTS` for every profile but
+// `release`, which is the one the packaged executable is built with.
+#if defined(BS_WIDGET_TESTS)
+//
 // See the note in `EditorArea.cpp`. `bs_widget_test_begin` must have run first.
 
 namespace {
@@ -599,3 +605,4 @@ extern "C" std::int32_t bs_widget_test_setup_page_closes_its_pty() {
     }
     return 0;
 }
+#endif // BS_WIDGET_TESTS

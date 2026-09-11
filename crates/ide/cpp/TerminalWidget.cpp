@@ -444,6 +444,12 @@ bool TerminalWidget::focusNextPrevChild(bool) {
 
 // --- offscreen test entries --------------------------------------------------
 //
+// Compiled only into a development build: this is test code -- it builds
+// widgets, leaks a QApplication and asserts -- and a shipped IDE has no caller
+// for any of it. `build.rs` defines `BS_WIDGET_TESTS` for every profile but
+// `release`, which is the one the packaged executable is built with.
+#if defined(BS_WIDGET_TESTS)
+//
 // See the note in `EditorArea.cpp`. `bs_widget_test_begin` must have run first.
 
 /// The banner over an unreachable terminal is drawn in the theme's red, lifted
@@ -495,3 +501,4 @@ extern "C" std::int32_t bs_widget_test_terminal_parses_its_rows_once_per_frame()
     // 0 says nothing painted at all and the check proved nothing.
     return parses == 0 ? 1 : parses;
 }
+#endif // BS_WIDGET_TESTS

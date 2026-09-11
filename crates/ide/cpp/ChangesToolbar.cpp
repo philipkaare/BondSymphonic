@@ -447,6 +447,12 @@ void ChangesToolbar::onSummarized(const QString& workspaceId, const QString& jso
 
 // --- offscreen test entries --------------------------------------------------
 //
+// Compiled only into a development build: this is test code -- it builds
+// widgets, leaks a QApplication and asserts -- and a shipped IDE has no caller
+// for any of it. `build.rs` defines `BS_WIDGET_TESTS` for every profile but
+// `release`, which is the one the packaged executable is built with.
+#if defined(BS_WIDGET_TESTS)
+//
 // See the note in `EditorArea.cpp`: the widget checks live beside the widget
 // and answer a code. `bs_widget_test_begin` must have run first.
 //
@@ -558,3 +564,4 @@ extern "C" std::int32_t bs_widget_test_changes_toolbar_acts_on_the_confirmed_wor
     }
     return 0;
 }
+#endif // BS_WIDGET_TESTS

@@ -416,6 +416,12 @@ int EditorArea::indexOfKey(const QString& key) const {
 
 // --- offscreen test entries --------------------------------------------------
 //
+// Compiled only into a development build: this is test code -- it builds
+// widgets, leaks a QApplication and asserts -- and a shipped IDE has no caller
+// for any of it. `build.rs` defines `BS_WIDGET_TESTS` for every profile but
+// `release`, which is the one the packaged executable is built with.
+#if defined(BS_WIDGET_TESTS)
+//
 // The IDE's shell is C++ and its test suites are Rust, so the checks that need
 // a live widget are written here, beside the widget they are about, and
 // exported as plain C entry points that `crates/ide/tests/qobject_smoke.rs`
@@ -477,3 +483,4 @@ extern "C" std::int32_t bs_widget_test_editor_area_survives_a_destroyed_workspac
     }
     return 0;
 }
+#endif // BS_WIDGET_TESTS
