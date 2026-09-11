@@ -338,6 +338,9 @@ void SetupPage::runAction(const QString& action) {
         return;
     }
     m_pendingAction = action;
+    // From here the machine may be a different one by the time the dialog is
+    // closed, which is the whole of what `ranAction` answers.
+    m_ranAction = true;
     setActionsEnabled(false);
     // Whatever the last terminal printed belongs to the last terminal. A row
     // left standing here would offer the previous login's URL beside the new
@@ -359,6 +362,8 @@ void SetupPage::runAction(const QString& action) {
         m_controller->openSetupPty(action, terminalCols(), terminalRows());
     });
 }
+
+bool SetupPage::ranAction() const { return m_ranAction; }
 
 void SetupPage::onSetupPtyOpened(const QString& action, const QString& ptyId) {
     if (action != m_pendingAction) {
@@ -602,6 +607,56 @@ extern "C" std::int32_t bs_widget_test_setup_page_closes_its_pty() {
     }
     if (closed != QStringLiteral("pty_7")) {
         return 2;
+    }
+
+    // The other ending: the process exits on its own, which reaps the PTY
+    // daemon-side. Closing it again on the way out would ask the daemon about a
+    // PTY that is gone, and on a daemon that has since handed the id out again
+    // it would close a stranger's.
+    closed.clear();
+    {
+        SetupPage page(&controller);
+        page.setPtyCloser([&closed](const QString& ptyId) { closed = ptyId; });
+        controller.prereqsChecked(QString::fromUtf8(kMarkupPrereq));
+        QPushButton* fix = fixButton(page);
+        if (fix == nullptr) {
+            return 3;
+        }
+        fix->click();
+        controller.setupPtyOpened(QStringLiteral("install_claude"), QStringLiteral("pty_8"));
+        // What the session reports when the login command's process ends.
+        TerminalSession* session = page.findChild<TerminalSession*>();
+        if (session == nullptr) {
+            return 5;
+        }
+        session->exitedSignal();
+    }
+    if (!closed.isEmpty()) {
+        return 4;
+    }
+    return 0;
+}
+
+/// Closing Settings re-checks the prerequisites only when something was run
+/// that could have changed one, and this page is what runs those things.
+extern "C" std::int32_t bs_widget_test_setup_page_reports_a_started_action() {
+    AppController controller;
+    SetupPage page(&controller);
+    controller.prereqsChecked(QString::fromUtf8(kMarkupPrereq));
+    // Opened, looked at, closed: nothing has changed, and nothing is owed to
+    // the daemon.
+    if (page.ranAction()) {
+        return 1;
+    }
+    QPushButton* fix = fixButton(page);
+    if (fix == nullptr) {
+        return 2;
+    }
+    fix->click();
+    // A fix was started, so the answer the window holds is out of date whatever
+    // became of it.
+    if (!page.ranAction()) {
+        return 3;
     }
     return 0;
 }

@@ -46,6 +46,17 @@ public:
     /// answers through.
     void setPtyCloser(std::function<void(const QString& ptyId)> close);
 
+    /// Whether the user started a setup action while this page was open.
+    ///
+    /// What closing Settings asks, before deciding whether to re-check the
+    /// prerequisites. An unconditional re-check meant every visit to Settings
+    /// -- to change the permission mode, to paste an API key -- put a
+    /// `system.check_prereqs` on the wire and, on a machine that is blocked,
+    /// re-ran the whole decision about opening this page. A prerequisite can
+    /// only have changed if something was run to change it, and this is the
+    /// page that runs those things.
+    bool ranAction() const;
+
 protected:
     /// Re-elides the sign-in URL: the label's width is only known once the
     /// layout has run, and it changes with the dialog.
@@ -146,4 +157,7 @@ private:
     QString m_ptyId;
     /// Never null: the constructor installs the session close.
     std::function<void(const QString& ptyId)> m_closePty;
+    /// See [`ranAction`]. Set when an action's terminal is opened and never
+    /// cleared: the page is destroyed with the dialog that asks.
+    bool m_ranAction = false;
 };

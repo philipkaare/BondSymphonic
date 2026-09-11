@@ -458,7 +458,7 @@ fn state_json_without_an_agent_id_still_loads() {
 /// `agent.state` word in, and the `TranscriptModel::state` property out.
 #[test]
 fn agent_state_words_round_trip() {
-    use bondsymphonic_ide::model::app_state::{agent_state_word, parse_agent_state};
+    use bondsymphonic_ide::model::transcript::{agent_state_word, parse_agent_state};
     use bondsymphonic_proto::AgentState;
     for state in [
         AgentState::Idle,
@@ -1545,6 +1545,7 @@ mod cpp_widgets {
         fn bs_widget_test_setup_page_detail_is_plain_text() -> i32;
         fn bs_widget_test_setup_page_glyphs_are_inked_accents() -> i32;
         fn bs_widget_test_setup_page_closes_its_pty() -> i32;
+        fn bs_widget_test_setup_page_reports_a_started_action() -> i32;
         fn bs_widget_test_terminal_parses_its_rows_once_per_frame() -> i32;
         fn bs_widget_test_terminal_error_ink_follows_the_palette() -> i32;
         fn bs_widget_test_transcript_coalesces_a_streamed_answer() -> i32;
@@ -1561,7 +1562,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 9] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 10] = [
             (
                 "EditorArea closes a tab under a destroyed workspace",
                 bs_widget_test_editor_area_survives_a_destroyed_workspace,
@@ -1585,6 +1586,10 @@ mod cpp_widgets {
             (
                 "SetupPage closes the PTY it opened",
                 bs_widget_test_setup_page_closes_its_pty,
+            ),
+            (
+                "SetupPage reports whether a setup action was started",
+                bs_widget_test_setup_page_reports_a_started_action,
             ),
             (
                 "TerminalWidget parses its rows once per frame",
