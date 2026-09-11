@@ -77,6 +77,23 @@ as a single stdout line, then serve. Logs go to stderr and
 `system.shutdown` or when stdin closes (the IDE holds stdin open; if the IDE dies,
 the daemon stops all sandboxes and exits).
 
+**A connection costs nothing until it says hello.** Every line is read through a
+bounded reader: 64 KiB until `hello` is through, 8 MiB after. A line that hits
+the cap without a newline disconnects with no reply — end of input and cap
+exhaustion are told apart by whether the limit was consumed — and each pre-hello
+line also gets a 10 s deadline of its own, so a peer that connects and says
+nothing is gone in ten seconds rather than held for a minute. A peer may spend
+at most three lines before it is authenticated; past that the reader simply
+breaks. The reader waits for the request loop to acknowledge each pre-hello line
+before taking the next, so a `hello` followed in the same burst by a large legal
+request does not read that request under the small cap.
+
+**A panicking handler still answers.** Each request runs in a task of its own,
+and a panic there used to end the task with the caller waiting for ever and
+nothing logged. The handler now runs in a nested task whose `JoinError` becomes
+a response carrying `Internal`, plus a `tracing::error!`; the connection
+survives and its next request is served.
+
 **One daemon per data directory.** Before anything in the data directory is read
 or written, the daemon takes an advisory exclusive lock on
 `<data_dir>/daemon.lock` and holds it for its whole life. A daemon that finds the
@@ -91,6 +108,13 @@ The lock is on an open file (`flock(LOCK_EX|LOCK_NB)` on Unix, a zero share mode
 on Windows), so the operating system releases it when the process ends however it
 ends. Nothing has to be cleaned up by hand and a `daemon.lock` left on disk means
 nothing on its own.
+
+On Windows the lock is a zero-share-mode open, so `ERROR_SHARING_VIOLATION` is
+what *any* other handle on the file produces — an antivirus scanner, an indexer
+or a backup agent reading it for a moment looked exactly like a rival daemon,
+and the daemon exited 2, which the launcher treats as final. The open is
+retried 20 × 50 ms before a violation is taken to mean the directory is busy; a
+persistent holder is still exit 2.
 
 Data directory default: `~/.bondsymphonic/` containing `workspaces.json`,
 `agents.json`, `daemon.lock`,
@@ -143,6 +167,20 @@ exactly as it always did and ignores the key beside it; a newer client reading a
 older daemon finds `agent_records` defaulted to empty, which it must read as
 "nothing is known about these agents" rather than as "there are none".
 
+**A workspace name must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.** The rule
+lives in `bondsymphonic_proto::workspace_name::validate`, which both the IDE and
+the daemon call, and it is deliberately narrower than `git check-ref-format`:
+the name becomes the branch `bs/<name>/work`, the loose-ref directory
+`refs/heads/bs/<name>/` and a directory name on the daemon's side, so everything
+git merely discourages — a leading dot, a trailing `.lock`, `@{`, a `.`
+anywhere — is refused rather than reasoned about. `workspace.create` checks it
+before it runs any git, and returns `InvalidParams` with the reason as its
+message: one of `name is empty`, `name is too long (64 max)` or `use letters,
+digits, - or _`, each ready to put next to the field with no wording of the
+caller's own. Before this, `feat:x` passed both sides' home-grown checks and
+then failed inside `git worktree add`, after the client had been told the
+workspace was being created.
+
 **Create** (`workspace.create`):
 1. Validate repo (`git rev-parse --git-common-dir`), base branch exists. With
    `init_if_missing`, a path that is not a repository is initialised here
@@ -153,6 +191,15 @@ older daemon finds `agent_records` defaulted to empty, which it must read as
 5. Create `homes/<id>` seeded with Claude credentials (8.3) and `caches/<id>`.
 6. Build the `SandboxSpec` and start the sandbox supervisor (6).
 7. Persist to registry, emit `workspace.state`.
+
+`create` holds the **per-repository lock** — the one `workspace.destroy` and
+`workspace.merge` take — from the repository classification through the registry
+insert and `git worktree add`. The branch, its loose-ref directory and its
+reflog are named after the workspace *name*, so two creates of one name at once
+would otherwise both pass the registry check, both reach `worktree add -b`, and
+have the loser's cleanup delete the winner's branch mid-checkout. The loser now
+sees `Conflict`. No cleanup after a failed creation may delete the branch unless
+that creation is the one that made it.
 
 **Starting from a folder that is not a repository.** `repo.inspect` answers for
 such a path rather than failing: `RepoInfo { is_repo: false, exists, branches:
@@ -167,8 +214,12 @@ permission error rather than "nothing there" — is an `IoError`, not `exists:
 false`.
 
 **"Is a repository" means *this* directory.** `git rev-parse` searches upwards,
-so the naive question is really about the nearest enclosing repository. Both
-callers ask about the path itself instead, by comparing `rev-parse
+so the naive question is really about the nearest enclosing repository. One
+classifier answers "what is this path": `git::repo::classify` returns `RepoKind`
+— `NotARepo`, `Root`, `InsideEnclosing { root }`, `Bare` or `Worktree` — and
+`repo.inspect`, `init_repo` and `workspace.create` all go through it, so the New
+Agent dialog's offer to initialise a folder and the daemon's willingness to do
+it cannot disagree. It asks about the path itself, by comparing `rev-parse
 --show-toplevel` with it: a plain folder inside a repository answers `is_repo:
 false` rather than borrowing its parent's branches, dirty state and remotes, and
 `workspace.create` initialises such a folder as a repository of its own instead
@@ -221,6 +272,22 @@ nothing to the index, so those files stay untracked.
 --force`; `git branch -D bs/<name>/work`; delete `homes/`, `caches/`, transcripts;
 remove from registry. With `force=false`, refuse if the worktree has uncommitted
 changes or unmerged commits and return `Conflict` with details.
+
+**Removing a worktree is a fixed sequence, not a reading of git's prose.**
+`worktree::remove` runs `worktree unlock` (whose failure is not news — most
+worktrees were never locked, and a locked one makes `worktree remove --force`
+refuse outright *and* makes `prune` skip the registration), then `worktree
+remove --force`, then a `remove_dir_all` of whatever is left with a retry for
+Windows sharing violations, then `worktree prune`, then the branch step. Each
+of the last three runs whatever the one before it did, because returning early
+on a transient directory lock would leave the registration behind — and a
+registration with no directory keeps the branch checked out and makes every
+later `worktree add` refuse, a state a person has to repair by hand. Every
+failure is logged; the first is returned whole, with the others appended to its
+message, since `workspace.destroy` turns it into `WorkspaceState::Error` and
+then stops. Deciding which failures were survivable by matching git's wording is
+what this used to do, and it hard-failed on every phrasing nobody had thought
+of.
 
 **Registry** is rewritten atomically after every change, and so is `agents.json`
 (8.5): the bytes go to a sibling temporary whose name is unique per call
@@ -360,12 +427,16 @@ Run in the main repo by the daemon, never inside a sandbox:
   `~/.bondsymphonic/merge-<id>`, removed on every exit path. Scratch worktrees an
   earlier run left behind (a killed daemon) are reaped at the start of each
   merge, under the same lock, so anything still there belongs to nobody.
-- Guard: the working tree must be clean, **and it is only checked on the first
-  of those two paths** — when the merge will land in the user's own checkout.
-  Otherwise the user's checkout is not involved and is not inspected. A dirty
-  base is `Conflict {reason: "base_dirty"}` with a message naming the repository
-  and the base branch; `--porcelain` counts untracked files, because `git merge`
-  refuses when an untracked file would be overwritten.
+- Guard: the working tree must be clean of *tracked* changes, **and it is only
+  checked on the first of those two paths** — when the merge will land in the
+  user's own checkout. Otherwise the user's checkout is not involved and is not
+  inspected. The question asked is `git status --porcelain
+  --untracked-files=no`: uncommitted edits to tracked files are `Conflict
+  {reason: "base_dirty"}` with a message naming the repository and the base
+  branch, and untracked files are not, because git will not overwrite one and a
+  scratch file in a checkout is not a reason to refuse every merge into it.
+  `RepoInfo.is_dirty` asks the same question with the same flag, so what the New
+  Agent dialog calls dirty and what a merge refuses are one thing.
 - `merge`: `git merge --no-ff bs/<name>/work`.
 - `rebase`: `git rebase <base> bs/<name>/work` in the workspace worktree, then
   fast-forward the base.
@@ -479,22 +550,53 @@ network namespace (so the forwarder can reach the dev server), one PID namespace
 (so shutdown kills everything), one mount namespace.
 
 ### 6.2 Linux/bwrap filesystem rules
-- `--ro-bind / /` as the base, then `--tmpfs /tmp`, `--proc /proc`, `--dev /dev`.
-- `--tmpfs /home`, then `--bind homes/<id> /home/<user>`.
-- `--bind worktree_path worktree_path` (same path inside so git paths match).
-- `--bind objects-<id> objects-<id>`.
-- The three writable `.git` subpaths from 5.2 (`--ro-bind <repo>/.git` first,
-  then the rw binds on top).
-- `--bind caches/<id> /home/<user>/.cache`.
-- `--bind ~/.bondsymphonic/run/<id> /run/bs` (exec, proxy, and forward sockets).
-- `--tmpfs /opt`, then `--ro-bind <resolved claude> /opt/bs/claude`: the mount
-  point cannot be created under the read-only root, and an empty `/opt` also
-  keeps host-installed third-party software out of a workspace. See 8.2 for how
-  the host path is resolved.
+A sandboxed process sees the host root read-only, minus a fixed set of masks,
+plus its own workspace's paths bound back in. In argv order:
+- `--ro-bind / /`, `--proc /proc`, `--dev /dev`.
+- An empty tmpfs over each of `/tmp`, `/home`, `/run`, `/opt`, `/mnt` and the
+  daemon's data directory (`~/.bondsymphonic` by default, or `--data-dir`;
+  omitted when one of the fixed masks already hides it). `/tmp` and `/run`
+  because the sandbox needs writable scratch and a home for `/run/bs` under a
+  read-only root; `/home` because the daemon user's own home is not a
+  workspace's business; `/opt` because that is where host software lives and
+  where the daemon binds its helpers; `/mnt` because on WSL that is every
+  Windows drive; the data directory because it holds every other workspace's
+  worktree, home, objects and exec socket.
+- The masks are the whole of what is hidden. Everything else under the
+  read-only root stays readable, `/var/tmp`, `/var/lib` and `/srv` included,
+  and a host Unix socket sitting outside the masked roots stays connectable
+  from inside a sandbox even though its network is unshared. That is
+  deliberate: the masks cover the daemon's own data and every other
+  workspace's, and the read-only root is what makes the rest of the host
+  inspectable but unwritable. A host service that must not be reachable from a
+  workspace belongs behind one of the masks, not behind the read-only root.
+- Every mask precedes every bind, so only what is bound comes back:
+  `--bind homes/<id> /home/<user>`; when the daemon binary itself lies under a
+  mask, `--ro-bind <daemon> /opt/bs/daemon` (the handle's `helper_exe()`
+  answers with whichever path applies); `--ro-bind <repo>/.git` and
+  `--ro-bind <resolved claude> /opt/bs/claude` (8.2 says how the host path is
+  resolved); `--bind worktree_path worktree_path` (same path inside so git
+  paths match), `--bind objects-<id> objects-<id>`, the writable `.git`
+  subpaths from 5.2, `--bind caches/<id> /home/<user>/.cache`; then the late
+  read-only binds (`config.worktree`); then
+  `--bind ~/.bondsymphonic/run/<id> /run/bs` (exec, proxy and forward sockets).
+- So when the repository lives under `/mnt`, only its `.git` (and the
+  worktree's gitdir paths inside it) are visible there; the repository's own
+  checkout, its siblings and every other Windows path are not. A repository
+  elsewhere sees nothing under `/mnt` at all.
+- `--clearenv`, then `--setenv` for exactly the base environment every process
+  in the sandbox gets (`HOME`, `USER`, `PATH`, `TERM`, `LANG`, the git object
+  directories, the proxy variables, `BS_WORKSPACE`). Both processes the sandbox
+  starts from begin at a fixed environment: the daemon spawns bwrap with a
+  cleared environment holding only the lookup path
+  `PATH=/usr/sbin:/usr/bin:/sbin:/bin`, enough to resolve `bwrap` by name, and
+  bwrap starts init from the per-workspace base environment above (plus the
+  `PWD` it derives from `--chdir`). Neither inherits any variable of the
+  daemon's own environment, which matters because bwrap's process stays inside
+  the pid namespace as pid 1 and `/proc/1/environ` is readable by everything in
+  the sandbox.
 - `--unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup`
   and `--unshare-net` (6.3). `--die-with-parent`, `--new-session`.
-- No `/mnt/c` visibility unless the repo lives there, in which case only the
-  repo's `.git` and the worktree binds are visible.
 
 ### 6.3 Sandbox init (one bwrap per workspace)
 bubblewrap cannot join an existing network namespace, so the daemon runs exactly
@@ -506,14 +608,18 @@ bwrap <mount and unshare flags> --die-with-parent --new-session \
       -- bondsymphonic-daemon sandbox-init --socket /run/bs/exec.sock
 ```
 
-`sandbox-init` is PID 1 inside the sandbox. It:
+`sandbox-init` runs as pid 2 inside the sandbox (bwrap's own process is pid 1
+and reaps for it). It:
 - listens on the Unix socket `/run/bs/exec.sock` (host path
   `~/.bondsymphonic/run/<id>/exec.sock`, rw-bound as `/run/bs`);
 - accepts spawn requests (argv, env, cwd, optional pty size) from the daemon;
   for each it forks the child inside the sandbox, and passes the child's stdio
   pipes or the PTY master back to the daemon over the socket with `SCM_RIGHTS`,
   so the daemon reads and writes those fds directly with no proxying;
-- reports exits (pid, code) on the socket and reaps zombies;
+- reports exits (pid, code) on the socket and reaps zombies. The daemon side
+  keeps an exit that arrives before its spawn has returned for at most 60 s and
+  hands it over once; a spawn whose caller went away before init answered is
+  killed on arrival and its exit dropped;
 - on `shutdown` or socket close sends SIGTERM to every child, SIGKILL after 5 s,
   then exits, which tears the sandbox down.
 
@@ -541,17 +647,28 @@ without namespace support (with a loud warning in the UI), and via
 `bondsymphonic.toml` `[network] allow = [...]` extends it; `workspace.set_allowlist`
 overrides it at runtime (at most 256 entries of at most 253 bytes each). A
 wildcard must leave a registrable name behind it, so `*.example.com` is a pattern
-and `*.com` is refused.
+and `*.com` is refused. An entry and a host are compared in one normalised
+form: lowercased, without the root dot of a fully qualified name, and — for an
+IPv6 literal, which may be written with or without the brackets a URI wraps it
+in — in canonical spelling. A published denial carries that same form, so the
+entry a one-click "Allow host" writes back is the one the next request matches.
 
 A repository extends the allowlist at creation without anyone necessarily having
 read it, so the list is a list of *names* the user may not have chosen. Two rules
 follow, and both are the boundary rather than hygiene:
 
-- **The address, not the name, is what is allowed.** After resolving, any address
-  that is loopback, link-local (`169.254/16`, `fe80::/10` — this is where the
-  cloud metadata endpoint lives), private (`10/8`, `172.16/12`, `192.168/16`),
-  unique-local (`fc00::/7`), unspecified or multicast is dropped, in either
-  address family and through the IPv4-mapped form. If nothing is left the request
+- **The address, not the name, is what is allowed.** After resolving, any
+  address that is not on the internet is dropped, in either address family.
+  IPv4: `0/8`, `127/8`, `10/8`, `172.16/12`, `192.168/16`, `169.254/16` (where
+  the cloud metadata endpoint lives), `100.64/10` (carrier-grade NAT — the
+  operator's network, not the internet), `192.0.0/24` (IETF protocol
+  assignments), `198.18/15` (benchmarking), `224/4` (multicast) and `240/4`
+  (reserved, broadcast included). IPv6: `::/96` — which covers loopback, the
+  unspecified address and the withdrawn IPv4-compatible spelling — `fc00::/7`,
+  `fe80::/10`, `ff00::/8`, and `64:ff9b::/96`, the NAT64 prefix, through which
+  an IPv6-only host names an IPv4 destination via a translator on the local
+  network. An IPv4-mapped address (`::ffff:a.b.c.d`) is classified as the IPv4
+  address it is. If nothing is left the request
   is refused `403` with a body saying the destination is private. The one
   exception is an allowlist entry that *is* that literal address: writing
   `127.0.0.1` down is a thing only a person does.
@@ -572,13 +689,37 @@ the sandbox (`bondsymphonic-daemon proxy-shim`) listens on `127.0.0.1:3128` and
 pipes to the Unix socket. The sandbox env sets `HTTP_PROXY`, `HTTPS_PROXY`,
 `ALL_PROXY`, `NO_PROXY=localhost,127.0.0.1`, and git/npm/pip/cargo honour those.
 
-The proxy implements HTTP `CONNECT` (for TLS) and plain absolute-URI `GET/POST`
-forwarding. It checks the target host against the allowlist and then its
-resolved addresses against the address rules of 7.1 before connecting, and
-answers `403` with a body naming the host and either the config key to add it or
-the reason the destination is refused. Every denial is emitted as
-`daemon.log {level: warn}` so the IDE can surface it, coalesced per host per
-workspace as 7.1 says.
+The proxy implements HTTP `CONNECT` (for TLS) and plain absolute-URI
+forwarding. Either way the target host is checked against the allowlist and its
+resolved addresses against the address rules of 7.1 before anything is
+connected, and a refusal is a `403` whose body names the host and either the
+config key to add it or the reason the destination is refused. Every denial is
+emitted as `daemon.log {level: warn}` so the IDE can surface it, coalesced per
+host per workspace as 7.1 says.
+
+A `CONNECT` pins its connection: once the tunnel is up, everything the client
+sends goes to the one host it was allowed. A plain-HTTP connection is not one
+decision but a sequence of them, because a keep-alive client's next request
+names its own host. So plain HTTP is served **one request at a time** — read one
+head, decide the host from the absolute-form URI or `Host`, run the same checks,
+open a connection to *that* host, forward the request in origin form with the
+hop-by-hop headers stripped and `Connection: close` added, relay the body by its
+`Content-Length` or chunked framing, relay the response until the upstream
+closes, then go round for the next request. The added `Connection: close` is
+what delimits the response without the proxy having to parse response framing. A
+head whose body framing is ambiguous (a non-chunked transfer coding, a
+non-numeric or contradictory `Content-Length`) is answered `400` and the
+connection is closed, rather than guessed at.
+
+An exchange is answered only while there is still a response to answer with: the
+two directions are counted as they are relayed, and a `400` or a `408` is
+written only when nothing of a response has gone downstream yet; past that point
+the connection is simply closed rather than having a second response spliced
+onto a half-written first. A 60 s idle deadline bounds a stalled exchange,
+measured from the last byte that moved in *either* direction and lifted once the
+request body is through, so a slow upload is never cut off and an origin that
+thinks for a long time still answers; a stall with nothing relayed yet is a
+`408`.
 
 ### 7.3 Port bridge (web apps)
 When a run declares port `P`, the daemon:
@@ -593,7 +734,15 @@ When a run declares port `P`, the daemon:
    /run/bs/fwd-<run_id>.sock --port P`, which accepts on the Unix socket and
    connects to `127.0.0.1:P`.
 4. Listens on `127.0.0.1:H` and bridges each accepted TCP connection to the Unix
-   socket.
+   socket. A failed `accept` is logged and the loop carries on after a 100 ms
+   pause: a peer that reset before the handshake finished, or a moment of
+   descriptor exhaustion, leaves the listener perfectly able to accept the next
+   connection. Only a listener that is itself closed — or 50 consecutive
+   failures with no connection between them, which is a listener that is never
+   going to recover — ends the bridge, and then with one warning rather than one
+   every 100 ms for ever. Any accept that succeeds resets the count. A loop that
+   returned on the first error left the port published in the IDE with nothing
+   behind it, which looks exactly like the app inside the sandbox having died.
 
 **The status byte.** Before any of the application's own bytes, the forwarder
 writes exactly one byte on each accepted Unix connection: `1` once it holds the
@@ -636,6 +785,22 @@ trait AgentAdapter: Send {
 emits is appended to `transcripts/<agent_id>.ndjson` before broadcast, so
 `agent.history` is a file read.
 
+An agent leaves the manager's map only when its workspace is destroyed, and only
+once the destroy has actually removed the worktree. Stopping a workspace's
+agents ahead of teardown ends their processes and leaves the entries; a destroy
+that fails late leaves the workspace behind in `error`, and its agents'
+transcripts are the one thing still worth having out of it.
+
+**One `agent.start` at a time per workspace.** A start seeds the workspace home
+and copies the repository's `[claude] settings` into it before it spawns
+anything, unlinking the destination and then creating it; two at once leave the
+second agent's settings file missing or half written. A second start while the
+first holds the gate is a `Conflict` with `data.reason = "agent_starting"` —
+refused rather than queued, because the client that asked has a user waiting on
+it. The reason names the gate and not a count: a workspace that already has
+three agents in it takes a fourth start perfectly happily, so a client acting on
+the string tells the user to try again rather than to stop an agent.
+
 ### 8.2 Claude Code adapter
 Spawns inside the sandbox, as built by `claude_argv` in
 `crates/daemon/src/agents/claude.rs`:
@@ -666,8 +831,22 @@ is validated against the CLI's own list (`default`, `acceptEdits`, `plan`,
 `InvalidParams` on `agent.start` rather than a usage error a second later.
 
 The flag set is pinned per Claude Code version: the adapter records
-`TESTED_CLAUDE_VERSION = "2.1.263"` and warns once per daemon lifetime when the
-installed `claude --version` differs. Every flag above was verified accepted by
+`TESTED_CLAUDE_VERSION = "2.1.263"` and warns when the installed `claude
+--version` differs. The probe runs before every agent's first start of a given
+program, under a 10 s timeout with `kill_on_drop`: a CLI that never answers — a
+binary on a filesystem that has gone away, one waiting on a terminal that is not
+there — fails `agent.start` with `PrereqMissing` and
+`data.reason = "claude_probe_timeout"` rather than hanging the request. Only a
+program that *answered* is remembered, so a half-installed CLI the user then
+repairs is usable without restarting the daemon, and the list of programs
+already probed belongs to the `AgentManager` rather than to the process, so
+every daemon starts from nothing probed. The program probed is the host's own
+install, on every backend: under `linux_bwrap` the agent is spawned as
+`/opt/bs/claude`, which is a mount point inside the sandbox and not a path the
+daemon can run, so probing that name on the host is an `ENOENT` that answers
+nothing and would silently retire the version check. `BS_CLAUDE_BIN` is the
+exception and is probed as given, since a hand-named stand-in has no host
+original to map back to. Every flag above was verified accepted by
 2.1.263 — a wrong flag makes `claude` exit with "unknown option" before any login
 check, so this is testable without being logged in. Two traps found in practice:
 
@@ -700,6 +879,40 @@ line on stdin. Output lines are parsed into `AgentEvent`:
 | `control_request` (`can_use_tool`) | `permission_request`; state → `waiting_permission` |
 | `result` | `result {cost, duration, turns}`; state → `idle` |
 
+**State belongs to the reader.** The stdout reader is the only thing that
+publishes an agent's state. `agent.send` and `agent.permission_reply` write a
+line and record a transcript entry; what the agent is doing is whatever its own
+output last said. A message line from an agent that was `idle` or `error` is
+what moves it to `working`; a line that carries a state of its own (`init`,
+`result`, `can_use_tool`) says it better and is left alone.
+
+Only the conversation moving counts: an assistant message, a delta, a tool use
+or result, a user line. Every line the parser cannot interpret is kept as
+`system {subtype:"raw"}` so that nothing is lost, and a `system` line is about
+the conversation rather than part of it, so neither is a resumption — one stray
+line on the CLI's stdout must not leave an idle agent showing `working`.
+
+This is why answering a permission request publishes nothing. One assistant
+message can propose two tools, and the CLI then has two `can_use_tool` requests
+outstanding at once; a `working` published on the answer to the first takes the
+IDE's bar down over the second, which can then never be answered, and the CLI
+waits for ever.
+
+`agent.send` is refused in the two states where the CLI will not read the line.
+An agent that has ended answers `AgentError` with
+`data.reason = "agent_exited"`. An agent with a permission question still
+outstanding answers `AgentError` with `data.reason = "waiting_permission"` —
+counted from the open requests rather than the published state, which by the
+rule above only moves when the reader sees a line: a user who answers the last
+question and immediately types must not be turned away over a question that is
+already settled. The exit is tested first, because a process that died with a
+question open leaves it open for ever. Written anyway, the first turn vanishes
+without a trace and the second comes back as a broken pipe.
+
+A turn that ends with an `is_error` result and a process that then exits is
+announced as `exited`, carrying the error's own message as the detail with the
+exit code after it. An agent left in `error` is a live tab in the IDE for ever.
+
 `permission_reply` writes a `control_response` line carrying allow (with optional
 updated input) or deny (with message), and then records the answer in the
 transcript as `system {subtype:"permission_reply", data:{request_id, decision}}`.
@@ -708,7 +921,15 @@ request is a message and comes back from disk, so without the answer beside it a
 client that re-attaches raises its permission bar over a settled question and the
 reply it then sends is a `NotFound`. `interrupt` writes a `control_request`
 `interrupt` line if supported by the pinned version, otherwise sends SIGINT.
-`stop` closes stdin, waits 5 s, then kills the process group.
+`stop` closes stdin, waits 5 s, then kills the process group. Both paths that
+announce an exit — `stop`, and the reader when the process goes on its own —
+wait up to 1 s for the stderr reader to reach end of input before they build the
+exit detail. The tail is the useful half of that detail ("Invalid API key", "Not
+logged in"), it is read by a task of its own, and the CLI hands its stderr to
+every tool it runs, so the agent's last words are routinely still in flight when
+the exit code lands. Bounded, because a killed grandchild can hold the write end
+open indefinitely and an exit nobody announces is worse than one that cannot say
+why.
 
 Unknown message types are stored verbatim as `system {subtype:"raw"}` so nothing
 is lost when Claude Code adds message kinds.
@@ -848,6 +1069,25 @@ does a restore that finds a record whose workspace the registry no longer has.
 child. Output is read in 4 KiB chunks and emitted as `pty.output` base64.
 Resize forwards `TIOCSWINSZ`. Idle PTYs cost one task each.
 
+**Closing a workspace's PTYs escalates.** The backend's own killer is
+`portable-pty`'s bare SIGHUP, which never goes further, so a command that traps
+it survived `workspace.destroy` and kept running while the worktree was deleted
+under it. `close_workspace` fires the killer, waits one signal grace, and then
+sends SIGTERM and SIGKILL to the process group of anything still registered. The
+ladder runs in a task of its own per victim, so a destroy is not held up by a
+second per open terminal; `workspace.destroy` therefore goes on to remove the
+worktree with the last terminal possibly still dying, which is the intended
+trade — the ladder is what guarantees they go, and nothing after it needs them
+gone. A caller that really needs them gone watches for the sessions to retire
+instead.
+
+**A host PTY dies with the connection that opened it.** Setup terminals
+(`system.setup_pty`) run on the host, outside any workspace, so nothing else
+would ever end them: the connection carries a cancellation token, fired when its
+reader stops, and each host session it opened is closed on it. `pty.close`
+accepts a host PTY id like any other — host terminals are adopted into the same
+session map — so the IDE can also close one itself.
+
 ## 10. Runs
 
 ### 10.1 `bondsymphonic.toml`
@@ -858,7 +1098,8 @@ name = "web"
 command = "npm run dev -- --port 3000"
 port = 3000
 cwd = "."               # optional, relative to worktree (an absolute path, or
-                        # one climbing out with "..", is InvalidParams)
+                        # one climbing out with "..", is InvalidParams; so is
+                        # a Windows drive-relative "C:secret" — see below)
 env = { NODE_ENV = "development" }
 ready_regex = "Local:.*http"   # optional, marks state "ready"
 
@@ -888,12 +1129,34 @@ beside the run list, and nothing in the daemon reads it. `run.start` sees only
 the entries that survived, so a name that was dropped is `NotFound` like any
 other name the repo never declared.
 
+**`cwd` is read as text before any host's path parser sees it.** The file is
+written on the machine the IDE runs on and read by the daemon in the distro,
+where `C:secret` is an ordinary directory name and nothing in `Path` finds
+anything wrong with it — while on Windows it is the *drive-relative* form: no
+root, so it counts as relative, and joining it to the worktree throws the base
+away and leaves the command wherever that drive's current directory happens to
+point. A leading `/` or `\`, a `<letter>:` prefix, and a `..` between either
+separator are all refused outright, and the host's own reading of the path is
+then applied on top for the spellings that text check does not name.
+
 ### 10.2 Auto-detection (when no file, or `repo.detect_run_configs` asks)
 Ordered heuristics, each yielding `RunConfig {name, command, port, source:
 "detected"}`:
 - `package.json` scripts `dev`, `start`, `serve` → `npm run <script>` (or `pnpm`/
   `yarn` if the lockfile says so); port guessed from `vite.config.*`, `next` (3000),
-  `angular.json` (4200), or 3000.
+  `angular.json` (4200), or 3000. A `vite.config.*` sets the port of the scripts
+  that actually run Vite's **dev server**, and of no others: `vite` as the
+  program a script's command invokes, directly, through a package runner
+  (`npx`, `npm`, `pnpm`, `yarn`, `bun`), or behind `cross-env` or a leading
+  environment assignment, and with no subcommand or `dev`/`serve`. `vite
+  preview` serves the built site and takes 4173 as a guess — the config's
+  `server` block is the dev server's port, not its — and `vite build` is a
+  compiler that binds nothing, so it takes the same generic guess as any other
+  script. Every script that is not the dev server keeps its framework default
+  with `port_guessed` set, which is what makes the Run panel offer to correct
+  it. The rule used to be "a `vite.config.*` exists in the repository", which
+  reported the `start` that runs `node server.js` beside a Vite front end as
+  serving on 5173, with `port_guessed` cleared so nobody could fix it.
 - `docker-compose.yml` → not runnable in v1 (no Docker in sandbox); listed with
   `disabled_reason`.
 - `Cargo.toml` with a `[[bin]]` or `axum`/`actix`/`rocket` dependency →
@@ -925,11 +1188,45 @@ byte, polled every 500 ms) → `stopped`/`failed`. A configuration that sets
 ready by a probe. `run.stop` sends SIGTERM to the process group, SIGKILL after
 5 s, and tears down the bridge; `workspace.destroy` stops every run first.
 
+**How a run's end is reported.** There are two terminal states and three
+endings. A run the user ended — or one whose workspace is being destroyed, which
+is the same thing from further away — reports `stopped` with **no** detail,
+whatever exit status the signal produced and whichever of the supervisor and the
+stop observes the exit first: a stop needs no explanation, and the exit status of
+a signalled process says nothing useful. A run that died on its own reports
+`failed` if it never became ready, and `stopped` if it had; both carry the exit
+code and the last lines of output as their detail. So the presence of the detail
+is what separates the two `stopped` cases over the wire, and a client must not
+read a bare `stopped` as a failure. The detail is assembled *after* the output
+readers are drained, because a command that prints an error and exits usually
+delivers its exit code before the daemon has read its pipes.
+
+**Readiness by port** is a connection that is accepted on either loopback —
+`127.0.0.1` or `::1` — with nothing sent. Both are asked at once: a dev server
+that binds `localhost` binds whichever address its runtime resolves first, and
+on a current host that is `::1`.
+
+**Starting a run reads the workspace's state twice**, once before it does
+anything and once after its run is in the list. A `workspace.destroy` marks the
+workspace and then sweeps its runs, so a start that registered its run after that
+sweep would otherwise outlive the workspace. On the second read the start tears
+its own run down and answers `InvalidParams` with `data.reason`
+`workspace_not_ready`, having announced nothing.
+
+**A `(workspace, config)` pair is spoken for** from before its process is spawned
+until after its teardown is complete. A `run.start` for a pair whose run is still
+being stopped is refused with `Conflict` and `data.reason` `run_stopping`, rather
+than being handed a port the dying process has not let go of; one whose run is up
+is refused with `Conflict` and `data.reason` `run_running`. The claim is released
+before the terminal event is published, so a client that reacts to `stopped` by
+starting the same configuration again is not told `run_stopping` for a run the
+daemon has just said is over.
+
 **The noop backend has no bridge.** Without a network namespace the run is a
 plain child of the daemon and its port already is the host's, so `host_port` is
 the configuration's own port, the URL is `http://localhost:<port>`, no
-`fwd-<run_id>.sock` and no in-sandbox forwarder exist, and readiness is a direct TCP
-connect to `127.0.0.1:<port>` on the same 500 ms tick. This is the path Windows
+`fwd-<run_id>.sock` and no in-sandbox forwarder exist, and readiness is the direct
+TCP connect above — both loopbacks at `<port>` — on the same 500 ms tick. This is the path Windows
 development takes, and the one the daemon's `run_integration` suite exercises on
 both hosts; the bridge path is covered by `sandbox_integration` under bwrap.
 A client must therefore take the URL from `run.start`'s reply or the `ready`
@@ -937,13 +1234,54 @@ event and never rebuild it from the configuration's port: under bwrap the two
 differ, and the host port changes on every start.
 
 ## 11. File service
-- Paths are joined to the worktree root and canonicalised; anything escaping the
-  root (including via symlink) returns `InvalidParams`.
+- **Containment is a walk, not a resolved path.** A path that is checked and
+  then opened is a path the agent can swap underneath the daemon: it owns the
+  worktree, and a directory replaced by a symlink between the two steps is a
+  read or a write outside the worktree. On unix the service never resolves to a
+  path at all. It walks from an `O_RDONLY|O_DIRECTORY|O_CLOEXEC` handle on the
+  root, each component an `openat` with `O_NOFOLLOW|O_DIRECTORY`, so the kernel
+  refuses a symlink at the moment of the open; `read_file` opens with
+  `O_NOFOLLOW`, `write_file` creates its temporary with
+  `O_CREAT|O_EXCL|O_NOFOLLOW` in the final directory handle and `renameat`s
+  within that same handle, and `list_dir` reads through `fdopendir` on the
+  handle and stats entries with `fstatat`. A path that really does climb out of
+  the root is `InvalidParams` naming the escape. `resolve` — a path, not a
+  handle — remains for the callers that genuinely need one: git invocations, and
+  the Windows service.
+- **A symlink is refused as a symlink, with its own message**, and is never
+  listed as a folder. The walk refuses *every* link, in-tree ones included,
+  because telling in from out means following it, which is the thing it must not
+  do; so most refusals are not escapes, and answering "path escapes the
+  worktree" to somebody's own `docs -> shared/docs` was a false accusation.
+  `list_dir` stats with `AT_SYMLINK_NOFOLLOW`, so a link is listed — it is
+  really there — but as a plain entry of size 0, never as a directory the
+  Explorer would render and then fail to open; the same `lstat` absorbs the
+  dangling case. Following a link safely means resolving its target through the
+  same walk, which is `openat2(RESOLVE_BENEATH)` on Linux 5.6+: the noted
+  upgrade path. What the walk pins is the inode and not the path, so a directory
+  renamed *out* of the worktree mid-request is still written into — not a
+  containment failure, and not something `RESOLVE_BENEATH` would change either.
 - `read_file` returns UTF-8 text, or `encoding: "binary"` with no content for
   non-UTF-8 files, truncated above 4 MiB with `truncated: true`.
-- `write_file` writes atomically (temp + rename) and preserves mode.
+- `write_file` writes atomically (temp + rename) and carries over the mode of
+  the file it replaces. Content longer than the 4 MiB `read_file` would ever
+  return is `InvalidParams` naming the limit, refused before any file is opened:
+  content that JSON-escapes past the 8 MiB frame cap used to kill the connection
+  with no reply at all.
 - `fs.watch` uses `notify` with 200 ms debouncing; emits relative paths; ignores
-  `.git/`, `node_modules/`, `target/`.
+  `.git/`, `node_modules/`, `target/`. **Ignored directories are not watched,
+  only-filtered-afterwards being the bug this replaces**: a recursive watch
+  installs one inotify watch per directory, so a JS worktree's `node_modules`
+  spent the user's whole `max_user_watches` allowance and the next `fs.watch`
+  for any workspace failed. On Linux the root is watched non-recursively and a
+  walk of the daemon's own adds one non-recursive watch per directory, never
+  entering an ignored name and never following a symlink. A directory that
+  appears later is watched when its creation is reported, and the walk that
+  watches it reports what it found, so writes that beat the watch into place are
+  not lost. Elsewhere the platform watcher is recursive natively and the tree is
+  watched whole. Enabling a watch builds the watcher and walks the tree with the
+  registry lock released, so a large worktree does not queue every other
+  workspace's `fs.watch` behind it.
 
 ## 12. Prerequisite checks
 `check_prereqs` returns, in order: `git ≥ 2.40`, `bwrap` present, user namespaces

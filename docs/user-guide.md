@@ -195,7 +195,7 @@ greyed out while the repository in the box has not been read.
 | --- | --- |
 | Repository | The git repository to branch from. **Browse…** picks one; **Recent** lists repositories you have used before. |
 | Base branch | The branch the workspace starts from and later merges back into. |
-| Name | Names the workspace and its branch, `bs/<name>/work`. Defaults to `agent-<n>`. One word: letters, digits, `-` or `_`. A space or a `/` is refused as you type, with the reason under the field, and **Create** stays greyed out until you fix it. |
+| Name | Names the workspace and its branch, `bs/<name>/work`. Defaults to `agent-<n>`. One word: letters, digits, `-` or `_`, starting with a letter or a digit, at most 64 characters. A space, a `/`, a `.` or a leading `-` is refused as you type, with the reason under the field, and **Create** stays greyed out until you fix it. The daemon applies the same rule, so nothing the dialog accepts can fail later inside git. |
 | Adapter | **Claude Code** (the default when the daemon has it) or **Terminal**. |
 | Command | For a Terminal workspace, the command to run. Empty means your default shell. |
 | Model | Claude Code's `--model`. Empty means its default. |
@@ -383,7 +383,10 @@ port on the host's loopback and bridges it to the app, so `http://localhost:<por
 answers from your Windows browser. The run goes `starting` → `ready`, on a
 `ready_regex` match or on the app accepting a connection, and its output streams
 into the panel's log, capped at 2,000 lines. **Open** launches the system
-browser. **Stop** ends the process group and tears the bridge down.
+browser. **Stop** ends the process group and tears the bridge down, and the run
+is then listed as `stopped` with nothing more to say. A run that dies on its own
+says why: `failed` with the exit code and its last lines if it never came ready,
+`stopped` with the same detail if it had.
 
 Bridging is raw bytes both ways, so WebSockets and hot reload work over the same
 port.
@@ -435,9 +438,11 @@ and cancelling it cancels the whole run, merges included.
 Three things worth knowing before you rely on this:
 
 - **Merging into your own checkout needs it clean.** When the repository is
-  checked out on the base branch, any uncommitted change in it — untracked files
-  included — refuses the merge rather than merging over your work. Checked out
-  on another branch, your working tree is not inspected at all.
+  checked out on the base branch, an uncommitted change to a tracked file
+  refuses the merge rather than merging over your work. Untracked files do not:
+  git will not overwrite one, and a scratch file sitting in your checkout is no
+  reason to refuse every merge into it. Checked out on another branch, your
+  working tree is not inspected at all.
 - **A merge runs none of your repository's hooks.** The daemon pins
   `core.hooksPath` at an empty directory, so a `post-merge` or `commit-msg` hook
   of yours does not fire for work landed from the Changes tab. The push behind
@@ -716,9 +721,12 @@ Because the daemon reads them from its own environment, launching it through
 `BS_GH_BIN/u:GH_STUB_LOG/u` for the `gh` stub) before starting the IDE, and
 putting the fake somewhere the sandbox can see. The workspace's **worktree** is
 the reliable place: it is bound read-write at its own path. `/home` is a tmpfs
-with the workspace's own home mounted over it, `/tmp` is a fresh tmpfs, and
-`/opt` is a tmpfs holding only the bound `claude`, so a fake under any of those
-is invisible from inside.
+with the workspace's own home mounted over it, `/tmp` and `/run` are fresh
+tmpfs, `/opt` is a tmpfs holding only the bound `claude` and, where it is
+needed, the daemon binary, and `/mnt` is an empty tmpfs — so a fake under any of
+those, a Windows drive included, is invisible from inside. The daemon's own data
+directory is masked the same way, which is how one workspace is kept out of
+another's worktree, home and objects.
 
 ### Driving the daemon by hand
 
