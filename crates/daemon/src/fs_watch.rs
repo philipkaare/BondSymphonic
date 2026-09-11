@@ -2,6 +2,17 @@
 //! filtered in the watcher callback, by kind and then by path, coalesced for
 //! [`DEBOUNCE`] after the first surviving one, then published as a single
 //! `fs.changed` carrying sorted, de-duplicated repo-relative paths.
+//!
+//! On Linux the watch is built one directory at a time by a walk of our own,
+//! rather than by `notify`'s recursive mode, so that the directories in
+//! [`IGNORED`] are never watched at all. inotify costs one watch per directory
+//! and the kernel caps them per user; a JS worktree's `node_modules` alone runs
+//! to tens of thousands of directories, and a recursive watch that merely
+//! *silenced* them would still spend the user's whole allowance on them, after
+//! which every further `fs.watch` fails. A directory that appears later is
+//! watched when its creation is reported. Elsewhere the platform watcher is
+//! recursive natively (one handle per tree on Windows), so the tree is watched
+//! as a whole and ignored paths are dropped in the callback.
 
 use crate::server::broadcast::EventBus;
 use bondsymphonic_proto::{Event, RpcError, WorkspaceId};
@@ -31,10 +42,22 @@ pub const DEBOUNCE: Duration = Duration::from_millis(200);
 /// trade at these three names.
 const IGNORED: [&str; 3] = [".git", "node_modules", "target"];
 
-/// A live watch: the `notify` watcher (dropped to unregister) and the task
-/// that coalesces its events (aborted to stop publishing).
+/// Whether the tree is watched one directory at a time (inotify) or as a whole
+/// (every other backend). See the module documentation.
+const PER_DIRECTORY: bool = cfg!(target_os = "linux");
+
+/// What the watcher callback hands the coalescing task.
+enum Msg {
+    /// Repo-relative paths that changed, already filtered and sorted.
+    Changed(Vec<String>),
+    /// A directory that appeared inside the tree and, on a per-directory
+    /// backend, needs a watch of its own.
+    NewDir(PathBuf),
+}
+
+/// A live watch: the task that owns the `notify` watcher and coalesces its
+/// events. Aborting it stops the publishing and drops the watcher.
 struct Active {
-    _watcher: RecommendedWatcher,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -49,9 +72,12 @@ impl Watchers {
     /// `enable` for a workspace that is already watched is a no-op, so a
     /// client that re-sends `fs.watch` never ends up with two watchers
     /// publishing the same change twice.
+    ///
+    /// The watcher is built, and the tree walked, with the lock released:
+    /// walking a large worktree takes real time, and every other workspace's
+    /// `fs.watch` would otherwise queue behind it.
     pub fn enable(&self, id: WorkspaceId, root: PathBuf, events: EventBus) -> Result<(), RpcError> {
-        let mut active = self.active.lock();
-        if active.contains_key(&id) {
+        if self.active.lock().contains_key(&id) {
             return Ok(());
         }
         // Watch the canonical root, so the paths a backend reports strip cleanly
@@ -61,7 +87,7 @@ impl Watchers {
         // every event. A root that cannot be canonicalized is watched as given, and
         // `watch` below reports the real problem.
         let root = root.canonicalize().unwrap_or(root);
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<String>>();
+        let (tx, rx) = mpsc::unbounded_channel::<Msg>();
         // The callback runs on notify's own thread, so it does the cheap part and
         // hands the result to the coalescing task. Filtering here rather than at
         // publish time is what keeps a `cargo build` inside the worktree from waking
@@ -72,9 +98,16 @@ impl Watchers {
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             match res {
                 Ok(ev) if is_change(&ev.kind) => {
+                    if PER_DIRECTORY && may_create_directory(&ev.kind) {
+                        for p in &ev.paths {
+                            if is_new_directory(&cb_root, p) {
+                                let _ = tx.send(Msg::NewDir(p.clone()));
+                            }
+                        }
+                    }
                     let paths = relative_paths(&cb_root, &ev.paths);
                     if !paths.is_empty() {
-                        let _ = tx.send(paths);
+                        let _ = tx.send(Msg::Changed(paths));
                     }
                 }
                 // Something only read the worktree. See [`is_change`].
@@ -86,27 +119,107 @@ impl Watchers {
             }
         })
         .map_err(|e| RpcError::internal(format!("fs.watch: {e}")))?;
-        watcher
-            .watch(&root, RecursiveMode::Recursive)
-            .map_err(|e| RpcError::internal(format!("fs.watch {}: {e}", root.display())))?;
-        let task = tokio::spawn(coalesce(id.clone(), rx, events));
-        active.insert(
-            id,
-            Active {
-                _watcher: watcher,
-                task,
-            },
-        );
+        if PER_DIRECTORY {
+            // The root first, so an error there is the one reported: a root that
+            // cannot be watched has nothing worth walking.
+            watcher
+                .watch(&root, RecursiveMode::NonRecursive)
+                .map_err(|e| RpcError::internal(format!("fs.watch {}: {e}", root.display())))?;
+            for dir in walk(&root).dirs.iter().skip(1) {
+                watch_quietly(&mut watcher, dir);
+            }
+        } else {
+            watcher
+                .watch(&root, RecursiveMode::Recursive)
+                .map_err(|e| RpcError::internal(format!("fs.watch {}: {e}", root.display())))?;
+        }
+        let task = tokio::spawn(coalesce(id.clone(), root, watcher, rx, events));
+        let mut active = self.active.lock();
+        if active.contains_key(&id) {
+            // A concurrent `enable` for the same workspace got there first while
+            // this one was walking; its watch stands and this one goes.
+            task.abort();
+            return Ok(());
+        }
+        active.insert(id, Active { task });
         Ok(())
     }
 
-    /// Stops watching `id`, if it is watched. Aborting the task first means an
-    /// in-flight debounce window is dropped rather than published after the
-    /// client asked for silence; dropping `Active` then drops the watcher.
+    /// Stops watching `id`, if it is watched. Aborting the task drops an
+    /// in-flight debounce window rather than publishing it after the client
+    /// asked for silence, and drops the watcher with it.
     pub fn disable(&self, id: &WorkspaceId) {
         if let Some(a) = self.active.lock().remove(id) {
             a.task.abort();
         }
+    }
+}
+
+/// Adds a watch for one directory, logging rather than failing: a directory
+/// that vanished between the walk and the watch, or one the kernel has no
+/// allowance left for, costs that directory's events and nothing else.
+fn watch_quietly(watcher: &mut RecommendedWatcher, dir: &Path) {
+    if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+        tracing::debug!("fs.watch {}: {e}", dir.display());
+    }
+}
+
+/// What a walk of a directory tree found: the directories, root first and in
+/// walk order, and every entry along the way, files and directories alike.
+/// Ignored directories are neither entered nor listed.
+#[derive(Default)]
+struct Walked {
+    dirs: Vec<PathBuf>,
+    entries: Vec<PathBuf>,
+}
+
+/// Walks `root` without following symlinks (a link to a directory outside the
+/// worktree would drag that directory in, and a loop would never end).
+fn walk(root: &Path) -> Walked {
+    let mut out = Walked::default();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        out.dirs.push(dir);
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let ignored = matches!(entry.file_name().to_str(), Some(n) if IGNORED.contains(&n));
+            if ignored {
+                continue;
+            }
+            // `file_type` does not follow symlinks, which is the point.
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            if is_dir {
+                pending.push(path.clone());
+            }
+            out.entries.push(path);
+        }
+    }
+    out
+}
+
+/// Whether an event of this kind can be the appearance of a directory: a
+/// creation, or a rename whose destination is inside the tree.
+fn may_create_directory(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_)
+            | EventKind::Modify(ModifyKind::Name(_))
+            | EventKind::Any
+            | EventKind::Other
+    )
+}
+
+/// Whether `path` is a directory inside `root` that the watcher should now
+/// follow: a real directory (not a link), not ignored, not the root itself.
+fn is_new_directory(root: &Path, path: &Path) -> bool {
+    match path.strip_prefix(root) {
+        Ok(rel) if !rel.as_os_str().is_empty() && !is_ignored(rel) => {
+            std::fs::symlink_metadata(path).is_ok_and(|md| md.is_dir())
+        }
+        _ => false,
     }
 }
 
@@ -116,27 +229,60 @@ impl Watchers {
 /// The deadline is deliberately not reset by later events. A sliding window
 /// would starve under continuous writing and never publish at all; this
 /// publishes once per [`DEBOUNCE`] for as long as the writing lasts.
-async fn coalesce(id: WorkspaceId, mut rx: mpsc::UnboundedReceiver<Vec<String>>, events: EventBus) {
+///
+/// The task owns the watcher, because on a per-directory backend it is also
+/// what extends the watch: the callback cannot, since `notify` answers a
+/// `watch` call from the same thread that runs the callback.
+async fn coalesce(
+    id: WorkspaceId,
+    root: PathBuf,
+    mut watcher: RecommendedWatcher,
+    mut rx: mpsc::UnboundedReceiver<Msg>,
+    events: EventBus,
+) {
     while let Some(first) = rx.recv().await {
-        let mut batch = first;
+        let mut batch = Vec::new();
+        absorb(&root, &mut watcher, first, &mut batch).await;
         let deadline = tokio::time::sleep(DEBOUNCE);
         tokio::pin!(deadline);
         loop {
             tokio::select! {
                 _ = &mut deadline => break,
                 more = rx.recv() => match more {
-                    Some(paths) => batch.extend(paths),
+                    Some(msg) => absorb(&root, &mut watcher, msg, &mut batch).await,
                     // The watcher is gone: publish what we have and stop.
                     None => break,
                 },
             }
         }
         // Each batch arrives sorted and de-duplicated on its own, but a burst
-        // merges several, so the union has to be sorted again. Never empty: the
-        // callback only sends what already survived the filter.
+        // merges several, so the union has to be sorted again. Never empty in
+        // practice: the callback only sends what already survived the filter,
+        // and a new directory arrives alongside its own creation.
         batch.sort();
         batch.dedup();
-        events.publish(Some(id.clone()), Event::FsChanged { paths: batch });
+        if !batch.is_empty() {
+            events.publish(Some(id.clone()), Event::FsChanged { paths: batch });
+        }
+    }
+}
+
+/// Folds one message into the current batch. A new directory is walked and
+/// watched, and whatever the walk found is reported too: anything written
+/// into the directory before its watch was in place would otherwise have
+/// gone unheard.
+async fn absorb(root: &Path, watcher: &mut RecommendedWatcher, msg: Msg, batch: &mut Vec<String>) {
+    match msg {
+        Msg::Changed(paths) => batch.extend(paths),
+        Msg::NewDir(dir) => {
+            let walked = tokio::task::spawn_blocking(move || walk(&dir))
+                .await
+                .unwrap_or_default();
+            for d in &walked.dirs {
+                watch_quietly(watcher, d);
+            }
+            batch.extend(relative_paths(root, &walked.entries));
+        }
     }
 }
 
@@ -284,5 +430,57 @@ mod tests {
             relative_paths(&root, &input),
             vec!["README.md".to_string(), "src/main.rs".to_string()]
         );
+    }
+
+    /// The walk never enters an ignored directory and never follows a link, so
+    /// neither can cost a watch.
+    #[test]
+    fn walk_skips_ignored_directories_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/a/b")).unwrap();
+        std::fs::create_dir_all(root.join("crates/x/target/debug")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("src"), root.join("link")).unwrap();
+
+        let walked = walk(root);
+        let dirs: Vec<_> = walked
+            .dirs
+            .iter()
+            .map(|d| {
+                d.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(dirs[0], "", "the root comes first");
+        for d in ["src", "src/deep", "crates", "crates/x"] {
+            assert!(dirs.contains(&d.to_string()), "{d} missing from {dirs:?}");
+        }
+        assert!(
+            !dirs
+                .iter()
+                .any(|d| d.contains("node_modules") || d.contains("target")),
+            "ignored directories were walked: {dirs:?}"
+        );
+        assert!(
+            !dirs.contains(&"link".to_string()),
+            "a symlink was followed"
+        );
+        let entries: Vec<_> = walked
+            .entries
+            .iter()
+            .map(|d| {
+                d.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(entries.contains(&"src/main.rs".to_string()));
+        assert!(!entries.iter().any(|e| e.starts_with("node_modules")));
     }
 }

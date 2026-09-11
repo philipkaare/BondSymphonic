@@ -363,31 +363,20 @@ impl PtyManager {
     /// SIGHUP; sending it a second time would change nothing, so the signal
     /// ladder in [`escalate`] runs instead.
     pub async fn close(&self, id: &PtyId) -> Result<Empty, RpcError> {
-        let s = self.session(id).await?;
-        (s.killer)();
+        close_session(&self.sessions, id).await
+    }
 
+    /// Closes `id` once `token` is cancelled, if the session is still there by
+    /// then. Used to tie a host terminal to the connection that opened it: an
+    /// unsandboxed login left running with nobody watching is precisely what
+    /// the host path must never leave behind.
+    pub fn close_on(&self, id: PtyId, token: tokio_util::sync::CancellationToken) {
         let sessions = self.sessions.clone();
-        let id = id.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(CLOSE_GRACE).await;
-            // The pump retires the session as soon as it has an exit code, so a
-            // session still present here did not take the hint.
-            let still_live = sessions.lock().await.get(&id).cloned();
-            let Some(s) = still_live else {
-                return;
-            };
-            if s.backend == "linux_bwrap" {
-                // The lock is released between the two writes: holding it across
-                // the settle would stall any concurrent `pty.write`.
-                let _ = s.writer.lock().await.write_all(INTERRUPT).await;
-                tokio::time::sleep(SETTLE).await;
-                let _ = s.writer.lock().await.write_all(END_OF_INPUT).await;
-                (s.killer)();
-            } else {
-                escalate(&sessions, &id, &s).await;
-            }
+            token.cancelled().await;
+            // `NotFound` here means the session ended on its own first.
+            let _ = close_session(&sessions, &id).await;
         });
-        Ok(Empty {})
     }
 
     /// Ends every host setup terminal and waits, within a bounded budget, for
@@ -428,19 +417,71 @@ impl PtyManager {
     }
 
     /// Closes every PTY belonging to `ws`, used when the workspace goes away.
+    ///
+    /// The killer alone is not enough here any more than it is in [`close`]:
+    /// on the no-sandbox backend it is a bare SIGHUP, which a command can
+    /// ignore and go on running after the worktree under it has been deleted.
+    /// The workspace is on its way out, so there is nothing to be polite to:
+    /// after one [`SIGNAL_GRACE`] whatever is still registered gets the signal
+    /// ladder, on every backend. The ladders run detached, so a destroy is not
+    /// held up by them.
+    ///
+    /// [`close`]: PtyManager::close
     pub async fn close_workspace(&self, ws: &WorkspaceId) {
-        let victims: Vec<Arc<Session>> = self
+        let victims: Vec<(PtyId, Arc<Session>)> = self
             .sessions
             .lock()
             .await
-            .values()
-            .filter(|s| s.workspace_id.as_ref() == Some(ws))
-            .cloned()
+            .iter()
+            .filter(|(_, s)| s.workspace_id.as_ref() == Some(ws))
+            .map(|(id, s)| (id.clone(), s.clone()))
             .collect();
-        for s in victims {
+        for (id, s) in victims {
             (s.killer)();
+            let sessions = self.sessions.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(SIGNAL_GRACE).await;
+                if sessions.lock().await.contains_key(&id) {
+                    escalate(&sessions, &id, &s).await;
+                }
+            });
         }
     }
+}
+
+/// [`PtyManager::close`] over the shared session map, so it can run from a
+/// task that holds the map rather than the manager.
+async fn close_session(sessions: &Sessions, id: &PtyId) -> Result<Empty, RpcError> {
+    let s = sessions
+        .lock()
+        .await
+        .get(id)
+        .cloned()
+        .ok_or_else(|| RpcError::not_found(format!("pty {id}")))?;
+    (s.killer)();
+
+    let sessions = sessions.clone();
+    let id = id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(CLOSE_GRACE).await;
+        // The pump retires the session as soon as it has an exit code, so a
+        // session still present here did not take the hint.
+        let still_live = sessions.lock().await.get(&id).cloned();
+        let Some(s) = still_live else {
+            return;
+        };
+        if s.backend == "linux_bwrap" {
+            // The lock is released between the two writes: holding it across
+            // the settle would stall any concurrent `pty.write`.
+            let _ = s.writer.lock().await.write_all(INTERRUPT).await;
+            tokio::time::sleep(SETTLE).await;
+            let _ = s.writer.lock().await.write_all(END_OF_INPUT).await;
+            (s.killer)();
+        } else {
+            escalate(&sessions, &id, &s).await;
+        }
+    });
+    Ok(Empty {})
 }
 
 #[cfg(test)]

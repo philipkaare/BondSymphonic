@@ -424,3 +424,53 @@ async fn start_bwrap_daemon(
     tokio::spawn(async move { server.with_handler(handler).run(c2).await.unwrap() });
     (port, token, cancel)
 }
+
+/// Closing a workspace's terminals has to end a command that ignores the
+/// backend's polite signal, the way `pty.close` does.
+///
+/// `close_workspace` runs from `workspace.destroy`, and on the no-sandbox
+/// backend the killer it fires is a bare SIGHUP. A command that traps SIGHUP
+/// survived it, kept its session registered and its process running, and the
+/// destroy went on to delete the worktree from under it. `pty.close` already
+/// escalates past that; the workspace path has to take the same ladder.
+#[cfg(unix)]
+#[tokio::test]
+async fn closing_a_workspace_ends_a_terminal_that_ignores_hangups() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = common::start_daemon(&dir.path().join("data")).await;
+    let mut c = common::Client::connect(port, &token).await;
+    let ws = create_workspace(&mut c, &repo, "hup").await;
+
+    let pty = open_pty(
+        &mut c,
+        &ws.id,
+        Some(r#"sh -c "trap '' HUP; sleep 60""#.to_string()),
+    )
+    .await;
+    // Let the shell install its trap before anything is sent to it.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    daemon.ptys.close_workspace(&ws.id).await;
+
+    // The session retires as soon as the pump sees the child exit, so a write
+    // that faults is proof the process is really gone rather than merely asked.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut gone = false;
+    while !gone && tokio::time::Instant::now() < deadline {
+        gone = matches!(
+            c.call(Request::PtyWrite(PtyWriteParams {
+                pty_id: pty.clone(),
+                data_b64: String::new(),
+            }))
+            .await,
+            Err(e) if e.code == ErrorCode::NotFound
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        gone,
+        "close_workspace must escalate past a signal the command ignores"
+    );
+    cancel.cancel();
+}

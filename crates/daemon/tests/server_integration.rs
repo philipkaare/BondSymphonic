@@ -41,6 +41,19 @@ async fn recv(r: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Option<Serve
     Some(codec::decode(line.trim_end()).unwrap())
 }
 
+/// [`recv`] for the tests that expect the daemon to hang up on them, where a
+/// failed read counts as the hang-up. Closing a socket that still has unread
+/// bytes in its receive buffer resets the connection rather than ending it
+/// cleanly, so a peer the daemon cut off mid-flood sees an error where a peer
+/// it let finish sees end of file. Both are the disconnect.
+async fn recv_or_reset(r: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Option<ServerMessage> {
+    let mut line = String::new();
+    match r.read_line(&mut line).await {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(codec::decode(line.trim_end()).unwrap()),
+    }
+}
+
 #[tokio::test]
 async fn hello_with_good_token_returns_version() {
     let (port, token, cancel, _h) = start().await;
@@ -712,6 +725,118 @@ async fn hello_without_a_protocol_version_is_accepted_as_version_one() {
     match recv(&mut r).await.unwrap() {
         ServerMessage::Response { id: 2, error, .. } => assert!(error.is_none(), "{error:?}"),
         other => panic!("unexpected {other:?}"),
+    }
+    cancel.cancel();
+}
+
+/// A handler that panics must not take its request's reply with it. Each request runs
+/// in its own task, and a task that panics simply ends: without a reply carrying the
+/// caller's id, the client waits on that request forever, and the panic is invisible.
+/// The reply is an `Internal` error, and the connection goes on serving.
+#[tokio::test]
+async fn a_panicking_handler_is_answered_with_an_internal_error_and_the_connection_survives() {
+    struct PanicOnList {
+        inner: std::sync::Arc<dyn Handler>,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for PanicOnList {
+        async fn handle(&self, req: Request, ctx: &ConnCtx) -> Result<serde_json::Value, RpcError> {
+            match req {
+                Request::WorkspaceList {} => panic!("test panic inside a handler"),
+                other => self.inner.handle(other, ctx).await,
+            }
+        }
+    }
+
+    let cfg = ServerConfig::default();
+    let capabilities = cfg.capabilities.clone();
+    let server = Server::bind(cfg).await.unwrap();
+    let port = server.port();
+    let token = server.token().to_string();
+    let server = server.with_handler(std::sync::Arc::new(PanicOnList {
+        inner: std::sync::Arc::new(SystemHandler {
+            token: token.clone(),
+            capabilities,
+        }),
+    }));
+    let cancel = CancellationToken::new();
+    let c2 = cancel.clone();
+    tokio::spawn(async move { server.run(c2).await.unwrap() });
+
+    let (mut r, mut w) = connect(port).await;
+    send(
+        &mut w,
+        1,
+        Request::Hello(HelloParams {
+            token,
+            client_version: "0.1.0".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
+        }),
+    )
+    .await;
+    recv(&mut r).await.unwrap();
+
+    send(&mut w, 2, Request::WorkspaceList {}).await;
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), recv(&mut r))
+        .await
+        .expect("the panicking request must still be answered")
+        .expect("the connection must stay open");
+    match reply {
+        ServerMessage::Response {
+            id: 2,
+            error: Some(e),
+            ..
+        } => assert_eq!(e.code, ErrorCode::Internal, "{e:?}"),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    send(&mut w, 3, Request::SystemCheckPrereqs {}).await;
+    match recv(&mut r).await.unwrap() {
+        ServerMessage::Response { id: 3, error, .. } => assert!(error.is_none(), "{error:?}"),
+        other => panic!("unexpected {other:?}"),
+    }
+    cancel.cancel();
+}
+
+/// Before `hello` a peer is nobody, and nobody gets to make the daemon buffer an
+/// unbounded line. A `hello` is a few hundred bytes; two megabytes without a newline is
+/// not a slow client, it is a flood, and it ends the connection with no reply.
+#[tokio::test]
+async fn a_flood_without_a_newline_before_hello_is_disconnected_without_a_reply() {
+    let (port, _token, cancel, _h) = start().await;
+    let (mut r, mut w) = connect(port).await;
+    let flood = vec![b'x'; 2 * 1024 * 1024];
+    // The daemon may close the socket before the whole flood is written, in which
+    // case the write itself fails: that is the disconnect this test is after.
+    let _ = w.write_all(&flood).await;
+    let closed =
+        tokio::time::timeout(std::time::Duration::from_secs(5), recv_or_reset(&mut r)).await;
+    match closed {
+        Ok(None) => {}
+        Ok(Some(msg)) => panic!("no reply is owed to a flood, got {msg:?}"),
+        Err(_) => panic!("the connection was not closed: the daemon is buffering the flood"),
+    }
+    cancel.cancel();
+}
+
+/// A peer that connects and then says nothing is holding a connection slot for
+/// nothing. Ten seconds of silence before `hello` ends it.
+///
+/// Time is paused: the runtime jumps straight to the daemon's own timeout the moment
+/// every task is idle, so the test takes milliseconds and still exercises the real
+/// deadline rather than a shortened one.
+#[tokio::test(start_paused = true)]
+async fn silence_before_hello_is_disconnected() {
+    let (port, _token, cancel, _h) = start().await;
+    let (mut r, _w) = connect(port).await;
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(60), recv(&mut r)).await;
+    match closed {
+        Ok(None) => {}
+        Ok(Some(msg)) => panic!("no reply is owed to silence, got {msg:?}"),
+        Err(_) => {
+            panic!("a silent peer was kept for a minute; it should be gone after ten seconds")
+        }
     }
     cancel.cancel();
 }

@@ -549,3 +549,102 @@ async fn on_windows_a_setup_terminal_is_answered_cleanly_either_way() {
     c.call(Request::WorkspaceList {}).await.unwrap();
     cancel.cancel();
 }
+
+/// A setup terminal belongs to the connection that opened it. It runs on the
+/// host with no sandbox around it, so when its client goes away — the IDE
+/// crashed, or was closed mid-login — nothing else is going to close it, and
+/// an unsandboxed login left running with nobody watching is precisely what
+/// the host path must never leave behind. The daemon closes it when the
+/// connection drops; a second connection can watch it go.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_host_terminal_is_closed_when_the_connection_that_opened_it_drops() {
+    let _home = fake_home();
+    let dir = tempfile::tempdir().unwrap();
+    let (port, token, _daemon, cancel) = common::start_daemon(&dir.path().join("data")).await;
+    let mut opener = common::Client::connect(port, &token).await;
+
+    let pty = open_setup(&mut opener, SetupAction::GhLogin).await.unwrap();
+    let mut out = String::new();
+    pump_until(
+        &mut opener,
+        &mut out,
+        &pty,
+        std::time::Duration::from_secs(20),
+        |o, _| o.contains(DEVICE_CODE_LINE),
+    )
+    .await;
+    assert!(out.contains(DEVICE_CODE_LINE), "collected: {out}");
+
+    // A second client, connected before the first goes, sees the same session:
+    // the id is an ordinary PTY id and the session is daemon-wide.
+    let mut watcher = common::Client::connect(port, &token).await;
+    watcher
+        .call(Request::PtyResize(PtyResizeParams {
+            pty_id: pty.clone(),
+            cols: 100,
+            rows: 30,
+        }))
+        .await
+        .unwrap();
+
+    drop(opener);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut gone = false;
+    while !gone && tokio::time::Instant::now() < deadline {
+        gone = matches!(
+            watcher
+                .call(Request::PtyWrite(PtyWriteParams {
+                    pty_id: pty.clone(),
+                    data_b64: String::new(),
+                }))
+                .await,
+            Err(e) if e.code == ErrorCode::NotFound
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        gone,
+        "a setup terminal must not outlive the connection that opened it"
+    );
+    cancel.cancel();
+}
+
+/// `pty.close` takes the id `system.setup_pty` returned, and the session is
+/// retired once the command is gone.
+#[cfg(unix)]
+#[tokio::test]
+async fn pty_close_accepts_a_host_terminal_id() {
+    let _home = fake_home();
+    let dir = tempfile::tempdir().unwrap();
+    let (port, token, _daemon, cancel) = common::start_daemon(&dir.path().join("data")).await;
+    let mut c = common::Client::connect(port, &token).await;
+
+    let pty = open_setup(&mut c, SetupAction::GhLogin).await.unwrap();
+    let mut out = String::new();
+    pump_until(
+        &mut c,
+        &mut out,
+        &pty,
+        std::time::Duration::from_secs(20),
+        |o, _| o.contains(DEVICE_CODE_LINE),
+    )
+    .await;
+
+    c.call(Request::PtyClose(PtyIdParams {
+        pty_id: pty.clone(),
+    }))
+    .await
+    .expect("pty.close takes a host terminal id");
+    let exit = pump_until(
+        &mut c,
+        &mut out,
+        &pty,
+        std::time::Duration::from_secs(20),
+        |_, exit| exit.is_some(),
+    )
+    .await;
+    assert!(exit.is_some(), "pty.exit expected after close: {out}");
+    cancel.cancel();
+}

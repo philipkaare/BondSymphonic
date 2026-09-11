@@ -225,3 +225,171 @@ async fn watch_reports_relative_paths_debounced_and_ignores_target_dir() {
 
     cancel.cancel();
 }
+
+/// How many inotify watches this process holds, summed over every inotify
+/// descriptor it has open. The kernel lists them in `/proc/self/fdinfo/<fd>`,
+/// one `inotify wd:` line per watch, so this is the watcher's real footprint
+/// against `max_user_watches` rather than anything the daemon claims.
+#[cfg(target_os = "linux")]
+fn inotify_watch_count() -> usize {
+    std::fs::read_dir("/proc/self/fdinfo")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .map(|info| {
+            info.lines()
+                .filter(|l| l.starts_with("inotify wd:"))
+                .count()
+        })
+        .sum()
+}
+
+/// An ignored directory is not merely silenced: it is never watched at all.
+///
+/// Filtering `node_modules/**` paths in the callback keeps the events quiet,
+/// but a recursive watch still installs one inotify watch per directory under
+/// it, and a JS worktree's `node_modules` alone runs to tens of thousands. That
+/// counts against the user's `max_user_watches`, and once it is exhausted the
+/// next `fs.watch` for any workspace fails outright. Linux only: the count is
+/// read from the kernel, and inotify is the backend the limit applies to.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ignored_directories_are_not_watched_and_new_directories_are() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let (port, token, _daemon, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "nm").await;
+    let worktree = std::path::Path::new(&ws.worktree_path).to_path_buf();
+
+    const SUBDIRS: usize = 200;
+    for i in 0..SUBDIRS {
+        std::fs::create_dir_all(worktree.join("node_modules").join(format!("pkg{i}"))).unwrap();
+    }
+    std::fs::create_dir_all(worktree.join("src")).unwrap();
+
+    let before = inotify_watch_count();
+    c.call(Request::FsWatch(FsWatchParams {
+        workspace_id: ws.id.clone(),
+        enable: true,
+    }))
+    .await
+    .unwrap();
+    let installed = inotify_watch_count() - before;
+    assert!(
+        installed < SUBDIRS,
+        "enabling the watch installed {installed} inotify watches: node_modules/ is being watched"
+    );
+
+    // The filter still holds, and it is a live watch: src/ is heard, node_modules/ is not.
+    std::fs::write(worktree.join("node_modules/pkg7/index.js"), "x").unwrap();
+    assert!(
+        wait_for_fs_changed(&mut c, &ws.id, Duration::from_secs(1))
+            .await
+            .is_none(),
+        "node_modules/ is silent"
+    );
+    std::fs::write(worktree.join("src/main.rs"), "fn main() {}").unwrap();
+    let paths = wait_for_fs_changed(&mut c, &ws.id, Duration::from_secs(5))
+        .await
+        .expect("src/ is watched");
+    assert_eq!(paths, vec!["src/main.rs".to_string()]);
+
+    // A directory created after the watch was enabled is picked up: first the
+    // directory itself is reported, then a file written inside it.
+    std::fs::create_dir(worktree.join("src/new")).unwrap();
+    let paths = wait_for_fs_changed(&mut c, &ws.id, Duration::from_secs(5))
+        .await
+        .expect("the new directory is reported");
+    assert!(paths.contains(&"src/new".to_string()), "{paths:?}");
+    std::fs::write(worktree.join("src/new/a.rs"), "x").unwrap();
+    let paths = wait_for_fs_changed(&mut c, &ws.id, Duration::from_secs(5))
+        .await
+        .expect("a file inside the new directory is reported");
+    assert!(paths.contains(&"src/new/a.rs".to_string()), "{paths:?}");
+
+    // And a new ignored directory stays unwatched, however many children it grows.
+    let before = inotify_watch_count();
+    for i in 0..SUBDIRS {
+        std::fs::create_dir_all(
+            worktree
+                .join("packages/web/node_modules")
+                .join(format!("d{i}")),
+        )
+        .unwrap();
+    }
+    wait_for_fs_changed(&mut c, &ws.id, Duration::from_secs(5))
+        .await
+        .expect("packages/ and packages/web/ are reported");
+    let grown = inotify_watch_count().saturating_sub(before);
+    assert!(
+        grown < SUBDIRS,
+        "a nested node_modules/ created later grew the watch set by {grown}"
+    );
+
+    cancel.cancel();
+}
+
+/// Enabling a watch on a big tree walks that tree, and the walk must not be
+/// done under the lock every other `fs.watch` needs: a `disable` for another
+/// workspace, issued while a 5,000-directory tree is being walked, returns
+/// at once rather than after the walk.
+///
+/// Both watchers are driven directly rather than over the protocol, so the
+/// timing measured is the lock's and not the connection's.
+#[tokio::test]
+async fn enabling_a_big_tree_does_not_block_other_workspaces_watches() {
+    use bondsymphonic_daemon::fs_watch::Watchers;
+    use bondsymphonic_daemon::server::broadcast::{EventBus, EVENT_BUS_CAPACITY};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let big = dir.path().join("big");
+    for i in 0..50 {
+        for j in 0..100 {
+            std::fs::create_dir_all(big.join(format!("d{i}/e{j}"))).unwrap();
+        }
+    }
+    let small = dir.path().join("small");
+    std::fs::create_dir_all(&small).unwrap();
+
+    let watchers = Arc::new(Watchers::default());
+    let events = EventBus::new(EVENT_BUS_CAPACITY);
+    let small_id: WorkspaceId = "ws_small".into();
+    watchers
+        .enable(small_id.clone(), small.clone(), events.clone())
+        .unwrap();
+
+    // The walk runs on a blocking thread; the disable is timed from the
+    // runtime once the walk is known to be under way.
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let big_id: WorkspaceId = "ws_big".into();
+    let walk = {
+        let (w, s, ev) = (watchers.clone(), started.clone(), events.clone());
+        tokio::task::spawn_blocking(move || {
+            s.store(true, std::sync::atomic::Ordering::SeqCst);
+            let t = Instant::now();
+            w.enable(big_id, big, ev).unwrap();
+            t.elapsed()
+        })
+    };
+    while !started.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let t = Instant::now();
+    tokio::task::spawn_blocking({
+        let w = watchers.clone();
+        move || w.disable(&small_id)
+    })
+    .await
+    .unwrap();
+    let disable_took = t.elapsed();
+    let enable_took = walk.await.unwrap();
+    eprintln!(
+        "enable of 5,000 dirs took {enable_took:?}; concurrent disable took {disable_took:?}"
+    );
+    assert!(
+        disable_took < Duration::from_millis(100),
+        "disable waited {disable_took:?} behind a {enable_took:?} walk: the lock is held across it"
+    );
+}

@@ -14,6 +14,10 @@ pub struct ConnCtx {
     pub authenticated: Arc<AtomicBool>,
     pub events: EventBus,
     pub shutdown: CancellationToken,
+    /// Cancelled when this connection ends, however it ends. A handler that starts
+    /// something on the peer's behalf which must not outlive the peer — a host setup
+    /// terminal, say — ties it to this.
+    pub disconnected: CancellationToken,
 }
 
 impl ConnCtx {

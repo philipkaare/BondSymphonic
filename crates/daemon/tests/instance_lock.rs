@@ -158,3 +158,44 @@ fn a_daemon_refuses_a_data_dir_locked_by_anything_else() {
     drop(held);
     InstanceLock::acquire(&data).expect("released when the handle goes");
 }
+
+/// On Windows the lock is a share-mode-zero open, and a sharing violation is
+/// what *any* other open handle on the file produces — not only another
+/// daemon's. An antivirus scanner, an indexer or a backup agent that has the
+/// lock file open for reading for a moment looks exactly like a rival daemon,
+/// and the daemon would exit 2, which the launcher treats as "do not restart".
+/// A brief hold is retried through; only a hold that persists is `Busy`.
+#[cfg(windows)]
+#[test]
+fn a_transient_reader_of_the_lock_file_does_not_make_the_directory_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let path = InstanceLock::path_in(&data);
+    std::fs::write(&path, b"").unwrap();
+
+    // Something else has the file open for reading for 200 ms. A plain
+    // `File::open` shares reads and writes, but our own open shares nothing,
+    // so the daemon's open fails with a sharing violation for as long as this
+    // handle lives.
+    let reader = {
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let f = std::fs::File::open(&p).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            drop(f);
+        })
+    };
+    std::thread::sleep(Duration::from_millis(20));
+
+    let started = Instant::now();
+    let lock = InstanceLock::acquire(&data);
+    let took = started.elapsed();
+    reader.join().unwrap();
+    match lock {
+        Ok(_) => {}
+        Err(e) => {
+            panic!("a reader that held the file for 200 ms was reported as {e} after {took:?}")
+        }
+    }
+}

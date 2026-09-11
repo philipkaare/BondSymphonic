@@ -115,17 +115,24 @@ impl Handler for WorkspaceHandler {
             // A setup terminal runs on the host rather than in a sandbox, so
             // it needs the daemon and cannot live in `SystemHandler` with the
             // other `system.*` methods.
-            Request::SystemSetupPty(p) => ok(d
-                .ptys
-                .open_host(
-                    d,
-                    crate::setup::setup_argv(p.action),
-                    crate::sandbox::PtySize {
-                        cols: p.cols.max(2),
-                        rows: p.rows.max(1),
-                    },
-                )
-                .await?),
+            Request::SystemSetupPty(p) => {
+                let opened = d
+                    .ptys
+                    .open_host(
+                        d,
+                        crate::setup::setup_argv(p.action),
+                        crate::sandbox::PtySize {
+                            cols: p.cols.max(2),
+                            rows: p.rows.max(1),
+                        },
+                    )
+                    .await?;
+                // A host terminal runs unsandboxed and belongs to the connection that
+                // asked for it: when that connection goes, so does the terminal.
+                d.ptys
+                    .close_on(opened.pty_id.clone(), ctx.disconnected.clone());
+                ok(opened)
+            }
             Request::PtyOpen(p) => ok(d.ptys.open(d, p).await?),
             Request::PtyWrite(p) => ok(d.ptys.write(p).await?),
             Request::PtyResize(p) => ok(d.ptys.resize(p).await?),

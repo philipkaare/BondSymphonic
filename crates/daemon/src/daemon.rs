@@ -135,21 +135,38 @@ fn lock_exclusive(path: &Path) -> Result<InstanceLock, LockFailure> {
 fn lock_exclusive(path: &Path) -> Result<InstanceLock, LockFailure> {
     use std::os::windows::fs::OpenOptionsExt;
 
-    /// `ERROR_SHARING_VIOLATION`: someone else has the file open and did not
-    /// share it. That someone is the daemon that got here first.
+    /// `ERROR_SHARING_VIOLATION`: someone else has the file open. A share mode
+    /// of zero refuses *every* other handle, so that someone is the daemon that
+    /// got here first — or, for a moment, an antivirus scanner, an indexer or a
+    /// backup agent that has the file open for reading. Those let go; a rival
+    /// daemon does not. So the open is retried for a second before the
+    /// violation is taken to mean `Busy`, an answer the launcher treats as
+    /// final and never restarts from.
     const ERROR_SHARING_VIOLATION: i32 = 32;
+    const RETRIES: u32 = 20;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .share_mode(0)
-        .open(path)
-    {
-        Ok(file) => Ok(InstanceLock { _file: file }),
-        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Err(LockFailure::Busy),
-        Err(e) => Err(LockFailure::Io(e)),
+    let mut attempt = 0;
+    loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(path)
+        {
+            Ok(file) => return Ok(InstanceLock { _file: file }),
+            Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+                if attempt < RETRIES {
+                    attempt += 1;
+                    std::thread::sleep(RETRY_DELAY);
+                    continue;
+                }
+                return Err(LockFailure::Busy);
+            }
+            Err(e) => return Err(LockFailure::Io(e)),
+        }
     }
 }
 
