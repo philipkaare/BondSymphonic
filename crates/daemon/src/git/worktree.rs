@@ -208,6 +208,14 @@ pub enum RemoveBranch {
 /// fatal. None of the three can be confused with the worktree *directory*
 /// already existing, which git reports as `<path> already exists` — no ref, no
 /// branch, no lock.
+///
+/// **This rests on a guarantee made elsewhere:** the phrases above are git's
+/// English, and a git running under any other locale prints none of them, so
+/// every branch conflict would be classified as an unrelated failure. What
+/// makes that impossible is [`crate::git::Git::command`] setting `LC_ALL=C` on
+/// every git this daemon starts, in one place, for exactly this reason. The
+/// dependency is not local: a fourth runner that built its own `Command`
+/// instead would break this function without touching this file.
 fn branch_is_already_there(e: &RpcError) -> bool {
     e.data
         .as_ref()
