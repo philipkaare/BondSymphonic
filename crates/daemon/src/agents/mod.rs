@@ -502,7 +502,14 @@ const ENDED_BEFORE_RESTART: &str = "the agent ended before the daemon restarted"
 
 /// The `data.reason` on the `Conflict` a second simultaneous `agent.start` in
 /// one workspace gets. Wire format, shared with the IDE by value.
-pub const REASON_AGENT_RUNNING: &str = "agent_running";
+///
+/// It names a start that is in flight, which is not the same as an agent that
+/// is running: a workspace with three agents in it takes a fourth start
+/// perfectly happily, and what the gate refuses is only a *second start at the
+/// same moment*. The earlier spelling, `agent_running`, described a rule the
+/// daemon does not have, and a client acting on it would tell the user to stop
+/// an agent when the answer is to try again in a second.
+pub const REASON_AGENT_STARTING: &str = "agent_starting";
 
 /// Every agent the daemon is running, and the requests that reach them.
 ///
@@ -520,6 +527,9 @@ pub struct AgentManager {
     /// The agents on disk, which is what makes the map survivable: see
     /// [`restore`](AgentManager::restore).
     records: Arc<AgentRecords>,
+    /// Which programs this daemon has already asked for a version: see
+    /// [`claude::Probed`].
+    probed: claude::Probed,
 }
 
 impl AgentManager {
@@ -531,6 +541,7 @@ impl AgentManager {
             next_ordinal: AtomicU64::new(0),
             starts: Mutex::new(HashMap::new()),
             records: Arc::new(AgentRecords::new(records)),
+            probed: claude::Probed::default(),
         }
     }
 
@@ -672,7 +683,7 @@ impl AgentManager {
                 ErrorCode::Conflict,
                 format!("another agent is already starting in workspace {}", ws.id),
             )
-            .with_data(serde_json::json!({ "reason": REASON_AGENT_RUNNING }))
+            .with_data(serde_json::json!({ "reason": REASON_AGENT_STARTING }))
         })?;
         // The backend decides how the CLI is named: bound into the sandbox at a
         // fixed path under bwrap, and at its host path where there are no
@@ -681,7 +692,7 @@ impl AgentManager {
         let argv = claude::claude_argv(&p.options, d.backend.name())?;
         // And before anything is written: a CLI that cannot even say its
         // version is one this workspace should not be prepared for.
-        claude::probe_claude(d.backend.name()).await?;
+        claude::probe_claude(&self.probed, d.backend.name()).await?;
 
         // Again at start, not only at creation: the user may have logged in
         // since this workspace was made, and a workspace that was created

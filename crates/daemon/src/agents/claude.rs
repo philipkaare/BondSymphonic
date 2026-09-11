@@ -365,14 +365,23 @@ fn probe_bin(backend: &str) -> Result<Vec<String>, RpcError> {
     Ok(vec![host.to_string_lossy().into_owned()])
 }
 
-/// The programs whose `--version` has already answered.
+/// The programs whose `--version` has already answered, for one daemon.
 ///
 /// The probe is worth running once per program, not once per agent: it costs a
 /// process start, and what it learns cannot change while the file does not. A
-/// probe that *failed* is deliberately not in here — a half-installed CLI that
-/// the user then repairs must be usable without restarting the daemon, which is
-/// exactly what a `OnceCell` filled with the failure prevented.
-static PROBED: Mutex<Vec<Vec<String>>> = Mutex::new(Vec::new());
+/// probe that *failed* is deliberately not remembered — a half-installed CLI
+/// that the user then repairs must be usable without restarting the daemon,
+/// which is exactly what a `OnceCell` filled with the failure prevented.
+///
+/// One per [`AgentManager`](crate::agents::AgentManager) rather than one per
+/// process. In production the two are the same thing -- one daemon per machine,
+/// one `claude` on it -- but a test binary holds several daemons at once, and a
+/// process-global list let one test's probe decide another's. The tests that
+/// are *about* the probe worked around that by pointing `BS_CLAUDE_BIN` at a
+/// copy of the fake under a path of their own, which only held while every such
+/// test remembered to.
+#[derive(Default)]
+pub struct Probed(Mutex<Vec<Vec<String>>>);
 
 /// Runs `claude --version` before an agent is started, and warns when the
 /// installed CLI is not the version this adapter was verified against.
@@ -392,9 +401,9 @@ static PROBED: Mutex<Vec<Vec<String>>> = Mutex::new(Vec::new());
 /// points at a stand-in whose version number says nothing about the protocol.
 /// The probe itself still runs, because "does this program answer at all" is
 /// the question the start wants answered.
-pub async fn probe_claude(backend: &str) -> Result<(), RpcError> {
+pub async fn probe_claude(probed: &Probed, backend: &str) -> Result<(), RpcError> {
     let bin = probe_bin(backend)?;
-    if PROBED.lock().iter().any(|seen| seen == &bin) {
+    if probed.0.lock().iter().any(|seen| seen == &bin) {
         return Ok(());
     }
     let mut cmd = tokio::process::Command::new(&bin[0]);
@@ -437,7 +446,7 @@ pub async fn probe_claude(backend: &str) -> Result<(), RpcError> {
             // The program answered, so there is nothing to learn by asking
             // again. A non-zero status counts: a stand-in that does not
             // understand `--version` still runs.
-            PROBED.lock().push(bin);
+            probed.0.lock().push(bin);
         }
         // Not fatal here, and not remembered: the spawn that follows fails with
         // the real reason, which names the program and what the operating system
@@ -766,8 +775,14 @@ impl AgentAdapter for ClaudeAdapter {
             // detail rather than replacing the exit. An agent left in `Error`
             // is one the IDE shows as a live tab for ever, and one whose next
             // turn comes back as a broken pipe instead of "this agent ended".
+            //
+            // The code still goes on the end of it, in the same layout the
+            // stderr tail gets: the reason the turn failed is the better half
+            // of the story and leads, but an exit that says only what went
+            // wrong and not how the process went leaves out the one thing the
+            // daemon knows and the agent never said.
             let detail = match sink.entry().state() {
-                (AgentState::Error, Some(why)) => why,
+                (AgentState::Error, Some(why)) => format!("{why} (exit code {code})"),
                 _ => exit_detail(code, &tail, Layout::TailFirst),
             };
             // `stop` may be ending this same process; the flag makes one of the

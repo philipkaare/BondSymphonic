@@ -57,7 +57,11 @@ fn arg_path(p: &std::path::Path) -> String {
 /// Every knob the two fixture programs read. Each test sets the ones it wants
 /// and the helpers below clear all of them first, so nothing leaks from one
 /// test into the next through the process environment.
-const FIXTURE_KNOBS: [&str; 8] = [
+///
+/// A slice rather than a fixed-length array: the length is not a fact about
+/// anything, and spelling it out means adding a knob is two edits with a
+/// compiler error in between.
+const FIXTURE_KNOBS: &[&str] = &[
     "FAKE_CLAUDE_ECHO_DELAY",
     "FAKE_CLAUDE_NO_WAIT",
     "FAKE_CLAUDE_VERSION_DELAY",
@@ -81,9 +85,12 @@ fn use_fake_claude(py: &str, fixture: &str) {
 
 /// The same, from a *copy* of the fake at `at`.
 ///
-/// The daemon probes `--version` once per program, so a test that needs the
-/// probe to actually run -- the two that are about what the probe does -- has to
-/// name a program no earlier test in this binary has already probed.
+/// A daemon probes `--version` once per program and remembers the answer for
+/// its own lifetime, so a test that needs the probe to actually run -- the two
+/// that are about what the probe does -- names a program of its own. That the
+/// list is per daemon rather than per process means a copy is belt and braces
+/// now; it was the only thing making those two tests work when one test's probe
+/// could answer for another's.
 fn use_fake_claude_copy(py: &str, at: &std::path::Path, fixture: &str) {
     std::fs::create_dir_all(at.parent().unwrap()).unwrap();
     std::fs::copy(fixture_dir().join("fake_claude.py"), at).unwrap();
@@ -96,6 +103,15 @@ fn use_dying_claude(py: &str, fixture: Option<&str>) {
     use_program(py, &fixture_dir().join("dying_claude.py"), fixture);
 }
 
+/// Points the adapter at `program`, replaying `fixture`, with every knob back
+/// at its default.
+///
+/// The knobs are cleared *last*, after the two variables above are set, and the
+/// order is the whole contract: a test calls one of the `use_*` helpers first
+/// and then sets the knobs it wants, so this is the point at which whatever the
+/// previous test left in the process environment is thrown away. Clearing first
+/// and setting the variables after would wipe nothing that matters and leave
+/// every knob of the previous test standing.
 fn use_program(py: &str, program: &std::path::Path, fixture: Option<&str>) {
     std::env::set_var(
         "BS_CLAUDE_BIN",
@@ -1280,7 +1296,10 @@ async fn two_starts_at_once_in_one_workspace_do_not_race() {
         (Err(x), Err(y)) => panic!("neither start succeeded: {x:?}, {y:?}"),
     };
     assert_eq!(refused.code, ErrorCode::Conflict, "{refused:?}");
-    assert_eq!(reason_of(&refused), "agent_running", "{refused:?}");
+    // The gate means "a start is already in flight in this workspace", which
+    // is not the same as "an agent is running": a workspace with three running
+    // agents takes a fourth start perfectly happily.
+    assert_eq!(reason_of(&refused), "agent_starting", "{refused:?}");
 
     // The winner's settings landed whole.
     let settings = d.dirs.home(&ws.id).join(".claude").join("settings.json");
@@ -1482,6 +1501,14 @@ async fn an_errored_turn_that_ends_the_process_is_reported_as_an_exit() {
     assert!(
         detail.contains("Not logged in"),
         "the exit must keep the reason the turn failed: {detail:?}"
+    );
+    // And the code beside it. The error the turn ended with is the better half
+    // of the story, which is why it leads, but an exit that says only what went
+    // wrong and not how the process went leaves out the one thing the daemon
+    // knows and the agent did not say.
+    assert!(
+        detail.contains("exit code 0"),
+        "the exit must carry the status as well as the reason: {detail:?}"
     );
 
     let h = history_of(&mut c, &ag).await;
