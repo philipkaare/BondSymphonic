@@ -18,6 +18,7 @@
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/run_panel.cxxqt.h"
+#include "bondsymphonic-ide/src/qobjects/smoke.cxx.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/transcript_model.cxxqt.h"
 #include <QAction>
@@ -353,6 +354,10 @@ bool MainWindow::announceMenuTest(const char* what, const QString& target,
                                 .toUtf8();
     std::fwrite(line.constData(), 1, static_cast<size_t>(line.size()), stdout);
     std::fflush(stdout);
+    // The script's `quit` step waits for these rather than sleeping for a fixed
+    // two seconds: the seam fires when the daemon has filled the bar, which is
+    // not something a delay can know.
+    bsMenuTestReported();
     return true;
 }
 

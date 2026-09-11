@@ -86,12 +86,11 @@ private:
     /// Schedules [`runMenuTests`] once the model is large enough for the menus
     /// to have something to act on, and only ever once.
     void armMenuTest();
+    /// Opens each menu the seam asked for over a named index, having asked the
+    /// smoke script for the model state to install while it is up. The states
+    /// themselves are the script's: this widget holds no application state, and
+    /// a fixture is application state.
     void runMenuTests();
-    /// The model state [`execMenu`] installs while a menu is up: the displayed
-    /// group's tabs reversed, or the groups rotated, so an index resolved after
-    /// the menu names something other than what was clicked.
-    QString stateWithTabsReversed() const;
-    QString stateWithGroupsRotated() const;
 
     GroupModel* m_model;
     QTabBar* m_groupTabs = nullptr;

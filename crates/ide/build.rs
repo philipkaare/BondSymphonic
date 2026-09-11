@@ -38,6 +38,10 @@ fn main() {
         .file("src/qobjects/changes_model.rs")
         .file("src/qobjects/transcript_model.rs")
         .file("src/qobjects/run_panel.rs")
+        // Not a QObject: three free functions the `BS_MENU_TEST` seam in
+        // `GroupBar` and `MainWindow` calls, so the model fixtures a menu step
+        // installs are built in Rust rather than in a widget.
+        .file("src/qobjects/smoke.rs")
         // Headers are run through moc, sources are compiled.
         .cpp_files([
             "cpp/GroupBar.h",

@@ -1,7 +1,9 @@
 #include "GroupBar.h"
 #include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
+#include "bondsymphonic-ide/src/qobjects/smoke.cxx.h"
 #include <QAction>
+#include <QByteArray>
 #include <QChar>
 #include <QColor>
 #include <QFont>
@@ -77,6 +79,19 @@ QString statusDot() {
 /// perfectly healthy. The tab's tooltip says what it is waiting for.
 QString attentionDot() {
     return QStringLiteral(" ") + QString(QChar(0x2022));
+}
+
+/// A `QString` as the borrowed UTF-8 slice the script's fixture builders take.
+/// The `QByteArray` is the owner and must outlive the call, so it is named.
+::rust::Str rustStr(const QByteArray& utf8) {
+    return ::rust::Str(utf8.constData(), static_cast<std::size_t>(utf8.size()));
+}
+
+/// The fixture the script built, as a `QString`. Empty means the script found
+/// nothing to rearrange, and the seam then installs nothing rather than
+/// emptying the model.
+QString menuTestFixture(const ::rust::String& state) {
+    return QString::fromUtf8(state.data(), static_cast<qsizetype>(state.size()));
 }
 
 /// The steps in `BS_MENU_TEST`. **Test-only**: the variable is unset in every
@@ -414,7 +429,11 @@ QAction* GroupBar::execMenu(QMenu& menu, const QPoint& globalPos) {
     // The seam, and the whole of what it does: the model moves while the menu
     // is up, exactly as a daemon event would move it, and then an item is
     // chosen. Nothing here runs unless `BS_MENU_TEST` armed it.
-    m_model->loadState(m_menuTestState);
+    if (!m_menuTestState.isEmpty()) {
+        // Empty means the script found nothing to rearrange. Loading it would
+        // empty the model, and the step would then pass for the wrong reason.
+        m_model->loadState(m_menuTestState);
+    }
     for (QAction* action : menu.actions()) {
         if (action->text() == m_menuTestChoice) {
             return action;
@@ -440,55 +459,22 @@ void GroupBar::armMenuTest() {
 }
 
 void GroupBar::runMenuTests() {
+    const QByteArray stateUtf8 = m_model->getStateJson().toUtf8();
     for (const QString& step : m_menuTestSteps) {
         if (step == QLatin1String("destroy")) {
             // The second tab of the group on show, with that group's tabs
             // reversed under the menu.
-            m_menuTestState = stateWithTabsReversed();
+            m_menuTestState = menuTestFixture(
+                bsMenuTestStateWithTabsReversed(rustStr(stateUtf8), m_displayGroup));
             m_menuTestChoice = QStringLiteral("Destroy workspace…");
             openAgentMenu(1, QPoint());
         } else if (step == QLatin1String("close-group")) {
-            // The second group, with the groups rotated under the menu.
-            m_menuTestState = stateWithGroupsRotated();
+            // The second group, brought to the front under the menu.
+            m_menuTestState = menuTestFixture(bsMenuTestStateWithGroupsRotated(rustStr(stateUtf8)));
             m_menuTestChoice = QStringLiteral("Close group…");
             openGroupMenu(1, QPoint());
         }
         m_menuTestChoice.clear();
         m_menuTestState.clear();
     }
-}
-
-QString GroupBar::stateWithTabsReversed() const {
-    QJsonObject state = QJsonDocument::fromJson(m_model->getStateJson().toUtf8()).object();
-    QJsonArray groups = state.value(QStringLiteral("groups")).toArray();
-    if (m_displayGroup < 0 || m_displayGroup >= groups.size()) {
-        return QString();
-    }
-    QJsonObject group = groups.at(m_displayGroup).toObject();
-    const QJsonArray tabs = group.value(QStringLiteral("tabs")).toArray();
-    QJsonArray reversed;
-    for (int i = tabs.size() - 1; i >= 0; --i) {
-        reversed.append(tabs.at(i));
-    }
-    group.insert(QStringLiteral("tabs"), reversed);
-    groups.replace(m_displayGroup, group);
-    state.insert(QStringLiteral("groups"), groups);
-    return QString::fromUtf8(QJsonDocument(state).toJson(QJsonDocument::Compact));
-}
-
-QString GroupBar::stateWithGroupsRotated() const {
-    QJsonObject state = QJsonDocument::fromJson(m_model->getStateJson().toUtf8()).object();
-    const QJsonArray groups = state.value(QStringLiteral("groups")).toArray();
-    if (groups.size() < 2) {
-        return QString();
-    }
-    QJsonArray rotated;
-    rotated.append(groups.at(1));
-    for (int i = 0; i < groups.size(); ++i) {
-        if (i != 1) {
-            rotated.append(groups.at(i));
-        }
-    }
-    state.insert(QStringLiteral("groups"), rotated);
-    return QString::fromUtf8(QJsonDocument(state).toJson(QJsonDocument::Compact));
 }

@@ -83,6 +83,7 @@ use crate::client::DaemonClient;
 use crate::qobjects::app_controller::{connection_generation, shared, QtHandle};
 use bondsymphonic_proto::*;
 use cxx_qt_lib::QString;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// The comma-separated step list. Unset in every ordinary run.
@@ -94,8 +95,18 @@ const DEFAULT_REPO: &str = "/smoke/repo";
 const BASE_BRANCH: &str = "main";
 /// The group the created tabs are filed under.
 const GROUP: &str = "Default";
-/// How long `quit` leaves the window running before ending the process.
+/// The `GroupBar`/`MainWindow` menu seam's step list. Read here as well as in
+/// C++, so `quit` knows how many reports to wait for.
+const MENU_TEST_ENV: &str = "BS_MENU_TEST";
+/// How long `quit` leaves the window running before ending the process, so the
+/// debounced writes the last steps provoked have landed.
 const QUIT_DELAY: Duration = Duration::from_secs(2);
+/// The longest `quit` waits, *before* that, for the menu seam to have reported
+/// every step it was given. Generous: it is a bound on a wait that ordinarily
+/// ends in milliseconds, and a run that reaches it has already gone wrong.
+const MENU_TEST_LIMIT: Duration = Duration::from_secs(10);
+/// How often that wait looks.
+const MENU_TEST_POLL: Duration = Duration::from_millis(50);
 /// How long `close` waits for the `pty.exit` events it triggers to reach the
 /// window's terminals, so the steps after it act on exited sessions.
 const EXIT_SETTLE: Duration = Duration::from_millis(750);
@@ -672,12 +683,125 @@ async fn tree(client: &DaemonClient, workspace: Option<&WorkspaceId>) -> Result<
 /// would need a C++ shim in `cpp/app.*`. The cost of exiting instead is that
 /// destructors do not run, so a crash on the way out would go unseen.
 async fn quit(qt: &QtHandle) -> Result<(), String> {
+    // Waits for the menu seam to have reported every step `BS_MENU_TEST` asked
+    // for, rather than trusting the settle below to have covered it. The seam
+    // fires from the Qt thread once the bar has tabs to open a menu over, which
+    // is however long the daemon takes to answer `workspace.list` -- not
+    // something a fixed delay can know, and a run that ended in the middle of a
+    // menu would fail on a missing line rather than on what it is checking.
+    let deadline = Instant::now() + MENU_TEST_LIMIT;
+    let wanted = menu_test_steps();
+    while menu_test_reports() < wanted && Instant::now() < deadline {
+        tokio::time::sleep(MENU_TEST_POLL).await;
+    }
+    if menu_test_reports() < wanted {
+        tracing::warn!(
+            target: "smoke",
+            "quitting with {}/{wanted} menu seam reports",
+            menu_test_reports()
+        );
+    }
+    // The settle proper: every step's answer reaches the window through the Qt
+    // queue and some of what it does with them -- the layout, the tab list --
+    // is written back on a debounce.
     tokio::time::sleep(QUIT_DELAY).await;
     qt.queue(|_| {
         tracing::info!(target: "smoke", "quit");
         std::process::exit(0)
     })
     .map_err(|_| "the Qt thread is gone".to_owned())
+}
+
+// --- the menu seam's half of the script --------------------------------------
+//
+// `GroupBar` opens a context menu over a named tab or group, rearranges the
+// model while it is up and chooses an item, so the window's handler is reached
+// with the model already moved. The rearranged model is a *fixture*, and a
+// widget that "holds no application state" is the wrong place to build one:
+// both are written here and handed over the bridge below.
+
+/// The displayed group's tabs reversed, as one `GroupModel` state JSON.
+///
+/// What the bar installs while the agent menu is up, so the index the user
+/// clicked names a different workspace once the menu closes. An empty answer
+/// means the state does not describe `group`, and the seam then installs
+/// nothing rather than emptying the bar.
+pub fn menu_test_state_with_tabs_reversed(state_json: &str, group: i32) -> String {
+    let Ok(mut state) = serde_json::from_str::<serde_json::Value>(state_json) else {
+        return String::new();
+    };
+    let Ok(index) = usize::try_from(group) else {
+        return String::new();
+    };
+    let Some(groups) = state.get_mut("groups").and_then(|g| g.as_array_mut()) else {
+        return String::new();
+    };
+    let Some(entry) = groups.get_mut(index) else {
+        return String::new();
+    };
+    let Some(tabs) = entry.get_mut("tabs").and_then(|t| t.as_array_mut()) else {
+        return String::new();
+    };
+    tabs.reverse();
+    state.to_string()
+}
+
+/// The groups with the second one brought to the front, as one `GroupModel`
+/// state JSON. The group menu's fixture, for the same reason: the index
+/// resolved after the menu names a group the user did not click.
+pub fn menu_test_state_with_groups_rotated(state_json: &str) -> String {
+    let Ok(mut state) = serde_json::from_str::<serde_json::Value>(state_json) else {
+        return String::new();
+    };
+    let Some(groups) = state.get_mut("groups").and_then(|g| g.as_array_mut()) else {
+        return String::new();
+    };
+    if groups.len() < 2 {
+        return String::new();
+    }
+    groups.swap(0, 1);
+    state.to_string()
+}
+
+/// How many seam steps have printed their report. Bumped from C++, read by
+/// `quit`.
+static MENU_TEST_REPORTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Called from `MainWindow::announceMenuTest` for each menu step it answers.
+pub fn menu_test_reported() {
+    MENU_TEST_REPORTS.fetch_add(1, Ordering::Relaxed);
+}
+
+fn menu_test_reports() -> usize {
+    MENU_TEST_REPORTS.load(Ordering::Relaxed)
+}
+
+/// How many menu steps `BS_MENU_TEST` asked for, which is how many reports
+/// `quit` waits for. Only the two that open a menu count: the seam's other
+/// steps report from the window as it is built and are long past by the time
+/// any script step runs.
+fn menu_test_steps() -> usize {
+    let Ok(raw) = std::env::var(MENU_TEST_ENV) else {
+        return 0;
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|step| *step == "destroy" || *step == "close-group")
+        .count()
+}
+
+/// The bridge those three cross. Plain `cxx`, not `cxx-qt`: none of this is a
+/// QObject, and the widget needs three free functions.
+#[cxx::bridge]
+pub mod seam {
+    extern "Rust" {
+        #[cxx_name = "bsMenuTestStateWithTabsReversed"]
+        fn menu_test_state_with_tabs_reversed(state_json: &str, group: i32) -> String;
+        #[cxx_name = "bsMenuTestStateWithGroupsRotated"]
+        fn menu_test_state_with_groups_rotated(state_json: &str) -> String;
+        #[cxx_name = "bsMenuTestReported"]
+        fn menu_test_reported();
+    }
 }
 
 /// The workspace a step operates on, or an error naming what is missing.
@@ -692,4 +816,59 @@ fn need_agent(agent: Option<&AgentId>, step: &str) -> Result<AgentId, String> {
     agent
         .cloned()
         .ok_or_else(|| format!("`{step}` needs an `open_agent` before it"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STATE: &str = r#"{"active_group":0,"groups":[
+        {"name":"alpha","tabs":[{"workspace_id":"ws_1"},{"workspace_id":"ws_2"}]},
+        {"name":"beta","tabs":[{"workspace_id":"ws_3"}]}]}"#;
+
+    fn ids(state: &str, group: usize) -> Vec<String> {
+        serde_json::from_str::<serde_json::Value>(state).expect("the fixture is JSON")["groups"]
+            [group]["tabs"]
+            .as_array()
+            .expect("tabs")
+            .iter()
+            .map(|tab| tab["workspace_id"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_agent_menu_fixture_reverses_only_the_group_on_show() {
+        let moved = menu_test_state_with_tabs_reversed(STATE, 0);
+        assert_eq!(ids(&moved, 0), ["ws_2", "ws_1"]);
+        // The other group is left exactly as it was: the fixture is about the
+        // index the menu was opened over, not about the whole model.
+        assert_eq!(ids(&moved, 1), ["ws_3"]);
+    }
+
+    /// A group the state does not describe builds nothing rather than an empty
+    /// model: the seam would otherwise replace the bar's contents with nothing
+    /// and the step would pass for the wrong reason.
+    #[test]
+    fn a_group_that_is_not_there_builds_no_fixture() {
+        assert!(menu_test_state_with_tabs_reversed(STATE, 7).is_empty());
+        assert!(menu_test_state_with_tabs_reversed("not json", 0).is_empty());
+    }
+
+    #[test]
+    fn the_group_menu_fixture_moves_the_second_group_to_the_front() {
+        let moved = menu_test_state_with_groups_rotated(STATE);
+        let state: serde_json::Value = serde_json::from_str(&moved).expect("JSON");
+        let names: Vec<&str> = state["groups"]
+            .as_array()
+            .expect("groups")
+            .iter()
+            .map(|g| g["name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(names, ["beta", "alpha"]);
+        // One group cannot be rotated onto anything, so there is no fixture.
+        assert!(
+            menu_test_state_with_groups_rotated(r#"{"groups":[{"name":"alpha","tabs":[]}]}"#)
+                .is_empty()
+        );
+    }
 }
