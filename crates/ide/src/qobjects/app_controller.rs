@@ -1098,62 +1098,6 @@ fn parse_setup_action(action: &str) -> Option<SetupAction> {
     }
 }
 
-/// The last `agent.state` seen for each of the most recent agents, so a state
-/// that reached the IDE before `agent.start` answered can still be applied once
-/// a tab knows which agent it is running.
-///
-/// The reply and the event travel on different channels -- one comes back on
-/// the request the IDE issued, the other arrives on the daemon's event stream
-/// -- so the daemon can announce that an agent is working before the IDE has
-/// been told which workspace that agent belongs to. The window binds the tab to
-/// the agent in its `agentStarted` slot, so until that has run there is no tab
-/// the event can reach and the model drops it. A Claude agent that goes
-/// straight to work and stays there emits nothing else until it is finished, so
-/// what the user sees is a tab that reads "idle" for the whole turn.
-///
-/// Nothing is withheld to make this work: the event is delivered when it
-/// arrives, exactly as before, and this only keeps a copy to offer again. That
-/// matters for the tabs rebuilt from `workspace.list`, which know their agent
-/// from the start and never get an `agentStarted` at all.
-///
-/// Bounded, and the bound is the point: every `agent.state` the daemon sends is
-/// offered to this, including states for agents this IDE never started, and an
-/// agent that is never announced would otherwise hold its entry for the life of
-/// the process.
-#[derive(Debug, Default)]
-pub struct RecentAgentStates {
-    /// Oldest first, one entry per agent, each holding the newest state seen.
-    held: std::collections::VecDeque<(String, String, String)>,
-}
-
-impl RecentAgentStates {
-    /// How many agents are remembered at once. A handful would cover the race
-    /// this exists for; this is generous enough that a daemon with many live
-    /// agents cannot push a pending one out before its start answers, and small
-    /// enough to be a rounding error beside one workspace list.
-    pub const CAPACITY: usize = 64;
-
-    /// Records the newest state for `agent`, replacing any earlier one.
-    pub fn note(&mut self, agent: &str, state: &str, detail: &str) {
-        self.held.retain(|(id, _, _)| id != agent);
-        self.held
-            .push_back((agent.to_owned(), state.to_owned(), detail.to_owned()));
-        while self.held.len() > Self::CAPACITY {
-            self.held.pop_front();
-        }
-    }
-
-    /// Takes the state held for `agent`, if there is one.
-    ///
-    /// Taken rather than read: it is replayed once, and replaying it a second
-    /// time would push a state the tab has already moved past back onto it.
-    pub fn take(&mut self, agent: &str) -> Option<(String, String)> {
-        let idx = self.held.iter().position(|(id, _, _)| id == agent)?;
-        let (_, state, detail) = self.held.remove(idx)?;
-        Some((state, detail))
-    }
-}
-
 /// What the connection state becomes the instant a connection ends, before
 /// anything slow is done about it.
 ///
@@ -1166,6 +1110,27 @@ impl RecentAgentStates {
 ///
 /// `next` is the attempt the loop is about to make, so the number the user is
 /// watching does not jump when the backoff starts counting it.
+/// Drops the client and publishes `losing`, in one step on the Qt thread.
+///
+/// One function because it is one invariant, and two statements side by side
+/// are how an invariant stops being one. The property must never read
+/// "connected" while the handle every operation reaches for is already gone:
+/// [`on_connection_lost`] has emptied the shared slot by the time this is
+/// called, so [`require_connection`] is already answering every invokable with
+/// "daemon connection lost". Split across two `queue` calls, the Qt thread
+/// could run the first and paint a frame before the second arrived.
+///
+/// Called before the old daemon is reaped, not after. `shutdown` closes the
+/// daemon's stdin and waits for the process to exit, which takes as long as the
+/// daemon takes to go, and a status bar still reading "daemon: connected" for
+/// all of that is the IDE claiming a connection it is itself refusing.
+fn publish_connection_loss(qt: &QtHandle, losing: ConnectionState) {
+    let _ = qt.queue(move |mut q| {
+        q.as_mut().rust_mut().client = None;
+        q.set_state(losing);
+    });
+}
+
 pub fn state_after_loss(quitting: bool, fatal: bool, next: u32) -> ConnectionState {
     match (quitting, fatal) {
         // The IDE is on its way out: nothing is reconnected, and the bar says
@@ -1212,9 +1177,6 @@ pub struct AppControllerRust {
     /// The last `prereqs_checked` payload, so a setup page built later can
     /// draw its rows without waiting for another check. See `prereqs_json`.
     prereqs_json: QString,
-    /// `agent.state` events kept for a moment in case the `agent.start` that
-    /// names their agent has not answered yet. See [`RecentAgentStates`].
-    recent_agent_states: RecentAgentStates,
 }
 
 impl Default for AppControllerRust {
@@ -1233,7 +1195,6 @@ impl Default for AppControllerRust {
             // in the seconds before the first `system.check_prereqs` answers.
             claude_logged_in: false,
             prereqs_json: QString::from(""),
-            recent_agent_states: RecentAgentStates::default(),
         }
     }
 }
@@ -1379,16 +1340,11 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
                 let id = agent_id.to_string();
                 let word = agent_state_word(state);
                 let detail = detail.unwrap_or_default();
-                let _ = qt.queue(move |mut q| {
-                    // Kept as well as delivered. A tab that already knows this
-                    // agent -- one the user started a while ago, one rebuilt
-                    // from the workspace list -- applies it now; one whose
-                    // `agent.start` has not answered yet has nowhere to put it,
-                    // and is given it again by `announce_agent_started`.
-                    q.as_mut()
-                        .rust_mut()
-                        .recent_agent_states
-                        .note(&id, word, &detail);
+                // Delivered and not buffered here. A state that names an
+                // agent no tab is running yet is held by `GroupModel`, which is
+                // where a tab learns its agent; see `group_model::
+                // HeldAgentStates`.
+                let _ = qt.queue(move |q| {
                     q.agent_state_changed(
                         QString::from(&id),
                         QString::from(word),
@@ -1570,7 +1526,7 @@ async fn start_agent_and_prompt(
         }
     };
     let (ws, id) = (workspace.to_string(), agent_id.to_string());
-    let _ = qt.queue(move |q| q.announce_agent_started(&ws, &id));
+    let _ = qt.queue(move |q| q.agent_started(QString::from(&ws), QString::from(&id)));
 
     if initial_prompt.is_empty() {
         return;
@@ -1720,15 +1676,7 @@ async fn supervise(spec: LaunchSpec, qt: QtHandle, process: ProcessHandle) {
         // fails at once, with a reason, instead of issuing a request nobody
         // will answer.
         on_connection_lost();
-        let losing = state_after_loss(quitting(), fatal, next);
-        let _ = qt.queue(move |mut q| {
-            q.as_mut().rust_mut().client = None;
-            // The same step, so the property can never say "connected" while
-            // the handle every operation reaches for is already gone -- and
-            // before the reaping below, which waits for the daemon process to
-            // exit and can take seconds. See [`state_after_loss`].
-            q.set_state(losing);
-        });
+        publish_connection_loss(&qt, state_after_loss(quitting(), fatal, next));
         // The old child is reaped rather than left behind: `shutdown` closes
         // its stdin, which is how the daemon is asked to exit, and then kills
         // the relay -- so a relaunch cannot end up with two daemons over one
@@ -2571,32 +2519,6 @@ impl qobject::AppController {
         self.as_mut().set_daemon_version(version);
         let state = self.as_ref().current_state();
         self.refresh_status(state);
-    }
-
-    /// Announces that `workspace_id` is now running `agent_id`, then applies the
-    /// last `agent.state` that reached the IDE before this reply did.
-    ///
-    /// The replay is the whole reason this is not a bare `agentStarted` emit.
-    /// The window binds the tab to the agent in its `agentStarted` slot, so
-    /// until that has run there is no tab an `agent.state` can reach and the
-    /// model drops it; a state that overtook the reply has to be offered again
-    /// afterwards or it is lost, and a Claude agent that goes straight to work
-    /// and stays there says nothing else until it has finished. Delivered after
-    /// the signal, in the same Qt-thread step, so the tab it is meant for
-    /// certainly exists by then.
-    fn announce_agent_started(mut self: Pin<&mut Self>, workspace_id: &str, agent_id: &str) {
-        self.as_mut()
-            .agent_started(QString::from(workspace_id), QString::from(agent_id));
-        let replay = self.as_mut().rust_mut().recent_agent_states.take(agent_id);
-        let Some((state, detail)) = replay else {
-            return;
-        };
-        tracing::info!("agent {agent_id} reported {state} before its start answered; applying it");
-        self.agent_state_changed(
-            QString::from(agent_id),
-            QString::from(&state),
-            QString::from(&detail),
-        );
     }
 
     pub fn prepare_quit(&self) {

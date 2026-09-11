@@ -107,6 +107,11 @@ const RUN_LIMIT: Duration = Duration::from_secs(90);
 /// that never showed them to a user never logs them either.
 const RECONNECTING_TEXT: &str = "daemon: reconnecting (attempt 1)";
 const CONNECTED_TEXT: &str = "daemon: connected";
+/// The script step that makes the fake daemon drop the connection, logged by
+/// `smoke::run` before it runs. Everything after it in the log is the gap this
+/// test is about, which is what lets the status lines be read in order rather
+/// than merely counted.
+const DROP_STEP: &str = "step: reconnect";
 /// Failures that mean the reconnect happened but left something behind: a pane
 /// still holding a subscription on the dead router, or a re-sync that could not
 /// be read.
@@ -234,6 +239,30 @@ fn the_ide_reconnects_after_the_daemon_drops_the_connection() {
     assert!(
         logs[reconnecting..].contains(CONNECTED_TEXT),
         "the status bar never went back to connected after reconnecting\n{context}"
+    );
+
+    // IC5. The same three lines read as a sequence rather than a set, anchored
+    // on the script step that caused the drop: after the connection ends, the
+    // next thing the status bar says has to be that it is reconnecting. A bar
+    // that went straight from "connected" to "connected" would mean the loss
+    // was never published, and every operation attempted in between was
+    // already failing with "daemon connection lost" behind a bar claiming a
+    // connection. `refresh_status` logs only on a change, so the absence of a
+    // reconnecting line is exactly that bug and not a missing print.
+    let dropped = logs
+        .find(DROP_STEP)
+        .unwrap_or_else(|| panic!("the script never reached the drop step\n{context}"));
+    let after_drop = &logs[dropped..];
+    let said = |text: &str| after_drop.find(text);
+    let next_status = [RECONNECTING_PREFIX, CONNECTED_TEXT]
+        .into_iter()
+        .filter_map(|text| said(text).map(|at| (at, text)))
+        .min();
+    assert_eq!(
+        next_status.map(|(_, text)| text),
+        Some(RECONNECTING_PREFIX),
+        "after the drop the status bar must say it is reconnecting before it \
+         says anything else\n{context}"
     );
 
     for warning in NO_WARNINGS {
@@ -706,7 +735,9 @@ fn wait_for_text(
 /// Task 10: what the status bar says the moment a connection ends.
 mod task_10 {
     use bondsymphonic_ide::model::app_state::ConnectionState;
-    use bondsymphonic_ide::qobjects::app_controller::{next_attempt, state_after_loss};
+    use bondsymphonic_ide::qobjects::app_controller::{
+        next_attempt, on_connection_lost, require_connection, state_after_loss, CONNECTION_LOST,
+    };
     use std::time::Duration;
 
     /// The gap between a connection ending and the next attempt starting is not
@@ -744,5 +775,38 @@ mod task_10 {
         assert_eq!(state_after_loss(true, false, 1), ConnectionState::Lost);
         assert_eq!(state_after_loss(true, true, 1), ConnectionState::Lost);
         assert_eq!(state_after_loss(false, true, 1), ConnectionState::Error);
+    }
+
+    /// The invariant the finding is actually worded as: the IDE never says it
+    /// is connected while its own operations are refusing for want of a
+    /// connection.
+    ///
+    /// Driven through the two process-wide functions `supervise` itself calls,
+    /// in the order it calls them, rather than through a copy of them:
+    /// `on_connection_lost` empties the shared slot and arms the "was lost"
+    /// latch, and from that instant `require_connection` -- which every
+    /// invokable goes through -- answers with the sentence the user gets. The
+    /// state published in the same step must therefore not be `Connected`, for
+    /// any of the three endings and any attempt number.
+    #[test]
+    fn nothing_the_loss_publishes_says_connected_while_operations_are_refused() {
+        on_connection_lost();
+        assert_eq!(
+            require_connection().err(),
+            Some(CONNECTION_LOST),
+            "every operation must already be failing with a reason"
+        );
+        for quitting in [false, true] {
+            for fatal in [false, true] {
+                for attempt in [1, 2, 30] {
+                    let state = state_after_loss(quitting, fatal, attempt);
+                    assert_ne!(
+                        state,
+                        ConnectionState::Connected,
+                        "quitting={quitting} fatal={fatal} attempt={attempt}"
+                    );
+                }
+            }
+        }
     }
 }

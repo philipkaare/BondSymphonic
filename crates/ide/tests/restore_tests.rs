@@ -729,3 +729,286 @@ mod task_10 {
         }
     }
 }
+
+/// Task 10: the `agent.state` that overtakes its own `agent.start` reply.
+///
+/// This is the race itself, driven through the real IDE: the fake daemon writes
+/// the event on the stream *before* it answers the request that names the
+/// agent, so when `GroupModel::setAgentStatus` runs there is no tab running
+/// that agent. The window then binds the tab in its `agentStarted` slot, and
+/// the held state has to reach it. Before the fix the event was simply
+/// dropped, and a Claude agent that went straight to work read "idle" until it
+/// finished.
+///
+/// The two log lines this asserts are the mechanism's own, one per half, and
+/// their order is the claim: held first, applied second.
+mod task_10_agent_state_race {
+    use super::{drain, wait_for, Journal, TOKEN};
+    use bondsymphonic_proto::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    /// Make a Claude workspace, start an agent in it, quit. `open_agent` is
+    /// what issues `agent.start`, and the window binds the tab because it
+    /// reacted to `agentStarted`.
+    const SCRIPT: &str = "create_claude,open_agent,quit";
+    const WS: &str = "ws_race";
+    const AGENT: &str = "ag_race";
+    /// How long the fake daemon waits between writing the event and answering
+    /// the request. The IDE reads the stream in order, so the event is already
+    /// ahead; this removes the scheduling question entirely rather than leaving
+    /// the test to win a race it is supposed to be observing.
+    const EVENT_LEAD: Duration = Duration::from_millis(300);
+    /// `create_claude` settles 750 ms, `open_agent` 1.5 s, `quit` 2 s, and a
+    /// cold Qt start is the rest.
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+    /// What `GroupModel` says as it holds the state, and as it applies it.
+    const HELD: &str = "agent ag_race reported working before any tab was running it; holding it";
+    const APPLIED: &str =
+        "agent ag_race reported working before its start was announced; applying it";
+
+    #[test]
+    fn an_agent_state_that_overtook_its_start_reply_still_reaches_the_tab() {
+        if bondsymphonic_ide::testing::skip_without_qt("restore/task-10-race") {
+            return;
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (addr, journal) = rt.block_on(fake_daemon());
+
+        // Never the developer's real `%APPDATA%\BondSymphonic`.
+        let config = std::env::temp_dir().join(format!("bs-restore-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("config dir");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", SCRIPT)
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", config.join("state.json"))
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let seen = journal.lock().expect("journal mutex").clone();
+        let logs = format!("{out}\n{err}");
+        let context = format!("requests: {seen:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(
+            status.success(),
+            "the IDE exited with {status}, expected 0\n{context}"
+        );
+        assert!(
+            !logs.contains("panicked at"),
+            "the IDE logged a panic\n{context}"
+        );
+        // The premise: an agent really was started, so the event the daemon
+        // wrote before answering really did overtake its own reply.
+        assert!(
+            seen.iter().any(|m| m == "agent.start"),
+            "the script never started an agent\n{context}"
+        );
+
+        // Half one: the state arrived with no tab to put it on, and was kept.
+        let held = logs
+            .find(HELD)
+            .unwrap_or_else(|| panic!("the early agent state was dropped, not held\n{context}"));
+        // Half two: the tab learned its agent and the state was applied to it.
+        let applied = logs
+            .find(APPLIED)
+            .unwrap_or_else(|| panic!("the held agent state never reached the tab\n{context}"));
+        assert!(
+            held < applied,
+            "the state must be held before it is applied\n{context}"
+        );
+        // Once. A replay that fired again would push a state the tab has moved
+        // past back onto it.
+        assert_eq!(
+            logs.matches(APPLIED).count(),
+            1,
+            "the held state was replayed more than once\n{context}"
+        );
+
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// A daemon that announces an agent is working before it admits the agent
+    /// exists.
+    async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let recorded = journal.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (r, mut w) = stream.into_split();
+                let mut r = BufReader::new(r);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let ClientMessage::Request { id, request } =
+                        codec::decode(line.trim_end()).expect("decode");
+                    recorded
+                        .lock()
+                        .expect("journal mutex")
+                        .push(request.method_name().to_owned());
+                    let reply = match request {
+                        Request::Hello(p) if p.token == TOKEN => ServerMessage::ok(
+                            id,
+                            &HelloResult {
+                                daemon_version: "0.0.0-fake".into(),
+                                capabilities: Capabilities {
+                                    sandbox_backend: "noop".into(),
+                                    git_protect: false,
+                                    adapters: vec![
+                                        AgentAdapterKind::Terminal,
+                                        AgentAdapterKind::Claude,
+                                    ],
+                                },
+                                protocol_version: Some(PROTOCOL_VERSION),
+                            },
+                        ),
+                        Request::Hello(_) => ServerMessage::err(id, RpcError::unauthorized()),
+                        Request::SystemCheckPrereqs {} => ServerMessage::ok(
+                            id,
+                            &CheckPrereqsResult {
+                                items: vec![PrereqStatus {
+                                    name: "git".into(),
+                                    ok: true,
+                                    detail: "git version 2.43".into(),
+                                    fix_hint: None,
+                                }],
+                            },
+                        ),
+                        Request::WorkspaceList {} => ServerMessage::ok(
+                            id,
+                            &WorkspaceListResult {
+                                workspaces: Vec::new(),
+                            },
+                        ),
+                        Request::WorkspaceCreate(p) => {
+                            ServerMessage::ok(id, &workspace(WS, &p.name))
+                        }
+                        Request::WorkspaceGet(_) => ServerMessage::ok(id, &workspace(WS, "smoke")),
+                        // The race, written on purpose. The event goes out
+                        // first and the reply that names the agent second, so
+                        // the IDE is told what `ag_race` is doing before it has
+                        // been told which workspace `ag_race` belongs to.
+                        Request::AgentStart(p) => {
+                            let event = ServerMessage::event(
+                                Some(p.workspace_id.clone()),
+                                Event::AgentStateChanged {
+                                    agent_id: AgentId(AGENT.to_owned()),
+                                    state: AgentState::Working,
+                                    detail: Some("editing main.rs".to_owned()),
+                                },
+                            );
+                            if w.write_all(codec::encode(&event).as_bytes()).await.is_err() {
+                                break;
+                            }
+                            tokio::time::sleep(EVENT_LEAD).await;
+                            ServerMessage::ok(
+                                id,
+                                &AgentStartResult {
+                                    agent_id: AgentId(AGENT.to_owned()),
+                                },
+                            )
+                        }
+                        // Consistent with the event: a history that answered
+                        // "idle" would be the daemon contradicting itself, and
+                        // the tab would be right to believe the later word.
+                        Request::AgentHistory(_) => ServerMessage::ok(
+                            id,
+                            &HistoryResult {
+                                messages: Vec::new(),
+                                state: AgentState::Working,
+                                detail: Some("editing main.rs".to_owned()),
+                            },
+                        ),
+                        Request::FsListDir(_) => ServerMessage::ok(
+                            id,
+                            &ListDirResult {
+                                entries: Vec::new(),
+                            },
+                        ),
+                        Request::WorkspaceChanges(_) => {
+                            ServerMessage::ok(id, &ChangesResult { files: vec![] })
+                        }
+                        Request::WorkspaceStatus(_) => {
+                            ServerMessage::ok(id, &WorkspaceStatusResult { entries: vec![] })
+                        }
+                        Request::RepoDetectRunConfigs(_) => ServerMessage::ok(
+                            id,
+                            &DetectRunConfigsResult {
+                                configs: vec![],
+                                network_allow: vec![],
+                                warnings: vec![],
+                            },
+                        ),
+                        Request::RunList(_) => {
+                            ServerMessage::ok(id, &RunListResult { runs: vec![] })
+                        }
+                        Request::FsWatch(_) | Request::AgentStop(_) => {
+                            ServerMessage::ok(id, &Empty {})
+                        }
+                        other => ServerMessage::err(
+                            id,
+                            RpcError::internal(format!("not implemented: {}", other.method_name())),
+                        ),
+                    };
+                    if w.write_all(codec::encode(&reply).as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        (addr, journal)
+    }
+
+    fn workspace(id: &str, name: &str) -> WorkspaceInfo {
+        WorkspaceInfo {
+            id: WorkspaceId(id.to_owned()),
+            name: name.to_owned(),
+            repo_path: "/restore/repo".to_owned(),
+            base_branch: "main".to_owned(),
+            branch: format!("bs/{name}/work"),
+            worktree_path: format!("/wt/{id}"),
+            created_at: "2026-09-11T10:00:00Z".to_owned(),
+            allowlist: Vec::new(),
+            state: WorkspaceState::Ready,
+            agents: Vec::new(),
+            agent_records: Vec::new(),
+            runs: Vec::new(),
+        }
+    }
+}

@@ -1619,9 +1619,14 @@ mod cpp_widgets {
 /// the model drops the event, and the agent then works in silence until it
 /// happens to change state again -- which, for an agent that goes straight to
 /// work and stays there, is when it finishes.
+///
+/// The buffer that closes it lives on `GroupModel`, beside `set_agent`, which
+/// is where a tab learns its agent. These cover the data structure; the wiring
+/// through the real `setAgentStatus`/`setAgent` pair is covered end to end by
+/// `restore_tests::task_10::an_agent_state_that_overtook_its_start_reply_still_reaches_the_tab`.
 mod task_10 {
-    use bondsymphonic_ide::model::app_state::{parse_agent_state, TabStatus, Workspaces};
-    use bondsymphonic_ide::qobjects::app_controller::RecentAgentStates;
+    use bondsymphonic_ide::model::app_state::{TabStatus, Workspaces};
+    use bondsymphonic_ide::qobjects::group_model::HeldAgentStates;
     use bondsymphonic_proto::{AgentId, WorkspaceState};
 
     #[test]
@@ -1632,22 +1637,19 @@ mod task_10 {
         let agent = AgentId("ag_1".to_owned());
 
         // The event arrives first. No tab is running that agent, so the model
-        // has nowhere to put it -- which is correct, and is why the controller
-        // has to keep it.
+        // has nowhere to put it -- which is correct, and is why `set_agent_status`
+        // hands it to the buffer instead of dropping it.
         assert!(model
             .set_agent_status(&agent, TabStatus::Working, "editing main.rs")
             .is_none());
-        let mut recent = RecentAgentStates::default();
-        recent.note(agent.as_str(), "working", "editing main.rs");
+        let mut held = HeldAgentStates::default();
+        held.note(&agent, TabStatus::Working, "editing main.rs");
 
         // `agent.start` answers: the tab learns the agent, and the state that
         // was held is replayed onto it.
         assert!(model.set_agent(&ws.id, agent.clone()));
-        let (word, detail) = recent.take(agent.as_str()).expect("the state was held");
-        let state = parse_agent_state(&word).expect("a daemon state word");
-        assert!(model
-            .set_agent_status(&agent, TabStatus::from_agent_state(&state), &detail)
-            .is_some());
+        let (status, detail) = held.take(&agent).expect("the state was held");
+        assert!(model.set_agent_status(&agent, status, &detail).is_some());
 
         let tab = model.active().expect("the tab");
         assert_eq!(tab.display_status(), TabStatus::Working);
@@ -1656,33 +1658,30 @@ mod task_10 {
 
         // Replayed once. A second announcement for the same agent has nothing
         // left to apply, so nothing stale is pushed onto a tab that has moved on.
-        assert!(recent.take(agent.as_str()).is_none());
+        assert!(held.take(&agent).is_none());
     }
 
-    /// The buffer is fed by every `agent.state` the daemon sends, including
-    /// ones for agents this IDE never started, so it has to forget as well as
-    /// remember.
+    /// The buffer is fed by every `agent.state` no tab claims, including ones
+    /// for agents this IDE never started, so it has to forget as well as hold.
     #[test]
     fn the_held_agent_states_stay_bounded_and_keep_only_the_newest() {
-        let mut recent = RecentAgentStates::default();
-        for n in 0..RecentAgentStates::CAPACITY + 8 {
-            recent.note(&format!("ag_{n}"), "working", "");
+        let mut held = HeldAgentStates::default();
+        for n in 0..HeldAgentStates::CAPACITY + 8 {
+            held.note(&AgentId(format!("ag_{n}")), TabStatus::Working, "");
         }
         assert!(
-            recent.take("ag_0").is_none(),
+            held.take(&AgentId("ag_0".to_owned())).is_none(),
             "the oldest agent must have been evicted"
         );
-        let newest = format!("ag_{}", RecentAgentStates::CAPACITY + 7);
-        assert!(recent.take(&newest).is_some(), "the newest is still held");
+        let newest = AgentId(format!("ag_{}", HeldAgentStates::CAPACITY + 7));
+        assert!(held.take(&newest).is_some(), "the newest is still held");
 
         // One entry per agent: a second state replaces the first rather than
         // queueing behind it, so a replay applies what is true now.
-        recent.note("ag_x", "working", "");
-        recent.note("ag_x", "idle", "done");
-        assert_eq!(
-            recent.take("ag_x"),
-            Some(("idle".to_owned(), "done".to_owned()))
-        );
-        assert!(recent.take("ag_x").is_none());
+        let x = AgentId("ag_x".to_owned());
+        held.note(&x, TabStatus::Working, "");
+        held.note(&x, TabStatus::Idle, "done");
+        assert_eq!(held.take(&x), Some((TabStatus::Idle, "done".to_owned())));
+        assert!(held.take(&x).is_none());
     }
 }

@@ -330,6 +330,9 @@ pub struct GroupModelRust {
     /// added a mutation and copied the wrong neighbour. Maintained in exactly
     /// one place, and only when it actually moves.
     arrangement: Arrangement,
+    /// `agent.state` events that arrived before any tab was running the agent
+    /// they name. See [`HeldAgentStates`].
+    held_states: HeldAgentStates,
 }
 
 impl Default for GroupModelRust {
@@ -338,6 +341,7 @@ impl Default for GroupModelRust {
         Self {
             state_json: QString::from(&workspaces.to_json()),
             arrangement: arrangement_of(&workspaces),
+            held_states: HeldAgentStates::default(),
             workspaces,
         }
     }
@@ -384,6 +388,60 @@ pub fn group_index_for(workspaces: &mut Workspaces, group_name: &str) -> usize {
     }
 }
 
+/// `agent.state` events for agents no tab is running yet, kept until one is.
+///
+/// `agent.start` answers on the request channel and `agent.state` streams on
+/// the event channel, so the daemon can say an agent is working before the IDE
+/// has been told which workspace that agent belongs to. The window binds the
+/// tab to the agent in its `agentStarted` slot, which calls
+/// [`qobject::GroupModel::set_agent`]; until that has run, `set_agent_status`
+/// finds no tab and the event is gone. A Claude agent that goes straight to
+/// work and stays there emits nothing else until it has finished, so what the
+/// user saw was a tab reading "idle" for the whole turn.
+///
+/// It lives here, beside `set_agent`, rather than on the controller, because
+/// this is where a tab learns its agent. A buffer on the controller could only
+/// replay through the one call path that happened to go through it, and the
+/// window is not the only thing that emits `agentStarted`.
+///
+/// Bounded, and the bound is the point: every `agent.state` the daemon sends
+/// that no tab claims is offered to this, including states for agents this IDE
+/// never started, and an agent that never appears in a tab would otherwise hold
+/// its entry for the life of the process.
+#[derive(Debug, Default)]
+pub struct HeldAgentStates {
+    /// Oldest first, one entry per agent, each holding the newest state seen.
+    held: std::collections::VecDeque<(AgentId, TabStatus, String)>,
+}
+
+impl HeldAgentStates {
+    /// How many agents are held at once. A handful would cover the race this
+    /// exists for; this is generous enough that a daemon with many live agents
+    /// cannot push a pending one out before its start answers, and small enough
+    /// to be a rounding error beside one workspace list.
+    pub const CAPACITY: usize = 64;
+
+    /// Holds the newest state for `agent`, replacing any earlier one.
+    pub fn note(&mut self, agent: &AgentId, status: TabStatus, detail: &str) {
+        self.held.retain(|(id, _, _)| id != agent);
+        self.held
+            .push_back((agent.clone(), status, detail.to_owned()));
+        while self.held.len() > Self::CAPACITY {
+            self.held.pop_front();
+        }
+    }
+
+    /// Takes the state held for `agent`, if there is one.
+    ///
+    /// Taken rather than read: it is replayed once, and replaying it a second
+    /// time would push a state the tab has already moved past back onto it.
+    pub fn take(&mut self, agent: &AgentId) -> Option<(TabStatus, String)> {
+        let idx = self.held.iter().position(|(id, _, _)| id == agent)?;
+        let (_, status, detail) = self.held.remove(idx)?;
+        Some((status, detail))
+    }
+}
+
 /// The status the daemon's own record for `agent_id` implies, or `None` when
 /// the `WorkspaceInfo` says nothing about that agent.
 ///
@@ -398,6 +456,36 @@ pub fn agent_record_status(info: &WorkspaceInfo, agent_id: Option<&AgentId>) -> 
         .iter()
         .find(|record| &record.id == agent_id)
         .map(|record| TabStatus::from_agent_state(&record.state))
+}
+
+/// Gives `tab` the status the daemon's own record for its agent implies, when
+/// the tab has never heard from that agent itself. True when it did.
+///
+/// Two conditions, both narrowing. The workspace must be `Ready`, which is the
+/// one state in which the badge belongs to the agent at all: a sandbox that is
+/// down or a workspace that failed is news about the workspace, and an agent
+/// record says nothing about either. And the tab must have no `agent_status`,
+/// so a tab that has heard from its agent directly is left alone.
+///
+/// It writes `agent_status`, not only `status`, and that is the whole reason it
+/// is a function rather than four lines at the call site.
+/// `Workspaces::refresh_attention` decides the attention bullet and the
+/// status-bar sentence from `agent_status` alone, so a tab rebuilt from
+/// `workspace.list` whose record says the agent is waiting for permission would
+/// otherwise paint the glyph and never the bullet -- and the bullet exists for
+/// exactly the tab the user is not looking at. `status` is written alongside
+/// because this runs after `Workspaces::apply_workspace_info` has already
+/// decided it; every later one derives it from `agent_status` itself.
+pub fn adopt_agent_record(tab: &mut AgentTab, info: &WorkspaceInfo) -> bool {
+    if !matches!(info.state, WorkspaceState::Ready) || tab.agent_status.is_some() {
+        return false;
+    }
+    let Some(status) = agent_record_status(info, tab.agent_id.as_ref()) else {
+        return false;
+    };
+    tab.agent_status = Some(status);
+    tab.status = status;
+    true
 }
 
 /// Qt hands indices in as `i32`; anything negative is simply out of range.
@@ -599,13 +687,8 @@ impl qobject::GroupModel {
             // state in which the badge belongs to the agent at all: a sandbox
             // that is down or a workspace that failed is news about the
             // workspace, and an agent record says nothing about either.
-            if let (Some((g, t)), WorkspaceState::Ready) = (placed, &info.state) {
-                let tab = &mut rust.workspaces.groups[g].tabs[t];
-                if tab.agent_status.is_none() {
-                    if let Some(status) = agent_record_status(&info, tab.agent_id.as_ref()) {
-                        tab.status = status;
-                    }
-                }
+            if let Some((g, t)) = placed {
+                adopt_agent_record(&mut rust.workspaces.groups[g].tabs[t], &info);
             }
             placed
         };
@@ -628,11 +711,31 @@ impl qobject::GroupModel {
     pub fn set_agent(mut self: Pin<&mut Self>, workspace_id: QString, agent_id: QString) -> bool {
         let ws = WorkspaceId(workspace_id.to_string());
         let agent = AgentId(agent_id.to_string());
-        let ok = self.as_mut().rust_mut().workspaces.set_agent(&ws, agent);
-        if ok {
-            self.publish();
+        let ok = self
+            .as_mut()
+            .rust_mut()
+            .workspaces
+            .set_agent(&ws, agent.clone());
+        if !ok {
+            return false;
         }
-        ok
+        // The tab now knows its agent, so an `agent.state` that overtook the
+        // `agent.start` reply finally has somewhere to go. See
+        // [`HeldAgentStates`]. Applied before `publish`, so the tab is painted
+        // once, already carrying the state, rather than flashing idle first.
+        {
+            let mut rust = self.as_mut().rust_mut();
+            if let Some((status, detail)) = rust.held_states.take(&agent) {
+                tracing::info!(
+                    "agent {} reported {} before its start was announced; applying it",
+                    agent.0,
+                    status_text(status)
+                );
+                rust.workspaces.set_agent_status(&agent, status, &detail);
+            }
+        }
+        self.publish();
+        true
     }
 
     pub fn set_agent_status(
@@ -648,12 +751,31 @@ impl qobject::GroupModel {
         };
         let agent = AgentId(agent_id.to_string());
         let status = TabStatus::from_agent_state(&agent_state);
-        let applied = self
-            .as_mut()
-            .rust_mut()
-            .workspaces
-            .set_agent_status(&agent, status, &detail.to_string())
-            .is_some();
+        let detail = detail.to_string();
+        let applied = {
+            let mut rust = self.as_mut().rust_mut();
+            let applied = rust
+                .workspaces
+                .set_agent_status(&agent, status, &detail)
+                .is_some();
+            if !applied {
+                // No tab is running this agent yet. Held rather than dropped:
+                // the `agent.start` that names it may simply not have answered,
+                // and `set_agent` replays it the moment a tab claims the agent.
+                //
+                // Logged because it is the readable half of a race: a tab that
+                // does not move when the daemon says its agent has is otherwise
+                // a silence, and this line and the one in `set_agent` say
+                // between them exactly what happened and when.
+                tracing::info!(
+                    "agent {} reported {} before any tab was running it; holding it",
+                    agent.0,
+                    status_text(status)
+                );
+                rust.held_states.note(&agent, status, &detail);
+            }
+            applied
+        };
         if applied {
             self.publish();
         }
@@ -1156,5 +1278,69 @@ mod tests {
         assert_eq!(agent_record_status(&info, None), None);
         info.agent_records.clear();
         assert_eq!(agent_record_status(&info, Some(&agent)), None);
+    }
+
+    /// The record fallback has to write `agent_status`, not only `status`.
+    ///
+    /// `Workspaces::refresh_attention` decides the attention bullet and the
+    /// status-bar sentence from `agent_status`, so a tab rebuilt from
+    /// `workspace.list` whose record says the agent is waiting for permission
+    /// would otherwise show the glyph and never the bullet -- and the whole
+    /// point of the bullet is the tab the user is *not* looking at.
+    #[test]
+    fn a_restored_tab_waiting_for_permission_asks_for_attention_when_it_loses_focus() {
+        let mut waiting = info("ws_1", "alpha");
+        let agent = AgentId("ag_1".to_owned());
+        waiting.agent_records = vec![AgentSummary {
+            id: agent.clone(),
+            adapter: AgentAdapterKind::Claude,
+            state: AgentState::WaitingPermission,
+            session_id: None,
+            command: None,
+            model: None,
+            permission_mode: None,
+        }];
+        let other = info("ws_2", "beta");
+
+        let mut model = Workspaces::new_default();
+        model.add_tab(0, AgentTab::from_workspace_info(&waiting));
+        model.add_tab(0, AgentTab::from_workspace_info(&other));
+        assert!(model.set_agent(&waiting.id, agent.clone()));
+
+        // What `Workspaces::apply_workspace_info` does, then the rule this
+        // test is about -- the same function `GroupModel::apply_workspace_info`
+        // calls, not a copy of it.
+        let (g, t) = model
+            .apply_workspace_info(&waiting)
+            .expect("the tab is tracked");
+        let tab = &mut model.groups[g].tabs[t];
+        assert!(
+            tab.agent_status.is_none(),
+            "the premise: no agent.state has ever been seen for this tab"
+        );
+        assert!(
+            adopt_agent_record(tab, &waiting),
+            "the daemon's record says what the agent is doing"
+        );
+        assert_eq!(tab.status, TabStatus::WaitingPermission, "the glyph");
+
+        // The user is on `alpha` and switches to `beta`. The tab they left is
+        // the one with the question, so it is the one that has to ask.
+        let (g, t) = model.find(&other.id).expect("beta is tracked");
+        assert!(model.set_active(g, t));
+        assert!(
+            model.refresh_attention(Some(&waiting.id)),
+            "leaving a tab whose agent is waiting must move something"
+        );
+        let (g, t) = model.find(&waiting.id).expect("alpha is tracked");
+        assert!(
+            !model.groups[g].tabs[t].attention.is_empty(),
+            "the tab the user left carries the attention mark"
+        );
+        assert!(
+            model.attention().is_some_and(|t| t.contains("alpha")),
+            "and the status bar names it: {:?}",
+            model.attention()
+        );
     }
 }
