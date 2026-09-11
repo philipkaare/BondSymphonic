@@ -166,6 +166,64 @@ fn s(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
+/// Whether a [`remove`] may delete the workspace's branch.
+///
+/// The branch is the one thing in a `Layout` that is **not** private to the
+/// workspace being removed. Its name comes from the workspace *name*, and so do
+/// `refs/heads/bs/<name>/` and that directory's reflog; the worktree and the
+/// object directory are named after the workspace id and belong to one
+/// workspace alone. So a cleanup that deletes the branch unconditionally is a
+/// cleanup that can delete somebody else's work: two creates of one name, one
+/// of them failing, and `git branch -D` lands on the branch the other one is
+/// checking out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveBranch {
+    /// Delete it. The workspace owns the branch, which is `workspace.destroy`
+    /// and the unwinding of a creation that got as far as making it.
+    Always,
+    /// Leave it, and leave the name-shared ref and reflog directories with it.
+    /// For a cleanup that cannot show the branch is its own.
+    Never,
+}
+
+/// True when `git worktree add -b` refused because the branch is already there.
+///
+/// Three wordings, because git has three, and the third is the one this is
+/// really for:
+///
+/// * `a branch named <b> already exists` — git checked before it started, so
+///   the branch was there all along;
+/// * `<b> is already used by worktree at <path>` — it is there and checked out;
+/// * `cannot lock ref refs/heads/<b>: reference already exists` — git got past
+///   its own check and lost the ref transaction. That is exactly the two-creates
+///   race: both calls looked, neither saw the branch, and one of them wrote it
+///   first.
+///
+/// Matched on git's wording and not on the exit code, which is its general
+/// fatal. None of the three can be confused with the worktree *directory*
+/// already existing, which git reports as `<path> already exists` — no ref, no
+/// branch, no lock.
+fn branch_is_already_there(e: &RpcError) -> bool {
+    e.data
+        .as_ref()
+        .and_then(|d| d["stderr"].as_str())
+        .is_some_and(|s| {
+            s.contains("a branch named")
+                || s.contains("already used by worktree")
+                || s.contains("reference already exists")
+        })
+}
+
+/// The one answer for "that branch is somebody else's", whichever step found
+/// out. `workspace.create` turns it into the `Conflict` a client sees when a
+/// name is taken.
+fn branch_conflict(branch: &str) -> RpcError {
+    RpcError::new(
+        ErrorCode::Conflict,
+        format!("branch {branch} already exists"),
+    )
+}
+
 /// Creates the workspace's branch and worktree.
 ///
 /// Through [`Layout::daemon_git`], so none of the repository's own hooks run.
@@ -173,13 +231,22 @@ fn s(p: &Path) -> String {
 /// `reference-transaction`; neither is the user typing a git command. Opening a
 /// workspace in the IDE must not execute code out of the repository being
 /// opened, on a schedule nobody chose and with no way to see it happen.
+///
+/// **A failure leaves nothing of this call behind, and nothing of anybody
+/// else's touched.** Whoever created the branch is the only one who may delete
+/// it, and the two failures are told apart rather than guessed at: git saying
+/// the branch is already there means the branch is not ours, so the cleanup
+/// keeps its hands off it and the caller gets a `Conflict` — the same answer as
+/// a branch that was already there when the call started. Every other failure
+/// happens on a branch this call is the only candidate for, so the cleanup
+/// takes it with the rest.
 pub async fn create(layout: &Layout, base_branch: &str) -> Result<(), RpcError> {
     let git = &layout.daemon_git();
     if repo::branch_exists(git, &layout.repo, &layout.branch).await? {
-        return Err(RpcError::new(
-            ErrorCode::Conflict,
-            format!("branch {} already exists", layout.branch),
-        ));
+        // Nothing of ours exists yet, so nothing is cleaned up here: the
+        // directories this `Layout` names are shared with whichever workspace
+        // that branch belongs to.
+        return Err(branch_conflict(&layout.branch));
     }
     if !repo::branch_exists(git, &layout.repo, base_branch).await? {
         return Err(RpcError::invalid_params(format!(
@@ -196,19 +263,32 @@ pub async fn create(layout: &Layout, base_branch: &str) -> Result<(), RpcError> 
     if let Some(parent) = layout.worktree_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| RpcError::io(&e))?;
     }
-    git.run(
-        &layout.repo,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &layout.branch,
-            &s(&layout.worktree_path),
-            base_branch,
-        ],
-    )
-    .await?;
+    if let Err(e) = git
+        .run(
+            &layout.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &layout.branch,
+                &s(&layout.worktree_path),
+                base_branch,
+            ],
+        )
+        .await
+    {
+        // Somebody put the branch there between the check above and now — the
+        // same name created twice at once. Their branch and their checkout, so
+        // only this call's own directories go.
+        if branch_is_already_there(&e) {
+            let _ = remove_with(layout, RemoveBranch::Never).await;
+            return Err(branch_conflict(&layout.branch));
+        }
+        let _ = remove_with(layout, RemoveBranch::Always).await;
+        return Err(e);
+    }
     if !layout.ref_dir().join("work").is_file() {
+        let _ = remove_with(layout, RemoveBranch::Always).await;
         return Err(RpcError::internal(format!(
             "expected loose ref at {}",
             layout.ref_dir().join("work").display()
@@ -219,10 +299,25 @@ pub async fn create(layout: &Layout, base_branch: &str) -> Result<(), RpcError> 
 
 /// Removes the worktree, its registration and its branch.
 ///
+/// [`remove_with`] with [`RemoveBranch::Always`]: what `workspace.destroy`
+/// wants, where the workspace owns everything the layout names.
+pub async fn remove(layout: &Layout) -> Result<(), RpcError> {
+    remove_with(layout, RemoveBranch::Always).await
+}
+
+/// Removes the worktree and its registration, and the branch if `branch` says
+/// so.
+///
 /// Through [`Layout::daemon_git`] for the same reason as [`create`]: the
 /// `branch -D` at the end fires `reference-transaction`, and a destroy is the
 /// last moment at which running the repository's code would be welcome.
-pub async fn remove(layout: &Layout) -> Result<(), RpcError> {
+///
+/// With [`RemoveBranch::Never`] the branch stays, and so do
+/// `refs/heads/bs/<name>/` and its reflog directory — those are named after the
+/// workspace *name*, not its id, so they are shared with any other workspace of
+/// the same name and are not this call's to delete either. What always goes is
+/// the worktree directory and its registration, which belong to one workspace.
+pub async fn remove_with(layout: &Layout, branch: RemoveBranch) -> Result<(), RpcError> {
     let git = &layout.daemon_git();
     let ignore_missing = |r: Result<super::GitOutput, RpcError>| match r {
         Ok(_) => Ok(()),
@@ -253,6 +348,9 @@ pub async fn remove(layout: &Layout) -> Result<(), RpcError> {
     }
     let _ = std::fs::remove_dir_all(&layout.worktree_path);
     git.run(&layout.repo, &["worktree", "prune"]).await?;
+    if branch == RemoveBranch::Never {
+        return Ok(());
+    }
     if repo::branch_exists(git, &layout.repo, &layout.branch).await? {
         git.run(&layout.repo, &["branch", "-D", &layout.branch])
             .await?;

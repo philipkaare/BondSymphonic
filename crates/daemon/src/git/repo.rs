@@ -135,42 +135,100 @@ pub fn canonical_ish(path: &Path) -> PathBuf {
     }
 }
 
-/// Whether `path` is a repository **of its own**, rather than a directory
-/// somewhere inside one.
+/// What `path` is, as far as git is concerned.
 ///
-/// `rev-parse` searches upwards, so every question asked with a bare
-/// `--git-common-dir` is really a question about the nearest *enclosing*
-/// repository. That is the wrong question here twice over: `repo.inspect` would
-/// answer a plain folder with its parent repository's branches, dirty state and
-/// remotes, and `workspace.create` would quietly make the folder a worktree of
-/// that parent — the opposite of the "this folder will be initialised" the
-/// dialog just showed. Comparing `--show-toplevel` with the path asks about this
-/// directory and no other.
+/// One question, one answer, asked by everything that has to decide what may be
+/// done with a directory. There used to be three: [`is_not_a_repository`]
+/// reading git's stderr, a `--show-toplevel` comparison, and a ladder of its own
+/// inside `workspace.create` — and they disagreed about the two cases that
+/// matter most. A subdirectory of a repository was "not a repository" to one
+/// and "a repository" to another, so `repo.inspect` offered to initialise a
+/// folder that `workspace.create` then refused; a bare repository was a plain
+/// folder to one of them, which is an invitation to run `git init` and a commit
+/// inside somebody's remote.
 ///
-/// A path that is not a directory is not a repository. A **bare** repository is
-/// neither a repository this daemon can use nor a folder it may write to, so it
-/// is the one answer that is an error rather than a `bool`: `false` would send
-/// `init_if_missing` on to run `git init` and a commit *inside somebody's bare
-/// repository*, and `true` would make a workspace whose worktree cannot be
-/// checked out. The caller gets a sentence naming the situation instead.
-pub async fn is_repo_root(git: &Git, path: &Path) -> Result<bool, RpcError> {
+/// Five answers, because five is what the callers need:
+///
+/// * `NotARepo` — a plain directory, or nothing at all. It may be initialised.
+/// * `Root` — the top of an ordinary repository with a working tree.
+/// * `InsideEnclosing` — a directory *inside* one. `rev-parse` searches
+///   upwards, so this is the answer a naive check silently turns into `Root`,
+///   and the enclosing root comes with it so the caller can name the repository
+///   the user probably meant.
+/// * `Bare` — a repository with no working tree. Neither usable as a workspace
+///   source nor writable, so every caller turns it into a refusal by name.
+/// * `Worktree` — a linked worktree of some repository. Its own checkout,
+///   sharing the main store, so it is usable exactly like a `Root`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoKind {
+    NotARepo,
+    Root,
+    InsideEnclosing { root: PathBuf },
+    Bare,
+    Worktree,
+}
+
+/// Asks git what `path` is. See [`RepoKind`].
+///
+/// A path that is not a directory is `NotARepo`: a file and a name with nothing
+/// behind it are both "not a repository", and telling them apart is
+/// [`exists_as_directory`]'s job, not this one's.
+///
+/// Every failure that is *not* one of git's two recognised refusals comes back
+/// as an error and stays one. A timeout, a missing binary, a `safe.directory`
+/// ownership refusal, an unreadable gitfile — each of those happens on a real
+/// repository, and answering `NotARepo` to any of them would send a caller on
+/// to initialise somebody's work.
+pub async fn classify(git: &Git, path: &Path) -> Result<RepoKind, RpcError> {
     if !path.is_dir() {
-        return Ok(false);
+        return Ok(RepoKind::NotARepo);
     }
-    match git
+    // One `rev-parse` for all three facts, so the answer cannot be assembled
+    // out of two different moments. `--git-dir` against `--git-common-dir` is
+    // what tells a linked worktree from the main one: they are the same
+    // directory in the main worktree and differ in every linked one.
+    let out = match git
         .run(
             path,
-            &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--show-toplevel",
+                "--git-dir",
+                "--git-common-dir",
+            ],
         )
         .await
     {
-        Ok(o) => Ok(canonical_ish(Path::new(o.stdout.trim())) == canonical_ish(path)),
-        Err(e) if is_not_a_repository(&e) => Ok(false),
-        Err(e) if is_bare_repository(&e) => Err(RpcError::invalid_params(format!(
-            "{} is a bare repository; BondSymphonic needs a checkout (clone it first)",
-            path.display()
-        ))),
-        Err(e) => Err(e),
+        Ok(o) => o,
+        Err(e) if is_not_a_repository(&e) => return Ok(RepoKind::NotARepo),
+        // `--show-toplevel` is the option that fails here, and it fails because
+        // there is no working tree at all.
+        Err(e) if is_bare_repository(&e) => return Ok(RepoKind::Bare),
+        Err(e) => return Err(e),
+    };
+    let mut lines = out.stdout.lines().map(str::trim).filter(|l| !l.is_empty());
+    let (Some(toplevel), Some(git_dir), Some(common_dir)) =
+        (lines.next(), lines.next(), lines.next())
+    else {
+        return Err(RpcError::internal(format!(
+            "git rev-parse did not answer all three questions about {}: {:?}",
+            path.display(),
+            out.stdout
+        )));
+    };
+    if canonical_ish(Path::new(toplevel)) != canonical_ish(path) {
+        // `rev-parse` searches upwards, so this is a folder somewhere inside a
+        // repository. Adopting that repository would answer a question nobody
+        // asked, so the root is handed back for the caller to name instead.
+        return Ok(RepoKind::InsideEnclosing {
+            root: PathBuf::from(toplevel),
+        });
+    }
+    if canonical_ish(Path::new(git_dir)) == canonical_ish(Path::new(common_dir)) {
+        Ok(RepoKind::Root)
+    } else {
+        Ok(RepoKind::Worktree)
     }
 }
 
@@ -186,13 +244,74 @@ fn is_bare_repository(e: &RpcError) -> bool {
         .is_some_and(|s| s.contains("must be run in a work tree"))
 }
 
+/// The refusal every caller gives for a [`RepoKind::Bare`] path.
+///
+/// A bare repository has no working tree, so it is neither something a
+/// workspace can be made from nor a folder the daemon may write into. Both
+/// mistakes are available and both are bad: read as "not a repository" it gets
+/// a `git init` and a commit *inside somebody's remote*, and read as a
+/// repository it gets a workspace whose worktree cannot be checked out. It is
+/// named instead, in a sentence that says what to do about it rather than
+/// quoting git.
+pub fn bare_repository_error(path: &Path) -> RpcError {
+    RpcError::invalid_params(format!(
+        "{} is a bare repository; BondSymphonic needs a checkout (clone it first)",
+        path.display()
+    ))
+}
+
+/// The refusal `workspace.create` gives for a [`RepoKind::NotARepo`] path when
+/// the client did not ask for it to be initialised.
+///
+/// [`ErrorCode::GitError`] rather than `InvalidParams`, and "not a git
+/// repository" in the message, because that is the answer clients have always
+/// had here: it used to be git's own error, passed through. A client that
+/// predates `init_if_missing` branches on it.
+pub fn not_a_repository_error(path: &Path) -> RpcError {
+    RpcError::new(
+        ErrorCode::GitError,
+        format!("{} is not a git repository", path.display()),
+    )
+}
+
+/// Whether `path` is a repository this daemon can use — its own root, or a
+/// linked worktree of one — rather than a directory somewhere inside one.
+///
+/// [`classify`] with the four answers that are not a `bool` collapsed: a bare
+/// repository is the one that cannot be, because `false` would send
+/// `init_if_missing` on to write inside it.
+pub async fn is_repo_root(git: &Git, path: &Path) -> Result<bool, RpcError> {
+    match classify(git, path).await? {
+        RepoKind::Root | RepoKind::Worktree => Ok(true),
+        RepoKind::NotARepo | RepoKind::InsideEnclosing { .. } => Ok(false),
+        RepoKind::Bare => Err(bare_repository_error(path)),
+    }
+}
+
 pub async fn inspect(git: &Git, repo: &Path) -> Result<RepoInfo, RpcError> {
-    let exists = exists_as_directory(repo)?;
     // A folder that is not a repository — or is one only by way of a parent — is
     // an answer rather than a failure: the New Agent dialog asks about a folder
-    // the user has just picked and offers to initialise it.
-    if !exists || !is_repo_root(git, repo).await? {
-        return Ok(not_a_repo(exists));
+    // the user has just picked and offers to initialise it. A bare repository is
+    // the one shape that stays a refusal, because neither answer is true of it.
+    if !exists_as_directory(repo)? {
+        return Ok(not_a_repo(false));
+    }
+    match classify(git, repo).await? {
+        RepoKind::Root | RepoKind::Worktree => {}
+        RepoKind::NotARepo => return Ok(not_a_repo(true)),
+        RepoKind::InsideEnclosing { root } => {
+            // Reported as "not a repository", which is what the folder is, and
+            // logged with the repository it sits in so the daemon log says which
+            // one a client was really looking at. `RepoInfo` has no field for
+            // it; `workspace.create` is where the user is told the name.
+            tracing::debug!(
+                path = %repo.display(),
+                root = %root.display(),
+                "a folder inside a repository is not a repository itself"
+            );
+            return Ok(not_a_repo(true));
+        }
+        RepoKind::Bare => return Err(bare_repository_error(repo)),
     }
     let branches: Vec<String> = git
         .run(
@@ -334,8 +453,11 @@ pub async fn init_repo(git: &Git, path: &Path) -> Result<(), RpcError> {
     // repository becomes a repository of its own, which is what the dialog
     // offered. `git init` inside a working tree is allowed and makes a nested
     // repository; the enclosing repository is not touched.
-    if is_repo_root(git, path).await? {
-        return Ok(());
+    match classify(git, path).await? {
+        // Already a repository is success, not an error — see above.
+        RepoKind::Root | RepoKind::Worktree => return Ok(()),
+        RepoKind::Bare => return Err(bare_repository_error(path)),
+        RepoKind::NotARepo | RepoKind::InsideEnclosing { .. } => {}
     }
     git.run(path, &["init", "-b", INITIAL_BRANCH]).await?;
     // Asked *after* the init, so the new repository's own config counts too, and

@@ -471,62 +471,111 @@ fn refuse_writing_into_the_daemons_own_directories(
 
 pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<WorkspaceInfo, RpcError> {
     let repo_path = PathBuf::from(&p.repo_path);
-    if p.name.is_empty()
-        || p.name.contains('/')
-        || p.name.contains("..")
-        || p.name.contains(char::is_whitespace)
-    {
-        return Err(RpcError::invalid_params(
-            "workspace name must be a single path-safe word",
-        ));
+    // The one workspace-name rule, shared with the IDE through `proto` so that
+    // what the New Agent dialog accepts and what the daemon accepts cannot drift
+    // apart. First, before anything runs git: the name becomes the branch
+    // `bs/<name>/work`, and a name git cannot make a ref of used to be
+    // discovered halfway through `git worktree add` — after the client had
+    // already been told the workspace was being created.
+    bondsymphonic_proto::workspace_name::validate(&p.name).map_err(RpcError::invalid_params)?;
+
+    // One create at a time per repository, held for the whole of the name
+    // check, the branch and the registry insert.
+    //
+    // Two creates of one name could otherwise pass the registry check together,
+    // both reach `git worktree add -b bs/<name>/work`, and have the loser's
+    // cleanup run `git branch -D` on the branch the winner was checking out.
+    // The branch, its loose-ref directory and its reflog are named after the
+    // workspace *name*, so none of them is private to one workspace; making the
+    // sequence serial is what keeps "the branch is not there yet" true from the
+    // check to the `worktree add`.
+    //
+    // The same lock `workspace.destroy` and `workspace.merge` take, and keyed on
+    // the canonicalised path, so two spellings of one repository are one
+    // repository here. Released before the sandbox starts: that is slow, touches
+    // no git, and holding a repository's merges behind it would be its own bug.
+    let ws = {
+        let repo_lock = crate::git::repo_lock(&repo_path);
+        let _repo_guard = repo_lock.lock().await;
+        create_the_workspace(d, &p, &repo_path).await?
+    };
+
+    seed_home(d, &ws).await;
+    match start_sandbox(d, &ws).await {
+        Ok(()) => Ok(d.workspace_info(&d.set_state(&ws.id, WorkspaceState::Ready)?)),
+        Err(e) => {
+            let ws = d.set_state(
+                &ws.id,
+                WorkspaceState::Error(format!("sandbox failed: {}", e.message)),
+            )?;
+            Ok(d.workspace_info(&ws))
+        }
     }
-    // Is this path a repository of its own? Three answers, and only the first
-    // two are allowed to lead to a write:
+}
+
+/// Everything in [`create`] that has to happen with the repository lock held:
+/// the repository is identified (and initialised if the client asked for that),
+/// the name is claimed in the registry, and the branch and worktree are made.
+///
+/// Split out so the lock has a scope rather than a lifetime: the caller drops it
+/// the moment this returns, before seeding the home and starting the sandbox.
+async fn create_the_workspace(
+    d: &Arc<Daemon>,
+    p: &WorkspaceCreateParams,
+    repo_path: &Path,
+) -> Result<Workspace, RpcError> {
+    // Is this path a repository of its own? [`repo::classify`] is the one place
+    // that answers, so `repo.inspect`, `init_repo` and this all say the same
+    // thing about the same folder. Only the first two answers lead to a write:
     //
-    // * yes — use it, exactly as before;
-    // * no, and git said so in as many words, or it answered about an enclosing
-    //   repository — the folder is not a repository, so `init_if_missing` may
-    //   make it one;
-    // * git failed for some other reason — a timeout, a missing binary, an
-    //   ownership refusal, an unreadable gitfile. Every one of those happens *on
-    //   a real repository*, so the error goes back untouched. Initialising here
-    //   would put an empty commit into somebody's work on the strength of a
-    //   transient failure.
+    // * a repository root, or a linked worktree of one — use it;
+    // * a plain folder, or one inside an enclosing repository — not a repository,
+    //   so `init_if_missing` may make it one. Adopting the enclosing repository
+    //   would make the folder a worktree of a repository the user did not pick,
+    //   which is the opposite of what the dialog offered, so the refusal names
+    //   that repository instead;
+    // * a bare repository — refused by name, because neither of the other two
+    //   answers is true of it;
+    // * anything else git said — a timeout, a missing binary, an ownership
+    //   refusal, an unreadable gitfile. Every one of those happens *on a real
+    //   repository*, so the error goes back untouched rather than becoming a
+    //   licence to run `git init` over somebody's work.
     //
-    // Why the path is not usable as it stands, kept for the client that did not
-    // ask for it to be initialised. `None` beside `existing: None` means the
-    // folder is simply not there yet.
+    // `not_a_repo` is why the path is not usable as it stands, kept for the
+    // client that did not ask for it to be initialised. `None` beside
+    // `existing: None` means the folder is simply not there yet.
     let mut not_a_repo: Option<RpcError> = None;
-    let existing: Option<PathBuf> = if !repo::exists_as_directory(&repo_path)? {
+    let existing: Option<PathBuf> = if !repo::exists_as_directory(repo_path)? {
         // Asked before git, because git run in a directory that does not exist
         // fails on the spawn — with no exit code, and so indistinguishable from a
         // git that could not be started at all.
         None
     } else {
-        match repo::common_dir(&d.git, &repo_path).await {
-            Ok(c) if repo::is_repo_root(&d.git, &repo_path).await? => Some(c),
-            // Inside an enclosing repository, but not one itself. Adopting the
-            // parent would make the folder a worktree of a repository the user
-            // did not pick, which is the opposite of what the dialog offered.
-            Ok(_) => {
+        match repo::classify(&d.git, repo_path).await? {
+            repo::RepoKind::Root | repo::RepoKind::Worktree => {
+                Some(repo::common_dir(&d.git, repo_path).await?)
+            }
+            repo::RepoKind::InsideEnclosing { root } => {
                 not_a_repo = Some(RpcError::invalid_params(format!(
-                    "{} is inside a git repository but is not one itself; pick the repository, \
+                    "{} is inside the git repository {}, but is not one itself; pick {}, \
                      or create this folder as a repository of its own",
-                    repo_path.display()
+                    repo_path.display(),
+                    root.display(),
+                    root.display()
                 )));
                 None
             }
-            Err(e) if repo::is_not_a_repository(&e) => {
-                not_a_repo = Some(e);
+            repo::RepoKind::NotARepo => {
+                not_a_repo = Some(repo::not_a_repository_error(repo_path));
                 None
             }
-            Err(e) => return Err(e),
+            repo::RepoKind::Bare => return Err(repo::bare_repository_error(repo_path)),
         }
     };
     let git_common = match existing {
         Some(c) => c,
         None if p.init_if_missing => {
-            refuse_writing_into_the_daemons_own_directories(d, &repo_path)?;
+            refuse_writing_into_the_daemons_own_directories(d, repo_path)?;
             // `core.hooksPath` pinned at the daemon's empty directory: `git init`
             // copies `init.templateDir` into the new repository, hooks included,
             // and the commit that follows would run them (daemon design §5.4).
@@ -539,8 +588,8 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
                 .map(|e| e.message.clone())
                 .unwrap_or_else(|| "the folder is not there".to_string());
             tracing::info!(repo = %repo_path.display(), "initialising a folder that is not a repository: {why}");
-            repo::init_repo(&git, &repo_path).await?;
-            repo::common_dir(&d.git, &repo_path).await?
+            repo::init_repo(&git, repo_path).await?;
+            repo::common_dir(&d.git, repo_path).await?
         }
         // The error an older client sees is the one it always saw: the IDE sets
         // the flag only after telling the user, in the New Agent dialog, that the
@@ -551,7 +600,7 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
             }))
         }
     };
-    if d.registry.find_by_name(&repo_path, &p.name).is_some() {
+    if d.registry.find_by_name(repo_path, &p.name).is_some() {
         return Err(RpcError::new(
             ErrorCode::Conflict,
             format!("workspace {} already exists for this repo", p.name),
@@ -563,7 +612,7 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
     // A `bondsymphonic.toml` that will not parse is worth a warning and nothing
     // more: refusing to create the workspace over it would leave the user
     // unable to open the very repo they need a workspace in to fix the file.
-    let repo_config = match crate::runs::config::load_repo_config(&repo_path) {
+    let repo_config = match crate::runs::config::load_repo_config(repo_path) {
         Ok(cfg) => cfg,
         Err(e) => {
             tracing::warn!(repo = %repo_path.display(), error = %e, "using the default allowlist");
@@ -574,7 +623,7 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
     let ws = Workspace {
         id: id.clone(),
         name: p.name.clone(),
-        repo_path: repo_path.clone(),
+        repo_path: repo_path.to_path_buf(),
         base_branch: p.base_branch.clone(),
         branch: Workspace::branch_for(&p.name),
         worktree_path: d.dirs.worktree(&id),
@@ -590,7 +639,7 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
     d.emit_state(&ws);
 
     let layout = Layout {
-        repo: repo_path,
+        repo: repo_path.to_path_buf(),
         git_common,
         name: ws.name.clone(),
         branch: ws.branch.clone(),
@@ -599,14 +648,13 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
         no_hooks_dir: d.dirs.no_hooks(),
     };
     if let Err(e) = worktree::create(&layout, &p.base_branch).await {
-        // `worktree::create` pre-creates ref, reflog and object directories, and
-        // `git worktree add` can fail halfway; `worktree::remove` is idempotent and
-        // clears all of it. The one failure it must not answer is `Conflict`, which
-        // means the branch already existed: that branch predates this workspace and
-        // is not ours to delete, and `create` rejects it before touching anything.
-        if e.code != ErrorCode::Conflict {
-            let _ = worktree::remove(&layout).await;
-        }
+        // `worktree::create` unwinds whatever it managed to make, the branch
+        // included when the branch was its own. This is the rest of the
+        // workspace: the worktree directory and its registration, and never the
+        // branch — `RemoveBranch::Never`, because a cleanup that cannot show the
+        // branch is its own is a cleanup that must not run `git branch -D` on
+        // somebody else's.
+        let _ = worktree::remove_with(&layout, worktree::RemoveBranch::Never).await;
         // The client has already seen `Creating`. Tell it why the workspace failed, then
         // send the terminal `Destroying` event a real destroy ends on, so the workspace
         // disappears from the client's list instead of hanging there forever.
@@ -616,17 +664,7 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
         d.dirs.remove_workspace(&id);
         return Err(e);
     }
-    seed_home(d, &ws).await;
-    match start_sandbox(d, &ws).await {
-        Ok(()) => Ok(d.workspace_info(&d.set_state(&id, WorkspaceState::Ready)?)),
-        Err(e) => {
-            let ws = d.set_state(
-                &id,
-                WorkspaceState::Error(format!("sandbox failed: {}", e.message)),
-            )?;
-            Ok(d.workspace_info(&ws))
-        }
-    }
+    Ok(ws)
 }
 
 pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty, RpcError> {

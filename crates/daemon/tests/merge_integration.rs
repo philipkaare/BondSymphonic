@@ -1054,3 +1054,72 @@ async fn a_conflict_on_a_non_ascii_path_is_reported_unescaped() {
 
     cancel.cancel();
 }
+
+// ---------------------------------------------------------------------------
+// Task 4: what counts as a dirty base checkout.
+// ---------------------------------------------------------------------------
+
+/// RN5. The dirty-base guard exists because merging over *uncommitted edits to
+/// tracked files* either loses them or wedges the checkout half-way through a
+/// merge nobody asked for. An untracked file is neither: git will not overwrite
+/// one, and a checkout with a scratch file in it — a log, a build output that
+/// is not ignored, a note — is the ordinary state of a working directory.
+///
+/// So the guard asks `git status --porcelain --untracked-files=no`. Both halves
+/// are asserted here together, because the value of the change is exactly that
+/// it moved one case and not the other.
+#[tokio::test]
+async fn an_untracked_file_does_not_block_an_in_place_merge_but_an_edit_still_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "alpha").await;
+    commit_in_ws(&daemon, &ws, &[("alpha.txt", "a\n")], "alpha work").await;
+
+    // The user is sitting on the base branch, so the merge lands in their own
+    // checkout — the only situation the guard applies to at all.
+    assert_eq!(git_out(&repo, &["symbolic-ref", "--short", "HEAD"]), "main");
+
+    // A tracked file with an uncommitted edit: still refused, and nothing moves.
+    std::fs::write(repo.join("README.md"), "hello\nlocal edit\n").unwrap();
+    let main_tip = git_out(&repo, &["rev-parse", "main"]);
+    let err = merge(&mut c, &ws.id, MergeMode::Merge, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+    assert_eq!(
+        err.data.as_ref().and_then(|d| d["reason"].as_str()),
+        Some("base_dirty"),
+        "{err:?}"
+    );
+    assert_eq!(git_out(&repo, &["rev-parse", "main"]), main_tip);
+
+    // Put the tracked file back and leave only an untracked, non-ignored file.
+    // Its name is not one the merge brings in, so git has nothing to overwrite.
+    std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+    std::fs::write(repo.join("scratch-notes.txt"), "mine\n").unwrap();
+    assert_eq!(
+        git_out(&repo, &["status", "--porcelain"]),
+        "?? scratch-notes.txt",
+        "the file has to be untracked and not ignored, or this test proves nothing"
+    );
+
+    let res = merge(&mut c, &ws.id, MergeMode::Merge, None).await.unwrap();
+    assert!(res.ok, "{res:?}");
+    assert_eq!(
+        git_out(&repo, &["log", "-1", "--format=%s", "main"]),
+        "Merge bs/alpha/work"
+    );
+    assert!(
+        repo.join("alpha.txt").is_file(),
+        "the merge landed in the user's own checkout"
+    );
+    // And their scratch file is exactly where they left it.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("scratch-notes.txt")).unwrap(),
+        "mine\n"
+    );
+
+    cancel.cancel();
+}

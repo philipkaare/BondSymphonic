@@ -101,9 +101,20 @@ pub async fn merge(
     // all — `worktree add` makes its own clean one — and refusing a merge
     // because a developer happens to have edits open on some other branch would
     // be refusing the ordinary case.
+    //
+    // `--untracked-files=no`, because an untracked file is neither of the two
+    // things this guard is about. Git will not overwrite one — a merge that
+    // would lands its own refusal, naming the file — and a checkout with a log,
+    // an unignored build output or a scratch note lying in it is the ordinary
+    // state of a working directory, not a reason to refuse every merge into it.
+    // Counting them made the guard fire on repositories where nothing was at
+    // risk, and the only way out was to delete files the user had put there.
     if on_base
         && !git
-            .run(&ws.repo_path, &["status", "--porcelain"])
+            .run(
+                &ws.repo_path,
+                &["status", "--porcelain", "--untracked-files=no"],
+            )
             .await?
             .stdout
             .trim()

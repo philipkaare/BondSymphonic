@@ -477,3 +477,140 @@ async fn a_bare_repository_is_refused_by_name() {
         "the bare repository gained refs: {refs}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 4 (AL5): one classifier, five answers.
+// ---------------------------------------------------------------------------
+
+use bondsymphonic_daemon::git::repo::RepoKind;
+
+/// Adds a linked worktree on a new branch and returns its path.
+fn add_worktree(repo: &std::path::Path, branch: &str, at: &std::path::Path) {
+    let out = std::process::Command::new("git")
+        .args(["worktree", "add", "-b", branch])
+        .arg(at)
+        .arg("main")
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git worktree add: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The five shapes a path can have, from the one function every caller now
+/// asks.
+///
+/// There used to be three answers to this question — `is_not_a_repository`
+/// reading git's stderr, `is_repo_root` comparing `--show-toplevel`, and the
+/// ladder inside `workspace.create` — and they did not agree. A subdirectory of
+/// a repository was "not a repository" to one and "a repository" to another, so
+/// `repo.inspect` offered to initialise a folder that `workspace.create` then
+/// refused.
+#[tokio::test]
+async fn classify_tells_the_five_shapes_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = Git::new();
+
+    // A plain directory.
+    let plain = dir.path().join("notes");
+    std::fs::create_dir_all(&plain).unwrap();
+    assert_eq!(
+        repo::classify(&git, &plain).await.unwrap(),
+        RepoKind::NotARepo
+    );
+
+    // A path that is not there at all is not a repository either.
+    assert_eq!(
+        repo::classify(&git, &dir.path().join("not-yet"))
+            .await
+            .unwrap(),
+        RepoKind::NotARepo
+    );
+
+    // A repository root.
+    let root = init_repo(dir.path());
+    assert_eq!(repo::classify(&git, &root).await.unwrap(), RepoKind::Root);
+
+    // A directory inside one: the answer names the repository it is inside, so
+    // the caller can say which one rather than "somewhere above you".
+    let inside = root.join("sub").join("deeper");
+    std::fs::create_dir_all(&inside).unwrap();
+    match repo::classify(&git, &inside).await.unwrap() {
+        RepoKind::InsideEnclosing { root: found } => assert_eq!(
+            repo::canonical_ish(&found),
+            repo::canonical_ish(&root),
+            "the enclosing repository has to be named"
+        ),
+        other => panic!("{other:?}"),
+    }
+
+    // A bare repository: no working tree, so neither usable nor writable.
+    let bare = dir.path().join("origin.git");
+    let out = std::process::Command::new("git")
+        .args(["init", "--bare", "-q", "-b", "main"])
+        .arg(&bare)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git init --bare");
+    assert_eq!(repo::classify(&git, &bare).await.unwrap(), RepoKind::Bare);
+
+    // A linked worktree of a repository: its own checkout, sharing the main
+    // repository's object store and refs.
+    let linked = dir.path().join("linked");
+    add_worktree(&root, "side", &linked);
+    assert_eq!(
+        repo::classify(&git, &linked).await.unwrap(),
+        RepoKind::Worktree
+    );
+
+    // A repository git cannot read is none of the five: it stays a failure, so
+    // nothing downstream treats it as an empty folder and writes into it.
+    let broken = dir_with_a_broken_gitfile(dir.path());
+    assert!(repo::classify(&git, &broken).await.is_err());
+}
+
+/// `inspect` and `is_repo_root` are the same classifier seen from two sides, so
+/// a linked worktree is a repository to both: a workspace made from one is a
+/// worktree of the same store, which works.
+#[tokio::test]
+async fn a_linked_worktree_is_a_repository_to_inspect_and_to_is_repo_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_repo(dir.path());
+    let linked = dir.path().join("linked");
+    add_worktree(&root, "side", &linked);
+    let git = Git::new();
+
+    assert!(repo::is_repo_root(&git, &linked).await.unwrap());
+    let info = repo::inspect(&git, &linked).await.unwrap();
+    assert!(info.is_repo);
+    assert!(info.exists);
+    assert!(info.branches.contains(&"side".to_string()));
+}
+
+/// The disagreement AL5 names, from the outside: what `repo.inspect` says about
+/// a folder inside a repository and what `workspace.create` does with it have
+/// to be the same story. `inspect` answers "not a repository" — the folder is
+/// not one — and `create` refuses by naming the repository it is inside, so the
+/// user is told which one to pick.
+#[tokio::test]
+async fn a_subdirectory_of_a_repository_is_refused_by_naming_the_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_repo(dir.path());
+    let inside = root.join("sub");
+    std::fs::create_dir_all(&inside).unwrap();
+    let git = Git::new();
+
+    let info = repo::inspect(&git, &inside).await.unwrap();
+    assert!(
+        !info.is_repo,
+        "the folder is not a repository, its parent is"
+    );
+    assert!(info.exists);
+
+    // And `init_repo` there still makes a repository of its own rather than
+    // adopting the parent.
+    assert!(!repo::is_repo_root(&git, &inside).await.unwrap());
+}

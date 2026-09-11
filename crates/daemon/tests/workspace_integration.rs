@@ -1032,7 +1032,8 @@ async fn create_initialises_a_folder_inside_a_repository_rather_than_adopting_it
 
 /// Without the flag, a folder inside a repository is refused rather than
 /// silently adopted, so the answer agrees with the one `repo.inspect` gives for
-/// the same path.
+/// the same path — and the refusal names the repository it is inside, which is
+/// the one the user probably meant to pick.
 #[tokio::test]
 async fn create_refuses_a_folder_inside_a_repository_without_the_flag() {
     let dir = tempfile::tempdir().unwrap();
@@ -1053,9 +1054,13 @@ async fn create_refuses_a_folder_inside_a_repository_without_the_flag() {
         .unwrap_err();
 
     assert_eq!(err.code, ErrorCode::InvalidParams);
+    let named = bondsymphonic_daemon::git::repo::canonical_ish(&outer)
+        .display()
+        .to_string();
     assert!(
-        err.message.contains("inside a git repository"),
-        "{}",
+        err.message.contains("inside the git repository")
+            && (err.message.contains(&outer.display().to_string()) || err.message.contains(&named)),
+        "the refusal has to name the repository the folder is inside: {}",
         err.message
     );
 
@@ -1126,4 +1131,259 @@ async fn create_refuses_a_bare_repository_by_name() {
     assert!(!bare.join(".git").exists(), "nothing initialised inside it");
 
     cancel.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: the workspace-name rule, and two creates of one name at once.
+// ---------------------------------------------------------------------------
+
+mod workspace_create_guards {
+    use super::common::{self, start_daemon, Client};
+    use bondsymphonic_proto::*;
+    use std::path::Path;
+
+    /// Trimmed stdout of a git command that must succeed.
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Whether a git command in `dir` succeeded at all, for the checkout a
+    /// deleted branch would have broken.
+    fn git_succeeds(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    async fn create(c: &mut Client, repo: &str, name: &str) -> Result<WorkspaceInfo, RpcError> {
+        let v = c
+            .call(Request::WorkspaceCreate(WorkspaceCreateParams {
+                repo_path: repo.to_string(),
+                base_branch: "main".into(),
+                name: name.into(),
+                init_if_missing: false,
+            }))
+            .await?;
+        Ok(serde_json::from_value(v).unwrap())
+    }
+
+    /// AL7. A name that cannot become a git ref has to be refused as bad
+    /// parameters, before any git runs — not discovered halfway through
+    /// `git worktree add`, after the client has already been told the workspace
+    /// is being created.
+    ///
+    /// `feat:x` is the one the review named: `:` passed every check the daemon
+    /// had (not empty, no `/`, no `..`, no whitespace) and git rejects it
+    /// outright as a ref.
+    #[tokio::test]
+    async fn a_name_git_cannot_make_a_ref_of_is_refused_before_any_git_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = common::init_repo(dir.path());
+        let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+        let mut c = Client::connect(port, &token).await;
+
+        for name in ["feat:x", "a b", "a/b", "..", "", "-dash", &"x".repeat(65)] {
+            let err = create(&mut c, &repo.to_string_lossy(), name)
+                .await
+                .expect_err("the name must be refused");
+            assert_eq!(err.code, ErrorCode::InvalidParams, "{name:?}: {err:?}");
+        }
+
+        // Nothing reached git: no `bs/` branch of any shape, and no workspace
+        // was ever announced.
+        assert_eq!(
+            git_out(
+                &repo,
+                &["for-each-ref", "--format=%(refname)", "refs/heads/bs/"]
+            ),
+            "",
+            "a refused name must not have created a branch"
+        );
+        assert!(daemon.registry.list().is_empty());
+
+        cancel.cancel();
+    }
+
+    /// RN6, in the shape the review found it: two creates of one name racing
+    /// past the registry check, both reaching `git worktree add -b`, and the
+    /// loser's cleanup running `git branch -D` on the branch the winner is
+    /// checking out.
+    ///
+    /// The two requests name the same repository with two spellings of its
+    /// path, which is what an IDE that remembers a folder one way and one that
+    /// remembers it another will send. `Registry::find_by_name` compares the
+    /// paths as given, so the second request gets past the name check every
+    /// time and the race is the whole of `worktree::create` — wide enough to be
+    /// reproducible rather than a coin toss.
+    ///
+    /// Whatever the order, the contract is the same: one workspace, one
+    /// `Conflict`, a branch that still exists and a worktree that still checks
+    /// out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_creates_of_one_name_never_delete_each_others_branch() {
+        for attempt in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = common::init_repo(dir.path());
+            // A second spelling of the same directory. It canonicalises to the
+            // same path, so both requests are about one repository.
+            std::fs::create_dir_all(repo.join("sub")).unwrap();
+            let same_repo = repo.join("sub").join("..");
+            let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+
+            // A connection each: the two creates have to be in flight together.
+            let mut c1 = Client::connect(port, &token).await;
+            let mut c2 = Client::connect(port, &token).await;
+            let (one, two) = (
+                repo.to_string_lossy().into_owned(),
+                same_repo.to_string_lossy().into_owned(),
+            );
+            let (a, b) = tokio::join!(
+                create(&mut c1, &one, "alpha"),
+                create(&mut c2, &two, "alpha"),
+            );
+
+            let (winner, loser) = match (a, b) {
+                (Ok(w), Err(e)) => (w, e),
+                (Err(e), Ok(w)) => (w, e),
+                (Ok(x), Ok(y)) => panic!(
+                    "attempt {attempt}: both creates succeeded: {} and {}",
+                    x.id, y.id
+                ),
+                (Err(x), Err(y)) => panic!("attempt {attempt}: both failed: {x:?} / {y:?}"),
+            };
+            assert_eq!(
+                loser.code,
+                ErrorCode::Conflict,
+                "attempt {attempt}: the second create of a name is a conflict, \
+                 not a git failure: {loser:?}"
+            );
+
+            // The winner's branch is still there, and its worktree still checks
+            // out: a `git branch -D` from the loser's cleanup takes both.
+            assert!(
+                !git_out(&repo, &["branch", "--list", "bs/alpha/work"]).is_empty(),
+                "attempt {attempt}: the winner's branch is gone"
+            );
+            assert!(
+                git_succeeds(Path::new(&winner.worktree_path), &["status", "--porcelain"]),
+                "attempt {attempt}: the winner's worktree no longer checks out"
+            );
+
+            // And the loser left nothing behind.
+            let ids: Vec<String> = daemon
+                .registry
+                .list()
+                .iter()
+                .map(|w| w.id.to_string())
+                .collect();
+            assert_eq!(
+                ids,
+                vec![winner.id.to_string()],
+                "attempt {attempt}: the registry holds more than the winner"
+            );
+
+            cancel.cancel();
+        }
+    }
+
+    /// The same race with one spelling, which is what two IDE windows on one
+    /// folder send. Here the registry's name check and its insert are what have
+    /// to happen as one step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_creates_of_one_name_on_one_path_leave_one_workspace() {
+        for attempt in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = common::init_repo(dir.path());
+            let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+            let mut c1 = Client::connect(port, &token).await;
+            let mut c2 = Client::connect(port, &token).await;
+            let path = repo.to_string_lossy().into_owned();
+            let (a, b) = tokio::join!(
+                create(&mut c1, &path, "alpha"),
+                create(&mut c2, &path, "alpha"),
+            );
+
+            let (winner, loser) = match (a, b) {
+                (Ok(w), Err(e)) => (w, e),
+                (Err(e), Ok(w)) => (w, e),
+                (Ok(x), Ok(y)) => panic!(
+                    "attempt {attempt}: both creates succeeded: {} and {}",
+                    x.id, y.id
+                ),
+                (Err(x), Err(y)) => panic!("attempt {attempt}: both failed: {x:?} / {y:?}"),
+            };
+            assert_eq!(
+                loser.code,
+                ErrorCode::Conflict,
+                "attempt {attempt}: {loser:?}"
+            );
+            assert!(
+                git_succeeds(Path::new(&winner.worktree_path), &["status", "--porcelain"]),
+                "attempt {attempt}: the winner's worktree no longer checks out"
+            );
+            assert_eq!(daemon.registry.list().len(), 1, "attempt {attempt}");
+
+            cancel.cancel();
+        }
+    }
+
+    /// AL5, from the client's side. `repo.inspect` and `workspace.create` ask
+    /// one classifier now, so what the New Agent dialog is told about a folder
+    /// and what happens when it is picked are the same story — and the refusal
+    /// names the repository the folder sits in, which is the one the user
+    /// probably meant to pick.
+    #[tokio::test]
+    async fn creating_in_a_subdirectory_names_the_repository_it_is_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = common::init_repo(dir.path());
+        let inside = repo.join("crates").join("thing");
+        std::fs::create_dir_all(&inside).unwrap();
+        let (port, token, _daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+        let mut c = Client::connect(port, &token).await;
+
+        // What the dialog asks first: not a repository, so it offers to
+        // initialise the folder.
+        let info: RepoInfo = serde_json::from_value(
+            c.call(Request::RepoInspect(RepoPathParams {
+                path: inside.to_string_lossy().into(),
+            }))
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!info.is_repo);
+        assert!(info.exists);
+
+        // And what happens when it is picked anyway: a refusal that says which
+        // repository it is inside, rather than a workspace quietly made on a
+        // repository nobody chose.
+        let err = create(&mut c, &inside.to_string_lossy(), "alpha")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams, "{err:?}");
+        let named = bondsymphonic_daemon::git::repo::canonical_ish(&repo)
+            .display()
+            .to_string();
+        assert!(
+            err.message.contains(&repo.display().to_string()) || err.message.contains(&named),
+            "the refusal has to name the enclosing repository: {}",
+            err.message
+        );
+
+        cancel.cancel();
+    }
 }
