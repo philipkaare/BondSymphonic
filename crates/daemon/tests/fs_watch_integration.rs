@@ -240,6 +240,7 @@ async fn watch_reports_relative_paths_debounced_and_ignores_target_dir() {
 /// `.await` in both tests, and this one has no poisoning, so a failure in one
 /// test reports itself rather than reappearing as a poisoned-lock panic in the
 /// other.
+#[cfg(target_os = "linux")]
 static WATCH_COUNT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// How many inotify watches this process holds, summed over every inotify
@@ -295,9 +296,12 @@ async fn ignored_directories_are_not_watched_and_new_directories_are() {
     .await
     .unwrap();
     let installed = inotify_watch_count() - before;
+    // The worktree, src/, and the root's own entry: three, and a handful of
+    // slack for anything else the fixture leaves in the tree. `< SUBDIRS`
+    // would let 199 leaked watches through and still pass.
     assert!(
-        installed < SUBDIRS,
-        "enabling the watch installed {installed} inotify watches: node_modules/ is being watched"
+        installed <= 10,
+        "enabling the watch installed {installed} inotify watches; a watch per directory under          node_modules/ would be about {SUBDIRS}"
     );
 
     // The filter still holds, and it is a live watch: src/ is heard, node_modules/ is not.
@@ -342,7 +346,7 @@ async fn ignored_directories_are_not_watched_and_new_directories_are() {
         .expect("packages/ and packages/web/ are reported");
     let grown = inotify_watch_count().saturating_sub(before);
     assert!(
-        grown < SUBDIRS,
+        grown <= 10,
         "a nested node_modules/ created later grew the watch set by {grown}"
     );
 
@@ -356,6 +360,12 @@ async fn ignored_directories_are_not_watched_and_new_directories_are() {
 ///
 /// Both watchers are driven directly rather than over the protocol, so the
 /// timing measured is the lock's and not the connection's.
+///
+/// Linux only, and not because of the kernel: the walk being timed is the
+/// per-directory one inotify needs, and on every other backend a recursive
+/// watch is a single call that returns at once. There the test would pass
+/// without a walk to be blocked behind, which is worse than not running.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn enabling_a_big_tree_does_not_block_other_workspaces_watches() {
     // Held for the whole test: the 5,000 watches this installs must not be in
@@ -409,6 +419,14 @@ async fn enabling_a_big_tree_does_not_block_other_workspaces_watches() {
     let enable_took = walk.await.unwrap();
     eprintln!(
         "enable of 5,000 dirs took {enable_took:?}; concurrent disable took {disable_took:?}"
+    );
+    // The walk has to have been substantial, or the disable had nothing to be
+    // blocked behind and the comparison below means nothing. 5,000 directories
+    // take far longer than this; anything under it says the fixture stopped
+    // building the tree it was supposed to.
+    assert!(
+        enable_took > Duration::from_millis(150),
+        "the walk of 5,000 directories took only {enable_took:?}: there was nothing to wait behind"
     );
     assert!(
         disable_took < Duration::from_millis(100),

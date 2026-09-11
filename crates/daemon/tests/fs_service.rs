@@ -301,3 +301,37 @@ fn write_file_retries_when_destination_is_briefly_locked() {
         .flatten()
         .all(|e| !e.file_name().to_string_lossy().ends_with(".bs-tmp")));
 }
+
+/// An oversized save is an error the IDE can show, not a connection that dies.
+///
+/// The request carrying it is one JSON line, and a line past the connection's
+/// 8 MiB frame cap is not read at all: the peer is disconnected with no reply,
+/// which from the editor looks like the daemon crashing on save. Since the
+/// service never hands out more than `MAX_READ` in the first place, anything
+/// larger is refused here with an answer that says so.
+#[test]
+fn write_file_refuses_content_larger_than_it_would_ever_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("wt");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let err = fs::write_file(&root, "big.txt", &"x".repeat(fs::MAX_READ + 1)).unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidParams);
+    assert!(
+        err.message.contains(&fs::MAX_READ.to_string()),
+        "the refusal names the limit: {}",
+        err.message
+    );
+    assert!(
+        !root.join("big.txt").exists(),
+        "nothing was created for a save that was refused"
+    );
+
+    // Exactly at the cap is a file the service could have read out, so it goes
+    // through: the refusal is for what is past the limit, not at it.
+    fs::write_file(&root, "edge.txt", &"y".repeat(fs::MAX_READ)).unwrap();
+    assert_eq!(
+        std::fs::metadata(root.join("edge.txt")).unwrap().len(),
+        fs::MAX_READ as u64
+    );
+}

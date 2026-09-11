@@ -29,6 +29,16 @@ pub const MAX_FRAME_BEFORE_HELLO: usize = 64 * 1024;
 /// nothing is holding a slot for nothing.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many lines a peer may send before `hello` goes through.
+///
+/// The cap and the deadline above are both per line, so without this a peer holds a
+/// connection for as long as it likes by sending one junk request every nine seconds:
+/// each is answered `Unauthorized`, each resets the timer, and the daemon keeps the
+/// slot. Three, because a client that has the token needs one line and a client that
+/// does not needs none - the two spare are for a protocol-version reply or a retry,
+/// not for a conversation.
+pub const MAX_LINES_BEFORE_HELLO: usize = 3;
+
 /// Notifies once on drop, however the scope it lives in is left.
 struct NotifyOnDrop<'a>(&'a Notify);
 
@@ -69,8 +79,10 @@ pub async fn serve_connection(
     // future is dropped mid-line), which makes it unusable directly inside the `select!`
     // below. `mpsc::Receiver::recv` is cancel safe, so the read lives in its own task.
     //
-    // Before `hello` the reader is strict: a short line cap and a deadline per line, and
-    // a peer that breaks either is simply disconnected, with no reply. After `hello` the
+    // Before `hello` the reader is strict: a short line cap, a deadline per line, and a
+    // budget of lines for the whole handshake ([`MAX_LINES_BEFORE_HELLO`], which is what
+    // stops a peer from renewing the deadline with junk for ever). A peer that breaks any
+    // of the three is simply disconnected, with no reply. After `hello` the
     // cap is the one a real request can need and there is no deadline. Whether `hello`
     // has happened is decided by the loop below, which handles it inline, so after each
     // pre-hello line the reader waits for the loop to have processed it (`processed`)
@@ -85,9 +97,20 @@ pub async fn serve_connection(
         async move {
             let mut reader = BufReader::new(r).take(0);
             let mut line = String::new();
+            let mut before_hello = 0usize;
             loop {
                 line.clear();
                 let pre_hello = !authenticated.load(Ordering::SeqCst);
+                if pre_hello {
+                    before_hello += 1;
+                    if before_hello > MAX_LINES_BEFORE_HELLO {
+                        tracing::info!(
+                            lines = MAX_LINES_BEFORE_HELLO,
+                            "no hello within the first lines; disconnecting"
+                        );
+                        break;
+                    }
+                }
                 reader.set_limit(if pre_hello {
                     MAX_FRAME_BEFORE_HELLO
                 } else {

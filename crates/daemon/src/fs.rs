@@ -16,6 +16,17 @@
 //! in-tree ones included, so most refusals are not escapes and must not be
 //! reported as one. `list_dir` matches, listing a link as a plain entry rather
 //! than as a folder nothing can then open.
+//!
+//! What the walk pins is the *inode*, not the path. A directory renamed out of
+//! the worktree between two steps of the walk is still the directory the
+//! daemon holds a handle to, so a save that was checked as `wt/a/f` can land in
+//! `/outside/a/f` if the agent moves `wt/a` there while the request is running.
+//! That is not the containment failure the symlink case is: only something
+//! already inside the worktree, with write access to it, can arrange it, and it
+//! could have copied the file out itself instead. `openat2(RESOLVE_BENEATH)`
+//! behaves the same way, so there is nothing to upgrade to here. Read "what is
+//! opened is exactly what was checked" with that in mind: it is a statement
+//! about the object, not about where the object still lives.
 
 use bondsymphonic_proto::*;
 use std::path::{Component, Path, PathBuf};
@@ -171,6 +182,26 @@ fn read_capped(file: std::fs::File) -> Result<ReadFileResult, RpcError> {
     Ok(classify(&bytes))
 }
 
+/// Refuses content no `fs.write_file` should be carrying, before anything is
+/// opened.
+///
+/// The service reads at most [`MAX_READ`], so a save larger than that is a save
+/// of something this daemon never handed out. Left uncapped it is not merely a
+/// large write: the request line carrying it is JSON, where every control
+/// character costs six bytes, so content past a few megabytes overruns
+/// [`crate::server::connection::MAX_FRAME`] and the connection is dropped with
+/// no reply at all. An error naming the limit is the difference between a save
+/// the user can fix and an editor that silently loses its daemon.
+fn check_write_size(content: &str) -> Result<(), RpcError> {
+    if content.len() > MAX_READ {
+        return Err(RpcError::invalid_params(format!(
+            "content is {} bytes; a file this service writes may be at most {MAX_READ}",
+            content.len()
+        )));
+    }
+    Ok(())
+}
+
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The temp file a write of `name` goes through: unique per call (pid + a
@@ -197,9 +228,11 @@ pub fn read_file(root: &Path, rel: &str) -> Result<ReadFileResult, RpcError> {
 }
 
 /// Writes `content` to `rel` via a temp file + rename, creating parent
-/// directories as needed and preserving the existing file's mode.
+/// directories as needed and preserving the existing file's mode. Content
+/// above [`MAX_READ`] is refused; see [`check_write_size`].
 #[cfg(unix)]
 pub fn write_file(root: &Path, rel: &str, content: &str) -> Result<Empty, RpcError> {
+    check_write_size(content)?;
     unix::write_file(root, rel, content)
 }
 
@@ -584,11 +617,13 @@ pub fn read_file(root: &Path, rel: &str) -> Result<ReadFileResult, RpcError> {
 }
 
 /// Writes `content` to `rel` via a temp file + rename, creating parent
-/// directories as needed.
+/// directories as needed. Content above [`MAX_READ`] is refused; see
+/// [`check_write_size`].
 ///
 /// The temp file is removed if anything fails after it is created.
 #[cfg(windows)]
 pub fn write_file(root: &Path, rel: &str, content: &str) -> Result<Empty, RpcError> {
+    check_write_size(content)?;
     let path = resolve(root, rel)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| RpcError::io(&e))?;

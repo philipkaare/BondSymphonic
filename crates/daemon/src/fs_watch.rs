@@ -55,16 +55,12 @@ enum Msg {
     NewDir(PathBuf),
 }
 
-/// A live watch: the task that owns the `notify` watcher and coalesces its
-/// events. Aborting it stops the publishing and drops the watcher.
-struct Active {
-    task: tokio::task::JoinHandle<()>,
-}
-
-/// The daemon's set of live worktree watches, one per workspace.
+/// The daemon's set of live worktree watches, one per workspace: the task that
+/// owns each `notify` watcher and coalesces its events. Aborting a task stops
+/// the publishing and drops the watcher with it.
 #[derive(Default)]
 pub struct Watchers {
-    active: Mutex<HashMap<WorkspaceId, Active>>,
+    active: Mutex<HashMap<WorkspaceId, tokio::task::JoinHandle<()>>>,
 }
 
 impl Watchers {
@@ -141,16 +137,25 @@ impl Watchers {
             task.abort();
             return Ok(());
         }
-        active.insert(id, Active { task });
+        active.insert(id, task);
         Ok(())
     }
 
     /// Stops watching `id`, if it is watched. Aborting the task drops an
     /// in-flight debounce window rather than publishing it after the client
     /// asked for silence, and drops the watcher with it.
+    ///
+    /// The drop is not synchronous with this call. Abort marks the task and
+    /// the runtime drops the aborted future - and with it the `notify` watcher
+    /// and its inotify registrations - at its next turn. Nothing the daemon
+    /// does depends on the difference: the task publishes nothing once
+    /// aborted, and a re-`enable` builds a watcher of its own rather than
+    /// reusing this one. A test that counts the process's inotify watches
+    /// right after a `disable` is the one thing that can see the gap, and it
+    /// has to allow for it.
     pub fn disable(&self, id: &WorkspaceId) {
-        if let Some(a) = self.active.lock().remove(id) {
-            a.task.abort();
+        if let Some(task) = self.active.lock().remove(id) {
+            task.abort();
         }
     }
 }

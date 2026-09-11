@@ -1,3 +1,4 @@
+use bondsymphonic_daemon::server::connection::MAX_LINES_BEFORE_HELLO;
 use bondsymphonic_daemon::server::dispatch::{ConnCtx, DelayingHandler, Handler, SystemHandler};
 use bondsymphonic_daemon::server::{Server, ServerConfig};
 use bondsymphonic_proto::*;
@@ -816,6 +817,42 @@ async fn a_flood_without_a_newline_before_hello_is_disconnected_without_a_reply(
         Ok(None) => {}
         Ok(Some(msg)) => panic!("no reply is owed to a flood, got {msg:?}"),
         Err(_) => panic!("the connection was not closed: the daemon is buffering the flood"),
+    }
+    cancel.cancel();
+}
+
+/// A peer that never says `hello` cannot keep the connection by talking.
+///
+/// The pre-hello line cap and the pre-hello deadline are both per line, so a
+/// peer that sends one junk request every nine seconds is inside both for ever:
+/// each is answered `Unauthorized`, each resets the clock, and the daemon holds
+/// the slot. A budget of lines for the whole handshake is what ends it, and it
+/// ends it the way the other two do - by disconnecting, with no reply.
+#[tokio::test]
+async fn a_peer_that_talks_without_saying_hello_runs_out_of_lines() {
+    let (port, _token, cancel, _h) = start().await;
+    let (mut r, mut w) = connect(port).await;
+    // Every one of these is a well-formed request that is simply not `hello`.
+    for id in 1..=MAX_LINES_BEFORE_HELLO as u64 {
+        send(&mut w, id, Request::WorkspaceList {}).await;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), recv(&mut r))
+            .await
+            .expect("an unauthorized request is answered")
+        {
+            Some(ServerMessage::Response { id: got, error, .. }) => {
+                assert_eq!(got, id);
+                assert_eq!(error.expect("unauthorized").code, ErrorCode::Unauthorized);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    // One line past the budget: no reply, and the connection is gone.
+    let over = MAX_LINES_BEFORE_HELLO as u64 + 1;
+    send(&mut w, over, Request::WorkspaceList {}).await;
+    match tokio::time::timeout(std::time::Duration::from_secs(5), recv_or_reset(&mut r)).await {
+        Ok(None) => {}
+        Ok(Some(msg)) => panic!("nothing is owed past the budget, got {msg:?}"),
+        Err(_) => panic!("the connection outlived its pre-hello line budget"),
     }
     cancel.cancel();
 }
