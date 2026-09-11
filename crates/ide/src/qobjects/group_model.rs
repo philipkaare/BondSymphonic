@@ -46,10 +46,14 @@ pub mod qobject {
         #[qsignal]
         fn arrangement_changed(self: Pin<&mut GroupModel>);
 
-        /// Replaces the whole model from a serialised `Workspaces` (session
-        /// restore). An unparseable or empty string installs the default
-        /// single-group model instead. Callers must use this rather than
-        /// `setStateJson`, which only overwrites the cached string.
+        /// Replaces the whole model from a serialised `Workspaces`. An
+        /// unparseable or empty string installs the default single-group model
+        /// instead. Callers must use this rather than `setStateJson`, which
+        /// only overwrites the cached string.
+        ///
+        /// The one caller is `GroupBar`'s menu-test seam, which moves the model
+        /// while a context menu is up exactly as a daemon event would. Nothing
+        /// reaches it unless `BS_MENU_TEST` armed it.
         #[qinvokable]
         fn load_state(self: Pin<&mut GroupModel>, json: QString) -> bool;
 
@@ -57,10 +61,10 @@ pub mod qobject {
         /// daemon's first workspace list (`AppController::workspacesRestored`),
         /// before any `reconcile`.
         ///
-        /// Distinct from `loadState`, which is the session-file path and falls
-        /// back to the default single-group model. A restore that will not
-        /// parse must leave what is on screen alone instead: the alternative is
-        /// throwing away the user's groups because one string was malformed.
+        /// Distinct from `loadState`, which falls back to the default
+        /// single-group model. A restore that will not parse must leave what is
+        /// on screen alone instead: the alternative is throwing away the user's
+        /// groups because one string was malformed.
         #[qinvokable]
         fn load_workspaces(self: Pin<&mut GroupModel>, json: QString) -> bool;
 
@@ -224,10 +228,6 @@ pub mod qobject {
         #[qinvokable]
         fn set_active(self: Pin<&mut GroupModel>, group_idx: i32, tab_idx: i32) -> bool;
 
-        /// The active tab workspace id, or empty when there is no tab.
-        #[qinvokable]
-        fn active_workspace_id(self: &GroupModel) -> QString;
-
         /// The active tab as JSON (an `AgentTab`), or empty when there is none.
         #[qinvokable]
         fn active_tab_json(self: &GroupModel) -> QString;
@@ -277,12 +277,6 @@ pub mod qobject {
         #[qinvokable]
         fn tab_workspace_id(self: &GroupModel, group_idx: i32, tab_idx: i32) -> QString;
 
-        /// The agent id of one tab, or empty when it is not running an agent.
-        /// This is how a restored session re-attaches a transcript to an agent
-        /// that is still alive in the daemon.
-        #[qinvokable]
-        fn tab_agent_id(self: &GroupModel, group_idx: i32, tab_idx: i32) -> QString;
-
         /// Records the run configuration chosen for `workspace_id`, so the Run
         /// panel opens on it whenever that tab becomes active. The empty name
         /// clears it. False when the workspace is not tracked.
@@ -297,21 +291,6 @@ pub mod qobject {
             workspace_id: QString,
             run_config: QString,
         ) -> bool;
-
-        /// The run configuration recorded for one tab, or empty when it has
-        /// none.
-        #[qinvokable]
-        fn tab_run_config(self: &GroupModel, group_idx: i32, tab_idx: i32) -> QString;
-
-        /// The worktree path of one tab, or empty for an unknown tab. The Run
-        /// panel detects run configurations against this path.
-        #[qinvokable]
-        fn tab_worktree_path(self: &GroupModel, group_idx: i32, tab_idx: i32) -> QString;
-
-        /// The active tab's worktree path, or empty when there is no tab. What
-        /// `MainWindow` hands to `RunPanelModel::setWorkspace`.
-        #[qinvokable]
-        fn active_worktree_path(self: &GroupModel) -> QString;
     }
 }
 
@@ -510,6 +489,34 @@ fn parse_adapter(name: &str) -> AgentAdapterKind {
     }
 }
 
+/// What the user chose for a tab, as `workspaceCreated` echoes it back.
+///
+/// Every field is "not supplied" when empty: the signal carries no adapter for
+/// a create that did not pick one, and a tab rebuilt from `workspace.list`
+/// already decided its own from the daemon's agent records. Applying them is
+/// one function because `addTab` does it on both of its paths -- the tab it
+/// creates and the one `reconcile` filed under "Unsorted" first -- and the two
+/// must not disagree about what an empty string means.
+pub struct TabChoices {
+    pub adapter: String,
+    pub command: String,
+    pub options_json: String,
+}
+
+impl TabChoices {
+    pub fn apply(&self, tab: &mut AgentTab) {
+        if !self.adapter.is_empty() {
+            tab.adapter = parse_adapter(&self.adapter);
+        }
+        if !self.command.is_empty() {
+            tab.command = Some(self.command.clone());
+        }
+        if !self.options_json.is_empty() {
+            tab.options_json = self.options_json.clone();
+        }
+    }
+}
+
 /// One word per status, for the C++ side to show verbatim.
 fn status_text(status: TabStatus) -> &'static str {
     match status {
@@ -520,14 +527,6 @@ fn status_text(status: TabStatus) -> &'static str {
         TabStatus::Done => "done",
         TabStatus::Creating => "creating",
         TabStatus::SandboxDown => "sandbox down",
-    }
-}
-
-/// The `Error(detail)` text of a workspace state, or empty for any other state.
-fn state_detail(state: &WorkspaceState) -> String {
-    match state {
-        WorkspaceState::Error(detail) => detail.clone(),
-        _ => String::new(),
     }
 }
 
@@ -600,14 +599,16 @@ impl qobject::GroupModel {
             return false;
         };
         let name = group_name.to_string();
+        let chosen = TabChoices {
+            adapter: adapter.to_string(),
+            command: command.to_string(),
+            options_json: options_json.to_string(),
+        };
         // A workspace the model already tracks (because `reconcile` filed it
         // into "Unsorted" as a plain terminal before the create call answered)
         // is refreshed, moved into the group the user asked for, and given the
         // adapter and command they chose, rather than added a second time.
         if self.as_ref().rust().workspaces.find(&info.id).is_some() {
-            let adapter = adapter.to_string();
-            let command = command.to_string();
-            let options = options_json.to_string();
             {
                 let mut rust = self.as_mut().rust_mut();
                 rust.workspaces.apply_workspace_info(&info);
@@ -615,20 +616,7 @@ impl qobject::GroupModel {
                     rust.workspaces.move_tab_to_group(&info.id, &name);
                 }
                 if let Some((g, t)) = rust.workspaces.find(&info.id) {
-                    {
-                        let tab = &mut rust.workspaces.groups[g].tabs[t];
-                        // Empty means "not supplied": the caller is echoing a
-                        // signal that carries no adapter or command.
-                        if !adapter.is_empty() {
-                            tab.adapter = parse_adapter(&adapter);
-                        }
-                        if !command.is_empty() {
-                            tab.command = Some(command);
-                        }
-                        if !options.is_empty() {
-                            tab.options_json = options;
-                        }
-                    }
+                    chosen.apply(&mut rust.workspaces.groups[g].tabs[t]);
                     rust.workspaces.set_active(g, t);
                 }
             }
@@ -643,26 +631,14 @@ impl qobject::GroupModel {
             let mut rust = self.as_mut().rust_mut();
             group_index_for(&mut rust.workspaces, &name)
         };
-        let command = command.to_string();
-        let tab = AgentTab {
-            workspace_id: info.id.clone(),
-            name: info.name.clone(),
-            repo_path: info.repo_path.clone(),
-            branch: info.branch.clone(),
-            base_branch: info.base_branch.clone(),
-            status: TabStatus::from_workspace_state(&info.state),
-            detail: state_detail(&info.state),
-            worktree_path: info.worktree_path.clone(),
-            adapter: parse_adapter(&adapter.to_string()),
-            command: (!command.is_empty()).then_some(command),
-            run_config: None,
-            agent_id: None,
-            agent_status: None,
-            agent_detail: String::new(),
-            options_json: options_json.to_string(),
-            op_error: None,
-            attention: String::new(),
-        };
+        // Built the one way a tab is ever built from a `WorkspaceInfo`, then
+        // given the user's choices by the same three lines the branch above
+        // uses. This used to name all seventeen fields, which meant a field
+        // added to `AgentTab` was live for a restored tab and silently default
+        // for a created one -- exactly how `options_json` came to be missing
+        // from the tab of an agent the user had just configured.
+        let mut tab = AgentTab::from_workspace_info(&info);
+        chosen.apply(&mut tab);
         self.as_mut().rust_mut().workspaces.add_tab(group_idx, tab);
         self.publish();
         true
@@ -923,13 +899,6 @@ impl qobject::GroupModel {
         ok
     }
 
-    pub fn active_workspace_id(&self) -> QString {
-        match self.rust().workspaces.active() {
-            Some(tab) => QString::from(tab.workspace_id.as_str()),
-            None => QString::from(""),
-        }
-    }
-
     pub fn active_tab_json(&self) -> QString {
         match self.rust().workspaces.active() {
             Some(tab) => QString::from(&serde_json::to_string(tab).unwrap_or_default()),
@@ -1025,16 +994,6 @@ impl qobject::GroupModel {
         }
     }
 
-    pub fn tab_agent_id(&self, group_idx: i32, tab_idx: i32) -> QString {
-        match self
-            .tab_at(group_idx, tab_idx)
-            .and_then(|t| t.agent_id.as_ref())
-        {
-            Some(id) => QString::from(id.as_str()),
-            None => QString::from(""),
-        }
-    }
-
     pub fn set_tab_run_config(
         mut self: Pin<&mut Self>,
         workspace_id: QString,
@@ -1051,30 +1010,6 @@ impl qobject::GroupModel {
         }
         self.publish();
         true
-    }
-
-    pub fn tab_run_config(&self, group_idx: i32, tab_idx: i32) -> QString {
-        match self
-            .tab_at(group_idx, tab_idx)
-            .and_then(|t| t.run_config.as_deref())
-        {
-            Some(name) => QString::from(name),
-            None => QString::from(""),
-        }
-    }
-
-    pub fn tab_worktree_path(&self, group_idx: i32, tab_idx: i32) -> QString {
-        match self.tab_at(group_idx, tab_idx) {
-            Some(tab) => QString::from(&tab.worktree_path),
-            None => QString::from(""),
-        }
-    }
-
-    pub fn active_worktree_path(&self) -> QString {
-        match self.rust().workspaces.active() {
-            Some(tab) => QString::from(&tab.worktree_path),
-            None => QString::from(""),
-        }
     }
 
     fn tab_at(&self, group_idx: i32, tab_idx: i32) -> Option<&AgentTab> {

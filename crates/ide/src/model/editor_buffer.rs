@@ -176,15 +176,6 @@ impl EditorBuffer {
         range
     }
 
-    /// Replaces the whole text, discarding the cached spans. The new text is
-    /// collapsed to LF and re-decides the file's ending, exactly as on load.
-    pub fn replace_all(&mut self, text: &str) {
-        let (text, line_ending) = to_lf(text);
-        self.rope = Rope::from_str(&text);
-        self.line_ending = line_ending;
-        self.spans = None;
-    }
-
     /// The spans on line `n`, highlighting the buffer first if needed. Always
     /// empty while highlighting is off.
     pub fn spans_for_line(&mut self, n: usize) -> &[Span] {

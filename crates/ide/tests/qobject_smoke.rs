@@ -1527,6 +1527,11 @@ fn setup_opens_itself_once_per_run_of_blocking_failures() {
 /// One `#[test]`, with every entry called from it in turn: Qt allows widgets
 /// only on the thread that built the `QApplication`, and libtest hands each
 /// test function a thread of its own.
+///
+/// The entries are compiled into the C++ only for a non-release profile, which
+/// `cargo test` builds; see `BS_WIDGET_TESTS` in `crates/ide/build.rs`. A
+/// `--release` run of this suite fails to link rather than quietly reporting
+/// checks it did not run.
 mod cpp_widgets {
     use bondsymphonic_ide::testing::skip_without_qt;
 
@@ -1542,6 +1547,7 @@ mod cpp_widgets {
         fn bs_widget_test_setup_page_closes_its_pty() -> i32;
         fn bs_widget_test_terminal_parses_its_rows_once_per_frame() -> i32;
         fn bs_widget_test_terminal_error_ink_follows_the_palette() -> i32;
+        fn bs_widget_test_transcript_coalesces_a_streamed_answer() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1555,7 +1561,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 8] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 9] = [
             (
                 "EditorArea closes a tab under a destroyed workspace",
                 bs_widget_test_editor_area_survives_a_destroyed_workspace,
@@ -1587,6 +1593,10 @@ mod cpp_widgets {
             (
                 "TerminalWidget inks its error banner for the palette",
                 bs_widget_test_terminal_error_ink_follows_the_palette,
+            ),
+            (
+                "TranscriptView coalesces a streamed answer",
+                bs_widget_test_transcript_coalesces_a_streamed_answer,
             ),
         ];
 
@@ -1736,5 +1746,81 @@ mod task_15_setup_prompt {
         prompt.note_shown();
         prompt.checked(true);
         assert!(!prompt.should_open());
+    }
+}
+
+/// Task 15: the tab `addTab` creates is the tab `reconcile` creates, plus the
+/// three things the user picked.
+///
+/// `addTab` used to name all seventeen fields of `AgentTab` itself, beside a
+/// second path in the same function that patched three of them onto a tab the
+/// model already had. A field added to `AgentTab` was therefore live for a
+/// restored tab and silently default for a created one. Both paths now build
+/// through `from_workspace_info` and apply the same `TabChoices`, which is what
+/// this pins -- and it is reachable without a Qt event loop, which the
+/// invokable is not.
+mod task_15_add_tab {
+    use bondsymphonic_ide::model::app_state::AgentTab;
+    use bondsymphonic_ide::qobjects::group_model::TabChoices;
+    use bondsymphonic_proto::{AgentAdapterKind, WorkspaceState};
+
+    fn choices(adapter: &str, command: &str, options: &str) -> TabChoices {
+        TabChoices {
+            adapter: adapter.to_owned(),
+            command: command.to_owned(),
+            options_json: options.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_created_tab_carries_the_workspace_and_the_users_choices() {
+        let ws = super::info("ws_1", "feature", WorkspaceState::Ready);
+        let mut tab = AgentTab::from_workspace_info(&ws);
+        choices("claude", "", "{\"permission_mode\":\"plan\"}").apply(&mut tab);
+
+        // The daemon's half of the tab, which is the half nobody should be
+        // retyping at the call site.
+        assert_eq!(tab.workspace_id, ws.id);
+        assert_eq!(tab.name, "feature");
+        assert_eq!(tab.repo_path, ws.repo_path);
+        assert_eq!(tab.branch, ws.branch);
+        assert_eq!(tab.base_branch, ws.base_branch);
+        assert_eq!(tab.worktree_path, ws.worktree_path);
+
+        // The user's half.
+        assert_eq!(tab.adapter, AgentAdapterKind::Claude);
+        assert_eq!(tab.command, None, "an empty command is not supplied");
+        assert_eq!(tab.options_json, "{\"permission_mode\":\"plan\"}");
+    }
+
+    /// Empty means "not supplied" on every field, so an echo that carries no
+    /// adapter leaves the one the constructor decided rather than overwriting
+    /// it with the fallback.
+    #[test]
+    fn an_empty_choice_leaves_what_the_workspace_said() {
+        let ws = super::info("ws_2", "plain", WorkspaceState::Ready);
+        let mut tab = AgentTab::from_workspace_info(&ws);
+        let before = tab.clone();
+        choices("", "", "").apply(&mut tab);
+        assert_eq!(tab.adapter, before.adapter);
+        assert_eq!(tab.command, before.command);
+        assert_eq!(tab.options_json, before.options_json);
+    }
+
+    /// A failing workspace hands its explanation to the tab, and one that is
+    /// not failing hands it nothing. One rule, applied wherever a tab is built.
+    #[test]
+    fn the_error_detail_comes_from_the_workspace_state() {
+        let failing = super::info(
+            "ws_3",
+            "broken",
+            WorkspaceState::Error("worktree is gone".to_owned()),
+        );
+        assert_eq!(
+            AgentTab::from_workspace_info(&failing).detail,
+            "worktree is gone"
+        );
+        let ok = super::info("ws_4", "fine", WorkspaceState::Ready);
+        assert_eq!(AgentTab::from_workspace_info(&ok).detail, "");
     }
 }

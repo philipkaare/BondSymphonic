@@ -302,6 +302,19 @@ pub fn permission_attention(name: &str) -> String {
     format!("{name} is waiting for permission")
 }
 
+/// The `Error(detail)` text of a workspace state, or empty for any other state.
+///
+/// Beside [`AgentTab`] because it is what a tab's `detail` is built from, and
+/// one function because it used to be an inline `match` here and a copy of the
+/// same `match` in `GroupModel`, which is two places to decide that a workspace
+/// that has stopped failing still has something to say about it.
+pub fn state_detail(state: &WorkspaceState) -> String {
+    match state {
+        WorkspaceState::Error(detail) => detail.clone(),
+        _ => String::new(),
+    }
+}
+
 impl AgentTab {
     /// The status the tab bar paints: [`TabStatus::Error`] while an operation
     /// error is showing, and the daemon's own status otherwise.
@@ -348,10 +361,7 @@ impl AgentTab {
             branch: info.branch.clone(),
             base_branch: info.base_branch.clone(),
             status: TabStatus::from_workspace_state(&info.state),
-            detail: match &info.state {
-                WorkspaceState::Error(detail) => detail.clone(),
-                _ => String::new(),
-            },
+            detail: state_detail(&info.state),
             worktree_path: info.worktree_path.clone(),
             adapter: agent.map_or(AgentAdapterKind::Terminal, |a| a.adapter),
             command: None,

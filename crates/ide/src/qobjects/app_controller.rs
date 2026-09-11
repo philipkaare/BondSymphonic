@@ -528,24 +528,11 @@ pub mod qobject {
         #[qinvokable]
         fn apply_daemon_version(self: Pin<&mut AppController>, version: QString);
 
-        /// Create a workspace. Answers with `workspace_created` or
-        /// `operation_failed`; `group`, `adapter` and `command` are not sent to
-        /// the daemon, only echoed back to the caller.
-        #[qinvokable]
-        fn create_workspace(
-            self: Pin<&mut AppController>,
-            repo_path: QString,
-            base_branch: QString,
-            name: QString,
-            group: QString,
-            adapter: QString,
-            command: QString,
-        );
-
-        /// Create a workspace, remembering the run configuration the user
-        /// picked. Identical to `createWorkspace` otherwise; the name is not
-        /// sent to the daemon, only echoed back in `workspaceCreated` so the
-        /// window can store it on the tab.
+        /// Create a workspace. Answers with `workspaceCreated` or
+        /// `operationFailed`; `group`, `adapter`, `command` and `run_config`
+        /// are not sent to the daemon, only echoed back to the caller so the
+        /// window can place the tab and open the Run panel on the configuration
+        /// the user picked.
         ///
         /// `init_if_missing` lets the daemon create and initialise the folder
         /// when it is not a git repository. It is the New Agent dialog's
@@ -565,9 +552,15 @@ pub mod qobject {
             init_if_missing: bool,
         );
 
-        /// `createWorkspaceWithAgent` plus the run configuration the user
-        /// picked, echoed back in `workspaceCreated`, and the same
-        /// `init_if_missing` as `createWorkspaceWithRun`.
+        /// Create a workspace and start a Claude agent in it. Answers with
+        /// `workspaceCreated` (adapter "claude"), then `agentStarted`, then
+        /// sends `initial_prompt` if it is not empty; any step can answer with
+        /// `operationFailed` instead. `options_json` is an `AgentStartOptions`
+        /// object without the API key, which the controller merges in, and is
+        /// echoed back so the tab can start the agent again with it.
+        ///
+        /// `run_config` and `init_if_missing` mean what they do on
+        /// `createWorkspaceWithRun`.
         #[qinvokable]
         fn create_workspace_with_agent_and_run(
             self: Pin<&mut AppController>,
@@ -579,22 +572,6 @@ pub mod qobject {
             initial_prompt: QString,
             run_config: QString,
             init_if_missing: bool,
-        );
-
-        /// Create a workspace and start a Claude agent in it. Answers with
-        /// `workspace_created` (adapter "claude"), then `agent_started`, then
-        /// sends `initial_prompt` if it is not empty; any step can answer with
-        /// `operation_failed` instead. `options_json` is an `AgentStartOptions`
-        /// object without the API key, which the controller merges in.
-        #[qinvokable]
-        fn create_workspace_with_agent(
-            self: Pin<&mut AppController>,
-            repo_path: QString,
-            base_branch: QString,
-            name: QString,
-            group: QString,
-            options_json: QString,
-            initial_prompt: QString,
         );
 
         /// Start a Claude agent in an existing workspace. Answers with
@@ -1336,6 +1313,21 @@ pub fn failure_parts(e: &crate::client::ClientError) -> (String, String) {
         }
         other => (other.to_string(), String::new()),
     }
+}
+
+/// What `workspaceCreated` carries back to the window, verbatim.
+///
+/// None of it is sent to the daemon. The controller keeps no tab state, so the
+/// choices the New Agent dialog collected -- the group to file the tab under,
+/// the adapter and command for a terminal tab, the agent options for a Claude
+/// one, the run configuration the Run panel should open on -- travel out with
+/// the request and come back with its answer.
+struct CreateEcho {
+    group: String,
+    adapter: String,
+    command: String,
+    options_json: String,
+    run_config: String,
 }
 
 /// Queues an `operation_failed` for `op` back onto the Qt thread.
@@ -2142,45 +2134,22 @@ impl qobject::AppController {
         runtime().spawn(supervise(spec, qt, process));
     }
 
-    pub fn create_workspace(
+    /// The whole of a create, with or without an agent to start in it.
+    ///
+    /// The two invokables differ in two things: what `workspaceCreated` echoes
+    /// back, and whether an agent follows. Everything else -- the name rule
+    /// applied where the request is built and not only where a name is typed,
+    /// the group and repository recorded in `state.json`, the tab raised as
+    /// soon as the workspace exists rather than when the agent answers, and the
+    /// one sentence every failure is reported with -- is the same, and was
+    /// written out twice.
+    fn create_workspace_inner(
         self: Pin<&mut Self>,
-        repo_path: QString,
-        base_branch: QString,
-        name: QString,
-        group: QString,
-        adapter: QString,
-        command: QString,
-    ) {
-        self.create_workspace_with_run(
-            repo_path,
-            base_branch,
-            name,
-            group,
-            adapter,
-            command,
-            QString::from(""),
-            false,
-        );
-    }
-
-    pub fn create_workspace_with_run(
-        self: Pin<&mut Self>,
-        repo_path: QString,
-        base_branch: QString,
-        name: QString,
-        group: QString,
-        adapter: QString,
-        command: QString,
-        run_config: QString,
-        init_if_missing: bool,
+        params: WorkspaceCreateParams,
+        echo: CreateEcho,
+        agent: Option<(AgentStartOptions, String)>,
     ) {
         let qt = self.qt_thread();
-        let params = WorkspaceCreateParams {
-            repo_path: repo_path.to_string(),
-            base_branch: base_branch.to_string(),
-            name: name.to_string(),
-            init_if_missing,
-        };
         // The same rule the dialog greys Create out on, applied again where the
         // request is actually built. Not a duplicate check for its own sake:
         // this is the only guard on a caller that is not the dialog, and a name
@@ -2190,103 +2159,8 @@ impl qobject::AppController {
             report_failure(&qt, "workspace.create", hint);
             return;
         }
-        // Echoed straight back on success: the controller keeps no tab state.
-        let (group, adapter, command, run_config) = (
-            group.to_string(),
-            adapter.to_string(),
-            command.to_string(),
-            run_config.to_string(),
-        );
-        // Kept for `state.json`, which the echo above does not reach.
-        let (group_for_state, repo_for_state) = (group.clone(), params.repo_path.clone());
-        let shared = match require_connection() {
-            Ok(shared) => shared,
-            Err(message) => {
-                report_failure(&qt, "workspace.create", message.to_owned());
-                return;
-            }
-        };
-        runtime().spawn(async move {
-            match shared
-                .client
-                .request::<WorkspaceInfo>(Request::WorkspaceCreate(params))
-                .await
-            {
-                Ok(info) => {
-                    note_workspace_created(&group_for_state, &info.id.0, &repo_for_state);
-                    let json = serde_json::to_string(&info).unwrap_or_default();
-                    let _ = qt.queue(move |q| {
-                        q.workspace_created(
-                            QString::from(&json),
-                            QString::from(&group),
-                            QString::from(&adapter),
-                            QString::from(&command),
-                            QString::from(""),
-                            QString::from(&run_config),
-                        )
-                    });
-                }
-                Err(e) => report_failure(&qt, "workspace.create", e.to_string()),
-            }
-        });
-    }
-
-    pub fn create_workspace_with_agent(
-        self: Pin<&mut Self>,
-        repo_path: QString,
-        base_branch: QString,
-        name: QString,
-        group: QString,
-        options_json: QString,
-        initial_prompt: QString,
-    ) {
-        self.create_workspace_with_agent_and_run(
-            repo_path,
-            base_branch,
-            name,
-            group,
-            options_json,
-            initial_prompt,
-            QString::from(""),
-            false,
-        );
-    }
-
-    pub fn create_workspace_with_agent_and_run(
-        self: Pin<&mut Self>,
-        repo_path: QString,
-        base_branch: QString,
-        name: QString,
-        group: QString,
-        options_json: QString,
-        initial_prompt: QString,
-        run_config: QString,
-        init_if_missing: bool,
-    ) {
-        let qt = self.qt_thread();
-        let params = WorkspaceCreateParams {
-            repo_path: repo_path.to_string(),
-            base_branch: base_branch.to_string(),
-            name: name.to_string(),
-            init_if_missing,
-        };
-        // As in `create_workspace_with_run`: the rule lives in one place and is
-        // applied wherever a create is built, not only where one is typed.
-        if let Err(hint) = workspace_name::validate(&params.name) {
-            report_failure(&qt, "workspace.create", hint);
-            return;
-        }
-        let group = group.to_string();
-        // Kept for `state.json`, which the echo below does not reach.
-        let (group_for_state, repo_for_state) = (group.clone(), params.repo_path.clone());
-        let options = start_options(&options_json.to_string());
-        // Echoed back to the window verbatim, so the tab keeps what the user
-        // asked for and can start the agent again with it. The API key is not
-        // in it: `start_options` merges the key into the request it builds and
-        // never into this string.
-        let echoed_options = options_json.to_string();
-        let run_config = run_config.to_string();
-        let prompt = initial_prompt.to_string();
+        // Kept for `state.json`, which the echo does not reach.
+        let (group_for_state, repo_for_state) = (echo.group.clone(), params.repo_path.clone());
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(message) => {
@@ -2308,21 +2182,87 @@ impl qobject::AppController {
             };
             note_workspace_created(&group_for_state, &info.id.0, &repo_for_state);
             let json = serde_json::to_string(&info).unwrap_or_default();
+            let id = info.id.clone();
             // The tab appears as soon as the workspace exists, so a slow
             // `agent.start` happens in front of the user rather than behind a
             // dialog that has not closed yet.
             let _ = qt.queue(move |q| {
                 q.workspace_created(
                     QString::from(&json),
-                    QString::from(&group),
-                    QString::from("claude"),
-                    QString::from(""),
-                    QString::from(&echoed_options),
-                    QString::from(&run_config),
+                    QString::from(&echo.group),
+                    QString::from(&echo.adapter),
+                    QString::from(&echo.command),
+                    QString::from(&echo.options_json),
+                    QString::from(&echo.run_config),
                 )
             });
-            start_agent_and_prompt(shared, qt, info.id, options, prompt).await;
+            if let Some((options, prompt)) = agent {
+                start_agent_and_prompt(shared, qt, id, options, prompt).await;
+            }
         });
+    }
+
+    pub fn create_workspace_with_run(
+        self: Pin<&mut Self>,
+        repo_path: QString,
+        base_branch: QString,
+        name: QString,
+        group: QString,
+        adapter: QString,
+        command: QString,
+        run_config: QString,
+        init_if_missing: bool,
+    ) {
+        self.create_workspace_inner(
+            WorkspaceCreateParams {
+                repo_path: repo_path.to_string(),
+                base_branch: base_branch.to_string(),
+                name: name.to_string(),
+                init_if_missing,
+            },
+            CreateEcho {
+                group: group.to_string(),
+                adapter: adapter.to_string(),
+                command: command.to_string(),
+                options_json: String::new(),
+                run_config: run_config.to_string(),
+            },
+            None,
+        );
+    }
+
+    pub fn create_workspace_with_agent_and_run(
+        self: Pin<&mut Self>,
+        repo_path: QString,
+        base_branch: QString,
+        name: QString,
+        group: QString,
+        options_json: QString,
+        initial_prompt: QString,
+        run_config: QString,
+        init_if_missing: bool,
+    ) {
+        let options_json = options_json.to_string();
+        self.create_workspace_inner(
+            WorkspaceCreateParams {
+                repo_path: repo_path.to_string(),
+                base_branch: base_branch.to_string(),
+                name: name.to_string(),
+                init_if_missing,
+            },
+            CreateEcho {
+                group: group.to_string(),
+                adapter: "claude".to_owned(),
+                command: String::new(),
+                // Echoed back to the window verbatim, so the tab keeps what the
+                // user asked for and can start the agent again with it. The API
+                // key is not in it: `start_options` merges the key into the
+                // request it builds and never into this string.
+                options_json: options_json.clone(),
+                run_config: run_config.to_string(),
+            },
+            Some((start_options(&options_json), initial_prompt.to_string())),
+        );
     }
 
     pub fn start_agent(self: Pin<&mut Self>, workspace_id: QString, options_json: QString) {
@@ -2911,8 +2851,43 @@ impl qobject::AppController {
         self.workspace_busy_changed(QString::from(workspace), false);
     }
 
+    /// The prologue every workspace operation shares: book the workspace in,
+    /// take the connection, and spawn `f` with both.
+    ///
+    /// The three operations that go through it -- merge, pull request, discard
+    /// -- differ only in the request they send and what they do with the
+    /// answer. What they must not differ in is any of this: the same refusal
+    /// sentence when one is already out, the same banner for a connection that
+    /// is gone, and the booking handed back in the same queued step that raises
+    /// that banner. Each used to spell all of it out, which is how a fourth one
+    /// would have been written with a subtly different order.
+    ///
+    /// The failures here are reported with [`report_workspace_failure`] and
+    /// [`end_workspace_op_with_failure`] respectively, and the difference
+    /// between them is the point: a refusal must *not* free the slot, because
+    /// the slot belongs to the operation that is still running.
+    fn workspace_op<F, Fut>(mut self: Pin<&mut Self>, op: &'static str, workspace: String, f: F)
+    where
+        F: FnOnce(Shared, QtHandle, String) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let qt = self.as_mut().qt_thread();
+        if !self.as_mut().begin_workspace_op(&workspace) {
+            report_workspace_failure(&qt, workspace, op, WORKSPACE_BUSY.to_owned(), String::new());
+            return;
+        }
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(e) => {
+                end_workspace_op_with_failure(&qt, workspace, op, e.to_owned(), String::new());
+                return;
+            }
+        };
+        runtime().spawn(f(shared, qt, workspace));
+    }
+
     pub fn merge_workspace(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         workspace_id: QString,
         mode: QString,
         message: QString,
@@ -2935,77 +2910,63 @@ impl qobject::AppController {
         // being optional.
         let summary = message.to_string();
         let summary = (!summary.trim().is_empty()).then_some(summary);
-        if !self.as_mut().begin_workspace_op(&workspace) {
-            report_workspace_failure(
-                &qt,
-                workspace,
-                "workspace.merge",
-                WORKSPACE_BUSY.to_owned(),
-                String::new(),
-            );
-            return;
-        }
-        let shared = match require_connection() {
-            Ok(shared) => shared,
-            Err(e) => {
-                end_workspace_op_with_failure(
-                    &qt,
-                    workspace,
-                    "workspace.merge",
-                    e.to_owned(),
-                    String::new(),
-                );
-                return;
-            }
-        };
-        runtime().spawn(async move {
-            let params = WorkspaceMergeParams {
-                workspace_id: WorkspaceId(workspace.clone()),
-                mode,
-                message: summary,
-            };
-            match shared
-                .client
-                .request::<MergeResult>(Request::WorkspaceMerge(params))
-                .await
-            {
-                Ok(result) => {
-                    let conflicts = serde_json::to_string(&result.conflicts)
-                        .unwrap_or_else(|_| "[]".to_owned());
-                    let reason = result.reason.unwrap_or_default();
-                    tracing::info!(
-                        %workspace,
-                        ok = result.ok,
-                        conflicts = result.conflicts.len(),
-                        %reason,
-                        "workspace.merge answered"
-                    );
-                    let _ = qt.queue(move |mut q| {
-                        q.as_mut().end_workspace_op(&workspace);
-                        q.merge_finished(
-                            QString::from(&workspace),
-                            result.ok,
-                            QString::from(&conflicts),
-                            QString::from(&reason),
-                        )
-                    });
+        self.workspace_op(
+            "workspace.merge",
+            workspace,
+            |shared, qt, workspace| async move {
+                let params = WorkspaceMergeParams {
+                    workspace_id: WorkspaceId(workspace.clone()),
+                    mode,
+                    message: summary,
+                };
+                match shared
+                    .client
+                    .request::<MergeResult>(Request::WorkspaceMerge(params))
+                    .await
+                {
+                    Ok(result) => {
+                        let conflicts = serde_json::to_string(&result.conflicts)
+                            .unwrap_or_else(|_| "[]".to_owned());
+                        let reason = result.reason.unwrap_or_default();
+                        tracing::info!(
+                            %workspace,
+                            ok = result.ok,
+                            conflicts = result.conflicts.len(),
+                            %reason,
+                            "workspace.merge answered"
+                        );
+                        let _ = qt.queue(move |mut q| {
+                            q.as_mut().end_workspace_op(&workspace);
+                            q.merge_finished(
+                                QString::from(&workspace),
+                                result.ok,
+                                QString::from(&conflicts),
+                                QString::from(&reason),
+                            )
+                        });
+                    }
+                    Err(e) => {
+                        let (message, data) = failure_parts(&e);
+                        end_workspace_op_with_failure(
+                            &qt,
+                            workspace,
+                            "workspace.merge",
+                            message,
+                            data,
+                        );
+                    }
                 }
-                Err(e) => {
-                    let (message, data) = failure_parts(&e);
-                    end_workspace_op_with_failure(&qt, workspace, "workspace.merge", message, data);
-                }
-            }
-        });
+            },
+        );
     }
 
     pub fn create_pr(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         workspace_id: QString,
         title: QString,
         body: QString,
         draft: bool,
     ) {
-        let qt = self.qt_thread();
         let workspace = workspace_id.to_string();
         let params = WorkspaceCreatePrParams {
             workspace_id: WorkspaceId(workspace.clone()),
@@ -3013,30 +2974,10 @@ impl qobject::AppController {
             body: body.to_string(),
             draft,
         };
-        if !self.as_mut().begin_workspace_op(&workspace) {
-            report_workspace_failure(
-                &qt,
-                workspace,
-                "workspace.create_pr",
-                WORKSPACE_BUSY.to_owned(),
-                String::new(),
-            );
-            return;
-        }
-        let shared = match require_connection() {
-            Ok(shared) => shared,
-            Err(e) => {
-                end_workspace_op_with_failure(
-                    &qt,
-                    workspace,
-                    "workspace.create_pr",
-                    e.to_owned(),
-                    String::new(),
-                );
-                return;
-            }
-        };
-        runtime().spawn(async move {
+        self.workspace_op(
+            "workspace.create_pr",
+            workspace,
+            |shared, qt, workspace| async move {
             match shared
                 .client
                 .request::<CreatePrResult>(Request::WorkspaceCreatePr(params))
@@ -3063,65 +3004,45 @@ impl qobject::AppController {
         });
     }
 
-    pub fn discard_workspace(mut self: Pin<&mut Self>, workspace_id: QString) {
-        let qt = self.qt_thread();
+    pub fn discard_workspace(self: Pin<&mut Self>, workspace_id: QString) {
         let workspace = workspace_id.to_string();
-        if !self.as_mut().begin_workspace_op(&workspace) {
-            report_workspace_failure(
-                &qt,
-                workspace,
-                "workspace.destroy",
-                WORKSPACE_BUSY.to_owned(),
-                String::new(),
-            );
-            return;
-        }
-        let shared = match require_connection() {
-            Ok(shared) => shared,
-            Err(e) => {
-                end_workspace_op_with_failure(
-                    &qt,
-                    workspace,
-                    "workspace.destroy",
-                    e.to_owned(),
-                    String::new(),
-                );
-                return;
-            }
-        };
-        runtime().spawn(async move {
-            let params = WorkspaceDestroyParams {
-                workspace_id: WorkspaceId(workspace.clone()),
-                // A discard is exactly a forced destroy. The confirmation
-                // naming what is lost happens in front of the user, in the
-                // toolbar, and is the whole of the protection.
-                force: true,
-            };
-            match shared
-                .client
-                .request_raw(Request::WorkspaceDestroy(params))
-                .await
-            {
-                Ok(_) => {
-                    note_state(|s| s.forget_workspace(&workspace));
-                    tracing::info!(%workspace, "workspace discarded");
-                    let _ = qt.queue(move |mut q| {
-                        q.as_mut().end_workspace_op(&workspace);
-                        q.workspace_destroyed(QString::from(&workspace))
-                    });
+        self.workspace_op(
+            "workspace.destroy",
+            workspace,
+            |shared, qt, workspace| async move {
+                let params = WorkspaceDestroyParams {
+                    workspace_id: WorkspaceId(workspace.clone()),
+                    // A discard is exactly a forced destroy. The confirmation
+                    // naming what is lost happens in front of the user, in the
+                    // toolbar, and is the whole of the protection.
+                    force: true,
+                };
+                match shared
+                    .client
+                    .request_raw(Request::WorkspaceDestroy(params))
+                    .await
+                {
+                    Ok(_) => {
+                        note_state(|s| s.forget_workspace(&workspace));
+                        tracing::info!(%workspace, "workspace discarded");
+                        let _ = qt.queue(move |mut q| {
+                            q.as_mut().end_workspace_op(&workspace);
+                            q.workspace_destroyed(QString::from(&workspace))
+                        });
+                    }
+                    Err(e) => {
+                        let (message, data) = failure_parts(&e);
+                        end_workspace_op_with_failure(
+                            &qt,
+                            workspace,
+                            "workspace.destroy",
+                            message,
+                            data,
+                        );
+                    }
                 }
-                Err(e) => {
-                    let (message, data) = failure_parts(&e);
-                    end_workspace_op_with_failure(
-                        &qt,
-                        workspace,
-                        "workspace.destroy",
-                        message,
-                        data,
-                    );
-                }
-            }
-        });
+            },
+        );
     }
 
     pub fn workspace_summary(self: Pin<&mut Self>, workspace_id: QString) {

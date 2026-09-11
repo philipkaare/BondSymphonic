@@ -177,11 +177,6 @@ pub struct WorkspaceRuns {
     pub configs: Vec<RunConfig>,
     /// The name in the combo, or `None` when nothing runnable was detected.
     pub selected: Option<String>,
-    /// Reserved for the editable port of Milestone 6. Nothing writes it yet:
-    /// `run.start` names a configuration and the daemon uses that
-    /// configuration's port, so a per-start override would be a number the
-    /// daemon never sees.
-    pub port_override: Option<u16>,
     /// The runs the daemon reports for this workspace, in its order.
     pub runs: Vec<RunView>,
     /// Output per run id. Pruned by [`WorkspaceRuns::apply_list`] so a
