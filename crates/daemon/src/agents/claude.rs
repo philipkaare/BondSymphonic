@@ -65,6 +65,26 @@ const READER_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
 /// login prompt or a stack trace, not enough to fill an event.
 const STDERR_TAIL: usize = 20;
 
+/// How long an exit waits for the stderr already in the pipe before it gives up
+/// on saying why the agent went.
+///
+/// The tail is the useful half of an exit detail -- "Invalid API key", "Not
+/// logged in" -- and it is read by a task of its own, so without this the detail
+/// is whatever that task happened to have got through when the process died.
+/// Bounded because a SIGKILLed grandchild can hold the write end open for ever,
+/// and an exit nobody announces is worse than one that cannot say why.
+const STDERR_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long `agent.start` waits for `claude --version` before it gives up on the
+/// program it was about to run.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `data.reason` values on the errors a client is meant to match on rather than
+/// read. Wire format, shared with the IDE by value.
+pub const REASON_WAITING_PERMISSION: &str = "waiting_permission";
+pub const REASON_AGENT_EXITED: &str = "agent_exited";
+pub const REASON_PROBE_TIMEOUT: &str = "claude_probe_timeout";
+
 /// The `System` subtype under which an answered permission request is recorded.
 /// Shared with the IDE by value, not by type: it is wire format.
 pub const PERMISSION_REPLY_SUBTYPE: &str = "permission_reply";
@@ -327,57 +347,121 @@ pub fn claude_argv(options: &AgentStartOptions, backend: &str) -> Result<Vec<Str
     Ok(argv)
 }
 
-/// Warns once per daemon lifetime when the installed CLI is not the version
-/// this adapter was verified against.
+/// The programs whose `--version` has already answered.
 ///
-/// Skipped entirely when `BS_CLAUDE_BIN` is set: that hook points at a stand-in
-/// whose version says nothing about the protocol, and running it would start a
-/// second copy of it for no reason.
-async fn warn_on_untested_version() {
-    static CHECKED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-    CHECKED
-        .get_or_init(|| async {
-            if std::env::var_os("BS_CLAUDE_BIN").is_some() {
-                return;
-            }
-            let Some(bin) = host_claude_bin() else {
+/// The probe is worth running once per program, not once per agent: it costs a
+/// process start, and what it learns cannot change while the file does not. A
+/// probe that *failed* is deliberately not in here — a half-installed CLI that
+/// the user then repairs must be usable without restarting the daemon, which is
+/// exactly what a `OnceCell` filled with the failure prevented.
+static PROBED: Mutex<Vec<Vec<String>>> = Mutex::new(Vec::new());
+
+/// Runs `claude --version` before an agent is started, and warns when the
+/// installed CLI is not the version this adapter was verified against.
+///
+/// Bounded, because this runs on the `agent.start` path: a CLI that never
+/// answers — a binary on a filesystem that has gone away, one waiting on a
+/// terminal that is not there — used to hang the request for ever with nothing
+/// to show the user. Ten seconds is far longer than the real CLI takes and short
+/// enough that the IDE can say what happened.
+///
+/// The version *comparison* is skipped when `BS_CLAUDE_BIN` is set: that hook
+/// points at a stand-in whose version number says nothing about the protocol.
+/// The probe itself still runs, because "does this program answer at all" is the
+/// question, and the answer has to be about the program that will be spawned.
+pub async fn probe_claude(backend: &str) -> Result<(), RpcError> {
+    let bin = claude_bin(backend)?;
+    if PROBED.lock().iter().any(|seen| seen == &bin) {
+        return Ok(());
+    }
+    let mut cmd = tokio::process::Command::new(&bin[0]);
+    cmd.args(&bin[1..])
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // The timeout drops the future, which drops the child: without this a
+        // probe that gave up would leave the hung process behind.
+        .kill_on_drop(true);
+    let out = match tokio::time::timeout(PROBE_TIMEOUT, cmd.output()).await {
+        Ok(out) => out,
+        Err(_) => {
+            warn!(bin = ?bin, "`claude --version` did not answer; giving up on this start");
+            return Err(RpcError::new(
+                ErrorCode::PrereqMissing,
+                format!(
+                    "{} did not answer `--version` within {} seconds; the install may be broken",
+                    bin.join(" "),
+                    PROBE_TIMEOUT.as_secs()
+                ),
+            )
+            .with_data(serde_json::json!({ "reason": REASON_PROBE_TIMEOUT })));
+        }
+    };
+    match out {
+        Ok(out) => {
+            let version = String::from_utf8_lossy(&out.stdout);
+            let version = version.trim();
+            if std::env::var_os("BS_CLAUDE_BIN").is_none()
+                && !version.starts_with(TESTED_CLAUDE_VERSION)
+            {
                 warn!(
-                    path = %pinned_claude_path().display(),
-                    "claude is not installed; agents cannot start"
+                    found = version,
+                    tested = TESTED_CLAUDE_VERSION,
+                    "claude version differs from the one this adapter was tested against"
                 );
-                return;
-            };
-            let out = tokio::process::Command::new(&bin)
-                .arg("--version")
-                .stdin(std::process::Stdio::null())
-                .output()
-                .await;
-            match out {
-                Ok(out) => {
-                    let version = String::from_utf8_lossy(&out.stdout);
-                    let version = version.trim();
-                    if !version.starts_with(TESTED_CLAUDE_VERSION) {
-                        warn!(
-                            found = version,
-                            tested = TESTED_CLAUDE_VERSION,
-                            "claude version differs from the one this adapter was tested against"
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(bin = %bin.display(), error = %e, "could not run `claude --version`")
-                }
             }
-        })
-        .await;
+            // The program answered, so there is nothing to learn by asking
+            // again. A non-zero status counts: a stand-in that does not
+            // understand `--version` still runs.
+            PROBED.lock().push(bin);
+        }
+        // Not fatal here, and not remembered: the spawn that follows fails with
+        // the real reason, which names the program and what the operating system
+        // said about it.
+        Err(e) => warn!(bin = ?bin, error = %e, "could not run `claude --version`"),
+    }
+    Ok(())
 }
 
 fn agent_error(msg: impl Into<String>) -> RpcError {
     RpcError::new(ErrorCode::AgentError, msg)
 }
 
+/// An `AgentError` a client can act on without reading the message.
+fn agent_error_because(reason: &str, msg: impl Into<String>) -> RpcError {
+    agent_error(msg).with_data(serde_json::json!({ "reason": reason }))
+}
+
 /// The last few stderr lines, kept so an exit can say why.
 type StderrTail = Arc<Mutex<VecDeque<String>>>;
+
+/// Whether a line of the agent's output means the CLI has picked the
+/// conversation back up, and the reader should say so.
+///
+/// This is the other half of "only the reader publishes state": with `send` and
+/// `permission_reply` no longer announcing a `Working` they cannot know to be
+/// true, the first thing the CLI says after being written to is what tells
+/// everyone it is going again.
+///
+/// A line that carries a state of its own says it better -- `init` opens a turn,
+/// a `result` ends one, a `can_use_tool` request stops it -- so those are left
+/// alone. And a permission answered while a second question is still outstanding
+/// is not a resumption at all: the CLI is still waiting.
+fn resumed(state: AgentState, nothing_pending: bool, items: &[Parsed]) -> bool {
+    if items.iter().any(|i| matches!(i, Parsed::State(..)))
+        || !items.iter().any(|i| matches!(i, Parsed::Message(_)))
+    {
+        return false;
+    }
+    match state {
+        AgentState::Idle | AgentState::Error => true,
+        AgentState::WaitingPermission => nothing_pending,
+        // Already working, or gone: a line from a process that has been
+        // announced as exited must not bring it back.
+        AgentState::Working | AgentState::Exited => false,
+    }
+}
 
 /// The half of the adapter that only exists while the process does.
 struct Running {
@@ -389,6 +473,10 @@ struct Running {
     exit: Shared<futures::future::BoxFuture<'static, i32>>,
     reader_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
+    /// Resolves when the stderr reader has seen end of input, so both of the
+    /// paths that build an exit detail can wait for the agent's last words
+    /// instead of racing them.
+    stderr_done: Shared<futures::future::BoxFuture<'static, ()>>,
 }
 
 /// One `claude` process and everything needed to talk to it.
@@ -479,6 +567,27 @@ impl ClaudeAdapter {
         }
     }
 
+    /// Whether the CLI can be given a new turn at all.
+    ///
+    /// Both refusals are about a process that will not read the line: one that
+    /// is blocked on a permission question reads nothing until it is answered,
+    /// and one that has exited reads nothing ever again. Written to anyway, the
+    /// first turn vanishes without a trace and the second comes back as a
+    /// broken pipe, which tells a client nothing it can act on.
+    fn ready_for_a_turn(&self) -> Result<(), RpcError> {
+        match self.sink.entry().state().0 {
+            AgentState::WaitingPermission => Err(agent_error_because(
+                REASON_WAITING_PERMISSION,
+                "the agent is waiting for a permission answer; answer it before sending a turn",
+            )),
+            AgentState::Exited => Err(agent_error_because(
+                REASON_AGENT_EXITED,
+                "the agent has ended; start a new one with resume_session to continue it",
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// What the agent said on its way out, with the exit code after it; just
     /// the code when it said nothing.
     ///
@@ -503,7 +612,6 @@ impl ClaudeAdapter {
 #[async_trait]
 impl AgentAdapter for ClaudeAdapter {
     async fn start(&mut self) -> Result<(), RpcError> {
-        warn_on_untested_version().await;
         let mut child = self
             .handle
             .spawn(SandboxCommand {
@@ -534,6 +642,7 @@ impl AgentAdapter for ClaudeAdapter {
         // This is where "not logged in" shows up.
         let agent_id = self.sink.agent_id().clone();
         let tail = self.stderr_tail.clone();
+        let (finished, finished_rx) = tokio::sync::oneshot::channel::<()>();
         let stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -547,7 +656,15 @@ impl AgentAdapter for ClaudeAdapter {
                 }
                 tail.push_back(line);
             }
+            // Dropped rather than sent on an abort, which the waiters read as
+            // "finished" too — they are bounded anyway.
+            let _ = finished.send(());
         });
+        let stderr_done: Shared<futures::future::BoxFuture<'static, ()>> = async move {
+            let _ = finished_rx.await;
+        }
+        .boxed()
+        .shared();
 
         // stdout: the protocol.
         let sink = self.sink.clone();
@@ -555,6 +672,7 @@ impl AgentAdapter for ClaudeAdapter {
         let announced = self.exit_announced.clone();
         let tail = self.stderr_tail.clone();
         let exit_for_reader = exit.clone();
+        let stderr_for_reader = stderr_done.clone();
         let reader_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             loop {
@@ -569,7 +687,17 @@ impl AgentAdapter for ClaudeAdapter {
                 if line.trim().is_empty() {
                     continue;
                 }
-                for item in parse_line(&line) {
+                let items = parse_line(&line);
+                // State belongs to this reader and to nothing else, so this is
+                // where `Working` comes from for a turn nobody announced: the
+                // prompt a client wrote to stdin, or the permission answer that
+                // released the CLI. Before the line's own messages, so the
+                // transcript entry and the state a client reads beside it
+                // agree.
+                if resumed(sink.entry().state().0, pending.lock().is_empty(), &items) {
+                    sink.state(AgentState::Working, None).await;
+                }
+                for item in items {
                     match item {
                         Parsed::Message(body) => {
                             if let AgentMessageBody::PermissionRequest { request_id, .. } = &body {
@@ -585,24 +713,33 @@ impl AgentAdapter for ClaudeAdapter {
             }
             // stdout is closed, so the process is on its way out.
             let code = exit_for_reader.await;
+            // Before the detail is built out of it: the stderr tail is read by
+            // a task of its own, and the agent's last words are still on their
+            // way when the exit code lands -- the CLI hands its stderr to every
+            // tool it runs, so something that outlives it by a moment is the
+            // ordinary case. Without this wait the exit says "exit code 1" for
+            // an agent that spent its last breath saying "Invalid API key".
+            // Bounded for the reason `STDERR_DRAIN` gives: an exit nobody
+            // announces is worse than one that cannot say why.
+            let _ = tokio::time::timeout(STDERR_DRAIN, stderr_for_reader).await;
             // The process is gone whichever way the state went, so the record
             // is closed here rather than only on the `Exited` announcement: an
             // agent that died mid-turn stays in `Error` and never announces one.
             sink.ended();
-            // An error result already said why the turn failed, and it is the
-            // more useful message of the two.
-            if sink.entry().state().0 == AgentState::Error {
-                return;
-            }
+            // An error result already said why the turn failed, and that is the
+            // more useful of the two messages -- so it becomes the exit's
+            // detail rather than replacing the exit. An agent left in `Error`
+            // is one the IDE shows as a live tab for ever, and one whose next
+            // turn comes back as a broken pipe instead of "this agent ended".
+            let detail = match sink.entry().state() {
+                (AgentState::Error, Some(why)) => why,
+                _ => ClaudeAdapter::exit_detail(code, &tail),
+            };
             // `stop` may be ending this same process; the flag makes one of the
             // two announce and the other stay quiet, so a process that exits on
             // its own and is then stopped still produces one `Exited`.
             if !announced.swap(true, Ordering::SeqCst) {
-                sink.state(
-                    AgentState::Exited,
-                    Some(ClaudeAdapter::exit_detail(code, &tail)),
-                )
-                .await;
+                sink.state(AgentState::Exited, Some(detail)).await;
             }
         });
 
@@ -612,20 +749,28 @@ impl AgentAdapter for ClaudeAdapter {
             exit,
             reader_task,
             stderr_task,
+            stderr_done,
         });
         Ok(())
     }
 
     /// The user's turn is recorded before it is sent, so it is in the
-    /// transcript even if the write fails.
+    /// transcript even if the write fails — but only once the agent is in a
+    /// state that can take one at all.
+    ///
+    /// No state is published here. What the agent is doing is what its own
+    /// output last said, and the reader is what says it: a `Working` written
+    /// from this side is a guess about a process this code has not heard from.
     async fn send(&mut self, text: String) -> Result<(), RpcError> {
+        // The state is asked first, so an agent that has already been stopped
+        // answers with the reason a client can act on rather than with the
+        // bare "not running" that having no process left would give.
+        self.ready_for_a_turn()?;
         self.running()?;
         self.sink
             .message(AgentMessageBody::UserText { text: text.clone() })
             .await;
-        self.write_line(user_line(&text)).await?;
-        self.sink.state(AgentState::Working, None).await;
-        Ok(())
+        self.write_line(user_line(&text)).await
     }
 
     async fn permission_reply(
@@ -664,7 +809,10 @@ impl AgentAdapter for ClaudeAdapter {
                 }),
             })
             .await;
-        self.sink.state(AgentState::Working, None).await;
+        // And no state: the CLI may have a second question outstanding -- one
+        // assistant message can propose two tools -- and publishing `Working`
+        // here takes the bar down over a question nobody has answered, which
+        // leaves the CLI waiting for an answer that can no longer be given.
         Ok(())
     }
 
@@ -738,6 +886,9 @@ impl AgentAdapter for ClaudeAdapter {
         {
             running.reader_task.abort();
         }
+        // The same wait the reader makes, for the same reason: this path builds
+        // an exit detail too, and the tail is what makes it worth reading.
+        let _ = tokio::time::timeout(STDERR_DRAIN, running.stderr_done.clone()).await;
         running.stderr_task.abort();
         self.pending_request_ids.lock().clear();
         if !self.exit_announced.swap(true, Ordering::SeqCst) {

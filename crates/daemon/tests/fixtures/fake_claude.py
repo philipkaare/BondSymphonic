@@ -17,7 +17,15 @@ Behaviour:
   rather than one burst.
 * A `control_request` line in the fixture is printed and then the replay stops
   until a `control_response` arrives on stdin. That is where the real CLI waits
-  for a permission answer.
+  for a permission answer. `FAKE_CLAUDE_NO_WAIT` skips that pause, which is how
+  a fixture asks two permissions out of one turn: a model that proposes two
+  tools in one assistant message has both requests outstanding at once, and the
+  second must survive the answer to the first.
+* `--version` is answered at once, unless `FAKE_CLAUDE_VERSION_DELAY` (seconds)
+  says to stall first -- the daemon probes the program before it runs it, and
+  the probe has a timeout of its own. `FAKE_CLAUDE_VERSION_DELAY_MARKER` names a
+  file the delay is conditional on, so one program can be slow once and prompt
+  the next time.
 * After the fixture, every `user` line on stdin is answered with an assistant
   message echoing its text and a `result` line, so a turn can be driven from
   the test. `FAKE_CLAUDE_ECHO_DELAY` (seconds, default 0) holds that turn open
@@ -43,6 +51,22 @@ def echo_delay():
     """How long an echoed turn takes before it answers."""
     try:
         return float(os.environ.get("FAKE_CLAUDE_ECHO_DELAY", "0"))
+    except ValueError:
+        return 0.0
+
+
+def version_delay():
+    """How long `--version` stalls before it answers.
+
+    Gated on a marker file when `FAKE_CLAUDE_VERSION_DELAY_MARKER` names one, so
+    a test can make the very same program hang once and answer the next time --
+    which is how "a probe that timed out is not remembered" is observed.
+    """
+    marker = os.environ.get("FAKE_CLAUDE_VERSION_DELAY_MARKER")
+    if marker and not os.path.exists(marker):
+        return 0.0
+    try:
+        return float(os.environ.get("FAKE_CLAUDE_VERSION_DELAY", "0"))
     except ValueError:
         return 0.0
 
@@ -119,7 +143,9 @@ def replay(path, resumed):
         if msg.get("session_id"):
             session = msg["session_id"]
         emit(msg)
-        if msg.get("type") == "control_request":
+        if msg.get("type") == "control_request" and not os.environ.get(
+            "FAKE_CLAUDE_NO_WAIT"
+        ):
             wait_for_control_response()
         time.sleep(LINE_DELAY)
     return session
@@ -201,6 +227,7 @@ def user_text(msg):
 
 def main():
     if "--version" in sys.argv[1:]:
+        time.sleep(version_delay())
         print("0.0.0-fake (fake_claude.py)")
         return 0
     signal.signal(signal.SIGINT, lambda *_: sys.exit(130))

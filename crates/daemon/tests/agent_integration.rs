@@ -54,22 +54,61 @@ fn arg_path(p: &std::path::Path) -> String {
     p.display().to_string().replace('\\', "/")
 }
 
+/// Every knob the two fixture programs read. Each test sets the ones it wants
+/// and the helpers below clear all of them first, so nothing leaks from one
+/// test into the next through the process environment.
+const FIXTURE_KNOBS: [&str; 8] = [
+    "FAKE_CLAUDE_ECHO_DELAY",
+    "FAKE_CLAUDE_NO_WAIT",
+    "FAKE_CLAUDE_VERSION_DELAY",
+    "FAKE_CLAUDE_VERSION_DELAY_MARKER",
+    "DYING_CLAUDE_STDERR",
+    "DYING_CLAUDE_STDERR_DELAY",
+    "DYING_CLAUDE_STDERR_FROM_CHILD",
+    "DYING_CLAUDE_EXIT",
+];
+
+fn clear_knobs() {
+    for knob in FIXTURE_KNOBS {
+        std::env::remove_var(knob);
+    }
+}
+
 /// Points the adapter at the fake replaying `fixture`.
 fn use_fake_claude(py: &str, fixture: &str) {
+    use_program(py, &fixture_dir().join("fake_claude.py"), Some(fixture));
+}
+
+/// The same, from a *copy* of the fake at `at`.
+///
+/// The daemon probes `--version` once per program, so a test that needs the
+/// probe to actually run -- the two that are about what the probe does -- has to
+/// name a program no earlier test in this binary has already probed.
+fn use_fake_claude_copy(py: &str, at: &std::path::Path, fixture: &str) {
+    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+    std::fs::copy(fixture_dir().join("fake_claude.py"), at).unwrap();
+    use_program(py, at, Some(fixture));
+}
+
+/// Points the adapter at the fixture program that exits instead of holding the
+/// conversation open. `fixture` is the stream it prints on the way out, if any.
+fn use_dying_claude(py: &str, fixture: Option<&str>) {
+    use_program(py, &fixture_dir().join("dying_claude.py"), fixture);
+}
+
+fn use_program(py: &str, program: &std::path::Path, fixture: Option<&str>) {
     std::env::set_var(
         "BS_CLAUDE_BIN",
-        format!(
-            "\"{py}\" \"{}\"",
-            arg_path(&fixture_dir().join("fake_claude.py"))
+        format!("\"{py}\" \"{}\"", arg_path(program)),
+    );
+    match fixture {
+        Some(fixture) => std::env::set_var(
+            "FAKE_CLAUDE_FIXTURE",
+            fixture_dir().join("claude-stream").join(fixture),
         ),
-    );
-    std::env::set_var(
-        "FAKE_CLAUDE_FIXTURE",
-        fixture_dir().join("claude-stream").join(fixture),
-    );
-    // Only the test that wants a slow turn sets this; clear whatever the
-    // previous test left behind.
-    std::env::remove_var("FAKE_CLAUDE_ECHO_DELAY");
+        None => std::env::remove_var("FAKE_CLAUDE_FIXTURE"),
+    }
+    clear_knobs();
 }
 
 fn agent_of(ev: &Event) -> Option<&AgentId> {
@@ -117,17 +156,81 @@ fn options() -> AgentStartOptions {
 }
 
 async fn start_agent(c: &mut Client, ws: &WorkspaceId) -> AgentId {
+    try_start_agent(c, ws).await.unwrap()
+}
+
+/// `agent.start` with the error kept, for the tests that are about a start
+/// being refused.
+async fn try_start_agent(c: &mut Client, ws: &WorkspaceId) -> Result<AgentId, RpcError> {
     let v = c
         .call(Request::AgentStart(AgentStartParams {
             workspace_id: ws.clone(),
             adapter: AgentAdapterKind::Claude,
             options: options(),
         }))
+        .await?;
+    Ok(serde_json::from_value::<AgentStartResult>(v)
+        .unwrap()
+        .agent_id)
+}
+
+/// The machine-readable half of an error: `data.reason`, which is what a client
+/// matches on. These are wire values, so the tests spell them out.
+fn reason_of(e: &RpcError) -> &str {
+    e.data
+        .as_ref()
+        .and_then(|d| d.get("reason"))
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+}
+
+async fn history_of(c: &mut Client, ag: &AgentId) -> HistoryResult {
+    let v = c
+        .call(Request::AgentHistory(AgentIdParams {
+            agent_id: ag.clone(),
+        }))
         .await
         .unwrap();
-    serde_json::from_value::<AgentStartResult>(v)
-        .unwrap()
-        .agent_id
+    serde_json::from_value(v).unwrap()
+}
+
+async fn reply(
+    c: &mut Client,
+    ag: &AgentId,
+    request_id: &str,
+) -> Result<serde_json::Value, RpcError> {
+    c.call(Request::AgentPermissionReply(AgentPermissionReplyParams {
+        agent_id: ag.clone(),
+        request_id: request_id.to_owned(),
+        decision: PermissionDecision::Allow,
+        updated_input: None,
+        message: None,
+    }))
+    .await
+}
+
+/// The request ids of every permission request in `events`, in order.
+fn request_ids(events: &[Event]) -> Vec<String> {
+    bodies(events)
+        .into_iter()
+        .filter_map(|b| match b {
+            AgentMessageBody::PermissionRequest { request_id, .. } => Some(request_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// True when the transcript holds a permission request for `request_id` and no
+/// answer to it: the question is still open and the client must still show it.
+fn still_pending(h: &HistoryResult, request_id: &str) -> bool {
+    let asked = h.messages.iter().any(
+        |m| matches!(&m.body, AgentMessageBody::PermissionRequest { request_id: r, .. } if r == request_id),
+    );
+    let answered = h.messages.iter().any(|m| {
+        matches!(&m.body, AgentMessageBody::System { subtype, data }
+            if subtype == "permission_reply" && data["request_id"] == serde_json::json!(request_id))
+    });
+    asked && !answered
 }
 
 fn bodies(events: &[Event]) -> Vec<&AgentMessageBody> {
@@ -707,5 +810,521 @@ async fn the_agents_home_trusts_the_worktree_it_runs_in() {
         "the worktree the agent runs in must be a trusted project; trusted: {trusted:?}"
     );
 
+    cancel.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// State ownership and lifecycle (review findings AG1-AG7).
+//
+// The rule these pin: the stdout reader is the only thing that publishes an
+// agent's state. `agent.send` and `agent.permission_reply` write a line and
+// record a transcript entry; what the agent *is* doing is whatever its own
+// output last said.
+// ---------------------------------------------------------------------------
+
+/// AG1. A model that proposes two tools in one assistant message has two
+/// permission requests outstanding at once. Answering the first used to publish
+/// `Working`, which takes the bar down over a question nobody has answered: the
+/// second request can never be answered from the UI, and the CLI waits for it
+/// for ever.
+#[tokio::test]
+async fn answering_one_permission_leaves_the_other_one_pending() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    use_fake_claude(py, "two_permissions_turn.ndjson");
+    // Both requests go out without waiting, which is what the real CLI does
+    // when one assistant message asks for two tools.
+    std::env::set_var("FAKE_CLAUDE_NO_WAIT", "1");
+    let (port, token, _d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "twoperm").await;
+
+    let ag = start_agent(&mut c, &ws.id).await;
+
+    // init, Working, the text, two tool_use, two requests, WaitingPermission x2.
+    let events = next_agent_events(&mut c, &ag, 9, Duration::from_secs(20)).await;
+    let ids = request_ids(&events);
+    assert_eq!(ids.len(), 2, "both requests must arrive: {events:?}");
+    assert_eq!(
+        states(&events).last(),
+        Some(&AgentState::WaitingPermission),
+        "{events:?}"
+    );
+
+    reply(&mut c, &ag, &ids[0]).await.unwrap();
+
+    // Nothing the daemon did on its own moved the agent: the second question is
+    // still open, so the agent is still waiting on a permission.
+    let h = history_of(&mut c, &ag).await;
+    assert_eq!(
+        h.state,
+        AgentState::WaitingPermission,
+        "answering one of two must not report the agent as working: {:?}",
+        h.state
+    );
+    assert!(
+        still_pending(&h, &ids[1]),
+        "the second request must still be open: {:?}",
+        h.messages
+    );
+    assert!(
+        !still_pending(&h, &ids[0]),
+        "the first must be settled: {:?}",
+        h.messages
+    );
+    let since = next_agent_events(&mut c, &ag, 0, Duration::from_millis(200)).await;
+    assert!(
+        !states(&since).contains(&AgentState::Working),
+        "the reply itself must publish no state: {since:?}"
+    );
+
+    // And the second is still answerable, which is the whole point.
+    reply(&mut c, &ag, &ids[1]).await.unwrap();
+
+    c.call(Request::AgentStop(AgentIdParams { agent_id: ag }))
+        .await
+        .unwrap();
+    cancel.cancel();
+}
+
+/// AG2. A turn typed while the agent is waiting for a permission answer cannot
+/// be delivered: the CLI is blocked on the question and will not read it. It is
+/// refused, with a reason the IDE can match on, and nothing is recorded.
+#[tokio::test]
+async fn sending_a_turn_while_a_permission_is_open_is_refused() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    use_fake_claude(py, "permission_turn.ndjson");
+    let (port, token, _d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "sendwait").await;
+
+    let ag = start_agent(&mut c, &ws.id).await;
+    let events = next_agent_events(&mut c, &ag, 4, Duration::from_secs(20)).await;
+    assert_eq!(
+        states(&events).last(),
+        Some(&AgentState::WaitingPermission),
+        "{events:?}"
+    );
+
+    let e = c
+        .call(Request::AgentSend(AgentSendParams {
+            agent_id: ag.clone(),
+            text: "never mind".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::AgentError, "{e:?}");
+    assert_eq!(reason_of(&e), "waiting_permission", "{e:?}");
+
+    let h = history_of(&mut c, &ag).await;
+    assert_eq!(h.state, AgentState::WaitingPermission, "{:?}", h.state);
+    assert!(
+        !h.messages.iter().any(
+            |m| matches!(&m.body, AgentMessageBody::UserText { text } if text == "never mind")
+        ),
+        "a refused turn must not reach the transcript: {:?}",
+        h.messages
+    );
+
+    c.call(Request::AgentStop(AgentIdParams { agent_id: ag }))
+        .await
+        .unwrap();
+    cancel.cancel();
+}
+
+/// AG3. What the agent said on its way out is the useful half of an exit: "not
+/// logged in", "invalid API key", a stack trace. The stderr reader is a task of
+/// its own, so the exit detail used to be whatever it happened to have read by
+/// the time the process died -- often nothing. Looped, because a race that is
+/// usually won is still a bug.
+#[tokio::test]
+async fn an_exit_detail_always_carries_the_agents_last_words() {
+    const ROUNDS: usize = 20;
+
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    use_dying_claude(py, None);
+    // The agent's last words are written by a process that inherits its stderr
+    // and outlives it by a moment, so the daemon has the exit code in hand
+    // while they are still on their way. That is the ordinary shape of it --
+    // the CLI hands its stderr to every tool it runs -- and it is the one
+    // ordering that is not a coin toss: text written just before the exit is
+    // usually, but only usually, read in time, and "usually" is what kept this
+    // from being a bug anybody saw.
+    let mut noise: Vec<String> = (0..400).map(|i| format!("  at frame {i}")).collect();
+    noise.push("boom".to_owned());
+    std::env::set_var("DYING_CLAUDE_STDERR", noise.join("\n"));
+    std::env::set_var("DYING_CLAUDE_STDERR_FROM_CHILD", "1");
+    std::env::set_var("DYING_CLAUDE_STDERR_DELAY", "0.15");
+    std::env::set_var("DYING_CLAUDE_EXIT", "3");
+    let (port, token, _d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "boom").await;
+
+    let mut details = Vec::new();
+    for round in 0..ROUNDS {
+        let ag = start_agent(&mut c, &ws.id).await;
+        let events = next_agent_events(&mut c, &ag, 1, Duration::from_secs(20)).await;
+        let detail = events
+            .iter()
+            .find_map(|e| match e {
+                Event::AgentStateChanged {
+                    state: AgentState::Exited | AgentState::Error,
+                    detail,
+                    ..
+                } => Some(detail.clone().unwrap_or_default()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("round {round}: no exit event: {events:?}"));
+        details.push(detail);
+    }
+    let missing: Vec<(usize, &String)> = details
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| !d.contains("boom"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} of {ROUNDS} exits lost the agent's stderr: {missing:?}",
+        missing.len()
+    );
+    assert!(
+        details.iter().all(|d| d.contains("exit code 3")),
+        "every exit must name the code too: {details:?}"
+    );
+    cancel.cancel();
+}
+
+/// Makes a worktree impossible to remove, so a `workspace.destroy` gets all the
+/// way to the git step and fails there. `None` where the host will not play
+/// along, which is a skip rather than a pass.
+struct RemovalBlock {
+    #[cfg(windows)]
+    _held: std::fs::File,
+    #[cfg(unix)]
+    dir: std::path::PathBuf,
+}
+
+#[cfg(windows)]
+fn block_removal(worktree: &std::path::Path) -> Option<RemovalBlock> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let path = worktree.join("held-open.txt");
+    std::fs::write(&path, "held open by the test").ok()?;
+    // Share mode 0: every other open of this name fails, deletion included.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&path)
+        .ok()?;
+    Some(RemovalBlock { _held: held })
+}
+
+#[cfg(unix)]
+fn block_removal(worktree: &std::path::Path) -> Option<RemovalBlock> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = worktree.join("held-open");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::write(dir.join("file"), "held open by the test").ok()?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).ok()?;
+    // root ignores the mode, and then there is nothing here to arrange.
+    if std::fs::remove_file(dir.join("file")).is_ok() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+    Some(RemovalBlock { dir })
+}
+
+#[cfg(unix)]
+impl Drop for RemovalBlock {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// AG4. A destroy that fails late leaves the workspace behind in `Error`, and
+/// its agents' transcripts are the one thing still worth having out of it. They
+/// used to be dropped from the map before the destroy had done anything, so the
+/// history was gone while the workspace was still there.
+#[tokio::test]
+async fn a_failed_destroy_keeps_its_agents_history() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    use_fake_claude(py, "simple_turn.ndjson");
+    let (port, token, _d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "stubborn").await;
+
+    let ag = start_agent(&mut c, &ws.id).await;
+    // Let the turn finish, so there is a transcript worth keeping.
+    next_agent_events(&mut c, &ag, 5, Duration::from_secs(20)).await;
+    let before = history_of(&mut c, &ag).await;
+    assert!(!before.messages.is_empty());
+
+    let Some(block) = block_removal(std::path::Path::new(&ws.worktree_path)) else {
+        eprintln!("SKIP: this host will not make a directory undeletable");
+        cancel.cancel();
+        return;
+    };
+
+    let e = c
+        .call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+            workspace_id: ws.id.clone(),
+            force: true,
+        }))
+        .await
+        .expect_err("the worktree cannot be removed, so the destroy must fail");
+    assert_ne!(e.code, ErrorCode::NotFound, "{e:?}");
+
+    let after = history_of(&mut c, &ag).await;
+    assert_eq!(
+        after.messages, before.messages,
+        "the transcript must outlive a destroy that did not happen"
+    );
+    // The workspace is still there, in error, and still lists its agent.
+    let v = c
+        .call(Request::WorkspaceGet(WorkspaceIdParams {
+            workspace_id: ws.id.clone(),
+        }))
+        .await
+        .unwrap();
+    let info: WorkspaceInfo = serde_json::from_value(v).unwrap();
+    assert_eq!(info.agents, vec![ag.clone()], "{:?}", info.agents);
+
+    drop(block);
+    // And once the obstacle is gone the destroy does work, taking the agent.
+    c.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+        workspace_id: ws.id.clone(),
+        force: true,
+    }))
+    .await
+    .unwrap();
+    let e = c
+        .call(Request::AgentHistory(AgentIdParams { agent_id: ag }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
+    cancel.cancel();
+}
+
+/// AG5. Starting an agent seeds the workspace home and copies the repository's
+/// `[claude] settings` into it before it spawns anything. Two starts at once
+/// interleave those writes, and the settings file -- which is unlinked and then
+/// created -- can be left missing or half written for the agent that wins.
+/// One start per workspace at a time; the second is a `Conflict`.
+#[tokio::test]
+async fn two_starts_at_once_in_one_workspace_do_not_race() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    // A repository that pins its agents' settings, so a start really does write
+    // into the workspace home on its way to the spawn.
+    std::fs::write(
+        repo.join("bondsymphonic.toml"),
+        "[claude]\nsettings = \"claude-settings.json\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("claude-settings.json"), "{\"pinned\":true}").unwrap();
+    common::commit_all(&repo, &[], "pin the agent settings");
+
+    // A copy of the fake nothing has probed yet, and a probe that takes its
+    // time: that is what holds the first start inside the critical section long
+    // enough for the second to arrive while it is there.
+    let fake = dir.path().join("race-fake").join("fake_claude.py");
+    use_fake_claude_copy(py, &fake, "simple_turn.ndjson");
+    std::env::set_var("FAKE_CLAUDE_VERSION_DELAY", "3");
+
+    let (port, token, d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "race").await;
+    let mut c2 = Client::connect(port, &token).await;
+
+    let (a, b) = tokio::join!(
+        try_start_agent(&mut c, &ws.id),
+        try_start_agent(&mut c2, &ws.id)
+    );
+    let (ok, refused) = match (a, b) {
+        (Ok(id), Err(e)) | (Err(e), Ok(id)) => (id, e),
+        (Ok(x), Ok(y)) => panic!("both starts were allowed into the workspace: {x}, {y}"),
+        (Err(x), Err(y)) => panic!("neither start succeeded: {x:?}, {y:?}"),
+    };
+    assert_eq!(refused.code, ErrorCode::Conflict, "{refused:?}");
+    assert_eq!(reason_of(&refused), "agent_running", "{refused:?}");
+
+    // The winner's settings landed whole.
+    let settings = d.dirs.home(&ws.id).join(".claude").join("settings.json");
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap_or_default(),
+        "{\"pinned\":true}",
+        "the settings the winner wrote must be intact: {}",
+        settings.display()
+    );
+    // And the workspace holds exactly the one agent that started.
+    assert_eq!(d.agents.agents_of(&ws.id), vec![ok.clone()]);
+
+    c.call(Request::AgentStop(AgentIdParams { agent_id: ok }))
+        .await
+        .unwrap();
+    cancel.cancel();
+}
+
+/// AG6. An agent that ends its turn with an error and then exits is gone. It
+/// used to stay in `Error` for ever: the tab never said the process had died,
+/// and the next turn the user typed came back as a broken pipe rather than as
+/// "this agent has ended".
+#[tokio::test]
+async fn an_errored_turn_that_ends_the_process_is_reported_as_an_exit() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    use_dying_claude(py, Some("error_result_turn.ndjson"));
+    let (port, token, _d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "dead").await;
+
+    let ag = start_agent(&mut c, &ws.id).await;
+    // init, Working, the text, the result, Error, Exited.
+    let events = next_agent_events(&mut c, &ag, 6, Duration::from_secs(20)).await;
+    assert_eq!(
+        states(&events).last(),
+        Some(&AgentState::Exited),
+        "the process is gone, so the agent has exited: {events:?}"
+    );
+    let detail = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            Event::AgentStateChanged {
+                state: AgentState::Exited,
+                detail,
+                ..
+            } => Some(detail.clone().unwrap_or_default()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        detail.contains("Not logged in"),
+        "the exit must keep the reason the turn failed: {detail:?}"
+    );
+
+    let h = history_of(&mut c, &ag).await;
+    assert_eq!(h.state, AgentState::Exited, "{:?}", h.state);
+    let v = c
+        .call(Request::WorkspaceGet(WorkspaceIdParams {
+            workspace_id: ws.id.clone(),
+        }))
+        .await
+        .unwrap();
+    let info: WorkspaceInfo = serde_json::from_value(v).unwrap();
+    assert_eq!(info.agent_records[0].state, AgentState::Exited);
+
+    let e = c
+        .call(Request::AgentSend(AgentSendParams {
+            agent_id: ag.clone(),
+            text: "are you there".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(reason_of(&e), "agent_exited", "{e:?}");
+
+    // And the same answer once the agent has been stopped as well, which is
+    // where the process really is gone: the state is what decides, not whether
+    // there is still a handle to write to.
+    c.call(Request::AgentStop(AgentIdParams {
+        agent_id: ag.clone(),
+    }))
+    .await
+    .unwrap();
+    let e = c
+        .call(Request::AgentSend(AgentSendParams {
+            agent_id: ag.clone(),
+            text: "still there".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(reason_of(&e), "agent_exited", "{e:?}");
+    cancel.cancel();
+}
+
+/// AG7. The daemon runs `claude --version` before it starts an agent. A CLI
+/// that never answers -- a half-installed binary waiting on a terminal, a
+/// filesystem that has gone away -- used to hang `agent.start` for ever, and the
+/// answer was remembered for the life of the daemon, so a fixed install could
+/// not be picked up without a restart.
+#[tokio::test]
+async fn a_version_probe_that_hangs_fails_the_start_and_is_not_remembered() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let fake = dir.path().join("probe-fake").join("fake_claude.py");
+    use_fake_claude_copy(py, &fake, "simple_turn.ndjson");
+    // The same program, slow while the marker is there and prompt once it is
+    // gone: that is how "the failure is not remembered" is observable at all.
+    let marker = dir.path().join("hang-the-probe");
+    std::fs::write(&marker, "").unwrap();
+    std::env::set_var("FAKE_CLAUDE_VERSION_DELAY", "60");
+    std::env::set_var("FAKE_CLAUDE_VERSION_DELAY_MARKER", arg_path(&marker));
+
+    let (port, token, _d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "probe").await;
+
+    let started = Instant::now();
+    let e = try_start_agent(&mut c, &ws.id)
+        .await
+        .expect_err("a probe that never answers cannot start an agent");
+    let waited = started.elapsed();
+    assert_eq!(reason_of(&e), "claude_probe_timeout", "{e:?}");
+    assert!(
+        waited >= Duration::from_secs(8) && waited < Duration::from_secs(30),
+        "the start must give up at the timeout, not before or never: {waited:?}"
+    );
+
+    // Not remembered: the same program, now answering, starts an agent.
+    std::fs::remove_file(&marker).unwrap();
+    let ag = start_agent(&mut c, &ws.id).await;
+    let events = next_agent_events(&mut c, &ag, 4, Duration::from_secs(20)).await;
+    assert_eq!(
+        states(&events).last(),
+        Some(&AgentState::Idle),
+        "{events:?}"
+    );
+
+    c.call(Request::AgentStop(AgentIdParams { agent_id: ag }))
+        .await
+        .unwrap();
     cancel.cancel();
 }

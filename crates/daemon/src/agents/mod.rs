@@ -386,6 +386,10 @@ impl Agent {
 const ENDED_AT_RESTART: &str = "the agent ended when the daemon restarted";
 const ENDED_BEFORE_RESTART: &str = "the agent ended before the daemon restarted";
 
+/// The `data.reason` on the `Conflict` a second simultaneous `agent.start` in
+/// one workspace gets. Wire format, shared with the IDE by value.
+pub const REASON_AGENT_RUNNING: &str = "agent_running";
+
 /// Every agent the daemon is running, and the requests that reach them.
 ///
 /// The manager owns the list, not the workspace registry: an agent is a live
@@ -396,6 +400,9 @@ pub struct AgentManager {
     store: Arc<TranscriptStore>,
     agents: Mutex<HashMap<AgentId, Arc<Agent>>>,
     next_ordinal: AtomicU64,
+    /// One gate per workspace, held for the whole of a start: see
+    /// [`start`](AgentManager::start).
+    starts: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
     /// The agents on disk, which is what makes the map survivable: see
     /// [`restore`](AgentManager::restore).
     records: Arc<AgentRecords>,
@@ -408,6 +415,7 @@ impl AgentManager {
             store: Arc::new(TranscriptStore::new(transcripts)),
             agents: Mutex::new(HashMap::new()),
             next_ordinal: AtomicU64::new(0),
+            starts: Mutex::new(HashMap::new()),
             records: Arc::new(AgentRecords::new(records)),
         }
     }
@@ -528,11 +536,38 @@ impl AgentManager {
             )));
         }
         let handle = d.sandbox(&ws.id)?;
+        // One start at a time in a workspace, from here to the moment the
+        // process is up.
+        //
+        // Everything below writes into the *workspace's* home before it spawns
+        // anything, and the settings copy in particular unlinks the destination
+        // and then creates it: two starts at once leave the second agent's
+        // settings file missing or half written, and neither agent is running
+        // under the settings its repository pins. Refused rather than queued,
+        // because the client that asked has a user waiting on it, and a start
+        // held behind a spawn is a start that looks hung.
+        let gate = {
+            let mut gates = self.starts.lock();
+            gates
+                .entry(ws.id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _gate = gate.try_lock_owned().map_err(|_| {
+            RpcError::new(
+                ErrorCode::Conflict,
+                format!("another agent is already starting in workspace {}", ws.id),
+            )
+            .with_data(serde_json::json!({ "reason": REASON_AGENT_RUNNING }))
+        })?;
         // The backend decides how the CLI is named: bound into the sandbox at a
         // fixed path under bwrap, and at its host path where there are no
         // mounts. Resolved before anything is spawned, so a missing install is
         // a `PrereqMissing` naming the path rather than an exec failure.
         let argv = claude::claude_argv(&p.options, d.backend.name())?;
+        // And before anything is written: a CLI that cannot even say its
+        // version is one this workspace should not be prepared for.
+        claude::probe_claude(d.backend.name()).await?;
 
         // Again at start, not only at creation: the user may have logged in
         // since this workspace was made, and a workspace that was created
@@ -717,22 +752,26 @@ impl AgentManager {
         self.records_of(ws).into_iter().map(|a| a.id).collect()
     }
 
-    /// Stops and forgets every agent in `ws`. Called before a workspace's
-    /// sandbox is torn down, so the agents end through their own `stop` path
-    /// (stdin closed, exit awaited, `Exited` announced) instead of vanishing
-    /// with the sandbox.
+    /// Stops every agent in `ws` without forgetting any of them. Called before a
+    /// workspace's sandbox is torn down, so the agents end through their own
+    /// `stop` path (stdin closed, exit awaited, `Exited` announced) instead of
+    /// vanishing with the sandbox.
+    ///
+    /// The agents stay in the map. A destroy can still fail after this point --
+    /// a worktree git will not delete, a repository that has gone read-only --
+    /// and it leaves the workspace behind in `Error` with its agents' history
+    /// the one thing worth having out of it. Forgetting them here made
+    /// `agent.history` a `NotFound` for a workspace the user can still see.
+    /// [`forget_workspace`](AgentManager::forget_workspace) is what removes
+    /// them, and the destroy calls it only once the worktree is really gone.
     pub async fn stop_all_in(&self, ws: &WorkspaceId) {
-        let victims: Vec<(AgentId, Arc<Agent>)> = {
-            let mut agents = self.agents.lock();
-            let ids: Vec<AgentId> = agents
-                .iter()
-                .filter(|(_, a)| &a.entry.workspace_id == ws)
-                .map(|(id, _)| id.clone())
-                .collect();
-            ids.into_iter()
-                .filter_map(|id| agents.remove(&id).map(|a| (id, a)))
-                .collect()
-        };
+        let victims: Vec<(AgentId, Arc<Agent>)> = self
+            .agents
+            .lock()
+            .iter()
+            .filter(|(_, a)| &a.entry.workspace_id == ws)
+            .map(|(id, a)| (id.clone(), a.clone()))
+            .collect();
         for (id, agent) in victims {
             let Some(adapter) = agent.adapter.as_ref() else {
                 continue;
@@ -751,12 +790,32 @@ impl AgentManager {
     /// fails late leaves the workspace in the registry in `Error`, and its
     /// agents' history is the one thing the user might still want out of it.
     ///
-    /// The ids come from the file rather than from the map, so an agent this
-    /// daemon never held an entry for -- one restored and then stopped, or one
-    /// whose entry was lost -- takes its transcript with it too.
+    /// The transcripts to delete come from the file as well as from the map, so
+    /// an agent this daemon never held an entry for -- one restored and then
+    /// stopped, or one whose entry was lost -- takes its transcript with it too.
     pub fn forget_workspace(&self, ws: &WorkspaceId) {
+        let mut gone: Vec<AgentId> = {
+            let mut agents = self.agents.lock();
+            let ids: Vec<AgentId> = agents
+                .iter()
+                .filter(|(_, a)| &a.entry.workspace_id == ws)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &ids {
+                agents.remove(id);
+            }
+            ids
+        };
+        // The workspace is gone, so the gate that serialised its starts is one
+        // entry nobody will ask for again.
+        self.starts.lock().remove(ws);
         for id in self.records.remove_workspace(ws) {
-            self.store.remove(&id);
+            if !gone.contains(&id) {
+                gone.push(id);
+            }
+        }
+        for id in &gone {
+            self.store.remove(id);
         }
     }
 }
