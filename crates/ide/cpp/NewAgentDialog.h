@@ -36,9 +36,9 @@ public:
                    QWidget* parent = nullptr);
 
     /// The repository the dialog will open on: the most recently used one, or
-    /// empty when there is none. Static because the window needs it *before*
-    /// there is a dialog -- it inspects that path first, so the branch list is
-    /// filled the moment the dialog appears rather than half a minute later.
+    /// empty when there is none. Static because the window has to name that
+    /// path when it builds the dialog, and the window has no dialog to ask
+    /// until it has.
     static QString initialRepoPath(AppController* controller);
 
     /// Preselects a group, adding it to the list if it is not there yet.
@@ -85,10 +85,18 @@ private:
     void inspectRepo();
     void onRepoInspected(const QString& path, const QString& infoJson);
     void onRunConfigsDetected(const QString& path, const QString& json);
+    /// A `repo.inspect` that did not answer, from the typed signal that carries
+    /// the path it was asked about. Only this dialog's own path is acted on: a
+    /// failure for a repository the user has since moved off would otherwise
+    /// grey Create out over an inspection nobody is waiting for.
+    void onRepoInspectFailed(const QString& path, const QString& message);
     /// Raises or hides the note naming the hosts the repository's own
     /// `bondsymphonic.toml` would add to the new workspace's allowlist.
     void showNetworkAllow(const QString& json);
-    void onInspectFailed(const QString& op, const QString& message);
+    /// The one failure with no signal of its own. A daemon that cannot detect
+    /// run configurations is not a reason to refuse to create the workspace,
+    /// so it only puts the reason on the Run config row.
+    void onRunConfigsFailed(const QString& op, const QString& message);
     /// Re-runs the name rule and shows or hides the hint under the field.
     /// Called on every edit, so a name the daemon would refuse is refused
     /// while it is being typed rather than after the dialog has closed and

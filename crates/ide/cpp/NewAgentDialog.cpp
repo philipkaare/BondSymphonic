@@ -209,7 +209,12 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     QObject::connect(m_controller, &AppController::repoInspected, this, &NewAgentDialog::onRepoInspected);
     QObject::connect(m_controller, &AppController::runConfigsDetected, this,
                      &NewAgentDialog::onRunConfigsDetected);
-    QObject::connect(m_controller, &AppController::operationFailed, this, &NewAgentDialog::onInspectFailed);
+    QObject::connect(m_controller, &AppController::repoInspectFailed, this,
+                     &NewAgentDialog::onRepoInspectFailed);
+    // The catch-all, for the one lookup this dialog makes that has no signal of
+    // its own. Everything else on it belongs to the window.
+    QObject::connect(m_controller, &AppController::operationFailed, this,
+                     &NewAgentDialog::onRunConfigsFailed);
 
     onAdapterChanged();
     updateNameHint();
@@ -465,22 +470,30 @@ void NewAgentDialog::onRunConfigsDetected(const QString& path, const QString& js
     }
 }
 
-void NewAgentDialog::onInspectFailed(const QString& op, const QString& message) {
-    // Only inspection failures belong in this dialog; the window reports the rest.
-    if (op == "repo.inspect") {
-        // The path is kept, not cleared: an inspection that failed is still the
-        // one this dialog is showing, and `updateOkEnabled` refuses Create while
-        // it stands. `inspectRepo` lets the same path be asked about again once
-        // this flag is up, so Enter, Recent or Browse are all a retry.
-        m_inspectPending = false;
-        m_inspectFailed = true;
-        m_status->setText(message);
-        updateOkEnabled();
+void NewAgentDialog::onRepoInspectFailed(const QString& path, const QString& message) {
+    if (path != m_pendingPath) {
+        // An inspection of a repository this dialog has moved off, or one the
+        // window asked for on its own account. Acting on it would grey Create
+        // out over an answer about somewhere else.
         return;
     }
+    // The path is kept, not cleared: an inspection that failed is still the
+    // one this dialog is showing, and `updateOkEnabled` refuses Create while
+    // it stands. `inspectRepo` lets the same path be asked about again once
+    // this flag is up, so Enter, Recent or Browse are all a retry.
+    m_inspectPending = false;
+    m_inspectFailed = true;
+    m_status->setText(message);
+    updateOkEnabled();
+}
+
+void NewAgentDialog::onRunConfigsFailed(const QString& op, const QString& message) {
     // A daemon that cannot detect run configurations is not a reason to refuse
-    // to create the workspace: the list stays at "(none)" and says why.
-    if (op == "repo.detect_run_configs") {
+    // to create the workspace: the list stays at "(none)" and says why. The
+    // comparison stays because this is the catch-all and the detection is the
+    // one operation on it with no signal of its own; everything this dialog
+    // gates on arrives typed.
+    if (op == QLatin1String("repo.detect_run_configs")) {
         m_runConfig->setToolTip(message);
     }
 }
@@ -513,3 +526,90 @@ void NewAgentDialog::updateOkEnabled() {
                     m_controller->validateWorkspaceName(name()).isEmpty();
     m_buttons->button(QDialogButtonBox::Ok)->setEnabled(ok);
 }
+
+// --- offscreen test entries --------------------------------------------------
+//
+// See the note in `EditorArea.cpp`. `bs_widget_test_begin` must have run first.
+#if defined(BS_WIDGET_TESTS)
+#include <cstdint>
+
+namespace {
+
+/// The repository the dialog under test opens on. A distro path, which
+/// `wslPath` passes through unchanged, so `repoPath()` answers what was typed.
+const char* const kDialogRepo = "/repo/alpha";
+/// A repository the dialog is not showing.
+const char* const kOtherRepo = "/repo/other";
+
+/// The dialog's status line.
+QLabel* statusLabel(const NewAgentDialog& dialog) {
+    return dialog.findChild<QLabel*>(QStringLiteral("NewAgentStatus"));
+}
+
+/// Whether the dialog is offering Create.
+bool createEnabled(const NewAgentDialog& dialog) {
+    auto* buttons = dialog.findChild<QDialogButtonBox*>();
+    return buttons != nullptr && buttons->button(QDialogButtonBox::Ok)->isEnabled();
+}
+
+/// Whether the dialog is saying it is reading a repository.
+bool isReading(const NewAgentDialog& dialog) {
+    const QLabel* status = statusLabel(dialog);
+    return status != nullptr && status->text().startsWith(QLatin1String("Reading repository"));
+}
+
+} // namespace
+
+/// A failed inspection reaches the dialog that asked for it, and only that one.
+///
+/// The dialog used to learn about this by comparing the daemon's method name on
+/// the catch-all `operationFailed`, which carries no path: it could not tell an
+/// inspection of its own repository from one of another, and it would have lost
+/// its only failure path altogether once the paired emission goes.
+extern "C" std::int32_t bs_widget_test_new_agent_dialog_takes_its_own_inspect_failure() {
+    AppController controller;
+    GroupModel model;
+    NewAgentDialog dialog(&controller, &model, QString::fromUtf8(kDialogRepo));
+
+    // The constructor asked, so the dialog is waiting and Create is refused
+    // until the branch list is in.
+    if (!isReading(dialog)) {
+        return 1;
+    }
+    if (createEnabled(dialog)) {
+        return 2;
+    }
+
+    // A failure for a repository this dialog is not showing. The window asks
+    // about others; none of them is this dialog's business.
+    controller.repoInspectFailed(QString::fromUtf8(kOtherRepo), QStringLiteral("not mine"));
+    if (!isReading(dialog)) {
+        return 3;
+    }
+
+    // Its own. The reason is shown, and Create stays refused because nothing in
+    // the branch combo is known to exist.
+    controller.repoInspectFailed(QString::fromUtf8(kDialogRepo), QStringLiteral("boom"));
+    const QLabel* status = statusLabel(dialog);
+    if (status == nullptr || status->text() != QLatin1String("boom")) {
+        return 4;
+    }
+    if (createEnabled(dialog)) {
+        return 5;
+    }
+
+    // And the retry is armed: the same path asked about again is a fresh
+    // inspection rather than the no-op it would be after a success. Enter in
+    // the path field is one of the three ways a user does that.
+    auto* path = dialog.findChild<QLineEdit*>(QStringLiteral("NewAgentRepoPath"));
+    if (path == nullptr) {
+        return 6;
+    }
+    emit path->editingFinished();
+    if (!isReading(dialog)) {
+        return 7;
+    }
+    return 0;
+}
+
+#endif // BS_WIDGET_TESTS
