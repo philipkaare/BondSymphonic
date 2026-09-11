@@ -113,10 +113,15 @@ private:
     /// asks about, so the question and the act cannot name different
     /// workspaces however much the model has moved since.
     void onDestroyRequested(const QString& workspaceId, const QString& workspaceName);
-    /// Whether `workspaceId` has an operation running, having said so if it
-    /// has. Asked twice by a destroy -- before the confirmation and after it --
+    /// Whether the model still has a tab for `workspaceId`. By id, because a
+    /// workspace may legitimately have no name.
+    bool workspaceIsOpen(const QString& workspaceId) const;
+    /// Whether `workspaceId` has a merge, pull request or discard running.
+    /// Asked twice by a destroy -- before the confirmation and after it --
     /// because a merge can start while the question is on screen.
-    bool isWorkspaceBusyOrSaidSo(const QString& workspaceId);
+    bool isWorkspaceBusy(const QString& workspaceId) const;
+    /// Says so, which is what a destroy does when it finds one.
+    void sayWorkspaceIsBusy();
     /// A `system.check_prereqs` that did not answer. Logged, never shown.
     void onPrereqsCheckFailed(const QString& message);
     /// A `repo.inspect` that did not answer, naming the path. Logged: the New

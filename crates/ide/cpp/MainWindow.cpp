@@ -18,7 +18,6 @@
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/run_panel.cxxqt.h"
-#include "bondsymphonic-ide/src/qobjects/smoke.cxx.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/transcript_model.cxxqt.h"
 #include <QAction>
@@ -354,10 +353,10 @@ bool MainWindow::announceMenuTest(const char* what, const QString& target,
                                 .toUtf8();
     std::fwrite(line.constData(), 1, static_cast<size_t>(line.size()), stdout);
     std::fflush(stdout);
-    // The script's `quit` step waits for these rather than sleeping for a fixed
-    // two seconds: the seam fires when the daemon has filled the bar, which is
-    // not something a delay can know.
-    bsMenuTestReported();
+    // Not counted towards the script's wait. Most of what reaches here is not a
+    // menu step at all -- `model-changed` fires on every workspace the daemon
+    // reports -- and the one step whose whole point is to print nothing would
+    // never be counted at all. `GroupBar::runMenuTests` reports the steps.
     return true;
 }
 
@@ -915,10 +914,11 @@ void MainWindow::onDestroyRequested(const QString& workspaceId, const QString& w
     // Destroyed by something else while the menu was up -- another IDE, or the
     // agent's own workspace going away. Nothing is left to ask about, and the
     // same silence is what `onCloseGroup` answers a group that has gone with.
-    if (workspaceId.isEmpty() || m_groupModel->workspaceName(workspaceId).isEmpty()) {
+    if (workspaceId.isEmpty() || !workspaceIsOpen(workspaceId)) {
         return;
     }
-    if (isWorkspaceBusyOrSaidSo(workspaceId)) {
+    if (isWorkspaceBusy(workspaceId)) {
+        sayWorkspaceIsBusy();
         return;
     }
     // Named, not "this workspace": the menu that led here has been closed for
@@ -947,25 +947,42 @@ void MainWindow::onDestroyRequested(const QString& workspaceId, const QString& w
     // read it and a merge can have started in that time. This is the same
     // defect one layer up that the Changes toolbar was fixed for: the check
     // before a modal says nothing about the moment after it.
-    if (isWorkspaceBusyOrSaidSo(workspaceId)) {
+    if (isWorkspaceBusy(workspaceId)) {
+        sayWorkspaceIsBusy();
         return;
     }
     m_controller->destroyWorkspace(workspaceId, force->isChecked());
 }
 
-bool MainWindow::isWorkspaceBusyOrSaidSo(const QString& workspaceId) {
+bool MainWindow::workspaceIsOpen(const QString& workspaceId) const {
+    // By id, never by name. `GroupModel::workspaceName` answers an empty string
+    // both for an id it cannot find and for a tab whose name is empty, and this
+    // handler's own question text has a fallback for an unnamed workspace --
+    // so the codebase expects those to exist, and telling the two apart by the
+    // name would make one of them undestroyable in silence.
+    for (int group = 0; group < m_groupModel->groupCount(); ++group) {
+        for (int tab = 0; tab < m_groupModel->tabCount(group); ++tab) {
+            if (m_groupModel->tabWorkspaceId(group, tab) == workspaceId) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool MainWindow::isWorkspaceBusy(const QString& workspaceId) const {
     // The Changes toolbar greys its own Discard out while an operation is
     // running; this menu is the other way to the same call, and a destroy that
     // lands while a merge is still absorbing objects out of the workspace is
     // what leaves the base branch pointing at commits that no longer exist.
-    if (!m_controller->isWorkspaceBusy(workspaceId)) {
-        return false;
-    }
+    return m_controller->isWorkspaceBusy(workspaceId);
+}
+
+void MainWindow::sayWorkspaceIsBusy() {
     QMessageBox::information(
         this, QStringLiteral("Destroy workspace"),
         QStringLiteral("This workspace has a merge, pull request or discard running. "
                        "Wait for it to finish, then try again."));
-    return true;
 }
 
 TranscriptModel* MainWindow::activeAgentModel(const QString& agentId, const char* what) {
@@ -1263,6 +1280,13 @@ void MainWindow::noteFailureRouted(const QString& message) {
 }
 
 bool MainWindow::takeRoutedFailure(const QString& message) {
+    // Correlating on the text alone is enough because of the shape of the
+    // emitter, not because of anything recorded here: `report_prereqs_failure`,
+    // `report_inspect_failure` and `report_workspace_op_failure` each emit the
+    // typed signal and the `operationFailed` inside one `qt.queue` closure, so
+    // the pair arrives as one step on this thread and nothing can be
+    // interleaved between them. A second failure cannot reach the record
+    // before the `operationFailed` that clears it.
     const bool routed = m_routedFailureSet && m_routedFailure == message;
     m_routedFailureSet = false;
     m_routedFailure.clear();

@@ -1908,3 +1908,285 @@ mod menu_targets {
         super::entry(name, is_dir, 0)
     }
 }
+
+/// Task 16: a destroy whose workspace went while the menu was up.
+///
+/// The window returns without a word when the workspace a destroy names is no
+/// longer in the model -- destroyed by another IDE, or gone with its own agent
+/// -- the way closing a group already answers a group that has gone. The guard
+/// runs *before* the seam prints, so a run that arms `destroy-gone` must print
+/// no destroy line at all and must put no `workspace.destroy` on the wire.
+///
+/// An absence proves nothing on its own: a run whose menus never opened would
+/// print no destroy line either. The `close-group` step is the control. It
+/// opens the other menu from the same pass of the same loop, so its line says
+/// the seam ran, and only then does the missing destroy line mean the guard
+/// fired rather than the run falling short.
+mod task_16 {
+    use super::{drain, wait_for};
+    use bondsymphonic_ide::model::persistence::{PersistedGroup, StateFile, STATE_VERSION};
+    use bondsymphonic_proto::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    const TOKEN: &str = "gone-token";
+    const SCRIPT: &str = "quit";
+    /// The destroy whose workspace vanishes under the menu, and the close-group
+    /// that says the seam ran at all.
+    const MENU_TEST: &str = "destroy-gone,close-group";
+
+    const GROUP_A: &str = "alpha";
+    const GROUP_B: &str = "beta";
+    /// The tab the agent menu is opened over, which the fixture then takes out
+    /// of the model while the menu is up.
+    const CLICKED_ID: &str = "ws_gone2";
+    const CLICKED_NAME: &str = "alpha-two";
+    const OTHER_TAB_ID: &str = "ws_gone1";
+    const OTHER_TAB_NAME: &str = "alpha-one";
+    const GROUP_B_ID: &str = "ws_gone3";
+    const GROUP_B_NAME: &str = "beta-one";
+
+    /// A cold Qt start, three panes and the script's settle.
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+    type Journal = Arc<Mutex<Vec<String>>>;
+
+    #[test]
+    fn a_destroy_for_a_workspace_that_has_gone_says_nothing_at_all() {
+        if bondsymphonic_ide::testing::skip_without_qt("task 16 gone destroy") {
+            return;
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (addr, journal) = rt.block_on(fake_daemon());
+
+        // Never the developer's real `%APPDATA%\BondSymphonic`.
+        let config = std::env::temp_dir().join(format!("bs-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("config dir");
+        let state_path = config.join("state.json");
+        let state = StateFile {
+            version: STATE_VERSION,
+            groups: vec![
+                PersistedGroup {
+                    name: GROUP_A.to_owned(),
+                    workspace_ids: vec![OTHER_TAB_ID.to_owned(), CLICKED_ID.to_owned()],
+                    ..PersistedGroup::default()
+                },
+                PersistedGroup {
+                    name: GROUP_B.to_owned(),
+                    workspace_ids: vec![GROUP_B_ID.to_owned()],
+                    ..PersistedGroup::default()
+                },
+            ],
+            active_workspace: Some(OTHER_TAB_ID.to_owned()),
+            ..StateFile::default()
+        };
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&state).expect("state json"),
+        )
+        .expect("seed state.json");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", SCRIPT)
+            .env("BS_MENU_TEST", MENU_TEST)
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", &state_path)
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let seen = journal.lock().expect("journal mutex").clone();
+        let context = format!("requests: {seen:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(
+            status.success(),
+            "the IDE exited with {status}, expected 0\n{context}"
+        );
+        assert!(
+            !format!("{out}{err}").contains("panicked at"),
+            "the IDE logged a panic\n{context}"
+        );
+
+        // The control. Both steps run in one pass of the seam's loop, so this
+        // line says the menus opened at all -- without it the missing destroy
+        // line below would be the silence of a run that fell short rather than
+        // of a guard that fired.
+        assert!(
+            line(&out, "close-group").is_some(),
+            "the seam never opened a menu, so this run proves nothing about the destroy below\n{context}"
+        );
+
+        // The guard itself. The bar emitted the id and the name it resolved
+        // before the menu; the model no longer has that workspace, so there is
+        // nothing to ask about and nothing to say.
+        assert!(
+            line(&out, "destroy").is_none(),
+            "the window went on to ask about a workspace that is no longer in the model\n{context}"
+        );
+        assert!(
+            !seen.iter().any(|m| m.starts_with("workspace.destroy")),
+            "a destroy reached the daemon for a workspace that had gone\n{context}"
+        );
+
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// The one line the seam printed for `what`, or `None`.
+    fn line(out: &str, what: &str) -> Option<String> {
+        let prefix = format!("BS_MENU_TEST {what} ");
+        out.lines()
+            .find(|l| l.trim_start().starts_with(&prefix))
+            .map(|l| l.trim().to_owned())
+    }
+
+    /// Three ready workspaces in two groups, with the list held back.
+    async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let recorded = journal.clone();
+
+        tokio::spawn(async move {
+            let mut ptys = 0_u32;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (r, mut w) = stream.into_split();
+                let mut r = BufReader::new(r);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let trimmed = line.trim_end();
+                    let ClientMessage::Request { id, request } =
+                        codec::decode(trimmed).expect("decode");
+                    let method = match &request {
+                        Request::WorkspaceDestroy(p) => {
+                            format!("workspace.destroy:{}", p.workspace_id.0)
+                        }
+                        other => other.method_name().to_owned(),
+                    };
+                    recorded.lock().expect("journal mutex").push(method);
+                    let reply = match request {
+                        Request::Hello(p) if p.token == TOKEN => ServerMessage::ok(
+                            id,
+                            &HelloResult {
+                                daemon_version: "0.0.0-fake".into(),
+                                capabilities: Capabilities {
+                                    sandbox_backend: "noop".into(),
+                                    git_protect: false,
+                                    adapters: vec![AgentAdapterKind::Terminal],
+                                },
+                                protocol_version: Some(PROTOCOL_VERSION),
+                            },
+                        ),
+                        Request::Hello(_) => ServerMessage::err(id, RpcError::unauthorized()),
+                        Request::SystemCheckPrereqs {} => ServerMessage::ok(
+                            id,
+                            &CheckPrereqsResult {
+                                items: vec![PrereqStatus {
+                                    name: "git".into(),
+                                    ok: true,
+                                    detail: "git version 2.43".into(),
+                                    fix_hint: None,
+                                }],
+                            },
+                        ),
+                        Request::WorkspaceList {} => ServerMessage::ok(
+                            id,
+                            &WorkspaceListResult {
+                                workspaces: vec![
+                                    workspace(OTHER_TAB_ID, OTHER_TAB_NAME),
+                                    workspace(CLICKED_ID, CLICKED_NAME),
+                                    workspace(GROUP_B_ID, GROUP_B_NAME),
+                                ],
+                            },
+                        ),
+                        Request::WorkspaceGet(p) => {
+                            ServerMessage::ok(id, &workspace(&p.workspace_id.0, "unknown"))
+                        }
+                        Request::PtyOpen(_) => {
+                            ptys += 1;
+                            ServerMessage::ok(
+                                id,
+                                &PtyOpenResult {
+                                    pty_id: PtyId(format!("pty_gone{ptys}")),
+                                },
+                            )
+                        }
+                        Request::PtyResize(_) | Request::PtyWrite(_) | Request::PtyClose(_) => {
+                            ServerMessage::ok(id, &Empty {})
+                        }
+                        Request::FsListDir(_) => ServerMessage::ok(
+                            id,
+                            &ListDirResult {
+                                entries: vec![super::entry("README.md", false, 0)],
+                            },
+                        ),
+                        Request::FsWatch(_) => ServerMessage::ok(id, &Empty {}),
+                        Request::WorkspaceChanges(_) => {
+                            ServerMessage::ok(id, &ChangesResult { files: vec![] })
+                        }
+                        Request::WorkspaceStatus(_) => {
+                            ServerMessage::ok(id, &WorkspaceStatusResult { entries: vec![] })
+                        }
+                        Request::RepoDetectRunConfigs(_) => ServerMessage::ok(
+                            id,
+                            &DetectRunConfigsResult {
+                                configs: vec![],
+                                network_allow: vec![],
+                                warnings: vec![],
+                            },
+                        ),
+                        Request::RunList(_) => {
+                            ServerMessage::ok(id, &RunListResult { runs: vec![] })
+                        }
+                        // Answered so a run that got this far would still end
+                        // cleanly; the assertions require it never to be asked.
+                        Request::WorkspaceDestroy(_) => ServerMessage::ok(id, &Empty {}),
+                        other => ServerMessage::err(
+                            id,
+                            RpcError::internal(format!("not implemented: {}", other.method_name())),
+                        ),
+                    };
+                    if w.write_all(codec::encode(&reply).as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        (addr, journal)
+    }
+
+    fn workspace(id: &str, name: &str) -> WorkspaceInfo {
+        super::workspace(id, name, WorkspaceState::Ready, &[])
+    }
+}
