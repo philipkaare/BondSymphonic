@@ -31,6 +31,7 @@ use crate::ids::new_id;
 use crate::sandbox::{ChildReader, SandboxCommand, SandboxHandle, Signaller};
 use crate::server::broadcast::EventBus;
 use crate::util::tail::{exit_detail, ExitCode, Layout, Tail};
+use crate::workspace::registry::Registry;
 use bondsymphonic_proto::*;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
@@ -90,6 +91,11 @@ const BWRAP_BACKEND: &str = "linux_bwrap";
 /// only thing it has to cover is the gap between a terminal `run.state` event
 /// and a Stop click already on its way.
 const ENDED_MEMORY: usize = 64;
+
+/// The `data.reason` on both of the refusals a `run.start` gets when the
+/// workspace it named is not one a run may be started in. Wire format, shared
+/// with the IDE by value.
+pub const REASON_WORKSPACE_NOT_READY: &str = "workspace_not_ready";
 
 /// The claimed `(workspace, config)` pairs, each with its run's stopping flag.
 type Claims = Arc<Mutex<HashMap<(WorkspaceId, String), Arc<AtomicBool>>>>;
@@ -172,10 +178,16 @@ impl Plumbing {
 }
 
 impl Run {
-    /// Marks the run as on its way out. Called under no lock, immediately after
-    /// the run is taken out of [`RunManager::runs`] and before anything is
-    /// signalled, so there is no moment in which the run is neither listed nor
-    /// known to be stopping.
+    /// Marks the run as on its way out.
+    ///
+    /// Set while [`RunManager::runs`] is still locked, in the same breath as the
+    /// run is taken out of it, so there is no moment at all in which the run is
+    /// neither listed nor known to be stopping. A `run.start` for the same
+    /// configuration landing in such a moment used to be told, for the whole
+    /// termination grace, that nothing was running.
+    ///
+    /// A plain store on an atomic under a lock nobody else has to take for it,
+    /// so there is no order to invert.
     fn begin_stopping(&self) {
         self.stopping.store(true, Ordering::SeqCst);
     }
@@ -244,10 +256,14 @@ impl RunManager {
     pub async fn start(&self, d: &Daemon, p: RunStartParams) -> Result<RunStartResult, RpcError> {
         let ws = d.workspace(&p.workspace_id)?;
         if ws.state != WorkspaceState::Ready {
-            return Err(RpcError::invalid_params(format!(
-                "workspace {} is not ready",
-                ws.id
-            )));
+            // The same `reason` the check after the insert gives, because it is
+            // the same answer: a client that wants to tell "that workspace is
+            // going away" from "no such run configuration" must not have to
+            // read English to do it.
+            return Err(
+                RpcError::invalid_params(format!("workspace {} is not ready", ws.id))
+                    .with_data(serde_json::json!({ "reason": REASON_WORKSPACE_NOT_READY })),
+            );
         }
         // Zero is the operating system's "pick one for me", and a run whose port
         // nobody knows cannot be bridged, probed or opened in a browser.
@@ -435,7 +451,7 @@ impl RunManager {
                 "workspace {} is no longer ready",
                 p.workspace_id
             ))
-            .with_data(serde_json::json!({ "reason": "workspace_not_ready" })));
+            .with_data(serde_json::json!({ "reason": REASON_WORKSPACE_NOT_READY })));
         }
 
         publish(&self.events, &run, RunState::Starting, None, None);
@@ -445,6 +461,7 @@ impl RunManager {
             self.runs.clone(),
             self.ended.clone(),
             self.events.clone(),
+            d.registry.clone(),
             readiness,
         ));
         *run.supervisor.lock() = Some(supervisor);
@@ -466,18 +483,25 @@ impl RunManager {
     /// `run.state` event. An id nobody ever minted is a different thing, and a
     /// client that sends one is told so.
     pub async fn stop(&self, id: &RunId) -> Result<Empty, RpcError> {
-        let Some(run) = self.runs.lock().remove(id) else {
+        // Out of the list and known to be stopping, with nothing in between: a
+        // `run.start` for the same configuration is answered `run_stopping`
+        // from this moment on rather than being told, for the length of the
+        // termination grace, that nothing is running.
+        let taken = {
+            let mut runs = self.runs.lock();
+            let taken = runs.remove(id);
+            if let Some(run) = &taken {
+                run.begin_stopping();
+            }
+            taken
+        };
+        let Some(run) = taken else {
             return if self.ended.lock().contains(id) {
                 Ok(Empty {})
             } else {
                 Err(RpcError::not_found(format!("run {id}")))
             };
         };
-        // Out of the list and known to be stopping, with nothing in between: a
-        // `run.start` for the same configuration is answered `run_stopping`
-        // from this moment on rather than being told, for the length of the
-        // termination grace, that nothing is running.
-        run.begin_stopping();
         // Before the teardown rather than after it, so a second `run.stop` that
         // arrives during the termination grace is answered as the race it is.
         retire(&self.ended, id);
@@ -516,10 +540,16 @@ impl RunManager {
                 .filter(|r| &r.workspace_id == ws)
                 .map(|r| r.id.clone())
                 .collect();
-            ids.into_iter().filter_map(|id| runs.remove(&id)).collect()
+            let taken: Vec<Arc<Run>> = ids.into_iter().filter_map(|id| runs.remove(&id)).collect();
+            // Still under the list's lock, for the reason `begin_stopping`
+            // gives: a run that has left the list and is not yet known to be
+            // stopping is a run a `run.start` would be told nothing about.
+            for run in &taken {
+                run.begin_stopping();
+            }
+            taken
         };
         for run in &victims {
-            run.begin_stopping();
             retire(&self.ended, &run.id);
         }
         // Together rather than one after another: each one may wait out the
@@ -535,19 +565,15 @@ impl RunManager {
     /// refused rather than handed a port the dying process has not let go of.
     fn claim(&self, ws: &WorkspaceId, config: &str) -> Result<Claim, RpcError> {
         let key = (ws.clone(), config.to_string());
-        // One lock over both checks: a run that is already registered and one
-        // that is still starting are the same conflict.
+        // The claim is the whole answer. A run that is in the list holds one --
+        // it was taken before the process was spawned and is given back only
+        // once the teardown is over -- so asking the list as well would be
+        // asking the same question twice and getting a worse answer the second
+        // time: the list cannot tell a run that is up from one that is still
+        // going down, and the claim's own flag can.
         let mut claims = self.claims.lock();
         if let Some(held) = claims.get(&key) {
             return Err(conflict(ws, config, held.load(Ordering::SeqCst)));
-        }
-        let running = self
-            .runs
-            .lock()
-            .values()
-            .any(|r| r.workspace_id == *ws && r.config_name == config);
-        if running {
-            return Err(conflict(ws, config, false));
         }
         let stopping = Arc::new(AtomicBool::new(false));
         claims.insert(key.clone(), stopping.clone());
@@ -570,6 +596,7 @@ impl RunManager {
         let events = self.events.clone();
         let run_id = run.id.clone();
         let ws = run.workspace_id.clone();
+        let finished = run.finished.clone();
         tokio::spawn(async move {
             let mut lines = Lines::new(pipe);
             while let Some(line) = lines.next().await {
@@ -579,6 +606,18 @@ impl RunManager {
                     }
                 }
                 tail.push(line.clone());
+                // Nothing is said about a run nobody may hear of. The readers
+                // are attached before the run is registered -- they have to be,
+                // or a run that starts normally loses its first lines -- and
+                // the one path that claims `finished` before anything has been
+                // announced is the start that finds its workspace gone after
+                // the insert. Its caller is told the start did not happen, so
+                // there is no run id for these lines to belong to, and a client
+                // could neither unsubscribe from them nor stop what was
+                // printing them.
+                if finished.load(Ordering::SeqCst) {
+                    continue;
+                }
                 events.publish(
                     Some(ws.clone()),
                     Event::RunOutput {
@@ -681,6 +720,7 @@ async fn supervise(
     runs: Runs,
     ended: Ended,
     events: EventBus,
+    registry: Registry,
     readiness: ReadinessSource,
 ) {
     let mut exit = run.exit.clone();
@@ -690,7 +730,7 @@ async fn supervise(
                 // Gone before it ever answered: that is a failure, and the exit
                 // code with the last of its output is the only explanation
                 // anyone gets.
-                finish(&run, &runs, &ended, &events, RunState::Failed, code).await;
+                finish(&run, &runs, &ended, &events, &registry, RunState::Failed, code).await;
                 return;
             }
             _ = tokio::time::sleep(PROBE_INTERVAL) => {
@@ -711,7 +751,16 @@ async fn supervise(
     // `stop` claims `finished` before this ever sees the exit, and `finish`
     // then keeps quiet.
     let code = exit.await;
-    finish(&run, &runs, &ended, &events, RunState::Stopped, code).await;
+    finish(
+        &run,
+        &runs,
+        &ended,
+        &events,
+        &registry,
+        RunState::Stopped,
+        code,
+    )
+    .await;
 }
 
 /// Publishes a run's terminal state, once, and forgets it.
@@ -725,6 +774,7 @@ async fn finish(
     runs: &Runs,
     ended: &Ended,
     events: &EventBus,
+    registry: &Registry,
     state: RunState,
     code: i32,
 ) {
@@ -739,18 +789,63 @@ async fn finish(
     runs.lock().remove(&run.id);
     retire(ended, &run.id);
     teardown_run(run);
-    // A run that was being stopped did not fail, however it died: the
-    // supervisor is watching the very exit the stop asked for, and it wins this
-    // race about as often as it loses it. Nor does a stop need an explanation --
-    // the exit status of a process that was signalled says nothing useful, and
-    // the last lines of its output explain something the user already did.
-    let (state, detail) = if run.stopping.load(Ordering::SeqCst) {
-        (RunState::Stopped, None)
-    } else {
-        (state, Some(exit_detail(code, &run.tail, Layout::CodeFirst)))
-    };
-    publish(events, run, state, None, detail);
+    let (state, detail) = terminal(
+        state,
+        run.stopping.load(Ordering::SeqCst),
+        workspace_is_going(registry, &run.workspace_id),
+        code,
+        &run.tail,
+    );
+    // Before the event, not after it. A client that reacts to `stopped` by
+    // starting the same configuration again is doing the obvious thing, and
+    // while the claim was still held that obvious thing came back
+    // `run_stopping` -- for a run the daemon had just said was over.
     release_claim(run);
+    publish(events, run, state, None, detail);
+}
+
+/// Which terminal state a dead run is announced as, and what is said about it.
+///
+/// Only one of the three is a failure.
+///
+/// * **A run that was being stopped.** However it died, it did not fail: the
+///   supervisor is watching the very exit the stop asked for and wins that race
+///   about as often as it loses it. Nor does a stop need an explanation -- the
+///   exit status of a signalled process says nothing useful, and its last lines
+///   explain something the user already did.
+/// * **A run whose workspace is going.** The same thing from further away. A
+///   destroy marks the workspace and then sweeps its runs, and a process that
+///   dies in between -- because the worktree under it was deleted, or because
+///   init took the sandbox down -- would otherwise be announced as a failure to
+///   a client that has already been told the workspace is gone. Without this
+///   the "no `Failed` after a destroy" rule was only ever a matter of timing.
+/// * **Anything else.** The state the caller reached, with the exit code and
+///   the last of the run's output, which is the only explanation anyone gets.
+fn terminal(
+    reached: RunState,
+    stopping: bool,
+    workspace_going: bool,
+    code: i32,
+    tail: &Tail,
+) -> (RunState, Option<String>) {
+    if stopping || workspace_going {
+        return (RunState::Stopped, None);
+    }
+    (reached, Some(exit_detail(code, tail, Layout::CodeFirst)))
+}
+
+/// Whether `ws` has been marked for destruction or is gone from the registry
+/// altogether.
+///
+/// Read fresh rather than from anything a start was holding: the point is
+/// precisely to notice a `workspace.destroy` that began after this run did.
+/// Narrower than "not `Ready`" on purpose -- a workspace left in `Error` still
+/// has a user looking at it, and a run that fails in one has to say so.
+fn workspace_is_going(registry: &Registry, ws: &WorkspaceId) -> bool {
+    match registry.get(ws) {
+        None => true,
+        Some(w) => w.state == WorkspaceState::Destroying,
+    }
 }
 
 /// Lets the reader tasks finish, then abandons whichever did not.
@@ -810,16 +905,18 @@ async fn stop_run(run: &Arc<Run>, events: &EventBus) {
     if let Some(supervisor) = run.supervisor.lock().take() {
         supervisor.abort();
     }
+    // Before the event. Between the run leaving the list and this line the old
+    // process was still dying and still holding its port, and a `run.start` for
+    // the same configuration in that window is rightly told `run_stopping` --
+    // but the process is gone by now, so holding the claim across the
+    // announcement as well would refuse the one start a client is most likely
+    // to make: the one it makes because it has just seen `stopped`.
+    release_claim(run);
     if !run.finished.swap(true, Ordering::SeqCst) {
         // No detail: a run the user stopped needs no explanation, and the exit
         // status of a process that was signalled says nothing useful.
         publish(events, run, RunState::Stopped, None, None);
     }
-    // Last of all. Between the run leaving the list and this line the old
-    // process is still dying and still holds its port, and a `run.start` for the
-    // same configuration in that window is told `run_stopping` rather than being
-    // handed a port it cannot bind.
-    release_claim(run);
 }
 
 /// Gives a run's `(workspace, config)` back, so it can be started again. Called
@@ -1198,32 +1295,69 @@ fn push_capped(buf: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool) {
 mod tests {
     use super::*;
 
-    /// A service that listens on one loopback is reachable there and nowhere
-    /// else, and the readiness probe has to ask both.
+    /// [`accepts`] — the connect [`is_ready`] runs against both loopbacks at
+    /// once — has to answer for either of them.
     ///
     /// `localhost` resolves to `::1` first on a modern host, so a dev server
     /// that binds by name binds the address the old probe never asked about,
     /// and the run sat in `starting` for ever while the URL the daemon handed
     /// back worked in a browser.
+    ///
+    /// Only the positive direction is asserted. "Nothing accepts on the *other*
+    /// loopback at this number" is not this test's to promise: the port came
+    /// from the kernel for one address family, and any other test in this
+    /// binary is free to be listening on the same number on the other.
     #[tokio::test]
-    async fn readiness_asks_both_loopbacks() {
+    async fn the_readiness_connect_answers_for_either_loopback() {
         let Ok(v6) = std::net::TcpListener::bind("[::1]:0") else {
             eprintln!("SKIP: no IPv6 loopback on this host");
             return;
         };
         let port = v6.local_addr().unwrap().port();
         assert!(accepts(("::1", port)).await, "bound on ::1, so it accepts");
-        // Slow on purpose, and the reason [`is_ready`] asks the two at once:
-        // Windows does not refuse the loopback that is not listening, it sits
-        // on the attempt for about two seconds.
-        assert!(
-            !accepts(("127.0.0.1", port)).await,
-            "and nothing is listening on the other loopback"
-        );
 
         let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = v4.local_addr().unwrap().port();
         assert!(accepts(("127.0.0.1", port)).await, "and the same both ways");
+    }
+
+    /// A run only ever *fails* when it died on its own in a workspace that is
+    /// still there. The other two deaths are endings, and neither needs
+    /// explaining.
+    ///
+    /// The workspace half is what makes "no `Failed` event after a destroy"
+    /// more than a matter of timing: a destroy marks the workspace and then
+    /// sweeps its runs, and a process that dies in between -- because the
+    /// worktree under it was deleted -- used to be announced as a failure to a
+    /// client that had already been told the workspace was gone.
+    #[test]
+    fn only_a_run_that_died_on_its_own_in_a_living_workspace_has_failed() {
+        let tail = Tail::new(TAIL);
+        tail.push("boom".into());
+
+        let (state, detail) = terminal(RunState::Failed, false, false, 3, &tail);
+        assert_eq!(state, RunState::Failed);
+        let detail = detail.expect("a failure has to say why");
+        assert!(detail.starts_with("exit code 3"), "{detail}");
+        assert!(detail.contains("boom"), "{detail}");
+
+        for (stopping, going, why) in [
+            (true, false, "the user stopped it"),
+            (false, true, "its workspace is going"),
+            (true, true, "both at once"),
+        ] {
+            assert_eq!(
+                terminal(RunState::Failed, stopping, going, 3, &tail),
+                (RunState::Stopped, None),
+                "{why}"
+            );
+        }
+
+        // A run that was already `Ready` still ends as `Stopped` with the
+        // reason it ended, which is the ordinary end of a run nobody stopped.
+        let (state, detail) = terminal(RunState::Stopped, false, false, 0, &tail);
+        assert_eq!(state, RunState::Stopped);
+        assert!(detail.is_some());
     }
 
     #[test]

@@ -1253,6 +1253,16 @@ port = {port}
             announced.is_empty(),
             "a start that was refused announced a run: {announced:?}"
         );
+        // Its output counts as a word said about it. The readers are attached
+        // before the run is registered -- they have to be, or the first lines
+        // of a run that starts normally are lost -- so on this path they were
+        // publishing `run.output` for a run id the client was never given and
+        // could not have subscribed to, unsubscribed from, or stopped.
+        let said = output(&seen);
+        assert!(
+            said.is_empty(),
+            "a start that was refused streamed a run's output: {said:?}"
+        );
         assert!(
             http_get(port).await.is_none(),
             "the web app must not have been left running"
@@ -1265,5 +1275,47 @@ port = {port}
         landed_in_the_window,
         "no attempt reached the check after the insert; the sweep needs widening"
     );
+    cancel.cancel();
+}
+
+/// A `run.start` refused because the workspace is not ready says so in
+/// `data.reason`, whichever of the two checks refused it.
+///
+/// There are two. The one at the top of the call reads the workspace the client
+/// named; the one after the run is registered catches a destroy that began
+/// while the start was spawning. The second has always carried a reason a
+/// client can match on and the first carried a sentence and nothing else, so an
+/// IDE wanting to tell "that workspace is going away" from "no such run
+/// configuration" had to read English to do it.
+#[tokio::test]
+async fn a_start_refused_because_the_workspace_is_not_ready_says_which_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let port = free_port();
+    write_repo_config(
+        &repo,
+        &format!("[[run]]\nname = \"web\"\ncommand = \"true\"\nport = {port}\n"),
+    );
+    let (p, token, d, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(p, &token).await;
+    let ws = create_ws(&mut c, &repo, "notready").await;
+
+    // The first half of a destroy, on its own: the workspace is still in the
+    // registry and is no longer somewhere a run may be started.
+    d.set_state(&ws.id, WorkspaceState::Destroying).unwrap();
+
+    let refused = start_run(&mut c, &ws.id, "web").await.unwrap_err();
+    assert_eq!(refused.code, ErrorCode::InvalidParams, "{refused:?}");
+    assert_eq!(
+        refused
+            .data
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(|r| r.as_str()),
+        Some("workspace_not_ready"),
+        "the refusal must be one a client can act on without reading it: {refused:?}"
+    );
+    assert!(d.runs.runs_of(&ws.id).is_empty());
+
     cancel.cancel();
 }
