@@ -283,12 +283,7 @@ fn claude_not_installed() -> RpcError {
 /// failure a second later.
 fn claude_bin(backend: &str) -> Result<Vec<String>, RpcError> {
     if let Ok(raw) = std::env::var("BS_CLAUDE_BIN") {
-        let argv = shell_words::split(&raw)
-            .map_err(|e| RpcError::invalid_params(format!("BS_CLAUDE_BIN: {e}")))?;
-        if argv.is_empty() {
-            return Err(RpcError::invalid_params("BS_CLAUDE_BIN: no program to run"));
-        }
-        return Ok(argv);
+        return crate::util::argv::split(&raw, "BS_CLAUDE_BIN").map_err(RpcError::invalid_params);
     }
     let host = host_claude_bin().ok_or_else(claude_not_installed)?;
     if backend == SANDBOXED_BACKEND {

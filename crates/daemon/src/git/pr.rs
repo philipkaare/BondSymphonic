@@ -166,12 +166,7 @@ fn gh_argv() -> Result<Vec<String>, RpcError> {
     let Ok(raw) = std::env::var("BS_GH_BIN") else {
         return Ok(vec!["gh".to_owned()]);
     };
-    let argv =
-        shell_words::split(&raw).map_err(|e| RpcError::internal(format!("BS_GH_BIN: {e}")))?;
-    if argv.is_empty() {
-        return Err(RpcError::internal("BS_GH_BIN: no program to run"));
-    }
-    Ok(argv)
+    crate::util::argv::split(&raw, "BS_GH_BIN").map_err(RpcError::internal)
 }
 
 #[cfg(test)]

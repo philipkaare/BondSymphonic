@@ -158,12 +158,7 @@ impl PtyManager {
             .filter(|s| !s.is_empty())
         {
             Some(cmd) => {
-                let argv = shell_words::split(cmd)
-                    .map_err(|e| RpcError::invalid_params(format!("command: {e}")))?;
-                if argv.is_empty() {
-                    return Err(RpcError::invalid_params("command: no program to run"));
-                }
-                argv
+                crate::util::argv::split(cmd, "command").map_err(RpcError::invalid_params)?
             }
             None => Self::default_command(d.backend.name()),
         };
