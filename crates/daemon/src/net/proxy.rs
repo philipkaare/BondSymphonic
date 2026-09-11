@@ -48,8 +48,8 @@ use crate::net::http::text_response;
 // loop, which needs a Unix socket.
 #[cfg(unix)]
 use crate::net::http::{
-    bad_gateway, bad_request, body_framing, origin_form, read_head, relay_exchange,
-    request_timeout, target_host_port, wants_close, Relayed,
+    bad_gateway, bad_request, body_framing, head_is_well_formed, origin_form, read_head,
+    relay_exchange, request_timeout, target_host_port, wants_close, Relayed,
 };
 use crate::server::broadcast::EventBus;
 #[cfg(unix)]
@@ -569,6 +569,19 @@ async fn serve(mut client: tokio::net::UnixStream, ctx: &ConnCtx) -> std::io::Re
             Ok(Err(e)) => return Err(e),
         };
         first = false;
+        // Before anything is decided about this request: a header carrying a
+        // bare LF, a lone CR or a NUL is a second request hiding inside the
+        // first, and it is refused here rather than checked and relayed. See
+        // `head_is_well_formed`. Nothing has been connected yet, so the origin
+        // never sees a byte of it.
+        if !head_is_well_formed(&head) {
+            tracing::debug!(
+                ws = %ctx.workspace,
+                "request head carries a line terminator or a bad field name; refused"
+            );
+            let _ = client.write_all(&bad_request()).await;
+            return Ok(());
+        }
         let Some((host, port)) = target_host_port(&head) else {
             let _ = client.write_all(&bad_request()).await;
             return Ok(());

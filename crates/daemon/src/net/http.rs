@@ -91,6 +91,58 @@ fn parse_request_head_from(buf: &[u8], from: usize) -> Option<RequestHead> {
     })
 }
 
+/// Whether a head can be written back out without the two ends disagreeing
+/// about where the message stops.
+///
+/// [`parse_request_head_from`] ends the head at the first `\r\n\r\n` and then
+/// splits it on `"\r\n"`, so a `\n` that arrives without its `\r` is not a
+/// line terminator here: it stays inside a header name or value, and
+/// [`origin_form`] writes it back byte for byte. RFC 9112 §2.2 records that
+/// many recipients accept a bare LF as a line terminator anyway - so the proxy
+/// checks one request against the allowlist and the origin reads two, the
+/// second one naming whatever `Host` the client wrote after the LF. That is
+/// request smuggling straight through the boundary this subsystem exists to
+/// be. A lone `\r` is the mirror image at an end that terminates on CR, and a
+/// `\0` goes with them because no two parsers need agree on what it ends.
+///
+/// So the rule is the one RFC 9110 §5 already states, checked rather than
+/// assumed: a field name is a token, and a field value carries no control
+/// character but HTAB. The request line is held to the same bar for the bytes
+/// that could not already have been split out of it by whitespace - nothing
+/// splits on NUL, and `{method} {target} {version}` is written back whole.
+///
+/// A head that fails this is a 400, which is the answer the ambiguous-framing
+/// cases get ([`body_framing`]) and for the same reason: where a message ends
+/// is not something to guess at.
+pub(super) fn head_is_well_formed(head: &RequestHead) -> bool {
+    let line_is_clean = |s: &str| !s.bytes().any(|b| b.is_ascii_control());
+    line_is_clean(&head.method)
+        && line_is_clean(&head.target)
+        && line_is_clean(&head.version)
+        && head
+            .headers
+            .iter()
+            .all(|(name, value)| is_token(name) && value_is_clean(value))
+}
+
+/// Whether every byte of a field value is one RFC 9110 §5.5 allows: visible
+/// characters, space, horizontal tab, and the obs-text range above 0x7F. No
+/// other control character, which is what keeps `\r`, `\n` and `\0` out.
+fn value_is_clean(value: &str) -> bool {
+    !value
+        .bytes()
+        .any(|b| (b.is_ascii_control() && b != b'\t') || b == 0x7f)
+}
+
+/// Whether `s` is a non-empty RFC 9110 §5.6.2 token, which is what a field
+/// name must be. The separators - space, colon, the bracket family - are the
+/// bytes a name carrying one would be re-split on at the far end.
+fn is_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 /// The host and port this request wants to reach, or `None` when it is not
 /// something a proxy can serve.
 ///
@@ -828,6 +880,76 @@ mod tests {
             String::from_utf8(origin_form(&h)).unwrap(),
             "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
         );
+    }
+
+    /// A bare LF inside a header value is a second request hiding in the
+    /// first, and the far end is the one that decides so.
+    ///
+    /// The head is split on CRLF here, so an LF without its CR stays inside a
+    /// value and `origin_form` writes it back verbatim. RFC 9112 §2.2 records
+    /// that many origins accept a bare LF as a line terminator anyway: the
+    /// proxy checked one request against the allowlist and the origin reads
+    /// two, the second naming a host nobody cleared. A CR alone splits the
+    /// same way at an end that is lenient in the other direction, and a NUL
+    /// is refused beside them because no two parsers need agree on it.
+    #[test]
+    fn a_header_carrying_a_line_terminator_or_a_nul_is_refused() {
+        // The exact smuggle: a value that ends the head early and starts a
+        // request for a host the allowlist never saw.
+        let h = head(
+            "GET http://allowed/ HTTP/1.1\r\nHost: allowed\r\nX: v\n\nGET http://elsewhere/ HTTP/1.1\nHost: elsewhere\r\n\r\n",
+        );
+        assert!(
+            !head_is_well_formed(&h),
+            "a bare LF in a value must be refused, not relayed: {:?}",
+            h.headers
+        );
+        // A lone CR splits a head at an end that terminates on CR.
+        assert!(!head_is_well_formed(&head(
+            "GET http://allowed/ HTTP/1.1\r\nX: a\rb\r\n\r\n"
+        )));
+        assert!(!head_is_well_formed(&head(
+            "GET http://allowed/ HTTP/1.1\r\nX: a\0b\r\n\r\n"
+        )));
+        // A name is a token: the separators and controls are not in it, and a
+        // name with a space in it is read as a name by one parser and as a
+        // continuation by another.
+        assert!(!head_is_well_formed(&head(
+            "GET http://allowed/ HTTP/1.1\r\nX Y: v\r\n\r\n"
+        )));
+        assert!(!head_is_well_formed(&head(
+            "GET http://allowed/ HTTP/1.1\r\nX\0Y: v\r\n\r\n"
+        )));
+        // An empty name is a head that begins with a colon.
+        assert!(!head_is_well_formed(&head(
+            "GET http://allowed/ HTTP/1.1\r\n: v\r\n\r\n"
+        )));
+        // A NUL anywhere in the request line is refused too: nothing splits
+        // the line on it here, and the upstream need not agree.
+        assert!(!head_is_well_formed(&head(
+            "GET\0X http://allowed/ HTTP/1.1\r\nHost: allowed\r\n\r\n"
+        )));
+    }
+
+    /// The refusal is narrow: everything an ordinary request carries still
+    /// goes through, including the bytes RFC 9110 allows in a value.
+    #[test]
+    fn an_ordinary_head_is_well_formed() {
+        assert!(head_is_well_formed(&head(
+            "GET http://example.com/a?b=c HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\nUser-Agent: curl/8.0 (x; y)\r\nAuthorization: Basic YWJjOmQ=\r\n\r\n"
+        )));
+        // Tab is field whitespace, and a token name may wear any of the
+        // punctuation RFC 9110 lists.
+        assert!(head_is_well_formed(&head(
+            "POST http://example.com/ HTTP/1.1\r\nX-Odd_Name.1: a\tb\r\n\r\n"
+        )));
+        // An empty value is legal and common.
+        assert!(head_is_well_formed(&head(
+            "GET http://example.com/ HTTP/1.1\r\nX-Empty:\r\n\r\n"
+        )));
+        assert!(head_is_well_formed(&head(
+            "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+        )));
     }
 
     /// A body cannot be delimited two ways at once. The proxy walks a chunked

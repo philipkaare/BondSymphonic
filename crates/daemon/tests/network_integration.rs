@@ -508,6 +508,63 @@ async fn each_plain_http_request_on_a_kept_alive_connection_goes_to_its_own_host
     cancel.cancel();
 }
 
+/// A bare LF inside a header is a second request, and it must not reach the
+/// origin the first one was cleared for.
+///
+/// The proxy ends a head at the blank line and splits it on CRLF, so an LF
+/// with no CR in front of it is not a line terminator there: it stays inside a
+/// header value rather than ending the line it sits on.
+/// An origin that treats a bare LF as a line terminator - RFC 9112 §2.2 says
+/// many do - then reads two requests where the allowlist checked one, and the
+/// second names its own `Host`. Both halves of the assertion matter: the
+/// client is told 400, and the upstream never hears from us at all.
+#[tokio::test]
+async fn a_header_with_a_bare_lf_is_refused_before_any_origin_is_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "smuggle").await;
+    let sock = daemon.dirs.run(&ws.id).join("proxy.sock");
+    // Two origins, both allowed: the one the visible request names, and the
+    // one the request hidden after the LF names. Neither may see a byte.
+    let (a_port, a_seen) = recording_server().await;
+    let (b_port, b_seen) = recording_server().await;
+    set_allowlist(&mut c, &ws.id, &["127.0.0.1"]).await.unwrap();
+
+    let mut s = UnixStream::connect(&sock).await.unwrap();
+    s.write_all(
+        format!(
+            "GET http://127.0.0.1:{a_port}/ HTTP/1.1\r\n\
+             Host: 127.0.0.1:{a_port}\r\n\
+             X: v\n\nGET http://127.0.0.1:{b_port}/smuggled HTTP/1.1\nHost: 127.0.0.1:{b_port}\r\n\
+             \r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let answer = read_all(&mut s).await;
+    assert!(
+        answer.starts_with("HTTP/1.1 400 Bad Request"),
+        "a head carrying a bare LF is refused: {answer}"
+    );
+    drop(s);
+
+    let a: Vec<String> = a_seen.lock().unwrap().clone();
+    let b: Vec<String> = b_seen.lock().unwrap().clone();
+    assert!(a.is_empty(), "the named origin saw nothing: {a:?}");
+    assert!(b.is_empty(), "the smuggled origin saw nothing: {b:?}");
+
+    c.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+        workspace_id: ws.id.clone(),
+        force: true,
+    }))
+    .await
+    .unwrap();
+    cancel.cancel();
+}
+
 /// A listener that accepts a connection and then drops it without a byte.
 ///
 /// The one failure the close-delimited design creates: the proxy relays a
