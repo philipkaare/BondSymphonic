@@ -347,6 +347,28 @@ pub fn claude_argv(options: &AgentStartOptions, backend: &str) -> Result<Vec<Str
     Ok(argv)
 }
 
+/// The program the *daemon* runs to ask a version, which is not always the one
+/// the agent is spawned as.
+///
+/// [`claude_bin`] answers with the path the agent will use, and under
+/// `linux_bwrap` that is [`CLAUDE_IN_SANDBOX`] -- a mount
+/// point that exists only inside the sandbox. The probe runs on the host, with
+/// no sandbox around it, so asking for that path there is an `ENOENT` every
+/// time: the version comparison never happens, "could not run `claude
+/// --version`" is logged on every start, and the timeout guards nothing. What
+/// the probe wants is the host file the sandbox binds, which is the same file.
+///
+/// `BS_CLAUDE_BIN` is the exception and keeps [`claude_bin`]'s answer: the hook
+/// names a program by hand, there is no host original to map it back to, and a
+/// stand-in that is only reachable inside a sandbox is the caller's own doing.
+fn probe_bin(backend: &str) -> Result<Vec<String>, RpcError> {
+    if std::env::var_os("BS_CLAUDE_BIN").is_some() {
+        return claude_bin(backend);
+    }
+    let host = host_claude_bin().ok_or_else(claude_not_installed)?;
+    Ok(vec![host.to_string_lossy().into_owned()])
+}
+
 /// The programs whose `--version` has already answered.
 ///
 /// The probe is worth running once per program, not once per agent: it costs a
@@ -365,12 +387,17 @@ static PROBED: Mutex<Vec<Vec<String>>> = Mutex::new(Vec::new());
 /// to show the user. Ten seconds is far longer than the real CLI takes and short
 /// enough that the IDE can say what happened.
 ///
+/// The program asked is [`probe_bin`]'s, not [`claude_bin`]'s: the probe runs on
+/// the host and the agent runs in the sandbox, and under `linux_bwrap` those are
+/// two names for one file. Asking for the sandbox's name on the host is an
+/// `ENOENT` that tells nobody anything.
+///
 /// The version *comparison* is skipped when `BS_CLAUDE_BIN` is set: that hook
 /// points at a stand-in whose version number says nothing about the protocol.
-/// The probe itself still runs, because "does this program answer at all" is the
-/// question, and the answer has to be about the program that will be spawned.
+/// The probe itself still runs, because "does this program answer at all" is
+/// the question the start wants answered.
 pub async fn probe_claude(backend: &str) -> Result<(), RpcError> {
-    let bin = claude_bin(backend)?;
+    let bin = probe_bin(backend)?;
     if PROBED.lock().iter().any(|seen| seen == &bin) {
         return Ok(());
     }
@@ -436,6 +463,28 @@ fn agent_error_because(reason: &str, msg: impl Into<String>) -> RpcError {
 /// The last few stderr lines, kept so an exit can say why.
 type StderrTail = Arc<Mutex<VecDeque<String>>>;
 
+/// Whether a transcript entry is the conversation itself moving, rather than
+/// something about it.
+///
+/// Only these count as a resumption. `parse_line` wraps every line it cannot
+/// interpret as `System { subtype: "raw" }` so that nothing is lost, and every
+/// `system` line that is not the `init` is a message with no state beside it --
+/// so counting `System` would let one stray line of CLI noise on stdout, or a
+/// tool that wrote there, leave an idle agent showing `Working` until its next
+/// `result`. `Result` and `PermissionRequest` carry a state of their own and
+/// are excluded by the caller anyway; naming them here too would be a second
+/// place to get it wrong.
+fn moved_the_conversation(body: &AgentMessageBody) -> bool {
+    matches!(
+        body,
+        AgentMessageBody::AssistantText { .. }
+            | AgentMessageBody::AssistantDelta { .. }
+            | AgentMessageBody::ToolUse { .. }
+            | AgentMessageBody::ToolResult { .. }
+            | AgentMessageBody::UserText { .. }
+    )
+}
+
 /// Whether a line of the agent's output means the CLI has picked the
 /// conversation back up, and the reader should say so.
 ///
@@ -450,7 +499,9 @@ type StderrTail = Arc<Mutex<VecDeque<String>>>;
 /// is not a resumption at all: the CLI is still waiting.
 fn resumed(state: AgentState, nothing_pending: bool, items: &[Parsed]) -> bool {
     if items.iter().any(|i| matches!(i, Parsed::State(..)))
-        || !items.iter().any(|i| matches!(i, Parsed::Message(_)))
+        || !items
+            .iter()
+            .any(|i| matches!(i, Parsed::Message(body) if moved_the_conversation(body)))
     {
         return false;
     }
@@ -574,18 +625,34 @@ impl ClaudeAdapter {
     /// and one that has exited reads nothing ever again. Written to anyway, the
     /// first turn vanishes without a trace and the second comes back as a
     /// broken pipe, which tells a client nothing it can act on.
+    ///
+    /// The permission half asks the pending set rather than the published
+    /// state, because by this adapter's own design the published state is a
+    /// moment behind: it only moves when the reader sees the CLI's next line.
+    /// `permission_reply` empties the set as soon as the answer is written, so
+    /// a user who answers the last question and immediately types is let
+    /// through instead of being refused for a question that is already settled.
+    /// The set is also the more exact answer in the other direction: it still
+    /// holds the second of two questions while the state says whatever the last
+    /// line said.
     fn ready_for_a_turn(&self) -> Result<(), RpcError> {
-        match self.sink.entry().state().0 {
-            AgentState::WaitingPermission => Err(agent_error_because(
-                REASON_WAITING_PERMISSION,
-                "the agent is waiting for a permission answer; answer it before sending a turn",
-            )),
-            AgentState::Exited => Err(agent_error_because(
+        // The exit is asked first, and the two are not interchangeable: a
+        // process that died with a question outstanding leaves the pending set
+        // full for ever, and "answer the permission first" is advice that
+        // cannot be taken about an agent that has ended.
+        if self.sink.entry().state().0 == AgentState::Exited {
+            return Err(agent_error_because(
                 REASON_AGENT_EXITED,
                 "the agent has ended; start a new one with resume_session to continue it",
-            )),
-            _ => Ok(()),
+            ));
         }
+        if !self.pending_request_ids.lock().is_empty() {
+            return Err(agent_error_because(
+                REASON_WAITING_PERMISSION,
+                "the agent is waiting for a permission answer; answer it before sending a turn",
+            ));
+        }
+        Ok(())
     }
 
     /// What the agent said on its way out, with the exit code after it; just
@@ -738,6 +805,16 @@ impl AgentAdapter for ClaudeAdapter {
             // `stop` may be ending this same process; the flag makes one of the
             // two announce and the other stay quiet, so a process that exits on
             // its own and is then stopped still produces one `Exited`.
+            //
+            // Nothing may yield between claiming the announcement and making
+            // it. `stop` can abort this task, and an abort that landed in
+            // between would leave the flag set and the event unsent, with
+            // `stop` then staying quiet because it reads the flag as somebody
+            // else's announcement: the tab would never learn the agent ended.
+            // `AgentSink::state` has no await inside it, so this pair runs to
+            // completion once polled -- if that ever stops being true, the
+            // claim has to move after the publish, or be a claim only the
+            // publisher can redeem.
             if !announced.swap(true, Ordering::SeqCst) {
                 sink.state(AgentState::Exited, Some(detail)).await;
             }
@@ -880,7 +957,15 @@ impl AgentAdapter for ClaudeAdapter {
         // so the reader gets a moment to finish; it is aborted only if it does
         // not, which is what a SIGKILLed grandchild still holding the pipe open
         // looks like.
-        if tokio::time::timeout(READER_DRAIN, &mut running.reader_task)
+        //
+        // Strictly longer than the reader can spend after the exit, which is
+        // its own `STDERR_DRAIN` -- both timers start from the same exit, so a
+        // budget merely *equal* to it is a dead heat, decided by the scheduler,
+        // in exactly the case both constants were written for. Losing it aborts
+        // the reader mid-drain, and the exit is then announced by this path,
+        // which knows only the code: an agent whose turn ended in an error
+        // loses the error message that was the better half of its exit detail.
+        if tokio::time::timeout(READER_DRAIN + STDERR_DRAIN, &mut running.reader_task)
             .await
             .is_err()
         {
@@ -1183,9 +1268,9 @@ settings = \"s.json\"
     }
 
     /// `BS_CLAUDE_BIN` is process-wide, so every case that touches it lives in
-    /// one test.
+    /// one test -- the probe's choice of program included.
     #[test]
-    fn claude_argv_pins_the_flags_the_program_and_the_permission_mode() {
+    fn claude_argv_and_probe_bin_pin_the_program_the_flags_and_the_permission_mode() {
         const BWRAP: &str = SANDBOXED_BACKEND;
         const NOOP: &str = "noop";
         let plain = AgentStartOptions {
@@ -1268,6 +1353,17 @@ settings = \"s.json\"
             ErrorCode::InvalidParams
         );
 
+        // The hook also decides what the probe runs, because there is no host
+        // original to map a hand-named program back to.
+        std::env::set_var("BS_CLAUDE_BIN", "\"python\" \"/tmp/fake claude.py\"");
+        for backend in [NOOP, BWRAP] {
+            assert_eq!(
+                probe_bin(backend).unwrap(),
+                ["python", "/tmp/fake claude.py"],
+                "the hook must decide the probe's program on {backend}"
+            );
+        }
+
         // Without the hook the program is always an absolute path, never a bare
         // `claude`: the sandbox `PATH` leads with the *workspace's* home, so a
         // bare name does not resolve there at all.
@@ -1280,6 +1376,25 @@ settings = \"s.json\"
                     host.to_string_lossy()
                 );
                 assert!(host.is_absolute(), "{host:?}");
+
+                // And the probe asks the *host* file on every backend. Under
+                // bwrap the agent is spawned as `/opt/bs/claude`, which exists
+                // only inside the sandbox; the probe runs on the host, where
+                // asking for that name is an `ENOENT` that answers nothing --
+                // no version comparison, a warning on every start, and a
+                // timeout guarding a failure that is instant.
+                for backend in [NOOP, BWRAP] {
+                    assert_eq!(
+                        probe_bin(backend).unwrap(),
+                        [host.to_string_lossy().into_owned()],
+                        "the probe must run the host binary on {backend}"
+                    );
+                }
+                assert_ne!(
+                    probe_bin(BWRAP).unwrap()[0],
+                    CLAUDE_IN_SANDBOX,
+                    "the sandbox alias is not a program the daemon can run"
+                );
             }
             // A host without Claude Code -- every Windows developer machine,
             // and CI -- must refuse the start with a prerequisite error naming
@@ -1310,6 +1425,112 @@ settings = \"s.json\"
                 assert_eq!(Some(host), host_claude_bin());
             }
             None => assert!(host_claude_bin().is_none()),
+        }
+    }
+
+    /// The other half of "only the reader publishes state": with `send` and
+    /// `permission_reply` no longer announcing a `Working` they cannot know to
+    /// be true, this function is the whole of what says the CLI is going again.
+    /// It is pure, so every arm is worth a line.
+    #[test]
+    fn the_reader_republishes_working_only_when_the_conversation_moved() {
+        let text = || Parsed::Message(AgentMessageBody::AssistantText { text: "one".into() });
+        let tool = || {
+            Parsed::Message(AgentMessageBody::ToolUse {
+                id: "toolu_1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({}),
+            })
+        };
+        let system = |subtype: &str| {
+            Parsed::Message(AgentMessageBody::System {
+                subtype: subtype.to_owned(),
+                data: serde_json::json!({}),
+            })
+        };
+        let ended = || Parsed::State(AgentState::Idle, None);
+
+        use AgentState::*;
+        let cases: [(AgentState, bool, Vec<Parsed>, bool, &str); 13] = [
+            // The turn a client wrote to stdin and nobody announced.
+            (Idle, true, vec![text()], true, "an idle agent speaks again"),
+            // A turn that failed is still a live process, and the next thing it
+            // says is it picking the conversation back up.
+            (Error, true, vec![text()], true, "an errored agent speaks"),
+            (Working, true, vec![text()], false, "already working"),
+            // A line from a process that has been announced as exited must not
+            // bring it back.
+            (Exited, true, vec![text()], false, "gone stays gone"),
+            // The permission that released the CLI.
+            (
+                WaitingPermission,
+                true,
+                vec![tool()],
+                true,
+                "the last question was answered",
+            ),
+            // AG1: one assistant message can propose two tools, and answering
+            // the first must not take the bar down over the second.
+            (
+                WaitingPermission,
+                false,
+                vec![tool()],
+                false,
+                "a second question is still open",
+            ),
+            // A line that carries a state of its own says it better.
+            (
+                Idle,
+                true,
+                vec![text(), ended()],
+                false,
+                "the line states its own",
+            ),
+            // Minor 4: `parse_line` wraps anything it cannot interpret as a
+            // `raw` system message, so one stray line of CLI noise on stdout
+            // would otherwise leave an idle agent showing `Working` until its
+            // next result.
+            (Idle, true, vec![system("raw")], false, "stdout noise"),
+            (
+                Idle,
+                true,
+                vec![system("compact_boundary")],
+                false,
+                "a system line is about the conversation, not of it",
+            ),
+            // Noise beside real content is still real content.
+            (
+                Idle,
+                true,
+                vec![system("raw"), text()],
+                true,
+                "noise beside a reply",
+            ),
+            (Idle, true, vec![], false, "an empty line"),
+            (
+                Idle,
+                true,
+                vec![Parsed::Nothing, Parsed::SessionId("sess-1".into())],
+                false,
+                "an envelope we drop",
+            ),
+            (
+                Idle,
+                true,
+                vec![Parsed::Message(AgentMessageBody::UserText {
+                    text: "tool output".into(),
+                })],
+                true,
+                "the CLI's own user line",
+            ),
+        ];
+
+        for (state, nothing_pending, items, want, why) in cases {
+            assert_eq!(
+                resumed(state, nothing_pending, &items),
+                want,
+                "{why}: resumed({state:?}, nothing_pending={nothing_pending}, {items:?})"
+            );
         }
     }
 

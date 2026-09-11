@@ -320,6 +320,21 @@ async fn claude_agent_streams_a_turn_and_records_history() {
             .any(|b| matches!(b, AgentMessageBody::AssistantText { text } if text.contains("echo: hello"))),
         "{more_bodies:?}"
     );
+    // `send` publishes no state of its own: the agent is `Working` because the
+    // reader saw the CLI answer, not because this side guessed it would. The
+    // ordering is the assertion -- `Working` for the turn just sent, then `Idle`
+    // when its `result` lands.
+    // `crate::`, because the `states` binding above shadows the helper here.
+    let echoed = crate::states(&more);
+    let working = echoed
+        .iter()
+        .position(|s| *s == AgentState::Working)
+        .unwrap_or_else(|| panic!("the reader must republish Working after a send: {echoed:?}"));
+    let idle = echoed
+        .iter()
+        .position(|s| *s == AgentState::Idle)
+        .unwrap_or_else(|| panic!("the echoed turn must end: {echoed:?}"));
+    assert!(working < idle, "{echoed:?}");
 
     let v = c
         .call(Request::AgentHistory(AgentIdParams {
@@ -453,6 +468,30 @@ async fn permission_request_waits_for_the_reply() {
         "{after_bodies:?}"
     );
     assert_eq!(states(&after).last(), Some(&AgentState::Idle), "{after:?}");
+
+    // The reader is what says the CLI picked the turn back up. Nothing on the
+    // answering side publishes a state any more, so if the reader stopped doing
+    // it the agent would sit at `WaitingPermission` until the `result` line
+    // dropped it straight to `Idle` -- and the IDE would keep its permission bar
+    // up over a question already answered.
+    //
+    // Asserted positively and by position: `next_agent_events` hands back
+    // whatever it has when its deadline passes rather than failing, so a
+    // missing `Working` would otherwise show up only as a slow test that still
+    // passed.
+    let after_states = states(&after);
+    let working = after_states
+        .iter()
+        .position(|s| *s == AgentState::Working)
+        .unwrap_or_else(|| panic!("the reader must republish Working: {after_states:?}"));
+    let idle = after_states
+        .iter()
+        .position(|s| *s == AgentState::Idle)
+        .unwrap_or_else(|| panic!("the turn must end: {after_states:?}"));
+    assert!(
+        working < idle,
+        "Working belongs to the resumed turn, before it ends: {after_states:?}"
+    );
 
     // Answering the same request twice is a NotFound: it is no longer pending.
     let e = c
@@ -895,6 +934,11 @@ async fn answering_one_permission_leaves_the_other_one_pending() {
 /// AG2. A turn typed while the agent is waiting for a permission answer cannot
 /// be delivered: the CLI is blocked on the question and will not read it. It is
 /// refused, with a reason the IDE can match on, and nothing is recorded.
+///
+/// The refusal counts open questions rather than reading the published state.
+/// Both directions matter: it must still refuse while the second of two
+/// questions is open, and it must stop refusing the moment the last one is
+/// answered, without waiting for the CLI to say something the reader can see.
 #[tokio::test]
 async fn sending_a_turn_while_a_permission_is_open_is_refused() {
     let _guard = ENV.lock().await;
@@ -904,13 +948,20 @@ async fn sending_a_turn_while_a_permission_is_open_is_refused() {
     };
     let dir = tempfile::tempdir().unwrap();
     let repo = init_repo(dir.path());
-    use_fake_claude(py, "permission_turn.ndjson");
+    // Two questions out of one assistant message, so the refusal can be watched
+    // lifting one question at a time. With `FAKE_CLAUDE_NO_WAIT` the fake says
+    // nothing more until something is written to its stdin, which is what makes
+    // the state assertions below settled rather than racing the reader.
+    use_fake_claude(py, "two_permissions_turn.ndjson");
+    std::env::set_var("FAKE_CLAUDE_NO_WAIT", "1");
     let (port, token, _d, cancel) = start_daemon(dir.path()).await;
     let mut c = Client::connect(port, &token).await;
     let ws = create_ws(&mut c, &repo, "sendwait").await;
 
     let ag = start_agent(&mut c, &ws.id).await;
-    let events = next_agent_events(&mut c, &ag, 4, Duration::from_secs(20)).await;
+    let events = next_agent_events(&mut c, &ag, 9, Duration::from_secs(20)).await;
+    let ids = request_ids(&events);
+    assert_eq!(ids.len(), 2, "both requests must arrive: {events:?}");
     assert_eq!(
         states(&events).last(),
         Some(&AgentState::WaitingPermission),
@@ -936,6 +987,57 @@ async fn sending_a_turn_while_a_permission_is_open_is_refused() {
         "a refused turn must not reach the transcript: {:?}",
         h.messages
     );
+
+    // Still refused with one of the two answered. The CLI is blocked on the
+    // other one and will not read the line.
+    reply(&mut c, &ag, &ids[0]).await.unwrap();
+    let e = c
+        .call(Request::AgentSend(AgentSendParams {
+            agent_id: ag.clone(),
+            text: "still never mind".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(reason_of(&e), "waiting_permission", "{e:?}");
+
+    // And let through the moment the last question is settled, rather than when
+    // the CLI next happens to speak. The published state is deliberately a
+    // moment behind -- it only moves when the reader sees a line, and the fake
+    // has nothing more to say until it is written to -- so a refusal that
+    // consulted it would turn away a turn the CLI is already able to read.
+    reply(&mut c, &ag, &ids[1]).await.unwrap();
+    let h = history_of(&mut c, &ag).await;
+    assert_eq!(
+        h.state,
+        AgentState::WaitingPermission,
+        "the published state is a moment behind by design; the pending set is not: {:?}",
+        h.state
+    );
+    c.call(Request::AgentSend(AgentSendParams {
+        agent_id: ag.clone(),
+        text: "now then".into(),
+    }))
+    .await
+    .unwrap();
+
+    // And the CLI really did read it, so this was not merely a permissive
+    // check. Collected until the echo arrives rather than by counting: the two
+    // permission answers are transcript entries of their own and are still
+    // queued on this connection, so a count would be counting them too.
+    let mut more = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let echoed = loop {
+        more.extend(next_agent_events(&mut c, &ag, 1, Duration::from_millis(200)).await);
+        if bodies(&more).iter().any(
+            |b| matches!(b, AgentMessageBody::AssistantText { text } if text.contains("echo: now then")),
+        ) {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+    };
+    assert!(echoed, "the CLI never answered the turn: {more:?}");
 
     c.call(Request::AgentStop(AgentIdParams { agent_id: ag }))
         .await
@@ -1194,6 +1296,148 @@ async fn two_starts_at_once_in_one_workspace_do_not_race() {
     c.call(Request::AgentStop(AgentIdParams { agent_id: ok }))
         .await
         .unwrap();
+    cancel.cancel();
+}
+
+/// The reader's wait for stderr and `stop`'s wait for the reader start at the
+/// same instant -- the process exit -- so sizing them alike makes which of them
+/// announces the exit a scheduler coin toss, in exactly the case both were
+/// written for: a grandchild holding the stderr pipe open past the bound.
+///
+/// Losing that toss aborts the reader mid-drain and hands the announcement to
+/// `stop`, which knows the exit code and nothing else. For an agent whose turn
+/// ended in an error that throws away the error message -- the better half of
+/// the detail, and the whole of what AG6 exists to deliver. Worse, the abort
+/// window sits either side of the flag the two paths use to agree on who
+/// announces; the reader's claim and its publish have no yield between them
+/// today, and nothing but a comment says they must not acquire one.
+///
+/// `stop` is therefore given strictly more time than the reader can spend.
+/// Looped, because the failure it prevents is a coin toss rather than a
+/// certainty.
+#[tokio::test]
+async fn a_stop_racing_a_held_stderr_pipe_still_announces_one_exit_with_its_reason() {
+    const ROUNDS: usize = 10;
+
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    // The turn fails, so the agent is in `Error` with a message when its process
+    // goes -- which is the detail worth keeping.
+    use_dying_claude(py, Some("error_result_turn.ndjson"));
+    // Held well past the adapter's one-second stderr bound, and never written
+    // to inside it, so the reader always spends its whole budget.
+    std::env::set_var("DYING_CLAUDE_STDERR", "far too late to matter");
+    std::env::set_var("DYING_CLAUDE_STDERR_FROM_CHILD", "1");
+    std::env::set_var("DYING_CLAUDE_STDERR_DELAY", "1.5");
+    let (port, token, _d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "heldpipe").await;
+
+    let mut details = Vec::new();
+    let mut counts = Vec::new();
+    for round in 0..ROUNDS {
+        let ag = start_agent(&mut c, &ws.id).await;
+        // Straight into the reader's stderr wait: the fixture's process is gone
+        // within a few line delays, and both budgets start from that exit.
+        c.call(Request::AgentStop(AgentIdParams {
+            agent_id: ag.clone(),
+        }))
+        .await
+        .unwrap();
+        // `stop` has returned, so both paths have had their say and anything
+        // either published is already buffered on this connection; the wait is
+        // only to let a straggler through. `usize::MAX` because the assertion
+        // is about how many there are, so the collection must not stop early.
+        let events = next_agent_events(&mut c, &ag, usize::MAX, Duration::from_millis(500)).await;
+        let exits: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::AgentStateChanged {
+                    state: AgentState::Exited,
+                    detail,
+                    ..
+                } => Some(detail.clone().unwrap_or_default()),
+                _ => None,
+            })
+            .collect();
+        counts.push(exits.len());
+        details.push(
+            exits
+                .first()
+                .cloned()
+                .unwrap_or_else(|| panic!("round {round}: no exit announced: {events:?}")),
+        );
+    }
+    assert!(
+        counts.iter().all(|n| *n == 1),
+        "every agent must announce exactly one exit: {counts:?}"
+    );
+    let lost: Vec<(usize, &String)> = details
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| !d.contains("Not logged in"))
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "{} of {ROUNDS} exits lost the reason the turn failed: {lost:?}",
+        lost.len()
+    );
+    cancel.cancel();
+}
+
+/// An agent that dies with a question still outstanding has ended, and that is
+/// what a client is told.
+///
+/// The refusal counts open permission requests, and a process that went while
+/// one was open leaves that set full for ever -- nothing clears it but an answer
+/// or a `stop`. "Answer the permission first" is advice nobody can take about an
+/// agent whose process is gone, so the exit is the answer that wins.
+#[tokio::test]
+async fn a_turn_sent_to_an_agent_that_died_mid_question_says_the_agent_ended() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    // Two questions and then a process that simply stops, which is what a CLI
+    // killed or crashed mid-permission looks like from here.
+    use_dying_claude(py, Some("two_permissions_turn.ndjson"));
+    let (port, token, _d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "diedasking").await;
+
+    let ag = start_agent(&mut c, &ws.id).await;
+    let events = next_agent_events(&mut c, &ag, 10, Duration::from_secs(20)).await;
+    assert_eq!(
+        request_ids(&events).len(),
+        2,
+        "both questions must have been asked: {events:?}"
+    );
+    assert_eq!(
+        states(&events).last(),
+        Some(&AgentState::Exited),
+        "the process is gone: {events:?}"
+    );
+
+    let e = c
+        .call(Request::AgentSend(AgentSendParams {
+            agent_id: ag.clone(),
+            text: "anyone there".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        reason_of(&e),
+        "agent_exited",
+        "an ended agent is ended, whatever it left open: {e:?}"
+    );
     cancel.cancel();
 }
 
