@@ -638,11 +638,28 @@ mod tests {
         let plain = sub.join("not-there-yet");
         let roundabout = sub.join("..").join("sub").join("not-there-yet");
 
+        // The key first, then the lock. The two halves fail for entirely
+        // different reasons — a platform whose `canonical_ish` resolves `..`
+        // differently, against a lock map that stopped keying on it — and a
+        // single assertion at the end could not say which, least of all on the
+        // platform the reader is not sitting in front of.
+        let (a, b) = (
+            repo::canonical_ish(&plain),
+            repo::canonical_ish(&roundabout),
+        );
+        assert_eq!(
+            a,
+            b,
+            "canonical_ish gives {} and {} two keys for one directory",
+            a.display(),
+            b.display()
+        );
         assert!(
             Arc::ptr_eq(&repo_lock(&plain), &repo_lock(&roundabout)),
-            "{} and {} are the same repository and must share one lock",
+            "{} and {} both key on {}, so they must share one lock",
             plain.display(),
-            roundabout.display()
+            roundabout.display(),
+            a.display()
         );
     }
 }
