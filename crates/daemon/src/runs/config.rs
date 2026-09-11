@@ -319,11 +319,21 @@ fn node_port(root: &Path, script: &str) -> (u16, bool) {
     // `package.json` declared: the `start` that runs `node server.js` beside a
     // Vite front end was reported as serving on 5173, and with `port_guessed`
     // cleared the Run panel did not even offer to correct it.
-    if invokes_vite(script) {
-        return match vite_config(root).as_deref().and_then(vite_port) {
-            Some(p) => (p, false),
-            None => (5173, true),
-        };
+    match vite_mode(script) {
+        Some(ViteMode::Dev) => {
+            return match vite_config(root).as_deref().and_then(vite_port) {
+                Some(p) => (p, false),
+                None => (5173, true),
+            }
+        }
+        // Its own port, and a guess: `vite_port` reads the config's `server`
+        // block, which is the dev server's and not this one's.
+        Some(ViteMode::Preview) => return (4173, true),
+        // A compiler, not a server. There is nothing to give it a port for, so
+        // it takes the same generic guess as any other script that is not a dev
+        // server -- marked as a guess, which is what makes the Run panel offer
+        // to correct it.
+        Some(ViteMode::Build) | None => {}
     }
     if mentions(script, "next") {
         return (3000, true);
@@ -334,16 +344,43 @@ fn node_port(root: &Path, script: &str) -> (u16, bool) {
     (3000, true)
 }
 
-/// Whether a `package.json` script actually runs Vite, rather than merely
-/// naming it.
+/// Which of the three programs called `vite` a script runs.
+///
+/// Only one of them is a dev server, and only that one may be handed the port
+/// the Vite config names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ViteMode {
+    /// `vite`, `vite dev`, `vite serve`: the dev server, on 5173 unless the
+    /// config says otherwise.
+    Dev,
+    /// `vite preview`: the *built* site, served on 4173. A `server.port` in the
+    /// config belongs to the dev server; `preview.port` is this one's, and is
+    /// not read here, so the number is a guess.
+    Preview,
+    /// `vite build`: a compiler. It binds nothing and serves nothing.
+    Build,
+}
+
+/// Which way a `package.json` script runs Vite, or `None` when it merely names
+/// it.
 ///
 /// The command is what counts: `vite` as the program being invoked, directly or
 /// through one of the package runners, in any of the commands the script
 /// chains. `echo vite`, `npm run vite-build` and `node scripts/vite-warmup.js`
 /// all contain the word and none of them starts a Vite dev server, so none of
 /// them may be handed its port.
+///
+/// A script that chains several commands answers for the first Vite among them,
+/// which is the one whose port anything would be reachable on: `vite build &&
+/// vite preview` is a preview, and `vite build` on its own is a build.
+fn vite_mode(script: &str) -> Option<ViteMode> {
+    script.split(['&', '|', ';']).find_map(segment_vite_mode)
+}
+
+/// Whether a script runs Vite at all, whichever way.
+#[cfg(test)]
 fn invokes_vite(script: &str) -> bool {
-    script.split(['&', '|', ';']).any(segment_runs_vite)
+    vite_mode(script).is_some()
 }
 
 /// The runners that stand in front of the command they run, with the
@@ -352,10 +389,12 @@ fn invokes_vite(script: &str) -> bool {
 const RUNNERS: [&str; 6] = ["npx", "npm", "pnpm", "yarn", "bun", "cross-env"];
 const RUNNER_SUBCOMMANDS: [&str; 3] = ["exec", "dlx", "run"];
 
-/// Whether one command out of a script -- one link of its `&&` chain -- runs
-/// Vite.
-fn segment_runs_vite(segment: &str) -> bool {
-    for word in segment.split_whitespace() {
+/// Which way one command out of a script -- one link of its `&&` chain -- runs
+/// Vite, if it does.
+fn segment_vite_mode(segment: &str) -> Option<ViteMode> {
+    let mut words = segment.split_whitespace();
+    loop {
+        let word = words.next()?;
         // `NODE_ENV=development vite`: a shell assignment is a prefix to the
         // command rather than the command.
         if is_env_assignment(word) {
@@ -367,15 +406,24 @@ fn segment_runs_vite(segment: &str) -> bool {
         }
         let name = program_name(word);
         if name == "vite" {
-            return true;
+            break;
         }
         if RUNNERS.contains(&name) || RUNNER_SUBCOMMANDS.contains(&name) {
             continue;
         }
         // Anything else is the program this command runs, and it is not Vite.
-        return false;
+        return None;
     }
-    false
+    // The first word after `vite` that is not a flag is its subcommand, and no
+    // subcommand at all is the dev server that plain `vite` runs.
+    Some(match words.find(|w| !w.starts_with('-')) {
+        Some("build") => ViteMode::Build,
+        Some("preview") => ViteMode::Preview,
+        // `dev` and `serve` are both spellings of the dev server, and an
+        // unknown subcommand is likelier a newer alias for it than a second
+        // compiler.
+        _ => ViteMode::Dev,
+    })
 }
 
 /// Whether `word` is a shell variable assignment rather than a command.
@@ -913,6 +961,47 @@ mod tests {
         ] {
             assert!(!invokes_vite(no), "{no:?} does not run vite");
         }
+    }
+
+    /// `vite` is three programs wearing one name, and only one of them is the
+    /// dev server whose port the config file names.
+    ///
+    /// `vite preview` serves the *built* site, on 4173, and a `server.port` in
+    /// the config says nothing about it -- `preview.port` does, and this does
+    /// not read it, so the number is the guess it is. `vite build` is a
+    /// compiler: it binds nothing at all, so handing it the dev server's port
+    /// told the Run panel a run was reachable somewhere nothing would ever
+    /// answer, with `port_guessed` cleared so the panel did not even offer to
+    /// correct it.
+    #[test]
+    fn vite_build_and_vite_preview_are_not_the_vite_dev_server() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("vite.config.ts"),
+            "export default { server: { port: 5199 } }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite","serve":"vite preview","start":"vite build"}}"#,
+        )
+        .unwrap();
+        let v = detect(dir.path());
+        let of = |name: &str| {
+            let c = v.iter().find(|c| c.name == name).expect(name);
+            (c.port, c.port_guessed)
+        };
+        assert_eq!(of("dev"), (5199, false), "the dev server reads the config");
+        assert_eq!(
+            of("serve"),
+            (4173, true),
+            "preview serves the built site on its own port, and not from `server.port`"
+        );
+        assert_eq!(
+            of("start"),
+            (3000, true),
+            "a build serves nothing, so it gets no server's port"
+        );
     }
 
     /// Python projects declare dependencies in two shapes and dress the names

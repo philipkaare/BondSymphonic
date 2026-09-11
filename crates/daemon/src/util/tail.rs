@@ -178,12 +178,14 @@ mod tests {
     }
 
     /// A backend that dropped the sender lost the child; that is not an exit
-    /// status of zero, and no real status is negative.
+    /// status of zero, and no real status is negative, so the two can never be
+    /// confused.
     #[tokio::test]
     async fn a_lost_child_reports_a_code_no_process_could_have_returned() {
         let (tx, rx) = tokio::sync::oneshot::channel::<i32>();
         drop(tx);
-        assert_eq!(exit_code(rx).await, NO_CODE);
-        assert!(NO_CODE < 0);
+        let lost = exit_code(rx).await;
+        assert_eq!(lost, NO_CODE);
+        assert!(lost < 0, "a real exit status is never negative");
     }
 }
