@@ -1074,12 +1074,18 @@ Resize forwards `TIOCSWINSZ`. Idle PTYs cost one task each.
 it survived `workspace.destroy` and kept running while the worktree was deleted
 under it. `close_workspace` fires the killer, waits one signal grace, and then
 sends SIGTERM and SIGKILL to the process group of anything still registered. The
-ladder runs in a task of its own per victim, so a destroy is not held up by a
-second per open terminal; `workspace.destroy` therefore goes on to remove the
-worktree with the last terminal possibly still dying, which is the intended
-trade — the ladder is what guarantees they go, and nothing after it needs them
-gone. A caller that really needs them gone watches for the sessions to retire
-instead.
+ladder runs in a task of its own per victim and `close_workspace` returns as soon
+as every terminal has been *asked*, so `workspace.destroy` goes straight on to
+remove the worktree with the last terminal possibly still dying. That is
+deliberate: it is the difference between a destroy that answers at once and one
+that spends a second per open terminal doing nothing, the ladder is what
+guarantees the processes go, a worktree removal is not blocked by a process whose
+working directory is inside it, and nothing the destroy does afterwards needs
+them gone first. A caller that has to know a workspace's terminals are really
+gone watches for their `pty.exit` events; the call returning is not that promise.
+Closing the daemon's host PTYs is the other way round and *does* await its grace,
+because it runs on the way out of the process, where a task nobody waits for is a
+task that never runs.
 
 **A host PTY dies with the connection that opened it.** Setup terminals
 (`system.setup_pty`) run on the host, outside any workspace, so nothing else
@@ -1189,17 +1195,24 @@ ready by a probe. `run.stop` sends SIGTERM to the process group, SIGKILL after
 5 s, and tears down the bridge; `workspace.destroy` stops every run first.
 
 **How a run's end is reported.** There are two terminal states and three
-endings. A run the user ended — or one whose workspace is being destroyed, which
-is the same thing from further away — reports `stopped` with **no** detail,
-whatever exit status the signal produced and whichever of the supervisor and the
-stop observes the exit first: a stop needs no explanation, and the exit status of
-a signalled process says nothing useful. A run that died on its own reports
-`failed` if it never became ready, and `stopped` if it had; both carry the exit
-code and the last lines of output as their detail. So the presence of the detail
-is what separates the two `stopped` cases over the wire, and a client must not
-read a bare `stopped` as a failure. The detail is assembled *after* the output
-readers are drained, because a command that prints an error and exits usually
-delivers its exit code before the daemon has read its pipes.
+endings. A run the user ended reports `stopped` with **no** detail, whatever exit
+status the signal produced and whichever of the supervisor and the stop observes
+the exit first: a stop needs no explanation, and the exit status of a signalled
+process says nothing useful. A run whose workspace is going is the same thing
+from further away and is announced the same way. That is decided by reading the
+registry fresh at the moment the exit is announced, rather than from anything the
+start was holding, so a run that dies because the worktree went out from under it
+or because init took the sandbox down is not reported as a failure to a client
+that has already been told the workspace is gone. Without that read, the "no
+`failed` after a destroy" rule was only ever a matter of timing.
+
+A run that died on its own reports `failed` if it never became ready, and
+`stopped` if it had; both carry the exit code and the last lines of output as
+their detail. So the presence of the detail is what separates the two `stopped`
+cases over the wire, and a client must not read a bare `stopped` as a failure.
+The detail is assembled *after* the output readers are drained, because a command
+that prints an error and exits usually delivers its exit code before the daemon
+has read its pipes.
 
 **Readiness by port** is a connection that is accepted on either loopback —
 `127.0.0.1` or `::1` — with nothing sent. Both are asked at once: a dev server
@@ -1211,16 +1224,23 @@ anything and once after its run is in the list. A `workspace.destroy` marks the
 workspace and then sweeps its runs, so a start that registered its run after that
 sweep would otherwise outlive the workspace. On the second read the start tears
 its own run down and answers `InvalidParams` with `data.reason`
-`workspace_not_ready`, having announced nothing.
+`workspace_not_ready` — the same `data.reason` the first read gives, from the
+same constant, so a client telling "the workspace is going away" from "no such
+run configuration" never has to read English to do it. Neither refusal announces
+anything: the `starting` event is published only after the second read, and the
+output readers check the run's finished flag before they publish a line, so a
+start that loses to a destroy is silent rather than half-announced.
 
 **A `(workspace, config)` pair is spoken for** from before its process is spawned
 until after its teardown is complete. A `run.start` for a pair whose run is still
 being stopped is refused with `Conflict` and `data.reason` `run_stopping`, rather
 than being handed a port the dying process has not let go of; one whose run is up
 is refused with `Conflict` and `data.reason` `run_running`. The claim is released
-before the terminal event is published, so a client that reacts to `stopped` by
-starting the same configuration again is not told `run_stopping` for a run the
-daemon has just said is over.
+before the terminal event is published, on both the path a stop takes and the one
+a death takes, so a client that reacts to `stopped` by starting the same
+configuration again is not told `run_stopping` for a run the daemon has just said
+is over. The stopping flag is set while the run list's lock is still held, so
+there is no window in which a run is out of the list but not yet marked.
 
 **The noop backend has no bridge.** Without a network namespace the run is a
 plain child of the daemon and its port already is the host's, so `host_port` is
