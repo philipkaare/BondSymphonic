@@ -420,16 +420,26 @@ async fn enabling_a_big_tree_does_not_block_other_workspaces_watches() {
     eprintln!(
         "enable of 5,000 dirs took {enable_took:?}; concurrent disable took {disable_took:?}"
     );
-    // The walk has to have been substantial, or the disable had nothing to be
-    // blocked behind and the comparison below means nothing. 5,000 directories
-    // take far longer than this; anything under it says the fixture stopped
-    // building the tree it was supposed to.
+    // The property is a comparison, so it is asserted as one. A wall-clock
+    // bound on either measurement is really a bound on how fast the host is:
+    // the old lower bound on `enable_took` said the fixture had to be *slow*,
+    // which a fast machine with a warm dentry cache can honestly fail, and the
+    // old 100 ms ceiling on `disable_took` could be spent by the
+    // `spawn_blocking` hand-off alone on a loaded runner. The ratio says what
+    // the test is actually about: if `enable` held the lock across its walk,
+    // the disable behind it would take nearly as long, not a quarter of it.
     assert!(
-        enable_took > Duration::from_millis(150),
-        "the walk of 5,000 directories took only {enable_took:?}: there was nothing to wait behind"
+        disable_took * 4 < enable_took,
+        "disable took {disable_took:?} against a concurrent {enable_took:?} walk: \
+         that is the shape of a lock held across the walk"
     );
+    // The ratio alone would also be satisfied by a stalled disable sitting
+    // behind an even slower walk, so one absolute bound stays - placed far past
+    // any scheduling hiccup rather than near the measurement, so that only a
+    // real stall can reach it.
     assert!(
-        disable_took < Duration::from_millis(100),
-        "disable waited {disable_took:?} behind a {enable_took:?} walk: the lock is held across it"
+        disable_took < Duration::from_secs(2),
+        "disable took {disable_took:?}: no hand-off to a blocking thread costs that, \
+         however loaded the host is"
     );
 }
