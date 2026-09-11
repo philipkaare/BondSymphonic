@@ -89,6 +89,15 @@ QString attentionDot() {
 /// the IDE's stdout, which is the only way to see it: the confirmations these
 /// menus lead to are modal, and an automated run has nobody to answer them.
 QStringList menuTestSteps() {
+    // Two variables and not one. `BS_MENU_TEST` on its own would turn every
+    // destroy and every close-group into a silent no-op for anyone who happened
+    // to have it set, which is a sharper edge than a test hook should have.
+    // `BS_SMOKE_SCRIPT` is the IDE's existing "this is an automated run" switch
+    // and is never set by a user; the seam is inert without it. `MainWindow`
+    // gates its half of the seam on the same pair.
+    if (qEnvironmentVariableIsEmpty("BS_SMOKE_SCRIPT")) {
+        return QStringList();
+    }
     return qEnvironmentVariable("BS_MENU_TEST").split(QLatin1Char(','), Qt::SkipEmptyParts);
 }
 

@@ -38,6 +38,7 @@
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QSplitter>
+#include <QTabBar>
 #include <QStatusBar>
 #include <QTabWidget>
 #include <QTimer>
@@ -48,11 +49,25 @@
 
 namespace {
 
-/// The steps in `BS_MENU_TEST`, as one string. **Test-only**: unset in every
+/// The steps in `BS_MENU_TEST`, as one string. **Test-only**: empty in every
 /// ordinary run, and then everything below that reads it is inert.
+///
+/// Gated on `BS_SMOKE_SCRIPT` as well, for the reason spelled out beside
+/// `GroupBar`'s copy of this: what the seam does here is return early from a
+/// destroy and a close-group, so `BS_MENU_TEST` on its own would let one stray
+/// variable disable both actions. `BS_SMOKE_SCRIPT` is the IDE's existing
+/// automated-run switch and no user sets it.
 QString menuTest() {
+    if (qEnvironmentVariableIsEmpty("BS_SMOKE_SCRIPT")) {
+        return QString();
+    }
     return qEnvironmentVariable("BS_MENU_TEST");
 }
+
+/// `GroupModel::tabStatus`'s code for an agent or workspace in error, which is
+/// the one status painted in the theme's red. `GroupBar` holds the mapping; the
+/// seam only has to find a tab that has this status.
+constexpr int kTabStatusError = 3;
 
 /// How Qt's text formats are spelled in a test line. `QLabel`'s default is
 /// `AutoText`, which is what makes an unset format worth reporting at all.
@@ -305,8 +320,35 @@ void MainWindow::buildCentral() {
     QObject::connect(m_centerSplitter, &QSplitter::splitterMoved, this,
                      [this](int, int) { noteSplitterState(); });
 
-    if (menuTest().contains(QLatin1String("new-agent-status"))) {
-        QTimer::singleShot(0, this, &MainWindow::reportNewAgentStatusFormat);
+    if (menuTest().contains(QLatin1String("widgets"))) {
+        // Not `singleShot(0)`: one of the four values is a tab's text colour,
+        // and at the first turn of the event loop the daemon has not answered
+        // `workspace.list` yet, so there are no tabs. Waits instead for the
+        // model to report a tab in error, which is the state the fixture puts
+        // one workspace in, and reports once. `GroupBar` connected to `changed`
+        // before this did, and Qt delivers in connection order, so the tab bar
+        // has already been rebuilt when this runs.
+        QObject::connect(m_groupModel, &GroupModel::changed, this, [this] {
+            if (m_seamWidgetsReported) {
+                return;
+            }
+            const int group = m_groupModel->activeGroupIndex();
+            for (int i = 0; i < m_groupModel->tabCount(group); ++i) {
+                if (m_groupModel->tabStatus(group, i) == kTabStatusError) {
+                    m_seamWidgetsReported = true;
+                    reportSeamWidgets();
+                    return;
+                }
+            }
+        });
+    }
+    if (menuTest().contains(QLatin1String("signal-counts"))) {
+        // One line per firing rather than a total read at a chosen moment:
+        // counting lines on stdout after the run needs nothing to be timed. The
+        // other half of the count, `layout-recorded`, is printed by the lambda
+        // that writes the layout, wherever that ends up connected.
+        QObject::connect(m_groupModel, &GroupModel::changed, this,
+                         [this] { announceMenuTest("model-changed", QString(), QString()); });
     }
 }
 
@@ -323,15 +365,40 @@ bool MainWindow::announceMenuTest(const char* what, const QString& target,
     return true;
 }
 
-void MainWindow::reportNewAgentStatusFormat() {
+void MainWindow::reportSeamWidgets() {
     // Built and thrown away without being shown: what is being read is how the
-    // label was configured, and showing it would need somebody to dismiss it.
+    // widgets were configured, and showing it would need somebody to dismiss it.
     NewAgentDialog dialog(m_controller, m_groupModel, QString(), this);
     const QLabel* status = dialog.findChild<QLabel*>(QStringLiteral("NewAgentStatus"));
     announceMenuTest("new-agent-status",
                      status == nullptr ? QStringLiteral("missing")
                                        : QString::fromUtf8(textFormatWord(status->textFormat())),
                      QString());
+    const QLabel* hint = dialog.findChild<QLabel*>(QStringLiteral("NewAgentNameHint"));
+    announceMenuTest("name-hint-style",
+                     hint == nullptr ? QStringLiteral("missing") : hint->styleSheet(), QString());
+
+    // Which palette the run is on, so the expected colour is not guessed at:
+    // `theme::ink` lifts an accent for a dark palette and leaves it alone on a
+    // light one, and the two hexes differ.
+    announceMenuTest("palette",
+                     theme::isDark(palette()) ? QStringLiteral("dark") : QStringLiteral("light"),
+                     QString());
+
+    // The text colour of the first tab the model reports in error. Read off the
+    // tab bar itself rather than recomputed, so it is the colour a user sees.
+    const QTabBar* tabs = m_groupBar->findChild<QTabBar*>(QStringLiteral("GroupBarAgentTabs"));
+    const int group = m_groupModel->activeGroupIndex();
+    QString colour = QStringLiteral("missing");
+    if (tabs != nullptr) {
+        for (int i = 0; i < tabs->count(); ++i) {
+            if (m_groupModel->tabStatus(group, i) == kTabStatusError) {
+                colour = tabs->tabTextColor(i).name();
+                break;
+            }
+        }
+    }
+    announceMenuTest("error-tab-colour", colour, QString());
 }
 
 void MainWindow::showSetupPage() { openSettings(true); }
@@ -560,8 +627,14 @@ void MainWindow::connectController() {
     // glyph, an agent heartbeat and a running cost, none of which `state.json`
     // records, and recording on it re-serialised and re-scheduled a write of
     // the whole file dozens of times a minute with nothing to write.
-    QObject::connect(m_groupModel, &GroupModel::arrangementChanged, this,
-                     [this] { m_controller->noteGroups(m_groupModel->groupsJson()); });
+    QObject::connect(m_groupModel, &GroupModel::arrangementChanged, this, [this] {
+        // Reported from inside the lambda that records rather than from a
+        // second connection to the same signal: a seam wired to its own copy of
+        // `arrangementChanged` would keep saying the right thing after this
+        // line had been moved back to `changed`. Inert unless armed.
+        announceMenuTest("layout-recorded", QString(), QString());
+        m_controller->noteGroups(m_groupModel->groupsJson());
+    });
     // The re-sync has finished. The panes re-attached themselves in Rust; what
     // is left is the window's own furniture.
     QObject::connect(m_controller, &AppController::reconnected, this, [this](::std::int64_t) {

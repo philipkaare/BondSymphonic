@@ -1485,13 +1485,12 @@ fn request_order_is_checked_as_a_subsequence() {
 /// dialog's status label: the daemon writes that sentence, so it is shown as
 /// text and never as markup.
 mod menu_targets {
+    use super::{drain, wait_for};
     use bondsymphonic_ide::model::persistence::{PersistedGroup, StateFile, STATE_VERSION};
     use bondsymphonic_proto::*;
-    use std::io::Read;
     use std::process::{Command, Stdio};
-    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
@@ -1499,8 +1498,12 @@ mod menu_targets {
     /// Nothing but the quit: the menus are driven by the seam, not by a script
     /// step, and every tab in the run comes back out of `workspace.list`.
     const SCRIPT: &str = "quit";
-    /// The steps the seam runs, in order.
-    const MENU_TEST: &str = "destroy,close-group,new-agent-status";
+    /// The seam steps this run arms. Not an order: `widgets` and
+    /// `signal-counts` are set up from `buildCentral` and fire as the window
+    /// builds, while `destroy` and `close-group` wait for the first
+    /// `workspace.list` to have filled the bar, so the widget report comes out
+    /// first however this string is spelled.
+    const MENU_TEST: &str = "destroy,close-group,widgets,signal-counts";
 
     /// Two groups: the first holds the two tabs the agent menu is opened over,
     /// the second is the one the group menu is opened over.
@@ -1516,6 +1519,22 @@ mod menu_targets {
     const DISPLACED_NAME: &str = "alpha-one";
     const OTHER_ID: &str = "ws_menu3";
     const OTHER_NAME: &str = "beta-one";
+    /// `theme::removed()`, the IDE's one red, as `QColor::name()` spells it.
+    /// The literal `#eb5757` both call sites used to carry is deliberately not
+    /// this, which is what makes the two colour assertions below discriminate.
+    const THEME_RED: &str = "#d03933";
+    /// What `#eb5757` was, so a revert is named in the failure rather than
+    /// merely not matching.
+    const OLD_RED: &str = "#eb5757";
+    /// How many `workspace.state` events the fake daemon pushes once the list
+    /// has answered. Each moves a tab's status and nothing else, so each fires
+    /// `changed` and must not fire `arrangementChanged`. Three rather than one
+    /// because an event that overtakes the restore has no tab to land on yet;
+    /// the assertion only needs one of them to arrive.
+    const STATUS_EVENTS: usize = 3;
+    /// What the daemon says is wrong with the workspace it reports in error.
+    /// The tab that carries it is the one whose text colour CI6 is about.
+    const ERROR_DETAIL: &str = "worktree is gone";
     /// The quit step's two seconds, three panes, and a cold Qt start.
     const RUN_LIMIT: Duration = Duration::from_secs(120);
 
@@ -1637,7 +1656,65 @@ mod menu_targets {
             "the New Agent status label renders markup: {status_format}\n{context}"
         );
 
+        // CP2, the other half of it. The seam prints what the window resolved
+        // and returns before the modal, so the destroy must never reach the
+        // daemon: a run that asked for one asked about a workspace nobody
+        // confirmed.
+        assert!(
+            !seen.iter().any(|m| m.starts_with("workspace.destroy")),
+            "a destroy reached the daemon without a confirmation\n{context}"
+        );
+
+        // CI6. Both former `#eb5757` sites now read the IDE's one red out of
+        // `theme`. Which hex that is depends on the palette, because
+        // `theme::ink` lifts an accent for a dark one, so the palette is
+        // reported rather than assumed.
+        let palette = line(&out, "palette")
+            .unwrap_or_else(|| panic!("the seam never reported the palette\n{context}"));
+        assert!(
+            palette.contains("target=light"),
+            "the offscreen run is no longer on a light palette, so the two colour assertions below want the lifted red instead: {palette}\n{context}"
+        );
+
+        let tab_colour = line(&out, "error-tab-colour")
+            .unwrap_or_else(|| panic!("the seam never reported a tab colour\n{context}"));
+        assert!(
+            tab_colour.contains(&format!("target={THEME_RED}")),
+            "an agent tab in error is not painted the theme's red; a revert to {OLD_RED} looks like this: {tab_colour}\n{context}"
+        );
+
+        let hint_style = line(&out, "name-hint-style")
+            .unwrap_or_else(|| panic!("the seam never reported the name hint\n{context}"));
+        assert!(
+            hint_style.contains(&format!("color:{THEME_RED}")),
+            "the New Agent name hint is not painted the theme's red; a revert to {OLD_RED} looks like this: {hint_style}\n{context}"
+        );
+
+        // CI1. The layout is recorded from `arrangementChanged`, which fires
+        // only when the groups themselves moved. The daemon pushed
+        // `STATUS_EVENTS` workspace-state events that move a tab's status and
+        // nothing else, so `changed` must have fired at least that many times
+        // more than the layout was recorded. Wired back to `changed`, as it was
+        // before this task, the two counts are equal and this fails.
+        let changed = count(&out, "model-changed");
+        let recorded = count(&out, "layout-recorded");
+        assert!(
+            recorded >= 1,
+            "the layout was never recorded, so this run proves nothing about what does not record it\n{context}"
+        );
+        assert!(
+            changed > recorded,
+            "every `changed` rewrote the layout: it fired {changed} times and the layout was recorded {recorded} times. The run pushed {STATUS_EVENTS} status-only events, so with the recording on `arrangementChanged` these two differ; wired back to `changed` they are equal, which is exactly this\n{context}"
+        );
         let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// How many lines the seam printed for `what`.
+    fn count(out: &str, what: &str) -> usize {
+        let prefix = format!("BS_MENU_TEST {what} ");
+        out.lines()
+            .filter(|l| l.trim_start().starts_with(&prefix))
+            .count()
     }
 
     /// The one line the seam printed for `what`, or `None`.
@@ -1684,6 +1761,7 @@ mod menu_targets {
                         other => other.method_name().to_owned(),
                     };
                     recorded.lock().expect("journal mutex").push(method);
+                    let listed = matches!(request, Request::WorkspaceList {});
                     let reply = match request {
                         Request::Hello(p) if p.token == TOKEN => ServerMessage::ok(
                             id,
@@ -1716,7 +1794,7 @@ mod menu_targets {
                             id,
                             &WorkspaceListResult {
                                 workspaces: vec![
-                                    workspace(DISPLACED_ID, DISPLACED_NAME),
+                                    broken(DISPLACED_ID, DISPLACED_NAME),
                                     workspace(CLICKED_ID, CLICKED_NAME),
                                     workspace(OTHER_ID, OTHER_NAME),
                                 ],
@@ -1772,6 +1850,35 @@ mod menu_targets {
                     if w.write_all(codec::encode(&reply).as_bytes()).await.is_err() {
                         break;
                     }
+                    // Behind the list, so the tabs they name exist. Each moves
+                    // one tab's status and touches no group, no membership and
+                    // no order, which is the whole of what CI1 is about: these
+                    // must reach `changed` and must not reach
+                    // `arrangementChanged`. The workspace is the one in the
+                    // group that is *not* on show, so the error tab the colour
+                    // assertion looks for is left alone.
+                    if listed {
+                        let mut pushed = false;
+                        for i in 0..STATUS_EVENTS {
+                            let state = if i % 2 == 0 {
+                                WorkspaceState::SandboxDown
+                            } else {
+                                WorkspaceState::Ready
+                            };
+                            let info = Box::new(super::workspace(OTHER_ID, OTHER_NAME, state, &[]));
+                            let event = ServerMessage::event(
+                                Some(WorkspaceId(OTHER_ID.to_owned())),
+                                Event::WorkspaceStateChanged { info },
+                            );
+                            if w.write_all(codec::encode(&event).as_bytes()).await.is_err() {
+                                pushed = true;
+                                break;
+                            }
+                        }
+                        if pushed {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -1779,57 +1886,25 @@ mod menu_targets {
         (addr, journal)
     }
 
+    /// A ready workspace with no allowlist of its own, which is every tab in
+    /// this run bar the one the daemon puts into error.
     fn workspace(id: &str, name: &str) -> WorkspaceInfo {
-        WorkspaceInfo {
-            id: WorkspaceId(id.to_owned()),
-            name: name.to_owned(),
-            repo_path: "/menu/repo".to_owned(),
-            base_branch: "main".to_owned(),
-            branch: format!("bs/{name}"),
-            worktree_path: format!("/wt/{id}"),
-            created_at: "2026-09-11T10:00:00Z".to_owned(),
-            allowlist: Vec::new(),
-            state: WorkspaceState::Ready,
-            agents: Vec::new(),
-            agent_records: Vec::new(),
-            runs: Vec::new(),
-        }
+        super::workspace(id, name, WorkspaceState::Ready, &[])
     }
 
+    /// The same tab, reported in error, so one agent tab in the bar is painted
+    /// the status colour CI6 is about.
+    fn broken(id: &str, name: &str) -> WorkspaceInfo {
+        super::workspace(
+            id,
+            name,
+            WorkspaceState::Error(ERROR_DETAIL.to_owned()),
+            &[],
+        )
+    }
+
+    /// One entry of the fake file listing. Size is never read here.
     fn entry(name: &str, is_dir: bool) -> FileEntry {
-        FileEntry {
-            name: name.to_owned(),
-            is_dir,
-            size: 0,
-            status: FileStatus::Unchanged,
-        }
-    }
-
-    /// Reads a child pipe to end on its own thread, so a full pipe cannot
-    /// deadlock the child before the time limit.
-    fn drain(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
-        });
-        rx
-    }
-
-    fn wait_for(
-        child: &mut std::process::Child,
-        limit: Duration,
-    ) -> Option<std::process::ExitStatus> {
-        let deadline = Instant::now() + limit;
-        while Instant::now() < deadline {
-            match child.try_wait().expect("try_wait") {
-                Some(status) => return Some(status),
-                None => std::thread::sleep(Duration::from_millis(50)),
-            }
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        None
+        super::entry(name, is_dir, 0)
     }
 }

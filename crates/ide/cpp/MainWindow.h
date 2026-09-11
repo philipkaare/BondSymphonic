@@ -178,11 +178,16 @@ private:
     /// of raising a modal dialog an automated run has nobody to answer. See
     /// `GroupBar`'s own half of the seam.
     bool announceMenuTest(const char* what, const QString& target, const QString& question) const;
-    /// Builds a New Agent dialog without showing it and reports the text format
-    /// of its status label, which is the only way to see from outside that the
-    /// daemon's sentences land there as text rather than as markup. Test seam;
-    /// see [`announceMenuTest`].
-    void reportNewAgentStatusFormat();
+    /// Reports the widget settings that have no other observable effect: the
+    /// New Agent dialog's status text format and name-hint colour, the palette
+    /// the run is on, and the text colour of an agent tab in error. Each is a
+    /// value a widget was configured with and nothing reads back, so the seam
+    /// is the only way to see from outside that it is still set. Test seam; see
+    /// [`announceMenuTest`].
+    void reportSeamWidgets();
+    /// Whether [`reportSeamWidgets`] has already run. The report waits for a
+    /// tab in error and then happens once; `changed` goes on firing after it.
+    bool m_seamWidgetsReported = false;
 
     /// Points the status bar's cost at the active tab's transcript, dropping
     /// the watch on the tab before it. A tab with no transcript costs nothing.

@@ -109,6 +109,7 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     form->addRow("Name:", m_name);
 
     m_nameHint = new QLabel(this);
+    m_nameHint->setObjectName(QStringLiteral("NewAgentNameHint"));
     m_nameHint->setWordWrap(true);
     m_nameHint->setTextFormat(Qt::PlainText);
     // The one colour in this dialog that means "this will not work". The IDE's
