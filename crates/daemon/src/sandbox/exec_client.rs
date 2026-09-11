@@ -9,7 +9,7 @@ use super::protocol::{encode, InitReply, InitRequest};
 use super::*;
 use nix::cmsg_space;
 use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{IoSliceMut, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -40,9 +40,13 @@ struct ExitTable {
     /// the spawn that claims them, so the table cannot grow with the
     /// sandbox's lifetime.
     early: HashMap<u32, (i32, Instant)>,
-    /// Pids whose spawn nobody was left to receive: the process was killed on
-    /// arrival, and its exit is dropped rather than filed as early.
-    abandoned: HashSet<u32>,
+    /// Pids whose spawn nobody was left to receive, with when that was: the
+    /// process was killed on arrival, and its exit is dropped rather than
+    /// filed as early. Pruned on insert like `early`, because the `Kill` that
+    /// should produce the exit is fire-and-forget: if that send failed, the
+    /// note would otherwise sit here for the sandbox's lifetime and swallow
+    /// the exit of a later spawn that reused the pid.
+    abandoned: HashMap<u32, Instant>,
     ttl: Duration,
 }
 
@@ -51,7 +55,7 @@ impl ExitTable {
         Self {
             waiters: HashMap::new(),
             early: HashMap::new(),
-            abandoned: HashSet::new(),
+            abandoned: HashMap::new(),
             ttl,
         }
     }
@@ -63,7 +67,7 @@ impl ExitTable {
         if let Some(tx) = self.waiters.remove(&pid) {
             return Some(tx);
         }
-        if self.abandoned.remove(&pid) {
+        if self.abandoned.remove(&pid).is_some() {
             return None;
         }
         let now = Instant::now();
@@ -85,9 +89,13 @@ impl ExitTable {
         }
     }
 
-    /// Notes that nobody will ever wait for `pid`.
+    /// Notes that nobody will ever wait for `pid`, dropping any note whose
+    /// exit never came and has outlived the TTL.
     fn abandon(&mut self, pid: u32) {
-        self.abandoned.insert(pid);
+        let now = Instant::now();
+        self.abandoned
+            .retain(|_, at| now.duration_since(*at) < self.ttl);
+        self.abandoned.insert(pid, now);
     }
 }
 
@@ -398,6 +406,26 @@ mod tests {
         assert!(table.exited(43, 0).is_none());
         assert!(!table.early.contains_key(&42), "42 outlived the TTL");
         assert!(table.early.contains_key(&43));
+    }
+
+    /// NT8 (b), the abandoned half: a note whose exit never arrives — the
+    /// `Kill` that should have produced it is fire-and-forget — is dropped
+    /// once it outlives the TTL, so a later spawn that reuses the pid is not
+    /// silently swallowed by it.
+    #[test]
+    fn abandoned_notes_older_than_the_ttl_are_pruned() {
+        let mut table = ExitTable::new(Duration::from_millis(10));
+        table.abandon(42);
+        std::thread::sleep(Duration::from_millis(30));
+        table.abandon(43);
+        assert!(!table.abandoned.contains_key(&42), "42 outlived the TTL");
+        assert!(table.abandoned.contains_key(&43));
+        // The pid is free again: its next exit is filed like any other.
+        assert!(table.exited(42, 0).is_none());
+        assert!(
+            table.early.contains_key(&42),
+            "a reused pid's exit is filed, not dropped"
+        );
     }
 
     /// NT8 (a), the table half: the exit of a pid whose spawn nobody waited

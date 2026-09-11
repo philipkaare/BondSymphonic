@@ -59,7 +59,13 @@ fn whoami() -> String {
 /// sandbox: under the sandbox's empty `/opt`, beside
 /// `agents::claude::CLAUDE_IN_SANDBOX`, so bwrap can always create the mount
 /// point and nothing a workspace writes can be in the way.
-pub const DAEMON_IN_SANDBOX: &str = "/opt/bs/daemon";
+const DAEMON_IN_SANDBOX: &str = "/opt/bs/daemon";
+
+/// The only environment variable the daemon hands `bwrap` itself: a fixed
+/// lookup path, standard enough to find `bwrap` by name on any distribution.
+/// It is what `/proc/1/environ` holds inside the sandbox, so it must name
+/// nothing of the host's — see [`BwrapBackend::start`].
+const BWRAP_LOOKUP_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// The host directories the sandbox replaces with empty tmpfs mounts, on top
 /// of the read-only root, before any bind puts a workspace's own paths back.
@@ -87,7 +93,7 @@ fn data_dir(spec: &SandboxSpec) -> Option<&Path> {
 /// home, objects and exec socket. The data directory is left out when one of
 /// the fixed roots already hides it (`~/.bondsymphonic` under `/home`, a
 /// test's tempdir under `/tmp`).
-pub fn masked_roots(spec: &SandboxSpec) -> Vec<PathBuf> {
+fn masked_roots(spec: &SandboxSpec) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = MASKED_ROOTS.iter().map(PathBuf::from).collect();
     if let Some(data) = data_dir(spec) {
         if !roots.iter().any(|r| data.starts_with(r)) {
@@ -123,7 +129,7 @@ pub fn exe_in_sandbox(spec: &SandboxSpec, self_exe: &Path) -> PathBuf {
 /// home, plus whatever the spec adds (git object paths, the proxy, the
 /// workspace id). Nothing from the daemon's own environment, which is the
 /// shell the user started it from.
-pub fn base_env(spec: &SandboxSpec, user: &str) -> Vec<(String, String)> {
+fn base_env(spec: &SandboxSpec, user: &str) -> Vec<(String, String)> {
     let home_in = format!("/home/{user}");
     let mut env = vec![
         ("HOME".to_string(), home_in.clone()),
@@ -281,11 +287,14 @@ impl SandboxBackend for BwrapBackend {
         // process stays inside the sandbox as its pid 1 with the environment
         // it was started with, readable from `/proc/1/environ` by everything
         // in there, so the daemon's environment is not handed to it at all.
-        // `PATH` stays so `bwrap` itself can be found by name.
+        // Not even its `PATH`: that one names the daemon user's home and, on
+        // WSL, every Windows directory on the user's path. `bwrap_path`
+        // defaults to the bare name `bwrap`, so a fixed lookup path is all
+        // the spawn needs to resolve it.
         let mut child = tokio::process::Command::new(&self.bwrap_path)
             .args(&args)
             .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("PATH", BWRAP_LOOKUP_PATH)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

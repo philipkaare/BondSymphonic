@@ -1697,14 +1697,54 @@ async fn nothing_from_the_daemon_environment_reaches_bwrap_or_init() {
         .start(&flat_spec("ws_nt2", dir.path()))
         .await
         .unwrap();
-    let (_, out) = run_in(
-        &handle,
-        "tr '\\0' '\\n' < /proc/1/environ; tr '\\0' '\\n' < /proc/2/environ",
-    )
-    .await;
+    // A sentinel no environment can hold, so an unset HOME cannot make the
+    // "no host home" check below pass vacuously on a substring of "".
+    let host_home = std::env::var("HOME").unwrap_or_else(|_| "\u{0}unset".into());
+    let (code, p1) = run_in(&handle, "tr '\\0' '\\n' < /proc/1/environ").await;
+    assert_eq!(code, 0, "{p1}");
+    let (code, p2) = run_in(&handle, "tr '\\0' '\\n' < /proc/2/environ").await;
+    assert_eq!(code, 0, "{p2}");
     assert!(
-        !out.contains("hunter2") && !out.contains("BS_TEST_SECRET"),
-        "the daemon's environment reached the sandbox's init or bwrap: {out}"
+        !p1.contains("hunter2")
+            && !p1.contains("BS_TEST_SECRET")
+            && !p2.contains("hunter2")
+            && !p2.contains("BS_TEST_SECRET"),
+        "the daemon's environment reached the sandbox's init or bwrap: {p1}{p2}"
+    );
+    // bwrap's own process stays inside the namespace as pid 1 with the
+    // environment the daemon started it with, readable by everything in
+    // there. So that environment is a fixed lookup path and nothing else:
+    // the daemon's own `PATH` names its user's home and, on WSL, the
+    // Windows drives under `/mnt`.
+    assert_eq!(
+        p1.trim(),
+        "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+        "bwrap's environment is not the fixed one: {p1}"
+    );
+    assert!(
+        !p1.contains("/mnt/") && !p1.contains(&host_home),
+        "a host-derived path is readable at /proc/1/environ: {p1}"
+    );
+    // pid 2 is init, which bwrap starts from `--setenv` alone: exactly the
+    // base environment this spec asks for, plus the `PWD` bwrap itself
+    // derives from `--chdir`, and no variable of the daemon's. Init's `HOME`
+    // is the workspace's own `/home/<user>`, which spells the same as the
+    // daemon user's host home on this box, so the variable names are what
+    // carry that half of the check.
+    let mut names: Vec<&str> = p2
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split('=').next().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["HOME", "LANG", "PATH", "PWD", "TERM", "USER"],
+        "init must start from the base environment alone: {p2}"
+    );
+    assert!(
+        !p2.contains("/mnt/"),
+        "a Windows path reached init's environment: {p2}"
     );
     let user = std::env::var("USER").unwrap_or_else(|_| "bs".into());
     let (code, out) = run_in(&handle, "echo \"$HOME\"; echo \"$PATH\"").await;
