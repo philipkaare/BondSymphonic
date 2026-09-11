@@ -375,7 +375,13 @@ void NewAgentDialog::onRepoInspected(const QString& path, const QString& infoJso
     } else {
         m_baseBranch->setEditText(preferred);
     }
-    m_status->setText(info.value("is_dirty").toBool() ? "Repository has uncommitted changes." : QString());
+    // Tracked files only: the daemon asks `git status --untracked-files=no`, the
+    // same question the merge guard asks, so the sentence has to say which
+    // changes it counted. A build output or a scratch note lying in a working
+    // directory is its ordinary state and is not announced here.
+    m_status->setText(info.value("is_dirty").toBool()
+                          ? QStringLiteral("Repository has uncommitted changes to tracked files.")
+                          : QString());
     updateOkEnabled();
 }
 
