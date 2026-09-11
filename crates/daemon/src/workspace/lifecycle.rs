@@ -409,18 +409,21 @@ async fn seed_home(d: &Daemon, ws: &Workspace) {
         tracing::warn!(ws = %ws.id, path = %home.display(), error = %e, "could not create the workspace home");
         return;
     }
-    let name = d
+    // One `git config` for both halves of the identity rather than two. A
+    // `--get-regexp` that matches nothing exits non-zero, which is the same
+    // "there is no identity here" the two `--get` calls answered with, and is
+    // handled the same way: no `.gitconfig` is written.
+    let identity = d
         .git
-        .run(&ws.repo_path, &["config", "--get", "user.name"])
+        .run(
+            &ws.repo_path,
+            &["config", "--get-regexp", r"^user\.(name|email)$"],
+        )
         .await
-        .map(|o| o.stdout.trim().to_string())
+        .map(|o| o.stdout)
         .unwrap_or_default();
-    let email = d
-        .git
-        .run(&ws.repo_path, &["config", "--get", "user.email"])
-        .await
-        .map(|o| o.stdout.trim().to_string())
-        .unwrap_or_default();
+    let name = config_value(&identity, "user.name");
+    let email = config_value(&identity, "user.email");
     if !name.is_empty() || !email.is_empty() {
         let _ = write_guarded(
             &home.join(".gitconfig"),
@@ -431,6 +434,22 @@ async fn seed_home(d: &Daemon, ws: &Workspace) {
     if !seeded.is_empty() {
         tracing::info!(ws = %ws.id, files = ?seeded, "seeded claude credentials");
     }
+}
+
+/// One key's value out of `git config --get-regexp` output, or `""`.
+///
+/// Each line is `<key> <value>`, the value running to the end of the line and
+/// free to contain spaces — which a person's name usually does. The **last**
+/// match wins, because that is what `git config --get` answers for a key set
+/// more than once, and this stands in for two of those.
+fn config_value(output: &str, key: &str) -> String {
+    output
+        .lines()
+        .filter_map(|line| line.strip_prefix(key)?.strip_prefix(' '))
+        .next_back()
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// Refuses to initialise a repository inside the daemon's own data directory,
@@ -556,6 +575,12 @@ async fn create_the_workspace(
                 Some(repo::common_dir(&d.git, repo_path).await?)
             }
             repo::RepoKind::InsideEnclosing { root } => {
+                // The repository named the way the user's filesystem spells it.
+                // `root` is git's `--show-toplevel`, which answers with forward
+                // slashes on Windows — so the sentence telling somebody to pick
+                // `C:/code/thing` would name a path that looks nothing like the
+                // one in the folder picker they just came from.
+                let root = repo::canonical_ish(&root);
                 not_a_repo = Some(RpcError::invalid_params(format!(
                     "{} is inside the git repository {}, but is not one itself; pick {}, \
                      or create this folder as a repository of its own",
@@ -654,7 +679,18 @@ async fn create_the_workspace(
         // branch — `RemoveBranch::Never`, because a cleanup that cannot show the
         // branch is its own is a cleanup that must not run `git branch -D` on
         // somebody else's.
-        let _ = worktree::remove_with(&layout, worktree::RemoveBranch::Never).await;
+        //
+        // Except after a `Conflict`, which is the one failure that created
+        // nothing to clean up. It comes from the pre-check, before anything was
+        // made, or from the same-name race — where `worktree::create` has
+        // already unwound its own half. Running the cleanup anyway meant a
+        // `git worktree prune` **on the user's repository**, and prune forgets
+        // every registration whose directory is not there at that moment: a
+        // worktree on an unmounted disk, or one the user had moved aside. Those
+        // are not this call's to lose over a name that was taken.
+        if e.code != ErrorCode::Conflict {
+            let _ = worktree::remove_with(&layout, worktree::RemoveBranch::Never).await;
+        }
         // The client has already seen `Creating`. Tell it why the workspace failed, then
         // send the terminal `Destroying` event a real destroy ends on, so the workspace
         // disappears from the client's list instead of hanging there forever.
@@ -694,31 +730,39 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
         // and the branch still points at commits whose objects live only in this
         // workspace's private object dir, which the `git branch -D` in `worktree::remove`
         // would discard for good.
-        let dirty = if ws.worktree_path.exists() {
-            !layout
-                .worktree_git()
-                .run(&ws.worktree_path, &["status", "--porcelain"])
-                .await?
-                .stdout
-                .trim()
-                .is_empty()
-        } else {
-            false
-        };
-        let unmerged = if repo::branch_exists(&d.git, &ws.repo_path, &ws.branch).await? {
-            !layout
-                .daemon_git()
-                .run(
-                    &ws.repo_path,
-                    &["rev-list", &format!("{}..{}", ws.base_branch, ws.branch)],
-                )
-                .await?
-                .stdout
-                .trim()
-                .is_empty()
-        } else {
-            false
-        };
+        //
+        // Asked at once: one reads the worktree and the other the repository's
+        // refs, neither looks at the other's answer, and a destroy the user is
+        // waiting on should cost the slower of the two rather than both.
+        let (dirty, unmerged) = tokio::try_join!(
+            async {
+                if !ws.worktree_path.exists() {
+                    return Ok(false);
+                }
+                Ok(!layout
+                    .worktree_git()
+                    .run(&ws.worktree_path, &["status", "--porcelain"])
+                    .await?
+                    .stdout
+                    .trim()
+                    .is_empty())
+            },
+            async {
+                if !repo::branch_exists(&d.git, &ws.repo_path, &ws.branch).await? {
+                    return Ok(false);
+                }
+                Ok(!layout
+                    .daemon_git()
+                    .run(
+                        &ws.repo_path,
+                        &["rev-list", &format!("{}..{}", ws.base_branch, ws.branch)],
+                    )
+                    .await?
+                    .stdout
+                    .trim()
+                    .is_empty())
+            },
+        )?;
         if dirty || unmerged {
             return Err(RpcError::new(
                 ErrorCode::Conflict,

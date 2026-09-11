@@ -40,6 +40,49 @@ pub fn init_repo(dir: &Path) -> PathBuf {
     repo
 }
 
+/// Runs git in `dir` and returns trimmed stdout, asserting it succeeded.
+///
+/// `output()` rather than `status()` for the reason [`init_repo`] gives: on
+/// Windows git narrates every LF/CRLF rewrite on stderr, and that is worth
+/// seeing only when the command actually failed.
+pub fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// [`git_out`] for a command whose output nothing reads.
+pub fn git_ok(dir: &Path, args: &[&str]) {
+    git_out(dir, args);
+}
+
+/// Asserts that a refusal names the repository a folder sits inside.
+///
+/// Either spelling counts. The daemon prints what it canonicalised, and on
+/// Windows that differs from the path a test typed in more than one way at
+/// once: `git rev-parse --show-toplevel` answers with forward slashes, and a
+/// `tempfile` directory under `%TEMP%` may be reached through a short name or a
+/// symlink.
+pub fn assert_names_enclosing_repo(message: &str, repo: &Path) {
+    let canonical = bondsymphonic_daemon::git::repo::canonical_ish(repo)
+        .display()
+        .to_string();
+    assert!(
+        message.contains(&repo.display().to_string()) || message.contains(&canonical),
+        "the refusal has to name the enclosing repository {}: {message}",
+        repo.display()
+    );
+}
+
 /// A repository with a *local* bare "origin" it tracks, for the push half of
 /// `workspace.create_pr`.
 ///

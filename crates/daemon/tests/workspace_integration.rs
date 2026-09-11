@@ -1054,15 +1054,12 @@ async fn create_refuses_a_folder_inside_a_repository_without_the_flag() {
         .unwrap_err();
 
     assert_eq!(err.code, ErrorCode::InvalidParams);
-    let named = bondsymphonic_daemon::git::repo::canonical_ish(&outer)
-        .display()
-        .to_string();
     assert!(
-        err.message.contains("inside the git repository")
-            && (err.message.contains(&outer.display().to_string()) || err.message.contains(&named)),
-        "the refusal has to name the repository the folder is inside: {}",
+        err.message.contains("inside the git repository"),
+        "{}",
         err.message
     );
+    common::assert_names_enclosing_repo(&err.message, &outer);
 
     cancel.cancel();
 }
@@ -1142,22 +1139,6 @@ mod workspace_create_guards {
     use bondsymphonic_proto::*;
     use std::path::Path;
 
-    /// Trimmed stdout of a git command that must succeed.
-    fn git_out(dir: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} in {}: {}",
-            dir.display(),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
     /// Whether a git command in `dir` succeeded at all, for the checkout a
     /// deleted branch would have broken.
     fn git_succeeds(dir: &Path, args: &[&str]) -> bool {
@@ -1206,7 +1187,7 @@ mod workspace_create_guards {
         // Nothing reached git: no `bs/` branch of any shape, and no workspace
         // was ever announced.
         assert_eq!(
-            git_out(
+            common::git_out(
                 &repo,
                 &["for-each-ref", "--format=%(refname)", "refs/heads/bs/"]
             ),
@@ -1275,7 +1256,7 @@ mod workspace_create_guards {
             // The winner's branch is still there, and its worktree still checks
             // out: a `git branch -D` from the loser's cleanup takes both.
             assert!(
-                !git_out(&repo, &["branch", "--list", "bs/alpha/work"]).is_empty(),
+                !common::git_out(&repo, &["branch", "--list", "bs/alpha/work"]).is_empty(),
                 "attempt {attempt}: the winner's branch is gone"
             );
             assert!(
@@ -1375,13 +1356,73 @@ mod workspace_create_guards {
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams, "{err:?}");
-        let named = bondsymphonic_daemon::git::repo::canonical_ish(&repo)
-            .display()
-            .to_string();
+        common::assert_names_enclosing_repo(&err.message, &repo);
+
+        cancel.cancel();
+    }
+}
+
+/// A create that was refused before it built anything leaves the user's own
+/// repository exactly as it found it.
+mod refused_create_touches_nothing {
+    use super::common::{self, start_daemon, Client};
+    use bondsymphonic_proto::*;
+
+    /// `worktree::create` answers `Conflict` from a pre-check, before it has
+    /// made a directory, a branch or a registration. The unwind that ran anyway
+    /// ended in `git worktree prune` **on the user's repository**, and prune
+    /// forgets every registration whose directory is not there right now — a
+    /// worktree on a disk that is not mounted, or one the user moved aside and
+    /// meant to move back. Losing those to somebody else's failed create is a
+    /// side effect nobody asked for, so a refusal that created nothing now
+    /// cleans up nothing.
+    #[tokio::test]
+    async fn a_refused_create_does_not_prune_the_users_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = common::init_repo(dir.path());
+
+        // The user's own linked worktree, with its directory moved aside: a
+        // registration that is prunable right now and that they expect back.
+        let side = dir.path().join("side");
+        let stashed = dir.path().join("side-stashed");
+        common::git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                &side.to_string_lossy(),
+            ],
+        );
+        std::fs::rename(&side, &stashed).unwrap();
         assert!(
-            err.message.contains(&repo.display().to_string()) || err.message.contains(&named),
-            "the refusal has to name the enclosing repository: {}",
-            err.message
+            common::git_out(&repo, &["worktree", "list", "--porcelain"]).contains("side"),
+            "the registration has to be there before the refused create"
+        );
+
+        // The name the create is about to ask for is already a branch, which is
+        // what the pre-check refuses on.
+        common::git_ok(&repo, &["branch", "bs/alpha/work", "main"]);
+
+        let (port, token, _daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+        let mut c = Client::connect(port, &token).await;
+        let err = c
+            .call(Request::WorkspaceCreate(WorkspaceCreateParams {
+                repo_path: repo.to_string_lossy().into(),
+                base_branch: "main".into(),
+                name: "alpha".into(),
+                init_if_missing: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+
+        let listed = common::git_out(&repo, &["worktree", "list", "--porcelain"]);
+        assert!(
+            listed.contains("side"),
+            "the refused create pruned the user's own worktree registration: {listed}"
         );
 
         cancel.cancel();

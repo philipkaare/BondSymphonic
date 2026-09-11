@@ -1,6 +1,6 @@
-use super::{repo, Git};
+use super::{path_arg, repo, Git};
 use bondsymphonic_proto::{ErrorCode, RpcError};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Layout {
@@ -51,10 +51,10 @@ impl Layout {
     /// Env for git *inside* the sandbox: new objects go to the private dir.
     pub fn sandbox_git_env(&self) -> Vec<(String, String)> {
         vec![
-            ("GIT_OBJECT_DIRECTORY".into(), s(&self.objects_dir)),
+            ("GIT_OBJECT_DIRECTORY".into(), path_arg(&self.objects_dir)),
             (
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES".into(),
-                s(&self.git_common.join("objects")),
+                path_arg(&self.git_common.join("objects")),
             ),
         ]
     }
@@ -81,8 +81,11 @@ impl Layout {
     /// drivers run, which is the residual risk §5.4 records.
     pub fn daemon_git(&self) -> Git {
         Git::new()
-            .with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", s(&self.objects_dir))
-            .with_config("core.hooksPath", &s(&self.no_hooks_dir))
+            .with_env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                path_arg(&self.objects_dir),
+            )
+            .with_config("core.hooksPath", &path_arg(&self.no_hooks_dir))
     }
 
     /// [`Layout::daemon_git`] with the repository's own hooks left in place, for
@@ -93,7 +96,10 @@ impl Layout {
     /// remote with nothing behind them. A push is also the one daemon-side git
     /// operation the user explicitly asked for by name, through **Create PR**.
     pub fn daemon_push_git(&self) -> Git {
-        Git::new().with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", s(&self.objects_dir))
+        Git::new().with_env(
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            path_arg(&self.objects_dir),
+        )
     }
 
     /// Git for daemon-side commands that run *against a workspace worktree*.
@@ -106,15 +112,18 @@ impl Layout {
     /// agent's hands: the environment outranks anything in the worktree.
     pub fn worktree_git(&self) -> Git {
         let mut git = Git::new()
-            .with_env("GIT_DIR", s(&self.worktree_gitdir()))
-            .with_env("GIT_COMMON_DIR", s(&self.git_common))
-            .with_env("GIT_WORK_TREE", s(&self.worktree_path))
-            .with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", s(&self.objects_dir))
+            .with_env("GIT_DIR", path_arg(&self.worktree_gitdir()))
+            .with_env("GIT_COMMON_DIR", path_arg(&self.git_common))
+            .with_env("GIT_WORK_TREE", path_arg(&self.worktree_path))
+            .with_env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                path_arg(&self.objects_dir),
+            )
             .with_config("extensions.worktreeConfig", "false")
             // Not in the list below: an empty `core.hooksPath` does not disable
             // hooks, it moves them to the filesystem root, so this one needs a
             // real directory that is always empty.
-            .with_config("core.hooksPath", &s(&self.no_hooks_dir));
+            .with_config("core.hooksPath", &path_arg(&self.no_hooks_dir));
         for key in NEUTRALISED_CONFIG {
             git = git.with_config(key, "");
         }
@@ -161,10 +170,6 @@ const NEUTRALISED_CONFIG: &[&str] = &[
     "gpg.program",
     "uploadpack.packObjectsHook",
 ];
-
-fn s(p: &Path) -> String {
-    p.to_string_lossy().into_owned()
-}
 
 /// Whether a [`remove`] may delete the workspace's branch.
 ///
@@ -232,14 +237,23 @@ fn branch_conflict(branch: &str) -> RpcError {
 /// workspace in the IDE must not execute code out of the repository being
 /// opened, on a schedule nobody chose and with no way to see it happen.
 ///
-/// **A failure leaves nothing of this call behind, and nothing of anybody
-/// else's touched.** Whoever created the branch is the only one who may delete
-/// it, and the two failures are told apart rather than guessed at: git saying
-/// the branch is already there means the branch is not ours, so the cleanup
-/// keeps its hands off it and the caller gets a `Conflict` — the same answer as
-/// a branch that was already there when the call started. Every other failure
-/// happens on a branch this call is the only candidate for, so the cleanup
-/// takes it with the rest.
+/// **A failure leaves nothing of this call behind, and nothing anybody else can
+/// be shown to own touched.** Whoever created the branch is the only one who
+/// may delete it, and the two failures are told apart rather than guessed at:
+/// git saying the branch is already there means the branch is not ours, so the
+/// cleanup keeps its hands off it and the caller gets a `Conflict` — the same
+/// answer as a branch that was already there when the call started.
+///
+/// Every *other* failure unwinds with [`RemoveBranch::Always`], and that rests
+/// on an inference rather than on a fact: the pre-check above saw no branch of
+/// this name, so this call is the only candidate for the one that is there now.
+/// The inference holds for every wording of "already there" git has, because
+/// those take the `Never` path — but a future git that refuses a create for
+/// that reason in words none of the three match would send the unwind down this
+/// branch instead, and `git branch -D` would land on somebody else's work. The
+/// repository lock `workspace.create` holds is what keeps a second create of
+/// the same name out of the window in practice; [`branch_is_already_there`] is
+/// the part that has to stay current with git.
 pub async fn create(layout: &Layout, base_branch: &str) -> Result<(), RpcError> {
     let git = &layout.daemon_git();
     if repo::branch_exists(git, &layout.repo, &layout.branch).await? {
@@ -271,7 +285,7 @@ pub async fn create(layout: &Layout, base_branch: &str) -> Result<(), RpcError> 
                 "add",
                 "-b",
                 &layout.branch,
-                &s(&layout.worktree_path),
+                &path_arg(&layout.worktree_path),
                 base_branch,
             ],
         )
@@ -319,34 +333,58 @@ pub async fn remove(layout: &Layout) -> Result<(), RpcError> {
 /// the worktree directory and its registration, which belong to one workspace.
 pub async fn remove_with(layout: &Layout, branch: RemoveBranch) -> Result<(), RpcError> {
     let git = &layout.daemon_git();
-    let ignore_missing = |r: Result<super::GitOutput, RpcError>| match r {
-        Ok(_) => Ok(()),
+    // `worktree unlock` first, and its failure is not news: it fails for a
+    // worktree that was never locked, which is almost all of them. When one
+    // *is* locked — a checkout the user parked on a removable disk, say — git
+    // refuses `worktree remove --force` outright *and* skips the registration
+    // during `prune`, so without this the workspace could not be destroyed at
+    // all.
+    let _ = git
+        .run(
+            &layout.repo,
+            &["worktree", "unlock", &path_arg(&layout.worktree_path)],
+        )
+        .await;
+    // Git's own removal, for the registration and the directory in one step,
+    // and equally not worth reading the outcome of: a worktree that is not
+    // registered, a directory that is already gone and a gitfile git will not
+    // parse all end here, and all three are states the two steps below reach
+    // anyway. Reading git's *prose* to decide which failures were survivable is
+    // what this used to do, and it hard-failed on every wording nobody had
+    // thought of — the locked one above being exactly that.
+    let _ = git
+        .run(
+            &layout.repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &path_arg(&layout.worktree_path),
+            ],
+        )
+        .await;
+    // Whatever git left. Not being there is the ordinary case — git usually did
+    // the job — but anything else is a directory still standing where the
+    // daemon has just told a client the workspace is gone, so it is reported
+    // rather than swallowed.
+    match std::fs::remove_dir_all(&layout.worktree_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            let stderr = e
-                .data
-                .as_ref()
-                .and_then(|d| d["stderr"].as_str())
-                .unwrap_or("");
-            if stderr.contains("is not a working tree")
-                || stderr.contains("not found")
-                || stderr.contains("No such file")
-            {
-                Ok(())
-            } else {
-                Err(e)
-            }
+            return Err(RpcError::new(
+                ErrorCode::IoError,
+                format!(
+                    "cannot remove the worktree directory {}: {e}",
+                    layout.worktree_path.display()
+                ),
+            ))
         }
-    };
-    if layout.worktree_path.exists() {
-        ignore_missing(
-            git.run(
-                &layout.repo,
-                &["worktree", "remove", "--force", &s(&layout.worktree_path)],
-            )
-            .await,
-        )?;
     }
-    let _ = std::fs::remove_dir_all(&layout.worktree_path);
+    // With the directory gone and the lock off, this is what forgets the
+    // registration, whatever state the steps above left it in. The one command
+    // here whose failure is a failure: a registration that outlives its
+    // directory keeps the branch checked out, and `worktree add` refuses it
+    // until a human intervenes.
     git.run(&layout.repo, &["worktree", "prune"]).await?;
     if branch == RemoveBranch::Never {
         return Ok(());

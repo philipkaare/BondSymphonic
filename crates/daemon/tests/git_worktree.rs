@@ -211,3 +211,52 @@ async fn create_and_remove_run_no_repository_hooks() {
         "the control worktree must fire the hook, or this test proves nothing: {fired:?}"
     );
 }
+
+/// A locked worktree is removed like any other.
+///
+/// `git worktree lock` is what a user reaches for when a checkout lives on a
+/// removable disk, and git then refuses `worktree remove --force` outright —
+/// with a wording that is none of the three the removal used to tolerate, so
+/// `workspace.destroy` failed and the workspace could never be got rid of. The
+/// removal now unlocks first and does not read git's prose at all: whatever the
+/// registration says, the directory goes and `worktree prune` forgets it.
+#[tokio::test]
+async fn remove_takes_a_locked_worktree_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_path = common::init_repo(dir.path());
+    let git = Git::new();
+    let layout = layout_for(dir.path(), &repo_path, "locked").await;
+    worktree::create(&layout, "main").await.unwrap();
+
+    git.run(
+        &repo_path,
+        &[
+            "worktree",
+            "lock",
+            &layout.worktree_path.to_string_lossy(),
+            "--reason",
+            "on a removable disk",
+        ],
+    )
+    .await
+    .unwrap();
+
+    worktree::remove(&layout).await.unwrap();
+
+    assert!(
+        !layout.worktree_path.exists(),
+        "the worktree directory is still there"
+    );
+    assert!(!repo::branch_exists(&git, &repo_path, "bs/locked/work")
+        .await
+        .unwrap());
+    let listed = git
+        .run(&repo_path, &["worktree", "list", "--porcelain"])
+        .await
+        .unwrap()
+        .stdout;
+    assert!(
+        !listed.contains("ws_00000001"),
+        "the registration outlived the worktree: {listed}"
+    );
+}
