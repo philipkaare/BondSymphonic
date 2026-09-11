@@ -18,8 +18,14 @@ daemon is still reading its pipes:
   shell command outliving the CLI by a few milliseconds is the ordinary case.
   Without it the text is written by this process just before it exits, which the
   daemon usually, but only usually, reads in time.
-* `DYING_CLAUDE_STDERR_DELAY` (seconds, default 0.15): how long to wait before
-  writing the stderr, so the daemon is reliably already waiting on the exit.
+
+  This process waits for the child to say it is up before exiting, so the gap
+  the daemon has to cover is the delay below and nothing else. Starting a Python
+  interpreter is not part of it: from a Windows drive that takes anything up to
+  a second, and the adapter's wait is deliberately bounded.
+* `DYING_CLAUDE_STDERR_DELAY` (seconds, default 0.1): how long to wait after
+  that before writing the stderr, so the daemon is reliably already waiting on
+  the exit.
 * `DYING_CLAUDE_EXIT` (default 0): the exit status.
 
 `--version` is answered and nothing else happens, because the daemon probes the
@@ -64,9 +70,17 @@ def stderr_text():
     return text if text.endswith("\n") else text + "\n"
 
 
+#: what the child says on its stdout once it is up, so the parent can stop
+#: waiting. The parent's exit is the event under test, and it must not be
+#: separated from the stderr by an interpreter start.
+READY = "ready"
+
+
 def write_stderr_after_the_delay():
-    """The child half: sleeps, then writes the text on the inherited stderr."""
-    time.sleep(float_env("DYING_CLAUDE_STDERR_DELAY", "0.15"))
+    """The child half: says it is up, sleeps, writes on the inherited stderr."""
+    sys.stdout.write(READY + "\n")
+    sys.stdout.flush()
+    time.sleep(float_env("DYING_CLAUDE_STDERR_DELAY", "0.1"))
     text = stderr_text()
     if text:
         sys.stderr.write(text)
@@ -86,18 +100,23 @@ def main():
     text = stderr_text()
     if text and os.environ.get("DYING_CLAUDE_STDERR_FROM_CHILD"):
         # Started and abandoned: stderr is fd 2, which the child inherits, and
-        # this process is gone long before the child writes to it.
-        subprocess.Popen(
+        # this process is gone before the child writes to it.
+        child = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), WRITER],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=2,
         )
+        # Blocks until the child is running, so what stands between this exit
+        # and the agent's last words is the delay and nothing else. An empty
+        # read means the child could not start at all, and then there is
+        # nothing to wait for.
+        child.stdout.readline()
         sys.stdout.close()
     else:
         sys.stdout.close()
         if text:
-            time.sleep(float_env("DYING_CLAUDE_STDERR_DELAY", "0.15"))
+            time.sleep(float_env("DYING_CLAUDE_STDERR_DELAY", "0.1"))
             sys.stderr.write(text)
             sys.stderr.flush()
     os._exit(int(os.environ.get("DYING_CLAUDE_EXIT", "0")))

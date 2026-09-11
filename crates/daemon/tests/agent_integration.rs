@@ -971,7 +971,11 @@ async fn an_exit_detail_always_carries_the_agents_last_words() {
     noise.push("boom".to_owned());
     std::env::set_var("DYING_CLAUDE_STDERR", noise.join("\n"));
     std::env::set_var("DYING_CLAUDE_STDERR_FROM_CHILD", "1");
-    std::env::set_var("DYING_CLAUDE_STDERR_DELAY", "0.15");
+    // Long enough that the daemon has the exit code first every time, short
+    // enough to sit well inside the second the adapter waits: the fixture holds
+    // the writer's interpreter start outside this window, so it is the whole of
+    // the gap.
+    std::env::set_var("DYING_CLAUDE_STDERR_DELAY", "0.1");
     std::env::set_var("DYING_CLAUDE_EXIT", "3");
     let (port, token, _d, cancel) = start_daemon(dir.path()).await;
     let mut c = Client::connect(port, &token).await;
