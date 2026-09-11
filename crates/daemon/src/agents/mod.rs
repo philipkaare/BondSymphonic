@@ -32,13 +32,37 @@ use tracing::{info, warn};
 /// most the last message: [`read`](TranscriptStore::read) skips a line it
 /// cannot parse rather than refusing the whole file, which is what makes a
 /// torn final write survivable.
+///
+/// The file for a live agent is held open between messages. A streaming turn
+/// arrives as one `AgentMessage` per text delta -- dozens a second -- and every
+/// one of them used to cost a `create_dir_all`, an `open` and a `close` on the
+/// path of the very task reading the agent's stdout. The handle is opened on
+/// the agent's first message and let go when it ends, so a turn costs one open
+/// rather than one per word.
 pub struct TranscriptStore {
     dir: PathBuf,
+    /// The open file of every agent that has spoken and not yet ended.
+    ///
+    /// The outer lock is taken only to look an agent up; the inner one is what
+    /// an append holds, so two agents writing at once never wait for each
+    /// other. `parking_lot` rather than tokio's, because nothing awaits while
+    /// the map is locked and [`remove`](TranscriptStore::remove) is called from
+    /// synchronous code.
+    open: Mutex<HashMap<AgentId, Arc<tokio::sync::Mutex<tokio::fs::File>>>>,
+    /// Whether the transcript directory has been made. It is made once, on the
+    /// first agent to say anything, rather than at startup: a daemon whose
+    /// agents never speak leaves no empty directory behind, and one whose
+    /// agents do pays for it once.
+    dir_made: std::sync::atomic::AtomicBool,
 }
 
 impl TranscriptStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            open: Mutex::new(HashMap::new()),
+            dir_made: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     /// The file for `agent`. Agent ids are minted by the daemon and are always
@@ -60,19 +84,70 @@ impl TranscriptStore {
         self.dir.join(format!("{name}.ndjson"))
     }
 
-    /// Appends one message. Creates the transcript directory on the first
-    /// write, so nothing has to be set up when the daemon starts.
+    /// The agent's open transcript, opening it on first use.
+    ///
+    /// Opened in append mode, so nothing that happens between two messages --
+    /// this daemon losing the handle and taking a new one, a previous daemon's
+    /// file already being there -- can write over what is already recorded.
+    async fn file(
+        &self,
+        agent: &AgentId,
+    ) -> std::io::Result<Arc<tokio::sync::Mutex<tokio::fs::File>>> {
+        if let Some(file) = self.open.lock().get(agent) {
+            return Ok(file.clone());
+        }
+        if !self.dir_made.load(Ordering::Relaxed) {
+            tokio::fs::create_dir_all(&self.dir).await?;
+            self.dir_made.store(true, Ordering::Relaxed);
+        }
+        let file = Arc::new(tokio::sync::Mutex::new(
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.path(agent))
+                .await?,
+        ));
+        // Two first messages for one agent can both have missed the map above.
+        // Whichever landed first is the agent's handle from here on and the
+        // other is dropped: both are append handles on the same file, so
+        // neither could have lost anything, but one map entry per agent is what
+        // makes `ended` a promise that the file is really closed.
+        Ok(self
+            .open
+            .lock()
+            .entry(agent.clone())
+            .or_insert(file)
+            .clone())
+    }
+
+    /// Appends one message.
+    ///
+    /// A write that fails takes the handle with it, so the next message opens
+    /// the file again rather than going on writing into a descriptor the
+    /// operating system has already given up on.
     pub async fn append(&self, agent: &AgentId, msg: &AgentMessage) -> std::io::Result<()> {
-        tokio::fs::create_dir_all(&self.dir).await?;
         let mut line = serde_json::to_string(msg).map_err(std::io::Error::other)?;
         line.push('\n');
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.path(agent))
-            .await?;
-        file.write_all(line.as_bytes()).await?;
-        file.flush().await
+        let file = self.file(agent).await?;
+        let mut open = file.lock().await;
+        let outcome = match open.write_all(line.as_bytes()).await {
+            Ok(()) => open.flush().await,
+            Err(e) => Err(e),
+        };
+        if outcome.is_err() {
+            drop(open);
+            self.ended(agent);
+        }
+        outcome
+    }
+
+    /// Lets go of the agent's open transcript.
+    ///
+    /// Called when the agent's process ends: the file is what the *live* agent
+    /// writes through, while everything afterwards reads it by path. A message
+    /// that arrives after this -- the exit's own, say -- simply opens it again.
+    pub fn ended(&self, agent: &AgentId) {
+        self.open.lock().remove(agent);
     }
 
     /// Deletes the transcript, if there is one.
@@ -81,6 +156,10 @@ impl TranscriptStore {
     /// the agent's process on purpose, and the record beside it is what makes
     /// it readable again after a restart.
     pub fn remove(&self, agent: &AgentId) {
+        // Closed before it is unlinked: on Windows an open handle refuses the
+        // delete outright, and everywhere else a handle nobody can reach any
+        // more would keep the bytes on disk until the daemon exited.
+        self.ended(agent);
         let path = self.path(agent);
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -294,12 +373,17 @@ impl AgentSink {
         }
     }
 
-    /// The agent's process is gone: closes its record, so the next daemon
-    /// reports it as an agent that ended rather than one it lost.
+    /// The agent's process is gone: closes its transcript file and its record,
+    /// so the next daemon reports it as an agent that ended rather than one it
+    /// lost.
     ///
     /// Idempotent, and it keeps the first answer: the moment the process ended
     /// is what the record wants, not the moment somebody noticed again.
     pub fn ended(&self) {
+        // Ahead of the record, and ahead of the early return below: an agent
+        // with no record on disk still holds a file descriptor, and a daemon
+        // that runs for a week must not keep one per agent it has ever run.
+        self.store.ended(&self.agent_id);
         let Some(records) = &self.records else {
             return;
         };
@@ -854,6 +938,58 @@ mod tests {
         let read = store.read(&id).await.unwrap();
         assert_eq!(read, vec![m1, m2]);
         assert!(store.read(&"ag_missing".into()).await.unwrap().is_empty());
+    }
+
+    /// A streaming turn is one message per text delta, dozens a second, and
+    /// every one of them arrives on the task reading the agent's stdout. One
+    /// handle per agent is what keeps that from being one `create_dir_all`, one
+    /// `open` and one `close` per word.
+    ///
+    /// The handle is the live agent's alone: it is let go when the agent ends,
+    /// and a message that arrives after that opens the file again rather than
+    /// being lost.
+    #[tokio::test]
+    async fn one_handle_serves_an_agent_for_as_long_as_it_runs_and_no_longer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TranscriptStore::new(dir.path().join("transcripts"));
+        let one: AgentId = "ag_one".into();
+        let two: AgentId = "ag_two".into();
+        let say = |n: u64, text: &str| AgentMessage {
+            seq: n,
+            ts: "2026-09-11T00:00:00Z".into(),
+            body: AgentMessageBody::AssistantDelta { text: text.into() },
+        };
+
+        assert!(store.open.lock().is_empty(), "nothing is opened eagerly");
+        for i in 1..=5u64 {
+            store.append(&one, &say(i, &format!("d{i}"))).await.unwrap();
+        }
+        store.append(&two, &say(1, "other")).await.unwrap();
+        assert_eq!(
+            store.open.lock().len(),
+            2,
+            "one handle each, however many messages"
+        );
+
+        // Ended: the handle goes, and every byte is on disk without it.
+        store.ended(&one);
+        assert_eq!(store.open.lock().len(), 1);
+        assert_eq!(store.read(&one).await.unwrap().len(), 5);
+
+        // And a late message is appended to what is already there rather than
+        // over it.
+        store.append(&one, &say(6, "last")).await.unwrap();
+        let all = store.read(&one).await.unwrap();
+        assert_eq!(all.len(), 6);
+        assert_eq!(all[0].seq, 1);
+        assert_eq!(all[5].seq, 6);
+
+        // A workspace going away takes the handle with the file: an open one
+        // refuses the delete outright on Windows.
+        store.remove(&one);
+        store.remove(&two);
+        assert!(store.open.lock().is_empty());
+        assert!(store.read(&one).await.unwrap().is_empty());
     }
 
     #[tokio::test]
