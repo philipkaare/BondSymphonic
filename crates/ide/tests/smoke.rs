@@ -1466,3 +1466,370 @@ fn request_order_is_checked_as_a_subsequence() {
     let short = journal(&["hello", "workspace.create", "agent.start", "fs.list_dir"]);
     assert!(!contains_in_order(&short, &EXPECTED));
 }
+
+/// Task 12: the two context menus in the agent bar, against a model that moves
+/// while they are open.
+///
+/// A menu is a nested event loop. Everything a daemon can say arrives during
+/// it, so a tab index or a group index read back *after* `QMenu::exec` returns
+/// may no longer be the one the user pointed at -- and the two items behind
+/// these two indices destroy a workspace and close a group. The bar therefore
+/// resolves its target before the menu runs and carries it in the signal; this
+/// is the proof, driven through the `BS_MENU_TEST` seam, which opens a menu
+/// over a named tab or group, rearranges the model while it is up and chooses
+/// the item, exactly as the daemon and a user between them would.
+///
+/// The window prints what it resolved instead of raising its confirmation --
+/// an offscreen run has nobody to answer a modal -- and those lines are what is
+/// asserted on here. The third step is the same seam reading the New Agent
+/// dialog's status label: the daemon writes that sentence, so it is shown as
+/// text and never as markup.
+mod menu_targets {
+    use bondsymphonic_ide::model::persistence::{PersistedGroup, StateFile, STATE_VERSION};
+    use bondsymphonic_proto::*;
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    const TOKEN: &str = "menu-token";
+    /// Nothing but the quit: the menus are driven by the seam, not by a script
+    /// step, and every tab in the run comes back out of `workspace.list`.
+    const SCRIPT: &str = "quit";
+    /// The steps the seam runs, in order.
+    const MENU_TEST: &str = "destroy,close-group,new-agent-status";
+
+    /// Two groups: the first holds the two tabs the agent menu is opened over,
+    /// the second is the one the group menu is opened over.
+    const GROUP_A: &str = "alpha";
+    const GROUP_B: &str = "beta";
+    /// The tab that is *clicked*: second in `alpha`, which the seam then makes
+    /// first by reversing that group's tabs while the menu is up.
+    const CLICKED_ID: &str = "ws_menu2";
+    const CLICKED_NAME: &str = "alpha-two";
+    /// The tab index 1 names once the model has moved. A run that destroys this
+    /// one destroyed a workspace the user never pointed at.
+    const DISPLACED_ID: &str = "ws_menu1";
+    const DISPLACED_NAME: &str = "alpha-one";
+    const OTHER_ID: &str = "ws_menu3";
+    const OTHER_NAME: &str = "beta-one";
+    /// The quit step's two seconds, three panes, and a cold Qt start.
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+    type Journal = Arc<Mutex<Vec<String>>>;
+
+    #[test]
+    fn a_context_menu_acts_on_the_tab_and_group_that_were_clicked() {
+        if bondsymphonic_ide::testing::skip_without_qt("menu targets") {
+            return;
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (addr, journal) = rt.block_on(fake_daemon());
+
+        // Never the developer's real `%APPDATA%\BondSymphonic`.
+        let config = std::env::temp_dir().join(format!("bs-menu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("menu config dir");
+        let state_path = config.join("state.json");
+        // The arrangement the tabs come back in. Two groups, so the group menu
+        // has a second one to be opened over, and two tabs in the first, so the
+        // agent menu has a tab that is not the one the model settles on.
+        let state = StateFile {
+            version: STATE_VERSION,
+            groups: vec![
+                PersistedGroup {
+                    name: GROUP_A.to_owned(),
+                    workspace_ids: vec![DISPLACED_ID.to_owned(), CLICKED_ID.to_owned()],
+                    ..PersistedGroup::default()
+                },
+                PersistedGroup {
+                    name: GROUP_B.to_owned(),
+                    workspace_ids: vec![OTHER_ID.to_owned()],
+                    ..PersistedGroup::default()
+                },
+            ],
+            active_workspace: Some(DISPLACED_ID.to_owned()),
+            ..StateFile::default()
+        };
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&state).expect("state json"),
+        )
+        .expect("seed state.json");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", SCRIPT)
+            .env("BS_MENU_TEST", MENU_TEST)
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", &state_path)
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let seen = journal.lock().expect("journal mutex").clone();
+        let context = format!("requests: {seen:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(
+            status.success(),
+            "the IDE exited with {status}, expected 0\n{context}"
+        );
+        assert!(
+            !format!("{out}{err}").contains("panicked at"),
+            "the IDE logged a panic\n{context}"
+        );
+
+        // CP2. The workspace destroyed is the one whose tab was under the
+        // pointer, and the question names it: the whole point of resolving both
+        // before the menu runs rather than after.
+        let destroy = line(&out, "destroy")
+            .unwrap_or_else(|| panic!("the agent menu never reported a destroy target\n{context}"));
+        assert!(
+            destroy.contains(&format!("target={CLICKED_ID}")),
+            "the destroy went to the wrong workspace: {destroy}\n{context}"
+        );
+        assert!(
+            !destroy.contains(&format!("target={DISPLACED_ID}")),
+            "the destroy followed the tab index instead of the tab: {destroy}\n{context}"
+        );
+        assert!(
+            destroy.contains(CLICKED_NAME) && !destroy.contains(DISPLACED_NAME),
+            "the confirmation did not name the clicked workspace: {destroy}\n{context}"
+        );
+
+        // CP6. Same for the group menu, whose item closes every workspace in a
+        // group.
+        let close = line(&out, "close-group")
+            .unwrap_or_else(|| panic!("the group menu never reported a close target\n{context}"));
+        assert!(
+            close.contains(&format!("target={GROUP_B}")),
+            "the close went to the wrong group: {close}\n{context}"
+        );
+
+        // CP5. The daemon writes what lands in that label -- a repository's
+        // name, a git error -- so it is shown as text.
+        let status_format = line(&out, "new-agent-status").unwrap_or_else(|| {
+            panic!("the New Agent dialog never reported its status format\n{context}")
+        });
+        assert!(
+            status_format.contains("target=PlainText"),
+            "the New Agent status label renders markup: {status_format}\n{context}"
+        );
+
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// The one line the seam printed for `what`, or `None`.
+    fn line(out: &str, what: &str) -> Option<String> {
+        let prefix = format!("BS_MENU_TEST {what} ");
+        out.lines()
+            .find(|l| l.trim_start().starts_with(&prefix))
+            .map(|l| l.trim().to_owned())
+    }
+
+    /// A daemon with the three workspaces the arrangement above files into two
+    /// groups. Terminal adapters throughout: a Claude pane would replay a
+    /// transcript, and nothing here is about transcripts.
+    async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let recorded = journal.clone();
+
+        tokio::spawn(async move {
+            let mut ptys = 0_u32;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (r, mut w) = stream.into_split();
+                let mut r = BufReader::new(r);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let trimmed = line.trim_end();
+                    let ClientMessage::Request { id, request } =
+                        codec::decode(trimmed).expect("decode");
+                    // The id travels with the method for a destroy: the point of
+                    // the run is *which* workspace one would have named.
+                    let method = match &request {
+                        Request::WorkspaceDestroy(p) => {
+                            format!("workspace.destroy:{}", p.workspace_id.0)
+                        }
+                        other => other.method_name().to_owned(),
+                    };
+                    recorded.lock().expect("journal mutex").push(method);
+                    let reply = match request {
+                        Request::Hello(p) if p.token == TOKEN => ServerMessage::ok(
+                            id,
+                            &HelloResult {
+                                daemon_version: "0.0.0-fake".into(),
+                                capabilities: Capabilities {
+                                    sandbox_backend: "noop".into(),
+                                    git_protect: false,
+                                    adapters: vec![
+                                        AgentAdapterKind::Terminal,
+                                        AgentAdapterKind::Claude,
+                                    ],
+                                },
+                                protocol_version: Some(PROTOCOL_VERSION),
+                            },
+                        ),
+                        Request::Hello(_) => ServerMessage::err(id, RpcError::unauthorized()),
+                        Request::SystemCheckPrereqs {} => ServerMessage::ok(
+                            id,
+                            &CheckPrereqsResult {
+                                items: vec![PrereqStatus {
+                                    name: "git".into(),
+                                    ok: true,
+                                    detail: "git version 2.43".into(),
+                                    fix_hint: None,
+                                }],
+                            },
+                        ),
+                        Request::WorkspaceList {} => ServerMessage::ok(
+                            id,
+                            &WorkspaceListResult {
+                                workspaces: vec![
+                                    workspace(DISPLACED_ID, DISPLACED_NAME),
+                                    workspace(CLICKED_ID, CLICKED_NAME),
+                                    workspace(OTHER_ID, OTHER_NAME),
+                                ],
+                            },
+                        ),
+                        Request::WorkspaceGet(p) => {
+                            ServerMessage::ok(id, &workspace(&p.workspace_id.0, "unknown"))
+                        }
+                        Request::PtyOpen(_) => {
+                            ptys += 1;
+                            ServerMessage::ok(
+                                id,
+                                &PtyOpenResult {
+                                    pty_id: PtyId(format!("pty_menu{ptys}")),
+                                },
+                            )
+                        }
+                        Request::PtyResize(_) | Request::PtyWrite(_) | Request::PtyClose(_) => {
+                            ServerMessage::ok(id, &Empty {})
+                        }
+                        Request::FsListDir(_) => ServerMessage::ok(
+                            id,
+                            &ListDirResult {
+                                entries: vec![entry("src", true), entry("README.md", false)],
+                            },
+                        ),
+                        Request::FsWatch(_) => ServerMessage::ok(id, &Empty {}),
+                        Request::WorkspaceChanges(_) => {
+                            ServerMessage::ok(id, &ChangesResult { files: vec![] })
+                        }
+                        Request::WorkspaceStatus(_) => {
+                            ServerMessage::ok(id, &WorkspaceStatusResult { entries: vec![] })
+                        }
+                        Request::RepoDetectRunConfigs(_) => ServerMessage::ok(
+                            id,
+                            &DetectRunConfigsResult {
+                                configs: vec![],
+                                network_allow: vec![],
+                                warnings: vec![],
+                            },
+                        ),
+                        Request::RunList(_) => {
+                            ServerMessage::ok(id, &RunListResult { runs: vec![] })
+                        }
+                        // Answered so a run that got this far would still end
+                        // cleanly; the assertions require it never to be asked.
+                        Request::WorkspaceDestroy(_) => ServerMessage::ok(id, &Empty {}),
+                        other => ServerMessage::err(
+                            id,
+                            RpcError::internal(format!("not implemented: {}", other.method_name())),
+                        ),
+                    };
+                    if w.write_all(codec::encode(&reply).as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        (addr, journal)
+    }
+
+    fn workspace(id: &str, name: &str) -> WorkspaceInfo {
+        WorkspaceInfo {
+            id: WorkspaceId(id.to_owned()),
+            name: name.to_owned(),
+            repo_path: "/menu/repo".to_owned(),
+            base_branch: "main".to_owned(),
+            branch: format!("bs/{name}"),
+            worktree_path: format!("/wt/{id}"),
+            created_at: "2026-09-11T10:00:00Z".to_owned(),
+            allowlist: Vec::new(),
+            state: WorkspaceState::Ready,
+            agents: Vec::new(),
+            agent_records: Vec::new(),
+            runs: Vec::new(),
+        }
+    }
+
+    fn entry(name: &str, is_dir: bool) -> FileEntry {
+        FileEntry {
+            name: name.to_owned(),
+            is_dir,
+            size: 0,
+            status: FileStatus::Unchanged,
+        }
+    }
+
+    /// Reads a child pipe to end on its own thread, so a full pipe cannot
+    /// deadlock the child before the time limit.
+    fn drain(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        });
+        rx
+    }
+
+    fn wait_for(
+        child: &mut std::process::Child,
+        limit: Duration,
+    ) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => return Some(status),
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        None
+    }
+}

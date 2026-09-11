@@ -44,8 +44,30 @@
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QWidget>
+#include <cstdio>
 
 namespace {
+
+/// The steps in `BS_MENU_TEST`, as one string. **Test-only**: unset in every
+/// ordinary run, and then everything below that reads it is inert.
+QString menuTest() {
+    return qEnvironmentVariable("BS_MENU_TEST");
+}
+
+/// How Qt's text formats are spelled in a test line. `QLabel`'s default is
+/// `AutoText`, which is what makes an unset format worth reporting at all.
+const char* textFormatWord(Qt::TextFormat format) {
+    switch (format) {
+    case Qt::PlainText:
+        return "PlainText";
+    case Qt::RichText:
+        return "RichText";
+    case Qt::MarkdownText:
+        return "MarkdownText";
+    default:
+        return "AutoText";
+    }
+}
 
 /// What the operation label says while the New Agent dialog's repository is
 /// being read. Named because it is both written and compared: the previous
@@ -282,6 +304,34 @@ void MainWindow::buildCentral() {
     QObject::connect(m_groupBar, &GroupBar::closeGroupRequested, this, &MainWindow::onCloseGroup);
     QObject::connect(m_centerSplitter, &QSplitter::splitterMoved, this,
                      [this](int, int) { noteSplitterState(); });
+
+    if (menuTest().contains(QLatin1String("new-agent-status"))) {
+        QTimer::singleShot(0, this, &MainWindow::reportNewAgentStatusFormat);
+    }
+}
+
+bool MainWindow::announceMenuTest(const char* what, const QString& target,
+                                  const QString& question) const {
+    if (menuTest().isEmpty()) {
+        return false;
+    }
+    const QByteArray line = QStringLiteral("BS_MENU_TEST %1 target=%2 question=%3\n")
+                                .arg(QString::fromUtf8(what), target, question)
+                                .toUtf8();
+    std::fwrite(line.constData(), 1, static_cast<size_t>(line.size()), stdout);
+    std::fflush(stdout);
+    return true;
+}
+
+void MainWindow::reportNewAgentStatusFormat() {
+    // Built and thrown away without being shown: what is being read is how the
+    // label was configured, and showing it would need somebody to dismiss it.
+    NewAgentDialog dialog(m_controller, m_groupModel, QString(), this);
+    const QLabel* status = dialog.findChild<QLabel*>(QStringLiteral("NewAgentStatus"));
+    announceMenuTest("new-agent-status",
+                     status == nullptr ? QStringLiteral("missing")
+                                       : QString::fromUtf8(textFormatWord(status->textFormat())),
+                     QString());
 }
 
 void MainWindow::showSetupPage() { openSettings(true); }
@@ -505,7 +555,12 @@ void MainWindow::connectController() {
     // Every arrangement the user makes -- a rename, a drag between groups, a
     // group closed -- reaches `state.json` from here. The model is the
     // authority on the arrangement; the controller only records what it says.
-    QObject::connect(m_groupModel, &GroupModel::changed, this,
+    //
+    // `arrangementChanged` and not `changed`: `changed` also fires for a status
+    // glyph, an agent heartbeat and a running cost, none of which `state.json`
+    // records, and recording on it re-serialised and re-scheduled a write of
+    // the whole file dozens of times a minute with nothing to write.
+    QObject::connect(m_groupModel, &GroupModel::arrangementChanged, this,
                      [this] { m_controller->noteGroups(m_groupModel->groupsJson()); });
     // The re-sync has finished. The panes re-attached themselves in Rust; what
     // is left is the window's own furniture.
@@ -843,7 +898,7 @@ void MainWindow::openNewAgentDialog(const QString& initialPath, const QString& d
                                          dialog.runConfig(), dialog.initIfMissing());
 }
 
-void MainWindow::onDestroyRequested(const QString& workspaceId) {
+void MainWindow::onDestroyRequested(const QString& workspaceId, const QString& workspaceName) {
     // The Changes toolbar greys its own Discard out while an operation is
     // running; this menu is the other way to the same call, and a destroy that
     // lands while a merge is still absorbing objects out of the workspace is
@@ -855,10 +910,21 @@ void MainWindow::onDestroyRequested(const QString& workspaceId) {
                            "Wait for it to finish, then try again."));
         return;
     }
+    // Named, not "this workspace": the menu that led here has been closed for
+    // as long as it takes to read the question, and the tab it was opened over
+    // may no longer be the one in front.
+    const QString question =
+        workspaceName.isEmpty()
+            ? QStringLiteral("Destroy this workspace? Its sandbox and worktree are removed.")
+            : QStringLiteral("Destroy workspace \"%1\"? Its sandbox and worktree are removed.")
+                  .arg(workspaceName);
+    if (announceMenuTest("destroy", workspaceId, question)) {
+        return;
+    }
     QMessageBox box(this);
     box.setIcon(QMessageBox::Question);
     box.setWindowTitle("Destroy workspace");
-    box.setText("Destroy this workspace? Its sandbox and worktree are removed.");
+    box.setText(question);
     box.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
     box.setDefaultButton(QMessageBox::Cancel);
     auto* force = new QCheckBox("Force (discard changes)", &box);
@@ -901,20 +967,37 @@ void MainWindow::onStartAgentRequested(const QString& workspaceId) {
     m_controller->startAgent(workspaceId, options);
 }
 
-void MainWindow::onCloseGroup(int groupIndex) {
-    const QString groupName = m_groupModel->groupName(groupIndex);
+void MainWindow::onCloseGroup(const QString& groupName) {
     if (groupName.isEmpty()) {
         return;
     }
     // The group's tabs in order, from the model's own state, so the dialog's
-    // rows and the run that follows are in the order the user sees.
+    // rows and the run that follows are in the order the user sees. Looked up
+    // by name: the bar resolved the name at the click, and the group may have
+    // changed places since.
     const QJsonArray groups = QJsonDocument::fromJson(m_groupModel->getStateJson().toUtf8())
                                   .object()
                                   .value("groups")
                                   .toArray();
-    const QJsonArray tabs =
-        groupIndex < groups.size() ? groups.at(groupIndex).toObject().value("tabs").toArray()
-                                   : QJsonArray();
+    QJsonArray tabs;
+    bool found = false;
+    for (const QJsonValue& value : groups) {
+        const QJsonObject group = value.toObject();
+        if (group.value("name").toString() == groupName) {
+            tabs = group.value("tabs").toArray();
+            found = true;
+            break;
+        }
+    }
+    // Closed by something else while the menu was up. Nothing is left to ask
+    // about, and asking about an empty group the user never opened would be
+    // worse than saying nothing.
+    if (!found) {
+        return;
+    }
+    if (announceMenuTest("close-group", groupName, QString())) {
+        return;
+    }
     ChangesToolbar* toolbar = m_explorer->changesToolbar();
     QList<CloseGroupChoice> workspaces;
     for (const QJsonValue& value : tabs) {

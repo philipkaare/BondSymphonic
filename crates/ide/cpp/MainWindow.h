@@ -116,7 +116,12 @@ private:
     void openNewAgentDialog(const QString& initialPath, const QString& distroPath,
                             const QString& infoJson, const QString& error);
     void onAbout();
-    void onDestroyRequested(const QString& workspaceId);
+    /// "Destroy workspace..." from the agent tab's context menu. Both strings
+    /// are the bar's reading of the tab that was clicked, taken before its menu
+    /// ran: the id is what is destroyed and the name is what the confirmation
+    /// asks about, so the question and the act cannot name different
+    /// workspaces however much the model has moved since.
+    void onDestroyRequested(const QString& workspaceId, const QString& workspaceName);
     void onOperationFailed(const QString& op, const QString& message);
     void onActiveTabChanged();
     /// Names the active workspace in the title bar: `<name> -- <branch> --
@@ -157,14 +162,28 @@ private:
                             const QString& detail, const QString& stderrText);
     /// Takes both down again, after an operation on that workspace worked.
     void clearWorkspaceError(const QString& workspaceId);
-    /// Asks what to do with each workspace in the group at `groupIndex` and
-    /// runs the answers.
-    void onCloseGroup(int groupIndex);
+    /// Asks what to do with each workspace in the group called `groupName` and
+    /// runs the answers. By name rather than by index for the same reason the
+    /// bar sends a name: the group tabs may have moved between the click and
+    /// the menu being answered.
+    void onCloseGroup(const QString& groupName);
     /// Puts one confirmation in front of a close-group run that would destroy
     /// anything, naming each workspace and what goes with it. True when there
     /// is nothing to destroy, or the user said yes; false cancels the whole
     /// run, merges included.
     bool confirmDiscards(const QList<CloseGroupChoice>& choices);
+    /// Test seam, armed only by `BS_MENU_TEST` and inert in every ordinary run.
+    /// Prints what a context menu resolved -- the target, and the question the
+    /// window would have put -- and answers true so the caller returns instead
+    /// of raising a modal dialog an automated run has nobody to answer. See
+    /// `GroupBar`'s own half of the seam.
+    bool announceMenuTest(const char* what, const QString& target, const QString& question) const;
+    /// Builds a New Agent dialog without showing it and reports the text format
+    /// of its status label, which is the only way to see from outside that the
+    /// daemon's sentences land there as text rather than as markup. Test seam;
+    /// see [`announceMenuTest`].
+    void reportNewAgentStatusFormat();
+
     /// Points the status bar's cost at the active tab's transcript, dropping
     /// the watch on the tab before it. A tab with no transcript costs nothing.
     void rebindCost();

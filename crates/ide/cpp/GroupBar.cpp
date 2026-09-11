@@ -16,7 +16,9 @@
 #include <QMenu>
 #include <QPalette>
 #include <QStyle>
+#include <QStringList>
 #include <QTabBar>
+#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -25,7 +27,12 @@ namespace {
 /// The one mapping table C++ is allowed to hold: `GroupModel::tabStatus` codes
 /// onto tab text colours. The status words come from `statusWord` and the tab
 /// glyph from `tabLabel`, so nothing else here switches on the code.
-QColor statusColour(int status) {
+///
+/// `dark` is whether the bar sits on a dark palette. It matters only to the
+/// error red, which is the one entry read out of `theme` rather than picked
+/// here: the theme's accents are chosen as fills for a light background and
+/// have to go through `theme::ink` before they are drawn as text.
+QColor statusColour(int status, bool dark) {
     switch (status) {
     case 0:
         return QColor(0x88, 0x88, 0x88); // idle
@@ -34,7 +41,10 @@ QColor statusColour(int status) {
     case 2:
         return QColor(0xf2, 0xa9, 0x00); // waiting for permission
     case 3:
-        return QColor(0xeb, 0x57, 0x57); // error
+        // The IDE's one red. `theme` has no "error" of its own; a line that is
+        // gone and an agent that failed are the same judgement, so the accent
+        // is read from there rather than written out again here.
+        return theme::ink(theme::removed(), dark); // error
     case 4:
         return QColor(0x27, 0xae, 0x60); // done
     case 5:
@@ -67,6 +77,19 @@ QString statusDot() {
 /// perfectly healthy. The tab's tooltip says what it is waiting for.
 QString attentionDot() {
     return QStringLiteral(" ") + QString(QChar(0x2022));
+}
+
+/// The steps in `BS_MENU_TEST`. **Test-only**: the variable is unset in every
+/// ordinary run, this is then empty, and nothing the seam reaches executes.
+///
+/// It stands in for a user at a context menu: a menu is opened over a named tab
+/// or group, the model is changed while it is up -- the daemon event that the
+/// resolve-before-`exec` rule in the two menus below exists for -- and an item
+/// is chosen. What the bar emitted then reaches `tests/smoke.rs` as a line on
+/// the IDE's stdout, which is the only way to see it: the confirmations these
+/// menus lead to are modal, and an automated run has nobody to answer them.
+QStringList menuTestSteps() {
+    return qEnvironmentVariable("BS_MENU_TEST").split(QLatin1Char(','), Qt::SkipEmptyParts);
 }
 
 } // namespace
@@ -148,7 +171,12 @@ GroupBar::GroupBar(GroupModel* model, QWidget* parent) : QWidget(parent), m_mode
     QObject::connect(m_agentTabs, &QTabBar::currentChanged, this, &GroupBar::onAgentCurrentChanged);
     QObject::connect(m_groupTabs, &QWidget::customContextMenuRequested, this, &GroupBar::showGroupMenu);
     QObject::connect(m_agentTabs, &QWidget::customContextMenuRequested, this, &GroupBar::showAgentMenu);
+    // `changed` and not `arrangementChanged`: a rebuild repaints the status dot
+    // and the cost beside every tab as well as laying the tabs out, and those
+    // move without the arrangement moving at all.
     QObject::connect(m_model, &GroupModel::changed, this, &GroupBar::rebuild);
+
+    m_menuTestSteps = menuTestSteps();
 
     rebuild();
 }
@@ -214,7 +242,8 @@ void GroupBar::rebuild() {
         }
         m_agentTabs->setTabText(i, label);
         m_agentTabs->setTabToolTip(i, m_model->tabTooltip(m_displayGroup, i));
-        m_agentTabs->setTabTextColor(i, statusColour(m_model->tabStatus(m_displayGroup, i)));
+        m_agentTabs->setTabTextColor(
+            i, statusColour(m_model->tabStatus(m_displayGroup, i), theme::isDark(palette())));
     }
     // An empty group is a strip with nothing on it; the label says which of the
     // two it is, where the tabs would have been.
@@ -227,6 +256,7 @@ void GroupBar::rebuild() {
     }
 
     m_rebuilding = false;
+    armMenuTest();
 }
 
 QJsonArray GroupBar::displayedTabsJson() const {
@@ -258,22 +288,35 @@ void GroupBar::onAgentCurrentChanged(int index) {
 }
 
 void GroupBar::showGroupMenu(const QPoint& pos) {
-    const int index = m_groupTabs->tabAt(pos);
+    openGroupMenu(m_groupTabs->tabAt(pos), m_groupTabs->mapToGlobal(pos));
+}
+
+void GroupBar::showAgentMenu(const QPoint& pos) {
+    openAgentMenu(m_agentTabs->tabAt(pos), m_agentTabs->mapToGlobal(pos));
+}
+
+void GroupBar::openGroupMenu(int index, const QPoint& globalPos) {
+    // Read off the tab that was clicked, before the menu takes over the event
+    // loop. Anything the daemon says while it is up goes through the model, so
+    // `index` may name a different group by the time an item is chosen -- and
+    // the item behind it closes every workspace in one.
+    const QString groupName = index >= 0 ? m_model->groupName(index) : QString();
+
     QMenu menu(this);
     QAction* addAction = menu.addAction("New group…");
-    QAction* renameAction = index >= 0 ? menu.addAction("Rename group…") : nullptr;
+    QAction* renameAction = groupName.isEmpty() ? nullptr : menu.addAction("Rename group…");
     QAction* closeAction = nullptr;
-    if (index >= 0) {
+    if (!groupName.isEmpty()) {
         menu.addSeparator();
         closeAction = menu.addAction("Close group…");
     }
 
-    QAction* chosen = menu.exec(m_groupTabs->mapToGlobal(pos));
+    QAction* chosen = execMenu(menu, globalPos);
     if (chosen == nullptr) {
         return;
     }
     if (chosen == closeAction) {
-        emit closeGroupRequested(index);
+        emit closeGroupRequested(groupName);
         return;
     }
     if (chosen == addAction) {
@@ -286,8 +329,18 @@ void GroupBar::showGroupMenu(const QPoint& pos) {
     } else if (chosen == renameAction) {
         bool ok = false;
         const QString name = QInputDialog::getText(this, "Rename group", "Group name:", QLineEdit::Normal,
-                                                   m_model->groupName(index), &ok);
-        if (ok && !name.trimmed().isEmpty() && !m_model->renameGroup(index, name.trimmed())) {
+                                                   groupName, &ok);
+        if (!ok || name.trimmed().isEmpty()) {
+            return;
+        }
+        // The input dialog is a second nested event loop, so the group is
+        // looked up again by the name resolved at the click. Renaming whatever
+        // sits at the old index now is the same bug one layer down.
+        const int target = groupIndexOf(groupName);
+        if (target < 0) {
+            return;
+        }
+        if (!m_model->renameGroup(target, name.trimmed())) {
             // The one way a rename is refused is a name another group already
             // has, and a rename that silently did nothing would read as a bug.
             QMessageBox::information(this, QStringLiteral("Rename group"),
@@ -297,22 +350,126 @@ void GroupBar::showGroupMenu(const QPoint& pos) {
     }
 }
 
-void GroupBar::showAgentMenu(const QPoint& pos) {
-    const int index = m_agentTabs->tabAt(pos);
+void GroupBar::openAgentMenu(int index, const QPoint& globalPos) {
+    // Both read before the menu runs, for the reason spelled out in
+    // `openGroupMenu`: the id is what gets destroyed and the name is what the
+    // window's confirmation asks about, so neither can drift onto the tab that
+    // happens to hold this index once the menu closes.
+    const QString workspaceId =
+        index >= 0 ? m_model->tabWorkspaceId(m_displayGroup, index) : QString();
+    const QString workspaceName =
+        workspaceId.isEmpty() ? QString() : m_model->workspaceName(workspaceId);
+
     QMenu menu(this);
     QAction* newAction = menu.addAction("New agent…");
-    QAction* destroyAction = index >= 0 ? menu.addAction("Destroy workspace…") : nullptr;
+    QAction* destroyAction =
+        workspaceId.isEmpty() ? nullptr : menu.addAction("Destroy workspace…");
 
-    QAction* chosen = menu.exec(m_agentTabs->mapToGlobal(pos));
+    QAction* chosen = execMenu(menu, globalPos);
     if (chosen == nullptr) {
         return;
     }
     if (chosen == newAction) {
         emit newAgentRequested();
     } else if (chosen == destroyAction) {
-        const QString id = m_model->tabWorkspaceId(m_displayGroup, index);
-        if (!id.isEmpty()) {
-            emit destroyRequested(id);
+        emit destroyRequested(workspaceId, workspaceName);
+    }
+}
+
+int GroupBar::groupIndexOf(const QString& name) const {
+    if (name.isEmpty()) {
+        return -1;
+    }
+    for (int i = 0; i < m_model->groupCount(); ++i) {
+        if (m_model->groupName(i) == name) {
+            return i;
         }
     }
+    return -1;
+}
+
+QAction* GroupBar::execMenu(QMenu& menu, const QPoint& globalPos) {
+    if (m_menuTestChoice.isEmpty()) {
+        return menu.exec(globalPos);
+    }
+    // The seam, and the whole of what it does: the model moves while the menu
+    // is up, exactly as a daemon event would move it, and then an item is
+    // chosen. Nothing here runs unless `BS_MENU_TEST` armed it.
+    m_model->loadState(m_menuTestState);
+    for (QAction* action : menu.actions()) {
+        if (action->text() == m_menuTestChoice) {
+            return action;
+        }
+    }
+    return nullptr;
+}
+
+void GroupBar::armMenuTest() {
+    if (m_menuTestArmed || m_menuTestSteps.isEmpty()) {
+        return;
+    }
+    // Both menus need something to act on, and the change worth making is one
+    // that moves an index onto a different target: two groups, and two tabs in
+    // the one on show.
+    if (m_model->groupCount() < 2 || m_model->tabCount(m_displayGroup) < 2) {
+        return;
+    }
+    m_menuTestArmed = true;
+    // Not from inside `rebuild`: a step installs a state of its own, which
+    // rebuilds the bar again.
+    QTimer::singleShot(0, this, &GroupBar::runMenuTests);
+}
+
+void GroupBar::runMenuTests() {
+    for (const QString& step : m_menuTestSteps) {
+        if (step == QLatin1String("destroy")) {
+            // The second tab of the group on show, with that group's tabs
+            // reversed under the menu.
+            m_menuTestState = stateWithTabsReversed();
+            m_menuTestChoice = QStringLiteral("Destroy workspace…");
+            openAgentMenu(1, QPoint());
+        } else if (step == QLatin1String("close-group")) {
+            // The second group, with the groups rotated under the menu.
+            m_menuTestState = stateWithGroupsRotated();
+            m_menuTestChoice = QStringLiteral("Close group…");
+            openGroupMenu(1, QPoint());
+        }
+        m_menuTestChoice.clear();
+        m_menuTestState.clear();
+    }
+}
+
+QString GroupBar::stateWithTabsReversed() const {
+    QJsonObject state = QJsonDocument::fromJson(m_model->getStateJson().toUtf8()).object();
+    QJsonArray groups = state.value(QStringLiteral("groups")).toArray();
+    if (m_displayGroup < 0 || m_displayGroup >= groups.size()) {
+        return QString();
+    }
+    QJsonObject group = groups.at(m_displayGroup).toObject();
+    const QJsonArray tabs = group.value(QStringLiteral("tabs")).toArray();
+    QJsonArray reversed;
+    for (int i = tabs.size() - 1; i >= 0; --i) {
+        reversed.append(tabs.at(i));
+    }
+    group.insert(QStringLiteral("tabs"), reversed);
+    groups.replace(m_displayGroup, group);
+    state.insert(QStringLiteral("groups"), groups);
+    return QString::fromUtf8(QJsonDocument(state).toJson(QJsonDocument::Compact));
+}
+
+QString GroupBar::stateWithGroupsRotated() const {
+    QJsonObject state = QJsonDocument::fromJson(m_model->getStateJson().toUtf8()).object();
+    const QJsonArray groups = state.value(QStringLiteral("groups")).toArray();
+    if (groups.size() < 2) {
+        return QString();
+    }
+    QJsonArray rotated;
+    rotated.append(groups.at(1));
+    for (int i = 0; i < groups.size(); ++i) {
+        if (i != 1) {
+            rotated.append(groups.at(i));
+        }
+    }
+    state.insert(QStringLiteral("groups"), rotated);
+    return QString::fromUtf8(QJsonDocument(state).toJson(QJsonDocument::Compact));
 }

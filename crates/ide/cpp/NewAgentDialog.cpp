@@ -1,5 +1,6 @@
 #include "NewAgentDialog.h"
 #include "RunPanel.h"
+#include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
 #include <QAbstractItemModel>
@@ -110,9 +111,13 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     m_nameHint = new QLabel(this);
     m_nameHint->setWordWrap(true);
     m_nameHint->setTextFormat(Qt::PlainText);
-    // The one colour in this dialog that means "this will not work". Set here
-    // rather than through the palette so it reads the same on both themes.
-    m_nameHint->setStyleSheet("color:#eb5757");
+    // The one colour in this dialog that means "this will not work". The IDE's
+    // red, lifted for a dark palette the way every other accent is, rather than
+    // a hex of its own: `theme` has no "error", and a name that cannot be used
+    // is the same judgement as a line that is gone.
+    m_nameHint->setStyleSheet(
+        QStringLiteral("color:%1")
+            .arg(theme::ink(theme::removed(), theme::isDark(palette())).name()));
     m_nameHint->hide();
     form->addRow(QString(), m_nameHint);
 
@@ -177,6 +182,12 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     m_newGroup->setVisible(false);
 
     m_status = new QLabel(this);
+    m_status->setObjectName(QStringLiteral("NewAgentStatus"));
+    // What lands here is written by the daemon -- a repository path, a git
+    // error, a name rule's complaint. `QLabel` guesses at a format otherwise,
+    // and a message carrying angle brackets or an ampersand would be read as
+    // markup and come out mangled or half-swallowed.
+    m_status->setTextFormat(Qt::PlainText);
     m_status->setWordWrap(true);
     outer->addWidget(m_status);
 
