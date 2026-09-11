@@ -475,7 +475,55 @@ pub async fn remove_with(layout: &Layout, branch: RemoveBranch) -> Result<(), Rp
         RemoveBranch::Never => Ok(()),
         RemoveBranch::Always => remove_branch(git, layout).await,
     };
-    directory.and(pruned).and(branched)
+    report(
+        layout,
+        [
+            ("removing the worktree directory", directory),
+            ("pruning the worktree registration", pruned),
+            ("deleting the branch", branched),
+        ],
+    )
+}
+
+/// One answer for three independent steps: the first failure, carrying what the
+/// others said.
+///
+/// Each of the three can fail for its own reason now that none of them is
+/// skipped, and a caller gets one `RpcError`. Returning the first and dropping
+/// the rest would be the wrong half to keep: `workspace.destroy` turns this into
+/// a `WorkspaceState::Error` and then stops, so whatever is not in this message
+/// is a thing nobody can go back and ask about. The first error is kept whole —
+/// its code and its `data` are what clients branch on — and the others are
+/// appended to its message.
+///
+/// Logged as well as returned, because the log is where the daemon's own
+/// operator looks and it keeps each error unflattened.
+fn report(
+    layout: &Layout,
+    steps: [(&'static str, Result<(), RpcError>); 3],
+) -> Result<(), RpcError> {
+    let mut failures: Vec<(&'static str, RpcError)> = Vec::new();
+    for (what, outcome) in steps {
+        if let Err(e) = outcome {
+            tracing::warn!(
+                repo = %layout.repo.display(),
+                worktree = %layout.worktree_path.display(),
+                "{what} failed: {}", e.message
+            );
+            failures.push((what, e));
+        }
+    }
+    let mut failures = failures.into_iter();
+    let Some((_, mut first)) = failures.next() else {
+        return Ok(());
+    };
+    let rest: Vec<String> = failures
+        .map(|(what, e)| format!("{what} failed: {}", e.message))
+        .collect();
+    if !rest.is_empty() {
+        first.message = format!("{} (also: {})", first.message, rest.join("; "));
+    }
+    Err(first)
 }
 
 /// Deletes the workspace's branch, and the two directories named after the

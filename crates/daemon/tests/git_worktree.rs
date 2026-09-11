@@ -276,21 +276,51 @@ async fn remove_takes_a_locked_worktree_with_it() {
 // that does not.
 // ---------------------------------------------------------------------------
 
-/// Holds an open handle on `path` until `release` is set, *without* the delete
-/// share Rust's own `File::open` grants — which is what a handle from another
-/// program looks like, and the only kind that stops a delete.
+/// A handle held open inside the worktree, released however the test ends.
 ///
-/// Announces through `opened` that the handle is real before the test goes on,
-/// so nothing here depends on a thread being scheduled promptly.
+/// The handle is opened *without* the delete share Rust's own `File::open`
+/// grants — the only kind that stops a delete, and what a handle from another
+/// program looks like. The guard exists because the release must not be a
+/// statement in the test body: an unexpected success or a failed assertion
+/// would skip it, and the thread would hold the directory open into whatever
+/// ran next. `Drop` runs on the panic path too.
 #[cfg(windows)]
-fn hold_a_handle(
-    path: std::path::PathBuf,
-    opened: std::sync::Arc<std::sync::atomic::AtomicBool>,
+struct HeldHandle {
     release: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> std::thread::JoinHandle<()> {
+    holder: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl HeldHandle {
+    /// The flag the holder watches, for a test that wants to let go early.
+    fn release_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.release)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HeldHandle {
+    fn drop(&mut self) {
+        self.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = self.holder.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Opens the handle and returns once it is really open, so nothing downstream
+/// depends on a thread being scheduled promptly.
+#[cfg(windows)]
+async fn hold_a_handle(path: std::path::PathBuf) -> HeldHandle {
     use std::os::windows::fs::OpenOptionsExt;
-    use std::sync::atomic::Ordering;
-    std::thread::spawn(move || {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let opened = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let (o, r) = (Arc::clone(&opened), Arc::clone(&release));
+    let holder = std::thread::spawn(move || {
         // FILE_SHARE_READ only: no FILE_SHARE_DELETE, so the file cannot be
         // unlinked while this handle is open.
         let f = std::fs::OpenOptions::new()
@@ -298,12 +328,19 @@ fn hold_a_handle(
             .share_mode(1)
             .open(&path)
             .expect("open the held file");
-        opened.store(true, Ordering::SeqCst);
-        while !release.load(Ordering::SeqCst) {
+        o.store(true, Ordering::SeqCst);
+        while !r.load(Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         drop(f);
-    })
+    });
+    while !opened.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    HeldHandle {
+        release,
+        holder: Some(holder),
+    }
 }
 
 /// A handle that is released while the removal is still trying does not fail
@@ -314,8 +351,7 @@ fn hold_a_handle(
 #[cfg(windows)]
 #[tokio::test]
 async fn remove_waits_out_a_handle_that_is_about_to_be_released() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     let dir = tempfile::tempdir().unwrap();
     let repo_path = common::init_repo(dir.path());
@@ -323,26 +359,14 @@ async fn remove_waits_out_a_handle_that_is_about_to_be_released() {
     let layout = layout_for(dir.path(), &repo_path, "briefly-held").await;
     worktree::create(&layout, "main").await.unwrap();
 
-    let (opened, release) = (
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
-    );
-    let holder = hold_a_handle(
-        layout.worktree_path.join("README.md"),
-        opened.clone(),
-        release.clone(),
-    );
-    while !opened.load(Ordering::SeqCst) {
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
-
-    let held = Arc::clone(&release);
+    let held = hold_a_handle(layout.worktree_path.join("README.md")).await;
+    let release = held.release_flag();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        held.store(true, Ordering::SeqCst);
+        release.store(true, Ordering::SeqCst);
     });
+
     worktree::remove(&layout).await.unwrap();
-    holder.join().unwrap();
 
     assert!(!layout.worktree_path.exists());
     assert!(
@@ -363,31 +387,17 @@ async fn remove_waits_out_a_handle_that_is_about_to_be_released() {
 #[cfg(windows)]
 #[tokio::test]
 async fn a_directory_that_will_not_go_still_costs_no_registration_and_no_branch() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
     let dir = tempfile::tempdir().unwrap();
     let repo_path = common::init_repo(dir.path());
     let git = Git::new();
     let layout = layout_for(dir.path(), &repo_path, "stuck").await;
     worktree::create(&layout, "main").await.unwrap();
 
-    let (opened, release) = (
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
-    );
-    let holder = hold_a_handle(
-        layout.worktree_path.join("README.md"),
-        opened.clone(),
-        release.clone(),
-    );
-    while !opened.load(Ordering::SeqCst) {
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    }
+    // Held for the whole call, and released by the guard's `Drop` whichever way
+    // this test ends — including the panic an unexpected success would raise.
+    let _held = hold_a_handle(layout.worktree_path.join("README.md")).await;
 
     let err = worktree::remove(&layout).await.unwrap_err();
-    release.store(true, Ordering::SeqCst);
-    holder.join().unwrap();
 
     assert!(
         err.message.contains("worktree directory"),
@@ -408,5 +418,44 @@ async fn a_directory_that_will_not_go_still_costs_no_registration_and_no_branch(
             .await
             .unwrap(),
         "the branch outlived a failed removal"
+    );
+}
+
+/// When more than one step of a removal fails, the error says so.
+///
+/// The three steps run independently now, so two of them can fail for two
+/// unrelated reasons. Returning only the first would park the workspace in
+/// `Error(...)` with half the story, and the half it drops is the half nobody
+/// can go back and ask about: the daemon has already finished the destroy.
+#[tokio::test]
+async fn a_removal_that_fails_twice_names_both_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_path = common::init_repo(dir.path());
+    let layout = layout_for(dir.path(), &repo_path, "doomed").await;
+    worktree::create(&layout, "main").await.unwrap();
+
+    // The repository itself goes. The worktree directory is an ordinary
+    // directory and still removes cleanly, so the first step succeeds — and
+    // neither `worktree prune` nor the branch step has a repository left to run
+    // in, so both of those fail, for the same underlying reason but as two
+    // separate commands.
+    std::fs::remove_dir_all(repo_path.join(".git")).unwrap();
+
+    let err = worktree::remove(&layout).await.unwrap_err();
+
+    assert!(
+        err.message.contains("worktree prune"),
+        "the first failure is the prune: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("also:"),
+        "the second failure has to be in the message too: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("deleting the branch"),
+        "the second failure has to say which step it was: {}",
+        err.message
     );
 }
