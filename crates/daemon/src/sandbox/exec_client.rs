@@ -9,16 +9,23 @@ use super::protocol::{encode, InitReply, InitRequest};
 use super::*;
 use nix::cmsg_space;
 use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{IoSliceMut, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 /// `(pid, has_pty, fds)` for a successful spawn, or init's error message.
 type SpawnReply = Result<(u32, bool, Vec<OwnedFd>), String>;
+
+/// How long an exit nobody has claimed is kept. A spawn claims its exit as
+/// soon as init's `Spawned` reply reaches it, which is the same socket the
+/// exit arrives on, so a legitimate claim comes within milliseconds; anything
+/// older belongs to a caller that is not coming back.
+const EARLY_EXIT_TTL: Duration = Duration::from_secs(60);
 
 /// Waiters and already-delivered exit codes, under one lock.
 ///
@@ -26,11 +33,62 @@ type SpawnReply = Result<(u32, bool, Vec<OwnedFd>), String>;
 /// thread recording an exit race for the same pid, and with two locks an exit
 /// can be filed as "early" moments after a waiter appeared, leaving that waiter
 /// to hang forever.
-#[derive(Default)]
 struct ExitTable {
     waiters: HashMap<u32, oneshot::Sender<i32>>,
-    /// Exit codes that arrived before the caller had a channel to receive them.
-    early: HashMap<u32, i32>,
+    /// Exit codes that arrived before the caller had a channel to receive
+    /// them, with when they arrived. Pruned on every insert, and consumed by
+    /// the spawn that claims them, so the table cannot grow with the
+    /// sandbox's lifetime.
+    early: HashMap<u32, (i32, Instant)>,
+    /// Pids whose spawn nobody was left to receive: the process was killed on
+    /// arrival, and its exit is dropped rather than filed as early.
+    abandoned: HashSet<u32>,
+    ttl: Duration,
+}
+
+impl ExitTable {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            waiters: HashMap::new(),
+            early: HashMap::new(),
+            abandoned: HashSet::new(),
+            ttl,
+        }
+    }
+
+    /// Files `pid`'s exit: returns its waiter when there is one, otherwise
+    /// keeps the code for the spawn still on its way back, unless the spawn
+    /// was abandoned.
+    fn exited(&mut self, pid: u32, code: i32) -> Option<oneshot::Sender<i32>> {
+        if let Some(tx) = self.waiters.remove(&pid) {
+            return Some(tx);
+        }
+        if self.abandoned.remove(&pid) {
+            return None;
+        }
+        let now = Instant::now();
+        self.early
+            .retain(|_, (_, at)| now.duration_since(*at) < self.ttl);
+        self.early.insert(pid, (code, now));
+        None
+    }
+
+    /// Claims an exit that already arrived for `pid`, handing back the sender
+    /// to deliver it on, or registers `tx` as the waiter.
+    fn claim(&mut self, pid: u32, tx: oneshot::Sender<i32>) -> Option<(oneshot::Sender<i32>, i32)> {
+        match self.early.remove(&pid) {
+            Some((code, _)) => Some((tx, code)),
+            None => {
+                self.waiters.insert(pid, tx);
+                None
+            }
+        }
+    }
+
+    /// Notes that nobody will ever wait for `pid`.
+    fn abandon(&mut self, pid: u32) {
+        self.abandoned.insert(pid);
+    }
 }
 
 pub struct ExecClient {
@@ -47,16 +105,22 @@ impl ExecClient {
     pub fn connect(path: &std::path::Path) -> std::io::Result<Arc<Self>> {
         let stream = UnixStream::connect(path)?;
         let reader = stream.try_clone()?;
+        Ok(Self::from_stream(stream, reader))
+    }
+
+    /// A client whose requests go out on `writer` and whose reader thread
+    /// reads `reader`, the two ends of one connected socket.
+    fn from_stream(writer: UnixStream, reader: UnixStream) -> Arc<Self> {
         let client = Arc::new(Self {
-            writer: Mutex::new(stream),
+            writer: Mutex::new(writer),
             pending: Default::default(),
-            exits: Default::default(),
+            exits: Mutex::new(ExitTable::new(EARLY_EXIT_TTL)),
             next_id: AtomicU64::new(1),
             died: tokio::sync::watch::channel(false).0,
         });
         let c = client.clone();
         std::thread::spawn(move || c.read_loop(reader));
-        Ok(client)
+        client
     }
 
     fn read_loop(&self, stream: UnixStream) {
@@ -112,8 +176,8 @@ impl ExecClient {
         for (_, tx) in pending {
             let _ = tx.send(Err("sandbox init went away".into()));
         }
-        let exits = std::mem::take(&mut *self.exits.lock().unwrap());
-        for (_, tx) in exits.waiters {
+        let waiters = std::mem::take(&mut self.exits.lock().unwrap().waiters);
+        for (_, tx) in waiters {
             let _ = tx.send(-1);
         }
         // Last, so anything watching for the sandbox's death sees it only once
@@ -131,8 +195,21 @@ impl ExecClient {
         match reply {
             InitReply::Spawned { id, pid, has_pty } => {
                 let fds = std::mem::take(fds);
-                if let Some(tx) = self.pending.lock().unwrap().remove(&id) {
-                    let _ = tx.send(Ok((pid, has_pty, fds)));
+                let delivered = match self.pending.lock().unwrap().remove(&id) {
+                    Some(tx) => tx.send(Ok((pid, has_pty, fds))).is_ok(),
+                    None => false,
+                };
+                // The caller was cancelled between sending the request and
+                // this reply: nobody will read the process's output or wait
+                // for its exit, so it is killed outright and its exit is not
+                // kept for a claim that will never come. Its descriptors were
+                // dropped with the undelivered reply.
+                if !delivered {
+                    self.exits.lock().unwrap().abandon(pid);
+                    let _ = self.send(&InitRequest::Kill {
+                        pid,
+                        signal: libc::SIGKILL,
+                    });
                 }
             }
             InitReply::SpawnFailed { id, message } => {
@@ -143,16 +220,7 @@ impl ExecClient {
             InitReply::Exited { pid, code } => {
                 // Take the waiter, or record the exit, without ever releasing
                 // the lock in between.
-                let waiter = {
-                    let mut table = self.exits.lock().unwrap();
-                    match table.waiters.remove(&pid) {
-                        Some(tx) => Some(tx),
-                        None => {
-                            table.early.insert(pid, code);
-                            None
-                        }
-                    }
-                };
+                let waiter = self.exits.lock().unwrap().exited(pid, code);
                 if let Some(tx) = waiter {
                     let _ = tx.send(code);
                 }
@@ -199,16 +267,7 @@ impl ExecClient {
         let (exit_tx, exit_rx) = oneshot::channel();
         // Claim an exit that already arrived, or register as its waiter, under
         // one lock: the reader thread may be handling this pid right now.
-        let already_exited = {
-            let mut table = self.exits.lock().unwrap();
-            match table.early.remove(&pid) {
-                Some(code) => Some((exit_tx, code)),
-                None => {
-                    table.waiters.insert(pid, exit_tx);
-                    None
-                }
-            }
-        };
+        let already_exited = self.exits.lock().unwrap().claim(pid, exit_tx);
         if let Some((tx, code)) = already_exited {
             let _ = tx.send(code);
         }
@@ -302,4 +361,139 @@ impl ExecClient {
 /// reader; Milestone 7 can move this to `AsyncFd`.
 fn to_file(fd: OwnedFd) -> tokio::fs::File {
     tokio::fs::File::from_std(std::fs::File::from(fd))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::BufRead;
+    use std::path::Path;
+
+    /// NT8 (c): an exit that arrived before its spawn returned is handed to
+    /// that spawn once, and is gone from the table afterwards.
+    #[test]
+    fn an_early_exit_is_consumed_by_the_spawn_that_claims_it() {
+        let mut table = ExitTable::new(EARLY_EXIT_TTL);
+        assert!(table.exited(42, 7).is_none(), "nobody was waiting");
+        let (tx, mut rx) = oneshot::channel();
+        let claimed = table.claim(42, tx);
+        let (tx, code) = claimed.expect("the early exit is claimed");
+        assert_eq!(code, 7);
+        tx.send(code).unwrap();
+        assert_eq!(rx.try_recv(), Ok(7));
+        assert!(table.early.is_empty(), "claimed entries are removed");
+        // A second claim for the same pid finds nothing and registers a waiter.
+        let (tx, _rx) = oneshot::channel();
+        assert!(table.claim(42, tx).is_none());
+        assert!(table.waiters.contains_key(&42));
+    }
+
+    /// NT8 (b): entries older than the TTL are dropped whenever a new one is
+    /// filed, so a spawn whose caller went away cannot grow the table forever.
+    #[test]
+    fn early_exits_older_than_the_ttl_are_pruned() {
+        let mut table = ExitTable::new(Duration::from_millis(10));
+        assert!(table.exited(42, 0).is_none());
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(table.exited(43, 0).is_none());
+        assert!(!table.early.contains_key(&42), "42 outlived the TTL");
+        assert!(table.early.contains_key(&43));
+    }
+
+    /// NT8 (a), the table half: the exit of a pid whose spawn nobody waited
+    /// for is not filed at all.
+    #[test]
+    fn an_exit_for_an_abandoned_spawn_is_not_filed() {
+        let mut table = ExitTable::new(EARLY_EXIT_TTL);
+        table.abandon(42);
+        assert!(table.exited(42, 0).is_none());
+        assert!(table.early.is_empty());
+        assert!(
+            table.abandoned.is_empty(),
+            "the note is used up by the exit"
+        );
+    }
+
+    fn read_line(stream: &UnixStream) -> String {
+        let mut line = String::new();
+        std::io::BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        line
+    }
+
+    /// NT8 (a), over the wire: a `Spawned` reply whose caller has gone away
+    /// gets its process killed, and the later `Exited` leaves no trace.
+    #[tokio::test]
+    async fn a_spawn_nobody_waits_for_is_killed_and_its_exit_dropped() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        theirs
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let client = ExecClient::from_stream(ours.try_clone().unwrap(), ours);
+        let cmd = SandboxCommand {
+            argv: vec!["sleep".into(), "9".into()],
+            env: vec![],
+            cwd: None,
+            pty: None,
+        };
+        // The caller registers its request, then is cancelled before init
+        // answers: an `agent.start` whose RPC connection dropped, say.
+        let c = client.clone();
+        let caller = tokio::spawn(async move { c.spawn(&cmd, &[], Path::new("/")).await });
+        let request = tokio::task::spawn_blocking({
+            let t = theirs.try_clone().unwrap();
+            move || read_line(&t)
+        })
+        .await
+        .unwrap();
+        let InitRequest::Spawn { id, .. } = serde_json::from_str(&request).unwrap() else {
+            panic!("expected a spawn request: {request}");
+        };
+        caller.abort();
+        let join = caller.await.err().expect("the caller was cancelled");
+        assert!(join.is_cancelled());
+
+        (&theirs)
+            .write_all(&encode(&InitReply::Spawned {
+                id,
+                pid: 42,
+                has_pty: false,
+            }))
+            .unwrap();
+        let kill = tokio::task::spawn_blocking({
+            let t = theirs.try_clone().unwrap();
+            move || read_line(&t)
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                serde_json::from_str::<InitRequest>(&kill).unwrap(),
+                InitRequest::Kill {
+                    pid: 42,
+                    signal: libc::SIGKILL
+                }
+            ),
+            "the orphaned process must be killed: {kill}"
+        );
+
+        (&theirs)
+            .write_all(&encode(&InitReply::Exited { pid: 42, code: 137 }))
+            .unwrap();
+        // The reader thread files exits; give it a moment.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && !client.exits.lock().unwrap().abandoned.is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let table = client.exits.lock().unwrap();
+        assert!(
+            table.early.is_empty(),
+            "the exit was filed: {:?}",
+            table.early
+        );
+        assert!(table.abandoned.is_empty());
+    }
 }

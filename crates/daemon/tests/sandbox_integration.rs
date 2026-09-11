@@ -1658,3 +1658,266 @@ async fn a_bwrap_run_answers_on_the_host_through_its_bridge() {
 
     lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Review fixes 2026-09-11, task 1: what a sandboxed process can see.
+// ---------------------------------------------------------------------------
+
+/// A hand-built spec whose home and run dir sit directly under `dir`, the
+/// layout the tests above use.
+fn flat_spec(id: &str, dir: &std::path::Path) -> SandboxSpec {
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    SandboxSpec {
+        id: id.into(),
+        rw_binds: vec![(work.clone(), work.clone())],
+        ro_binds: vec![],
+        late_ro_binds: vec![],
+        home: dir.join("home"),
+        run_dir: dir.join("run"),
+        env: vec![],
+        cwd: work,
+    }
+}
+
+/// NT2: bwrap runs with the daemon's environment, which is the shell the user
+/// started it from, and `--clearenv` alone does not reach bwrap's own pid 1
+/// inside the namespace. Neither pid 1 (bwrap) nor pid 2 (init) may hold
+/// anything the daemon inherited, and init's children still get the base
+/// environment the backend builds.
+#[tokio::test]
+async fn nothing_from_the_daemon_environment_reaches_bwrap_or_init() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    std::env::set_var("BS_TEST_SECRET", "hunter2");
+    let dir = tempfile::tempdir().unwrap();
+    let handle = backend_for("linux_bwrap")
+        .start(&flat_spec("ws_nt2", dir.path()))
+        .await
+        .unwrap();
+    let (_, out) = run_in(
+        &handle,
+        "tr '\\0' '\\n' < /proc/1/environ; tr '\\0' '\\n' < /proc/2/environ",
+    )
+    .await;
+    assert!(
+        !out.contains("hunter2") && !out.contains("BS_TEST_SECRET"),
+        "the daemon's environment reached the sandbox's init or bwrap: {out}"
+    );
+    let user = std::env::var("USER").unwrap_or_else(|_| "bs".into());
+    let (code, out) = run_in(&handle, "echo \"$HOME\"; echo \"$PATH\"").await;
+    assert_eq!(code, 0, "{out}");
+    let mut lines = out.lines();
+    assert_eq!(
+        lines.next(),
+        Some(format!("/home/{user}").as_str()),
+        "{out}"
+    );
+    assert!(
+        lines
+            .next()
+            .is_some_and(|p| p.starts_with(&format!("/home/{user}/.local/bin:"))
+                && p.ends_with(":/usr/bin:/sbin:/bin")),
+        "PATH must be the one the backend sets: {out}"
+    );
+    handle.shutdown().await.unwrap();
+}
+
+/// NT3, the WSL case: the Windows drives under `/mnt` are not visible from a
+/// workspace whose repository lives elsewhere.
+#[tokio::test]
+async fn the_windows_drives_are_hidden_from_a_workspace_that_does_not_live_there() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    if !std::path::Path::new("/mnt/c").is_dir() {
+        eprintln!("SKIP: no /mnt/c on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let handle = backend_for("linux_bwrap")
+        .start(&flat_spec("ws_nt3", dir.path()))
+        .await
+        .unwrap();
+    let (code, out) = run_in(&handle, "ls /mnt/c 2>&1").await;
+    assert_ne!(code, 0, "/mnt/c is visible inside the sandbox: {out}");
+    assert!(out.contains("No such file"), "{out}");
+    let (code, out) = run_in(&handle, "ls -A /mnt 2>&1").await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        out.trim(),
+        "",
+        "/mnt must be empty inside the sandbox: {out}"
+    );
+    handle.shutdown().await.unwrap();
+}
+
+/// A place on the Windows side that every account can write to, where a test
+/// repository can live "under /mnt" the way a user's own repositories do.
+fn public_mnt_dir() -> Option<std::path::PathBuf> {
+    let public = std::path::Path::new("/mnt/c/Users/Public");
+    let probe = public.join(format!(".bs-probe-{}", std::process::id()));
+    std::fs::create_dir(&probe).ok()?;
+    std::fs::remove_dir(&probe).ok()?;
+    Some(public.to_path_buf())
+}
+
+/// NT3, the other WSL case: when the repository itself lives under `/mnt`,
+/// its `.git` and the worktree come back through their binds and nothing
+/// beside them does -- not the repository's own checkout, and not a sibling
+/// directory.
+#[tokio::test]
+async fn a_repo_under_mnt_exposes_only_its_git_dir_and_the_worktree() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let Some(public) = public_mnt_dir() else {
+        eprintln!("SKIP: /mnt/c/Users/Public is not writable (not WSL?)");
+        return;
+    };
+    let on_mnt = tempfile::Builder::new()
+        .prefix("bs-nt3-")
+        .tempdir_in(&public)
+        .unwrap();
+    let repo = common::init_repo(on_mnt.path());
+    let sibling = on_mnt.path().join("sibling");
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(sibling.join("marker.txt"), "not yours").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (daemon, ws, layout) = bwrap_workspace(dir.path(), &repo, "onmnt").await;
+    let handle = daemon.sandbox(&ws.id).unwrap();
+
+    // The worktree works, through the repository's `.git` under /mnt.
+    let (code, out) = run_in(
+        &handle,
+        &format!(
+            "cd '{}' && git rev-parse --abbrev-ref HEAD && git log -1 --format=%s",
+            ws.worktree_path
+        ),
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.lines().next(), Some("bs/onmnt/work"), "{out}");
+    let (code, _) = run_in(
+        &handle,
+        &format!("test -d '{}'", layout.git_common.display()),
+    )
+    .await;
+    assert_eq!(code, 0, "the repository's .git must be reachable");
+
+    // Nothing else under /mnt is.
+    for hidden in [
+        sibling.clone(),
+        repo.join("README.md"),
+        std::path::PathBuf::from("/mnt/c/Users/Public/Desktop"),
+    ] {
+        let (code, out) = run_in(&handle, &format!("ls '{}' 2>&1", hidden.display())).await;
+        assert_ne!(code, 0, "{} is visible: {out}", hidden.display());
+    }
+    let (code, out) = run_in(&handle, "ls -A /mnt/c/Users 2>&1").await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        out.trim(),
+        "Public",
+        "only the path to the repo exists: {out}"
+    );
+
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+}
+
+/// Removes a directory this test made under `/var/tmp`, on success and on a
+/// panic alike.
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// NT3: two workspaces of one daemon share a data directory, and one must not
+/// see the other's home, run dir (its exec socket above all) or worktree.
+///
+/// The data directory lives under `/var/tmp`, which the sandbox does not mask
+/// on its own: a tempdir under `/tmp` would be hidden by the `/tmp` tmpfs and
+/// prove nothing about the data directory.
+#[tokio::test]
+async fn a_workspace_cannot_see_its_siblings_under_the_data_dir() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let base = std::path::PathBuf::from(format!("/var/tmp/bs-nt3-{}", std::process::id()));
+    if std::fs::create_dir_all(&base).is_err() {
+        eprintln!("SKIP: /var/tmp is not writable");
+        return;
+    }
+    let _cleanup = RemoveOnDrop(base.clone());
+    let repo = common::init_repo(&base);
+    let data = base.join("data");
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let daemon = Daemon::new(
+        DataDirs::new(&data),
+        backend_for("linux_bwrap"),
+        server.event_bus(),
+    )
+    .unwrap();
+    let mut ids = Vec::new();
+    for name in ["a", "b"] {
+        let ws = lifecycle::create(
+            &daemon,
+            WorkspaceCreateParams {
+                repo_path: repo.to_string_lossy().into(),
+                base_branch: "main".into(),
+                name: name.into(),
+                init_if_missing: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+        ids.push(ws.id);
+    }
+    let (a, b) = (&ids[0], &ids[1]);
+    let handle = daemon.sandbox(a).unwrap();
+
+    // Its own paths are there.
+    for own in [
+        daemon.dirs.worktree(a),
+        daemon.dirs.objects(a),
+        std::path::PathBuf::from("/run/bs/exec.sock"),
+    ] {
+        let (code, out) = run_in(&handle, &format!("ls -d '{}' 2>&1", own.display())).await;
+        assert_eq!(code, 0, "{} must be visible: {out}", own.display());
+    }
+    // The other workspace's are not, nor is anything else in the data dir.
+    for hidden in [
+        daemon.dirs.home(b),
+        daemon.dirs.run(b),
+        daemon.dirs.worktree(b),
+        daemon.dirs.objects(b),
+        daemon.dirs.registry_file(),
+    ] {
+        let (code, out) = run_in(&handle, &format!("ls -d '{}' 2>&1", hidden.display())).await;
+        assert_ne!(
+            code,
+            0,
+            "{} is visible from workspace a: {out}",
+            hidden.display()
+        );
+        assert!(out.contains("No such file"), "{out}");
+    }
+    let sock = daemon.dirs.run(b).join("exec.sock");
+    assert!(sock.exists(), "b's exec socket exists on the host");
+    let (code, _) = run_in(&handle, &format!("test -S '{}'", sock.display())).await;
+    assert_ne!(code, 0, "workspace b's exec socket is reachable from a");
+
+    for id in &ids {
+        lifecycle::destroy(&daemon, id, true).await.unwrap();
+    }
+}
