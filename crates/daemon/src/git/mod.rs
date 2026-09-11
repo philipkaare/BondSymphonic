@@ -100,10 +100,21 @@ impl Git {
         self
     }
 
-    pub async fn run(&self, cwd: &Path, args: &[&str]) -> Result<GitOutput, RpcError> {
-        // The reported command names the subcommand only: the `-c` prefix is a
-        // fixed policy of this `Git`, not part of what the caller asked for.
-        let command = format!("git {}", args.join(" "));
+    /// The `git` every runner below starts from: this `Git`'s `-c` prefix, its
+    /// environment, the working directory and the three pipes.
+    ///
+    /// **The one place `LC_ALL` and `GIT_TERMINAL_PROMPT` are set.** Both are
+    /// load-bearing rather than tidiness, and a runner that forgot one would be
+    /// wrong in a way nothing shouts about: half the daemon's error handling
+    /// reads git's own wording — "not a git repository", "must be run in a work
+    /// tree", "does not exist in" — and a translated git turns every one of
+    /// those into an unexplained failure, while a git that may prompt hangs on a
+    /// credential question nobody is there to answer until the 60 s timeout.
+    /// Adding a fourth runner gets them by construction, which is the point.
+    ///
+    /// Stdin is `null` here; [`Git::run_with_stdin`] is the one caller that
+    /// overrides it.
+    fn command(&self, cwd: &Path, args: &[&str]) -> Command {
         let mut argv: Vec<&str> = Vec::with_capacity(self.config.len() * 2 + args.len());
         for c in &self.config {
             argv.push("-c");
@@ -122,19 +133,19 @@ impl Git {
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
-        let started = std::time::Instant::now();
-        let finished = tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await;
-        log_elapsed(args, cwd, started);
-        let out = match finished {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => return Err(git_error(&command, None, &e.to_string())),
-            Err(_) => return Err(git_error(&command, None, "timed out after 60s")),
-        };
+        cmd
+    }
+
+    pub async fn run(&self, cwd: &Path, args: &[&str]) -> Result<GitOutput, RpcError> {
+        let command = describe(args);
+        let mut cmd = self.command(cwd, args);
+        let out = timed(&command, args, cwd, async move {
+            cmd.output().await.map_err(|e| e.to_string())
+        })
+        .await?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        if !out.status.success() {
-            return Err(git_error(&command, out.status.code(), stderr.trim()));
-        }
+        succeeded(&command, out.status, &stderr)?;
         Ok(GitOutput { stdout, stderr })
     }
 
@@ -154,25 +165,9 @@ impl Git {
     ) -> Result<GitOutput, RpcError> {
         use tokio::io::AsyncWriteExt;
 
-        let command = format!("git {}", args.join(" "));
-        let mut argv: Vec<&str> = Vec::with_capacity(self.config.len() * 2 + args.len());
-        for c in &self.config {
-            argv.push("-c");
-            argv.push(c);
-        }
-        argv.extend_from_slice(args);
-        let mut cmd = Command::new("git");
-        cmd.args(&argv)
-            .current_dir(cwd)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("LC_ALL", "C")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        for (k, v) in &self.env {
-            cmd.env(k, v);
-        }
+        let command = describe(args);
+        let mut cmd = self.command(cwd, args);
+        cmd.stdin(Stdio::piped());
         let run = async {
             let mut child = cmd.spawn().map_err(|e| e.to_string())?;
             {
@@ -186,19 +181,10 @@ impl Git {
             }
             child.wait_with_output().await.map_err(|e| e.to_string())
         };
-        let started = std::time::Instant::now();
-        let finished = tokio::time::timeout(GIT_TIMEOUT, run).await;
-        log_elapsed(args, cwd, started);
-        let out = match finished {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => return Err(git_error(&command, None, &e)),
-            Err(_) => return Err(git_error(&command, None, "timed out after 60s")),
-        };
+        let out = timed(&command, args, cwd, run).await?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        if !out.status.success() {
-            return Err(git_error(&command, out.status.code(), stderr.trim()));
-        }
+        succeeded(&command, out.status, &stderr)?;
         Ok(GitOutput { stdout, stderr })
     }
 
@@ -224,25 +210,8 @@ impl Git {
     ) -> Result<GitBytes, RpcError> {
         use tokio::io::AsyncReadExt;
 
-        let command = format!("git {}", args.join(" "));
-        let mut argv: Vec<&str> = Vec::with_capacity(self.config.len() * 2 + args.len());
-        for c in &self.config {
-            argv.push("-c");
-            argv.push(c);
-        }
-        argv.extend_from_slice(args);
-        let mut cmd = Command::new("git");
-        cmd.args(&argv)
-            .current_dir(cwd)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("LC_ALL", "C")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        for (k, v) in &self.env {
-            cmd.env(k, v);
-        }
+        let command = describe(args);
+        let mut cmd = self.command(cwd, args);
         let read = async {
             let mut child = cmd.spawn().map_err(|e| e.to_string())?;
             // Both pipes were just configured above.
@@ -269,19 +238,65 @@ impl Git {
             let status = child.wait().await.map_err(|e| e.to_string())?;
             Ok::<_, String>((stdout, stderr, status))
         };
-        let started = std::time::Instant::now();
-        let finished = tokio::time::timeout(GIT_TIMEOUT, read).await;
-        log_elapsed(args, cwd, started);
-        let (stdout, stderr, status) = match finished {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => return Err(git_error(&command, None, &e)),
-            Err(_) => return Err(git_error(&command, None, "timed out after 60s")),
-        };
-        if !status.success() {
-            return Err(git_error(&command, status.code(), stderr.trim()));
-        }
+        let (stdout, stderr, status) = timed(&command, args, cwd, read).await?;
+        succeeded(&command, status, &stderr)?;
         Ok(GitBytes { stdout })
     }
+}
+
+/// A path as a git argument.
+///
+/// Lossy on purpose and in one place. Every runner above takes `&[&str]`, so a
+/// path has to become one somewhere, and a name with an unpaired surrogate in
+/// it is a file the daemon will fail to act on either way — with a replacement
+/// character in the argument, or with no argument at all. There used to be
+/// three of these, one per module, which is three chances to pick a different
+/// answer to the same question.
+pub fn path_arg(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// The command as the daemon reports it, which names the subcommand only: the
+/// `-c` prefix is a fixed policy of the `Git` that ran it, not part of what the
+/// caller asked for.
+fn describe(args: &[&str]) -> String {
+    format!("git {}", args.join(" "))
+}
+
+/// Awaits one git invocation under [`GIT_TIMEOUT`], times it, and flattens the
+/// two ways it can fail to produce output into one [`RpcError`].
+///
+/// Neither is an exit code: a git that could not be spawned and a git that ran
+/// past the timeout have no status to report, so both come back with `None`
+/// where the exit code goes. Whether the command *succeeded* is a separate
+/// question, asked by [`succeeded`] once there is a status to ask about.
+async fn timed<T>(
+    command: &str,
+    args: &[&str],
+    cwd: &Path,
+    run: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, RpcError> {
+    let started = std::time::Instant::now();
+    let finished = tokio::time::timeout(GIT_TIMEOUT, run).await;
+    log_elapsed(args, cwd, started);
+    match finished {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(git_error(command, None, &e)),
+        Err(_) => Err(git_error(command, None, "timed out after 60s")),
+    }
+}
+
+/// The tail every runner shares: a non-zero exit is the error, carrying git's
+/// own exit code and stderr so callers can tell its refusals apart.
+fn succeeded(
+    command: &str,
+    status: std::process::ExitStatus,
+    stderr: &str,
+) -> Result<(), RpcError> {
+    if !status.success() {
+        return Err(git_error(command, status.code(), stderr.trim()));
+    }
+    Ok(())
 }
 
 /// Copies into the main repository's object store every object reachable from
@@ -409,12 +424,22 @@ fn repo_locks() -> &'static parking_lot::Mutex<HashMap<PathBuf, Arc<tokio::sync:
     LOCKS.get_or_init(Default::default)
 }
 
-/// The lock for one repository. Canonicalised where the filesystem allows it,
+/// The lock for one repository. Canonicalised as far as the filesystem allows,
 /// so two workspaces created with differently spelled paths to the same
 /// repository still take the same lock.
+///
+/// [`repo::canonical_ish`] rather than `std::fs::canonicalize`, which answers
+/// nothing at all for a path whose last component does not exist yet — and that
+/// is exactly the path `workspace.create` with `init_if_missing` is given. With
+/// the raw path as the key, two creates naming one missing folder two ways each
+/// took a lock of its own, so neither waited for the other and both went on to
+/// `git init` the same directory.
 pub fn repo_lock(repo: &Path) -> Arc<tokio::sync::Mutex<()>> {
-    let key = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
-    repo_locks().lock().entry(key).or_default().clone()
+    repo_locks()
+        .lock()
+        .entry(repo::canonical_ish(repo))
+        .or_default()
+        .clone()
 }
 
 /// The merge or push happened, but the commits it brought in are still only in
@@ -526,6 +551,98 @@ mod tests {
         assert!(
             logs.contains(&dir.path().display().to_string()),
             "the working directory is part of the line: {logs}"
+        );
+    }
+
+    /// The C locale and the silenced terminal prompt reach every git the daemon
+    /// runs, whatever that `Git` was built with.
+    ///
+    /// Both are load-bearing: the daemon reads git's own wording in half a dozen
+    /// places, and a translated git turns each of those into an unexplained
+    /// failure, while a git allowed to prompt hangs on a credential question
+    /// until the 60 s timeout. Asserted on the builder rather than on a runner
+    /// because the builder is what a fourth runner would inherit them from.
+    #[test]
+    fn the_builder_gives_every_command_the_c_locale_and_no_terminal_prompt() {
+        let git = Git::new()
+            .with_env("GIT_ALTERNATE_OBJECT_DIRECTORIES", "/objects")
+            .with_config("core.hooksPath", "/nohooks");
+        for args in [&["status"][..], &["worktree", "prune"][..]] {
+            let cmd = git.command(Path::new("."), args);
+            let env: HashMap<String, Option<String>> = cmd
+                .as_std()
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect();
+            assert_eq!(env.get("LC_ALL"), Some(&Some("C".to_string())), "{args:?}");
+            assert_eq!(
+                env.get("GIT_TERMINAL_PROMPT"),
+                Some(&Some("0".to_string())),
+                "{args:?}"
+            );
+            // The caller's own environment is still there: the fixed pair is
+            // added to it, not instead of it.
+            assert_eq!(
+                env.get("GIT_ALTERNATE_OBJECT_DIRECTORIES"),
+                Some(&Some("/objects".to_string())),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// And they are set in exactly one place, so there is no second runner to
+    /// keep in step with the first.
+    ///
+    /// Read off the module's own source, because "only one place" is a property
+    /// of the text rather than of any value a test could call for. The test
+    /// module is cut off first, or this assertion would count itself.
+    #[test]
+    fn the_fixed_environment_is_set_in_exactly_one_place() {
+        let source = include_str!("mod.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production half");
+        for key in ["LC_ALL", "GIT_TERMINAL_PROMPT"] {
+            // The assignment, not every mention: the builder's own doc comment
+            // names both keys, and that is the documentation, not a second
+            // place they are set.
+            assert_eq!(
+                production.matches(&format!(".env(\"{key}\"")).count(),
+                1,
+                "{key} is set in more than one place; every git command has to get it from \
+                 `Git::command` alone"
+            );
+        }
+    }
+
+    /// Two spellings of one repository take one lock, even when the directory
+    /// is not there yet.
+    ///
+    /// The key used to be `std::fs::canonicalize`, which answers nothing at all
+    /// for a path whose last component is missing — and a missing path is
+    /// exactly what `workspace.create` with `init_if_missing` is given. Two
+    /// concurrent creates naming one missing folder two ways each took a lock of
+    /// its own, so neither waited for the other and both ran `git init`.
+    /// [`repo::canonical_ish`] resolves as much of the path as exists.
+    #[test]
+    fn two_spellings_of_one_missing_repository_take_the_same_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let plain = sub.join("not-there-yet");
+        let roundabout = sub.join("..").join("sub").join("not-there-yet");
+
+        assert!(
+            Arc::ptr_eq(&repo_lock(&plain), &repo_lock(&roundabout)),
+            "{} and {} are the same repository and must share one lock",
+            plain.display(),
+            roundabout.display()
         );
     }
 }
