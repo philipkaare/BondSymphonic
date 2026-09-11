@@ -1538,8 +1538,10 @@ mod cpp_widgets {
         fn bs_widget_test_changes_toolbar_cancels_a_switched_workspace() -> i32;
         fn bs_widget_test_changes_toolbar_acts_on_the_confirmed_workspace() -> i32;
         fn bs_widget_test_setup_page_detail_is_plain_text() -> i32;
+        fn bs_widget_test_setup_page_glyphs_are_inked_accents() -> i32;
         fn bs_widget_test_setup_page_closes_its_pty() -> i32;
         fn bs_widget_test_terminal_parses_its_rows_once_per_frame() -> i32;
+        fn bs_widget_test_terminal_error_ink_follows_the_palette() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1553,7 +1555,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 6] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 8] = [
             (
                 "EditorArea closes a tab under a destroyed workspace",
                 bs_widget_test_editor_area_survives_a_destroyed_workspace,
@@ -1571,12 +1573,20 @@ mod cpp_widgets {
                 bs_widget_test_setup_page_detail_is_plain_text,
             ),
             (
+                "SetupPage inks its row glyphs for the palette",
+                bs_widget_test_setup_page_glyphs_are_inked_accents,
+            ),
+            (
                 "SetupPage closes the PTY it opened",
                 bs_widget_test_setup_page_closes_its_pty,
             ),
             (
                 "TerminalWidget parses its rows once per frame",
                 bs_widget_test_terminal_parses_its_rows_once_per_frame,
+            ),
+            (
+                "TerminalWidget inks its error banner for the palette",
+                bs_widget_test_terminal_error_ink_follows_the_palette,
             ),
         ];
 
