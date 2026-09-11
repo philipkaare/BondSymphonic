@@ -30,9 +30,8 @@ use crate::daemon::Daemon;
 use crate::ids::new_id;
 use crate::sandbox::{ChildReader, SandboxCommand, SandboxHandle, Signaller};
 use crate::server::broadcast::EventBus;
+use crate::util::tail::{exit_detail, ExitCode, Layout, Tail};
 use bondsymphonic_proto::*;
-use futures::future::Shared;
-use futures::FutureExt;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -92,7 +91,6 @@ const BWRAP_BACKEND: &str = "linux_bwrap";
 /// and a Stop click already on its way.
 const ENDED_MEMORY: usize = 64;
 
-type Tail = Arc<Mutex<VecDeque<String>>>;
 /// The claimed `(workspace, config)` pairs, each with its run's stopping flag.
 type Claims = Arc<Mutex<HashMap<(WorkspaceId, String), Arc<AtomicBool>>>>;
 type Runs = Arc<Mutex<HashMap<RunId, Arc<Run>>>>;
@@ -125,7 +123,7 @@ struct Run {
     state: Mutex<RunState>,
     signal: Arc<Signaller>,
     /// The exit code, awaitable more than once.
-    exit: Shared<futures::future::BoxFuture<'static, i32>>,
+    exit: ExitCode,
     tail: Tail,
     /// Claimed by whichever of the supervisor and `stop` gets there first, so
     /// one run publishes exactly one terminal state.
@@ -371,10 +369,8 @@ impl RunManager {
             return Err(RpcError::internal("backend returned no pipes for the run"));
         };
 
-        let exit_rx = child.exit;
-        let exit: Shared<futures::future::BoxFuture<'static, i32>> =
-            async move { exit_rx.await.unwrap_or(-1) }.boxed().shared();
-        let tail: Tail = Arc::new(Mutex::new(VecDeque::new()));
+        let exit = crate::util::tail::exit_code(child.exit);
+        let tail = Tail::new(TAIL);
         let regex_hit = Arc::new(AtomicBool::new(false));
         let run = Arc::new(Run {
             id: id.clone(),
@@ -582,13 +578,7 @@ impl RunManager {
                         regex_hit.store(true, Ordering::SeqCst);
                     }
                 }
-                {
-                    let mut tail = tail.lock();
-                    if tail.len() == TAIL {
-                        tail.pop_front();
-                    }
-                    tail.push_back(line.clone());
-                }
+                tail.push(line.clone());
                 events.publish(
                     Some(ws.clone()),
                     Event::RunOutput {
@@ -757,7 +747,7 @@ async fn finish(
     let (state, detail) = if run.stopping.load(Ordering::SeqCst) {
         (RunState::Stopped, None)
     } else {
-        (state, Some(exit_detail(code, &run.tail)))
+        (state, Some(exit_detail(code, &run.tail, Layout::CodeFirst)))
     };
     publish(events, run, state, None, detail);
     release_claim(run);
@@ -1114,17 +1104,6 @@ fn shell_argv(command: &str) -> Vec<String> {
     }
 }
 
-fn exit_detail(code: i32, tail: &Tail) -> String {
-    let lines = tail.lock();
-    if lines.is_empty() {
-        return format!("exit code {code}");
-    }
-    format!(
-        "exit code {code}\n{}",
-        lines.iter().cloned().collect::<Vec<_>>().join("\n")
-    )
-}
-
 /// Lines out of a child's pipe, with a bound on how long one line may be.
 ///
 /// `AsyncBufReadExt::lines` would happily buffer a gigabyte for a process that
@@ -1343,17 +1322,18 @@ mod tests {
         }
     }
 
+    /// A run's detail leads with the status: the IDE is already showing the
+    /// whole log beside it, so what the detail adds is how the run ended.
     #[test]
     fn the_exit_detail_carries_the_code_and_the_last_lines() {
-        let tail: Tail = Arc::new(Mutex::new(VecDeque::from(vec![
-            "starting".to_string(),
-            "boom".to_string(),
-        ])));
-        let detail = exit_detail(3, &tail);
+        let tail = Tail::new(TAIL);
+        tail.push("starting".to_string());
+        tail.push("boom".to_string());
+        let detail = exit_detail(3, &tail, Layout::CodeFirst);
         assert!(detail.starts_with("exit code 3"), "{detail}");
         assert!(detail.contains("boom"), "{detail}");
         assert_eq!(
-            exit_detail(1, &Arc::new(Mutex::new(VecDeque::new()))),
+            exit_detail(1, &Tail::new(TAIL), Layout::CodeFirst),
             "exit code 1"
         );
     }

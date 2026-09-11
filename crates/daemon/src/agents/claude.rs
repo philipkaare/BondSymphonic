@@ -14,6 +14,7 @@ use super::claude_stream::{control_response_line, interrupt_line, parse_line, us
 use super::AgentSink;
 use crate::ids::new_id;
 use crate::sandbox::{ChildWriter, SandboxCommand, SandboxHandle, Signaller};
+use crate::util::tail::{exit_detail, ExitCode, Layout, Tail};
 use async_trait::async_trait;
 use bondsymphonic_proto::{
     AgentMessageBody, AgentStartOptions, AgentState, ErrorCode, PermissionDecision, RpcError,
@@ -21,7 +22,7 @@ use bondsymphonic_proto::{
 use futures::future::{FutureExt, Shared};
 use parking_lot::Mutex;
 use serde_json::Value;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -455,9 +456,6 @@ fn agent_error_because(reason: &str, msg: impl Into<String>) -> RpcError {
     agent_error(msg).with_data(serde_json::json!({ "reason": reason }))
 }
 
-/// The last few stderr lines, kept so an exit can say why.
-type StderrTail = Arc<Mutex<VecDeque<String>>>;
-
 /// Whether a transcript entry is the conversation itself moving, rather than
 /// something about it.
 ///
@@ -516,7 +514,7 @@ struct Running {
     stdin: tokio::sync::Mutex<Option<ChildWriter>>,
     signal: Arc<Signaller>,
     /// The exit code, awaitable more than once.
-    exit: Shared<futures::future::BoxFuture<'static, i32>>,
+    exit: ExitCode,
     reader_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
     /// Resolves when the stderr reader has seen end of input, so both of the
@@ -536,7 +534,8 @@ pub struct ClaudeAdapter {
     /// Permission requests the CLI has asked and nobody has answered. Shared
     /// with the reader task, which is what adds to it.
     pending_request_ids: Arc<Mutex<HashSet<String>>>,
-    stderr_tail: StderrTail,
+    /// The last few stderr lines, kept so an exit can say why.
+    stderr_tail: Tail,
     /// Claimed by whichever of the reader task and `stop` gets there first, so
     /// one process produces exactly one `Exited`.
     exit_announced: Arc<AtomicBool>,
@@ -574,7 +573,7 @@ impl ClaudeAdapter {
             cwd,
             child: None,
             pending_request_ids: Arc::new(Mutex::new(HashSet::new())),
-            stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            stderr_tail: Tail::new(STDERR_TAIL),
             exit_announced: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -649,26 +648,6 @@ impl ClaudeAdapter {
         }
         Ok(())
     }
-
-    /// What the agent said on its way out, with the exit code after it; just
-    /// the code when it said nothing.
-    ///
-    /// The stderr tail leads because it is the part a person can act on. The
-    /// commonest way for a Claude agent to die is dying immediately -- not
-    /// logged in, no API key, a bad flag -- and this string is what the
-    /// transcript's banner shows, so "Invalid API key" has to be the first
-    /// thing in it rather than the tail of a sentence about an exit code.
-    fn exit_detail(code: i32, tail: &StderrTail) -> String {
-        let tail = tail.lock();
-        if tail.is_empty() {
-            format!("exit code {code}")
-        } else {
-            format!(
-                "{} (exit code {code})",
-                tail.iter().cloned().collect::<Vec<_>>().join("\n")
-            )
-        }
-    }
 }
 
 #[async_trait]
@@ -696,9 +675,7 @@ impl AgentAdapter for ClaudeAdapter {
                 }
             };
 
-        let exit_rx = child.exit;
-        let exit: Shared<futures::future::BoxFuture<'static, i32>> =
-            async move { exit_rx.await.unwrap_or(-1) }.boxed().shared();
+        let exit = crate::util::tail::exit_code(child.exit);
 
         // stderr: warned line by line, and the tail kept for the exit detail.
         // This is where "not logged in" shows up.
@@ -712,11 +689,7 @@ impl AgentAdapter for ClaudeAdapter {
                     continue;
                 }
                 warn!(agent = %agent_id, "claude: {line}");
-                let mut tail = tail.lock();
-                if tail.len() == STDERR_TAIL {
-                    tail.pop_front();
-                }
-                tail.push_back(line);
+                tail.push(line);
             }
             // Dropped rather than sent on an abort, which the waiters read as
             // "finished" too — they are bounded anyway.
@@ -795,7 +768,7 @@ impl AgentAdapter for ClaudeAdapter {
             // turn comes back as a broken pipe instead of "this agent ended".
             let detail = match sink.entry().state() {
                 (AgentState::Error, Some(why)) => why,
-                _ => ClaudeAdapter::exit_detail(code, &tail),
+                _ => exit_detail(code, &tail, Layout::TailFirst),
             };
             // `stop` may be ending this same process; the flag makes one of the
             // two announce and the other stay quiet, so a process that exits on
@@ -972,7 +945,7 @@ impl AgentAdapter for ClaudeAdapter {
         running.stderr_task.abort();
         self.pending_request_ids.lock().clear();
         if !self.exit_announced.swap(true, Ordering::SeqCst) {
-            let detail = code.map(|c| Self::exit_detail(c, &self.stderr_tail));
+            let detail = code.map(|c| exit_detail(c, &self.stderr_tail, Layout::TailFirst));
             self.sink.state(AgentState::Exited, detail).await;
         }
         Ok(())
@@ -1529,15 +1502,18 @@ settings = \"s.json\"
         }
     }
 
+    /// An agent's detail leads with what the agent said, which is the layout
+    /// this adapter asks [`crate::util::tail::exit_detail`] for. The commonest
+    /// way for a Claude agent to die is dying immediately -- not logged in, no
+    /// API key, a bad flag -- and this string is what the transcript's banner
+    /// shows, so the reason has to come before the number.
     #[test]
     fn the_exit_detail_carries_the_stderr_tail() {
-        let tail: StderrTail = Arc::new(Mutex::new(VecDeque::new()));
-        assert_eq!(ClaudeAdapter::exit_detail(1, &tail), "exit code 1");
-        tail.lock().push_back("Invalid API key".to_owned());
-        // The tail leads: this is what the transcript banner shows, and the
-        // reason is more use than the number.
+        let tail = Tail::new(STDERR_TAIL);
+        assert_eq!(exit_detail(1, &tail, Layout::TailFirst), "exit code 1");
+        tail.push("Invalid API key".to_owned());
         assert_eq!(
-            ClaudeAdapter::exit_detail(1, &tail),
+            exit_detail(1, &tail, Layout::TailFirst),
             "Invalid API key (exit code 1)"
         );
     }
