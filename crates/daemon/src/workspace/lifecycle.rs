@@ -655,25 +655,27 @@ async fn create_the_workspace(
         objects_dir: d.dirs.objects(&id),
         no_hooks_dir: d.dirs.no_hooks(),
     };
-    if let Err(e) = worktree::create(&layout, &p.base_branch).await {
+    if let Err(failed) = worktree::create(&layout, &p.base_branch).await {
         // `worktree::create` unwinds whatever it managed to make, the branch
-        // included when the branch was its own. This is the rest of the
-        // workspace: the worktree directory and its registration, and never the
+        // included when the branch was its own. This is the safety net for the
+        // rest: the worktree directory and its registration, and never the
         // branch — `RemoveBranch::Never`, because a cleanup that cannot show the
         // branch is its own is a cleanup that must not run `git branch -D` on
         // somebody else's.
         //
-        // Except after a `Conflict`, which is the one failure that created
-        // nothing to clean up. It comes from the pre-check, before anything was
-        // made, or from the same-name race — where `worktree::create` has
-        // already unwound its own half. Running the cleanup anyway meant a
+        // Only when there is something to clean up, which `create` reports
+        // rather than leaving to be guessed at. Half of its refusals happen
+        // before it writes anything — a name already taken, a base branch that
+        // does not exist, a `branch_exists` that failed outright — and the
+        // other half unwind themselves. Running this anyway meant a
         // `git worktree prune` **on the user's repository**, and prune forgets
         // every registration whose directory is not there at that moment: a
         // worktree on an unmounted disk, or one the user had moved aside. Those
-        // are not this call's to lose over a name that was taken.
-        if e.code != ErrorCode::Conflict {
+        // are not this call's to lose over a typo in a branch name.
+        if failed.left == worktree::Leftovers::Something {
             let _ = worktree::remove_with(&layout, worktree::RemoveBranch::Never).await;
         }
+        let e = failed.error;
         // The client has already seen `Creating`. Tell it why the workspace failed, then
         // send the terminal `Destroying` event a real destroy ends on, so the workspace
         // disappears from the client's list instead of hanging there forever.

@@ -1427,6 +1427,56 @@ mod refused_create_touches_nothing {
 
         cancel.cancel();
     }
+
+    /// The same, for the refusal next door.
+    ///
+    /// `worktree::create` checks the base branch after the name and before it
+    /// makes anything, so a base branch that does not exist — an ordinary typo
+    /// in the dialog's branch box — is the identical "created nothing" state.
+    /// Reading the error *code* could not tell the two apart, which is how the
+    /// first version of this skip closed `Conflict` and left its sibling open;
+    /// `create` reports what it left behind instead.
+    #[tokio::test]
+    async fn a_create_with_a_base_branch_that_does_not_exist_prunes_nothing_either() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = common::init_repo(dir.path());
+
+        let side = dir.path().join("side");
+        let stashed = dir.path().join("side-stashed");
+        common::git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                &side.to_string_lossy(),
+            ],
+        );
+        std::fs::rename(&side, &stashed).unwrap();
+
+        let (port, token, _daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+        let mut c = Client::connect(port, &token).await;
+        let err = c
+            .call(Request::WorkspaceCreate(WorkspaceCreateParams {
+                repo_path: repo.to_string_lossy().into(),
+                base_branch: "no-such-branch".into(),
+                name: "alpha".into(),
+                init_if_missing: false,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams, "{err:?}");
+
+        let listed = common::git_out(&repo, &["worktree", "list", "--porcelain"]);
+        assert!(
+            listed.contains("side"),
+            "a create refused over its base branch pruned the user's own worktree              registration: {listed}"
+        );
+
+        cancel.cancel();
+    }
 }
 
 /// The git identity a workspace's sandbox home is seeded with.

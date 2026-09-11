@@ -219,6 +219,67 @@ fn branch_is_already_there(e: &RpcError) -> bool {
         })
 }
 
+/// What a failed [`create`] left behind for its caller to clean up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leftovers {
+    /// Nothing the caller's unwind would reach: either the call refused before
+    /// it made anything, or it has already taken back everything it made.
+    Nothing,
+    /// Directories, a branch or a worktree registration this call made and
+    /// could not take back itself.
+    Something,
+}
+
+/// A failed [`create`]: what went wrong, and whether anything is left of it.
+///
+/// The second half is a fact the caller cannot safely re-derive. Three of
+/// `create`'s refusals happen before it has made a directory, a branch or a
+/// registration — a name already taken, a base branch that does not exist, and
+/// a `branch_exists` that failed outright — and for each of those the caller's
+/// unwind would run `git worktree prune` **on the user's repository**, which
+/// forgets every registration whose directory is not there at that moment: a
+/// worktree on a disk that is not mounted, or one the user moved aside. Reading
+/// the error *code* instead cannot tell those three apart from a real failure
+/// halfway through, which is how the first version of this skip closed the
+/// `Conflict` and left its two siblings open.
+#[derive(Debug)]
+pub struct CreateFailed {
+    pub error: RpcError,
+    pub left: Leftovers,
+}
+
+impl CreateFailed {
+    /// For a refusal that happened before anything was made.
+    fn nothing(error: RpcError) -> Self {
+        Self {
+            error,
+            left: Leftovers::Nothing,
+        }
+    }
+
+    /// For a failure with no unwind of its own, after something was made.
+    fn something(error: RpcError) -> Self {
+        Self {
+            error,
+            left: Leftovers::Something,
+        }
+    }
+
+    /// For a failure [`create`] has already tried to unwind. Whether anything
+    /// is left is whether that unwind worked, which is the one honest answer —
+    /// and it keeps the caller's cleanup as the safety net for the case where
+    /// it did not.
+    fn after(unwind: Result<(), RpcError>, error: RpcError) -> Self {
+        Self {
+            error,
+            left: match unwind {
+                Ok(()) => Leftovers::Nothing,
+                Err(_) => Leftovers::Something,
+            },
+        }
+    }
+}
+
 /// The one answer for "that branch is somebody else's", whichever step found
 /// out. `workspace.create` turns it into the `Conflict` a client sees when a
 /// name is taken.
@@ -254,28 +315,39 @@ fn branch_conflict(branch: &str) -> RpcError {
 /// repository lock `workspace.create` holds is what keeps a second create of
 /// the same name out of the window in practice; [`branch_is_already_there`] is
 /// the part that has to stay current with git.
-pub async fn create(layout: &Layout, base_branch: &str) -> Result<(), RpcError> {
+pub async fn create(layout: &Layout, base_branch: &str) -> Result<(), CreateFailed> {
     let git = &layout.daemon_git();
-    if repo::branch_exists(git, &layout.repo, &layout.branch).await? {
+    // Everything down to the first `create_dir_all` is a question, not a write.
+    // A refusal from any of it leaves the caller nothing to unwind, and saying
+    // so is what keeps its cleanup — `git worktree prune` on the user's own
+    // repository — away from a call that only ever asked.
+    if repo::branch_exists(git, &layout.repo, &layout.branch)
+        .await
+        .map_err(CreateFailed::nothing)?
+    {
         // Nothing of ours exists yet, so nothing is cleaned up here: the
         // directories this `Layout` names are shared with whichever workspace
         // that branch belongs to.
-        return Err(branch_conflict(&layout.branch));
+        return Err(CreateFailed::nothing(branch_conflict(&layout.branch)));
     }
-    if !repo::branch_exists(git, &layout.repo, base_branch).await? {
-        return Err(RpcError::invalid_params(format!(
+    if !repo::branch_exists(git, &layout.repo, base_branch)
+        .await
+        .map_err(CreateFailed::nothing)?
+    {
+        return Err(CreateFailed::nothing(RpcError::invalid_params(format!(
             "base branch {base_branch} does not exist"
-        )));
+        ))));
     }
+    // From here on this call is making things, and a failure has to say so.
     for d in [
         layout.ref_dir(),
         layout.reflog_dir(),
         layout.objects_dir.clone(),
     ] {
-        std::fs::create_dir_all(&d).map_err(|e| RpcError::io(&e))?;
+        std::fs::create_dir_all(&d).map_err(|e| CreateFailed::something(RpcError::io(&e)))?;
     }
     if let Some(parent) = layout.worktree_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| RpcError::io(&e))?;
+        std::fs::create_dir_all(parent).map_err(|e| CreateFailed::something(RpcError::io(&e)))?;
     }
     if let Err(e) = git
         .run(
@@ -295,18 +367,24 @@ pub async fn create(layout: &Layout, base_branch: &str) -> Result<(), RpcError> 
         // same name created twice at once. Their branch and their checkout, so
         // only this call's own directories go.
         if branch_is_already_there(&e) {
-            let _ = remove_with(layout, RemoveBranch::Never).await;
-            return Err(branch_conflict(&layout.branch));
+            let unwound = remove_with(layout, RemoveBranch::Never).await;
+            return Err(CreateFailed::after(
+                unwound,
+                branch_conflict(&layout.branch),
+            ));
         }
-        let _ = remove_with(layout, RemoveBranch::Always).await;
-        return Err(e);
+        let unwound = remove_with(layout, RemoveBranch::Always).await;
+        return Err(CreateFailed::after(unwound, e));
     }
     if !layout.ref_dir().join("work").is_file() {
-        let _ = remove_with(layout, RemoveBranch::Always).await;
-        return Err(RpcError::internal(format!(
-            "expected loose ref at {}",
-            layout.ref_dir().join("work").display()
-        )));
+        let unwound = remove_with(layout, RemoveBranch::Always).await;
+        return Err(CreateFailed::after(
+            unwound,
+            RpcError::internal(format!(
+                "expected loose ref at {}",
+                layout.ref_dir().join("work").display()
+            )),
+        ));
     }
     Ok(())
 }
@@ -366,29 +444,43 @@ pub async fn remove_with(layout: &Layout, branch: RemoveBranch) -> Result<(), Rp
     // Whatever git left. Not being there is the ordinary case — git usually did
     // the job — but anything else is a directory still standing where the
     // daemon has just told a client the workspace is gone, so it is reported
-    // rather than swallowed.
-    match std::fs::remove_dir_all(&layout.worktree_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(RpcError::new(
+    // rather than swallowed. Windows gets a while to let go first: `destroy`
+    // kills the sandbox and its agents a few lines before this runs, and their
+    // handles outlive them by a moment.
+    let directory = crate::util::fs_retry::remove_dir_all(&layout.worktree_path)
+        .await
+        .map_err(|e| {
+            RpcError::new(
                 ErrorCode::IoError,
                 format!(
                     "cannot remove the worktree directory {}: {e}",
                     layout.worktree_path.display()
                 ),
-            ))
-        }
-    }
-    // With the directory gone and the lock off, this is what forgets the
-    // registration, whatever state the steps above left it in. The one command
-    // here whose failure is a failure: a registration that outlives its
-    // directory keeps the branch checked out, and `worktree add` refuses it
-    // until a human intervenes.
-    git.run(&layout.repo, &["worktree", "prune"]).await?;
-    if branch == RemoveBranch::Never {
-        return Ok(());
-    }
+            )
+        });
+    // The rest runs whatever the directory did, and the first failure of the
+    // three is reported at the end.
+    //
+    // Returning early on the directory would make a transient lock cost far
+    // more than the directory: the registration would outlive it, and a
+    // registration without a directory keeps the branch checked out and makes
+    // every later `worktree add` refuse — a state a human has to repair by
+    // hand. The prune and the branch deletion do not depend on the directory
+    // being gone, so there is no reason to make them hostage to it.
+    let pruned = git
+        .run(&layout.repo, &["worktree", "prune"])
+        .await
+        .map(|_| ());
+    let branched = match branch {
+        RemoveBranch::Never => Ok(()),
+        RemoveBranch::Always => remove_branch(git, layout).await,
+    };
+    directory.and(pruned).and(branched)
+}
+
+/// Deletes the workspace's branch, and the two directories named after the
+/// workspace name that go with it.
+async fn remove_branch(git: &Git, layout: &Layout) -> Result<(), RpcError> {
     if repo::branch_exists(git, &layout.repo, &layout.branch).await? {
         git.run(&layout.repo, &["branch", "-D", &layout.branch])
             .await?;

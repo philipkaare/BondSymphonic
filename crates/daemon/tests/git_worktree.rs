@@ -45,7 +45,12 @@ async fn create_makes_branch_worktree_and_writable_dirs() {
 
     // Creating again is a Conflict.
     let err = worktree::create(&layout, "main").await.unwrap_err();
-    assert_eq!(err.code, ErrorCode::Conflict);
+    assert_eq!(err.error.code, ErrorCode::Conflict);
+    assert_eq!(
+        err.left,
+        worktree::Leftovers::Nothing,
+        "a name that is already taken is refused before anything is made"
+    );
 }
 
 #[tokio::test]
@@ -258,5 +263,150 @@ async fn remove_takes_a_locked_worktree_with_it() {
     assert!(
         !listed.contains("ws_00000001"),
         "the registration outlived the worktree: {listed}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A worktree directory that will not go away.
+//
+// `workspace.destroy` stops the sandbox and its agent processes a few lines
+// before it removes the worktree, and on Windows a just-killed process can hold
+// handles inside that directory for a moment afterwards. The daemon opens that
+// window itself, so both shapes of it are pinned here: one that clears, and one
+// that does not.
+// ---------------------------------------------------------------------------
+
+/// Holds an open handle on `path` until `release` is set, *without* the delete
+/// share Rust's own `File::open` grants — which is what a handle from another
+/// program looks like, and the only kind that stops a delete.
+///
+/// Announces through `opened` that the handle is real before the test goes on,
+/// so nothing here depends on a thread being scheduled promptly.
+#[cfg(windows)]
+fn hold_a_handle(
+    path: std::path::PathBuf,
+    opened: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        // FILE_SHARE_READ only: no FILE_SHARE_DELETE, so the file cannot be
+        // unlinked while this handle is open.
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .expect("open the held file");
+        opened.store(true, Ordering::SeqCst);
+        while !release.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(f);
+    })
+}
+
+/// A handle that is released while the removal is still trying does not fail
+/// the destroy.
+///
+/// Success is impossible before the release — the handle is held until this
+/// test says so — so a green here is the retry doing its job and nothing else.
+#[cfg(windows)]
+#[tokio::test]
+async fn remove_waits_out_a_handle_that_is_about_to_be_released() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo_path = common::init_repo(dir.path());
+    let git = Git::new();
+    let layout = layout_for(dir.path(), &repo_path, "briefly-held").await;
+    worktree::create(&layout, "main").await.unwrap();
+
+    let (opened, release) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let holder = hold_a_handle(
+        layout.worktree_path.join("README.md"),
+        opened.clone(),
+        release.clone(),
+    );
+    while !opened.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    let held = Arc::clone(&release);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        held.store(true, Ordering::SeqCst);
+    });
+    worktree::remove(&layout).await.unwrap();
+    holder.join().unwrap();
+
+    assert!(!layout.worktree_path.exists());
+    assert!(
+        !repo::branch_exists(&git, &repo_path, "bs/briefly-held/work")
+            .await
+            .unwrap()
+    );
+}
+
+/// A handle that is *never* released fails the destroy — and the failure costs
+/// the directory only.
+///
+/// The registration and the branch go regardless. A registration that outlives
+/// its directory keeps the branch checked out and makes `worktree add` refuse
+/// until a human intervenes, so leaving one behind on the way out of a failure
+/// is worse than the failure: it turns a transient lock into a repository the
+/// user has to repair by hand.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_directory_that_will_not_go_still_costs_no_registration_and_no_branch() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo_path = common::init_repo(dir.path());
+    let git = Git::new();
+    let layout = layout_for(dir.path(), &repo_path, "stuck").await;
+    worktree::create(&layout, "main").await.unwrap();
+
+    let (opened, release) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let holder = hold_a_handle(
+        layout.worktree_path.join("README.md"),
+        opened.clone(),
+        release.clone(),
+    );
+    while !opened.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    let err = worktree::remove(&layout).await.unwrap_err();
+    release.store(true, Ordering::SeqCst);
+    holder.join().unwrap();
+
+    assert!(
+        err.message.contains("worktree directory"),
+        "the error has to name what would not go: {}",
+        err.message
+    );
+    let listed = git
+        .run(&repo_path, &["worktree", "list", "--porcelain"])
+        .await
+        .unwrap()
+        .stdout;
+    assert!(
+        !listed.contains("ws_00000001"),
+        "the registration outlived a failed removal: {listed}"
+    );
+    assert!(
+        !repo::branch_exists(&git, &repo_path, "bs/stuck/work")
+            .await
+            .unwrap(),
+        "the branch outlived a failed removal"
     );
 }
