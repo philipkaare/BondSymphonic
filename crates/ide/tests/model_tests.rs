@@ -499,6 +499,7 @@ fn a_restored_session_brings_back_the_claude_tab_with_its_agent() {
     let persisted = vec![PersistedGroup {
         name: "Backend".to_owned(),
         workspace_ids: vec!["ws_1".to_owned()],
+        tabs: Vec::new(),
     }];
     let model = Workspaces::from_persisted(&persisted, std::slice::from_ref(&w), Some("ws_1"));
     let tab = model.active().expect("the restored tab is active");
@@ -541,14 +542,17 @@ fn group_ids_are_unique_across_a_restore_a_rename_and_a_removal() {
         PersistedGroup {
             name: "Frontend".to_owned(),
             workspace_ids: vec!["ws_1".to_owned()],
+            tabs: Vec::new(),
         },
         PersistedGroup {
             name: "Backend".to_owned(),
             workspace_ids: vec!["ws_2".to_owned()],
+            tabs: Vec::new(),
         },
         PersistedGroup {
             name: "Platform".to_owned(),
             workspace_ids: vec!["ws_3".to_owned()],
+            tabs: Vec::new(),
         },
     ];
     let mut w = Workspaces::from_persisted(&persisted, &list, Some("ws_1"));
@@ -751,4 +755,128 @@ fn a_long_transcript_folds_its_oldest_items_into_one_load_earlier_block() {
         TranscriptItem::User { text } if text == "message 0"
     ));
     assert_eq!(t.earlier_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Task 9: tab selection after a close, and who owns the badge while the
+// sandbox is down.
+// ---------------------------------------------------------------------------
+
+/// Closing a tab selects the one beside it, not a tab in some other group.
+///
+/// The old repair only decremented `active_tab` when the removed tab was
+/// *before* the active one, so closing the active tab left the index pointing
+/// past the end of its group and the fallback jumped to the first non-empty
+/// group -- from the tab the user was working in to whatever happened to be
+/// first in the sidebar.
+#[test]
+fn closing_a_tab_selects_its_left_neighbour_in_the_same_group() {
+    let mut w = Workspaces::new_default();
+    w.add_tab(0, tab("ws_a", "a"));
+    let feature = w.add_group("Feature");
+    w.add_tab(feature, tab("ws_b", "b"));
+    w.add_tab(feature, tab("ws_c", "c"));
+    assert_eq!(w.active().map(|t| t.name.as_str()), Some("c"));
+
+    assert!(w.remove_workspace(&"ws_c".into()));
+    assert_eq!(
+        w.active().map(|t| t.name.as_str()),
+        Some("b"),
+        "the left neighbour in the group the user was working in"
+    );
+
+    // The only tab of a group: the first tab of the previous group, which is
+    // the one the sidebar shows above it.
+    assert!(w.remove_workspace(&"ws_b".into()));
+    assert_eq!(w.active().map(|t| t.name.as_str()), Some("a"));
+}
+
+/// With no group above it, the selection falls forward instead.
+#[test]
+fn closing_the_only_tab_of_the_first_group_falls_forward() {
+    let mut w = Workspaces::new_default();
+    w.add_tab(0, tab("ws_a", "a"));
+    let later = w.add_group("Later");
+    w.add_tab(later, tab("ws_b", "b"));
+    assert!(w.set_active(0, 0));
+
+    assert!(w.remove_workspace(&"ws_a".into()));
+    assert_eq!(w.active().map(|t| t.name.as_str()), Some("b"));
+}
+
+/// Closing a tab the user is not looking at leaves the selection where it is.
+#[test]
+fn closing_another_tab_does_not_move_the_selection() {
+    let mut w = Workspaces::new_default();
+    w.add_tab(0, tab("ws_a", "a"));
+    w.add_tab(0, tab("ws_b", "b"));
+    w.add_tab(0, tab("ws_c", "c"));
+    assert!(w.set_active(0, 2));
+
+    // One before the active tab: the index shifts, the workspace does not.
+    assert!(w.remove_workspace(&"ws_a".into()));
+    assert_eq!(w.active().map(|t| t.name.as_str()), Some("c"));
+    // One after it: nothing moves at all.
+    assert!(w.set_active(0, 0));
+    assert!(w.remove_workspace(&"ws_c".into()));
+    assert_eq!(w.active().map(|t| t.name.as_str()), Some("b"));
+}
+
+/// A sandbox that is down owns the tab's badge until the workspace is `Ready`
+/// again. An `agent.state` event arriving in the meantime is recorded but not
+/// shown: "working" painted over a sandbox that is not running says the
+/// opposite of what is true, and nothing clears it, because the recovery event
+/// the workspace sends is the one the tab has already stopped listening to.
+#[test]
+fn a_down_sandbox_keeps_the_badge_until_the_workspace_is_ready() {
+    let mut w = Workspaces::new_default();
+    w.add_tab(0, tab("ws_1", "alpha"));
+    let ws = WorkspaceId::from("ws_1");
+    let agent = AgentId("ag_1".into());
+    assert!(w.set_agent(&ws, agent.clone()));
+
+    w.apply_workspace_info(&info("ws_1", "alpha", WorkspaceState::SandboxDown));
+    assert_eq!(
+        w.active().map(|t| t.status),
+        Some(TabStatus::SandboxDown),
+        "the workspace's own news"
+    );
+
+    assert!(w
+        .set_agent_status(&agent, TabStatus::Working, "thinking")
+        .is_some());
+    let showing = w.active().expect("a tab");
+    assert_eq!(
+        showing.status,
+        TabStatus::SandboxDown,
+        "the workspace still owns the badge"
+    );
+    assert_eq!(
+        showing.agent_status,
+        Some(TabStatus::Working),
+        "the agent's own status is recorded all the same"
+    );
+    assert_eq!(showing.agent_detail, "thinking");
+
+    // Recovery hands the badge back, carrying what the agent last said.
+    w.apply_workspace_info(&info("ws_1", "alpha", WorkspaceState::Ready));
+    let showing = w.active().expect("a tab");
+    assert_eq!(showing.status, TabStatus::Working);
+    assert_eq!(showing.detail, "thinking");
+}
+
+/// A key pasted out of a browser or a terminal carries whitespace often enough
+/// that storing it verbatim is how a perfectly good key ends up rejected by the
+/// API, with nothing in the IDE to suggest why. A field holding nothing but
+/// spaces is an empty field, which means "leave the stored key alone".
+#[test]
+fn an_api_key_is_trimmed_before_it_is_stored() {
+    use bondsymphonic_ide::qobjects::settings::normalise_api_key;
+
+    assert_eq!(normalise_api_key(" sk-x "), Some("sk-x"));
+    assert_eq!(normalise_api_key("sk-x\r\n"), Some("sk-x"));
+    assert_eq!(normalise_api_key("\tsk-x"), Some("sk-x"));
+    assert_eq!(normalise_api_key("   "), None);
+    assert_eq!(normalise_api_key("\n"), None);
+    assert_eq!(normalise_api_key(""), None);
 }

@@ -33,15 +33,44 @@ pub const MAX_RECENT_REPOS: usize = 10;
 /// after the last change still has it on disk.
 pub const DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// What one tab remembers about itself beyond its place in a group.
+///
+/// Only the fields that are the IDE's own. The daemon is authoritative about
+/// what a workspace *is* -- its name, branch, worktree and agents are read back
+/// from `workspace.list` on every start -- but the command a terminal tab was
+/// opened with and the run configuration the user picked for it exist nowhere
+/// else, and before this they were lost on every restart.
+#[derive(Serialize, Deserialize, Default, PartialEq, Eq, Debug, Clone)]
+#[serde(default)]
+pub struct PersistedTab {
+    pub workspace_id: String,
+    /// The command a terminal tab runs, or `None` for the default shell.
+    pub command: Option<String>,
+    /// The run configuration the Run panel opens on for this workspace.
+    pub run_config: Option<String>,
+}
+
 /// One group as the file records it: a name and the workspaces in it, in the
-/// order the user left them. The tabs themselves are not stored -- the daemon
-/// is authoritative about what a workspace *is*, so only the arrangement is
-/// ours to remember.
+/// order the user left them.
+///
+/// `workspace_ids` is the membership and the order; `tabs` carries what the IDE
+/// remembers about the individual tabs, and only for the tabs that have
+/// anything to remember, so a group of ordinary tabs still writes one list of
+/// ids. A file from before `tabs` existed loads with it empty, which is exactly
+/// what "nothing was remembered" means.
 #[derive(Serialize, Deserialize, Default, PartialEq, Eq, Debug, Clone)]
 #[serde(default)]
 pub struct PersistedGroup {
     pub name: String,
     pub workspace_ids: Vec<String>,
+    pub tabs: Vec<PersistedTab>,
+}
+
+impl PersistedGroup {
+    /// What the file remembers about `workspace`, if anything.
+    pub fn tab(&self, workspace: &str) -> Option<&PersistedTab> {
+        self.tabs.iter().find(|t| t.workspace_id == workspace)
+    }
 }
 
 /// The groups plus which workspace was active, as `GroupModel::groupsJson`
@@ -137,6 +166,7 @@ impl StateFile {
         let live = |id: &String| live_workspace_ids.iter().any(|k| k == id);
         for group in &mut self.groups {
             group.workspace_ids.retain(&live);
+            group.tabs.retain(|t| live(&t.workspace_id));
         }
         self.open_editors.retain(|ws, _| live(ws));
         self.active_editor.retain(|ws, _| live(ws));
@@ -187,20 +217,34 @@ impl StateFile {
     /// This is how the controller keeps the file honest between the first
     /// `workspace.list` and the next report from the tab model.
     pub fn add_to_group(&mut self, group: &str, workspace: &str) {
+        // Whatever the old group remembered about the tab travels with it, so
+        // filing a workspace into the group the user asked for does not forget
+        // its command or its run configuration on the way.
+        let mut carried = None;
         for existing in &mut self.groups {
             existing.workspace_ids.retain(|id| id != workspace);
+            if let Some(idx) = existing
+                .tabs
+                .iter()
+                .position(|t| t.workspace_id == workspace)
+            {
+                carried = Some(existing.tabs.remove(idx));
+            }
         }
         let idx = match self.groups.iter().position(|g| g.name == group) {
             Some(idx) => idx,
             None => {
                 self.groups.push(PersistedGroup {
                     name: group.to_owned(),
-                    workspace_ids: Vec::new(),
+                    ..PersistedGroup::default()
                 });
                 self.groups.len() - 1
             }
         };
         self.groups[idx].workspace_ids.push(workspace.to_owned());
+        if let Some(tab) = carried {
+            self.groups[idx].tabs.push(tab);
+        }
         self.active_workspace = Some(workspace.to_owned());
     }
 
@@ -209,6 +253,7 @@ impl StateFile {
     pub fn forget_workspace(&mut self, workspace: &str) {
         for group in &mut self.groups {
             group.workspace_ids.retain(|id| id != workspace);
+            group.tabs.retain(|t| t.workspace_id != workspace);
         }
         self.open_editors.remove(workspace);
         self.active_editor.remove(workspace);
@@ -338,7 +383,10 @@ pub fn save(path: &Path, state: &StateFile) -> io::Result<()> {
     }
 }
 
-fn write_and_rename(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Writes `bytes` to `tmp`, flushes them to the device and renames `tmp` over
+/// `path`. `pub(crate)` because `settings.json` is written the same way and
+/// there is no reason for two copies of it in one crate.
+pub(crate) fn write_and_rename(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
     {
         use std::io::Write;
         let mut f = std::fs::File::create(tmp)?;

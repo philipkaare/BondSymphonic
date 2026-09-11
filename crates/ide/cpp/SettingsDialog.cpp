@@ -130,7 +130,7 @@ void SettingsDialog::accept() {
     // An empty field means "leave the stored key alone", which is what makes
     // the placeholder honest: a dialog opened to change the permission mode
     // must not wipe the key on the way out.
-    const QString key = m_apiKey->text();
+    const QString key = m_apiKey->text().trimmed();
     if (!key.isEmpty() && !m_controller->setApiKey(key)) {
         QMessageBox::warning(this, "Settings", "The key could not be stored in the Windows "
                                                "credential store, so it has not been saved.");

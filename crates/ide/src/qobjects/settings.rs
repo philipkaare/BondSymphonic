@@ -8,7 +8,7 @@
 //! it: every helper fetches it, hands it to one caller, and drops it.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Overrides where `settings.json` is read from and written to. **Test-only**:
 /// nothing in the shipped IDE sets it, and with it unset [`Settings::path`]
@@ -108,6 +108,56 @@ const KEYRING_USER: &str = "anthropic_api_key";
 /// the Claude CLI spells it, because it is passed through verbatim.
 const DEFAULT_PERMISSION_MODE: &str = "default";
 
+/// Why [`Settings::try_load`] could not answer with the user's settings.
+///
+/// It exists so a read-modify-write caller can tell "there is no file yet",
+/// which is an ordinary first run and reads as the defaults, from "there is a
+/// file and I could not read it", which is the one case where writing the
+/// defaults back destroys something.
+#[derive(Debug, thiserror::Error)]
+pub enum SettingsError {
+    /// The file is there and will not parse. It has been renamed to `backup`
+    /// -- `None` only when even that failed -- so nothing can overwrite it.
+    #[error("{path} is not readable JSON")]
+    Malformed {
+        path: PathBuf,
+        backup: Option<PathBuf>,
+    },
+    /// The file is there and could not be read at all: a permission, a
+    /// directory in its place, a disk that answered with an error.
+    #[error("{path} could not be read: {source}")]
+    Unreadable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+/// Renames an unreadable `settings.json` to `settings.json.bad-<timestamp>` and
+/// answers with where it went, or `None` when the rename itself failed.
+///
+/// A timestamp rather than a fixed suffix, and a counter behind it, because the
+/// alternative is a second bad file replacing the backup of the first -- which
+/// is the same loss this exists to prevent, one step further along.
+fn keep_aside(path: &Path) -> Option<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let name = path.file_name()?.to_owned();
+    for attempt in 0..100 {
+        let mut candidate = name.clone();
+        candidate.push(format!(".bad-{stamp}"));
+        if attempt > 0 {
+            candidate.push(format!("-{attempt}"));
+        }
+        let target = path.with_file_name(&candidate);
+        if target.exists() {
+            continue;
+        }
+        return std::fs::rename(path, &target).ok().map(|()| target);
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -127,7 +177,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            distro: "bondsymphonic".into(),
+            distro: crate::launcher::DEFAULT_DISTRO.into(),
             daemon_path: "~/.bondsymphonic/bin/bondsymphonic-daemon".into(),
             log_level: "info".into(),
             api_key_set: false,
@@ -154,22 +204,84 @@ impl Settings {
             .or_else(|| config_dir().map(|d| d.join("state.json")))
     }
 
-    pub fn load() -> Self {
+    /// The settings on disk, or the reason they could not be read.
+    ///
+    /// No file is not a reason: a first run has none and reads as the defaults.
+    /// A file that is there and will not parse *is* one, and it is moved aside
+    /// as `settings.json.bad-<timestamp>` before this returns, so the user's
+    /// own file survives whatever the caller does next.
+    pub fn try_load() -> Result<Self, SettingsError> {
         migrate_legacy_settings();
-        Self::path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let Some(path) = Self::path() else {
+            return Ok(Self::default());
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(source) => return Err(SettingsError::Unreadable { path, source }),
+        };
+        // Bytes that are not UTF-8 are corruption like any other and get the
+        // same move-aside; `read_to_string` would call them an I/O error and
+        // leave the file in place.
+        let parsed = std::str::from_utf8(&bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| serde_json::from_str::<Self>(raw).map_err(|e| e.to_string()));
+        match parsed {
+            Ok(settings) => Ok(settings),
+            Err(detail) => {
+                let backup = keep_aside(&path);
+                match &backup {
+                    Some(to) => tracing::warn!(
+                        "{} is not readable ({detail}); kept as {}",
+                        path.display(),
+                        to.display()
+                    ),
+                    None => tracing::warn!(
+                        "{} is not readable ({detail}) and could not be moved aside",
+                        path.display()
+                    ),
+                }
+                Err(SettingsError::Malformed { path, backup })
+            }
+        }
     }
 
+    /// The settings on disk, falling back to the defaults for anything that
+    /// went wrong. For the readers that have nothing to write back: a caller
+    /// that saves afterwards must use [`Settings::try_load`] instead, or it
+    /// writes the defaults over a file it never managed to read.
+    pub fn load() -> Self {
+        Self::try_load().unwrap_or_else(|e| {
+            tracing::warn!("{e}; using the default settings");
+            Self::default()
+        })
+    }
+
+    /// Writes the settings the way `state.json` is written: a unique temporary
+    /// beside the file, flushed to the device, then a rename. A crash or a
+    /// power cut mid-write leaves either the previous settings or the new ones,
+    /// never a truncated file that the next start has to move aside.
     pub fn save(&self) -> std::io::Result<()> {
         let Some(p) = Self::path() else {
             return Ok(());
         };
         if let Some(dir) = p.parent() {
-            std::fs::create_dir_all(dir)?;
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir)?;
+            }
         }
-        std::fs::write(p, serde_json::to_string_pretty(self).unwrap())
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = crate::model::persistence::temp_path(&p);
+        match crate::model::persistence::write_and_rename(&tmp, &p, json.as_bytes()) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // A stray temporary beside the real file reads as a
+                // half-written settings file to the next person to look.
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
     }
 
     /// Records whether a key is in the credential store, leaving every other
@@ -177,7 +289,17 @@ impl Settings {
     /// save so a dialog that only touched the key cannot revert a field some
     /// other part of the IDE has written since.
     pub fn record_api_key_set(present: bool) {
-        let mut settings = Self::load();
+        // `try_load`, not `load`: this writes the object back, so a settings
+        // file it could not read must stop it. Answering with the defaults and
+        // saving them is how a typo in a hand-edited file used to cost the user
+        // every other setting in it.
+        let mut settings = match Self::try_load() {
+            Ok(settings) => settings,
+            Err(e) => {
+                tracing::warn!("the API key flag was not recorded: {e}");
+                return;
+            }
+        };
         if settings.api_key_set == present {
             return;
         }
@@ -208,9 +330,9 @@ fn entry() -> Result<keyring::Entry, keyring::Error> {
 /// `key` is never logged, and never appears in the error text either: the
 /// `keyring` errors carry the *entry*'s identity, not its secret.
 pub fn set_api_key(key: &str) -> bool {
-    if key.is_empty() {
+    let Some(key) = normalise_api_key(key) else {
         return false;
-    }
+    };
     match entry().and_then(|e| e.set_password(key)) {
         Ok(()) => {
             Settings::record_api_key_set(true);
@@ -224,12 +346,26 @@ pub fn set_api_key(key: &str) -> bool {
     }
 }
 
+/// The key as it will be stored: surrounding whitespace removed, and `None`
+/// when nothing is left.
+///
+/// A key pasted out of a browser or a terminal carries a trailing newline often
+/// enough that storing it verbatim is how a perfectly good key ends up rejected
+/// by the API with nothing in the IDE to suggest why. A field holding nothing
+/// but spaces is an empty field, and an empty field means "leave the stored key
+/// alone", not "store this".
+pub fn normalise_api_key(raw: &str) -> Option<&str> {
+    let key = raw.trim();
+    (!key.is_empty()).then_some(key)
+}
+
 /// The stored key, or `None` when there is none. The only reader is
 /// `agent.start`'s option builder, which puts it straight into the request.
 pub fn api_key() -> Option<String> {
     match entry().and_then(|e| e.get_password()) {
-        Ok(key) if !key.is_empty() => Some(key),
-        Ok(_) => None,
+        // Trimmed on the way out too, so a key an earlier build stored with a
+        // trailing newline starts working rather than needing to be re-entered.
+        Ok(key) => normalise_api_key(&key).map(str::to_owned),
         // The ordinary "no key has been stored" answer, not a failure.
         Err(keyring::Error::NoEntry) => None,
         Err(e) => {

@@ -163,7 +163,111 @@ fn parse_endpoint(raw: &str) -> Result<SocketAddr, &'static str> {
     Ok(addr)
 }
 
-/// Reads the daemon's first stdout line, `{"port":N,"token":"..."}`.
+/// The WSL distro this IDE installs its daemon into, and the one a
+/// `\\wsl.localhost\<distro>\...` path has to name for [`wsl_path`] to be able
+/// to convert it. `Settings::distro` defaults to it.
+pub const DEFAULT_DISTRO: &str = "bondsymphonic";
+
+/// How many stdout lines are read while looking for the daemon's port line
+/// before the launch is given up on. Generous, because the lines before it are
+/// a shell profile's own output and there is no upper bound on how chatty one
+/// is; bounded all the same, so a profile that never stops talking fails in a
+/// second rather than holding the launch open for the whole timeout.
+pub const MAX_PORT_LINES: usize = 20;
+
+/// How long the daemon has to print its port line.
+pub const PORT_LINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Reads one line and decodes it with replacement characters, or `None` at the
+/// end of the stream.
+///
+/// Deliberately not `tokio::io::Lines`, which yields `Err(InvalidData)` for a
+/// line that is not UTF-8. Every caller here stops reading on an error, so one
+/// stray byte in a log line -- and those lines are whatever a tool inside the
+/// sandbox wrote, in whatever encoding it used -- would silence the rest of the
+/// stream for the life of the process.
+async fn next_lossy_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    if reader.read_until(b'\n', &mut buf).await? == 0 {
+        return Ok(None);
+    }
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
+
+/// Hands every line of `reader` to `emit` until the stream ends. Used for the
+/// daemon's stderr, which is a log the IDE relays and never parses.
+async fn drain_lines<R, F>(reader: R, mut emit: F)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: FnMut(String),
+{
+    let mut reader = BufReader::new(reader);
+    loop {
+        match next_lossy_line(&mut reader).await {
+            Ok(Some(line)) => emit(line),
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!("the daemon's stderr could not be read: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// What looking for the daemon's port line on its stdout came to.
+#[derive(Debug, PartialEq, Eq)]
+enum PortLine {
+    Found {
+        port: u16,
+        token: String,
+    },
+    /// Stdout closed without one, which means the daemon exited while starting.
+    Closed,
+    /// [`MAX_PORT_LINES`] lines went by and none of them was it.
+    NotAmongTheFirstLines,
+    /// The budget ran out with stdout still open and still silent.
+    TimedOut,
+}
+
+/// Reads the daemon's stdout looking for `{"port":N,"token":"..."}`.
+///
+/// Every line is tried, not just the first. A login shell prints its own
+/// output before the daemon says a word -- a version manager's banner, an MOTD,
+/// anything a `.bashrc` echoes -- and taking the first line as the port line
+/// turned that into "unexpected daemon first line" against a daemon that was
+/// starting perfectly well. The lines that are not it are relayed to the log,
+/// which is where such a banner belongs and where the user can read it if the
+/// launch does fail.
+async fn find_port_line<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    budget: std::time::Duration,
+) -> PortLine {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut reader = BufReader::new(reader);
+    for _ in 0..MAX_PORT_LINES {
+        let line = match tokio::time::timeout_at(deadline, next_lossy_line(&mut reader)).await {
+            Err(_elapsed) => return PortLine::TimedOut,
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => return PortLine::Closed,
+            Ok(Err(e)) => {
+                tracing::warn!("the daemon's stdout could not be read: {e}");
+                return PortLine::Closed;
+            }
+        };
+        if let Some((port, token)) = parse_port_line(&line) {
+            return PortLine::Found { port, token };
+        }
+        tracing::info!(target: "daemon", "{line}");
+    }
+    PortLine::NotAmongTheFirstLines
+}
+
+/// Reads the daemon's port line, `{"port":N,"token":"..."}`.
 pub fn parse_port_line(line: &str) -> Option<(u16, String)> {
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     let port = u16::try_from(v.get("port")?.as_u64()?).ok()?;
@@ -171,26 +275,98 @@ pub fn parse_port_line(line: &str) -> Option<(u16, String)> {
     Some((port, token))
 }
 
-/// `C:\git\x` becomes `/mnt/c/git/x`. Paths that are already POSIX are passed through.
-pub fn windows_path_to_wsl(p: &Path) -> Option<String> {
-    let s = p.to_string_lossy().replace('\\', "/");
+/// The two spellings Windows gives a path inside a WSL distro's own filesystem.
+const WSL_UNC_PREFIXES: [&str; 2] = [r"\\wsl.localhost\", r"\\wsl$\"];
+
+/// `s` without `prefix`, compared without regard to ASCII case. Windows path
+/// prefixes are not case sensitive, and `\\WSL$\` is a spelling people type.
+fn strip_prefix_ignoring_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
+}
+
+/// The path `distro` knows a Windows path by: `C:\git\x` is `/mnt/c/git/x`, and
+/// `\\wsl.localhost\<distro>\home\bs\x` is `/home/bs/x`. A path that is already
+/// POSIX is passed through.
+///
+/// The UNC form is what File Explorer and every Qt file dialog hand back for a
+/// repository kept inside the distro, and it is the shape the plain
+/// backslash-to-slash conversion got silently wrong: it left
+/// `//wsl.localhost/bondsymphonic/home/bs/x`, which looks like an absolute
+/// POSIX path, passed the leading-slash check, and reached the daemon as a
+/// directory that does not exist.
+///
+/// A UNC path naming a *different* distro is an error rather than a guess: its
+/// files are not reachable under any path inside ours, and the message names
+/// both distros so the user can see which one they picked.
+pub fn wsl_path(p: &Path, distro: &str) -> Result<String, String> {
+    let raw = p.to_string_lossy();
+    // Windows accepts either separator in a UNC prefix, so the comparison is
+    // made against a copy that spells them all one way.
+    let unc = raw.replace('/', "\\");
+    if let Some(rest) = WSL_UNC_PREFIXES
+        .iter()
+        .find_map(|prefix| strip_prefix_ignoring_case(&unc, prefix))
+    {
+        let (named, inside) = rest.split_once('\\').unwrap_or((rest, ""));
+        if !named.eq_ignore_ascii_case(distro) {
+            return Err(format!(
+                "{} is inside the WSL distro {named:?}, not {distro:?}",
+                p.display()
+            ));
+        }
+        return Ok(format!("/{}", inside.replace('\\', "/")));
+    }
+    if unc.starts_with("\\\\") {
+        return Err(format!(
+            "{} is a network path, which the distro cannot reach",
+            p.display()
+        ));
+    }
+    let s = raw.replace('\\', "/");
     if s.starts_with('/') {
-        return Some(s);
+        return Ok(s);
     }
     let mut chars = s.chars();
-    let drive = chars.next()?.to_ascii_lowercase();
-    if !drive.is_ascii_alphabetic() || chars.next()? != ':' {
-        return None;
+    let drive = match chars.next() {
+        Some(c) => c.to_ascii_lowercase(),
+        None => return Err("an empty path names nothing".to_owned()),
+    };
+    if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
+        return Err(format!(
+            "{} does not start with a drive letter",
+            p.display()
+        ));
     }
     let rest: String = chars.collect();
-    Some(format!("/mnt/{drive}{rest}"))
+    Ok(format!("/mnt/{drive}{rest}"))
+}
+
+/// [`wsl_path`] against [`DEFAULT_DISTRO`], for the callers with no
+/// [`LaunchSpec`] to hand. The reason a path was refused is logged rather than
+/// returned, and the answer is `None`.
+pub fn windows_path_to_wsl(p: &Path) -> Option<String> {
+    match wsl_path(p, DEFAULT_DISTRO) {
+        Ok(path) => Some(path),
+        Err(why) => {
+            tracing::warn!("{why}");
+            None
+        }
+    }
 }
 
 /// The shell wrapper lets `~` expand and picks up the user's PATH from .bashrc.
 pub fn command_for(spec: &LaunchSpec) -> (String, Vec<String>) {
+    // Both halves quoted. The line travels to `bash -lc` as one string, so a
+    // daemon installed under a path with a space in it -- which is what
+    // `C:\Program Files` becomes the moment a package is unzipped where Windows
+    // suggests -- would otherwise start the first half of its own path with the
+    // second half as a stray argument.
     let inner = format!(
         "exec {} --log-level {}",
-        spec.daemon_path_in_wsl, spec.log_level
+        quoted_distro_path(&spec.daemon_path_in_wsl),
+        single_quoted(&spec.log_level)
     );
     if cfg!(windows) {
         (
@@ -239,9 +415,16 @@ async fn wsl(spec: &LaunchSpec, script: &str) -> Result<String> {
 /// the quotes so tilde expansion still happens.
 fn quoted_distro_path(path: &str) -> String {
     match path.strip_prefix("~/") {
-        Some(rest) => format!("~/'{rest}'"),
-        None => format!("'{path}'"),
+        Some(rest) => format!("~/{}", single_quoted(rest)),
+        None => single_quoted(path),
     }
+}
+
+/// One single-quoted shell word. A single quote inside it is closed, escaped
+/// and reopened (`'\''`), which is the only way to carry one through single
+/// quotes and is why this is not an inline `format!`.
+fn single_quoted(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
 }
 
 /// Copies the local daemon binary into the distro when the installed copy is missing or
@@ -263,7 +446,7 @@ pub(crate) async fn install_daemon(spec: &LaunchSpec) -> Result<()> {
         return Ok(());
     }
     // `local` is a Linux ELF binary on a DrvFs mount, so both hashes are taken inside WSL.
-    let src = windows_path_to_wsl(local).context("bad local path")?;
+    let src = wsl_path(local, &spec.distro).map_err(|why| anyhow!(why))?;
     let dst = quoted_distro_path(&spec.daemon_path_in_wsl);
     let tmp = quoted_distro_path(&format!("{}.tmp", spec.daemon_path_in_wsl));
     // The parent directory is derived here rather than with `dirname` in the shell, so
@@ -318,25 +501,29 @@ pub async fn launch(spec: &LaunchSpec) -> Result<DaemonProcess> {
         .with_context(|| format!("spawning {prog}"))?;
     let stdout = child.stdout.take().context("no stdout")?;
     let stderr = child.stderr.take().context("no stderr")?;
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(l)) = lines.next_line().await {
-            tracing::info!(target: "daemon", "{l}");
-        }
-    });
-    let mut lines = BufReader::new(stdout).lines();
-    let first = tokio::time::timeout(std::time::Duration::from_secs(30), lines.next_line())
-        .await
-        .context("daemon did not print its port within 30s")??;
-    let Some(first) = first else {
+    tokio::spawn(drain_lines(stderr, |line| {
+        tracing::info!(target: "daemon", "{line}");
+    }));
+    let (port, token) = match find_port_line(stdout, PORT_LINE_TIMEOUT).await {
+        PortLine::Found { port, token } => (port, token),
         // Stdout closed with no port line: the daemon exited during start-up.
         // Reaped here so its exit code travels with the error -- that code is
         // how the caller tells a data directory another daemon owns from a
         // failure another launch could get past.
-        return Err(anyhow::Error::new(exit_of(&mut child).await));
+        PortLine::Closed => return Err(anyhow::Error::new(exit_of(&mut child).await)),
+        PortLine::TimedOut => {
+            return Err(anyhow!(
+                "the daemon did not print its port within {}s",
+                PORT_LINE_TIMEOUT.as_secs()
+            ))
+        }
+        PortLine::NotAmongTheFirstLines => {
+            return Err(anyhow!(
+                "the daemon printed {MAX_PORT_LINES} lines without its port line; \
+                 something in the distro's shell profile is writing to stdout"
+            ))
+        }
     };
-    let (port, token) =
-        parse_port_line(&first).ok_or_else(|| anyhow!("unexpected daemon first line: {first}"))?;
     let stdin = child.stdin.take();
     Ok(DaemonProcess {
         child,
@@ -438,8 +625,107 @@ mod tests {
         assert_eq!(parse_endpoint("[2001:db8::1]:9000"), Err(off_host));
     }
 
+    /// A byte that is not UTF-8 ends the line, not the stream. The old drain
+    /// used `Lines`, whose `Err(InvalidData)` ended the `while let` and with it
+    /// every daemon log line for the rest of the session.
+    #[tokio::test]
+    async fn the_stderr_drain_decodes_lossily_and_keeps_reading() {
+        let mut seen: Vec<String> = Vec::new();
+        drain_lines(&b"ok\n\xff\xfe\n more\n"[..], |line| seen.push(line)).await;
+        assert_eq!(seen.len(), 3, "got {seen:?}");
+        assert_eq!(seen[0], "ok");
+        assert_eq!(seen[1], "\u{fffd}\u{fffd}", "the bad line is still a line");
+        assert_eq!(seen[2], " more", "and the stream carries on past it");
+    }
+
+    #[tokio::test]
+    async fn the_port_line_is_found_past_a_chatty_shell_profile() {
+        let stdout = "hello\nnvm: using v20\n{\"port\":41234,\"token\":\"abc\"}\n";
+        assert_eq!(
+            find_port_line(stdout.as_bytes(), PORT_LINE_TIMEOUT).await,
+            PortLine::Found {
+                port: 41234,
+                token: "abc".into()
+            }
+        );
+
+        // Stdout closing with no port line is the daemon exiting during
+        // start-up, which the caller answers by reading its exit code.
+        assert_eq!(
+            find_port_line(&b"hello\n"[..], PORT_LINE_TIMEOUT).await,
+            PortLine::Closed
+        );
+
+        // A profile that never stops talking is given up on after a bounded
+        // number of lines rather than read for the whole budget.
+        let noise = "hello\n".repeat(MAX_PORT_LINES + 5);
+        assert_eq!(
+            find_port_line(noise.as_bytes(), PORT_LINE_TIMEOUT).await,
+            PortLine::NotAmongTheFirstLines
+        );
+    }
+
+    /// The budget still bounds the whole search, not each line.
+    #[tokio::test]
+    async fn a_silent_daemon_runs_out_of_budget() {
+        let (client, _server) = tokio::io::duplex(64);
+        assert_eq!(
+            find_port_line(client, std::time::Duration::from_millis(50)).await,
+            PortLine::TimedOut
+        );
+    }
+
+    /// A repository kept inside the distro is handed to the IDE as a UNC path,
+    /// and it has a real path inside the distro -- but only when the UNC names
+    /// the distro the daemon is running in.
+    #[test]
+    fn converts_wsl_unc_paths_for_this_distro_only() {
+        let ours = "bondsymphonic";
+        assert_eq!(
+            wsl_path(
+                std::path::Path::new(r"\\wsl.localhost\bondsymphonic\home\bs\repo"),
+                ours
+            ),
+            Ok("/home/bs/repo".to_owned())
+        );
+        // The older `\\wsl$\` spelling, and the case-insensitivity Windows
+        // applies to both the prefix and the distro name.
+        assert_eq!(
+            wsl_path(
+                std::path::Path::new(r"\\wsl$\bondsymphonic\home\bs\repo"),
+                ours
+            ),
+            Ok("/home/bs/repo".to_owned())
+        );
+        assert_eq!(
+            wsl_path(std::path::Path::new(r"\\WSL$\BondSymphonic\home\bs"), ours),
+            Ok("/home/bs".to_owned())
+        );
+
+        // Another distro's filesystem has no path inside ours, so it is refused
+        // and the message names the one that was picked.
+        let why = wsl_path(
+            std::path::Path::new(r"\\wsl.localhost\ubuntu\home\bs\repo"),
+            ours,
+        )
+        .expect_err("another distro cannot be reached");
+        assert!(why.contains("ubuntu"), "{why}");
+        assert!(why.contains(ours), "{why}");
+
+        // An ordinary network share is refused for the same reason.
+        assert!(wsl_path(std::path::Path::new(r"\\server\share\x"), ours).is_err());
+    }
+
     #[test]
     fn converts_windows_paths() {
+        // The UNC form goes through the default-distro wrapper too, which is
+        // what `AppController::wslPath` hands a file dialog's answer to.
+        assert_eq!(
+            windows_path_to_wsl(std::path::Path::new(
+                r"\\wsl.localhost\bondsymphonic\home\bs\repo"
+            )),
+            Some("/home/bs/repo".into())
+        );
         assert_eq!(
             windows_path_to_wsl(std::path::Path::new(r"C:\git\Bond")),
             Some("/mnt/c/git/Bond".into())
@@ -574,8 +860,28 @@ mod tests {
                 "--",
                 "bash",
                 "-lc",
-                "exec ~/.bondsymphonic/bin/bondsymphonic-daemon --log-level debug"
+                "exec ~/'.bondsymphonic/bin/bondsymphonic-daemon' --log-level 'debug'"
             ]
+        );
+    }
+
+    /// Neither half of the launch line may be pasted in bare. A daemon
+    /// installed under a path with a space in it -- `C:\Program Files` becomes
+    /// one the moment a package is unzipped where Windows suggests -- is two
+    /// words to `bash -lc`, and the daemon is started with the first half of
+    /// its own path and a stray argument.
+    #[test]
+    fn quotes_the_daemon_path_and_the_log_level() {
+        let spec = LaunchSpec {
+            distro: "bondsymphonic".into(),
+            daemon_path_in_wsl: "/opt/my dir/daemon".into(),
+            local_daemon_binary: None,
+            log_level: "debug".into(),
+        };
+        let (_prog, args) = command_for(&spec);
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("exec '/opt/my dir/daemon' --log-level 'debug'")
         );
     }
 }

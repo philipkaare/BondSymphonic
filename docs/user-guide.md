@@ -458,8 +458,19 @@ Three things worth knowing before you rely on this:
 active tab, the open editor tabs per workspace and which was in front, the
 splitter sizes and whether the two halves are swapped, the window geometry and
 dock layout, the recently used repositories, and the per-workspace run port
-overrides. It is written 500 ms after the last change and again on exit.
-`settings.json` sits beside it.
+overrides. It also records the command a terminal tab was opened with and the
+run configuration chosen for each workspace, since neither exists anywhere else.
+It is written 500 ms after the last change and again on exit. `settings.json`
+sits beside it.
+
+**Neither file is ever overwritten when it cannot be read.** A `state.json` that
+will not parse is renamed to `state.json.corrupt`, and a `settings.json` that
+will not parse is renamed to `settings.json.bad-<timestamp>`; the IDE then
+starts on the defaults and says so in the log. A hand-edited file with a typo in
+it therefore costs you that run's settings, not the file — open the kept copy,
+fix the typo and rename it back. Both files are written through a temporary file
+and a rename, so a crash or a power cut mid-write leaves the previous version
+rather than half of the new one.
 
 On start the IDE reconciles that file against the daemon: workspaces the daemon
 no longer has are dropped along with their editors and overrides, and workspaces

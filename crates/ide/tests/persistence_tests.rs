@@ -50,6 +50,7 @@ fn group(name: &str, ids: &[&str]) -> PersistedGroup {
     PersistedGroup {
         name: name.to_owned(),
         workspace_ids: ids.iter().map(|s| (*s).to_owned()).collect(),
+        tabs: Vec::new(),
     }
 }
 
@@ -537,4 +538,75 @@ fn saves_go_through_a_unique_temporary_and_leave_nothing_behind() {
             "the counter is not a number in {name:?}"
         );
     }
+}
+
+/// A `settings.json` that will not parse is kept, never overwritten.
+///
+/// The old `load` swallowed the parse error and answered with the defaults, and
+/// the next read-modify-write -- recording that an API key had been stored, say
+/// -- wrote those defaults straight over the file. One typo in a hand-edited
+/// settings file cost the user every setting in it, silently.
+#[test]
+fn a_malformed_settings_file_is_kept_aside_and_never_overwritten() {
+    use bondsymphonic_ide::qobjects::settings::{
+        Settings, SettingsError, LEGACY_SETTINGS_PATH_ENV, SETTINGS_PATH_ENV, STATE_PATH_ENV,
+    };
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = temp_dir("malformed-settings");
+    let path = dir.join("settings.json");
+    // A trailing comma: the commonest way a hand-edited JSON file stops parsing.
+    let original = r#"{"distro":"mine","log_level":"debug",}"#;
+    std::fs::write(&path, original).expect("a malformed settings file");
+    std::env::set_var(SETTINGS_PATH_ENV, &path);
+    std::env::remove_var(LEGACY_SETTINGS_PATH_ENV);
+    std::env::remove_var(STATE_PATH_ENV);
+
+    let backup = match Settings::try_load() {
+        Err(SettingsError::Malformed {
+            path: reported,
+            backup,
+        }) => {
+            assert_eq!(reported, path);
+            backup.expect("the unreadable file was moved aside")
+        }
+        other => panic!("a file that will not parse must not read as settings: {other:?}"),
+    };
+    assert!(!path.exists(), "the unreadable file is out of the way");
+    assert_eq!(
+        std::fs::read_to_string(&backup).expect("the kept copy"),
+        original,
+        "the user's own bytes, untouched"
+    );
+    assert!(
+        backup
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("settings.json.bad-")),
+        "kept as {}",
+        backup.display()
+    );
+
+    // And the read-modify-write that used to flatten it writes nothing at all.
+    std::fs::write(&path, original).expect("a second malformed settings file");
+    Settings::record_api_key_set(true);
+    assert!(
+        !path.exists(),
+        "record_api_key_set wrote a defaults file over settings it could not read"
+    );
+
+    // With no settings file at all there is nothing to lose, so the same call
+    // does write one: this is a first run, not a damaged file.
+    Settings::record_api_key_set(true);
+    let written = std::fs::read_to_string(&path).expect("a fresh settings file");
+    assert!(
+        written.contains("\"api_key_set\": true"),
+        "the fresh file records the key: {written}"
+    );
+    assert!(
+        written.contains("\"distro\""),
+        "and is a whole settings object: {written}"
+    );
+
+    std::env::remove_var(SETTINGS_PATH_ENV);
 }

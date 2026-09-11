@@ -1,6 +1,6 @@
 //! Pure-Rust application state. This module must never import Qt types.
 
-use crate::model::persistence::PersistedGroup;
+use crate::model::persistence::{PersistedGroup, PersistedTab};
 use bondsymphonic_proto::{
     AgentAdapterKind, AgentId, AgentState, AgentSummary, WorkspaceId, WorkspaceInfo, WorkspaceState,
 };
@@ -474,7 +474,16 @@ impl Workspaces {
                 if !placed.insert(info.id.as_str()) {
                     continue;
                 }
-                tabs.push(AgentTab::from_workspace_info(info));
+                let mut tab = AgentTab::from_workspace_info(info);
+                // The two fields the daemon knows nothing about. Everything
+                // else on the tab is rebuilt from `WorkspaceInfo`, on purpose;
+                // these exist only in `state.json`, so this is the one place
+                // they can come back from.
+                if let Some(saved) = persisted.tab(id) {
+                    tab.command = saved.command.clone();
+                    tab.run_config = saved.run_config.clone();
+                }
+                tabs.push(tab);
             }
             let id = model.allocate_group_id();
             model.groups.push(Group {
@@ -528,6 +537,18 @@ impl Workspaces {
             .map(|g| PersistedGroup {
                 name: g.name.clone(),
                 workspace_ids: g.tabs.iter().map(|t| t.workspace_id.0.clone()).collect(),
+                // Only the tabs with something of their own to remember, so a
+                // group of ordinary tabs does not write the id list twice.
+                tabs: g
+                    .tabs
+                    .iter()
+                    .filter(|t| t.command.is_some() || t.run_config.is_some())
+                    .map(|t| PersistedTab {
+                        workspace_id: t.workspace_id.0.clone(),
+                        command: t.command.clone(),
+                        run_config: t.run_config.clone(),
+                    })
+                    .collect(),
             })
             .collect()
     }
@@ -617,14 +638,29 @@ impl Workspaces {
         (group_idx, tab_idx)
     }
 
-    /// Removes the tab for `id` from whichever group holds it, fixing up the
-    /// active selection if it pointed at the removed tab (or beyond it).
+    /// Removes the tab for `id` from whichever group holds it and moves the
+    /// selection to the tab beside it.
+    ///
+    /// Beside, not "the first tab of the first non-empty group". Closing the
+    /// tab you are working in is the common case, and the old repair only
+    /// decremented the index when the removed tab came *before* the active one:
+    /// closing the active tab left the index past the end of its group, and the
+    /// fallback threw the user to the top of the sidebar. What is selected now
+    /// is the left neighbour, or the tab that has just taken the closed one's
+    /// place when there was nothing to its left, or -- when the group is empty
+    /// now -- the first tab of the nearest group above, and only failing that
+    /// the nearest one below.
     pub fn remove_workspace(&mut self, id: &WorkspaceId) -> bool {
         let Some((g, t)) = self.find(id) else {
             return false;
         };
+        let was_active = self.active_group == g && self.active_tab == t;
         self.groups[g].tabs.remove(t);
-        if self.active_group == g && self.active_tab > t {
+        if was_active {
+            self.select_beside(g, t);
+        } else if self.active_group == g && self.active_tab > t {
+            // An unrelated tab in the same group: the workspace in front has
+            // not changed, only the index it sits at.
             self.active_tab -= 1;
         }
         let active_valid = self
@@ -635,6 +671,27 @@ impl Workspaces {
             self.fallback_active();
         }
         true
+    }
+
+    /// Selects the tab next to the one just removed from `group` at `removed`.
+    /// See [`Workspaces::remove_workspace`] for the order and why it is that one.
+    fn select_beside(&mut self, group: usize, removed: usize) {
+        if let Some(last) = self.groups[group].tabs.len().checked_sub(1) {
+            self.active_group = group;
+            // `saturating_sub` is the "nothing to the left" case: index 0 now
+            // holds what was the removed tab's right-hand neighbour.
+            self.active_tab = removed.saturating_sub(1).min(last);
+            return;
+        }
+        let above = (0..group).rev().find(|i| !self.groups[*i].tabs.is_empty());
+        let below = (group + 1..self.groups.len()).find(|i| !self.groups[*i].tabs.is_empty());
+        match above.or(below) {
+            Some(gi) => {
+                self.active_group = gi;
+                self.active_tab = 0;
+            }
+            None => self.fallback_active(),
+        }
     }
 
     /// Moves the tab for `id` into the group named `group_name`, creating that
@@ -920,8 +977,19 @@ impl Workspaces {
         // hands this back when the workspace recovers.
         tab.agent_status = Some(status);
         tab.agent_detail = detail.to_owned();
-        tab.status = status;
-        tab.detail = detail.to_owned();
+        // The workspace's own news outranks the agent's while the sandbox is
+        // down. A tab reading "working" over a sandbox that is not running says
+        // the opposite of what is true, and nothing takes it back: the event
+        // that would, `workspace.state` going `Ready`, is the one the tab has
+        // already stopped deferring to. `SandboxDown` is the one status only a
+        // workspace can produce -- `TabStatus::from_agent_state` never yields
+        // it -- so testing for it needs no second copy of the workspace state.
+        // `apply_workspace_info` hands the badge back on recovery, carrying
+        // exactly what was recorded above.
+        if tab.status != TabStatus::SandboxDown {
+            tab.status = status;
+            tab.detail = detail.to_owned();
+        }
         Some((g, t))
     }
 
