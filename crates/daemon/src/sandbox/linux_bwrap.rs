@@ -1,12 +1,37 @@
 //! The bubblewrap backend: one long-lived `bwrap` per workspace, running
 //! [`super::init`] inside it, with every process spawned through the exec
 //! socket bound at `/run/bs/exec.sock`.
+//!
+//! # Why every `bwrap` is forked from one thread of our own
+//!
+//! The argv carries `--die-with-parent`, which is the safety net that stops a
+//! daemon killed with `SIGKILL` from leaving orphaned sandboxes behind: bwrap
+//! implements it with `prctl(PR_SET_PDEATHSIG, SIGKILL)`.
+//!
+//! `prctl(2)` is explicit that the parent-death signal fires when the
+//! **thread** that created the process terminates, not when the parent process
+//! exits. On a thread pool that is a trap. Tokio runs each multi-threaded
+//! worker as a task on its blocking pool, `tokio::task::block_in_place` hands
+//! the worker's core to a sibling thread, and the thread that lost the core
+//! goes back to the blocking pool — where an unused thread exits after
+//! `KEEP_ALIVE`, ten seconds. A `bwrap` forked from such a thread is SIGKILLed
+//! ten seconds later, taking the workspace's sandbox with it, and the only
+//! thing that hides it is a live PTY whose reads keep feeding the pool.
+//!
+//! So the fork does not happen on whatever thread happens to be polling
+//! [`BwrapBackend::start`]. [`on_the_spawner_thread`] hands it to one thread
+//! the process owns, started once and never joined, and every sandbox in the
+//! daemon's life is keyed to that. It costs one idle thread and it is immune
+//! to any future `block_in_place` or blocking-pool use anywhere upstream of a
+//! sandbox start — which is the point, because nothing about the create path
+//! would otherwise tell the next author that the fork's thread matters.
 
 use super::exec_client::ExecClient;
 use super::*;
 use bondsymphonic_proto::PrereqStatus;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 pub struct BwrapBackend {
     pub bwrap_path: PathBuf,
@@ -53,6 +78,63 @@ fn daemon_exe() -> PathBuf {
 
 fn whoami() -> String {
     std::env::var("USER").unwrap_or_else(|_| "bs".into())
+}
+
+/// A piece of work for the spawner thread. Boxed rather than a fixed
+/// "spawn this command" message so the unit tests can ask the thread about
+/// itself through the same path a real fork takes.
+type SpawnerJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// The name the one spawner thread carries, so it is recognisable in `top`,
+/// `/proc/<pid>/task/*/comm` and a debugger.
+const SPAWNER_THREAD: &str = "bs-bwrap-spawner";
+
+static SPAWNER: OnceLock<tokio::sync::mpsc::UnboundedSender<SpawnerJob>> = OnceLock::new();
+
+/// The sender for the process-wide spawner thread, starting it on first use.
+///
+/// The thread runs until the process ends: the only sender is this `static`,
+/// so the channel is never closed and `blocking_recv` never returns `None`.
+/// That is the whole point — see the module documentation. Thread names are
+/// capped at 15 bytes by the kernel, which [`SPAWNER_THREAD`] stays inside.
+fn spawner() -> &'static tokio::sync::mpsc::UnboundedSender<SpawnerJob> {
+    SPAWNER.get_or_init(|| {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SpawnerJob>();
+        std::thread::Builder::new()
+            .name(SPAWNER_THREAD.to_string())
+            .spawn(move || {
+                while let Some(job) = rx.blocking_recv() {
+                    job();
+                }
+            })
+            .expect("starting the bwrap spawner thread");
+        tx
+    })
+}
+
+/// Runs `f` on the spawner thread and awaits its answer.
+///
+/// The caller's runtime handle is entered around `f`, because
+/// `tokio::process::Command::spawn` registers the child with the runtime's
+/// process driver and panics without one, and the spawner thread is not part
+/// of any runtime itself. The job is pushed onto an unbounded channel, so
+/// nothing here blocks the worker that is waiting for the result.
+async fn on_the_spawner_thread<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, RpcError> {
+    let handle = tokio::runtime::Handle::current();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let job: SpawnerJob = Box::new(move || {
+        let _entered = handle.enter();
+        // The receiver is gone only if the awaiting task was cancelled, which
+        // is not this thread's problem: `f` has already run.
+        let _ = tx.send(f());
+    });
+    spawner()
+        .send(job)
+        .map_err(|_| sandbox_error("the bwrap spawner thread is gone".to_string()))?;
+    rx.await
+        .map_err(|_| sandbox_error("the bwrap spawner thread dropped the job".to_string()))
 }
 
 /// Where the daemon binary is bound when its own path is hidden inside the
@@ -292,15 +374,19 @@ impl SandboxBackend for BwrapBackend {
         // WSL, every Windows directory on the user's path. `bwrap_path`
         // defaults to the bare name `bwrap`, so a fixed lookup path is all
         // the spawn needs to resolve it.
-        let mut child = tokio::process::Command::new(&self.bwrap_path)
-            .args(&args)
+        let mut cmd = tokio::process::Command::new(&self.bwrap_path);
+        cmd.args(&args)
             .env_clear()
             .env("PATH", BWRAP_LOOKUP_PATH)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
+            .kill_on_drop(true);
+        // Not `cmd.spawn()` here: `--die-with-parent` keys the sandbox's life
+        // to the thread that forks it, and a tokio worker is not a thread this
+        // process controls the lifetime of. See the module documentation.
+        let mut child = on_the_spawner_thread(move || cmd.spawn())
+            .await?
             .map_err(|e| sandbox_error(format!("bwrap: {e}")))?;
         // bwrap's stderr is the only diagnostic when the sandbox refuses to
         // start, so it is drained into the log rather than left to fill a pipe,
@@ -382,6 +468,51 @@ impl SandboxHandle for BwrapHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cheap guard for what the module documentation explains: every fork
+    /// goes to one thread this process owns, whichever task asked and whatever
+    /// the scheduler was doing with it. A tokio worker would fail all three
+    /// assertions -- it is unnamed, it differs between tasks, and it can be
+    /// the very thread that is awaiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_bwrap_is_forked_from_one_thread_the_daemon_owns() {
+        let here = std::thread::current().id();
+        let first = on_the_spawner_thread(|| std::thread::current().id())
+            .await
+            .unwrap();
+        // From a spawned task, which is polled on a worker rather than on the
+        // thread `block_on` is running.
+        let second = tokio::spawn(async {
+            on_the_spawner_thread(|| std::thread::current().id())
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(first, second, "every fork must use the same thread");
+        assert_ne!(first, here, "the fork must leave the calling thread");
+        let name = on_the_spawner_thread(|| std::thread::current().name().map(str::to_string))
+            .await
+            .unwrap();
+        assert_eq!(name.as_deref(), Some(SPAWNER_THREAD));
+    }
+
+    /// The spawner thread is not part of any runtime, so a
+    /// `tokio::process::Command` spawned on it needs the caller's runtime
+    /// entered around it or it panics on the missing process driver.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_spawner_thread_can_spawn_a_tokio_process() {
+        let mut cmd = tokio::process::Command::new("true");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = on_the_spawner_thread(move || cmd.spawn())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(child.wait().await.unwrap().success());
+    }
 
     #[test]
     fn bwrap_args_follow_the_spec_layout() {
