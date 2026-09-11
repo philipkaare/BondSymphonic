@@ -5,6 +5,7 @@ pub mod ids;
 pub mod message;
 pub mod request;
 pub mod types;
+pub mod workspace_name;
 
 pub use error::*;
 pub use event::*;
