@@ -23,7 +23,7 @@
 ///
 /// A head that never ends is otherwise an unbounded allocation driven by the
 /// sandbox, and 64 KiB is far past any real request line and header block.
-pub(super) const MAX_HEAD_BYTES: usize = 64 * 1024;
+const MAX_HEAD_BYTES: usize = 64 * 1024;
 
 /// How long a request body may go without a byte moving in either direction
 /// before the exchange is abandoned.
@@ -54,16 +54,11 @@ pub(super) struct RequestHead {
 }
 
 /// Parses a request head, or `None` while the blank line ending it has not
-/// arrived yet.
+/// arrived yet, resuming the search for that blank line at `from`.
 ///
 /// A malformed request line is *not* reported as incomplete — that would leave
 /// the caller waiting on a client that has already finished — but as a head
 /// whose target [`target_host_port`] cannot resolve, which answers 400.
-fn parse_request_head(buf: &[u8]) -> Option<RequestHead> {
-    parse_request_head_from(buf, 0)
-}
-
-/// The same, resuming the search for the blank line at `from`.
 ///
 /// A reader that appends `n` bytes and re-scans from byte zero every time is
 /// quadratic in the size of the head, and the client driving it sits inside the
@@ -721,16 +716,16 @@ mod tests {
     use super::*;
 
     fn head(text: &str) -> RequestHead {
-        parse_request_head(text.as_bytes()).expect("a complete head")
+        parse_request_head_from(text.as_bytes(), 0).expect("a complete head")
     }
 
     /// The head is parsed off a stream, so it must say "not yet" rather than
     /// guess: a request line without its blank line may still be growing.
     #[test]
     fn a_head_parses_only_once_the_blank_line_has_arrived() {
-        assert!(parse_request_head(b"GET http://a/ HTTP/1.1\r\nHost: a\r\n").is_none());
-        assert!(parse_request_head(b"CONNECT a:443 HTTP/1.1\r\n").is_none());
-        assert!(parse_request_head(b"").is_none());
+        assert!(parse_request_head_from(b"GET http://a/ HTTP/1.1\r\nHost: a\r\n", 0).is_none());
+        assert!(parse_request_head_from(b"CONNECT a:443 HTTP/1.1\r\n", 0).is_none());
+        assert!(parse_request_head_from(b"", 0).is_none());
         let h = head("GET http://a/x HTTP/1.1\r\nHost: a\r\nAccept: */*\r\n\r\nbody");
         assert_eq!(
             (h.method.as_str(), h.target.as_str()),
@@ -885,7 +880,7 @@ mod tests {
         assert_eq!(head.target, "http://a/x");
         assert_eq!(head.headers, vec![("Host".to_string(), "a".to_string())]);
         // Resuming from an offset can never find *more* than starting at zero.
-        assert_eq!(parse_request_head(text.as_bytes()), Some(head));
+        assert_eq!(parse_request_head_from(text.as_bytes(), 0), Some(head));
     }
 
     /// A client that never sends the blank line gets no request out of the
@@ -893,7 +888,7 @@ mod tests {
     #[test]
     fn a_head_that_never_ends_is_never_parsed() {
         let junk = vec![b'x'; MAX_HEAD_BYTES + 1];
-        assert!(parse_request_head(&junk).is_none());
+        assert!(parse_request_head_from(&junk, 0).is_none());
     }
 
     /// Where one request's body ends is where the next request begins, so the

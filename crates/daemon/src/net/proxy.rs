@@ -49,7 +49,7 @@ use crate::net::http::text_response;
 #[cfg(unix)]
 use crate::net::http::{
     bad_gateway, bad_request, body_framing, origin_form, read_head, relay_exchange,
-    request_timeout, target_host_port, wants_close, Relayed, MAX_HEAD_BYTES,
+    request_timeout, target_host_port, wants_close, Relayed,
 };
 use crate::server::broadcast::EventBus;
 #[cfg(unix)]
