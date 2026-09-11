@@ -418,10 +418,26 @@ impl PtyManager {
     /// ignore and go on running after the worktree under it has been deleted.
     /// The workspace is on its way out, so there is nothing to be polite to:
     /// after one [`SIGNAL_GRACE`] whatever is still registered gets the signal
-    /// ladder, on every backend. The ladders run detached, so a destroy is not
-    /// held up by them.
+    /// ladder, on every backend.
+    ///
+    /// **This does not wait for the processes to go.** Each ladder runs in a
+    /// task of its own and this returns as soon as every terminal has been
+    /// asked, so a `workspace.destroy` that calls it goes straight on to remove
+    /// the worktree with the last of the terminals possibly still dying. That
+    /// is deliberate, and it is the difference between a destroy that answers
+    /// at once and one that spends a second per open terminal doing nothing:
+    /// the ladder itself is what guarantees they go, and nothing the destroy
+    /// does afterwards needs them gone first. A worktree removal is not blocked
+    /// by a process whose working directory is inside it, and [`close_host`],
+    /// which *does* await its grace, has the opposite reason -- it runs on the
+    /// way out of the daemon, where a task nobody waits for is a task that
+    /// never runs.
+    ///
+    /// A caller that has to know a workspace's terminals are really gone has to
+    /// watch for their `pty.exit` events; this answering is not that promise.
     ///
     /// [`close`]: PtyManager::close
+    /// [`close_host`]: PtyManager::close_host
     pub async fn close_workspace(&self, ws: &WorkspaceId) {
         let victims: Vec<(PtyId, Arc<Session>)> = self
             .sessions

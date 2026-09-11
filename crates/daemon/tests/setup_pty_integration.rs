@@ -590,7 +590,12 @@ async fn a_host_terminal_is_closed_when_the_connection_that_opened_it_drops() {
 
     drop(opener);
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    // Twice the ladder, not the length of it. Losing the connection fires the
+    // backend's killer, waits one `SIGNAL_GRACE`, then sends SIGTERM and waits
+    // another before SIGKILL -- about a second, plus however long the process
+    // takes to die. A deadline set to what the ladder costs is a deadline this
+    // test fails on a loaded machine for no reason at all.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
     let mut gone = false;
     while !gone && tokio::time::Instant::now() < deadline {
         gone = matches!(

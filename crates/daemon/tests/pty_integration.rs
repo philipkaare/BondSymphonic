@@ -455,7 +455,13 @@ async fn closing_a_workspace_ends_a_terminal_that_ignores_hangups() {
 
     // The session retires as soon as the pump sees the child exit, so a write
     // that faults is proof the process is really gone rather than merely asked.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    //
+    // Twice the ladder, not the length of it: `close_workspace` returns before
+    // the ladder has even started, and the ladder is a killer this command
+    // ignores, one `SIGNAL_GRACE`, a SIGTERM it also ignores, another, and then
+    // SIGKILL. A deadline set to what that costs is one a loaded machine fails
+    // for no reason at all.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
     let mut gone = false;
     while !gone && tokio::time::Instant::now() < deadline {
         gone = matches!(
