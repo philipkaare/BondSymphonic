@@ -304,7 +304,11 @@ const MAX_HOST_LEN: usize = 253;
 /// mistake in it leaves the old list in place rather than half-applying it. What
 /// gets stored is the canonical form [`HostPattern`] produces, so the IDE sees
 /// back exactly what the proxy will match.
-pub fn set_allowlist(d: &Daemon, id: &WorkspaceId, hosts: &[String]) -> Result<Empty, RpcError> {
+pub async fn set_allowlist(
+    d: &Daemon,
+    id: &WorkspaceId,
+    hosts: &[String],
+) -> Result<Empty, RpcError> {
     if hosts.len() > MAX_ALLOWLIST_ENTRIES {
         return Err(RpcError::invalid_params(format!(
             "an allowlist may hold at most {MAX_ALLOWLIST_ENTRIES} entries, not {}",
@@ -322,7 +326,10 @@ pub fn set_allowlist(d: &Daemon, id: &WorkspaceId, hosts: &[String]) -> Result<E
         let pattern = HostPattern::parse(host).map_err(RpcError::invalid_params)?;
         patterns.push(pattern.as_str().to_string());
     }
-    let ws = d.registry.update(id, |w| w.allowlist = patterns.clone())?;
+    let ws = d
+        .registry
+        .update(id, |w| w.allowlist = patterns.clone())
+        .await?;
     d.proxies
         .set_allowlist(id, Allowlist::from_strings(&ws.allowlist));
     d.emit_state(&ws);
@@ -370,7 +377,7 @@ fn watch_sandbox(
         // the listener it is about to need.
         d.proxies.stop_generation(&id, proxy);
         tracing::warn!(ws = %id, "sandbox died");
-        let _ = d.set_state(&id, WorkspaceState::SandboxDown);
+        let _ = d.set_state(&id, WorkspaceState::SandboxDown).await;
     });
 }
 
@@ -504,12 +511,14 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
 
     seed_home(d, &ws).await;
     match start_sandbox(d, &ws).await {
-        Ok(()) => Ok(d.workspace_info(&d.set_state(&ws.id, WorkspaceState::Ready)?)),
+        Ok(()) => Ok(d.workspace_info(&d.set_state(&ws.id, WorkspaceState::Ready).await?)),
         Err(e) => {
-            let ws = d.set_state(
-                &ws.id,
-                WorkspaceState::Error(format!("sandbox failed: {}", e.message)),
-            )?;
+            let ws = d
+                .set_state(
+                    &ws.id,
+                    WorkspaceState::Error(format!("sandbox failed: {}", e.message)),
+                )
+                .await?;
             Ok(d.workspace_info(&ws))
         }
     }
@@ -643,6 +652,7 @@ async fn create_the_workspace(
     };
     d.registry
         .insert(ws.clone())
+        .await
         .map_err(|e| RpcError::internal(e.to_string()))?;
     d.emit_state(&ws);
 
@@ -679,9 +689,11 @@ async fn create_the_workspace(
         // The client has already seen `Creating`. Tell it why the workspace failed, then
         // send the terminal `Destroying` event a real destroy ends on, so the workspace
         // disappears from the client's list instead of hanging there forever.
-        let _ = d.set_state(&id, WorkspaceState::Error(e.message.clone()));
-        let _ = d.set_state(&id, WorkspaceState::Destroying);
-        let _ = d.registry.remove(&id);
+        let _ = d
+            .set_state(&id, WorkspaceState::Error(e.message.clone()))
+            .await;
+        let _ = d.set_state(&id, WorkspaceState::Destroying).await;
+        let _ = d.registry.remove(&id).await;
         d.dirs.remove_workspace(&id);
         return Err(e);
     }
@@ -756,7 +768,7 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
             .with_data(serde_json::json!({ "dirty": dirty, "unmerged": unmerged })));
         }
     }
-    d.set_state(id, WorkspaceState::Destroying)?;
+    d.set_state(id, WorkspaceState::Destroying).await?;
     // Runs first: each one holds a bridge on the host as well as a process in
     // the sandbox, and the bridge would outlive the workspace it belongs to.
     // Stopping them here also means the last `run.state` a client sees is
@@ -800,10 +812,12 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
             // The ptys are closed and the sandbox is down, so the workspace must not be
             // left stranded in `Destroying`: a client would wait on a state that never
             // arrives.
-            let _ = d.set_state(
-                id,
-                WorkspaceState::Error(format!("destroy failed: {}", e.message)),
-            );
+            let _ = d
+                .set_state(
+                    id,
+                    WorkspaceState::Error(format!("destroy failed: {}", e.message)),
+                )
+                .await;
             return Err(e);
         }
     }
@@ -816,6 +830,7 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
     d.dirs.remove_workspace(id);
     d.registry
         .remove(id)
+        .await
         .map_err(|e| RpcError::internal(e.to_string()))?;
     Ok(Empty {})
 }

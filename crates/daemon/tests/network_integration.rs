@@ -984,7 +984,9 @@ async fn a_sandboxed_process_reaches_the_host_only_through_the_allowlisting_prox
     // Through the proxy, once the host is allowed. `NO_PROXY` is cleared for
     // this probe only: the sandbox is told to reach loopback directly so the
     // port bridge works, and the upstream here is deliberately on loopback.
-    lifecycle::set_allowlist(&daemon, &ws.id, &["127.0.0.1".to_string()]).unwrap();
+    lifecycle::set_allowlist(&daemon, &ws.id, &["127.0.0.1".to_string()])
+        .await
+        .unwrap();
     let fetch = format!(
         "import urllib.request, urllib.error\n\
          try:\n    print(urllib.request.urlopen('http://127.0.0.1:{upstream}/', timeout=10).read().decode())\n\
@@ -1001,7 +1003,9 @@ async fn a_sandboxed_process_reaches_the_host_only_through_the_allowlisting_prox
     assert_eq!(out.trim(), "ok", "{out}");
 
     // Take the host away again and the same fetch is refused, by the proxy.
-    lifecycle::set_allowlist(&daemon, &ws.id, &[]).unwrap();
+    lifecycle::set_allowlist(&daemon, &ws.id, &[])
+        .await
+        .unwrap();
     let (code, out) = run_in(
         &daemon,
         &ws.id,

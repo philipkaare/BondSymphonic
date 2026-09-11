@@ -594,7 +594,9 @@ async fn agent_start_refuses_a_terminal_adapter_and_an_unready_workspace() {
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidParams, "{e:?}");
 
-    d.set_state(&ws.id, WorkspaceState::SandboxDown).unwrap();
+    d.set_state(&ws.id, WorkspaceState::SandboxDown)
+        .await
+        .unwrap();
     let e = c
         .call(Request::AgentStart(AgentStartParams {
             workspace_id: ws.id.clone(),

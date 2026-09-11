@@ -85,7 +85,7 @@ impl Handler for WorkspaceHandler {
             // defaults: this is the user saying what the workspace may reach,
             // and taking a host away has to be possible.
             Request::WorkspaceSetAllowlist(p) => {
-                ok(lifecycle::set_allowlist(d, &p.workspace_id, &p.hosts)?)
+                ok(lifecycle::set_allowlist(d, &p.workspace_id, &p.hosts).await?)
             }
             Request::WorkspaceChanges(p) => ok(changes::changes(d, &p.workspace_id).await?),
             Request::WorkspaceDiff(p) => ok(changes::diff(d, &p.workspace_id, &p.path).await?),

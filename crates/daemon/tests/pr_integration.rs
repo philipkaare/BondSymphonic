@@ -320,6 +320,7 @@ async fn create_pr_refuses_a_workspace_that_is_not_ready() {
     commit_in_ws(&daemon, &ws, "alpha.txt", "alpha work").await;
     daemon
         .set_state(&ws.id, WorkspaceState::SandboxDown)
+        .await
         .unwrap();
 
     let err = c

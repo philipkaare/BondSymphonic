@@ -315,12 +315,12 @@ impl Daemon {
         );
     }
 
-    pub fn set_state(
+    pub async fn set_state(
         &self,
         id: &WorkspaceId,
         state: WorkspaceState,
     ) -> Result<Workspace, RpcError> {
-        let ws = self.registry.update(id, |w| w.state = state)?;
+        let ws = self.registry.update(id, |w| w.state = state).await?;
         self.emit_state(&ws);
         Ok(ws)
     }
@@ -352,19 +352,21 @@ impl Daemon {
     pub async fn restore_workspaces(self: &Arc<Self>) {
         for ws in self.registry.list() {
             if !ws.worktree_path.exists() {
-                let _ = self.set_state(
-                    &ws.id,
-                    WorkspaceState::Error("worktree directory is missing".into()),
-                );
+                let _ = self
+                    .set_state(
+                        &ws.id,
+                        WorkspaceState::Error("worktree directory is missing".into()),
+                    )
+                    .await;
                 continue;
             }
             match lifecycle::start_sandbox(self, &ws).await {
                 Ok(()) => {
-                    let _ = self.set_state(&ws.id, WorkspaceState::Ready);
+                    let _ = self.set_state(&ws.id, WorkspaceState::Ready).await;
                 }
                 Err(e) => {
                     tracing::warn!(ws = %ws.id, "sandbox restore failed: {e}");
-                    let _ = self.set_state(&ws.id, WorkspaceState::SandboxDown);
+                    let _ = self.set_state(&ws.id, WorkspaceState::SandboxDown).await;
                 }
             }
         }

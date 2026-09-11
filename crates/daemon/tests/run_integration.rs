@@ -1186,7 +1186,7 @@ port = {port}
     // back to `Ready` between attempts is all it takes to try again.
     let mut landed_in_the_window = false;
     for micros in (0..12_000).step_by(250) {
-        d.set_state(&ws.id, WorkspaceState::Ready).unwrap();
+        d.set_state(&ws.id, WorkspaceState::Ready).await.unwrap();
         let _ = c.drain_events();
         let start = c
             .send(Request::RunStart(RunStartParams {
@@ -1196,7 +1196,9 @@ port = {port}
             }))
             .await;
         tokio::time::sleep(Duration::from_micros(micros)).await;
-        d.set_state(&ws.id, WorkspaceState::Destroying).unwrap();
+        d.set_state(&ws.id, WorkspaceState::Destroying)
+            .await
+            .unwrap();
 
         let mut events = Vec::new();
         let answer = c.recv_response(start, &mut events).await;
@@ -1302,7 +1304,9 @@ async fn a_start_refused_because_the_workspace_is_not_ready_says_which_it_was() 
 
     // The first half of a destroy, on its own: the workspace is still in the
     // registry and is no longer somewhere a run may be started.
-    d.set_state(&ws.id, WorkspaceState::Destroying).unwrap();
+    d.set_state(&ws.id, WorkspaceState::Destroying)
+        .await
+        .unwrap();
 
     let refused = start_run(&mut c, &ws.id, "web").await.unwrap_err();
     assert_eq!(refused.code, ErrorCode::InvalidParams, "{refused:?}");
