@@ -177,14 +177,10 @@ pub struct EditorDocumentRust {
     buffer: Option<EditorBuffer>,
     /// Background subscription to `fs.changed`, aborted on re-open and Drop.
     watch_task: Option<tokio::task::JoinHandle<()>>,
-    /// Set while a disk change is pending the user's reload/keep decision.
-    external_pending: bool,
+    /// Every decision about the file on disk, and the state behind them.
+    disk: DiskState,
     /// Bumped on every `open` so a late read for an earlier file is dropped.
     generation: u64,
-    /// What this document last knew to be on disk, by hash: the bytes it
-    /// loaded, reloaded, or wrote. `None` before the first read has landed.
-    /// A read that brings these bytes back is not news, whoever wrote them.
-    known_disk: Option<ContentHash>,
     /// Bumped on every edit that changes the text. A write and a read each
     /// capture it when they are issued and compare it when they land, so
     /// neither can act on a buffer the user has changed in the meantime.
@@ -205,9 +201,11 @@ impl Default for EditorDocumentRust {
             dark_theme: false,
             buffer: None,
             watch_task: None,
-            external_pending: false,
+            disk: DiskState {
+                known: None,
+                external_pending: false,
+            },
             generation: 0,
-            known_disk: None,
             content_generation: 0,
         }
     }
@@ -243,6 +241,12 @@ pub fn may_install_disk_text(dirty: bool, at_read: u64, now: u64) -> bool {
 /// remembered copy is whether the bytes just read are the same ones. Compared
 /// only against hashes taken in the same process run and never persisted, so
 /// the hasher only has to be consistent with itself.
+///
+/// A collision would mean a real external change read as the document's own
+/// bytes and silently ignored, which is the user's edit or the agent's write
+/// lost rather than a wrong pixel. At 64 bits that is not a practical risk for
+/// the handful of versions one open file goes through, and it is the reason
+/// this is a hash of the whole content rather than a cheaper summary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContentHash(u64);
 
@@ -298,6 +302,113 @@ pub fn disk_verdict(
         return DiskVerdict::Drop;
     }
     DiskVerdict::Install
+}
+
+/// The document's disk bookkeeping, with no Qt in it.
+///
+/// Everything the document decides about a file on disk is decided here: what
+/// a watch notice should do, what a completed read means, and what is on disk
+/// now. The QObject around it is left with the two things only Qt can do --
+/// replacing the buffer and emitting a signal -- so the decisions can be tested
+/// without a running Qt application. See [`DiskState::on_notice`] and
+/// [`DiskState::on_read`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiskState {
+    /// What the document last knew to be on disk, by hash: the bytes it
+    /// loaded, reloaded, wrote, or was told about by a change it prompted
+    /// over. `None` until the first read lands.
+    pub known: Option<ContentHash>,
+    /// A conflict is on screen, waiting for `acceptExternal` or `keepLocal`.
+    pub external_pending: bool,
+}
+
+/// What a [`WatchNotice`] asks the document to do next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchAction {
+    /// Read the file and install it whatever the document has done since: the
+    /// open's own first read.
+    ReadAndInstall,
+    /// Read the file and let [`DiskState::on_read`] decide, pinned to the
+    /// content generation the read is issued at.
+    ReadAndJudge(u64),
+    /// Nothing at all.
+    Nothing,
+}
+
+/// What is left for the QObject to do once a completed read has been applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadOutcome {
+    /// Put the text that was read into the buffer and emit `loaded`.
+    InstallDiskText,
+    /// Emit `externalChange` and wait for the user.
+    RaiseExternalChange,
+    /// Nothing: the file is not news, or the read is out of date.
+    Nothing,
+}
+
+impl DiskState {
+    /// Records the bytes that are on disk now: a write that landed, or a read
+    /// about to be installed. Clears any conflict, which those bytes settle.
+    pub fn record(&mut self, on_disk: ContentHash) {
+        self.known = Some(on_disk);
+        self.external_pending = false;
+    }
+
+    /// Forgets a conflict without resolving it: `keepLocal`, the user saying
+    /// their edits win. The next change is a fresh question.
+    pub fn keep_local(&mut self) {
+        self.external_pending = false;
+    }
+
+    /// Whether `notice` should issue a read, and on what terms.
+    ///
+    /// A conflict already on screen swallows further notices: a `git checkout`
+    /// touching the file repeatedly must not stack one prompt per event, and
+    /// the read it would issue could not do anything the pending answer will
+    /// not do better.
+    pub fn on_notice(&self, notice: WatchNotice, content_generation: u64) -> WatchAction {
+        match notice {
+            WatchNotice::Subscribed => WatchAction::ReadAndInstall,
+            WatchNotice::Changed | WatchNotice::Reconnected => {
+                if self.external_pending {
+                    WatchAction::Nothing
+                } else {
+                    WatchAction::ReadAndJudge(content_generation)
+                }
+            }
+        }
+    }
+
+    /// Applies a completed re-read, issued when the content stood at `at_read`,
+    /// and says what is left for the document to do.
+    pub fn on_read(&mut self, disk_text: &str, dirty: bool, at_read: u64, now: u64) -> ReadOutcome {
+        match disk_verdict(disk_text, self.known, dirty, at_read, now) {
+            DiskVerdict::Ignore => {
+                tracing::debug!("fs.read_file: the file holds what this document already knew");
+                ReadOutcome::Nothing
+            }
+            DiskVerdict::Drop => {
+                // The user typed, or saved newer text, while this read was in
+                // flight. Installing now would erase either one, and the bytes
+                // it carries are not what is on disk any more either, so they
+                // are not recorded as known.
+                tracing::debug!("fs.read_file: the document moved on; dropping the reload");
+                ReadOutcome::Nothing
+            }
+            DiskVerdict::ExternalChange => {
+                // Recorded even though nothing is installed: this *is* what is
+                // on disk, so a second event carrying the same bytes is not a
+                // second conflict once the user has answered.
+                self.known = Some(content_hash(disk_text));
+                self.external_pending = true;
+                ReadOutcome::RaiseExternalChange
+            }
+            DiskVerdict::Install => {
+                self.record(content_hash(disk_text));
+                ReadOutcome::InstallDiskText
+            }
+        }
+    }
 }
 
 /// What the watch task has to say about the file it is watching.
@@ -529,21 +640,15 @@ fn on_watch_notice(
     if q.as_ref().rust().generation != generation {
         return;
     }
-    match notice {
+    // Read here, on the Qt thread, so the request that goes out is pinned to
+    // the buffer as it stands at this instant.
+    let now = q.as_ref().rust().content_generation;
+    match q.as_ref().rust().disk.on_notice(notice, now) {
         // The open's own read. Issued from here so that it cannot outrun the
         // subscription that would have told us about a change made meanwhile.
-        WatchNotice::Subscribed => q.reload(Install::Always),
-        WatchNotice::Changed | WatchNotice::Reconnected => {
-            // One prompt per unanswered conflict: a `git checkout` touching the
-            // file repeatedly must not stack one per event.
-            if q.as_ref().rust().external_pending {
-                return;
-            }
-            // Captured here, on the Qt thread, so the read that goes out is
-            // pinned to the buffer as it stands at this instant.
-            let at_read = q.as_ref().rust().content_generation;
-            q.reload(Install::ByVerdict(at_read));
-        }
+        WatchAction::ReadAndInstall => q.reload(Install::Always),
+        WatchAction::ReadAndJudge(at_read) => q.reload(Install::ByVerdict(at_read)),
+        WatchAction::Nothing => {}
     }
 }
 
@@ -558,10 +663,9 @@ impl qobject::EditorDocument {
             let mut rust = self.as_mut().rust_mut();
             rust.generation += 1;
             rust.buffer = None;
-            rust.external_pending = false;
             // Nothing is known about the new file's bytes until its first read
             // lands; the previous file's hash must not answer for it.
-            rust.known_disk = None;
+            rust.disk = DiskState::default();
             rust.generation
         };
         let workspace = workspace_id.to_string();
@@ -712,11 +816,10 @@ impl qobject::EditorDocument {
                             q.as_mut().set_dirty(false);
                         }
                         // These are the bytes on disk now. The `fs.changed`
-                        // this write produces re-reads them, `disk_verdict`
+                        // this write produces re-reads them, `DiskState`
                         // recognises them, and nothing happens -- whether or
                         // not the user has typed since.
-                        q.as_mut().rust_mut().known_disk = Some(written);
-                        q.as_mut().rust_mut().external_pending = false;
+                        q.as_mut().rust_mut().disk.record(written);
                         q.as_mut().set_error(QString::from(""));
                         q.saved();
                     });
@@ -741,7 +844,7 @@ impl qobject::EditorDocument {
     }
 
     pub fn keep_local(mut self: Pin<&mut Self>) {
-        self.as_mut().rust_mut().external_pending = false;
+        self.as_mut().rust_mut().disk.keep_local();
     }
 
     /// Re-reads the file and offers what is on disk to `replace_from_disk`.
@@ -778,46 +881,41 @@ fn apply_disk_read(
     install: Install,
 ) {
     let at_read = match install {
-        Install::Always => return install_disk_text(q, res),
+        Install::Always => {
+            // The open, and `acceptExternal`: these bytes go in whatever the
+            // document has done since, so there is no verdict to ask for --
+            // only the record of what is now on disk.
+            q.as_mut()
+                .rust_mut()
+                .disk
+                .record(content_hash(&res.content));
+            return install_disk_text(q, res);
+        }
         Install::ByVerdict(at_read) => at_read,
     };
-    let known = q.as_ref().rust().known_disk;
+    let dirty = *q.as_ref().dirty();
     let now = q.as_ref().rust().content_generation;
-    match disk_verdict(&res.content, known, *q.as_ref().dirty(), at_read, now) {
-        DiskVerdict::Ignore => {
-            tracing::debug!("fs.read_file: the file holds what this document already knew");
-        }
-        DiskVerdict::Drop => {
-            // The user typed, or saved newer text, while this read was in
-            // flight. Installing now would erase either one, and the bytes it
-            // carries are not what is on disk now either, so they are not
-            // recorded as known.
-            tracing::debug!("fs.read_file: the document moved on; dropping the reload");
-        }
-        DiskVerdict::ExternalChange => {
-            // Recorded even though nothing is installed: this *is* what is on
-            // disk, so a second event carrying the same bytes is not a second
-            // conflict to prompt about once the user has answered.
-            q.as_mut().rust_mut().known_disk = Some(content_hash(&res.content));
-            q.as_mut().rust_mut().external_pending = true;
-            q.external_change();
-        }
-        DiskVerdict::Install => install_disk_text(q, res),
+    let mut disk = q.as_ref().rust().disk;
+    let outcome = disk.on_read(&res.content, dirty, at_read, now);
+    q.as_mut().rust_mut().disk = disk;
+    match outcome {
+        ReadOutcome::Nothing => {}
+        ReadOutcome::RaiseExternalChange => q.external_change(),
+        ReadOutcome::InstallDiskText => install_disk_text(q, res),
     }
 }
 
-/// Replaces the buffer with what was just read and tells the view.
+/// Replaces the buffer with what was just read and tells the view. The caller
+/// has already recorded those bytes as what is on disk.
 fn install_disk_text(mut q: Pin<&mut qobject::EditorDocument>, res: ReadFileResult) {
     let path = q.as_ref().path().to_string();
     // Rebuilt rather than `replace_all`ed so the size rule is re-applied: a
     // file that grew past the limit while open must not start highlighting.
     let (buffer, _) = build_buffer(&path, &res.content);
     q.as_mut().rust_mut().buffer = Some(buffer);
-    q.as_mut().rust_mut().known_disk = Some(content_hash(&res.content));
     q.as_mut()
         .set_read_only_reason(QString::from(read_only_reason(&res)));
     q.as_mut().set_dirty(false);
-    q.as_mut().rust_mut().external_pending = false;
     // The document now matches disk, so whatever the last failure said about
     // it is history.
     q.as_mut().set_error(QString::from(""));

@@ -330,7 +330,8 @@ mod review_fixes_task_7 {
     use bondsymphonic_ide::model::editor_buffer::{EditorBuffer, LineEnding};
     use bondsymphonic_ide::qobjects::app_controller::{publish_shared, Shared};
     use bondsymphonic_ide::qobjects::editor_document::{
-        content_hash, disk_verdict, watch_file, DiskVerdict, WatchNotice,
+        content_hash, disk_verdict, watch_file, DiskState, DiskVerdict, ReadOutcome, WatchAction,
+        WatchNotice,
     };
     use bondsymphonic_proto::*;
     use std::time::Duration;
@@ -392,6 +393,22 @@ mod review_fixes_task_7 {
         assert_eq!(buf.text(), "abcd\n");
         assert_eq!(buf.text_for_save(), "abcd\r\n");
         assert_eq!(buf.text_for_save().matches('\r').count(), 1);
+    }
+
+    /// A lone carriage return is content, not a break: only the `\r\n` pair
+    /// collapses, and saving an untouched file must return every byte of it.
+    #[test]
+    fn a_lone_carriage_return_before_a_break_survives_the_round_trip() {
+        let original = "a\r\r\n";
+        let buf = EditorBuffer::new("x.txt", original);
+        assert_eq!(buf.line_ending(), LineEnding::Crlf);
+        assert_eq!(buf.text(), "a\r\n", "only the CRLF collapsed");
+        assert_eq!(
+            buf.text_for_save(),
+            original,
+            "saving a file nobody edited must not lose a character"
+        );
+        assert_eq!(buf.line(0), "a\r", "the lone CR is part of the line");
     }
 
     /// Mixed endings: the majority wins, a tie goes to LF, and the file is
@@ -494,6 +511,113 @@ mod review_fixes_task_7 {
         assert_eq!(disk_verdict(other, None, false, 3, 3), DiskVerdict::Install);
     }
 
+    // -- IQ2/IQ3 through the document's own decisions ----------------------
+
+    /// The path the brief names for IQ2, one layer below the QObject: the
+    /// daemon restarts, the watch re-attaches and reports `Reconnected`, the
+    /// document re-reads, and because it has unsaved edits and the file no
+    /// longer holds what it knew, it raises `externalChange`.
+    ///
+    /// `EditorDocument::on_watch_notice` is `DiskState::on_notice` plus a
+    /// generation check, and `apply_disk_read` is `DiskState::on_read` plus
+    /// `external_change()`; this drives both halves in order.
+    #[test]
+    fn a_reconnect_that_finds_other_bytes_raises_an_external_change() {
+        let mut disk = DiskState::default();
+        // The open: the first read installs whatever is there.
+        assert_eq!(
+            disk.on_notice(WatchNotice::Subscribed, 0),
+            WatchAction::ReadAndInstall
+        );
+        disk.record(content_hash("fn main() {}\n"));
+
+        // The user types (content generation 1), then the daemon restarts and
+        // the watch re-attaches on the new router.
+        assert_eq!(
+            disk.on_notice(WatchNotice::Reconnected, 1),
+            WatchAction::ReadAndJudge(1)
+        );
+        // An agent rewrote the file while the IDE had nobody listening.
+        assert_eq!(
+            disk.on_read("fn main() { agent }\n", true, 1, 1),
+            ReadOutcome::RaiseExternalChange
+        );
+        assert!(disk.external_pending, "the bar is up");
+
+        // A `git checkout` touching the file again must not stack a second
+        // prompt behind the first.
+        assert_eq!(
+            disk.on_notice(WatchNotice::Changed, 1),
+            WatchAction::Nothing
+        );
+
+        // "Keep mine": the bar goes down and the next change is a fresh
+        // question, but the bytes the user already saw are no longer news.
+        disk.keep_local();
+        assert_eq!(
+            disk.on_notice(WatchNotice::Changed, 1),
+            WatchAction::ReadAndJudge(1)
+        );
+        assert_eq!(
+            disk.on_read("fn main() { agent }\n", true, 1, 1),
+            ReadOutcome::Nothing,
+            "the same disk bytes must not prompt twice"
+        );
+    }
+
+    /// The same path for IQ3, with a real buffer on the other end: the write
+    /// goes out as `text_for_save`, the user types before the daemon reports
+    /// it, and the document must neither prompt nor lose the keystroke.
+    #[test]
+    fn an_own_save_never_prompts_and_the_keystroke_survives_it() {
+        let mut buf = EditorBuffer::new("x.rs", "fn main() {}\r\n");
+        let mut disk = DiskState::default();
+        disk.record(content_hash(&buf.text_for_save()));
+
+        // Ctrl+S at content generation 7: these are the bytes that go out.
+        let written = buf.text_for_save();
+        // The user types while the write is in flight: generation 8, dirty.
+        let at = buf.utf16_to_char(12);
+        buf.apply_edit(at, 0, "\n");
+        // The write lands and the document records what is now on disk.
+        disk.record(content_hash(&written));
+
+        // The daemon reports the write this document made.
+        assert_eq!(
+            disk.on_notice(WatchNotice::Changed, 8),
+            WatchAction::ReadAndJudge(8)
+        );
+        assert_eq!(
+            disk.on_read(&written, true, 8, 8),
+            ReadOutcome::Nothing,
+            "our own write is not an external change"
+        );
+        assert!(!disk.external_pending, "no bar over our own write");
+        assert_eq!(buf.text(), "fn main() {}\n\n", "the keystroke survives");
+        assert_eq!(buf.text_for_save(), "fn main() {}\r\n\r\n");
+    }
+
+    /// An unmodified document quietly takes whatever else wrote the file, and a
+    /// read overtaken by a save is dropped rather than undoing the save.
+    #[test]
+    fn a_clean_document_installs_and_a_stale_read_is_dropped() {
+        let mut disk = DiskState::default();
+        disk.record(content_hash("one\n"));
+        assert_eq!(
+            disk.on_read("two\n", false, 4, 4),
+            ReadOutcome::InstallDiskText
+        );
+        assert_eq!(disk.known, Some(content_hash("two\n")));
+
+        // A read issued at generation 4 landing after a save moved it to 5.
+        assert_eq!(disk.on_read("three\n", false, 4, 5), ReadOutcome::Nothing);
+        assert_eq!(
+            disk.known,
+            Some(content_hash("two\n")),
+            "a stale read must not be recorded as what is on disk"
+        );
+    }
+
     // -- IQ2: the watch follows the router across a reconnect ----------------
 
     /// A daemon just real enough for the watch task: it answers `hello`,
@@ -567,6 +691,13 @@ mod review_fixes_task_7 {
             .expect("the watch task must answer within 5 s")
     }
 
+    /// `publish_shared` writes one process-wide slot and bumps one
+    /// process-wide generation, and cargo runs the tests in this binary in
+    /// parallel. A second test publishing during the first test's quiet window
+    /// would hand it a spurious `Reconnected`, or attach its watch to the wrong
+    /// router. Every test that publishes holds this for its whole body.
+    static GLOBAL_CONNECTION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn nothing(rx: &mut mpsc::UnboundedReceiver<WatchNotice>) {
         let got = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
         assert!(got.is_err(), "expected no notice, got {:?}", got.unwrap());
@@ -578,6 +709,7 @@ mod review_fixes_task_7 {
     /// published there reaches the document.
     #[tokio::test]
     async fn the_watch_follows_the_router_across_a_reconnect() {
+        let _connection = GLOBAL_CONNECTION.lock().await;
         let addr = fake_daemon("secret").await;
         let (c1, _hello, _events1) = DaemonClient::connect(addr, "secret", "0.1.0")
             .await
@@ -634,6 +766,7 @@ mod review_fixes_task_7 {
     /// showing for the rest of the session.
     #[tokio::test]
     async fn the_watch_ends_when_its_document_stops_listening() {
+        let _connection = GLOBAL_CONNECTION.lock().await;
         let addr = fake_daemon("secret").await;
         let (client, _hello, _events) = DaemonClient::connect(addr, "secret", "0.1.0")
             .await

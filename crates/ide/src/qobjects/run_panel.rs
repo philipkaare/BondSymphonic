@@ -11,7 +11,7 @@
 //! Every decision lives in [`WorkspaceRuns`]; this object is the adapter that
 //! moves JSON and signals across the boundary and owns the subscriptions.
 
-use crate::client::router::EventRx;
+use crate::client::router::{EventRx, Release};
 use crate::model::run_config::{denial_owner, may_queue_denial, Detection, WorkspaceRuns};
 use crate::qobjects::app_controller::{
     connection_generation, on_reconnect, require_connection, runtime, state_store, Shared,
@@ -392,7 +392,7 @@ async fn detect_and_list(shared: Shared, qt: QtHandle, workspace: String, worktr
 }
 
 /// Follows one run until it finishes or the panel lets go of it.
-async fn follow_run(shared: Shared, qt: QtHandle, run: RunId, mut rx: EventRx) {
+async fn follow_run(qt: QtHandle, run: RunId, mut rx: EventRx, release: Release) {
     while let Some((_, event)) = rx.recv().await {
         // A run that has stopped or failed sends nothing more, so the task ends
         // with it rather than parking on a channel forever.
@@ -408,7 +408,9 @@ async fn follow_run(shared: Shared, qt: QtHandle, run: RunId, mut rx: EventRx) {
             break;
         }
     }
-    shared.router.unsubscribe_run(&run);
+    // This panel row's own subscription, not the run id's: `watch_run` may
+    // have re-subscribed on a new connection while this task was winding down.
+    release.release();
 }
 
 impl qobject::RunPanelModel {
@@ -943,14 +945,13 @@ impl qobject::RunPanelModel {
             return;
         };
         let run = RunId(run_id.to_owned());
-        let rx = shared.router.subscribe_run(&run);
+        let (rx, release) = shared.router.subscribe_run(&run);
         let unsubscribe = {
-            let router = shared.router.clone();
-            let run = run.clone();
-            move || router.unsubscribe_run(&run)
+            let release = release.clone();
+            move || release.release()
         };
         let qt = self.as_ref().qt_thread();
-        let task = runtime().spawn(follow_run(shared, qt, run, rx));
+        let task = runtime().spawn(follow_run(qt, run, rx, release));
         self.as_mut().rust_mut().subscriptions.insert(
             run_id.to_owned(),
             Subscription {

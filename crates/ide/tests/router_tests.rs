@@ -14,7 +14,7 @@ async fn routes_by_pty_and_replays_early_output() {
     let mut all = r.subscribe_all();
     r.dispatch(Some("ws_1".into()), out("pty_a", "early1"));
     r.dispatch(Some("ws_1".into()), out("pty_b", "other"));
-    let mut a = r.subscribe_pty(&"pty_a".into());
+    let (mut a, _) = r.subscribe_pty(&"pty_a".into());
     r.dispatch(Some("ws_1".into()), out("pty_a", "live2"));
     r.dispatch(
         Some("ws_1".into()),
@@ -48,7 +48,7 @@ async fn early_output_buffer_expires() {
     r.dispatch(None, out("pty_x", "stale"));
     // Test hook: with a zero max age everything already in the buffer is "old".
     r.expire_early_buffers_older_than(std::time::Duration::from_secs(0));
-    let mut x = r.subscribe_pty(&"pty_x".into());
+    let (mut x, _) = r.subscribe_pty(&"pty_x".into());
     assert!(x.try_recv().is_err());
     r.unsubscribe_pty(&"pty_x".into());
     r.dispatch(None, out("pty_x", "after"));
@@ -76,7 +76,7 @@ async fn routes_by_agent_and_replays_early_messages() {
     r.dispatch(Some("ws_1".into()), agent_msg("ag_b", 1, "other agent"));
     r.dispatch(None, out("pty_a", "not an agent"));
 
-    let mut a = r.subscribe_agent(&"ag_a".into());
+    let (mut a, _) = r.subscribe_agent(&"ag_a".into());
     r.dispatch(
         Some("ws_1".into()),
         Event::AgentStateChanged {
@@ -111,7 +111,7 @@ async fn unsubscribing_an_agent_closes_the_receiver_and_drops_its_buffer() {
     let r = EventRouter::new();
     r.dispatch(None, agent_msg("ag_x", 1, "stale"));
     r.unsubscribe_agent(&"ag_x".into());
-    let mut x = r.subscribe_agent(&"ag_x".into());
+    let (mut x, _) = r.subscribe_agent(&"ag_x".into());
     assert!(
         x.try_recv().is_err(),
         "unsubscribe discards the early buffer"
@@ -125,8 +125,8 @@ async fn unsubscribing_an_agent_closes_the_receiver_and_drops_its_buffer() {
 #[tokio::test]
 async fn pty_and_agent_keys_do_not_collide() {
     let r = EventRouter::new();
-    let mut pty = r.subscribe_pty(&"x".into());
-    let mut agent = r.subscribe_agent(&"x".into());
+    let (mut pty, _) = r.subscribe_pty(&"x".into());
+    let (mut agent, _) = r.subscribe_agent(&"x".into());
     r.dispatch(None, out("x", "pty bytes"));
     r.dispatch(None, agent_msg("x", 1, "agent words"));
     assert!(matches!(pty.try_recv(), Ok((_, Event::PtyOutput { .. }))));
@@ -155,7 +155,7 @@ async fn routes_by_run_and_replays_early_output() {
     r.dispatch(Some("ws_1".into()), run_out("run_b", "other run"));
     r.dispatch(None, out("pty_a", "not a run"));
 
-    let mut a = r.subscribe_run(&"run_a".into());
+    let (mut a, _) = r.subscribe_run(&"run_a".into());
     r.dispatch(
         Some("ws_1".into()),
         Event::RunStateChanged {
@@ -188,7 +188,7 @@ async fn unsubscribing_a_run_closes_the_receiver_and_drops_its_buffer() {
     let r = EventRouter::new();
     r.dispatch(None, run_out("run_x", "stale"));
     r.unsubscribe_run(&"run_x".into());
-    let mut x = r.subscribe_run(&"run_x".into());
+    let (mut x, _) = r.subscribe_run(&"run_x".into());
     assert!(
         x.try_recv().is_err(),
         "unsubscribe discards the early buffer"
@@ -203,9 +203,9 @@ async fn unsubscribing_a_run_closes_the_receiver_and_drops_its_buffer() {
 #[tokio::test]
 async fn run_pty_and_agent_keys_do_not_collide() {
     let r = EventRouter::new();
-    let mut pty = r.subscribe_pty(&"x".into());
-    let mut agent = r.subscribe_agent(&"x".into());
-    let mut run = r.subscribe_run(&"x".into());
+    let (mut pty, _) = r.subscribe_pty(&"x".into());
+    let (mut agent, _) = r.subscribe_agent(&"x".into());
+    let (mut run, _) = r.subscribe_run(&"x".into());
     r.dispatch(None, out("x", "pty bytes"));
     r.dispatch(None, agent_msg("x", 1, "agent words"));
     r.dispatch(None, run_out("x", "run line"));
@@ -266,14 +266,110 @@ mod review_fixes_task_7 {
         );
     }
 
-    /// The by-key form still exists for callers that hold no token; it keeps
-    /// its old meaning of "whoever holds the key".
+    /// The by-key form still exists for retiring an id; it keeps its old
+    /// meaning of "whoever holds the key".
     #[tokio::test]
     async fn the_by_key_unsubscribe_still_ends_the_current_subscriber() {
         let r = EventRouter::new();
-        let mut a = r.subscribe_pty(&"pty_2".into());
+        let (mut a, _) = r.subscribe_pty(&"pty_2".into());
         r.unsubscribe_pty(&"pty_2".into());
         assert!(a.recv().await.is_none());
+    }
+
+    /// IM6 as the terminal actually runs into it, through the calls
+    /// `TerminalSession` makes rather than the raw table.
+    ///
+    /// `open`/`attach` subscribe with `subscribe_pty` and hand the `Release` to
+    /// `adopt`, which stores it and gives it to `pump`. A second session
+    /// attaching to the same host PTY replaces the first, whose `rx.recv()`
+    /// then returns `None` -- the loop's "the subscription was replaced or
+    /// ended" arm -- and whose tail releases. Before the token, that tail
+    /// removed by key and took the live session's subscription with it: the
+    /// terminal went silent for the rest of the session while the shell behind
+    /// it kept running.
+    #[tokio::test]
+    async fn a_replaced_terminal_pump_does_not_take_its_replacement_down() {
+        let r = EventRouter::new();
+        let pty = "pty_host".into();
+
+        // The first session attaches.
+        let (mut first_rx, first) = r.subscribe_pty(&pty);
+        r.dispatch(None, out("pty_host", "for the first"));
+        assert!(first_rx.try_recv().is_ok());
+
+        // A second session attaches to the same PTY and takes the key.
+        let (mut second_rx, _second) = r.subscribe_pty(&pty);
+        assert!(
+            first_rx.recv().await.is_none(),
+            "the first session's channel closes when it is replaced"
+        );
+
+        // The first session's pump wakes on that `None` and lets go.
+        first.release();
+
+        // The second session is still the one being fed.
+        r.dispatch(None, out("pty_host", "for the second"));
+        assert!(
+            matches!(second_rx.try_recv(), Ok((_, Event::PtyOutput { data_b64, .. })) if data_b64 == "for the second"),
+            "the replacement must still receive after the replaced pump's tail"
+        );
+
+        // And the same holds for a transcript pane and a run row, which end
+        // the same way.
+        let agent = "ag_one".into();
+        let (mut first_msgs, first_pane) = r.subscribe_agent(&agent);
+        let (mut second_msgs, _second_pane) = r.subscribe_agent(&agent);
+        assert!(first_msgs.recv().await.is_none());
+        first_pane.release();
+        r.dispatch(
+            None,
+            Event::AgentStateChanged {
+                agent_id: agent.clone(),
+                state: AgentState::Idle,
+                detail: None,
+            },
+        );
+        assert!(
+            second_msgs.try_recv().is_ok(),
+            "the replacement transcript must still receive"
+        );
+
+        let run = "run_one".into();
+        let (mut first_log, first_row) = r.subscribe_run(&run);
+        let (mut second_log, _second_row) = r.subscribe_run(&run);
+        assert!(first_log.recv().await.is_none());
+        first_row.release();
+        r.dispatch(
+            None,
+            Event::RunStateChanged {
+                run_id: run.clone(),
+                state: RunState::Starting,
+                url: None,
+                detail: None,
+            },
+        );
+        assert!(
+            second_log.try_recv().is_ok(),
+            "the replacement run row must still receive"
+        );
+    }
+
+    /// Releasing twice, which `Drop` after a tail release does, is harmless and
+    /// still takes nobody else's subscription.
+    #[tokio::test]
+    async fn releasing_twice_is_harmless() {
+        let r = EventRouter::new();
+        let pty = "pty_twice".into();
+        let (mut rx, release) = r.subscribe_pty(&pty);
+        release.release();
+        assert!(rx.recv().await.is_none());
+        let (mut next_rx, _next) = r.subscribe_pty(&pty);
+        release.release();
+        r.dispatch(None, out("pty_twice", "still here"));
+        assert!(
+            next_rx.try_recv().is_ok(),
+            "a second release must not reach the next subscriber"
+        );
     }
 
     /// `fs.changed` is routed by workspace: an editor on workspace A never

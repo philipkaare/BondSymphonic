@@ -10,7 +10,7 @@
 //! Everything the widget paints is a stored property: `rows_json` is
 //! regenerated inside that closure, never on a property read.
 
-use crate::client::router::{EventRouter, EventRx};
+use crate::client::router::{EventRouter, EventRx, Release};
 use crate::model::terminal_grid::{key_to_bytes, TerminalGrid};
 use crate::qobjects::app_controller::{on_reconnect, require_connection, runtime, shared};
 use base64::Engine as _;
@@ -506,7 +506,7 @@ fn flush(qt: &QtHandle, pending: &Arc<AtomicBool>, id: &str, batch: &mut Vec<u8>
 async fn pump(
     mut rx: EventRx,
     pty_id: PtyId,
-    router: EventRouter,
+    release: Release,
     qt: QtHandle,
     pending: Arc<AtomicBool>,
 ) {
@@ -570,7 +570,10 @@ async fn pump(
         }
     }
 
-    router.unsubscribe_pty(&pty_id);
+    // This session's own subscription and no other: the loop above may have
+    // ended precisely because another session took this PTY's key, and by key
+    // this line would then close the live one.
+    release.release();
     if gone {
         return;
     }
@@ -620,12 +623,12 @@ async fn adopt(
     qt: QtHandle,
     pty_id: PtyId,
     rx: EventRx,
+    release: Release,
     pending: Arc<AtomicBool>,
 ) {
     let unsubscribe = {
-        let router = router.clone();
-        let pty_id = pty_id.clone();
-        move || router.unsubscribe_pty(&pty_id)
+        let release = release.clone();
+        move || release.release()
     };
     let id_text = pty_id.to_string();
     let queued = qt.queue(move |mut q| {
@@ -643,12 +646,14 @@ async fn adopt(
     });
     if queued.is_err() {
         // The QObject went away before the id reached it: the same orphan,
-        // from the other direction.
+        // from the other direction. The PTY itself is closed here, so the id is
+        // being retired and taking everything on it -- parked output included
+        // -- is what is wanted.
         router.unsubscribe_pty(&pty_id);
         close_pty(pty_id.to_string());
         return;
     }
-    pump(rx, pty_id, router, qt, pending).await;
+    pump(rx, pty_id, release, qt, pending).await;
 }
 
 impl qobject::TerminalSession {
@@ -701,8 +706,8 @@ impl qobject::TerminalSession {
             };
             // Subscribing before the id reaches the Qt thread: the router
             // replays output that arrived while `pty.open` was in flight.
-            let rx = shared.router.subscribe_pty(&pty_id);
-            adopt(shared.router.clone(), qt, pty_id, rx, pending).await;
+            let (rx, release) = shared.router.subscribe_pty(&pty_id);
+            adopt(shared.router.clone(), qt, pty_id, rx, release, pending).await;
         });
     }
 
@@ -735,7 +740,7 @@ impl qobject::TerminalSession {
             // Subscribed before anything else, exactly as in `open`: the
             // daemon starts writing the moment the terminal opens, and the
             // router replays what arrived before this session existed.
-            let rx = shared.router.subscribe_pty(&pty_id);
+            let (rx, release) = shared.router.subscribe_pty(&pty_id);
             // The terminal was opened at whatever size the request asked for.
             // This is where it becomes the size of the pane showing it.
             let params = PtyResizeParams {
@@ -746,7 +751,7 @@ impl qobject::TerminalSession {
             if let Err(e) = shared.client.request_raw(Request::PtyResize(params)).await {
                 report(&qt, format!("pty.resize failed: {e}"));
             }
-            adopt(shared.router.clone(), qt, pty_id, rx, pending).await;
+            adopt(shared.router.clone(), qt, pty_id, rx, release, pending).await;
         });
     }
 

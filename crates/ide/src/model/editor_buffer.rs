@@ -84,23 +84,19 @@ impl EditorBuffer {
     ///
     /// The inverse of the collapse done on load, and the reason the view can be
     /// given LF text without a CRLF file being converted behind the user's
-    /// back. A `\r` that is already there (a lone one, which is content rather
-    /// than a break) is not doubled.
+    /// back.
+    ///
+    /// Unconditional, because the rope is LF-only by construction: every `\n`
+    /// in it is a break this has to restore. Skipping one that already has a
+    /// `\r` in front would lose that character, since a lone `\r` there is
+    /// content the collapse deliberately left alone -- `"a\r\r\n"` loaded and
+    /// saved untouched must come back as `"a\r\r\n"`.
     pub fn text_for_save(&self) -> String {
         let text = self.rope.to_string();
-        if self.line_ending == LineEnding::Lf {
-            return text;
+        match self.line_ending {
+            LineEnding::Lf => text,
+            LineEnding::Crlf => text.replace('\n', "\r\n"),
         }
-        let mut out = String::with_capacity(text.len() + text.matches('\n').count());
-        let mut prev = '\0';
-        for c in text.chars() {
-            if c == '\n' && prev != '\r' {
-                out.push('\r');
-            }
-            out.push(c);
-            prev = c;
-        }
-        out
     }
 
     /// The language detected from the path, whether or not highlighting is on.

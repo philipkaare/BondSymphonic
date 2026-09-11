@@ -251,6 +251,7 @@ async fn replay_and_follow(
     agent: AgentId,
     generation: u64,
     mut rx: crate::client::router::EventRx,
+    release: crate::client::router::Release,
 ) {
     let params = AgentIdParams {
         agent_id: agent.clone(),
@@ -330,7 +331,7 @@ async fn replay_and_follow(
         q.sync_pending();
     });
     if queued.is_err() {
-        shared.router.unsubscribe_agent(&agent);
+        release.release();
         return;
     }
 
@@ -345,7 +346,9 @@ async fn replay_and_follow(
             break;
         }
     }
-    shared.router.unsubscribe_agent(&agent);
+    // This pane's own subscription: the loop ends when the channel closes, and
+    // one of the ways it closes is another pane attaching to the same agent.
+    release.release();
 }
 
 impl qobject::TranscriptModel {
@@ -401,14 +404,15 @@ impl qobject::TranscriptModel {
         // messages the agent produces meanwhile are parked in the channel and
         // applied after the history, not missed.
         let agent = AgentId(agent);
-        let rx = shared.router.subscribe_agent(&agent);
+        let (rx, release) = shared.router.subscribe_agent(&agent);
         let unsubscribe = {
-            let router = shared.router.clone();
-            let agent = agent.clone();
-            move || router.unsubscribe_agent(&agent)
+            let release = release.clone();
+            move || release.release()
         };
         let qt = self.as_ref().qt_thread();
-        let task = runtime().spawn(replay_and_follow(shared, qt, agent, generation, rx));
+        let task = runtime().spawn(replay_and_follow(
+            shared, qt, agent, generation, rx, release,
+        ));
         {
             let mut rust = self.as_mut().rust_mut();
             rust.task = Some(task);

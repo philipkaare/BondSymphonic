@@ -100,6 +100,39 @@ struct Sub {
     tx: EventTx,
 }
 
+/// A consumer's hold on one stream, and the only way it ends its own
+/// subscription.
+///
+/// Every per-id consumer finishes the same way: its channel closes because the
+/// subscription was replaced, or the QObject it feeds goes away, and it lets
+/// go. Letting go *by key* is what IM6 was -- the replaced pump wakes precisely
+/// because the replacement took its key, and removing by key then takes the
+/// replacement with it. A `Release` carries the token as well as the key, so
+/// there is no key-shaped release for a tail path to reach for by mistake.
+///
+/// Retiring the id itself is a different act and keeps its own method
+/// ([`EventRouter::unsubscribe_pty`] and friends): that one is meant to take
+/// everything, including anything parked in the early buffer.
+#[derive(Clone)]
+pub struct Release {
+    router: EventRouter,
+    key: StreamKey,
+    token: SubToken,
+}
+
+impl Release {
+    /// Ends exactly the subscription this handle was given out for. Safe to
+    /// call from a tail path, a `Drop`, or twice.
+    pub fn release(&self) {
+        self.router.unsubscribe_stream(&self.key, self.token);
+    }
+
+    /// The stream this hold is on.
+    pub fn key(&self) -> &StreamKey {
+        &self.key
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     all: Vec<EventTx>,
@@ -149,14 +182,21 @@ impl EventRouter {
     /// replaces the earlier subscription (its receiver then sees the channel
     /// close), which keeps a re-opened terminal from being shadowed by a stale
     /// consumer.
-    pub fn subscribe_pty(&self, id: &PtyId) -> EventRx {
-        self.subscribe_stream(StreamKey::Pty(id.clone())).0
+    ///
+    /// The [`Release`] handed back with the receiver is how the consumer ends
+    /// *its own* subscription when its pump stops; see the type's own note on
+    /// why it is not a bare key.
+    pub fn subscribe_pty(&self, id: &PtyId) -> (EventRx, Release) {
+        self.subscribe_held(StreamKey::Pty(id.clone()))
     }
 
-    /// Ends the subscription for `id`: dropping the sender closes the
-    /// receiver, so the consumer sees `None` rather than hanging. Anything
-    /// still parked for that id is discarded too, since a closed PTY's output
-    /// must not be replayed onto a later terminal reusing the id.
+    /// Retires the id: ends whatever subscription holds it and discards
+    /// anything parked for it, since a closed PTY's output must not be
+    /// replayed onto a later terminal reusing the id.
+    ///
+    /// For closing the PTY itself, not for a consumer letting go — a consumer
+    /// that has been replaced would take the replacement's subscription with
+    /// it. That one uses the [`Release`] it was given.
     pub fn unsubscribe_pty(&self, id: &PtyId) {
         self.unsubscribe_key(&StreamKey::Pty(id.clone()));
     }
@@ -166,12 +206,14 @@ impl EventRouter {
     /// soon as `agent.start` returns, which is before the transcript model has
     /// the id it needs in order to subscribe. Subscribing twice for the same
     /// id replaces the earlier subscription.
-    pub fn subscribe_agent(&self, id: &AgentId) -> EventRx {
-        self.subscribe_stream(StreamKey::Agent(id.clone())).0
+    pub fn subscribe_agent(&self, id: &AgentId) -> (EventRx, Release) {
+        self.subscribe_held(StreamKey::Agent(id.clone()))
     }
 
-    /// Ends the subscription for `id` and discards anything parked for it, so
-    /// a stopped agent's tail is not replayed onto a later transcript.
+    /// Retires the id, discarding anything parked for it, so a stopped
+    /// agent's tail is not replayed onto a later transcript. Like
+    /// [`EventRouter::unsubscribe_pty`], this is about the id and not about one
+    /// consumer of it; a consumer letting go uses its [`Release`].
     pub fn unsubscribe_agent(&self, id: &AgentId) {
         self.unsubscribe_key(&StreamKey::Agent(id.clone()));
     }
@@ -182,13 +224,14 @@ impl EventRouter {
     /// `run.start` returning and the Run panel subscribing with the id that
     /// reply carried. Subscribing twice for the same id replaces the earlier
     /// subscription.
-    pub fn subscribe_run(&self, id: &RunId) -> EventRx {
-        self.subscribe_stream(StreamKey::Run(id.clone())).0
+    pub fn subscribe_run(&self, id: &RunId) -> (EventRx, Release) {
+        self.subscribe_held(StreamKey::Run(id.clone()))
     }
 
-    /// Ends the subscription for `id` and discards anything parked for it. The
-    /// panel calls this when a run stops, so a finished run's tail cannot be
-    /// replayed into the log of a later run of the same configuration.
+    /// Retires the id, discarding anything parked for it, so a finished run's
+    /// tail cannot be replayed into the log of a later run of the same
+    /// configuration. About the id, not about one consumer of it; a consumer
+    /// letting go uses its [`Release`].
     pub fn unsubscribe_run(&self, id: &RunId) {
         self.unsubscribe_key(&StreamKey::Run(id.clone()));
     }
@@ -211,6 +254,18 @@ impl EventRouter {
     /// A [`Fanout::Exclusive`] key replaces whoever held it and is replayed
     /// anything parked for it; a [`Fanout::Shared`] key simply gains one more
     /// listener.
+    /// [`EventRouter::subscribe_stream`] with the token already wrapped in the
+    /// [`Release`] that ends it.
+    fn subscribe_held(&self, key: StreamKey) -> (EventRx, Release) {
+        let (rx, token) = self.subscribe_stream(key.clone());
+        let release = Release {
+            router: self.clone(),
+            key,
+            token,
+        };
+        (rx, release)
+    }
+
     pub fn subscribe_stream(&self, key: StreamKey) -> (EventRx, SubToken) {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut inner = self.lock();
@@ -282,16 +337,17 @@ impl EventRouter {
                 // back and the event falls through into the early buffer.
                 let mut undelivered = Some((workspace_id, event));
                 if let Entry::Occupied(slot) = inner.streams.entry(key.clone()) {
-                    let item = undelivered.take().expect("payload not yet delivered");
-                    let failed = slot
-                        .get()
-                        .first()
-                        .expect("an exclusive key holds one subscriber")
-                        .tx
-                        .send(item);
-                    if let Err(returned) = failed {
-                        slot.remove();
-                        undelivered = Some(returned.0);
+                    // One subscriber, by construction: the `Exclusive` arm of
+                    // `subscribe_stream` inserts exactly one and
+                    // `unsubscribe_stream` drops the key when the last goes.
+                    // Read rather than asserted, so a future mistake elsewhere
+                    // cannot take the reader loop down from here.
+                    if let Some(sub) = slot.get().first() {
+                        let item = undelivered.take().expect("payload not yet delivered");
+                        if let Err(returned) = sub.tx.send(item) {
+                            slot.remove();
+                            undelivered = Some(returned.0);
+                        }
                     }
                 }
                 if let Some((ws, ev)) = undelivered {
