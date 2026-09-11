@@ -508,6 +508,142 @@ async fn each_plain_http_request_on_a_kept_alive_connection_goes_to_its_own_host
     cancel.cancel();
 }
 
+/// A server that answers the moment the request head arrives - before the body
+/// it was promised - and then holds its connection open.
+///
+/// That is legal HTTP and ordinary in practice (a refusal, a redirect, a
+/// `100-continue` decision), and it is the shape both tests below need: the
+/// client can read the response and only then decide what to do with the rest
+/// of its body.
+async fn early_answering_server() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                // A head and part of the body it promises, so the client has a
+                // response under way while its own request is still unfinished.
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel")
+                    .await;
+                let _ = s.flush().await;
+                // Held open: the response is not over, so the proxy is still
+                // relaying it when the client's body goes wrong or stops.
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    port
+}
+
+/// A request body the proxy refuses must not put a 400 into a response that is
+/// already on its way to the client.
+///
+/// The body and the response are relayed at the same time, so by the time a
+/// malformed chunk is read the client may already have most of a 200 in hand.
+/// Appending a complete 400 to that is a corrupt stream: the client reads one
+/// response's head and another response's body, and has no way to tell.
+#[tokio::test]
+async fn a_refused_body_does_not_splice_a_400_onto_a_response_already_under_way() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "splice").await;
+    let sock = daemon.dirs.run(&ws.id).join("proxy.sock");
+    let upstream = early_answering_server().await;
+    set_allowlist(&mut c, &ws.id, &["127.0.0.1"]).await.unwrap();
+
+    let mut s = UnixStream::connect(&sock).await.unwrap();
+    s.write_all(
+        format!(
+            "POST http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: 127.0.0.1:{upstream}\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    // The response is under way before anything malformed is sent.
+    let head = read_head(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+    // A chunk size that is not a number: the body cannot be walked any further.
+    s.write_all(b"zz\r\n").await.unwrap();
+    let rest = read_all(&mut s).await;
+    assert!(
+        !rest.contains("400 Bad Request"),
+        "a 400 was spliced onto a response already under way: {rest:?}"
+    );
+
+    c.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+        workspace_id: ws.id.clone(),
+        force: true,
+    }))
+    .await
+    .unwrap();
+    cancel.cancel();
+}
+
+/// A client that promises a body and then stops sending it must not hold an
+/// upstream socket to an allowlisted host open for ever.
+///
+/// Nothing else bounds this: the head timeout is spent, the connect timeout is
+/// spent, and a legitimate slow upload must not be cut off - so what ends it is
+/// an *idle* deadline, measured from the last byte that moved in either
+/// direction rather than from the start of the request.
+///
+/// Time is paused once the stall is set up, so the runtime jumps to the
+/// daemon's own deadline instead of the test waiting it out.
+#[tokio::test]
+async fn a_request_body_that_stalls_does_not_hold_an_upstream_for_ever() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "stall").await;
+    let sock = daemon.dirs.run(&ws.id).join("proxy.sock");
+    let upstream = early_answering_server().await;
+    set_allowlist(&mut c, &ws.id, &["127.0.0.1"]).await.unwrap();
+
+    let mut s = UnixStream::connect(&sock).await.unwrap();
+    s.write_all(
+        format!(
+            "POST http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: 127.0.0.1:{upstream}\r\nContent-Length: 1000000\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let head = read_head(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+    // Not one byte of the million follows.
+    tokio::time::pause();
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(3600), read_all(&mut s)).await;
+    assert!(
+        ended.is_ok(),
+        "the stalled request still held its client and its upstream an hour later"
+    );
+
+    tokio::time::resume();
+    c.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+        workspace_id: ws.id.clone(),
+        force: true,
+    }))
+    .await
+    .unwrap();
+    cancel.cancel();
+}
+
 // ---------------------------------------------------------------------------
 // The sandbox side: only where bubblewrap can create user namespaces.
 // ---------------------------------------------------------------------------

@@ -67,6 +67,21 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(unix)]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a request body may go without a byte moving in either direction
+/// before the exchange is abandoned.
+///
+/// A client that promises a body and then stops otherwise holds its own task,
+/// its socket and an open connection to an allowlisted host for as long as it
+/// likes, and nothing else bounds that: the head timeout is spent by then, and
+/// so is the connect timeout. An *idle* deadline rather than a total one,
+/// because a slow upload that keeps sending is a legitimate thing to do and
+/// must not be cut off in the middle. It stops applying once the body is
+/// through: an origin that thinks about a request for a long while before
+/// answering is also legitimate, and the CONNECT tunnel beside this has no
+/// deadline at all for the same reason.
+#[cfg(unix)]
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How many connections one workspace may have in flight through its proxy.
 ///
 /// The sandbox is the untrusted side of this socket, and a task per connection
@@ -186,6 +201,34 @@ fn split_authority(auth: &str, default_port: u16) -> Option<(String, u16)> {
     }
 }
 
+/// The authority of an absolute-form target, userinfo dropped, exactly as the
+/// URI spells it - port and all. `None` for anything that is not absolute
+/// form.
+///
+/// This is what the request was *checked* against, so it is what the origin
+/// must be told in `Host`; [`target_host_port`] is the same authority split up
+/// and normalised for the allowlist and the socket.
+fn uri_authority(target: &str) -> Option<String> {
+    let rest = strip_http_scheme(target)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    (!authority.is_empty()).then(|| authority.to_string())
+}
+
+/// The header names the client listed in its `Connection` header, which are
+/// hop-by-hop by the client's own declaration (RFC 9110 §7.6.1). The two
+/// connection *options* are not header names and are dropped here; the
+/// `Connection` header itself never goes upstream either way.
+fn connection_named(head: &RequestHead) -> Vec<String> {
+    head.headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, v)| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty() && t != "close" && t != "keep-alive")
+        .collect()
+}
+
 /// The request as the upstream server expects it: an origin-form request line,
 /// without the hop-by-hop headers, and with `Connection: close` in their place.
 ///
@@ -213,27 +256,48 @@ pub fn origin_form(head: &RequestHead) -> Vec<u8> {
         },
         None => head.target.as_str(),
     };
-    // A chunked body is walked as chunked and passed on as chunked, so a
-    // `Content-Length` sitting beside it is not framing the proxy believes -
-    // and must not be framing the upstream believes either. An origin that
-    // read the length instead would stop short and take the rest of the body
-    // for a second request to that host. RFC 9112 lets an intermediary drop
-    // the length rather than refuse the whole request, which is what this does.
-    let chunked = body_framing(head) == Some(BodyFraming::Chunked);
+    // The framing this proxy believes is the framing the upstream is given, in
+    // the proxy's own words rather than the client's. A `Content-Length`
+    // beside a chunked body is dropped: the body is walked as chunked and
+    // passed on as chunked, and an origin that read the length instead would
+    // stop short and take the rest of the body for a second request to that
+    // host. RFC 9112 lets an intermediary drop the length rather than refuse
+    // the whole request. A length that *is* the framing is re-emitted as the
+    // number that was parsed, because `u64::from_str` accepts spellings an
+    // origin may not: `+5` frames five bytes here and nothing at all there,
+    // and those five bytes would be read as a request of their own.
+    let framing = body_framing(head);
     let mut out = format!("{} {} {}\r\n", head.method, path, head.version);
+    // Absolute form carries the host twice: in the URI, which is what the
+    // allowlist checked and what the socket was opened to, and in `Host`,
+    // which is what the origin routes on. The URI wins, so a request cleared
+    // for one host cannot arrive there naming another. An origin-form request
+    // has no URI authority and keeps the `Host` it came with.
+    let authority = uri_authority(&head.target);
+    if let Some(authority) = &authority {
+        out.push_str(&format!("Host: {authority}\r\n"));
+    }
+    let named = connection_named(head);
     for (name, value) in &head.headers {
         // Hop-by-hop, addressed to this proxy: forwarding them would leak the
         // client's proxy credentials to the upstream server and confuse its
         // connection handling. `Connection` and `Keep-Alive` describe the
         // client's connection to the proxy, not the proxy's to the server,
-        // whose lifetime is decided below.
-        if is_hop_by_hop(name) {
+        // whose lifetime is decided below. Whatever else `Connection` names is
+        // hop-by-hop because the client said so.
+        if is_hop_by_hop(name) || named.iter().any(|t| name.eq_ignore_ascii_case(t)) {
             continue;
         }
-        if chunked && name.eq_ignore_ascii_case("content-length") {
+        if authority.is_some() && name.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("content-length") {
             continue;
         }
         out.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if let Some(BodyFraming::Length(n)) = framing {
+        out.push_str(&format!("Content-Length: {n}\r\n"));
     }
     out.push_str("Connection: close\r\n\r\n");
     out.into_bytes()
@@ -252,7 +316,12 @@ fn is_hop_by_hop(name: &str) -> bool {
 /// Whether the client wants its connection closed once this request has been
 /// answered: it said so, or it speaks HTTP/1.0, where staying open has to be
 /// asked for.
-pub fn wants_close(head: &RequestHead) -> bool {
+///
+/// This and the body-relay helpers below are reached only from the connection
+/// loop, which needs a Unix socket; the Windows build keeps them for the tests
+/// at the end of this file, which is what the dead-code allowance is for.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn wants_close(head: &RequestHead) -> bool {
     let tokens: Vec<String> = head
         .headers
         .iter()
@@ -270,7 +339,7 @@ pub fn wants_close(head: &RequestHead) -> bool {
 
 /// How the body of a request is delimited, read off its head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BodyFraming {
+enum BodyFraming {
     /// No body at all: neither `Content-Length` nor `Transfer-Encoding`.
     None,
     /// Exactly this many bytes follow the head.
@@ -285,7 +354,7 @@ pub enum BodyFraming {
 /// know where the body ends, and so where the next request begins), a
 /// `Content-Length` that is not a number, or two that disagree. Every one of
 /// those is a 400; RFC 9112 calls them request smuggling vectors.
-pub fn body_framing(head: &RequestHead) -> Option<BodyFraming> {
+fn body_framing(head: &RequestHead) -> Option<BodyFraming> {
     let mut codings = head
         .headers
         .iter()
@@ -523,6 +592,13 @@ fn bad_request() -> Vec<u8> {
         "400 Bad Request",
         "not a proxy request this daemon can serve\n",
     )
+}
+
+/// Sent when a client promised a body and then stopped sending it. See
+/// [`BODY_IDLE_TIMEOUT`].
+#[cfg(unix)]
+fn request_timeout() -> Vec<u8> {
+    text_response("408 Request Timeout", "the request body stopped arriving\n")
 }
 
 /// Sent when an allowed host would not take the connection. The reason stays in
@@ -912,32 +988,48 @@ async fn serve(mut client: tokio::net::UnixStream, ctx: &ConnCtx) -> std::io::Re
             return Ok(());
         };
         upstream.write_all(&origin_form(&head)).await?;
-        // The body goes up and the response comes down at the same time: a
-        // server may answer (a `100 Continue`, or a refusal) before it has
-        // read the body, and a client waiting on that answer would otherwise
-        // never send it. The upstream was asked to close after its response,
-        // so its end of stream is the end of the response.
-        let (mut from_client, mut to_client) = client.split();
-        let (mut from_upstream, mut to_upstream) = upstream.split();
-        let relayed = tokio::try_join!(
-            relay_body(&mut from_client, &mut to_upstream, &mut buf, framing),
-            tokio::io::copy(&mut from_upstream, &mut to_client),
-        );
+        let relayed = {
+            let (mut from_client, mut to_client) = client.split();
+            let (mut from_upstream, mut to_upstream) = upstream.split();
+            relay_exchange(
+                &mut from_client,
+                &mut to_client,
+                &mut from_upstream,
+                &mut to_upstream,
+                &mut buf,
+                framing,
+            )
+            .await?
+        };
         match relayed {
+            Relayed::Done => {}
             // An upstream that closed without a byte of response would leave
             // the client waiting on a connection the proxy thinks is idle.
-            Ok((_, 0)) => {
+            Relayed::NoResponse => {
                 tracing::debug!(ws = %ctx.workspace, host = %host, "upstream closed without responding");
                 let _ = client.write_all(&bad_gateway()).await;
                 return Ok(());
             }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                tracing::debug!(ws = %ctx.workspace, host = %host, "request body is malformed: {e}");
-                let _ = client.write_all(&bad_request()).await;
+            // An answer only while there is still a response to be the answer
+            // *to*. Once any of the upstream's response has reached the client,
+            // appending a complete 400 or 408 to it is not an error message but
+            // a second response spliced onto the first, and nothing on the
+            // other end can tell the two apart. The connection closes either
+            // way, so nothing can be confused with a later response.
+            Relayed::BadBody { relayed } => {
+                tracing::debug!(ws = %ctx.workspace, host = %host, relayed, "request body is malformed");
+                if relayed == 0 {
+                    let _ = client.write_all(&bad_request()).await;
+                }
                 return Ok(());
             }
-            Err(e) => return Err(e),
+            Relayed::Stalled { relayed } => {
+                tracing::debug!(ws = %ctx.workspace, host = %host, relayed, "request body stalled; connection ended");
+                if relayed == 0 {
+                    let _ = client.write_all(&request_timeout()).await;
+                }
+                return Ok(());
+            }
         }
         drop(upstream);
         if wants_close(&head) {
@@ -1046,7 +1138,144 @@ async fn open_upstream(
 
 /// The longest line the chunked-body relay will buffer looking for its end:
 /// a chunk-size line or a trailer. Real ones are a few bytes.
+#[cfg_attr(not(unix), allow(dead_code))]
 const MAX_LINE_BYTES: usize = 8 * 1024;
+
+/// A writer that counts what it has passed on.
+///
+/// Two things need the count. The idle deadline needs to know whether anything
+/// moved during the last interval, and the error path needs to know whether any
+/// of the response has already reached the client - because once it has, a 400
+/// written after it is not an error message but a second response spliced onto
+/// the first, which no client can tell apart from the body it was reading.
+#[cfg(unix)]
+struct Counted<'a, W> {
+    inner: &'a mut W,
+    count: &'a std::sync::atomic::AtomicU64,
+}
+
+#[cfg(unix)]
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Counted<'_, W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let n = std::task::ready!(std::pin::Pin::new(&mut *this.inner).poll_write(cx, buf))?;
+        this.count
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        std::task::Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// How relaying one request body up and one response down ended.
+#[cfg(unix)]
+enum Relayed {
+    /// The response was relayed to its end. Nothing is owed to the client.
+    Done,
+    /// The upstream closed without a byte of response.
+    NoResponse,
+    /// The request body could not be walked any further. `relayed` is how much
+    /// of the response had already reached the client.
+    BadBody { relayed: u64 },
+    /// Nothing moved either way for [`BODY_IDLE_TIMEOUT`] while the body was
+    /// still owed. `relayed` is how much of the response had already reached
+    /// the client.
+    Stalled { relayed: u64 },
+}
+
+/// Carries one request body up and the response back down at the same time.
+///
+/// At the same time, because a server may answer - a `100 Continue`, or a
+/// refusal - before it has read the body, and a client waiting on that answer
+/// would otherwise never send it. The upstream was asked to close after its
+/// response, so its end of stream is the end of the response and nothing here
+/// has to understand response framing.
+///
+/// Both directions are counted, which is what makes the two failures above
+/// answerable: an idle interval is one in which neither count moved, and a
+/// half-written response is one whose count is not zero.
+#[cfg(unix)]
+async fn relay_exchange<CR, CW, UR, UW>(
+    from_client: &mut CR,
+    to_client: &mut CW,
+    from_upstream: &mut UR,
+    to_upstream: &mut UW,
+    buf: &mut Vec<u8>,
+    framing: BodyFraming,
+) -> std::io::Result<Relayed>
+where
+    CR: tokio::io::AsyncRead + Unpin,
+    CW: tokio::io::AsyncWrite + Unpin,
+    UR: tokio::io::AsyncRead + Unpin,
+    UW: tokio::io::AsyncWrite + Unpin,
+{
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let up = AtomicU64::new(0);
+    let down = AtomicU64::new(0);
+    // Once the body is through, the deadline stops applying; see
+    // [`BODY_IDLE_TIMEOUT`].
+    let body_done = AtomicBool::new(false);
+    let mut counted_up = Counted {
+        inner: to_upstream,
+        count: &up,
+    };
+    let mut counted_down = Counted {
+        inner: to_client,
+        count: &down,
+    };
+    let exchange = async {
+        tokio::try_join!(
+            async {
+                let r = relay_body(from_client, &mut counted_up, buf, framing).await;
+                body_done.store(true, Ordering::Relaxed);
+                r
+            },
+            tokio::io::copy(from_upstream, &mut counted_down),
+        )
+    };
+    // Pinned rather than dropped and rebuilt on each interval: a timeout that
+    // dropped this future would lose whatever `copy` had read into its own
+    // buffer and not yet written.
+    tokio::pin!(exchange);
+    let mut seen = (0u64, 0u64);
+    let outcome = loop {
+        match tokio::time::timeout(BODY_IDLE_TIMEOUT, &mut exchange).await {
+            Ok(outcome) => break outcome,
+            Err(_) if body_done.load(Ordering::Relaxed) => continue,
+            Err(_) => {
+                let moved = (up.load(Ordering::Relaxed), down.load(Ordering::Relaxed));
+                if moved == seen {
+                    return Ok(Relayed::Stalled { relayed: moved.1 });
+                }
+                seen = moved;
+            }
+        }
+    };
+    match outcome {
+        Ok((_, 0)) => Ok(Relayed::NoResponse),
+        Ok(_) => Ok(Relayed::Done),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Ok(Relayed::BadBody {
+            relayed: down.load(Ordering::Relaxed),
+        }),
+        Err(e) => Err(e),
+    }
+}
 
 /// Carries one request body from the client to the upstream, exactly as
 /// delimited by `framing`, and leaves `buf` holding whatever followed it - the
@@ -1059,7 +1288,8 @@ const MAX_LINE_BYTES: usize = 8 * 1024;
 /// which the caller turns into a 400; any other error is the connection.
 ///
 /// Generic over the streams so it can be tested on a pair of in-memory pipes.
-pub async fn relay_body<R, W>(
+#[cfg_attr(not(unix), allow(dead_code))]
+async fn relay_body<R, W>(
     client: &mut R,
     upstream: &mut W,
     buf: &mut Vec<u8>,
@@ -1076,16 +1306,22 @@ where
         BodyFraming::Chunked => {
             loop {
                 let line = read_line(client, buf).await?;
-                upstream.write_all(&line).await?;
+                // Read before it is written: a size the proxy cannot read is a
+                // 400 to the client, and an origin that had already been handed
+                // it would be framing this body by a number the proxy never
+                // agreed to.
                 let size = chunk_size(&line)?;
+                upstream.write_all(&line).await?;
                 if size == 0 {
                     break;
                 }
-                // The chunk's data and the CRLF that ends it.
-                let with_crlf = size.checked_add(2).ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "chunk size overflows")
-                })?;
-                relay_exact(client, upstream, buf, with_crlf).await?;
+                relay_exact(client, upstream, buf, size).await?;
+                // Every chunk's data ends with CRLF. Passing those two bytes
+                // through unchecked lets a client end a chunk with something a
+                // lenient origin accepts and this proxy does not, and the body
+                // then ends in two different places - which is where request
+                // smuggling starts.
+                relay_chunk_end(client, upstream, buf).await?;
             }
             // Trailers, up to and including the blank line that ends the body.
             loop {
@@ -1101,6 +1337,7 @@ where
 
 /// Passes exactly `remaining` bytes from `client` to `upstream`, taking what
 /// is already in `buf` first and leaving any surplus there.
+#[cfg_attr(not(unix), allow(dead_code))]
 async fn relay_exact<R, W>(
     client: &mut R,
     upstream: &mut W,
@@ -1135,9 +1372,48 @@ where
     Ok(())
 }
 
+/// Checks and forwards the CRLF that ends one chunk's data.
+///
+/// Anything else there is `InvalidData`, which the caller turns into a 400: the
+/// chunk was as long as it said, and what follows it is not the next chunk.
+#[cfg_attr(not(unix), allow(dead_code))]
+async fn relay_chunk_end<R, W>(
+    client: &mut R,
+    upstream: &mut W,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    while buf.len() < 2 {
+        let mut chunk = [0u8; 1024];
+        match client.read(&mut chunk).await? {
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "client closed at the end of a chunk",
+                ))
+            }
+            n => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    if &buf[..2] != b"\r\n" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "chunk is not ended by CRLF",
+        ));
+    }
+    upstream.write_all(b"\r\n").await?;
+    buf.drain(..2);
+    Ok(())
+}
+
 /// One line of `buf`, CRLF included, reading more from `client` until it is
 /// complete. A line longer than [`MAX_LINE_BYTES`] is `InvalidData`; a client
 /// that closes mid-line is `UnexpectedEof`.
+#[cfg_attr(not(unix), allow(dead_code))]
 async fn read_line<R>(client: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -1171,6 +1447,7 @@ where
 
 /// The size a chunk-size line announces: hex, with any `;ext=…` after it
 /// ignored. Anything else is `InvalidData`.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn chunk_size(line: &[u8]) -> std::io::Result<u64> {
     let text = std::str::from_utf8(line)
         .ok()
@@ -1285,10 +1562,12 @@ mod tests {
         );
         // The upstream is asked to close after this response, whatever the
         // client asked for: that is what delimits the response, so the next
-        // request on the client's connection can be checked on its own.
+        // request on the client's connection can be checked on its own. `Host`
+        // is the URI's authority, which is the host that was checked; see
+        // `an_absolute_uri_names_upstream_the_host_it_was_checked_against`.
         assert_eq!(
             String::from_utf8(origin_form(&h)).unwrap(),
-            "GET /a/b?c=d HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+            "GET /a/b?c=d HTTP/1.1\r\nHost: example.com:8080\r\nAccept: */*\r\nConnection: close\r\n\r\n"
         );
         // A URI with no path becomes the root.
         let h = head("GET http://example.com HTTP/1.1\r\nHost: example.com\r\n\r\n");
@@ -1659,6 +1938,17 @@ mod tests {
         later: &[u8],
         framing: BodyFraming,
     ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+        let (result, received, rest) = relay_full(already, later, framing).await;
+        result.map(|()| (received, rest))
+    }
+
+    /// The same, but keeping what reached the upstream even when the relay
+    /// failed: a body the proxy refuses must not have been passed on first.
+    async fn relay_full(
+        already: &[u8],
+        later: &[u8],
+        framing: BodyFraming,
+    ) -> (std::io::Result<()>, Vec<u8>, Vec<u8>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (mut client_side, mut proxy_side) = tokio::io::duplex(64);
         let (mut proxy_out, mut upstream_side) = tokio::io::duplex(64);
@@ -1678,7 +1968,7 @@ mod tests {
         sender.await.unwrap();
         let received = receiver.await.unwrap();
         proxy_side.read_to_end(&mut buf).await.unwrap();
-        result.map(|()| (received, buf))
+        (result, received, buf)
     }
 
     /// A body of known length is passed on whole and nothing past it: what
@@ -1728,5 +2018,96 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A chunk-size line the proxy cannot read is a 400 to the client, and the
+    /// origin must never have seen it. Writing the line upstream before
+    /// checking it leaves the origin framing the body one way and the proxy
+    /// another, which is the disagreement every check in here exists to
+    /// prevent.
+    #[tokio::test]
+    async fn a_chunk_size_reaches_the_origin_only_once_it_has_been_read() {
+        let (result, upstream, _) =
+            relay_full(b"zz\r\nab\r\n0\r\n\r\n", b"", BodyFraming::Chunked).await;
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "a size that is not hex is refused"
+        );
+        assert!(
+            upstream.is_empty(),
+            "the origin was handed a size the proxy then refused: {:?}",
+            String::from_utf8_lossy(&upstream)
+        );
+    }
+
+    /// Every chunk's data is followed by CRLF, and those two bytes are checked
+    /// rather than passed through. An origin lenient about the terminator
+    /// would find the body ending somewhere the proxy does not, and the bytes
+    /// in between would be a request it attributes to this client.
+    #[tokio::test]
+    async fn a_chunk_that_does_not_end_in_crlf_is_refused() {
+        let (result, _, _) = relay_full(b"4\r\nWikiXX0\r\n\r\n", b"", BodyFraming::Chunked).await;
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        // The well-formed body of the same shape still goes through.
+        let (got, _) = relay(b"4\r\nWiki\r\n0\r\n\r\n", b"", BodyFraming::Chunked)
+            .await
+            .unwrap();
+        assert_eq!(got, b"4\r\nWiki\r\n0\r\n\r\n");
+    }
+
+    /// The `Content-Length` sent upstream is the number the proxy parsed, not
+    /// the text it accepted. `u64::from_str` takes a leading `+`, so
+    /// `Content-Length: +5` frames the body as five bytes here while an origin
+    /// that refused the `+` would read no body at all and take those five
+    /// bytes for a request of their own.
+    #[test]
+    fn the_content_length_sent_on_is_the_number_the_proxy_read() {
+        for value in ["+5", "5, 5", " 5 "] {
+            let h = head(&format!(
+                "POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\nContent-Length: {value}\r\n\r\n"
+            ));
+            assert_eq!(
+                String::from_utf8(origin_form(&h)).unwrap(),
+                "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
+                "{value:?}"
+            );
+        }
+    }
+
+    /// `Connection` lists the headers that belong to this hop, and RFC 9110
+    /// §7.6.1 says an intermediary drops every one it names. Passing them on
+    /// hands the origin a header the client meant for the proxy alone.
+    #[test]
+    fn a_header_the_client_named_in_connection_is_hop_by_hop_too() {
+        let h = head(
+            "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close, X-Internal\r\nX-Internal: secret\r\nAccept: */*\r\n\r\n",
+        );
+        let out = String::from_utf8(origin_form(&h)).unwrap();
+        assert!(!out.contains("X-Internal"), "{out}");
+        assert!(!out.contains("secret"), "{out}");
+        // Only what it named: the rest of the request is untouched.
+        assert!(out.contains("Accept: */*\r\n"), "{out}");
+    }
+
+    /// An absolute-form request carries the host twice - in the URI, which is
+    /// what the allowlist checked and what the proxy connected to, and in
+    /// `Host`, which is what the origin routes on. They must agree, or a
+    /// request cleared for one host arrives at it naming another.
+    #[test]
+    fn an_absolute_uri_names_upstream_the_host_it_was_checked_against() {
+        let h = head(
+            "GET http://example.com:8080/a HTTP/1.1\r\nHost: evil.example\r\nAccept: */*\r\n\r\n",
+        );
+        assert_eq!(
+            String::from_utf8(origin_form(&h)).unwrap(),
+            "GET /a HTTP/1.1\r\nHost: example.com:8080\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        );
+        // Userinfo is part of the URI, not of the host being named.
+        let h = head("GET http://u:p@example.com/a HTTP/1.1\r\nHost: evil.example\r\n\r\n");
+        assert_eq!(
+            String::from_utf8(origin_form(&h)).unwrap(),
+            "GET /a HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+        );
     }
 }
