@@ -610,3 +610,60 @@ fn a_malformed_settings_file_is_kept_aside_and_never_overwritten() {
 
     std::env::remove_var(SETTINGS_PATH_ENV);
 }
+
+/// Task 15 (CI1): an arrangement that has not moved is not written.
+///
+/// Every status glyph, agent heartbeat and running cost moves the tab model,
+/// and the window reports the arrangement back on the signal that says so.
+/// `GroupModel` now fires `arrangementChanged` only when the groups themselves
+/// moved, but the store is the other half of the same guarantee: a report that
+/// says exactly what the file already holds must not mark it dirty, because
+/// dirty is what schedules an `fsync` of `state.json`.
+#[test]
+fn an_unchanged_arrangement_neither_dirties_the_store_nor_writes_the_file() {
+    let dir = temp_dir("unchanged-arrangement");
+    let path = dir.join("state.json");
+    let store = StateStore::new(Some(path.clone()));
+
+    let groups = || {
+        vec![PersistedGroup {
+            name: "Feature A".to_owned(),
+            workspace_ids: vec!["ws_1".to_owned(), "ws_2".to_owned()],
+            tabs: Vec::new(),
+        }]
+    };
+
+    // The first report is news and is written.
+    let token = store.update_changed(|s| s.set_groups(groups(), Some("ws_1".to_owned())));
+    assert!(token.is_some(), "a first arrangement is a change");
+    assert!(store.flush(), "and is written");
+    let written = std::fs::read_to_string(&path).expect("state.json");
+    assert!(written.contains("Feature A"));
+
+    // The same arrangement again is not.
+    assert!(
+        store
+            .update_changed(|s| s.set_groups(groups(), Some("ws_1".to_owned())))
+            .is_none(),
+        "an identical arrangement is not a change"
+    );
+    assert!(
+        !store.flush(),
+        "and leaves nothing to write, so no fsync is scheduled"
+    );
+
+    // A real move is, and so is a change of the active workspace on its own.
+    assert!(store
+        .update_changed(|s| s.set_groups(groups(), Some("ws_2".to_owned())))
+        .is_some());
+    assert!(store.flush());
+
+    let mut moved = groups();
+    moved[0].workspace_ids.reverse();
+    assert!(store
+        .update_changed(|s| s.set_groups(moved, Some("ws_2".to_owned())))
+        .is_some());
+    assert!(store.flush());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

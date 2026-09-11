@@ -2,6 +2,8 @@
 //! printed. This is the only module that knows about `wsl.exe` and Windows path
 //! shapes; like `model` and `client`, it must never import Qt types.
 
+use crate::model::DEFAULT_DISTRO;
+
 use anyhow::{anyhow, Context, Result};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -162,11 +164,6 @@ fn parse_endpoint(raw: &str) -> Result<SocketAddr, &'static str> {
     }
     Ok(addr)
 }
-
-/// The WSL distro this IDE installs its daemon into, and the one a
-/// `\\wsl.localhost\<distro>\...` path has to name for [`wsl_path`] to be able
-/// to convert it. `Settings::distro` defaults to it.
-pub const DEFAULT_DISTRO: &str = "bondsymphonic";
 
 /// How many stdout lines are read while looking for the daemon's port line
 /// before the launch is given up on. Generous, because the lines before it are

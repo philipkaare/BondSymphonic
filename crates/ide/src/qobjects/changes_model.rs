@@ -96,10 +96,10 @@ impl Drop for ChangesModelRust {
 
 /// Whether `ev` is a worktree change belonging to `workspace_id`.
 ///
-/// The router carries every event from the connection, so both this model and
-/// each open editor filter the same stream down to the workspace they are
-/// showing. An event with no workspace is the daemon talking about itself and
-/// never matches.
+/// The router already narrows the stream to this workspace's `fs.changed`, so
+/// this is the check that the narrowing held: an event for another workspace,
+/// or one with no workspace at all -- the daemon talking about itself -- is not
+/// a change to the list of files this model is showing.
 pub fn touches_workspace(ws: &Option<WorkspaceId>, ev: &Event, workspace_id: &str) -> bool {
     matches!(ev, Event::FsChanged { .. }) && ws.as_ref().is_some_and(|w| w.0 == workspace_id)
 }
@@ -180,7 +180,7 @@ impl qobject::ChangesModel {
                 return;
             }
         };
-        let rx = shared.router.subscribe_all();
+        let rx = shared.router.subscribe_fs(&WorkspaceId(workspace.clone()));
         let qt = self.as_ref().qt_thread();
         let task = runtime().spawn(watch(rx, workspace.clone(), qt));
         self.as_mut().rust_mut().watch_task = Some(task);

@@ -126,11 +126,6 @@ impl Release {
     pub fn release(&self) {
         self.router.unsubscribe_stream(&self.key, self.token);
     }
-
-    /// The stream this hold is on.
-    pub fn key(&self) -> &StreamKey {
-        &self.key
-    }
 }
 
 #[derive(Default)]
@@ -248,14 +243,11 @@ impl EventRouter {
         self.subscribe_stream(StreamKey::Fs(workspace.clone())).0
     }
 
-    /// Subscribes to one stream, whatever kind of key it is, and hands back the
-    /// token that names this subscription.
-    ///
-    /// A [`Fanout::Exclusive`] key replaces whoever held it and is replayed
-    /// anything parked for it; a [`Fanout::Shared`] key simply gains one more
-    /// listener.
     /// [`EventRouter::subscribe_stream`] with the token already wrapped in the
-    /// [`Release`] that ends it.
+    /// [`Release`] that ends it, which is what every exclusive stream hands its
+    /// consumer: taking the subscription and taking the only thing that ends it
+    /// are one step, so no tail path can reach for a key-shaped release and
+    /// take a replacement's subscription with it.
     fn subscribe_held(&self, key: StreamKey) -> (EventRx, Release) {
         let (rx, token) = self.subscribe_stream(key.clone());
         let release = Release {
@@ -266,6 +258,12 @@ impl EventRouter {
         (rx, release)
     }
 
+    /// Subscribes to one stream, whatever kind of key it is, and hands back the
+    /// token that names this subscription.
+    ///
+    /// A [`Fanout::Exclusive`] key replaces whoever held it and is replayed
+    /// anything parked for it; a [`Fanout::Shared`] key simply gains one more
+    /// listener.
     pub fn subscribe_stream(&self, key: StreamKey) -> (EventRx, SubToken) {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut inner = self.lock();

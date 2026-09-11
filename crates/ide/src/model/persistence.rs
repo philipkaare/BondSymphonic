@@ -204,10 +204,26 @@ impl StateFile {
     }
 
     /// Replaces the recorded arrangement wholesale, which is what a
-    /// `GroupModel` mutation reports.
-    pub fn set_groups(&mut self, groups: Vec<PersistedGroup>, active_workspace: Option<String>) {
+    /// `GroupModel` mutation reports. Answers whether anything moved.
+    ///
+    /// The answer is the point. The window reports the arrangement back on
+    /// every mutation of the tab model, and most mutations are not
+    /// arrangements at all -- a status glyph, an agent heartbeat, a running
+    /// cost. `GroupModel` now fires `arrangementChanged` only when the groups
+    /// themselves moved; this is the other half of the same guarantee, so a
+    /// report that says exactly what the file already holds cannot mark it
+    /// dirty and schedule an `fsync` of `state.json` with nothing to write.
+    pub fn set_groups(
+        &mut self,
+        groups: Vec<PersistedGroup>,
+        active_workspace: Option<String>,
+    ) -> bool {
+        if self.groups == groups && self.active_workspace == active_workspace {
+            return false;
+        }
         self.groups = groups;
         self.active_workspace = active_workspace;
+        true
     }
 
     /// Files `workspace` under `group`, creating that group at the end if it is
@@ -474,6 +490,24 @@ impl StateStore {
         inner.dirty = true;
         inner.token = inner.token.wrapping_add(1);
         inner.token
+    }
+
+    /// Changes the state only when `f` reports that it changed something, and
+    /// hands back the token whose timer may write it.
+    ///
+    /// `None` means nothing moved: the state is not marked dirty, no new token
+    /// is minted, and the caller has no write to schedule. For the reports that
+    /// arrive far more often than they say anything new -- see
+    /// [`StateFile::set_groups`] -- which would otherwise cost an `fsync` of
+    /// the whole file per status event.
+    pub fn update_changed(&self, f: impl FnOnce(&mut StateFile) -> bool) -> Option<u64> {
+        let mut inner = self.lock();
+        if !f(&mut inner.state) {
+            return None;
+        }
+        inner.dirty = true;
+        inner.token = inner.token.wrapping_add(1);
+        Some(inner.token)
     }
 
     /// Writes iff there is something to write and `token` is still the newest

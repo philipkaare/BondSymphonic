@@ -667,20 +667,33 @@ impl Workspaces {
         let was_active = self.active_group == g && self.active_tab == t;
         self.groups[g].tabs.remove(t);
         if was_active {
+            // `select_beside` always leaves a valid selection, falling back
+            // itself when every group is empty, so there is nothing left to
+            // repair here: checking again could only run the fallback a second
+            // time over the tab it had just chosen.
             self.select_beside(g, t);
-        } else if self.active_group == g && self.active_tab > t {
+            return true;
+        }
+        if self.active_group == g && self.active_tab > t {
             // An unrelated tab in the same group: the workspace in front has
             // not changed, only the index it sits at.
             self.active_tab -= 1;
         }
-        let active_valid = self
+        self.ensure_active_valid();
+        true
+    }
+
+    /// Repairs a selection that a removal or a move may have left pointing past
+    /// the end of its group. A selection that still names a tab is left where
+    /// it is: the user is looking at it.
+    fn ensure_active_valid(&mut self) {
+        let valid = self
             .groups
             .get(self.active_group)
             .is_some_and(|grp| self.active_tab < grp.tabs.len());
-        if !active_valid {
+        if !valid {
             self.fallback_active();
         }
-        true
     }
 
     /// Selects the tab next to the one just removed from `group` at `removed`.
@@ -734,13 +747,7 @@ impl Workspaces {
             self.active_tab = self.groups[to].tabs.len() - 1;
             return true;
         }
-        let active_valid = self
-            .groups
-            .get(self.active_group)
-            .is_some_and(|grp| self.active_tab < grp.tabs.len());
-        if !active_valid {
-            self.fallback_active();
-        }
+        self.ensure_active_valid();
         true
     }
 
@@ -1157,32 +1164,6 @@ impl Workspaces {
 
     pub fn from_json(s: &str) -> Option<Self> {
         serde_json::from_str(s).ok()
-    }
-}
-
-/// The daemon's snake_case spelling of an agent state. The `TranscriptModel`
-/// publishes this as its `state` property, and `GroupModel::setAgentStatus`
-/// parses it back, so the word crossing the boundary is defined once here.
-pub fn agent_state_word(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Idle => "idle",
-        AgentState::Working => "working",
-        AgentState::WaitingPermission => "waiting_permission",
-        AgentState::Error => "error",
-        AgentState::Exited => "exited",
-    }
-}
-
-/// Inverse of [`agent_state_word`]. `None` for anything else, so a caller
-/// decides what an unrecognised word means rather than being handed a guess.
-pub fn parse_agent_state(word: &str) -> Option<AgentState> {
-    match word {
-        "idle" => Some(AgentState::Idle),
-        "working" => Some(AgentState::Working),
-        "waiting_permission" => Some(AgentState::WaitingPermission),
-        "error" => Some(AgentState::Error),
-        "exited" => Some(AgentState::Exited),
-        _ => None,
     }
 }
 

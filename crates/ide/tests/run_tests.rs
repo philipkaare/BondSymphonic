@@ -207,8 +207,20 @@ fn apply_list_builds_views_and_apply_state_moves_them() {
     // lost -- a restart loses every run -- so nothing is carried over here. The
     // last *finished* run of a configuration is the one exception, and
     // `a_finished_run_survives_a_relist_that_omits_it` is where it lives.
-    runs.apply_state("run_1", RunState::Ready, None, None);
-    runs.apply_output("run_1", "hello");
+    //
+    // The live run is a second one, started after the first failed, rather than
+    // `run_1` moved back to `ready`: the daemon never walks a run backwards out
+    // of a terminal state, and a test that asks it to is testing a sequence
+    // that cannot happen. Starting the configuration again drops the finished
+    // run, which is what leaves exactly one live run here.
+    runs.record_started(
+        "run_2".to_owned(),
+        "dev".to_owned(),
+        41874,
+        "http://localhost:41874".to_owned(),
+    );
+    runs.apply_state("run_2", RunState::Ready, None, None);
+    runs.apply_output("run_2", "hello");
     runs.apply_list(vec![]);
     assert!(runs.runs.is_empty());
     assert!(runs.logs.is_empty(), "an unknown run's log is not kept");

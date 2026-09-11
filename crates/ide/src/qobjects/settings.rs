@@ -177,7 +177,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            distro: crate::launcher::DEFAULT_DISTRO.into(),
+            distro: crate::model::DEFAULT_DISTRO.into(),
             daemon_path: "~/.bondsymphonic/bin/bondsymphonic-daemon".into(),
             log_level: "info".into(),
             api_key_set: false,

@@ -180,12 +180,14 @@ pub struct TranscriptModelRust {
     /// Tool names the user answered "always allow this tool" for, for the agent
     /// this model is attached to.
     ///
-    /// Held here rather than only in the [`Transcript`] because `attach` builds
-    /// a fresh transcript, and a reconnect re-attaches this pane to the same
-    /// agent. Keeping it there made a daemon restart quietly cancel every
-    /// pre-approval the user had given, so the next tool call asked again for
-    /// something they had already said "always" to. [`carry_always_allow`]
-    /// decides what survives an attach.
+    /// Held here and nowhere else. `attach` builds a fresh [`Transcript`], and
+    /// a reconnect re-attaches this pane to the same agent, so a set kept on
+    /// the transcript made a daemon restart quietly cancel every pre-approval
+    /// the user had given: the next tool call asked again for something they
+    /// had already said "always" to. The transcript used to keep a second copy
+    /// of this one, synchronised by hand at two call sites;
+    /// [`decide_permission`] takes it as an argument instead, and
+    /// [`carry_always_allow`] decides what survives an attach.
     always_allow: BTreeSet<String>,
     /// Replay plus the live loop, aborted on re-attach and on Drop.
     task: Option<tokio::task::JoinHandle<()>>,
@@ -362,11 +364,9 @@ impl qobject::TranscriptModel {
         let generation = {
             let mut rust = self.as_mut().rust_mut();
             rust.generation += 1;
-            let carried =
+            rust.always_allow =
                 carry_always_allow(&previous, &agent, std::mem::take(&mut rust.always_allow));
-            rust.always_allow = carried.clone();
             rust.transcript = Transcript::default();
-            rust.transcript.always_allow = carried;
             rust.generation
         };
         self.as_mut().set_workspace_id(workspace_id);
@@ -473,12 +473,7 @@ impl qobject::TranscriptModel {
         // "always deny" in the permission bar.
         if allow && always_allow {
             if let Some(name) = tool {
-                // Both copies, in one place so they cannot drift: the
-                // transcript's is what `take_auto_allowed` reads, and the
-                // model's is what survives the next attach.
-                let mut rust = self.as_mut().rust_mut();
-                rust.always_allow.insert(name.clone());
-                rust.transcript.always_allow.insert(name);
+                self.as_mut().rust_mut().always_allow.insert(name);
             }
         }
         if answers_pending {
@@ -606,7 +601,15 @@ impl qobject::TranscriptModel {
     /// decision is Rust's, not the view's. Idempotent, so it can be called
     /// after every applied message without re-raising the same request.
     fn sync_pending(mut self: Pin<&mut Self>) {
-        let auto = self.as_mut().rust_mut().transcript.take_auto_allowed();
+        // Read before the transcript is borrowed mutably: the set and the
+        // pending request live on the same struct, and only one of them is
+        // being changed.
+        let allowed = self.as_ref().rust().always_allow.clone();
+        let auto = self
+            .as_mut()
+            .rust_mut()
+            .transcript
+            .take_auto_allowed(&allowed);
         let current = self.as_ref().pending_json().to_string();
         if let Some((pending, decision)) = auto {
             if !current.is_empty() {

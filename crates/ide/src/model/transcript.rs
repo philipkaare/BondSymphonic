@@ -16,12 +16,11 @@
 //!   are attached to it by id, so a tool card is one frame that fills in.
 //!
 //! What a permission request means is decided here too: [`Transcript::pending`]
-//! is what the permission bar shows, and [`Transcript::decide_permission`] is
-//! what lets "always allow this tool" answer the next one without the user.
+//! is what the permission bar shows, and [`decide_permission`] is what lets
+//! "always allow this tool" answer the next one without the user.
 //!
 //! This module must never import Qt types.
 
-use crate::model::app_state::agent_state_word;
 use bondsymphonic_proto::{AgentMessage, AgentMessageBody, AgentState, PermissionDecision};
 use serde::Serialize;
 use serde_json::Value;
@@ -89,6 +88,37 @@ pub enum TranscriptItem {
     },
 }
 
+/// The daemon's snake_case spelling of an agent state.
+///
+/// Here, beside [`TabAgentState`], because that is the type that carries the
+/// word across the boundary: the `TranscriptModel` publishes it as its `state`
+/// property and `GroupModel::setAgentStatus` parses it back, so both ends of
+/// one string are defined in one place. It used to live beside the tab model,
+/// which meant the pure transcript module had to reach into the application
+/// state for it.
+pub fn agent_state_word(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Idle => "idle",
+        AgentState::Working => "working",
+        AgentState::WaitingPermission => "waiting_permission",
+        AgentState::Error => "error",
+        AgentState::Exited => "exited",
+    }
+}
+
+/// Inverse of [`agent_state_word`]. `None` for anything else, so a caller
+/// decides what an unrecognised word means rather than being handed a guess.
+pub fn parse_agent_state(word: &str) -> Option<AgentState> {
+    match word {
+        "idle" => Some(AgentState::Idle),
+        "working" => Some(AgentState::Working),
+        "waiting_permission" => Some(AgentState::WaitingPermission),
+        "error" => Some(AgentState::Error),
+        "exited" => Some(AgentState::Exited),
+        _ => None,
+    }
+}
+
 /// The state the tab shows the agent in.
 ///
 /// The daemon's [`AgentState`] plus the one thing it cannot say: that the IDE
@@ -135,6 +165,21 @@ impl TabAgentState {
     pub fn is(self, state: AgentState) -> bool {
         self == Self::Known(state)
     }
+}
+
+/// The answer to give without asking the user, if there is one.
+///
+/// `always_allow` is the set of tool names the user answered with "always allow
+/// this tool for this session". It is not persisted -- a session is one tab's
+/// lifetime -- and it is held by the pane, not by the transcript, because a
+/// reconnect rebuilds the transcript and must not cancel a pre-approval.
+pub fn decide_permission(
+    always_allow: &BTreeSet<String>,
+    tool_name: &str,
+) -> Option<PermissionDecision> {
+    always_allow
+        .contains(tool_name)
+        .then_some(PermissionDecision::Allow)
 }
 
 /// A tool call waiting for the user's answer. Everything the permission bar
@@ -185,9 +230,6 @@ pub struct Transcript {
     pub turns: u32,
     pub session_id: Option<String>,
     pub pending: Option<PendingPermission>,
-    /// Tool names the user answered with "always allow this tool for this
-    /// session". Not persisted: a session is one tab's lifetime.
-    pub always_allow: BTreeSet<String>,
     /// Highest `seq` applied. `None` until the first message, so a daemon that
     /// numbers its first message `0` does not have it swallowed by the
     /// duplicate check.
@@ -206,7 +248,6 @@ impl Default for Transcript {
             turns: 0,
             session_id: None,
             pending: None,
-            always_allow: BTreeSet::new(),
             last_seq: None,
         }
     }
@@ -484,18 +525,20 @@ impl Transcript {
     /// This is the auto-answer: the caller sends the reply, and because the
     /// request was taken rather than published, the permission bar never shows
     /// one the user has already pre-answered. `None` leaves `pending` alone.
-    pub fn take_auto_allowed(&mut self) -> Option<(PendingPermission, PermissionDecision)> {
+    ///
+    /// `always_allow` is passed in rather than held here. It used to be both:
+    /// a copy on the transcript, which this read, and a copy on the model,
+    /// which survives the re-attach that a reconnect makes -- two sets kept in
+    /// step by hand at two call sites, and a third one added anywhere would
+    /// have been the bug this is named for.
+    pub fn take_auto_allowed(
+        &mut self,
+        always_allow: &BTreeSet<String>,
+    ) -> Option<(PendingPermission, PermissionDecision)> {
         let tool = self.pending.as_ref().map(|p| p.tool_name.clone())?;
-        let decision = self.decide_permission(&tool)?;
+        let decision = decide_permission(always_allow, &tool)?;
         let pending = self.pending.take()?;
         Some((pending, decision))
-    }
-
-    /// The answer to give without asking the user, if there is one.
-    pub fn decide_permission(&self, tool_name: &str) -> Option<PermissionDecision> {
-        self.always_allow
-            .contains(tool_name)
-            .then_some(PermissionDecision::Allow)
     }
 
     /// Every item, for a view rebuilding itself from scratch.

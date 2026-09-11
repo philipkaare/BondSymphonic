@@ -7,8 +7,9 @@
 //! the C++ side never has to parse that JSON just to paint a tab: it asks for
 //! the label, the tooltip, the status word and the counts directly.
 
-use crate::model::app_state::{parse_agent_state, AgentTab, TabStatus, Workspaces, UNSORTED_GROUP};
+use crate::model::app_state::{AgentTab, TabStatus, Workspaces, UNSORTED_GROUP};
 use crate::model::persistence::{PersistedGroup, PersistedGroups};
+use crate::model::transcript::parse_agent_state;
 use bondsymphonic_proto::{AgentAdapterKind, AgentId, WorkspaceId, WorkspaceInfo, WorkspaceState};
 
 #[cxx_qt::bridge]

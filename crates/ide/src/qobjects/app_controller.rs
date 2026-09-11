@@ -9,8 +9,9 @@
 use crate::client::router::EventRouter;
 use crate::client::{ClientError, DaemonClient};
 use crate::launcher::{self, LaunchSpec};
-use crate::model::app_state::{agent_state_word, compose_status, ConnectionState, Workspaces};
+use crate::model::app_state::{compose_status, ConnectionState, Workspaces};
 use crate::model::persistence::{self, StateFile, StateStore};
+use crate::model::transcript::agent_state_word;
 use crate::qobjects::settings::Settings;
 use crate::qobjects::smoke;
 use bondsymphonic_proto::*;
@@ -254,6 +255,15 @@ pub fn state_store() -> &'static StateStore {
 /// closing -- is therefore one write, [`persistence::DEBOUNCE`] after it stops.
 pub fn note_state(f: impl FnOnce(&mut StateFile)) {
     schedule_flush(state_store().update(f));
+}
+
+/// The same, for a change that may turn out not to be one: nothing is written
+/// and no timer is started when `f` reports that the state already said this.
+/// See [`StateStore::update_changed`].
+pub fn note_state_if_changed(f: impl FnOnce(&mut StateFile) -> bool) {
+    if let Some(token) = state_store().update_changed(f) {
+        schedule_flush(token);
+    }
 }
 
 /// Starts the timer that writes `state.json` unless a later change supersedes
@@ -2738,8 +2748,11 @@ impl qobject::AppController {
         }
         let json = json.to_string();
         match serde_json::from_str::<persistence::PersistedGroups>(&json) {
+            // Only when it moved. The window reports on every mutation of the
+            // tab model and an arrangement is the smallest part of what moves,
+            // so an equal report must not schedule a write of the whole file.
             Ok(reported) => {
-                note_state(|s| s.set_groups(reported.groups, reported.active_workspace))
+                note_state_if_changed(|s| s.set_groups(reported.groups, reported.active_workspace))
             }
             // Refused rather than applied as an empty arrangement: that would
             // record every group as deleted over a bug in the caller.

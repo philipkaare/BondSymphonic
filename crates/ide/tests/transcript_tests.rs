@@ -3,7 +3,8 @@
 //! transcript view's behaviour actually rests on.
 
 use bondsymphonic_ide::model::transcript::{
-    tool_summary, Applied, LiveEvent, PendingPermission, TabAgentState, Transcript, TranscriptItem,
+    decide_permission, tool_summary, Applied, LiveEvent, PendingPermission, TabAgentState,
+    Transcript, TranscriptItem,
 };
 use bondsymphonic_ide::qobjects::transcript_model::carry_always_allow;
 use bondsymphonic_proto::{AgentMessage, AgentMessageBody, AgentState, PermissionDecision};
@@ -287,11 +288,16 @@ fn a_permission_request_sets_pending_and_leaving_the_state_clears_it() {
 
 #[test]
 fn decide_permission_answers_only_for_always_allowed_tools() {
-    let mut t = Transcript::default();
-    assert_eq!(t.decide_permission("Bash"), None);
-    t.always_allow.insert("Bash".to_owned());
-    assert_eq!(t.decide_permission("Bash"), Some(PermissionDecision::Allow));
-    assert_eq!(t.decide_permission("Write"), None);
+    // The set is the pane's, not the transcript's: a reconnect rebuilds the
+    // transcript and must not cancel a pre-approval the user has given.
+    let mut always_allow = BTreeSet::new();
+    assert_eq!(decide_permission(&always_allow, "Bash"), None);
+    always_allow.insert("Bash".to_owned());
+    assert_eq!(
+        decide_permission(&always_allow, "Bash"),
+        Some(PermissionDecision::Allow)
+    );
+    assert_eq!(decide_permission(&always_allow, "Write"), None);
 }
 
 #[test]
@@ -470,7 +476,7 @@ fn replay_applies_history_then_live_and_de_duplicates_the_overlap() {
 #[test]
 fn replay_leaves_an_always_allowed_request_to_be_auto_answered() {
     let mut t = Transcript::default();
-    t.always_allow.insert("Read".to_owned());
+    let always_allow = BTreeSet::from(["Read".to_owned()]);
     // The state `agent.history` came back with, applied before the fold the way
     // the model does it. Without it the request would be folded and then
     // dropped: an agent that is not waiting has nothing to be answered.
@@ -488,7 +494,7 @@ fn replay_leaves_an_always_allowed_request_to_be_auto_answered() {
     // Still pending at this point: `replay` folds, the caller decides.
     assert!(t.pending.is_some());
 
-    let (taken, decision) = t.take_auto_allowed().expect("auto-answered");
+    let (taken, decision) = t.take_auto_allowed(&always_allow).expect("auto-answered");
     assert_eq!(taken.request_id, "req_7");
     assert_eq!(taken.summary, "/repo/a.rs");
     assert_eq!(decision, PermissionDecision::Allow);
@@ -497,7 +503,7 @@ fn replay_leaves_an_always_allowed_request_to_be_auto_answered() {
         "an auto-answered request must not reach the bar"
     );
     // Nothing left to take, and a tool that is not on the list is left alone.
-    assert!(t.take_auto_allowed().is_none());
+    assert!(t.take_auto_allowed(&always_allow).is_none());
 
     let mut other = Transcript::default();
     other.apply(&msg(
@@ -509,7 +515,7 @@ fn replay_leaves_an_always_allowed_request_to_be_auto_answered() {
             suggestions: Vec::new(),
         },
     ));
-    assert!(other.take_auto_allowed().is_none());
+    assert!(other.take_auto_allowed(&always_allow).is_none());
     assert!(other.pending.is_some(), "an unlisted tool still asks");
 }
 
