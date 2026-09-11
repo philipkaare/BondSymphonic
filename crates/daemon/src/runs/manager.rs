@@ -1079,21 +1079,15 @@ async fn start_forwarder(
     };
     let killer = child.killer;
     let mut exit = child.exit;
-    let mut out = tokio::io::BufReader::new(stdout).lines();
-    let mut err = tokio::io::BufReader::new(stderr).lines();
+    let mut helper = crate::util::ready_line::Helper::new("forward", ws.as_str(), stdout, stderr);
     // The forwarder announces its bind, so the first probe after the command
     // starts is not answered by an empty run directory.
-    let ready = tokio::time::timeout(FORWARDER_READY, async {
-        while let Ok(Some(line)) = out.next_line().await {
-            if line.starts_with(crate::net::forward::READY_LINE) {
-                return true;
-            }
-            tracing::debug!(ws = %ws, "forward: {line}");
-        }
-        false
-    })
-    .await
-    .unwrap_or(false);
+    let ready = helper
+        .ready(crate::net::forward::READY_LINE, FORWARDER_READY)
+        .await;
+    // Returning, unlike the shim's caller: a bridge whose far end never came up
+    // cannot carry a thing, so the run refuses to start rather than sitting in
+    // `starting` for ever.
     if !ready {
         warn!(ws = %ws, port, "port forwarder never reported listening");
         killer();
@@ -1103,18 +1097,7 @@ async fn start_forwarder(
     }
     let id = ws.clone();
     tokio::spawn(async move {
-        tokio::join!(
-            async {
-                while let Ok(Some(line)) = out.next_line().await {
-                    tracing::debug!(ws = %id, "forward: {line}");
-                }
-            },
-            async {
-                while let Ok(Some(line)) = err.next_line().await {
-                    warn!(ws = %id, "forward: {line}");
-                }
-            }
-        );
+        helper.drain().await;
         let code = (&mut exit).await.ok();
         tracing::debug!(ws = %id, ?code, "port forwarder exited");
     });

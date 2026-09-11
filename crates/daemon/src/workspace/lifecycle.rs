@@ -13,7 +13,6 @@ use crate::workspace::{now_rfc3339, Workspace};
 use bondsymphonic_proto::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::AsyncBufReadExt;
 
 /// The account whose `/home/<user>` the bwrap backend mounts the sandbox home at.
 ///
@@ -246,21 +245,16 @@ async fn start_shim(d: &Arc<Daemon>, ws: &Workspace, handle: &Arc<dyn SandboxHan
         report_no_network(d, &ws.id, "the proxy shim started without pipes");
         return;
     };
-    let mut out = tokio::io::BufReader::new(stdout).lines();
-    let mut err = tokio::io::BufReader::new(stderr).lines();
+    let mut helper =
+        crate::util::ready_line::Helper::new("proxy-shim", ws.id.as_str(), stdout, stderr);
     // The shim announces its bind, so the first request out of the sandbox
     // cannot arrive before the port exists.
-    let ready = tokio::time::timeout(SHIM_READY_TIMEOUT, async {
-        while let Ok(Some(line)) = out.next_line().await {
-            if line.starts_with(crate::net::shim::READY_LINE) {
-                return true;
-            }
-            tracing::debug!(ws = %ws.id, "proxy-shim: {line}");
-        }
-        false
-    })
-    .await
-    .unwrap_or(false);
+    let ready = helper
+        .ready(crate::net::shim::READY_LINE, SHIM_READY_TIMEOUT)
+        .await;
+    // Not returning: a workspace with no route out is still a workspace worth
+    // opening, so the notice goes out and the shim is watched exactly as a
+    // healthy one would be.
     if !ready {
         report_no_network(
             d,
@@ -271,18 +265,7 @@ async fn start_shim(d: &Arc<Daemon>, ws: &Workspace, handle: &Arc<dyn SandboxHan
     let d = d.clone();
     let id = ws.id.clone();
     tokio::spawn(async move {
-        tokio::join!(
-            async {
-                while let Ok(Some(line)) = out.next_line().await {
-                    tracing::debug!(ws = %id, "proxy-shim: {line}");
-                }
-            },
-            async {
-                while let Ok(Some(line)) = err.next_line().await {
-                    tracing::warn!(ws = %id, "proxy-shim: {line}");
-                }
-            }
-        );
+        helper.drain().await;
         let code = (&mut child.exit).await.ok();
         // A sandbox on its way down takes the shim with it, which is ordinary; a
         // shim that dies under a live sandbox has cost that workspace its
