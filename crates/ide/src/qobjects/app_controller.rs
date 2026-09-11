@@ -2325,7 +2325,18 @@ impl qobject::AppController {
         // absorbing objects out of it leaves the base branch pointing at
         // commits whose parents have been deleted.
         if !self.as_mut().begin_workspace_op(&id) {
-            report_failure(&qt, "workspace.destroy", WORKSPACE_BUSY.to_owned());
+            // Typed, like this function's other two failures, so every
+            // workspace-scoped failure says which workspace it belongs to.
+            // Deliberately not `end_destroy`: a refusal must leave the booking
+            // alone, because the booking belongs to the operation that is still
+            // running. Whether the window shows this as a box or a banner is
+            // its own decision -- the signal forces neither.
+            report_workspace_op_failure(
+                &qt,
+                id.clone(),
+                "workspace.destroy",
+                WORKSPACE_BUSY.to_owned(),
+            );
             return;
         }
         let shared = match require_connection() {
