@@ -12,8 +12,20 @@
 //! `CONNECT host:port` for TLS (everything an agent does), and an absolute-URI
 //! request (`GET http://host/path`) for plain HTTP. Either way the host is
 //! resolved from the request, checked against the workspace's live allowlist,
-//! and the connection is then either tunnelled to that one host or refused with
-//! a 403 that says which host and where to allow it.
+//! and the request is then either carried to that one host or refused with a
+//! 403 that says which host and where to allow it.
+//!
+//! A `CONNECT` pins its connection: once the tunnel is up, everything the
+//! client sends goes to the one host it was allowed. A plain-HTTP connection
+//! is not one decision but a sequence of them: a keep-alive client sends its
+//! next request on the same connection, and that request names its own host.
+//! So plain HTTP is served one request at a time - head, check, connect,
+//! relay, and round again - each request to the host *it* names, and each
+//! upstream connection asked to close after its response, which is what tells
+//! one response from the next without parsing every framing HTTP has. The
+//! first version of this proxy piped the whole connection to the first host,
+//! and a second request for another allowed host arrived there, credentials
+//! and all.
 //!
 //! The allowlist is a list of *names*, and a name is not a destination: a
 //! repository the user has not read can add `assets.example.test` to it and
@@ -175,7 +187,19 @@ fn split_authority(auth: &str, default_port: u16) -> Option<(String, u16)> {
 }
 
 /// The request as the upstream server expects it: an origin-form request line,
-/// without the hop-by-hop proxy headers.
+/// without the hop-by-hop headers, and with `Connection: close` in their place.
+///
+/// The close is the proxy's own: whatever the client asked for, the upstream
+/// is told to end its connection after this one response. Its end of stream is
+/// then the end of the response, so the response can be relayed without the
+/// proxy understanding its framing, and the client's next request - which may
+/// name a different host - gets checked and connected on its own. Every origin
+/// honours it. The proxy never closes the client's own connection over it, but
+/// the response carries the `Connection: close` back, so a well-behaved client
+/// usually closes anyway and opens a fresh connection for its next request:
+/// the loop is there for the clients that do *not* - a pipelining one, or one
+/// that ignores the header - because those are the ones whose second request
+/// used to be delivered to the first request's host.
 ///
 /// The client's HTTP version is kept rather than forced to 1.1: an HTTP/1.0
 /// client told the server it speaks 1.1 would be sent chunked responses it
@@ -189,20 +213,110 @@ pub fn origin_form(head: &RequestHead) -> Vec<u8> {
         },
         None => head.target.as_str(),
     };
+    // A chunked body is walked as chunked and passed on as chunked, so a
+    // `Content-Length` sitting beside it is not framing the proxy believes -
+    // and must not be framing the upstream believes either. An origin that
+    // read the length instead would stop short and take the rest of the body
+    // for a second request to that host. RFC 9112 lets an intermediary drop
+    // the length rather than refuse the whole request, which is what this does.
+    let chunked = body_framing(head) == Some(BodyFraming::Chunked);
     let mut out = format!("{} {} {}\r\n", head.method, path, head.version);
     for (name, value) in &head.headers {
         // Hop-by-hop, addressed to this proxy: forwarding them would leak the
         // client's proxy credentials to the upstream server and confuse its
-        // connection handling.
-        if name.eq_ignore_ascii_case("proxy-connection")
-            || name.eq_ignore_ascii_case("proxy-authorization")
-        {
+        // connection handling. `Connection` and `Keep-Alive` describe the
+        // client's connection to the proxy, not the proxy's to the server,
+        // whose lifetime is decided below.
+        if is_hop_by_hop(name) {
+            continue;
+        }
+        if chunked && name.eq_ignore_ascii_case("content-length") {
             continue;
         }
         out.push_str(&format!("{name}: {value}\r\n"));
     }
-    out.push_str("\r\n");
+    out.push_str("Connection: close\r\n\r\n");
     out.into_bytes()
+}
+
+/// Whether a request header is about the client's connection to this proxy
+/// rather than about the request, and so must not be passed on.
+fn is_hop_by_hop(name: &str) -> bool {
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("proxy-"))
+}
+
+/// Whether the client wants its connection closed once this request has been
+/// answered: it said so, or it speaks HTTP/1.0, where staying open has to be
+/// asked for.
+pub fn wants_close(head: &RequestHead) -> bool {
+    let tokens: Vec<String> = head
+        .headers
+        .iter()
+        .filter(|(k, _)| {
+            k.eq_ignore_ascii_case("connection") || k.eq_ignore_ascii_case("proxy-connection")
+        })
+        .flat_map(|(_, v)| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .collect();
+    if tokens.iter().any(|t| t == "close") {
+        return true;
+    }
+    head.version.eq_ignore_ascii_case("HTTP/1.0") && !tokens.iter().any(|t| t == "keep-alive")
+}
+
+/// How the body of a request is delimited, read off its head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyFraming {
+    /// No body at all: neither `Content-Length` nor `Transfer-Encoding`.
+    None,
+    /// Exactly this many bytes follow the head.
+    Length(u64),
+    /// Chunked transfer coding; the body ends with its zero-size chunk and
+    /// trailers.
+    Chunked,
+}
+
+/// The body framing of `head`, or `None` for a head that does not say
+/// consistently: a `Transfer-Encoding` other than chunked (the proxy would not
+/// know where the body ends, and so where the next request begins), a
+/// `Content-Length` that is not a number, or two that disagree. Every one of
+/// those is a 400; RFC 9112 calls them request smuggling vectors.
+pub fn body_framing(head: &RequestHead) -> Option<BodyFraming> {
+    let mut codings = head
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"))
+        .flat_map(|(_, v)| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .peekable();
+    if codings.peek().is_some() {
+        // Chunked must be the final coding applied, and it is the only one
+        // the proxy can find the end of. It also takes precedence over any
+        // `Content-Length`, which is then ignored rather than believed.
+        return (codings.last().as_deref() == Some("chunked")).then_some(BodyFraming::Chunked);
+    }
+    let mut length = None;
+    for (_, v) in head
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+    {
+        // A list value (`5, 5`) is one header repeated, and treated as such.
+        for item in v.split(',') {
+            let n: u64 = item.trim().parse().ok()?;
+            if length.replace(n).is_some_and(|prev| prev != n) {
+                return None;
+            }
+        }
+    }
+    Some(match length {
+        Some(n) => BodyFraming::Length(n),
+        None => BodyFraming::None,
+    })
 }
 
 /// The refusal sent to a client that asked for a host the workspace may not
@@ -252,31 +366,61 @@ fn canonical_ip(ip: IpAddr) -> IpAddr {
 /// Whether `addr` is somewhere a sandboxed workspace has no business reaching
 /// through its proxy: the host's own loopback, the machine's private network,
 /// the link-local range that carries the cloud metadata endpoint
-/// (`169.254.169.254`), or an address that is not a destination at all.
+/// (`169.254.169.254`), a range that is routed only inside some operator's
+/// network, or an address that is not a destination at all.
 ///
 /// The proxy exists to let the sandbox reach *the internet* under an allowlist.
 /// Everything here is on this side of the boundary the sandbox was built to
 /// keep it behind, so a name resolving to one of these is treated as the
 /// attempt to cross it that it is - unless the allowlist entry is that literal
 /// address, which only a person can have written.
+///
+/// The ranges, by family. IPv4: `0/8` (this network; Linux routes it to the
+/// host itself), `127/8`, `10/8`, `172.16/12`, `192.168/16`, `169.254/16`,
+/// `100.64/10` (carrier-grade NAT: the operator's network, not the internet),
+/// `192.0.0/24` (IETF protocol assignments, `192.0.0.8` among them),
+/// `198.18/15` (benchmarking), `224/4` (multicast) and `240/4` (reserved,
+/// which includes broadcast). IPv6: `::/96` (loopback, the unspecified
+/// address, and the withdrawn IPv4-compatible spelling of an IPv4 address),
+/// `fc00::/7`, `fe80::/10`, `ff00::/8`, and `64:ff9b::/96`, the NAT64 prefix,
+/// which names an IPv4 destination through a translator on the local network.
+/// An IPv4-mapped address (`::ffff:a.b.c.d`) is classified as the IPv4 address
+/// it is.
 pub fn is_private_addr(addr: &IpAddr) -> bool {
     match canonical_ip(*addr) {
         IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_multicast()
+                // This network, 0.0.0.0/8.
+                || a == 0
+                // Carrier-grade NAT, 100.64.0.0/10.
+                || (a == 100 && (b & 0xc0) == 64)
+                // IETF protocol assignments, 192.0.0.0/24.
+                || (a == 192 && b == 0 && c == 0)
+                // Benchmarking, 198.18.0.0/15.
+                || (a == 198 && (b & 0xfe) == 18)
+                // Reserved, 240.0.0.0/4, broadcast included.
+                || a >= 240
         }
         IpAddr::V6(v6) => {
-            let head = v6.segments()[0];
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
+            let seg = v6.segments();
+            let head = seg[0];
+            v6.is_multicast()
                 // Unique local, fc00::/7 - the IPv6 answer to 10/8.
                 || (head & 0xfe00) == 0xfc00
                 // Link local, fe80::/10.
                 || (head & 0xffc0) == 0xfe80
+                // `::/96`: loopback (`::1`), the unspecified address, and the
+                // withdrawn IPv4-compatible spelling of an IPv4 address
+                // (`::127.0.0.1`), which no stack routes and which a
+                // classifier that only unmaps `::ffff:` would call public.
+                || seg[..6] == [0, 0, 0, 0, 0, 0]
+                // NAT64, 64:ff9b::/96.
+                || seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
         }
     }
 }
@@ -532,9 +676,10 @@ impl ProxyRegistry {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst))
     }
 
-    /// Replaces the live allowlist. Connections already established keep the
-    /// host they were allowed to: they are pinned to one upstream, so nothing
-    /// they can do afterwards reaches anywhere else.
+    /// Replaces the live allowlist. A tunnel already established keeps the
+    /// host it was allowed to: it is pinned to one upstream, so nothing it can
+    /// do afterwards reaches anywhere else. A plain-HTTP connection's next
+    /// request is checked against the new list.
     pub fn set_allowlist(&self, id: &WorkspaceId, allow: Allowlist) {
         if let Some(entry) = self.entries.lock().get(id) {
             *entry.allow.write() = allow;
@@ -691,56 +836,145 @@ async fn refuse(
     let _ = client.write_all(&body).await;
 }
 
+/// One client connection, from its first request to its last.
+///
+/// A `CONNECT` becomes a tunnel to the one host it named and this returns when
+/// the tunnel ends. Plain HTTP loops: one request at a time, each checked
+/// against the allowlist and carried to the host *it* names on an upstream
+/// connection of its own, until the client closes, asks to close, or sends
+/// something that cannot be served.
 #[cfg(unix)]
 async fn serve(mut client: tokio::net::UnixStream, ctx: &ConnCtx) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut buf = Vec::with_capacity(4096);
-    let head = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut client, &mut buf)).await {
-        Ok(Ok(Some(head))) => head,
-        // Nothing usable arrived: an empty connection, an oversized head, or a
-        // client that took longer than the timeout to say anything.
-        Ok(Ok(None)) | Err(_) => {
+    let mut first = true;
+    loop {
+        let head = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut client, &mut buf)).await
+        {
+            Ok(Ok(Some(head))) => head,
+            // A kept-alive client that closes, or falls silent, between
+            // requests is finished rather than malformed.
+            Ok(Ok(None)) | Err(_) if !first && buf.is_empty() => return Ok(()),
+            // Nothing usable arrived: an empty connection, an oversized
+            // head, or a client that took longer than the timeout to say
+            // anything.
+            Ok(Ok(None)) | Err(_) => {
+                let _ = client.write_all(&bad_request()).await;
+                return Ok(());
+            }
+            Ok(Err(e)) => return Err(e),
+        };
+        first = false;
+        let Some((host, port)) = target_host_port(&head) else {
+            let _ = client.write_all(&bad_request()).await;
+            return Ok(());
+        };
+        // One spelling for the check, the denial and the connect: `GitHub.com.`
+        // is `github.com`, and the entry a denial's one-click Allow writes back
+        // has to be the one the next request matches.
+        let host = crate::net::allowlist::normalize_host(&host);
+        // The sandbox writes this text, and a denial carries it into the IDE's
+        // toast and from there into the workspace allowlist. `CONNECT *.com:443`
+        // is a malformed request, not a denial: answering 400 keeps it out of
+        // the event stream entirely.
+        if !is_valid_host(&host) {
+            tracing::debug!(
+                ws = %ctx.workspace,
+                "proxy target is not a hostname or an address; refused"
+            );
             let _ = client.write_all(&bad_request()).await;
             return Ok(());
         }
-        Ok(Err(e)) => return Err(e),
-    };
-    let Some((host, port)) = target_host_port(&head) else {
-        let _ = client.write_all(&bad_request()).await;
-        return Ok(());
-    };
-    // The sandbox writes this text, and a denial carries it into the IDE's
-    // toast and from there into the workspace allowlist. `CONNECT *.com:443` is
-    // a malformed request, not a denial: answering 400 keeps it out of the
-    // event stream entirely.
-    if !is_valid_host(&host) {
-        tracing::debug!(
-            ws = %ctx.workspace,
-            "proxy target is not a hostname or an address; refused"
+        let Some(mut upstream) = open_upstream(&mut client, ctx, &host, port).await? else {
+            // Refused or unreachable; the answer has been written and says
+            // `Connection: close`.
+            return Ok(());
+        };
+        // Whatever followed the head is already in hand: a TLS ClientHello sent
+        // without waiting for the tunnel's 200, a request body, or the next
+        // request of a pipelining client.
+        buf.drain(..head.head_len);
+        if head.method.eq_ignore_ascii_case("CONNECT") {
+            client
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await?;
+            if !buf.is_empty() {
+                upstream.write_all(&buf).await?;
+            }
+            // From here the connection is pinned to the one host it was
+            // allowed: anything else the client sends still goes there.
+            tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+            return Ok(());
+        }
+        let Some(framing) = body_framing(&head) else {
+            tracing::debug!(ws = %ctx.workspace, host = %host, "request body framing is not usable; refused");
+            let _ = client.write_all(&bad_request()).await;
+            return Ok(());
+        };
+        upstream.write_all(&origin_form(&head)).await?;
+        // The body goes up and the response comes down at the same time: a
+        // server may answer (a `100 Continue`, or a refusal) before it has
+        // read the body, and a client waiting on that answer would otherwise
+        // never send it. The upstream was asked to close after its response,
+        // so its end of stream is the end of the response.
+        let (mut from_client, mut to_client) = client.split();
+        let (mut from_upstream, mut to_upstream) = upstream.split();
+        let relayed = tokio::try_join!(
+            relay_body(&mut from_client, &mut to_upstream, &mut buf, framing),
+            tokio::io::copy(&mut from_upstream, &mut to_client),
         );
-        let _ = client.write_all(&bad_request()).await;
-        return Ok(());
+        match relayed {
+            // An upstream that closed without a byte of response would leave
+            // the client waiting on a connection the proxy thinks is idle.
+            Ok((_, 0)) => {
+                tracing::debug!(ws = %ctx.workspace, host = %host, "upstream closed without responding");
+                let _ = client.write_all(&bad_gateway()).await;
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                tracing::debug!(ws = %ctx.workspace, host = %host, "request body is malformed: {e}");
+                let _ = client.write_all(&bad_request()).await;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+        drop(upstream);
+        if wants_close(&head) {
+            client.shutdown().await?;
+            return Ok(());
+        }
     }
+}
+
+/// The upstream connection for one request, or `None` once the client has
+/// been answered with why there is not going to be one: the host is not on the
+/// allowlist, it resolves only to private addresses, or it would not take the
+/// connection.
+///
+/// One function for both `CONNECT` and plain HTTP, so there is exactly one
+/// place a host is let through.
+#[cfg(unix)]
+async fn open_upstream(
+    client: &mut tokio::net::UnixStream,
+    ctx: &ConnCtx,
+    host: &str,
+    port: u16,
+) -> std::io::Result<Option<tokio::net::TcpStream>> {
+    use tokio::io::AsyncWriteExt;
     // The guard is a temporary of this statement alone: an `RwLock` read held
     // across the awaits below would block every `set_allowlist` behind a tunnel.
-    let allowed = ctx.allow.read().allows(&host);
+    let allowed = ctx.allow.read().allows(host);
     if !allowed {
-        refuse(
-            &mut client,
-            ctx,
-            &host,
-            denied_response(&host),
-            "network denied",
-        )
-        .await;
-        return Ok(());
+        refuse(client, ctx, host, denied_response(host), "network denied").await;
+        return Ok(None);
     }
     // Resolved here rather than inside `connect`, because what the allowlist
     // cleared was a *name*: the destination it stands for is checked next, and
     // a name that resolves nowhere is a gateway failure like any other.
     let resolved: Vec<std::net::SocketAddr> = match tokio::time::timeout(
         CONNECT_TIMEOUT,
-        tokio::net::lookup_host((host.as_str(), port)),
+        tokio::net::lookup_host((host, port)),
     )
     .await
     {
@@ -750,12 +984,12 @@ async fn serve(mut client: tokio::net::UnixStream, ctx: &ConnCtx) -> std::io::Re
         Ok(Err(e)) => {
             tracing::debug!(ws = %ctx.workspace, host = %host, port, "upstream resolve failed: {e}");
             let _ = client.write_all(&bad_gateway()).await;
-            return Ok(());
+            return Ok(None);
         }
         Err(_) => {
             tracing::debug!(ws = %ctx.workspace, host = %host, port, "upstream resolve timed out");
             let _ = client.write_all(&bad_gateway()).await;
-            return Ok(());
+            return Ok(None);
         }
     };
     // A private destination is refused whatever name led to it, unless the
@@ -773,14 +1007,14 @@ async fn serve(mut client: tokio::net::UnixStream, ctx: &ConnCtx) -> std::io::Re
     };
     if reachable.is_empty() {
         refuse(
-            &mut client,
+            client,
             ctx,
-            &host,
-            private_response(&host),
+            host,
+            private_response(host),
             "network denied: private destination",
         )
         .await;
-        return Ok(());
+        return Ok(None);
     }
     // One deadline over the whole list, not one per address: a name with four
     // addresses behind it must not cost four times the budget, which is what
@@ -801,27 +1035,150 @@ async fn serve(mut client: tokio::net::UnixStream, ctx: &ConnCtx) -> std::io::Re
             }
         }
     }
-    let Some(mut upstream) = connected else {
-        let _ = client.write_all(&bad_gateway()).await;
-        return Ok(());
-    };
-    // Whatever followed the head is already in hand: a TLS ClientHello sent
-    // without waiting for the tunnel's 200, or a request body.
-    let rest = buf[head.head_len..].to_vec();
-    if head.method.eq_ignore_ascii_case("CONNECT") {
-        client
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?;
-    } else {
-        upstream.write_all(&origin_form(&head)).await?;
+    match connected {
+        Some(upstream) => Ok(Some(upstream)),
+        None => {
+            let _ = client.write_all(&bad_gateway()).await;
+            Ok(None)
+        }
     }
-    if !rest.is_empty() {
-        upstream.write_all(&rest).await?;
+}
+
+/// The longest line the chunked-body relay will buffer looking for its end:
+/// a chunk-size line or a trailer. Real ones are a few bytes.
+const MAX_LINE_BYTES: usize = 8 * 1024;
+
+/// Carries one request body from the client to the upstream, exactly as
+/// delimited by `framing`, and leaves `buf` holding whatever followed it - the
+/// next request of a pipelining client. `buf` holds the bytes already read
+/// past the head when this starts.
+///
+/// The bytes are passed on verbatim: a chunked body is not re-coded, only
+/// walked, so the proxy knows where it ends. A body that cannot be walked - a
+/// chunk size that is not a number, a line without end - is `InvalidData`,
+/// which the caller turns into a 400; any other error is the connection.
+///
+/// Generic over the streams so it can be tested on a pair of in-memory pipes.
+pub async fn relay_body<R, W>(
+    client: &mut R,
+    upstream: &mut W,
+    buf: &mut Vec<u8>,
+    framing: BodyFraming,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    match framing {
+        BodyFraming::None => Ok(()),
+        BodyFraming::Length(n) => relay_exact(client, upstream, buf, n).await,
+        BodyFraming::Chunked => {
+            loop {
+                let line = read_line(client, buf).await?;
+                upstream.write_all(&line).await?;
+                let size = chunk_size(&line)?;
+                if size == 0 {
+                    break;
+                }
+                // The chunk's data and the CRLF that ends it.
+                let with_crlf = size.checked_add(2).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "chunk size overflows")
+                })?;
+                relay_exact(client, upstream, buf, with_crlf).await?;
+            }
+            // Trailers, up to and including the blank line that ends the body.
+            loop {
+                let line = read_line(client, buf).await?;
+                upstream.write_all(&line).await?;
+                if line == b"\r\n" {
+                    return Ok(());
+                }
+            }
+        }
     }
-    // From here the connection is pinned to the one host it was allowed:
-    // anything else the client sends, on this connection, still goes there.
-    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+}
+
+/// Passes exactly `remaining` bytes from `client` to `upstream`, taking what
+/// is already in `buf` first and leaving any surplus there.
+async fn relay_exact<R, W>(
+    client: &mut R,
+    upstream: &mut W,
+    buf: &mut Vec<u8>,
+    mut remaining: u64,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fits = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+    let take = buf.len().min(fits(remaining));
+    if take > 0 {
+        upstream.write_all(&buf[..take]).await?;
+        buf.drain(..take);
+        remaining -= take as u64;
+    }
+    let mut chunk = [0u8; 8192];
+    while remaining > 0 {
+        let want = chunk.len().min(fits(remaining));
+        let n = client.read(&mut chunk[..want]).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "client closed inside the request body",
+            ));
+        }
+        upstream.write_all(&chunk[..n]).await?;
+        remaining -= n as u64;
+    }
     Ok(())
+}
+
+/// One line of `buf`, CRLF included, reading more from `client` until it is
+/// complete. A line longer than [`MAX_LINE_BYTES`] is `InvalidData`; a client
+/// that closes mid-line is `UnexpectedEof`.
+async fn read_line<R>(client: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut scanned = 0usize;
+    loop {
+        if let Some(i) = buf[scanned..].windows(2).position(|w| w == b"\r\n") {
+            let end = scanned + i + 2;
+            return Ok(buf.drain(..end).collect());
+        }
+        if buf.len() >= MAX_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunk line too long",
+            ));
+        }
+        scanned = buf.len().saturating_sub(1);
+        let mut chunk = [0u8; 1024];
+        match client.read(&mut chunk).await? {
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "client closed inside a chunked body",
+                ))
+            }
+            n => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// The size a chunk-size line announces: hex, with any `;ext=…` after it
+/// ignored. Anything else is `InvalidData`.
+fn chunk_size(line: &[u8]) -> std::io::Result<u64> {
+    let text = std::str::from_utf8(line)
+        .ok()
+        .and_then(|t| t.strip_suffix("\r\n"))
+        .map(|t| t.split(';').next().unwrap_or_default().trim())
+        .filter(|t| !t.is_empty());
+    text.and_then(|t| u64::from_str_radix(t, 16).ok())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))
 }
 
 #[cfg(test)]
@@ -924,17 +1281,45 @@ mod tests {
     #[test]
     fn origin_form_rewrites_the_request_line_and_drops_the_proxy_headers() {
         let h = head(
-            "GET http://example.com:8080/a/b?c=d HTTP/1.1\r\nHost: example.com\r\nProxy-Connection: keep-alive\r\nproxy-authorization: Basic x\r\nAccept: */*\r\n\r\n",
+            "GET http://example.com:8080/a/b?c=d HTTP/1.1\r\nHost: example.com\r\nProxy-Connection: keep-alive\r\nproxy-authorization: Basic x\r\nConnection: keep-alive\r\nAccept: */*\r\n\r\n",
         );
+        // The upstream is asked to close after this response, whatever the
+        // client asked for: that is what delimits the response, so the next
+        // request on the client's connection can be checked on its own.
         assert_eq!(
             String::from_utf8(origin_form(&h)).unwrap(),
-            "GET /a/b?c=d HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n"
+            "GET /a/b?c=d HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\nConnection: close\r\n\r\n"
         );
         // A URI with no path becomes the root.
         let h = head("GET http://example.com HTTP/1.1\r\nHost: example.com\r\n\r\n");
         assert_eq!(
             String::from_utf8(origin_form(&h)).unwrap(),
-            "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+            "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    /// A body cannot be delimited two ways at once. The proxy walks a chunked
+    /// body as chunked, so the upstream has to read it as chunked too: an
+    /// origin that believed a `Content-Length` beside it would stop short and
+    /// take the rest of the body for a second, smuggled request to that same
+    /// host. RFC 9112 gives an intermediary two options here, and dropping the
+    /// length is the one that still serves the request.
+    #[test]
+    fn a_chunked_request_is_forwarded_without_a_content_length_beside_it() {
+        let h = head(
+            "POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        assert_eq!(
+            String::from_utf8(origin_form(&h)).unwrap(),
+            "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        );
+        // Without a transfer coding the length *is* the framing, and stays.
+        let h = head(
+            "POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\n",
+        );
+        assert_eq!(
+            String::from_utf8(origin_form(&h)).unwrap(),
+            "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
         );
     }
 
@@ -1157,5 +1542,191 @@ mod tests {
         );
         assert!(body.contains("assets.example.test"), "{body}");
         assert!(body.contains("private address"), "{body}");
+    }
+
+    /// The ranges that are not "the internet" either but that the first list
+    /// missed: carrier-grade NAT, the IETF protocol-assignment block, the
+    /// benchmarking range, the reserved class E block, and the NAT64 prefix
+    /// through which an IPv6-only host names an IPv4 destination.
+    #[test]
+    fn the_wider_private_ranges_are_recognised_too() {
+        for private in [
+            "100.64.0.1",
+            "100.127.255.255",
+            "192.0.0.8",
+            "198.18.0.1",
+            "198.19.255.255",
+            "240.0.0.1",
+            "255.255.255.255",
+            "64:ff9b::1.2.3.4",
+            "64:ff9b::7f00:1",
+            // IPv4-compatible IPv6, `::/96`: the withdrawn spelling of an
+            // IPv4 address, `::127.0.0.1` among them, which no classifier
+            // that only knows `::ffff:` recognises.
+            "::1.2.3.4",
+            "::7f00:1",
+            "::ffff:10.0.0.1",
+            "::ffff:100.64.0.1",
+        ] {
+            assert!(is_private_addr(&ip(private)), "{private} must be refused");
+        }
+        for public in [
+            "8.8.8.8",
+            "2606:4700::1111",
+            // Just outside each new range.
+            "100.63.255.255",
+            "100.128.0.0",
+            "192.0.1.1",
+            "198.17.255.255",
+            "198.20.0.0",
+            // Below 224/4 (multicast) and 240/4 alike.
+            "223.255.255.255",
+            "64:ff9c::1",
+        ] {
+            assert!(!is_private_addr(&ip(public)), "{public} must be allowed");
+        }
+    }
+
+    /// Where one request's body ends is where the next request begins, so the
+    /// head has to say it unambiguously or the request is not served.
+    #[test]
+    fn body_framing_is_read_off_the_head_or_refused() {
+        let framing = |h: &str| body_framing(&head(h));
+        assert_eq!(
+            framing("GET http://a/ HTTP/1.1\r\nHost: a\r\n\r\n"),
+            Some(BodyFraming::None)
+        );
+        assert_eq!(
+            framing("POST http://a/ HTTP/1.1\r\nContent-Length: 12\r\n\r\n"),
+            Some(BodyFraming::Length(12))
+        );
+        // The same length twice is one header repeated; two lengths are an
+        // attack on whichever side believes the other one.
+        assert_eq!(
+            framing("POST http://a/ HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n"),
+            Some(BodyFraming::Length(5))
+        );
+        assert_eq!(
+            framing("POST http://a/ HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            framing("POST http://a/ HTTP/1.1\r\nContent-Length: five\r\n\r\n"),
+            None
+        );
+        // Chunked wins over a length, and is the only coding that can be
+        // walked to its end.
+        assert_eq!(
+            framing("POST http://a/ HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"),
+            Some(BodyFraming::Chunked)
+        );
+        assert_eq!(
+            framing("POST http://a/ HTTP/1.1\r\nTransfer-Encoding: gzip, Chunked\r\n\r\n"),
+            Some(BodyFraming::Chunked)
+        );
+        assert_eq!(
+            framing("POST http://a/ HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n"),
+            None
+        );
+    }
+
+    /// The client's connection to the proxy outlives a request unless the
+    /// client says otherwise, or is too old to have said anything.
+    #[test]
+    fn the_client_decides_whether_its_connection_stays_open() {
+        assert!(!wants_close(&head("GET http://a/ HTTP/1.1\r\n\r\n")));
+        assert!(wants_close(&head(
+            "GET http://a/ HTTP/1.1\r\nConnection: close\r\n\r\n"
+        )));
+        assert!(wants_close(&head(
+            "GET http://a/ HTTP/1.1\r\nConnection: keep-alive, Close\r\n\r\n"
+        )));
+        assert!(wants_close(&head(
+            "GET http://a/ HTTP/1.1\r\nProxy-Connection: close\r\n\r\n"
+        )));
+        assert!(wants_close(&head("GET http://a/ HTTP/1.0\r\n\r\n")));
+        assert!(!wants_close(&head(
+            "GET http://a/ HTTP/1.0\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+        )));
+    }
+
+    /// Runs the relay over in-memory pipes: `already` is what had arrived with
+    /// the head, `later` what the client sends afterwards. Returns what the
+    /// upstream received and what was left over for the next request, whether
+    /// that stayed in the buffer or was never read off the client.
+    async fn relay(
+        already: &[u8],
+        later: &[u8],
+        framing: BodyFraming,
+    ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client_side, mut proxy_side) = tokio::io::duplex(64);
+        let (mut proxy_out, mut upstream_side) = tokio::io::duplex(64);
+        let later = later.to_vec();
+        let sender = tokio::spawn(async move {
+            client_side.write_all(&later).await.unwrap();
+            drop(client_side);
+        });
+        let mut received = Vec::new();
+        let receiver = tokio::spawn(async move {
+            upstream_side.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        let mut buf = already.to_vec();
+        let result = relay_body(&mut proxy_side, &mut proxy_out, &mut buf, framing).await;
+        drop(proxy_out);
+        sender.await.unwrap();
+        let received = receiver.await.unwrap();
+        proxy_side.read_to_end(&mut buf).await.unwrap();
+        result.map(|()| (received, buf))
+    }
+
+    /// A body of known length is passed on whole and nothing past it: what
+    /// follows is the next request, and stays with the client's connection.
+    #[tokio::test]
+    async fn a_body_of_known_length_is_relayed_and_the_rest_kept() {
+        let (got, rest) = relay(b"abc", b"defNEXT", BodyFraming::Length(6))
+            .await
+            .unwrap();
+        assert_eq!(got, b"abcdef");
+        assert_eq!(rest, b"NEXT");
+        // Entirely in hand already, with the next request behind it.
+        let (got, rest) = relay(b"abcdefGET", b"", BodyFraming::Length(6))
+            .await
+            .unwrap();
+        assert_eq!(got, b"abcdef");
+        assert_eq!(rest, b"GET");
+        // No body: nothing moves, nothing is lost.
+        let (got, rest) = relay(b"GET", b"", BodyFraming::None).await.unwrap();
+        assert!(got.is_empty());
+        assert_eq!(rest, b"GET");
+        // A client that hangs up mid-body is a broken connection, not a 400.
+        let err = relay(b"ab", b"c", BodyFraming::Length(6))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A chunked body is walked to its terminating chunk and trailers, passed
+    /// on byte for byte, and what follows it is kept.
+    #[tokio::test]
+    async fn a_chunked_body_is_relayed_verbatim_to_its_end() {
+        let body = b"4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\nTrailer: x\r\n\r\n";
+        let (already, later) = body.split_at(7);
+        let (got, rest) = relay(already, &[later, b"NEXT"].concat(), BodyFraming::Chunked)
+            .await
+            .unwrap();
+        assert_eq!(got, body);
+        assert_eq!(rest, b"NEXT");
+        // The client's framing is what is checked, so a size that is not a
+        // number is refused rather than guessed.
+        let err = relay(b"zz\r\nab\r\n0\r\n\r\n", b"", BodyFraming::Chunked)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let err = relay(b"", &vec![b'a'; MAX_LINE_BYTES + 1], BodyFraming::Chunked)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

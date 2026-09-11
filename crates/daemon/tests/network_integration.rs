@@ -161,6 +161,16 @@ async fn the_proxy_forwards_allowed_hosts_and_refuses_everything_else() {
     assert!(denied.starts_with("HTTP/1.1 403 Forbidden"), "{denied}");
     assert!(denied.contains("127.0.0.1"), "{denied}");
     assert!(denied.contains("[network] allow"), "{denied}");
+    // A fully qualified spelling is denied as the host it names, without the
+    // root dot: the toast's one-click Allow has to produce an entry that
+    // matches the next request, however the sandbox spelled this one.
+    let mut s = UnixStream::connect(&sock).await.unwrap();
+    s.write_all(b"CONNECT Registry.Example.:443 HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+    let denied = read_all(&mut s).await;
+    assert!(denied.starts_with("HTTP/1.1 403 Forbidden"), "{denied}");
+    assert!(denied.contains("registry.example"), "{denied}");
     // A round trip to the daemon, so the denial event has certainly been
     // delivered by the time the events are drained.
     let _ = c
@@ -176,8 +186,11 @@ async fn the_proxy_forwards_allowed_hosts_and_refuses_everything_else() {
         .collect();
     assert_eq!(
         denials,
-        vec![(Some(ws.id.clone()), "127.0.0.1".to_string())],
-        "one denial, tagged with the workspace it came from"
+        vec![
+            (Some(ws.id.clone()), "127.0.0.1".to_string()),
+            (Some(ws.id.clone()), "registry.example".to_string()),
+        ],
+        "one denial per host, tagged with the workspace it came from, in normalised form"
     );
 
     // A pattern that is not a host is refused rather than silently dropped, so
@@ -296,6 +309,195 @@ async fn a_name_that_resolves_to_a_private_address_is_refused_and_bad_targets_ar
     let err = set_allowlist(&mut c, &ws.id, &refs).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidParams);
     assert!(err.message.contains("256"), "{}", err.message);
+
+    c.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+        workspace_id: ws.id.clone(),
+        force: true,
+    }))
+    .await
+    .unwrap();
+    cancel.cancel();
+}
+
+/// A keep-alive HTTP server that remembers every request head it is sent.
+///
+/// Answers each request with a one-byte body and keeps the connection open
+/// for the next one, closing only when the request asks it to with
+/// `Connection: close` - the way every real origin behaves, and the reason the
+/// proxy has to ask.
+async fn recording_server() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let end = loop {
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                        match s.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                    buf.drain(..end);
+                    let close = head
+                        .lines()
+                        .any(|l| l.to_ascii_lowercase().trim() == "connection: close");
+                    log.lock().unwrap().push(head);
+                    if s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na")
+                        .await
+                        .is_err()
+                        || close
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// Reads one complete response - the head, then as many body bytes as its
+/// `Content-Length` says - and leaves the stream at the start of the next.
+async fn read_response(s: &mut UnixStream) -> (String, String) {
+    let head = read_head(s).await;
+    let len: usize = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse().unwrap())
+        })
+        .unwrap_or_else(|| panic!("no Content-Length in {head:?}"));
+    let mut body = vec![0u8; len];
+    s.read_exact(&mut body).await.unwrap();
+    (head, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// A keep-alive client connection is a sequence of requests, and each one is
+/// checked and routed on its own.
+///
+/// The first proxy pinned a connection to the upstream its first request
+/// named and piped everything after it there verbatim: a second request for
+/// another allowed host, credentials and all, was delivered to the first one.
+/// Two hosts the workspace may reach are two trust decisions, not one.
+#[tokio::test]
+async fn each_plain_http_request_on_a_kept_alive_connection_goes_to_its_own_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "keepalive").await;
+    let sock = daemon.dirs.run(&ws.id).join("proxy.sock");
+    let (a_port, a_seen) = recording_server().await;
+    let (b_port, b_seen) = recording_server().await;
+    set_allowlist(&mut c, &ws.id, &["127.0.0.1"]).await.unwrap();
+
+    // One connection, two requests, one after the other.
+    let mut s = UnixStream::connect(&sock).await.unwrap();
+    s.write_all(
+        format!("GET http://127.0.0.1:{a_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{a_port}\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let (head, body) = read_response(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+    assert_eq!(body, "a");
+    s.write_all(
+        format!(
+            "GET http://127.0.0.1:{b_port}/secret HTTP/1.1\r\nHost: 127.0.0.1:{b_port}\r\nAuthorization: Bearer b-token\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let (head, body) = read_response(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+    assert_eq!(body, "a");
+    drop(s);
+
+    let a: Vec<String> = a_seen.lock().unwrap().clone();
+    let b: Vec<String> = b_seen.lock().unwrap().clone();
+    assert_eq!(a.len(), 1, "A saw exactly its own request: {a:?}");
+    assert!(a[0].starts_with("GET / HTTP/1.1\r\n"), "{:?}", a[0]);
+    assert!(
+        !a[0].contains("b-token") && !a[0].contains("/secret"),
+        "B's request must never reach A: {:?}",
+        a[0]
+    );
+    assert_eq!(b.len(), 1, "B saw exactly its own request: {b:?}");
+    assert!(b[0].starts_with("GET /secret HTTP/1.1\r\n"), "{:?}", b[0]);
+    assert!(b[0].contains("Authorization: Bearer b-token"), "{:?}", b[0]);
+    // Each request is sent as the last one on its upstream connection.
+    for head in a.iter().chain(&b) {
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("\r\nconnection: close\r\n"),
+            "{head:?}"
+        );
+    }
+
+    // The same two requests pipelined - sent together, before either answer -
+    // still arrive at their own hosts and are answered in order.
+    let mut s = UnixStream::connect(&sock).await.unwrap();
+    s.write_all(
+        format!(
+            "GET http://127.0.0.1:{a_port}/one HTTP/1.1\r\nHost: 127.0.0.1:{a_port}\r\n\r\n\
+             POST http://127.0.0.1:{b_port}/two HTTP/1.1\r\nHost: 127.0.0.1:{b_port}\r\nContent-Length: 3\r\n\r\nxyz"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let (head, body) = read_response(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+    assert_eq!(body, "a");
+    let (head, body) = read_response(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+    assert_eq!(body, "a");
+    drop(s);
+    let a: Vec<String> = a_seen.lock().unwrap().clone();
+    let b: Vec<String> = b_seen.lock().unwrap().clone();
+    assert_eq!(a.len(), 2, "{a:?}");
+    assert!(a[1].starts_with("GET /one HTTP/1.1\r\n"), "{:?}", a[1]);
+    assert_eq!(b.len(), 2, "{b:?}");
+    assert!(b[1].starts_with("POST /two HTTP/1.1\r\n"), "{:?}", b[1]);
+
+    // A second request for a host that is *not* allowed is refused on its own,
+    // after the first was served, and the refusal closes the connection.
+    let mut s = UnixStream::connect(&sock).await.unwrap();
+    s.write_all(
+        format!("GET http://127.0.0.1:{a_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{a_port}\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let (head, _) = read_response(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+    s.write_all(b"GET http://denied.example/ HTTP/1.1\r\nHost: denied.example\r\n\r\n")
+        .await
+        .unwrap();
+    let denied = read_all(&mut s).await;
+    assert!(denied.starts_with("HTTP/1.1 403 Forbidden"), "{denied}");
+    assert!(denied.contains("denied.example"), "{denied}");
+    assert_eq!(
+        a_seen.lock().unwrap().len(),
+        3,
+        "A served the first request only"
+    );
 
     c.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
         workspace_id: ws.id.clone(),

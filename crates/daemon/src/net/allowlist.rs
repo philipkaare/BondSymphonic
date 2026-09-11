@@ -1,16 +1,25 @@
 //! Which hosts a sandboxed workspace is allowed to reach.
 //!
-//! A pattern is either an exact host (`api.anthropic.com`) or a suffix wildcard
-//! (`*.npmjs.org`, which covers `registry.npmjs.org` and `a.b.npmjs.org` but
-//! neither `npmjs.org` itself nor `evilnpmjs.org`). Ports are unrestricted: the
-//! proxy decides *where* a connection may go, not on which port, because a
-//! registry that moves to 8443 is still the same trust decision.
+//! A pattern is either an exact host (`api.anthropic.com`, or an address such
+//! as `127.0.0.1` or `2606:4700::1111`) or a suffix wildcard (`*.npmjs.org`,
+//! which covers `registry.npmjs.org` and `a.b.npmjs.org` but neither
+//! `npmjs.org` itself nor `evilnpmjs.org`). Ports are unrestricted: the proxy
+//! decides *where* a connection may go, not on which port, because a registry
+//! that moves to 8443 is still the same trust decision.
+//!
+//! Every entry and every host is compared in one normalised form
+//! ([`normalize_host`]): lowercased, without the root dot of a fully qualified
+//! name, and with an IPv6 literal in its canonical spelling and without the
+//! brackets a URI wraps it in. A denial the proxy publishes carries that same
+//! form, so the entry a one-click "Allow host" writes back is the one the next
+//! request matches.
 //!
 //! Everything here is pure and synchronous, so the proxy can consult it on the
 //! connection path without locking or awaiting, and so the rules can be tested
 //! without a sandbox.
 
 use crate::runs::config::RepoConfig;
+use std::net::Ipv6Addr;
 
 /// The hosts every workspace may reach without any configuration: the Anthropic
 /// API the agent talks to, and the package registries a repo has to fetch from
@@ -44,14 +53,18 @@ pub const DEFAULT_ALLOW: [&str; 12] = [
 pub struct HostPattern(String);
 
 impl HostPattern {
-    /// Parses one entry, lowercasing it.
+    /// Parses one entry into its normalised form: lowercased, without the root
+    /// dot of a fully qualified name, an IPv6 literal in its canonical spelling
+    /// and without brackets.
     ///
     /// Rejects anything that is not a bare host or a `*.`-prefixed suffix: an
     /// empty or blank entry, a lone `*` (which would allow everything), a
     /// wildcard anywhere but the front (`foo.*`, and `*bar.com` — the latter
-    /// would otherwise let `evilnpmjs.org` through as `*npmjs.org`), and
-    /// anything carrying a scheme, path or port (`/`, `:`), which never appears
-    /// in the host being matched and so would silently match nothing.
+    /// would otherwise let `evilnpmjs.org` through as `*npmjs.org`), an empty
+    /// label (`a..b`, a leading dot, two root dots), and anything carrying a
+    /// scheme, path or port (`/`, or a `:` that is not part of an IPv6
+    /// address), which never appears in the host being matched and so would
+    /// silently match nothing.
     pub fn parse(s: &str) -> Result<HostPattern, String> {
         let lower = s.to_ascii_lowercase();
         if lower.is_empty() {
@@ -60,10 +73,33 @@ impl HostPattern {
         if lower.chars().any(char::is_whitespace) {
             return Err(format!("host pattern {s:?} contains whitespace"));
         }
+        // An IPv6 address is the one host with colons in it, and in a URI it
+        // wears brackets that are not part of the address. Either spelling is
+        // the address, stored canonically so `2606:4700:0:0::1111` and
+        // `2606:4700::1111` are one entry.
+        if let Some(v6) = ipv6_literal(&lower) {
+            return Ok(HostPattern(v6.to_string()));
+        }
+        if lower.contains('[') || lower.contains(']') {
+            return Err(format!(
+                "host pattern {s:?} is bracketed but is not an IPv6 address"
+            ));
+        }
         if lower.contains('/') || lower.contains(':') {
             return Err(format!(
                 "host pattern {s:?} must be a bare host, without a scheme, path or port"
             ));
+        }
+        // One trailing dot is the root label of a fully qualified name, and
+        // the same host without it. What remains must have no empty label: a
+        // second dot, a leading dot, or `a..b` name nothing.
+        let lower = lower.strip_suffix('.').unwrap_or(&lower).to_string();
+        if lower.is_empty()
+            || lower.starts_with('.')
+            || lower.ends_with('.')
+            || lower.contains("..")
+        {
+            return Err(format!("host pattern {s:?} has an empty label"));
         }
         // A wildcard is only ever the whole first label. What follows it is
         // matched literally, so it has to be a plain host in its own right.
@@ -112,11 +148,10 @@ impl HostPattern {
 
     /// The literal IP address this entry *is*, if it is one rather than a name.
     ///
-    /// Only IPv4 can appear: [`HostPattern::parse`] rejects the colons an IPv6
-    /// literal is written with, because a pattern carrying a colon is
-    /// indistinguishable from a `host:port` that would match nothing. The proxy
-    /// uses this to tell "the user allowed `127.0.0.1`" from "a name the
-    /// repository allowed happens to resolve there".
+    /// Either family: an IPv6 entry is stored in the canonical spelling
+    /// [`HostPattern::parse`] gave it, which parses back to the same address.
+    /// The proxy uses this to tell "the user allowed `127.0.0.1`" from "a name
+    /// the repository allowed happens to resolve there".
     pub fn as_ip(&self) -> Option<std::net::IpAddr> {
         // A wildcard is never an address, and `"1.2.3.4".parse()` would not
         // see the `*.` in front of it anyway; checked so the intent is plain.
@@ -127,15 +162,33 @@ impl HostPattern {
     }
 }
 
-/// A host as it is compared: lowercased, with the trailing dot of a fully
-/// qualified name dropped, so `github.com.` and `github.com` are one host.
+/// A host as it is compared and as it is published: lowercased, with the
+/// trailing dot of a fully qualified name dropped, so `github.com.` and
+/// `github.com` are one host; an IPv6 literal without its URI brackets and in
+/// canonical spelling, so `[2606:4700:0:0::1111]` and `2606:4700::1111` are one
+/// address.
 ///
 /// Ports are deliberately *not* stripped here. Splitting `host:port` is the
 /// proxy's job, where an IPv6 literal (`[::1]:8080`) still has to be told from
-/// a bare address; a pattern carrying a colon is rejected at parse time instead.
-fn normalize_host(host: &str) -> String {
+/// a bare address; a pattern carrying a port is rejected at parse time instead.
+pub fn normalize_host(host: &str) -> String {
     let h = host.trim().to_ascii_lowercase();
-    h.strip_suffix('.').unwrap_or(&h).to_string()
+    let h = h.strip_suffix('.').unwrap_or(&h);
+    match ipv6_literal(h) {
+        Some(v6) => v6.to_string(),
+        None => h.to_string(),
+    }
+}
+
+/// `text` as the IPv6 address it spells, bracketed or bare, or `None` for
+/// anything else - including a bracketed thing that is not an address, and
+/// `[v6]:port`, whose brackets do not enclose the whole of it.
+fn ipv6_literal(text: &str) -> Option<Ipv6Addr> {
+    let bare = text
+        .strip_prefix('[')
+        .and_then(|r| r.strip_suffix(']'))
+        .unwrap_or(text);
+    bare.parse().ok()
 }
 
 /// The set of patterns one workspace may reach, in the order they were
@@ -342,5 +395,58 @@ mod tests {
         // An empty list reaches nothing at all.
         assert!(Allowlist::default().is_empty());
         assert!(!Allowlist::default().allows("github.com"));
+    }
+
+    /// A fully qualified name is the same host with or without its root dot,
+    /// whichever side of the comparison the dot is on.
+    #[test]
+    fn a_trailing_dot_is_the_same_host_on_either_side() {
+        let dotted = HostPattern::parse("example.com.").unwrap();
+        assert_eq!(dotted.as_str(), "example.com");
+        assert!(dotted.matches("example.com"));
+        assert!(dotted.matches("example.com."));
+        let plain = HostPattern::parse("example.com").unwrap();
+        assert!(plain.matches("example.com."));
+        // A wildcard written fully qualified still covers its subdomains.
+        let w = HostPattern::parse("*.example.com.").unwrap();
+        assert!(w.matches("a.example.com"));
+        assert!(w.matches("a.example.com."));
+        // One root dot is the root label; two are an empty label, which is
+        // never a host, and a bare dot is nothing at all.
+        for bad in ["example.com..", "a..b", "..", ".", "*.."] {
+            assert!(HostPattern::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// An IPv6 address is written with colons, which every other entry is
+    /// refused for, and in a URI it wears brackets that are not part of the
+    /// address. Both spellings are the one literal.
+    #[test]
+    fn an_ipv6_literal_is_accepted_with_or_without_brackets() {
+        let addr: std::net::IpAddr = "2606:4700::1111".parse().unwrap();
+        for spelled in [
+            "2606:4700::1111",
+            "[2606:4700::1111]",
+            "2606:4700:0:0::1111",
+        ] {
+            let p = HostPattern::parse(spelled).unwrap_or_else(|e| panic!("{spelled}: {e}"));
+            assert_eq!(p.as_str(), "2606:4700::1111", "{spelled}");
+            assert_eq!(p.as_ip(), Some(addr), "{spelled}");
+            // The proxy hands the host over bare, the way `CONNECT [v6]:443`
+            // yields it, and it may also arrive still wearing its brackets.
+            assert!(p.matches("2606:4700::1111"), "{spelled}");
+            assert!(p.matches("[2606:4700::1111]"), "{spelled}");
+            assert!(p.matches("2606:4700:0:0:0:0:0:1111"), "{spelled}");
+            assert!(!p.matches("2606:4700::1112"), "{spelled}");
+        }
+        let list = Allowlist::from_strings(&["[2606:4700::1111]".to_string()]);
+        assert!(list.allows("2606:4700::1111"));
+        assert!(list.allows_literal_addr(&addr));
+        assert_eq!(list.to_strings(), vec!["2606:4700::1111".to_string()]);
+        // A colon that is not an IPv6 address is still a port, and refused; a
+        // bracketed thing that is not an address is not a host either.
+        for bad in ["host:80", "[::1]:8080", "[example.com]", "[", "[]", "::1]"] {
+            assert!(HostPattern::parse(bad).is_err(), "{bad:?}");
+        }
     }
 }
