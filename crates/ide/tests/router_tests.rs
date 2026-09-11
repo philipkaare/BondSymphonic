@@ -11,7 +11,6 @@ fn out(pty: &str, s: &str) -> Event {
 #[tokio::test]
 async fn routes_by_pty_and_replays_early_output() {
     let r = EventRouter::new();
-    let mut all = r.subscribe_all();
     r.dispatch(Some("ws_1".into()), out("pty_a", "early1"));
     r.dispatch(Some("ws_1".into()), out("pty_b", "other"));
     let (mut a, _) = r.subscribe_pty(&"pty_a".into());
@@ -34,12 +33,6 @@ async fn routes_by_pty_and_replays_early_output() {
         .collect();
     assert_eq!(got, vec!["early1", "live2", "exit0"]);
     assert!(a.try_recv().is_err(), "pty_b output must not reach pty_a");
-    // subscribe_all saw everything in order
-    let mut n = 0;
-    while all.try_recv().is_ok() {
-        n += 1;
-    }
-    assert_eq!(n, 4);
 }
 
 #[tokio::test]
@@ -381,7 +374,6 @@ mod review_fixes_task_7 {
         let mut a1 = r.subscribe_fs(&"ws_a".into());
         let mut a2 = r.subscribe_fs(&"ws_a".into());
         let mut b = r.subscribe_fs(&"ws_b".into());
-        let mut all = r.subscribe_all();
 
         r.dispatch(Some("ws_a".into()), fs_changed("src/main.rs"));
         r.dispatch(None, fs_changed("nowhere"));
@@ -398,12 +390,6 @@ mod review_fixes_task_7 {
             );
         }
         assert!(b.try_recv().is_err(), "ws_b must not hear about ws_a");
-        // `subscribe_all` still sees everything.
-        let mut n = 0;
-        while all.try_recv().is_ok() {
-            n += 1;
-        }
-        assert_eq!(n, 3);
 
         // Dropping one editor's receiver does not end the other's.
         drop(a1);

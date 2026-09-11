@@ -363,7 +363,11 @@ async fn init_repo_inside_a_repository_makes_a_repository_of_its_own() {
     repo::init_repo(&git, &inside).await.unwrap();
 
     assert!(inside.join(".git").is_dir(), "its own git directory");
-    assert!(repo::is_repo_root(&git, &inside).await.unwrap());
+    assert_eq!(
+        repo::classify(&git, &inside).await.unwrap(),
+        RepoKind::Root,
+        "a root of its own, not a folder inside the enclosing repository"
+    );
     assert_eq!(log_line(&inside, "--format=%s"), "Initial commit");
     assert_eq!(
         repo::head_commit(&git, &outer, "HEAD").await.unwrap(),
@@ -510,7 +514,7 @@ fn add_worktree(repo: &std::path::Path, branch: &str, at: &std::path::Path) {
 /// asks.
 ///
 /// There used to be three answers to this question — `is_not_a_repository`
-/// reading git's stderr, `is_repo_root` comparing `--show-toplevel`, and the
+/// reading git's stderr, an `is_repo_root` comparing `--show-toplevel`, and the
 /// ladder inside `workspace.create` — and they did not agree. A subdirectory of
 /// a repository was "not a repository" to one and "a repository" to another, so
 /// `repo.inspect` offered to initialise a folder that `workspace.create` then
@@ -578,18 +582,21 @@ async fn classify_tells_the_five_shapes_apart() {
     assert!(repo::classify(&git, &broken).await.is_err());
 }
 
-/// `inspect` and `is_repo_root` are the same classifier seen from two sides, so
-/// a linked worktree is a repository to both: a workspace made from one is a
+/// `inspect` and `classify` are the same classifier seen from two sides, so a
+/// linked worktree is a repository to both: a workspace made from one is a
 /// worktree of the same store, which works.
 #[tokio::test]
-async fn a_linked_worktree_is_a_repository_to_inspect_and_to_is_repo_root() {
+async fn a_linked_worktree_is_a_repository_to_inspect_and_to_classify() {
     let dir = tempfile::tempdir().unwrap();
     let root = init_repo(dir.path());
     let linked = dir.path().join("linked");
     add_worktree(&root, "side", &linked);
     let git = Git::new();
 
-    assert!(repo::is_repo_root(&git, &linked).await.unwrap());
+    assert_eq!(
+        repo::classify(&git, &linked).await.unwrap(),
+        RepoKind::Worktree
+    );
     let info = repo::inspect(&git, &linked).await.unwrap();
     assert!(info.is_repo);
     assert!(info.exists);
@@ -616,9 +623,12 @@ async fn a_subdirectory_of_a_repository_is_refused_by_naming_the_repository() {
     );
     assert!(info.exists);
 
-    // And `init_repo` there still makes a repository of its own rather than
-    // adopting the parent.
-    assert!(!repo::is_repo_root(&git, &inside).await.unwrap());
+    // And the classifier the refusal is built on says the same thing in more
+    // words: not "no repository here", but "you are inside this one".
+    assert!(matches!(
+        repo::classify(&git, &inside).await.unwrap(),
+        RepoKind::InsideEnclosing { .. }
+    ));
 }
 
 /// `RepoInfo.is_dirty` and the merge guard answer the same question the same

@@ -1,11 +1,12 @@
 //! Fans one daemon event stream out to the consumers that care about it.
 //!
 //! The reader loop in `AppController::start` owns the single [`EventStream`] the
-//! client hands back and calls [`EventRouter::dispatch`] for every event. Five
-//! kinds of consumer subscribe here:
+//! client hands back and calls [`EventRouter::dispatch`] for every event. Four
+//! kinds of consumer subscribe here, and every one of them is a filter: there
+//! is no subscription to the whole stream, because nothing in the IDE wants
+//! one. The reader loop handles workspace state and daemon logs itself, from
+//! the event it already has in hand.
 //!
-//! * [`EventRouter::subscribe_all`] — every event, in order. Used for
-//!   workspace-state and daemon-log handling.
 //! * [`EventRouter::subscribe_pty`] — only `pty.output`/`pty.exit` for one PTY.
 //! * [`EventRouter::subscribe_agent`] — only `agent.message`/`agent.state` for
 //!   one agent.
@@ -15,7 +16,7 @@
 //!   open editor takes one of these, rather than the whole stream it would
 //!   otherwise have to filter.
 //!
-//! All four per-id kinds share one table keyed by [`StreamKey`], so a PTY, an
+//! All four share one table keyed by [`StreamKey`], so a PTY, an
 //! agent and a run whose ids collide as strings still get separate streams.
 //! They differ in how many consumers a key may have, which is [`Fanout`]: a
 //! PTY, an agent and a run are each shown in one place, while a workspace can
@@ -130,7 +131,6 @@ impl Release {
 
 #[derive(Default)]
 struct Inner {
-    all: Vec<EventTx>,
     streams: HashMap<StreamKey, Vec<Sub>>,
     early: HashMap<StreamKey, Vec<(Instant, Option<WorkspaceId>, Event)>>,
     /// Never reused, so a token can only ever name the subscription it was
@@ -162,13 +162,6 @@ pub struct EventRouter {
 impl EventRouter {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Every event, in order.
-    pub fn subscribe_all(&self) -> EventRx {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.lock().all.push(tx);
-        rx
     }
 
     /// Only events carrying `id`. Anything parked in the early buffer for that
@@ -319,11 +312,6 @@ impl EventRouter {
     /// Called by the reader loop for every event received from the daemon.
     pub fn dispatch(&self, workspace_id: Option<WorkspaceId>, event: Event) {
         let mut inner = self.lock();
-        // A dropped receiver un-registers its "all" subscription implicitly.
-        inner
-            .all
-            .retain(|tx| tx.send((workspace_id.clone(), event.clone())).is_ok());
-
         let Some(key) = stream_key_of(workspace_id.as_ref(), &event) else {
             inner.prune(EARLY_BUFFER_TTL);
             return;

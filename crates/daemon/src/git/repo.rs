@@ -274,27 +274,6 @@ pub fn not_a_repository_error(path: &Path) -> RpcError {
     )
 }
 
-/// Whether `path` is a repository this daemon can use — its own root, or a
-/// linked worktree of one — rather than a directory somewhere inside one.
-///
-/// [`classify`] with the four answers that are not a `bool` collapsed: a bare
-/// repository is the one that cannot be, because `false` would send
-/// `init_if_missing` on to write inside it.
-///
-/// **Test-facing surface.** No caller in the daemon asks the question this way
-/// any more — each of them needs a `RepoKind` to say what it will do next, and
-/// the collapse throws away exactly what they need. It is kept because the
-/// tests for [`classify`] read better through it: "is this a repository the
-/// daemon can use" is the property, and a test that spelled out the two
-/// matching variants would restate the implementation instead of checking it.
-pub async fn is_repo_root(git: &Git, path: &Path) -> Result<bool, RpcError> {
-    match classify(git, path).await? {
-        RepoKind::Root | RepoKind::Worktree => Ok(true),
-        RepoKind::NotARepo | RepoKind::InsideEnclosing { .. } => Ok(false),
-        RepoKind::Bare => Err(bare_repository_error(path)),
-    }
-}
-
 /// Every local branch, in git's own order.
 async fn local_branches(git: &Git, repo: &Path) -> Result<Vec<String>, RpcError> {
     Ok(git

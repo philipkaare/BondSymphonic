@@ -909,8 +909,9 @@ fn apply_disk_read(
 /// has already recorded those bytes as what is on disk.
 fn install_disk_text(mut q: Pin<&mut qobject::EditorDocument>, res: ReadFileResult) {
     let path = q.as_ref().path().to_string();
-    // Rebuilt rather than `replace_all`ed so the size rule is re-applied: a
-    // file that grew past the limit while open must not start highlighting.
+    // A fresh buffer rather than new text poured into the existing one, so the
+    // size rule is re-applied: a file that grew past the limit while it was
+    // open must not go on being highlighted.
     let (buffer, _) = build_buffer(&path, &res.content);
     q.as_mut().rust_mut().buffer = Some(buffer);
     q.as_mut()

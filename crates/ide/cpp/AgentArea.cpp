@@ -123,13 +123,6 @@ void AgentArea::setStarting(const QString& workspaceId, bool starting) {
     }
 }
 
-void AgentArea::clearStarting() {
-    const QList<QString> pending = m_starting.values();
-    for (const QString& workspaceId : pending) {
-        setStarting(workspaceId, false);
-    }
-}
-
 void AgentArea::setAgent(const QString& workspaceId, const QString& agentId) {
     TranscriptView* view = m_transcripts.value(workspaceId);
     if (view == nullptr || agentId.isEmpty()) {

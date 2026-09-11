@@ -75,11 +75,6 @@ public:
     /// Claude workspace is created before its tab is first shown.
     void setStarting(const QString& workspaceId, bool starting);
 
-    /// Clears every in-flight mark. Used when an `agent.start` fails: the
-    /// failure signal names the operation, not the workspace, and only one
-    /// start is ever in flight.
-    void clearStarting();
-
     /// Whether Claude Code is logged in, per the daemon's `claude_auth`
     /// prerequisite. Applied to every transcript pane, now and as each one is
     /// built: a workspace whose tab has not been opened yet has no pane to

@@ -275,8 +275,12 @@ pub(crate) async fn run(steps: Vec<String>, mut client: DaemonClient, qt: QtHand
 const TERMINAL_ADAPTER: &str = "terminal";
 const CLAUDE_ADAPTER: &str = "claude";
 
-/// Creates a workspace and announces it with the signal the
-/// `create_workspace` invokable emits, which is what the window listens for.
+/// Creates a workspace and announces it with `workspace_created`, the signal
+/// both `createWorkspace*` invokables emit once the daemon has answered. That
+/// signal is what the window listens for, so the script raises it itself
+/// rather than going through an invokable: the request above goes out on the
+/// script's own client, and the window still builds the group, the tab and the
+/// pane exactly as it would for a real create.
 async fn create(
     client: &DaemonClient,
     qt: &QtHandle,
