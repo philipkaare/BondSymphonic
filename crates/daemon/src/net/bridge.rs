@@ -106,12 +106,13 @@ async fn accept_loop(
     socket: PathBuf,
     cancel: CancellationToken,
 ) {
+    let mut run = AcceptRun::default();
     loop {
         let accepted = tokio::select! {
             _ = cancel.cancelled() => return,
             a = listener.accept() => a,
         };
-        let tcp = match on_accept(accepted) {
+        let tcp = match run.step(accepted) {
             Control::Serve(tcp) => tcp,
             Control::Continue => {
                 // Descriptor exhaustion is transient; spinning on it is not.
@@ -144,26 +145,66 @@ enum Control {
     Stop,
 }
 
-/// Decides whether one failed `accept` ends the bridge.
+/// How many accepts may fail in a row, with no connection between them, before
+/// the bridge gives up.
 ///
-/// Almost never: a peer that reset before the handshake finished
-/// (`ECONNABORTED`), a moment of descriptor exhaustion (`EMFILE`), an
-/// interrupted call - all leave the listener perfectly able to accept the
-/// next connection. A loop that returned on the first of them left the port
-/// published in the IDE with nobody behind it, which looks exactly like the
-/// app inside the sandbox having died. Only a listener that is itself closed
-/// (`EBADF`) can never accept again, and that is the one case worth stopping
-/// for rather than spinning on.
-fn on_accept(result: std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>) -> Control {
-    match result {
-        Ok((tcp, _)) => Control::Serve(tcp),
-        Err(e) if e.raw_os_error() == Some(libc::EBADF) => {
-            tracing::warn!("port bridge listener is closed; bridge stopped: {e}");
-            Control::Stop
-        }
-        Err(e) => {
-            tracing::warn!("port bridge accept failed; continuing: {e}");
-            Control::Continue
+/// `EBADF` is the only error that says outright the listener can never accept
+/// again, but it is not the only one that means it: `ENOTSOCK` and `EINVAL` do
+/// not heal either, and the loop that treats them as transient warns every
+/// 100 ms for as long as the daemon lives. Fifty is far past any run of
+/// genuinely transient failures - descriptor exhaustion clears within a few -
+/// and the count starts over at every connection that does arrive, so a busy
+/// bridge under memory pressure is never counted out.
+const MAX_CONSECUTIVE_ACCEPT_FAILURES: u32 = 50;
+
+/// The accept loop's memory of how it has been going: how many accepts have
+/// failed since the last one that worked.
+#[derive(Default)]
+struct AcceptRun {
+    consecutive_failures: u32,
+}
+
+impl AcceptRun {
+    /// Decides what one outcome of `accept` means for the bridge.
+    ///
+    /// Almost every failure is `Continue`: a peer that reset before the
+    /// handshake finished (`ECONNABORTED`), a moment of descriptor exhaustion
+    /// (`EMFILE`), an interrupted call - all leave the listener perfectly able
+    /// to accept the next connection. A loop that returned on the first of them
+    /// left the port published in the IDE with nobody behind it, which looks
+    /// exactly like the app inside the sandbox having died.
+    ///
+    /// Two things end it: a listener that is itself closed (`EBADF`), which can
+    /// never accept again, and a run of
+    /// [`MAX_CONSECUTIVE_ACCEPT_FAILURES`] failures with no connection in
+    /// between, which is not a transient condition whatever the errno says.
+    fn step(
+        &mut self,
+        result: std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>,
+    ) -> Control {
+        match result {
+            Ok((tcp, _)) => {
+                self.consecutive_failures = 0;
+                Control::Serve(tcp)
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EBADF) => {
+                tracing::warn!("port bridge listener is closed; bridge stopped: {e}");
+                Control::Stop
+            }
+            Err(e) => {
+                self.consecutive_failures += 1;
+                if self.consecutive_failures >= MAX_CONSECUTIVE_ACCEPT_FAILURES {
+                    // Once, on the way out, rather than every 100 ms for ever.
+                    tracing::warn!(
+                        failures = self.consecutive_failures,
+                        "port bridge accept has failed every time since the last connection; \
+                         bridge stopped: {e}"
+                    );
+                    return Control::Stop;
+                }
+                tracing::warn!("port bridge accept failed; continuing: {e}");
+                Control::Continue
+            }
         }
     }
 }
@@ -221,7 +262,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    on_accept(Err(std::io::Error::from(kind))),
+                    AcceptRun::default().step(Err(std::io::Error::from(kind))),
                     Control::Continue
                 ),
                 "{kind:?}"
@@ -229,7 +270,10 @@ mod tests {
         }
         // Too many open files, the one error worth a pause.
         let emfile = std::io::Error::from_raw_os_error(libc::EMFILE);
-        assert!(matches!(on_accept(Err(emfile)), Control::Continue));
+        assert!(matches!(
+            AcceptRun::default().step(Err(emfile)),
+            Control::Continue
+        ));
     }
 
     /// Only a listener that is itself gone ends the loop: nothing will ever
@@ -238,7 +282,41 @@ mod tests {
     #[tokio::test]
     async fn a_closed_listener_stops_the_loop() {
         let ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
-        assert!(matches!(on_accept(Err(ebadf)), Control::Stop));
+        assert!(matches!(
+            AcceptRun::default().step(Err(ebadf)),
+            Control::Stop
+        ));
+    }
+
+    /// Continuing past an accept error is right for an error the next accept
+    /// need not repeat, and wrong for one it will. `ENOTSOCK` and `EINVAL` on a
+    /// listener do not heal, and the loop that treats them like a peer reset
+    /// warns every 100 ms for the life of the daemon - a log nobody can read,
+    /// on a port nobody can reach.
+    ///
+    /// So a run of failures with no connection between them ends the bridge,
+    /// and one connection in between says the listener is working and starts
+    /// the count over.
+    #[tokio::test]
+    async fn a_long_run_of_failures_ends_the_bridge_and_one_success_resets_it() {
+        let einval = || std::io::Error::from_raw_os_error(libc::EINVAL);
+        let mut run = AcceptRun::default();
+        for i in 1..MAX_CONSECUTIVE_ACCEPT_FAILURES {
+            assert!(matches!(run.step(Err(einval())), Control::Continue), "{i}");
+        }
+        // One accept that works: the listener is fine, whatever the run said.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(matches!(
+            run.step(listener.accept().await),
+            Control::Serve(_)
+        ));
+
+        for i in 1..MAX_CONSECUTIVE_ACCEPT_FAILURES {
+            assert!(matches!(run.step(Err(einval())), Control::Continue), "{i}");
+        }
+        assert!(matches!(run.step(Err(einval())), Control::Stop));
     }
 
     /// The accepted connection comes back to be served.
@@ -248,6 +326,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let accepted = listener.accept().await;
-        assert!(matches!(on_accept(accepted), Control::Serve(_)));
+        assert!(matches!(
+            AcceptRun::default().step(accepted),
+            Control::Serve(_)
+        ));
     }
 }
