@@ -13,10 +13,26 @@
 //!   a document over [`HIGHLIGHT_MAX_BYTES`] opens with it switched off.
 //!   `language` still reports what the file is; `spansForLine` returns `[]`.
 //!
-//! The document also watches its own file. `fs.watch` is enabled for the
-//! workspace on open, and a background task filters `fs.changed` down to this
-//! path. A change while the document is clean reloads it silently; a change
-//! while it is dirty raises `externalChange` and waits for `acceptExternal` or
+//! Line endings are the buffer's business ([`EditorBuffer::text_for_save`]):
+//! the rope holds LF, the file's own ending is put back on save, and `save`
+//! therefore writes `text_for_save()` rather than `text()`.
+//!
+//! The document also watches its own file. [`watch_file`] subscribes to the
+//! workspace's `fs.changed` stream, enables `fs.watch` on the daemon, and
+//! reports what happens as a [`WatchNotice`]. It follows the *connection*
+//! rather than one router: every connect builds a fresh [`EventRouter`], so a
+//! subscription taken on the previous one is dead, and the task re-subscribes
+//! on the router that is live after a reconnect, asks the restarted daemon for
+//! `fs.watch` again, and re-reads the file.
+//!
+//! Every change is answered by re-reading the file and then deciding, in
+//! [`disk_verdict`], what the bytes that came back mean. The document remembers
+//! by hash what it last knew to be on disk -- what it loaded, what it reloaded,
+//! what it last wrote -- so bytes it already knows are its own save landing, or
+//! a touch, and change nothing. That is what lets a keystroke typed between the
+//! save and the event survive: the document is dirty again, but the file is not
+//! news. Bytes it does not know reload a clean document silently and raise
+//! `externalChange` on a dirty one, which waits for `acceptExternal` or
 //! `keepLocal`.
 //!
 //! Writes and reads overlap with typing, so both are decided twice: once when
@@ -28,12 +44,16 @@
 //! can neither overwrite fresh edits nor undo a save that overtook it. The one
 //! exception is `acceptExternal`, which is the user asking for exactly that
 //! overwrite.
+//!
+//! [`EventRouter`]: crate::client::router::EventRouter
 
 use crate::highlight::languages::Language;
 use crate::highlight::theme::Theme;
 use crate::model::editor_buffer::EditorBuffer;
-use crate::qobjects::app_controller::{require_connection, runtime, Shared};
-use crate::qobjects::changes_model::{enable_watch, touches_workspace};
+use crate::qobjects::app_controller::{
+    generation_watch, require_connection, runtime, shared, Shared,
+};
+use crate::qobjects::changes_model::enable_watch;
 use bondsymphonic_proto::{
     Event, FsPathParams, FsWriteParams, ReadFileResult, Request, WorkspaceId,
 };
@@ -161,6 +181,10 @@ pub struct EditorDocumentRust {
     external_pending: bool,
     /// Bumped on every `open` so a late read for an earlier file is dropped.
     generation: u64,
+    /// What this document last knew to be on disk, by hash: the bytes it
+    /// loaded, reloaded, or wrote. `None` before the first read has landed.
+    /// A read that brings these bytes back is not news, whoever wrote them.
+    known_disk: Option<ContentHash>,
     /// Bumped on every edit that changes the text. A write and a read each
     /// capture it when they are issued and compare it when they land, so
     /// neither can act on a buffer the user has changed in the meantime.
@@ -183,6 +207,7 @@ impl Default for EditorDocumentRust {
             watch_task: None,
             external_pending: false,
             generation: 0,
+            known_disk: None,
             content_generation: 0,
         }
     }
@@ -210,6 +235,157 @@ impl Drop for EditorDocumentRust {
 /// whole point of the call.
 pub fn may_install_disk_text(dirty: bool, at_read: u64, now: u64) -> bool {
     !dirty && at_read == now
+}
+
+/// Identifies the bytes of a file without keeping a second copy of them.
+///
+/// A document may hold four megabytes, and the only question ever asked of the
+/// remembered copy is whether the bytes just read are the same ones. Compared
+/// only against hashes taken in the same process run and never persisted, so
+/// the hasher only has to be consistent with itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentHash(u64);
+
+pub fn content_hash(text: &str) -> ContentHash {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    ContentHash(hasher.finish())
+}
+
+/// What a completed re-read of the watched file means for the document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskVerdict {
+    /// The file holds the bytes this document already knew were there: its own
+    /// save landing, or a touch that rewrote the same content. Nothing to do,
+    /// and in particular nothing to prompt about -- which is what keeps a
+    /// keystroke typed between the save and the event.
+    Ignore,
+    /// Something else wrote the file and this document has edits that
+    /// installing it would erase. Ask.
+    ExternalChange,
+    /// Something else wrote the file and there is nothing to lose. Install it.
+    Install,
+    /// The read is out of date: the buffer moved on while it was in flight, so
+    /// its bytes describe neither what is on disk now nor what the user has.
+    Drop,
+}
+
+/// Decides what to do with a file that has just been re-read, given what the
+/// document last knew to be on disk (`known`), whether it has unsaved edits,
+/// and the content generation the read was issued at against the one now.
+///
+/// The order of the three questions is the whole of it. Bytes already known
+/// come first, because a file that has not actually changed is not a conflict
+/// however dirty the buffer is. Unsaved edits come next, because they are the
+/// only thing a prompt could protect. The generation comes last, and catches
+/// the clean document that was made clean by a *save* newer than this read: see
+/// [`may_install_disk_text`].
+pub fn disk_verdict(
+    disk_text: &str,
+    known: Option<ContentHash>,
+    dirty: bool,
+    at_read: u64,
+    now: u64,
+) -> DiskVerdict {
+    if known == Some(content_hash(disk_text)) {
+        return DiskVerdict::Ignore;
+    }
+    if dirty {
+        return DiskVerdict::ExternalChange;
+    }
+    if !may_install_disk_text(dirty, at_read, now) {
+        return DiskVerdict::Drop;
+    }
+    DiskVerdict::Install
+}
+
+/// What the watch task has to say about the file it is watching.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchNotice {
+    /// Attached to the live connection's `fs.changed` stream. The document
+    /// reads the file for the first time here rather than before subscribing,
+    /// so a change landing between the two cannot be missed.
+    Subscribed,
+    /// The watched path was named in an `fs.changed`.
+    Changed,
+    /// Attached again, on the connection that is live after a reconnect. The
+    /// daemon was restarted and has forgotten everything it knew, so the file
+    /// is re-read as if it had changed -- it may well have, while the IDE had
+    /// nobody to hear about it.
+    Reconnected,
+}
+
+/// Watches one file for as long as `notify` keeps returning true, across any
+/// number of daemon connections.
+///
+/// Free of Qt on purpose: the document's own use of it queues each notice onto
+/// the Qt thread, and a test can hand it a channel instead.
+///
+/// The generation receiver is taken *before* the connection is read. Taken
+/// after, a connection published in between would be one this task had already
+/// marked as seen, and it would wait for a change that had already happened --
+/// watching a router nothing dispatches into for the rest of the session.
+pub async fn watch_file<F>(workspace: String, path: String, notify: F)
+where
+    F: Fn(WatchNotice) -> bool,
+{
+    let mut first = true;
+    loop {
+        let mut generations = generation_watch();
+        let _ = *generations.borrow_and_update();
+        let Some(shared) = shared() else {
+            // Nothing to subscribe to yet. The watch is armed all the same, so
+            // a document opened while the daemon was down still follows its
+            // file once one is connected.
+            if generations.changed().await.is_err() {
+                return;
+            }
+            continue;
+        };
+        let mut rx = shared.router.subscribe_fs(&WorkspaceId(workspace.clone()));
+        let notice = if first {
+            WatchNotice::Subscribed
+        } else {
+            tracing::info!("{path}: re-attaching the file watch after a reconnect");
+            WatchNotice::Reconnected
+        };
+        first = false;
+        if !notify(notice) {
+            return;
+        }
+        // Enabled even when the read failed, and again after every reconnect:
+        // the file may be about to appear, and a restarted daemon has been
+        // told about no watches at all.
+        enable_watch(&shared, &workspace).await;
+
+        loop {
+            tokio::select! {
+                received = rx.recv() => {
+                    let Some((_, ev)) = received else {
+                        // The router this subscription lived in is gone, which
+                        // only a reconnect does. Waiting for the new
+                        // connection to be published beats re-subscribing into
+                        // the one on its way out.
+                        if generations.changed().await.is_err() {
+                            return;
+                        }
+                        break;
+                    };
+                    let Event::FsChanged { paths } = &ev else { continue };
+                    if paths.iter().any(|p| p == &path) && !notify(WatchNotice::Changed) {
+                        return;
+                    }
+                }
+                changed = generations.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Why a file opens read-only, or empty when it is editable.
@@ -287,10 +463,9 @@ enum Install {
     /// whatever the document has done while the read was in flight, because
     /// discarding local state is what the caller asked for.
     Always,
-    /// The watch task's silent reload, carrying the content generation the
-    /// read was issued at. Installs only while [`may_install_disk_text`]
-    /// allows it, and then only if the file actually differs.
-    IfUnchangedSince(u64),
+    /// The watch task's re-read, carrying the content generation the read was
+    /// issued at. What happens to it is [`disk_verdict`]'s answer.
+    ByVerdict(u64),
 }
 
 /// Reads one file and installs it over the buffer on the Qt thread, dropping
@@ -318,7 +493,7 @@ async fn read_into(
                     tracing::debug!("fs.read_file: dropping stale read of {path}");
                     return;
                 }
-                replace_from_disk(q, res, install);
+                apply_disk_read(q, res, install);
             });
         }
         Err(e) => {
@@ -335,62 +510,39 @@ async fn read_into(
     }
 }
 
-/// Loads the file, then watches it for the life of this generation.
-async fn open_and_watch(
-    shared: Shared,
-    qt: QtHandle,
-    workspace: String,
-    path: String,
+/// Watches the file for the life of this generation, reading it whenever the
+/// watch has something to say -- including the first time.
+async fn open_and_watch(qt: QtHandle, workspace: String, path: String, generation: u64) {
+    watch_file(workspace, path, move |notice| {
+        qt.queue(move |q| on_watch_notice(q, notice, generation))
+            .is_ok()
+    })
+    .await;
+}
+
+/// One notice from the watch task, on the Qt thread.
+fn on_watch_notice(
+    q: core::pin::Pin<&mut qobject::EditorDocument>,
+    notice: WatchNotice,
     generation: u64,
 ) {
-    // Subscribed before the read goes out, so a change landing between the
-    // read and the subscription is not missed.
-    let mut rx = shared.router.subscribe_all();
-    read_into(
-        shared.clone(),
-        qt.clone(),
-        workspace.clone(),
-        path.clone(),
-        generation,
-        Install::Always,
-    )
-    .await;
-    // Enabled even when the read failed: the file may be about to appear, and
-    // the watch is what will pick it up.
-    enable_watch(&shared, &workspace).await;
-
-    while let Some((ws, ev)) = rx.recv().await {
-        if !touches_workspace(&ws, &ev, &workspace) {
-            continue;
-        }
-        let Event::FsChanged { paths } = &ev else {
-            continue;
-        };
-        if !paths.iter().any(|p| p == &path) {
-            continue;
-        }
-        let queued = qt.queue(move |mut q| {
-            if q.as_ref().rust().generation != generation {
-                return;
-            }
-            if *q.as_ref().dirty() {
-                // Local edits win until the user says otherwise. Raised once
-                // per unanswered conflict: a `git checkout` touching the file
-                // repeatedly must not stack one prompt per event.
-                if q.as_ref().rust().external_pending {
-                    return;
-                }
-                q.as_mut().rust_mut().external_pending = true;
-                q.external_change();
+    if q.as_ref().rust().generation != generation {
+        return;
+    }
+    match notice {
+        // The open's own read. Issued from here so that it cannot outrun the
+        // subscription that would have told us about a change made meanwhile.
+        WatchNotice::Subscribed => q.reload(Install::Always),
+        WatchNotice::Changed | WatchNotice::Reconnected => {
+            // One prompt per unanswered conflict: a `git checkout` touching the
+            // file repeatedly must not stack one per event.
+            if q.as_ref().rust().external_pending {
                 return;
             }
             // Captured here, on the Qt thread, so the read that goes out is
             // pinned to the buffer as it stands at this instant.
             let at_read = q.as_ref().rust().content_generation;
-            q.reload(Install::IfUnchangedSince(at_read));
-        });
-        if queued.is_err() {
-            return;
+            q.reload(Install::ByVerdict(at_read));
         }
     }
 }
@@ -407,6 +559,9 @@ impl qobject::EditorDocument {
             rust.generation += 1;
             rust.buffer = None;
             rust.external_pending = false;
+            // Nothing is known about the new file's bytes until its first read
+            // lands; the previous file's hash must not answer for it.
+            rust.known_disk = None;
             rust.generation
         };
         let workspace = workspace_id.to_string();
@@ -419,16 +574,15 @@ impl qobject::EditorDocument {
         self.as_mut().set_read_only_reason(QString::from(""));
         self.as_mut().set_error(QString::from(""));
 
-        let shared = match require_connection() {
-            Ok(shared) => shared,
-            Err(message) => {
-                self.as_mut().set_error(QString::from(message));
-                self.load_failed(QString::from(message));
-                return;
-            }
-        };
+        // Reported here rather than left to the watch task: a file opened
+        // while the daemon is down must say so, and the task itself simply
+        // waits for a connection.
+        if let Err(message) = require_connection() {
+            self.as_mut().set_error(QString::from(message));
+            self.as_mut().load_failed(QString::from(message));
+        }
         let qt = self.as_ref().qt_thread();
-        let task = runtime().spawn(open_and_watch(shared, qt, workspace, file, generation));
+        let task = runtime().spawn(open_and_watch(qt, workspace, file, generation));
         self.rust_mut().watch_task = Some(task);
     }
 
@@ -505,10 +659,21 @@ impl qobject::EditorDocument {
             self.save_failed(QString::from(&reason));
             return;
         }
-        let Some(content) = self.as_ref().rust().buffer.as_ref().map(EditorBuffer::text) else {
+        // `text_for_save`, not `text`: the buffer holds LF and the file keeps
+        // the ending it was loaded with.
+        let Some(content) = self
+            .as_ref()
+            .rust()
+            .buffer
+            .as_ref()
+            .map(EditorBuffer::text_for_save)
+        else {
             self.save_failed(QString::from(NOT_LOADED));
             return;
         };
+        // Taken before the content is handed to the request, so the reply can
+        // record what is now on disk without keeping a copy of the file.
+        let written = content_hash(&content);
         let generation = self.as_ref().rust().generation;
         // Captured with the content that is about to be written, and compared
         // when the write returns: a keystroke landing in between must not be
@@ -546,10 +711,11 @@ impl qobject::EditorDocument {
                         if q.as_ref().rust().content_generation == content_at_write {
                             q.as_mut().set_dirty(false);
                         }
-                        // The write itself produces an `fs.changed`; the watch
-                        // then re-reads, finds identical content and does
-                        // nothing. That is how our own writes are ignored,
-                        // without any bookkeeping to get wrong.
+                        // These are the bytes on disk now. The `fs.changed`
+                        // this write produces re-reads them, `disk_verdict`
+                        // recognises them, and nothing happens -- whether or
+                        // not the user has typed since.
+                        q.as_mut().rust_mut().known_disk = Some(written);
                         q.as_mut().rust_mut().external_pending = false;
                         q.as_mut().set_error(QString::from(""));
                         q.saved();
@@ -580,11 +746,10 @@ impl qobject::EditorDocument {
 
     /// Re-reads the file and offers what is on disk to `replace_from_disk`.
     ///
-    /// [`Install::Always`] is the user answering `externalChange`: the text is
-    /// replaced and `loaded` emitted whatever the file now holds. The watch
-    /// task passes [`Install::IfUnchangedSince`] instead, so an unchanged file
-    /// is left alone (which is what makes our own `save` a no-op here) and a
-    /// document the user has moved on from is not overwritten.
+    /// [`Install::Always`] is the open, and the user answering
+    /// `externalChange`: the text is replaced and `loaded` emitted whatever the
+    /// file now holds. The watch task passes [`Install::ByVerdict`] instead and
+    /// leaves the decision to [`disk_verdict`].
     fn reload(mut self: Pin<&mut Self>, install: Install) {
         let generation = self.as_ref().rust().generation;
         let workspace = self.as_ref().workspace_id().to_string();
@@ -605,41 +770,50 @@ impl qobject::EditorDocument {
     }
 }
 
-/// Installs a freshly read file over the buffer, if this read is still allowed
-/// to and the file actually differs.
-fn replace_from_disk(
+/// Acts on a freshly read file: unconditionally for an `open` or an
+/// `acceptExternal`, and otherwise on [`disk_verdict`]'s answer.
+fn apply_disk_read(
     mut q: Pin<&mut qobject::EditorDocument>,
     res: ReadFileResult,
     install: Install,
 ) {
-    let force = match install {
-        Install::Always => true,
-        Install::IfUnchangedSince(at_read) => {
-            let now = q.as_ref().rust().content_generation;
-            if !may_install_disk_text(*q.as_ref().dirty(), at_read, now) {
-                // The user typed, or saved newer text, while this read was in
-                // flight. Installing now would erase either one.
-                tracing::debug!("fs.read_file: the document moved on; dropping the reload");
-                return;
-            }
-            false
-        }
+    let at_read = match install {
+        Install::Always => return install_disk_text(q, res),
+        Install::ByVerdict(at_read) => at_read,
     };
-    let path = q.as_ref().path().to_string();
-    let (text, _) = normalise_line_separators(&res.content);
-    let unchanged = q
-        .as_ref()
-        .rust()
-        .buffer
-        .as_ref()
-        .is_some_and(|buffer| buffer.text() == text);
-    if unchanged && !force {
-        return;
+    let known = q.as_ref().rust().known_disk;
+    let now = q.as_ref().rust().content_generation;
+    match disk_verdict(&res.content, known, *q.as_ref().dirty(), at_read, now) {
+        DiskVerdict::Ignore => {
+            tracing::debug!("fs.read_file: the file holds what this document already knew");
+        }
+        DiskVerdict::Drop => {
+            // The user typed, or saved newer text, while this read was in
+            // flight. Installing now would erase either one, and the bytes it
+            // carries are not what is on disk now either, so they are not
+            // recorded as known.
+            tracing::debug!("fs.read_file: the document moved on; dropping the reload");
+        }
+        DiskVerdict::ExternalChange => {
+            // Recorded even though nothing is installed: this *is* what is on
+            // disk, so a second event carrying the same bytes is not a second
+            // conflict to prompt about once the user has answered.
+            q.as_mut().rust_mut().known_disk = Some(content_hash(&res.content));
+            q.as_mut().rust_mut().external_pending = true;
+            q.external_change();
+        }
+        DiskVerdict::Install => install_disk_text(q, res),
     }
+}
+
+/// Replaces the buffer with what was just read and tells the view.
+fn install_disk_text(mut q: Pin<&mut qobject::EditorDocument>, res: ReadFileResult) {
+    let path = q.as_ref().path().to_string();
     // Rebuilt rather than `replace_all`ed so the size rule is re-applied: a
     // file that grew past the limit while open must not start highlighting.
     let (buffer, _) = build_buffer(&path, &res.content);
     q.as_mut().rust_mut().buffer = Some(buffer);
+    q.as_mut().rust_mut().known_disk = Some(content_hash(&res.content));
     q.as_mut()
         .set_read_only_reason(QString::from(read_only_reason(&res)));
     q.as_mut().set_dirty(false);

@@ -219,3 +219,100 @@ async fn run_pty_and_agent_keys_do_not_collide() {
     assert!(matches!(run.try_recv(), Ok((_, Event::RunOutput { .. }))));
     assert!(run.try_recv().is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Review fixes 2026-09-11, task 7: unsubscribing by token (IM6) and the
+// per-workspace `fs.changed` stream (CI2).
+// ---------------------------------------------------------------------------
+
+mod review_fixes_task_7 {
+    use super::out;
+    use bondsymphonic_ide::client::router::{EventRouter, StreamKey};
+    use bondsymphonic_proto::*;
+
+    fn fs_changed(path: &str) -> Event {
+        Event::FsChanged {
+            paths: vec![path.into()],
+        }
+    }
+
+    /// Consumer A is replaced by consumer B on the same id (a re-attached
+    /// transcript, a re-opened terminal). A's receiver closes, A's task ends
+    /// and unsubscribes on its way out. By key, that would take B's live
+    /// subscription with it; by token, it takes nothing.
+    #[tokio::test]
+    async fn a_stale_tail_unsubscribe_leaves_the_live_subscriber_receiving() {
+        let r = EventRouter::new();
+        let key = StreamKey::Pty("pty_1".into());
+        let (mut a, token_a) = r.subscribe_stream(key.clone());
+        let (mut b, token_b) = r.subscribe_stream(key.clone());
+        assert!(a.recv().await.is_none(), "A was replaced by B");
+        assert_ne!(token_a, token_b);
+
+        r.unsubscribe_stream(&key, token_a);
+        r.dispatch(None, out("pty_1", "live"));
+        assert!(
+            matches!(b.try_recv(), Ok((_, Event::PtyOutput { data_b64, .. })) if data_b64 == "live"),
+            "B must still receive after A's stale unsubscribe"
+        );
+
+        // B's own token does end B, and clears what was parked for the key.
+        r.unsubscribe_stream(&key, token_b);
+        assert!(b.recv().await.is_none());
+        r.dispatch(None, out("pty_1", "parked"));
+        let (mut c, _) = r.subscribe_stream(key);
+        assert!(
+            matches!(c.try_recv(), Ok((_, Event::PtyOutput { data_b64, .. })) if data_b64 == "parked")
+        );
+    }
+
+    /// The by-key form still exists for callers that hold no token; it keeps
+    /// its old meaning of "whoever holds the key".
+    #[tokio::test]
+    async fn the_by_key_unsubscribe_still_ends_the_current_subscriber() {
+        let r = EventRouter::new();
+        let mut a = r.subscribe_pty(&"pty_2".into());
+        r.unsubscribe_pty(&"pty_2".into());
+        assert!(a.recv().await.is_none());
+    }
+
+    /// `fs.changed` is routed by workspace: an editor on workspace A never
+    /// hears about B's worktree, two editors on A both hear about A's, and an
+    /// event with no workspace reaches no fs subscriber at all.
+    #[tokio::test]
+    async fn fs_changes_reach_only_the_subscribers_of_their_workspace() {
+        let r = EventRouter::new();
+        let mut a1 = r.subscribe_fs(&"ws_a".into());
+        let mut a2 = r.subscribe_fs(&"ws_a".into());
+        let mut b = r.subscribe_fs(&"ws_b".into());
+        let mut all = r.subscribe_all();
+
+        r.dispatch(Some("ws_a".into()), fs_changed("src/main.rs"));
+        r.dispatch(None, fs_changed("nowhere"));
+        r.dispatch(Some("ws_a".into()), out("pty_x", "not a change"));
+
+        for (name, rx) in [("a1", &mut a1), ("a2", &mut a2)] {
+            assert!(
+                matches!(rx.try_recv(), Ok((Some(ws), Event::FsChanged { paths })) if ws.0 == "ws_a" && paths == ["src/main.rs"]),
+                "{name} must receive ws_a's change"
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "{name} got more than the one change"
+            );
+        }
+        assert!(b.try_recv().is_err(), "ws_b must not hear about ws_a");
+        // `subscribe_all` still sees everything.
+        let mut n = 0;
+        while all.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 3);
+
+        // Dropping one editor's receiver does not end the other's.
+        drop(a1);
+        r.dispatch(Some("ws_a".into()), fs_changed("src/lib.rs"));
+        assert!(matches!(a2.try_recv(), Ok((_, Event::FsChanged { .. }))));
+        assert!(b.try_recv().is_err());
+    }
+}

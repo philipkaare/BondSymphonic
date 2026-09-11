@@ -318,3 +318,347 @@ fn only_newlines_start_a_new_line() {
     assert_eq!(crlf.line_count(), 3);
     assert_eq!(crlf.line(1), "b");
 }
+
+// ---------------------------------------------------------------------------
+// Review fixes 2026-09-11, task 7: line endings (IQ1), the watch across a
+// reconnect (IQ2) and an own save not being an external change (IQ3).
+// ---------------------------------------------------------------------------
+
+mod review_fixes_task_7 {
+    use bondsymphonic_ide::client::router::EventRouter;
+    use bondsymphonic_ide::client::DaemonClient;
+    use bondsymphonic_ide::model::editor_buffer::{EditorBuffer, LineEnding};
+    use bondsymphonic_ide::qobjects::app_controller::{publish_shared, Shared};
+    use bondsymphonic_ide::qobjects::editor_document::{
+        content_hash, disk_verdict, watch_file, DiskVerdict, WatchNotice,
+    };
+    use bondsymphonic_proto::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+
+    /// `QTextDocument` collapses every `\r\n` to one block separator, so the
+    /// position it reports for "between c and d" in `ab⏎cd` is 4. A rope
+    /// still holding the `\r` puts unit 4 in front of the `c`, one early, and
+    /// every edit below line 1 lands one unit early per preceding CRLF.
+    /// Uses only the API that existed before the fix, so it fails on
+    /// behaviour rather than on a missing name.
+    #[test]
+    fn the_view_position_after_a_crlf_lands_on_the_right_char() {
+        let mut buf = EditorBuffer::new("x.txt", "ab\r\ncd");
+        let from = buf.utf16_to_char(4);
+        buf.apply_edit(from, 0, "X");
+        assert!(
+            buf.text().ends_with("cXd"),
+            "the X must land between c and d, got {:?}",
+            buf.text()
+        );
+    }
+
+    /// The buffer holds LF text (what the view is given) and remembers the
+    /// file's ending, which `text_for_save` puts back.
+    #[test]
+    fn a_crlf_file_is_edited_at_qt_positions_and_saved_with_its_endings() {
+        let mut buf = EditorBuffer::new("x.txt", "ab\r\ncd");
+        assert_eq!(buf.line_ending(), LineEnding::Crlf);
+        assert_eq!(buf.text(), "ab\ncd", "the view gets LF text");
+        assert_eq!(buf.line_count(), 2);
+        let from = buf.utf16_to_char(4);
+        buf.apply_edit(from, 0, "X");
+        assert_eq!(buf.text(), "ab\ncXd");
+        assert_eq!(buf.text_for_save(), "ab\r\ncXd");
+    }
+
+    /// Three CRLF lines: an edit on line 3 is two units off with the old rope.
+    #[test]
+    fn an_edit_on_the_third_crlf_line_lands_where_the_view_put_it() {
+        let mut buf = EditorBuffer::new("x.txt", "l1\r\nl2\r\nl3");
+        // "l1" ¶ "l2" ¶ "l3": the `3` is at unit 7.
+        let from = buf.utf16_to_char(7);
+        buf.apply_edit(from, 0, "X");
+        assert_eq!(buf.text(), "l1\nl2\nlX3");
+        assert_eq!(buf.text_for_save(), "l1\r\nl2\r\nlX3");
+    }
+
+    /// Backspacing over a line break removes one unit in the view and one
+    /// char in the buffer; the saved file must not keep a stray `\r`.
+    #[test]
+    fn deleting_a_line_break_leaves_no_stray_carriage_return() {
+        let mut buf = EditorBuffer::new("x.txt", "ab\r\ncd\r\n");
+        let from = buf.utf16_to_char(2);
+        let to = buf.utf16_to_char(3);
+        buf.apply_edit(from, to - from, "");
+        assert_eq!(buf.text(), "abcd\n");
+        assert_eq!(buf.text_for_save(), "abcd\r\n");
+        assert_eq!(buf.text_for_save().matches('\r').count(), 1);
+    }
+
+    /// Mixed endings: the majority wins, a tie goes to LF, and the file is
+    /// saved consistently in the chosen ending.
+    #[test]
+    fn mixed_endings_normalise_to_the_majority_and_save_consistently() {
+        let crlf_majority = EditorBuffer::new("x.txt", "a\r\nb\r\nc\nd");
+        assert_eq!(crlf_majority.line_ending(), LineEnding::Crlf);
+        assert_eq!(crlf_majority.text(), "a\nb\nc\nd");
+        assert_eq!(crlf_majority.text_for_save(), "a\r\nb\r\nc\r\nd");
+
+        let lf_majority = EditorBuffer::new("x.txt", "a\nb\nc\r\nd");
+        assert_eq!(lf_majority.line_ending(), LineEnding::Lf);
+        assert_eq!(lf_majority.text_for_save(), "a\nb\nc\nd");
+
+        let tie = EditorBuffer::new("x.txt", "a\r\nb\nc");
+        assert_eq!(tie.line_ending(), LineEnding::Lf);
+        assert_eq!(tie.text_for_save(), "a\nb\nc");
+
+        let no_breaks = EditorBuffer::new("x.txt", "abc");
+        assert_eq!(no_breaks.line_ending(), LineEnding::Lf);
+        assert_eq!(no_breaks.text_for_save(), "abc");
+
+        // A file that starts out LF and is saved stays byte-identical.
+        let lf = EditorBuffer::new("x.txt", "a\nb\n");
+        assert_eq!(lf.text_for_save(), "a\nb\n");
+    }
+
+    /// Spans and line lookups keep working over the LF-only rope.
+    #[test]
+    fn crlf_files_still_highlight_per_line() {
+        let mut buf = EditorBuffer::new("x.rs", "// one\r\n// two\r\n");
+        assert_eq!(buf.line_count(), 3);
+        assert_eq!(buf.line(1), "// two");
+        assert_eq!(buf.spans_for_line(1).len(), 1);
+        assert_eq!(buf.spans_for_line(1)[0].len, 6);
+    }
+
+    // -- IQ3: an own save is not an external change ------------------------
+
+    /// The document remembers what it last knew to be on disk (by hash). An
+    /// `fs.changed` that reads back exactly that is its own write, or a touch,
+    /// and changes nothing: a keystroke typed between the save and the event
+    /// stays in the buffer, and no `externalChange` is raised.
+    #[test]
+    fn a_change_that_reads_back_the_saved_text_is_ignored() {
+        let saved = "fn main() {}\r\n";
+        let known = Some(content_hash(saved));
+        // Dirty again: the user typed after the save was issued.
+        assert_eq!(disk_verdict(saved, known, true, 3, 4), DiskVerdict::Ignore);
+        // Still clean: the same answer, nothing to install.
+        assert_eq!(disk_verdict(saved, known, false, 4, 4), DiskVerdict::Ignore);
+    }
+
+    /// The two halves together: what `save` writes is `text_for_save`, so the
+    /// hash it records is over the file's *own* bytes, CRLF and all. The
+    /// `fs.changed` that write produces reads those bytes back and is ignored
+    /// even though the user has typed since -- which is the keystroke
+    /// surviving the save.
+    #[test]
+    fn the_saved_bytes_are_what_the_next_read_is_measured_against() {
+        let mut buf = EditorBuffer::new("x.rs", "fn main() {}\r\n");
+        let written = buf.text_for_save();
+        assert_eq!(written, "fn main() {}\r\n", "the file keeps its endings");
+        let known = Some(content_hash(&written));
+
+        // The user types while the write is in flight: dirty again, content
+        // generation moved on.
+        let at = buf.utf16_to_char(12);
+        buf.apply_edit(at, 0, "\n");
+        assert_eq!(buf.text(), "fn main() {}\n\n");
+
+        // The daemon reports the write. The file holds the written bytes.
+        assert_eq!(
+            disk_verdict(&written, known, true, 7, 8),
+            DiskVerdict::Ignore
+        );
+        // And what the user typed is still there to be saved next time.
+        assert_eq!(buf.text_for_save(), "fn main() {}\r\n\r\n");
+    }
+
+    /// Something else wrote the file: with local edits the user is asked,
+    /// without them the disk text is installed, unless the buffer moved on
+    /// while the read was in flight.
+    #[test]
+    fn a_change_that_reads_back_other_text_is_external() {
+        let known = Some(content_hash("fn main() {}\n"));
+        let other = "fn main() { changed }\n";
+        assert_eq!(
+            disk_verdict(other, known, true, 3, 3),
+            DiskVerdict::ExternalChange
+        );
+        assert_eq!(
+            disk_verdict(other, known, false, 3, 3),
+            DiskVerdict::Install
+        );
+        // A save overtook the read: its content is newer than the read's.
+        assert_eq!(disk_verdict(other, known, false, 3, 4), DiskVerdict::Drop);
+        // Nothing known yet (the first read never landed): install.
+        assert_eq!(disk_verdict(other, None, false, 3, 3), DiskVerdict::Install);
+    }
+
+    // -- IQ2: the watch follows the router across a reconnect ----------------
+
+    /// A daemon just real enough for the watch task: it answers `hello`,
+    /// acknowledges `fs.watch`, and accepts any number of connections so a
+    /// second `connect` is a reconnect.
+    async fn fake_daemon(token: &'static str) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut r = BufReader::new(r);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match r.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        let ClientMessage::Request { id, request } =
+                            codec::decode(line.trim_end()).unwrap();
+                        let msg = match request {
+                            Request::Hello(p) if p.token == token => ServerMessage::ok(
+                                id,
+                                &HelloResult {
+                                    daemon_version: "9.9.9".into(),
+                                    capabilities: Capabilities {
+                                        sandbox_backend: "noop".into(),
+                                        git_protect: false,
+                                        adapters: vec![],
+                                    },
+                                    protocol_version: Some(PROTOCOL_VERSION),
+                                },
+                            ),
+                            Request::Hello(_) => ServerMessage::err(id, RpcError::unauthorized()),
+                            Request::FsWatch(_) => ServerMessage::ok(id, &serde_json::json!({})),
+                            other => ServerMessage::err(
+                                id,
+                                RpcError::internal(format!(
+                                    "not implemented: {}",
+                                    other.method_name()
+                                )),
+                            ),
+                        };
+                        if w.write_all(codec::encode(&msg).as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn fs_changed(ws: &str, path: &str) -> (Option<WorkspaceId>, Event) {
+        (
+            Some(ws.into()),
+            Event::FsChanged {
+                paths: vec![path.into()],
+            },
+        )
+    }
+
+    async fn next(rx: &mut mpsc::UnboundedReceiver<WatchNotice>) -> Option<WatchNotice> {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the watch task must answer within 5 s")
+    }
+
+    async fn nothing(rx: &mut mpsc::UnboundedReceiver<WatchNotice>) {
+        let got = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(got.is_err(), "expected no notice, got {:?}", got.unwrap());
+    }
+
+    /// Every connect builds a fresh router, so a subscription taken on the
+    /// previous one is dead. The watch task re-subscribes on the router that
+    /// is live after the reconnect and asks again for `fs.watch`; a change
+    /// published there reaches the document.
+    #[tokio::test]
+    async fn the_watch_follows_the_router_across_a_reconnect() {
+        let addr = fake_daemon("secret").await;
+        let (c1, _hello, _events1) = DaemonClient::connect(addr, "secret", "0.1.0")
+            .await
+            .unwrap();
+        let r1 = EventRouter::new();
+        publish_shared(Shared {
+            client: c1,
+            router: r1.clone(),
+        });
+
+        let (tx, mut notices) = mpsc::unbounded_channel();
+        let task = tokio::spawn(watch_file(
+            "ws_a".to_owned(),
+            "src/main.rs".to_owned(),
+            move |notice| tx.send(notice).is_ok(),
+        ));
+        assert_eq!(next(&mut notices).await, Some(WatchNotice::Subscribed));
+
+        let (ws, ev) = fs_changed("ws_a", "src/main.rs");
+        r1.dispatch(ws, ev);
+        assert_eq!(next(&mut notices).await, Some(WatchNotice::Changed));
+        // Another path, and another workspace: not this document's business.
+        let (ws, ev) = fs_changed("ws_a", "src/other.rs");
+        r1.dispatch(ws, ev);
+        let (ws, ev) = fs_changed("ws_b", "src/main.rs");
+        r1.dispatch(ws, ev);
+        nothing(&mut notices).await;
+
+        // The reconnect: a new connection, a new router, published the way
+        // `AppController` publishes one.
+        let (c2, _hello, _events2) = DaemonClient::connect(addr, "secret", "0.1.0")
+            .await
+            .unwrap();
+        let r2 = EventRouter::new();
+        publish_shared(Shared {
+            client: c2,
+            router: r2.clone(),
+        });
+        assert_eq!(next(&mut notices).await, Some(WatchNotice::Reconnected));
+
+        // The old router is history; the new one is what the document hears.
+        let (ws, ev) = fs_changed("ws_a", "src/main.rs");
+        r1.dispatch(ws, ev);
+        nothing(&mut notices).await;
+        let (ws, ev) = fs_changed("ws_a", "src/main.rs");
+        r2.dispatch(ws, ev);
+        assert_eq!(next(&mut notices).await, Some(WatchNotice::Changed));
+
+        task.abort();
+    }
+
+    /// A closed tab, or a document re-opened on another file: the sink refuses
+    /// the notice and the task ends rather than watching a file nobody is
+    /// showing for the rest of the session.
+    #[tokio::test]
+    async fn the_watch_ends_when_its_document_stops_listening() {
+        let addr = fake_daemon("secret").await;
+        let (client, _hello, _events) = DaemonClient::connect(addr, "secret", "0.1.0")
+            .await
+            .unwrap();
+        let router = EventRouter::new();
+        publish_shared(Shared {
+            client,
+            router: router.clone(),
+        });
+
+        let (tx, mut notices) = mpsc::unbounded_channel();
+        let task = tokio::spawn(watch_file(
+            "ws_gone".to_owned(),
+            "src/main.rs".to_owned(),
+            move |notice| {
+                // The document is gone: the queue onto its Qt thread fails,
+                // which is what `false` stands for here.
+                let _ = tx.send(notice);
+                false
+            },
+        ));
+        assert_eq!(next(&mut notices).await, Some(WatchNotice::Subscribed));
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the watch task must end once its sink refuses")
+            .expect("and end by returning, not by panicking");
+    }
+}

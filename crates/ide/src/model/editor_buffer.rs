@@ -10,6 +10,13 @@
 //! Lines are counted the way `QTextDocument` counts blocks: `ropey` is built
 //! without `unicode_lines`, so only LF and CRLF start a new line and a form
 //! feed or vertical tab stays an ordinary character.
+//!
+//! The rope holds LF only. `QTextDocument` collapses each `\r\n` into a single
+//! block separator and reports every position after it counting that separator
+//! as one unit, so a rope that kept the `\r` would put each edit below line 1
+//! one unit early per preceding CRLF -- and a save would then write the
+//! mangled result back. The file's own ending is remembered instead (see
+//! [`LineEnding`]) and put back by [`EditorBuffer::text_for_save`].
 
 use crate::highlight::languages::Language;
 use crate::highlight::theme::{StyleId, Theme};
@@ -26,9 +33,28 @@ pub struct Span {
     pub style: StyleId,
 }
 
+/// How a file ends its lines, as it was found on disk and as it will be
+/// written back.
+///
+/// **The rule for a file that mixes the two: the majority wins, and a tie is
+/// LF.** A file with no line break at all is LF. Whichever ending wins is then
+/// used for every line, so a mixed file becomes consistent the first time it is
+/// saved. Counting rather than taking the first ending is what keeps an
+/// otherwise-CRLF file that someone appended one LF line to from being
+/// rewritten wholesale; taking the first would flip a 2000-line file on the
+/// strength of its first line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineEnding {
+    Lf,
+    Crlf,
+}
+
 /// One open file: its text, its language, and its per-line highlight spans.
 pub struct EditorBuffer {
+    /// LF only: every `\r\n` of the loaded text was collapsed to `\n`.
     rope: Rope,
+    /// What the file used on disk, and what `text_for_save` writes back.
+    line_ending: LineEnding,
     language: Option<Language>,
     /// When false, no highlight pass runs and every line reports no spans.
     highlighting: bool,
@@ -38,12 +64,43 @@ pub struct EditorBuffer {
 
 impl EditorBuffer {
     pub fn new(path: &str, text: &str) -> EditorBuffer {
+        let (text, line_ending) = to_lf(text);
         EditorBuffer {
-            rope: Rope::from_str(text),
+            rope: Rope::from_str(&text),
+            line_ending,
             language: Language::from_path(path),
             highlighting: true,
             spans: None,
         }
+    }
+
+    /// The ending the file was loaded with, which is the one it is saved with.
+    pub fn line_ending(&self) -> LineEnding {
+        self.line_ending
+    }
+
+    /// The bytes to write to disk: the buffer's text with the file's own line
+    /// ending put back.
+    ///
+    /// The inverse of the collapse done on load, and the reason the view can be
+    /// given LF text without a CRLF file being converted behind the user's
+    /// back. A `\r` that is already there (a lone one, which is content rather
+    /// than a break) is not doubled.
+    pub fn text_for_save(&self) -> String {
+        let text = self.rope.to_string();
+        if self.line_ending == LineEnding::Lf {
+            return text;
+        }
+        let mut out = String::with_capacity(text.len() + text.matches('\n').count());
+        let mut prev = '\0';
+        for c in text.chars() {
+            if c == '\n' && prev != '\r' {
+                out.push('\r');
+            }
+            out.push(c);
+            prev = c;
+        }
+        out
     }
 
     /// The language detected from the path, whether or not highlighting is on.
@@ -123,9 +180,12 @@ impl EditorBuffer {
         range
     }
 
-    /// Replaces the whole text, discarding the cached spans.
+    /// Replaces the whole text, discarding the cached spans. The new text is
+    /// collapsed to LF and re-decides the file's ending, exactly as on load.
     pub fn replace_all(&mut self, text: &str) {
-        self.rope = Rope::from_str(text);
+        let (text, line_ending) = to_lf(text);
+        self.rope = Rope::from_str(&text);
+        self.line_ending = line_ending;
         self.spans = None;
     }
 
@@ -159,16 +219,16 @@ impl EditorBuffer {
         serde_json::Value::Array(items).to_string()
     }
 
-    /// Chars on line `n` before its line terminator. `ropey` here recognises
-    /// only LF and CRLF, so exactly one of those is stripped.
+    /// Chars on line `n` before its line terminator.
+    ///
+    /// Only the `\n` is stripped: the rope holds LF, so a `\r` that survived
+    /// the collapse is a lone carriage return, which is a character of the
+    /// file's content and not a break either Qt or `ropey` ends a line at.
     fn visible_len(&self, n: usize) -> usize {
         let line = self.rope.line(n);
         let mut len = line.len_chars();
         if len > 0 && line.char(len - 1) == '\n' {
             len -= 1;
-            if len > 0 && line.char(len - 1) == '\r' {
-                len -= 1;
-            }
         }
         len
     }
@@ -246,4 +306,32 @@ fn changed_range(before: &[Vec<Span>], after: &[Vec<Span>], edited_line: usize) 
         }
     }
     (from, to.min(last))
+}
+
+/// Collapses every `\r\n` to `\n` and reports which ending the file used, by
+/// the majority rule documented on [`LineEnding`].
+///
+/// One left-to-right pass: a `\r` is dropped only when the very next character
+/// is the `\n` it belongs to, so a lone carriage return is left as the content
+/// character it is.
+fn to_lf(text: &str) -> (String, LineEnding) {
+    let crlf = text.matches("\r\n").count();
+    let lf = text.matches('\n').count() - crlf;
+    let ending = if crlf > lf {
+        LineEnding::Crlf
+    } else {
+        LineEnding::Lf
+    };
+    if crlf == 0 {
+        return (text.to_owned(), ending);
+    }
+    let mut out = String::with_capacity(text.len() - crlf);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' && chars.peek() == Some(&'\n') {
+            continue;
+        }
+        out.push(c);
+    }
+    (out, ending)
 }

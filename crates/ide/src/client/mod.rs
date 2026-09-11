@@ -193,6 +193,18 @@ impl DaemonClient {
                             break;
                         }
                     }
+                    // A line this build cannot make sense of: an event kind a
+                    // newer daemon has and this IDE has not, or one malformed
+                    // message. The line has already been consumed, so skipping
+                    // it costs that one message; ending the loop here would
+                    // instead fail every request in flight with `Disconnected`
+                    // and take the session down over a message nobody was
+                    // waiting for.
+                    Err(ClientError::Proto(e)) => {
+                        tracing::warn!("skipping an undecodable line from the daemon: {e}");
+                    }
+                    // A clean EOF, or the socket itself failing: there is
+                    // nothing left to read either way.
                     Ok(None) | Err(_) => break,
                 }
             }

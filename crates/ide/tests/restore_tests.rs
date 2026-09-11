@@ -313,3 +313,106 @@ fn wait_for(child: &mut std::process::Child, limit: Duration) -> Option<std::pro
     let _ = child.wait();
     None
 }
+
+/// Task 9: what a restored tab remembers beyond its place in a group.
+///
+/// The daemon is authoritative about what a workspace *is*, but the command a
+/// terminal tab was opened with and the run configuration the user picked are
+/// the IDE's own and exist nowhere else. Until `state.json` carried them, every
+/// restart handed back a terminal tab with no command and a Run panel that had
+/// forgotten which configuration the workspace runs.
+mod task_9 {
+    use bondsymphonic_ide::model::app_state::{AgentTab, Workspaces};
+    use bondsymphonic_ide::model::persistence::{load, save, StateFile};
+    use bondsymphonic_proto::{WorkspaceId, WorkspaceInfo, WorkspaceState};
+    use std::path::PathBuf;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bs-restore-t9-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn info(id: &str, name: &str) -> WorkspaceInfo {
+        WorkspaceInfo {
+            id: WorkspaceId(id.to_owned()),
+            name: name.to_owned(),
+            repo_path: "/repo".to_owned(),
+            base_branch: "main".to_owned(),
+            branch: format!("bs/{name}/work"),
+            worktree_path: format!("/wt/{name}"),
+            created_at: "2026-09-11T10:00:00Z".to_owned(),
+            allowlist: Vec::new(),
+            state: WorkspaceState::Ready,
+            agents: Vec::new(),
+            agent_records: Vec::new(),
+            runs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_command_and_a_run_config_come_back_after_a_save_and_load() {
+        let path = temp_dir("roundtrip").join("state.json");
+        let terminal = info("ws_term", "term");
+        let claude = info("ws_claude", "claude");
+
+        let mut model = Workspaces::new_default();
+        let mut tab = AgentTab::from_workspace_info(&terminal);
+        tab.command = Some("npm run dev".to_owned());
+        model.add_tab(0, tab);
+        let mut tab = AgentTab::from_workspace_info(&claude);
+        tab.run_config = Some("dev".to_owned());
+        model.add_tab(0, tab);
+
+        let mut state = StateFile::default();
+        state.set_groups(model.persisted_groups(), Some("ws_claude".to_owned()));
+        save(&path, &state).expect("state.json written");
+
+        let reread = load(&path);
+        let restored = Workspaces::from_persisted(
+            &reread.groups,
+            &[terminal, claude],
+            reread.active_workspace.as_deref(),
+        );
+
+        let (g, t) = restored
+            .find(&WorkspaceId("ws_term".to_owned()))
+            .expect("the terminal tab is back");
+        assert_eq!(
+            restored.groups[g].tabs[t].command.as_deref(),
+            Some("npm run dev"),
+            "the command the terminal tab was opened with"
+        );
+        let (g, t) = restored
+            .find(&WorkspaceId("ws_claude".to_owned()))
+            .expect("the agent tab is back");
+        assert_eq!(
+            restored.groups[g].tabs[t].run_config.as_deref(),
+            Some("dev"),
+            "the run configuration the user picked"
+        );
+    }
+
+    /// A file written before the fields existed still loads, with both of them
+    /// empty rather than the whole arrangement lost.
+    #[test]
+    fn an_old_state_file_without_the_fields_still_loads() {
+        let path = temp_dir("old-format").join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"groups":[{"name":"Default","workspace_ids":["ws_term"]}],"active_workspace":"ws_term"}"#,
+        )
+        .expect("an old-format state.json");
+
+        let reread = load(&path);
+        assert_eq!(reread.groups.len(), 1, "the group survived");
+        assert_eq!(reread.groups[0].workspace_ids, ["ws_term"]);
+
+        let restored =
+            Workspaces::from_persisted(&reread.groups, &[info("ws_term", "term")], Some("ws_term"));
+        let tab = restored.active().expect("the restored tab");
+        assert_eq!(tab.command, None);
+        assert_eq!(tab.run_config, None);
+    }
+}

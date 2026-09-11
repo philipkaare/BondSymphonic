@@ -700,3 +700,118 @@ async fn a_pre_m7_daemon_still_connects() {
         .expect("a daemon that sends no protocol version speaks version 1");
     assert_eq!(hello.protocol_version, None);
 }
+
+// ---------------------------------------------------------------------------
+// Review fixes 2026-09-11, task 7: one undecodable line does not drop the
+// connection (IM7).
+// ---------------------------------------------------------------------------
+
+mod review_fixes_task_7 {
+    use bondsymphonic_ide::client::DaemonClient;
+    use bondsymphonic_proto::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    /// The line the brief names: not a `ServerMessage` at all.
+    const BAD_LINE: &str = "{\"kind\":\"no_such_kind\"}\n";
+
+    /// Answers `hello`; on `system.check_prereqs` it writes one line the
+    /// client cannot decode, then a valid event, then the reply.
+    async fn fake_daemon_with_a_bad_line(token: &'static str) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut r = BufReader::new(r);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if r.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let ClientMessage::Request { id, request } =
+                    codec::decode(line.trim_end()).unwrap();
+                match request {
+                    Request::Hello(p) if p.token == token => {
+                        let ok = ServerMessage::ok(
+                            id,
+                            &HelloResult {
+                                daemon_version: "9.9.9".into(),
+                                capabilities: Capabilities {
+                                    sandbox_backend: "noop".into(),
+                                    git_protect: false,
+                                    adapters: vec![],
+                                },
+                                protocol_version: Some(PROTOCOL_VERSION),
+                            },
+                        );
+                        w.write_all(codec::encode(&ok).as_bytes()).await.unwrap();
+                    }
+                    Request::SystemCheckPrereqs {} => {
+                        let mut out = String::from(BAD_LINE);
+                        out.push_str(&codec::encode(&ServerMessage::event(
+                            None,
+                            Event::DaemonLog {
+                                level: LogLevel::Info,
+                                message: "after the bad line".into(),
+                                host: None,
+                            },
+                        )));
+                        out.push_str(&codec::encode(&ServerMessage::ok(
+                            id,
+                            &CheckPrereqsResult {
+                                items: vec![PrereqStatus {
+                                    name: "git".into(),
+                                    ok: true,
+                                    detail: "git version 2.43".into(),
+                                    fix_hint: None,
+                                }],
+                            },
+                        )));
+                        w.write_all(out.as_bytes()).await.unwrap();
+                    }
+                    _ => {
+                        let err = ServerMessage::err(id, RpcError::unauthorized());
+                        w.write_all(codec::encode(&err).as_bytes()).await.unwrap();
+                    }
+                }
+            }
+        });
+        addr
+    }
+
+    /// A daemon a version ahead may send an event kind this build has never
+    /// heard of. That line is logged and skipped; the valid event after it
+    /// is delivered, the pending request is answered, and the connection
+    /// stays up.
+    #[tokio::test]
+    async fn one_undecodable_line_is_skipped_rather_than_dropping_the_connection() {
+        let addr = fake_daemon_with_a_bad_line("secret").await;
+        let (client, _hello, mut events) = DaemonClient::connect(addr, "secret", "0.1.0")
+            .await
+            .unwrap();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.request::<CheckPrereqsResult>(Request::SystemCheckPrereqs {}),
+        )
+        .await
+        .expect("the request must be answered within 5 s")
+        .expect("the request after the bad line must resolve, not fail as disconnected");
+        assert_eq!(res.items[0].name, "git");
+        assert!(
+            client.is_connected(),
+            "one bad line must not end the session"
+        );
+
+        let (_, ev) = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("the event after the bad line must arrive")
+            .expect("the event stream must stay open");
+        assert!(
+            matches!(&ev, Event::DaemonLog { message, .. } if message == "after the bad line"),
+            "expected the event after the bad line, got {ev:?}"
+        );
+    }
+}

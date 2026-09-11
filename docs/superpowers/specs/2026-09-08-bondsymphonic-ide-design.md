@@ -217,8 +217,27 @@ the only place with `cfg(windows)` branches in the IDE.
   property). Theme colours come from `highlight/theme.rs`, light and dark.
 - Languages in v1: Rust, JavaScript, TypeScript, TSX, Python, JSON, TOML, YAML,
   HTML, CSS, Markdown, Bash, C, C++, Go. Unknown extensions get no highlighting.
-- Save: Ctrl+S → `fs.write_file`. If a `fs.changed` event arrives for an open,
-  unmodified file, it reloads silently; if modified, a bar offers reload/keep.
+- Save: Ctrl+S → `fs.write_file`, written in the file's own line ending (see
+  below). The document remembers, by hash, the bytes it last knew to be on
+  disk: what it loaded, what it reloaded, what it last wrote, and what a change
+  it prompted about turned out to hold. A `fs.changed`
+  for an open file re-reads it; bytes it already knows (its own save landing, a
+  touch) change nothing, so a keystroke typed between the save and the event
+  survives and no prompt is raised. Other bytes reload an unmodified file
+  silently; on a modified file a bar offers reload/keep.
+- Line endings: the buffer holds LF only. `QTextDocument` collapses each
+  `\r\n` into one block separator and reports positions that count it as one
+  unit, so a rope that kept the `\r` would put every edit below line 1 one unit
+  early per preceding CRLF. The file's ending is detected on load by majority
+  rule (a tie, and a file with no line breaks, count as LF; a mixed file is
+  normalised to its majority ending on the first save) and re-applied by
+  `EditorBuffer::text_for_save` when the file is written. The view never sees a
+  `\r`.
+- Watch: each document subscribes to the router's per-workspace `fs.changed`
+  stream (`EventRouter::subscribe_fs`) rather than to every event. The watch
+  task follows the connection generation: after a reconnect it re-subscribes on
+  the router that is live then, asks the restarted daemon for `fs.watch` again,
+  and re-reads the file as if it had changed.
 - Files over 4 MiB or binary open as a read-only notice.
 - **As built (Milestone 3):** highlighting re-runs over the *whole* buffer after
   an edit, lazily on the next span query, rather than applying the edit to the

@@ -1,7 +1,7 @@
 //! Fans one daemon event stream out to the consumers that care about it.
 //!
 //! The reader loop in `AppController::start` owns the single [`EventStream`] the
-//! client hands back and calls [`EventRouter::dispatch`] for every event. Four
+//! client hands back and calls [`EventRouter::dispatch`] for every event. Five
 //! kinds of consumer subscribe here:
 //!
 //! * [`EventRouter::subscribe_all`] — every event, in order. Used for
@@ -11,14 +11,22 @@
 //!   one agent.
 //! * [`EventRouter::subscribe_run`] — only `run.output`/`run.state` for one
 //!   run.
+//! * [`EventRouter::subscribe_fs`] — only `fs.changed` for one workspace. Every
+//!   open editor takes one of these, rather than the whole stream it would
+//!   otherwise have to filter.
 //!
-//! All three per-id kinds share one table keyed by `StreamKey`, so a PTY, an
+//! All four per-id kinds share one table keyed by [`StreamKey`], so a PTY, an
 //! agent and a run whose ids collide as strings still get separate streams.
+//! They differ in how many consumers a key may have, which is [`Fanout`]: a
+//! PTY, an agent and a run are each shown in one place, while a workspace can
+//! have any number of editors open on it at once.
 //!
 //! A PTY's first output, an agent's first messages and a run's banner usually
 //! arrive before the widget that will display them has finished being constructed and
 //! subscribed, so unclaimed per-id events are parked in a short-lived *early
-//! buffer* and replayed on subscription.
+//! buffer* and replayed on subscription. Worktree changes are not parked: a
+//! change from before a file was opened says nothing about the file that is
+//! open now, and replaying one would make a fresh editor reload or prompt.
 //!
 //! This module must never import Qt types.
 //!
@@ -44,21 +52,62 @@ pub const EARLY_BUFFER_TTL: Duration = Duration::from_secs(5);
 /// anyway.
 pub const EARLY_BUFFER_CAP: usize = 256;
 
-/// What a per-id subscription is for. Three id spaces, one table: the daemon's
+/// What a per-id subscription is for. Four id spaces, one table: the daemon's
 /// prefixes make a collision unlikely, but nothing in the protocol forbids one
 /// and a terminal fed an agent's messages would be a mystery to debug.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum StreamKey {
+pub enum StreamKey {
     Pty(PtyId),
     Agent(AgentId),
     Run(RunId),
+    /// Worktree changes for one workspace.
+    Fs(WorkspaceId),
+}
+
+/// How many consumers a key may have at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fanout {
+    /// One, and subscribing again replaces it: a PTY, an agent or a run is
+    /// shown in exactly one widget, and a re-opened one must not be shadowed
+    /// by the consumer it replaced. Early-buffered events go to it.
+    Exclusive,
+    /// Any number, each hearing every event: several editors can be open on
+    /// one workspace, and each of them needs its own copy.
+    Shared,
+}
+
+impl StreamKey {
+    pub fn fanout(&self) -> Fanout {
+        match self {
+            StreamKey::Pty(_) | StreamKey::Agent(_) | StreamKey::Run(_) => Fanout::Exclusive,
+            StreamKey::Fs(_) => Fanout::Shared,
+        }
+    }
+}
+
+/// Identifies one subscription among the ones taken on the same key.
+///
+/// Handed out by [`EventRouter::subscribe_stream`] and given back to
+/// [`EventRouter::unsubscribe_stream`], which is what keeps a consumer that has
+/// already been replaced from cancelling the one that replaced it as it winds
+/// down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubToken(u64);
+
+/// One subscription: where to send, and which subscription it is.
+struct Sub {
+    token: SubToken,
+    tx: EventTx,
 }
 
 #[derive(Default)]
 struct Inner {
     all: Vec<EventTx>,
-    streams: HashMap<StreamKey, EventTx>,
+    streams: HashMap<StreamKey, Vec<Sub>>,
     early: HashMap<StreamKey, Vec<(Instant, Option<WorkspaceId>, Event)>>,
+    /// Never reused, so a token can only ever name the subscription it was
+    /// handed out for.
+    next_token: u64,
 }
 
 impl Inner {
@@ -68,6 +117,11 @@ impl Inner {
             buf.retain(|(at, _, _)| at.elapsed() < age);
             !buf.is_empty()
         });
+    }
+
+    fn mint(&mut self) -> SubToken {
+        self.next_token += 1;
+        SubToken(self.next_token)
     }
 }
 
@@ -96,7 +150,7 @@ impl EventRouter {
     /// close), which keeps a re-opened terminal from being shadowed by a stale
     /// consumer.
     pub fn subscribe_pty(&self, id: &PtyId) -> EventRx {
-        self.subscribe_stream(StreamKey::Pty(id.clone()))
+        self.subscribe_stream(StreamKey::Pty(id.clone())).0
     }
 
     /// Ends the subscription for `id`: dropping the sender closes the
@@ -104,7 +158,7 @@ impl EventRouter {
     /// still parked for that id is discarded too, since a closed PTY's output
     /// must not be replayed onto a later terminal reusing the id.
     pub fn unsubscribe_pty(&self, id: &PtyId) {
-        self.unsubscribe_stream(&StreamKey::Pty(id.clone()));
+        self.unsubscribe_key(&StreamKey::Pty(id.clone()));
     }
 
     /// Only `agent.message`/`agent.state` for `id`, with the same early-buffer
@@ -113,13 +167,13 @@ impl EventRouter {
     /// the id it needs in order to subscribe. Subscribing twice for the same
     /// id replaces the earlier subscription.
     pub fn subscribe_agent(&self, id: &AgentId) -> EventRx {
-        self.subscribe_stream(StreamKey::Agent(id.clone()))
+        self.subscribe_stream(StreamKey::Agent(id.clone())).0
     }
 
     /// Ends the subscription for `id` and discards anything parked for it, so
     /// a stopped agent's tail is not replayed onto a later transcript.
     pub fn unsubscribe_agent(&self, id: &AgentId) {
-        self.unsubscribe_stream(&StreamKey::Agent(id.clone()));
+        self.unsubscribe_key(&StreamKey::Agent(id.clone()));
     }
 
     /// Only `run.output`/`run.state` for `id`, with the same early-buffer
@@ -129,29 +183,81 @@ impl EventRouter {
     /// reply carried. Subscribing twice for the same id replaces the earlier
     /// subscription.
     pub fn subscribe_run(&self, id: &RunId) -> EventRx {
-        self.subscribe_stream(StreamKey::Run(id.clone()))
+        self.subscribe_stream(StreamKey::Run(id.clone())).0
     }
 
     /// Ends the subscription for `id` and discards anything parked for it. The
     /// panel calls this when a run stops, so a finished run's tail cannot be
     /// replayed into the log of a later run of the same configuration.
     pub fn unsubscribe_run(&self, id: &RunId) {
-        self.unsubscribe_stream(&StreamKey::Run(id.clone()));
+        self.unsubscribe_key(&StreamKey::Run(id.clone()));
     }
 
-    fn subscribe_stream(&self, key: StreamKey) -> EventRx {
+    /// Only `fs.changed` for `workspace`, which is all an open editor or the
+    /// changed-files list has ever wanted out of the stream.
+    ///
+    /// Shared, unlike the per-id streams: every editor open on the workspace
+    /// gets its own copy, and none of them is replaced by the next one to open.
+    /// Ending it is just dropping the receiver -- the next dispatch notices the
+    /// closed channel and forgets it -- so there is no unsubscribe to forget to
+    /// call from a Drop.
+    pub fn subscribe_fs(&self, workspace: &WorkspaceId) -> EventRx {
+        self.subscribe_stream(StreamKey::Fs(workspace.clone())).0
+    }
+
+    /// Subscribes to one stream, whatever kind of key it is, and hands back the
+    /// token that names this subscription.
+    ///
+    /// A [`Fanout::Exclusive`] key replaces whoever held it and is replayed
+    /// anything parked for it; a [`Fanout::Shared`] key simply gains one more
+    /// listener.
+    pub fn subscribe_stream(&self, key: StreamKey) -> (EventRx, SubToken) {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut inner = self.lock();
-        if let Some(buf) = inner.early.remove(&key) {
-            for (_, ws, ev) in buf {
-                let _ = tx.send((ws, ev));
+        let token = inner.mint();
+        match key.fanout() {
+            Fanout::Exclusive => {
+                if let Some(buf) = inner.early.remove(&key) {
+                    for (_, ws, ev) in buf {
+                        let _ = tx.send((ws, ev));
+                    }
+                }
+                inner.streams.insert(key, vec![Sub { token, tx }]);
             }
+            Fanout::Shared => inner
+                .streams
+                .entry(key)
+                .or_default()
+                .push(Sub { token, tx }),
         }
-        inner.streams.insert(key, tx);
-        rx
+        (rx, token)
     }
 
-    fn unsubscribe_stream(&self, key: &StreamKey) {
+    /// Ends exactly the subscription `token` names, and nothing else.
+    ///
+    /// The token is what makes this safe to call from a consumer's tail: a
+    /// terminal that has already been replaced on its id unsubscribes as its
+    /// task winds down, and by key alone that call would take the live
+    /// subscription with it. A token that names no current subscription -- the
+    /// usual case for that tail -- does nothing at all.
+    pub fn unsubscribe_stream(&self, key: &StreamKey, token: SubToken) {
+        let mut inner = self.lock();
+        let Some(subs) = inner.streams.get_mut(key) else {
+            return;
+        };
+        subs.retain(|sub| sub.token != token);
+        if subs.is_empty() {
+            inner.streams.remove(key);
+            // Nobody is left to be shown it, and the next consumer of this id
+            // is a different PTY, agent or run.
+            inner.early.remove(key);
+        }
+    }
+
+    /// Ends every subscription on `key` and discards anything parked for it,
+    /// for the callers that hold no token: closing a PTY, an agent or a run is
+    /// about the id, not about one consumer of it.
+    fn unsubscribe_key(&self, key: &StreamKey) {
         let mut inner = self.lock();
         inner.streams.remove(key);
         inner.early.remove(key);
@@ -165,24 +271,48 @@ impl EventRouter {
             .all
             .retain(|tx| tx.send((workspace_id.clone(), event.clone())).is_ok());
 
-        if let Some(key) = stream_key_of(&event) {
-            // Carried in an `Option` so the payload moves at most once: if the
-            // registered subscriber has gone away, the send hands it back and
-            // the event falls through into the early buffer.
-            let mut undelivered = Some((workspace_id, event));
-            if let Entry::Occupied(slot) = inner.streams.entry(key.clone()) {
-                let item = undelivered.take().expect("payload not yet delivered");
-                if let Err(returned) = slot.get().send(item) {
-                    slot.remove();
-                    undelivered = Some(returned.0);
+        let Some(key) = stream_key_of(workspace_id.as_ref(), &event) else {
+            inner.prune(EARLY_BUFFER_TTL);
+            return;
+        };
+        match key.fanout() {
+            Fanout::Exclusive => {
+                // Carried in an `Option` so the payload moves at most once: if
+                // the registered subscriber has gone away, the send hands it
+                // back and the event falls through into the early buffer.
+                let mut undelivered = Some((workspace_id, event));
+                if let Entry::Occupied(slot) = inner.streams.entry(key.clone()) {
+                    let item = undelivered.take().expect("payload not yet delivered");
+                    let failed = slot
+                        .get()
+                        .first()
+                        .expect("an exclusive key holds one subscriber")
+                        .tx
+                        .send(item);
+                    if let Err(returned) = failed {
+                        slot.remove();
+                        undelivered = Some(returned.0);
+                    }
+                }
+                if let Some((ws, ev)) = undelivered {
+                    let buf = inner.early.entry(key).or_default();
+                    if buf.len() >= EARLY_BUFFER_CAP {
+                        buf.remove(0);
+                    }
+                    buf.push((Instant::now(), ws, ev));
                 }
             }
-            if let Some((ws, ev)) = undelivered {
-                let buf = inner.early.entry(key).or_default();
-                if buf.len() >= EARLY_BUFFER_CAP {
-                    buf.remove(0);
+            // Every listener gets a copy, and one whose receiver has been
+            // dropped is forgotten here rather than needing an unsubscribe.
+            // Nothing is parked: see the note on the early buffer above.
+            Fanout::Shared => {
+                if let Entry::Occupied(mut slot) = inner.streams.entry(key) {
+                    slot.get_mut()
+                        .retain(|sub| sub.tx.send((workspace_id.clone(), event.clone())).is_ok());
+                    if slot.get().is_empty() {
+                        slot.remove();
+                    }
                 }
-                buf.push((Instant::now(), ws, ev));
             }
         }
         inner.prune(EARLY_BUFFER_TTL);
@@ -202,8 +332,14 @@ impl EventRouter {
 }
 
 /// The per-id stream an event belongs to, for the events that belong to one.
-fn stream_key_of(event: &Event) -> Option<StreamKey> {
+///
+/// `fs.changed` is the one that needs the envelope rather than the payload: the
+/// worktree it describes is named by the message's `workspace_id`, and one with
+/// no workspace at all is the daemon talking about itself and belongs to no
+/// editor.
+fn stream_key_of(workspace_id: Option<&WorkspaceId>, event: &Event) -> Option<StreamKey> {
     match event {
+        Event::FsChanged { .. } => workspace_id.cloned().map(StreamKey::Fs),
         Event::PtyOutput { pty_id, .. } | Event::PtyExit { pty_id, .. } => {
             Some(StreamKey::Pty(pty_id.clone()))
         }
