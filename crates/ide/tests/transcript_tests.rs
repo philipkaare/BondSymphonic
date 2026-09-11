@@ -3,10 +3,12 @@
 //! transcript view's behaviour actually rests on.
 
 use bondsymphonic_ide::model::transcript::{
-    tool_summary, Applied, LiveEvent, PendingPermission, Transcript, TranscriptItem,
+    tool_summary, Applied, LiveEvent, PendingPermission, TabAgentState, Transcript, TranscriptItem,
 };
+use bondsymphonic_ide::qobjects::transcript_model::carry_always_allow;
 use bondsymphonic_proto::{AgentMessage, AgentMessageBody, AgentState, PermissionDecision};
 use serde_json::json;
+use std::collections::BTreeSet;
 
 fn msg(seq: u64, body: AgentMessageBody) -> AgentMessage {
     AgentMessage {
@@ -276,7 +278,7 @@ fn a_permission_request_sets_pending_and_leaving_the_state_clears_it() {
     assert!(t.pending.is_some());
     t.set_state(AgentState::Idle, None);
     assert!(t.pending.is_none());
-    assert_eq!(t.state, AgentState::Idle);
+    assert_eq!(t.state, TabAgentState::Known(AgentState::Idle));
     assert!(t.state_detail.is_empty());
 
     t.set_state(AgentState::Error, Some("exit code 1".to_owned()));
@@ -459,7 +461,7 @@ fn replay_applies_history_then_live_and_de_duplicates_the_overlap() {
         ]
     );
     assert_eq!(t.items.len(), 3, "{:?}", t.items);
-    assert_eq!(t.state, AgentState::Idle);
+    assert_eq!(t.state, TabAgentState::Known(AgentState::Idle));
     assert_eq!(t.state_detail, "finished");
 }
 
@@ -634,8 +636,11 @@ fn an_unanswered_request_on_a_waiting_agent_still_asks() {
     assert_eq!(pending.summary, "ls -la");
 
     // And a daemon that is not waiting is the case it must not: the state comes
-    // back with the history, so `Idle` here means the agent really is idle.
+    // back with the history, so `Idle` here means the agent really is idle. It
+    // has to have come back with it -- a transcript that was told nothing keeps
+    // the bar up rather than guessing.
     let mut moved_on = Transcript::default();
+    moved_on.set_state_from_history(AgentState::Idle, None);
     moved_on.replay(&[request(1, "req_1")], &[]);
     assert!(moved_on.pending.is_none());
 }
@@ -678,10 +683,96 @@ fn a_buffered_state_older_than_the_history_does_not_take_the_bar_down() {
         Some("req_1"),
         "the bar must survive a replay that folds the state backwards"
     );
-    assert_eq!(t.state, AgentState::WaitingPermission);
+    assert_eq!(t.state, TabAgentState::Known(AgentState::WaitingPermission));
 
     // And the live path still clears on the way out of the wait, which is what
     // takes the bar down when the daemon moves on.
     t.set_state(AgentState::Working, None);
     assert!(t.pending.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// A history that could not be read, and answers that outlive a reconnect
+// (review fixes, IQ6/IQ7).
+// ---------------------------------------------------------------------------
+
+/// `agent.history` failing tells the tab nothing about the agent. It used to be
+/// answered with a fabricated `Idle`, and the two things that followed from
+/// that were both wrong: the tab painted a running agent as finished, and the
+/// guard at the end of the replay took down the bar over a permission request
+/// the daemon was still holding -- which `seq` de-duplication then made
+/// impossible to raise again, so the agent blocked forever.
+#[test]
+fn a_history_that_could_not_be_read_leaves_the_state_unknown_and_the_bar_up() {
+    let mut t = Transcript::default();
+    assert_eq!(
+        t.state,
+        TabAgentState::Unknown,
+        "a transcript that has heard nothing does not claim the agent is idle"
+    );
+
+    // The request reached the live buffer while the history request was in
+    // flight; the history itself never answered, so nothing sets the state.
+    t.replay(&[], &[LiveEvent::Message(request(1, "req_1"))]);
+    assert_eq!(
+        t.pending.as_ref().map(|p| p.request_id.as_str()),
+        Some("req_1"),
+        "a state nobody reported must not settle a question the daemon is holding"
+    );
+    assert_eq!(t.state, TabAgentState::Unknown);
+    assert_eq!(
+        t.state.word(),
+        "unavailable",
+        "the view is told the state is unknown, not given a made-up one"
+    );
+
+    // The live stream still decides, both ways. A state that arrives is the
+    // daemon's own word.
+    t.set_state(AgentState::WaitingPermission, None);
+    assert_eq!(t.state, TabAgentState::Known(AgentState::WaitingPermission));
+    assert_eq!(t.state.word(), "waiting_permission");
+    t.set_state(AgentState::Working, None);
+    assert!(t.pending.is_none(), "leaving the wait still clears it");
+}
+
+/// A history that answered is still the last word: an agent the daemon says is
+/// idle has nothing waiting, and the bar comes down.
+#[test]
+fn a_history_that_answered_still_settles_the_question() {
+    let mut t = Transcript::default();
+    t.set_state_from_history(AgentState::Idle, None);
+    t.replay(&[request(1, "req_1")], &[]);
+    assert!(t.pending.is_none());
+    assert_eq!(t.state, TabAgentState::Known(AgentState::Idle));
+}
+
+/// "Always allow this tool" is answered once per tab, for as long as that tab
+/// is looking at that agent. A daemon restart re-attaches the pane to the same
+/// agent with a fresh `Transcript`, and losing the answers there made the user
+/// re-approve every tool they had already approved. Pointing the tab at a
+/// different agent is a different session and starts with none.
+#[test]
+fn always_allow_survives_a_reattach_to_the_same_agent() {
+    let allowed = || BTreeSet::from(["Read".to_owned(), "Bash".to_owned()]);
+
+    assert_eq!(
+        carry_always_allow("agent_1", "agent_1", allowed()),
+        allowed(),
+        "the same agent after a reconnect keeps what the user answered"
+    );
+    assert_eq!(
+        carry_always_allow("agent_1", "agent_2", allowed()),
+        BTreeSet::new(),
+        "another agent is another session"
+    );
+    assert_eq!(
+        carry_always_allow("agent_1", "", allowed()),
+        BTreeSet::new(),
+        "detaching ends the session the answers belonged to"
+    );
+    assert_eq!(
+        carry_always_allow("", "agent_1", BTreeSet::new()),
+        BTreeSet::new(),
+        "a first attach starts with nothing"
+    );
 }

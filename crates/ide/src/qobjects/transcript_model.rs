@@ -18,12 +18,11 @@
 //! been told to always allow is answered by this model without ever reaching
 //! the permission bar.
 
-use crate::model::app_state::agent_state_word;
 use crate::model::transcript::{Applied, LiveEvent, Transcript};
 use crate::qobjects::app_controller::{on_reconnect, require_connection, runtime, Shared};
 use bondsymphonic_proto::{
-    AgentId, AgentIdParams, AgentMessage, AgentPermissionReplyParams, AgentSendParams, AgentState,
-    Event, HistoryResult, PermissionDecision, Request,
+    AgentId, AgentIdParams, AgentMessage, AgentPermissionReplyParams, AgentSendParams, Event,
+    HistoryResult, PermissionDecision, Request,
 };
 
 #[cxx_qt::bridge]
@@ -157,6 +156,7 @@ use core::pin::Pin;
 use cxx_qt::CxxQtType;
 use cxx_qt::Threading;
 use cxx_qt_lib::QString;
+use std::collections::BTreeSet;
 
 type QtHandle = cxx_qt::CxxQtThread<qobject::TranscriptModel>;
 
@@ -177,6 +177,16 @@ pub struct TranscriptModelRust {
     options_json: QString,
     /// The state of record. Every property above is derived from it.
     transcript: Transcript,
+    /// Tool names the user answered "always allow this tool" for, for the agent
+    /// this model is attached to.
+    ///
+    /// Held here rather than only in the [`Transcript`] because `attach` builds
+    /// a fresh transcript, and a reconnect re-attaches this pane to the same
+    /// agent. Keeping it there made a daemon restart quietly cancel every
+    /// pre-approval the user had given, so the next tool call asked again for
+    /// something they had already said "always" to. [`carry_always_allow`]
+    /// decides what survives an attach.
+    always_allow: BTreeSet<String>,
     /// Replay plus the live loop, aborted on re-attach and on Drop.
     task: Option<tokio::task::JoinHandle<()>>,
     /// Waits for the connection generation to move and then re-attaches this
@@ -195,7 +205,7 @@ impl Default for TranscriptModelRust {
         Self {
             agent_id: QString::from(""),
             workspace_id: QString::from(""),
-            state: QString::from(agent_state_word(transcript.state)),
+            state: QString::from(transcript.state.word()),
             state_detail: QString::from(""),
             cost_usd: 0.0,
             turns: 0,
@@ -203,6 +213,7 @@ impl Default for TranscriptModelRust {
             busy: false,
             options_json: QString::from(""),
             transcript,
+            always_allow: BTreeSet::new(),
             task: None,
             reconnect_task: None,
             unsubscribe: None,
@@ -249,13 +260,18 @@ async fn replay_and_follow(
         .request::<HistoryResult>(Request::AgentHistory(params))
         .await
     {
-        Ok(res) => res,
+        Ok(res) => Some(res),
         Err(e) => {
             // The live stream is still worth following: a history that could
             // not be read costs the tab its scrollback, not its agent. Only
             // the error is raised here; the replay closure below is the one
             // place that ends `busy` and rebuilds the view, so a live event
             // that arrived meanwhile cannot be painted before that rebuild.
+            //
+            // `None`, not an empty history claiming the agent is idle: the
+            // state is the daemon's to report, and inventing one painted a
+            // working agent as finished and took the permission bar down over
+            // a request the daemon was still holding. See `TabAgentState`.
             let message = format!("agent.history failed: {e}");
             tracing::warn!("{message}");
             let _ = qt.queue(move |q| {
@@ -264,11 +280,7 @@ async fn replay_and_follow(
                 }
                 q.fail(&message);
             });
-            HistoryResult {
-                messages: Vec::new(),
-                state: AgentState::Idle,
-                detail: None,
-            }
+            None
         }
     };
 
@@ -288,13 +300,25 @@ async fn replay_and_follow(
             let mut rust = q.as_mut().rust_mut();
             // The daemon's state first, then the fold. State changes are events
             // rather than transcript entries, so every one of them predates
-            // this attachment; without this the fold would end on `Idle` and a
-            // running agent would paint as finished, an exited one would say
-            // nothing, and a genuinely open permission request would have its
-            // bar taken down by the guard at the end of `replay`.
-            rust.transcript
-                .set_state_from_history(history.state, history.detail.clone());
-            rust.transcript.replay(&history.messages, &buffered);
+            // this attachment; without this the fold would end on the
+            // transcript's default and a running agent would paint as finished,
+            // an exited one would say nothing, and a genuinely open permission
+            // request would have its bar taken down by the guard at the end of
+            // `replay`.
+            //
+            // A history that failed sets no state at all, which leaves it
+            // `Unknown` and that guard satisfied by nothing: the bar stays up
+            // over a request the live buffer carried, and the live stream is
+            // what moves the state from here.
+            let messages: &[AgentMessage] = match &history {
+                Some(history) => {
+                    rust.transcript
+                        .set_state_from_history(history.state, history.detail.clone());
+                    &history.messages
+                }
+                None => &[],
+            };
+            rust.transcript.replay(messages, &buffered);
         }
         // Once, at the end: replaying a long history through the per-message
         // path would emit four property notifications per item.
@@ -327,10 +351,19 @@ async fn replay_and_follow(
 impl qobject::TranscriptModel {
     pub fn attach(mut self: Pin<&mut Self>, workspace_id: QString, agent_id: QString) {
         self.as_mut().detach();
+        // The agent this pane was on, before the new id is published: a
+        // reconnect re-attaches to the same one and the user's "always allow"
+        // answers go with it.
+        let previous = self.as_ref().agent_id().to_string();
+        let agent = agent_id.to_string();
         let generation = {
             let mut rust = self.as_mut().rust_mut();
             rust.generation += 1;
+            let carried =
+                carry_always_allow(&previous, &agent, std::mem::take(&mut rust.always_allow));
+            rust.always_allow = carried.clone();
             rust.transcript = Transcript::default();
+            rust.transcript.always_allow = carried;
             rust.generation
         };
         self.as_mut().set_workspace_id(workspace_id);
@@ -339,7 +372,6 @@ impl qobject::TranscriptModel {
         self.as_mut().set_busy(true);
         self.as_mut().publish_totals();
 
-        let agent = agent_id.to_string();
         if agent.is_empty() {
             // Detaching: an empty transcript, and no request to make. No
             // reconnect watch either -- there is nothing to come back to.
@@ -437,11 +469,12 @@ impl qobject::TranscriptModel {
         // "always deny" in the permission bar.
         if allow && always_allow {
             if let Some(name) = tool {
-                self.as_mut()
-                    .rust_mut()
-                    .transcript
-                    .always_allow
-                    .insert(name);
+                // Both copies, in one place so they cannot drift: the
+                // transcript's is what `take_auto_allowed` reads, and the
+                // model's is what survives the next attach.
+                let mut rust = self.as_mut().rust_mut();
+                rust.always_allow.insert(name.clone());
+                rust.transcript.always_allow.insert(name);
             }
         }
         if answers_pending {
@@ -550,7 +583,7 @@ impl qobject::TranscriptModel {
             let this = self.as_ref();
             let t = &this.rust().transcript;
             (
-                agent_state_word(t.state),
+                t.state.word(),
                 t.state_detail.clone(),
                 t.cost_usd,
                 i32::try_from(t.turns).unwrap_or(i32::MAX),
@@ -745,6 +778,30 @@ pub fn restart_options(options_json: &str, session: Option<&str>) -> String {
         }
     }
     options.to_string()
+}
+
+/// The "always allow this tool" answers that survive an `attach`.
+///
+/// `previous` is the agent the pane was on and `next` the one it is being
+/// pointed at. The same agent is a reconnect -- the daemon came back and the
+/// pane re-attached itself -- and the answers are the user's for that
+/// conversation, so they carry over; the transcript they were held in does not,
+/// because `attach` builds a fresh one. Without this a daemon restart silently
+/// cancelled every pre-approval and the next tool call asked again.
+///
+/// Anything else starts with none. A different agent is a different session, and
+/// detaching (`next` empty) ends the one the answers belonged to -- an
+/// allowlist must never widen by accident, so the doubtful case is the empty
+/// one.
+pub fn carry_always_allow(
+    previous: &str,
+    next: &str,
+    allowed: BTreeSet<String>,
+) -> BTreeSet<String> {
+    if next.is_empty() || previous != next {
+        return BTreeSet::new();
+    }
+    allowed
 }
 
 /// This agent's half of one routed event, or `None` for anything else. The

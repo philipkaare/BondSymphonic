@@ -21,6 +21,7 @@
 //!
 //! This module must never import Qt types.
 
+use crate::model::app_state::agent_state_word;
 use bondsymphonic_proto::{AgentMessage, AgentMessageBody, AgentState, PermissionDecision};
 use serde::Serialize;
 use serde_json::Value;
@@ -88,6 +89,54 @@ pub enum TranscriptItem {
     },
 }
 
+/// The state the tab shows the agent in.
+///
+/// The daemon's [`AgentState`] plus the one thing it cannot say: that the IDE
+/// has not been told. The state comes back with `agent.history`, and a history
+/// request that failed -- a connection that dropped mid-request, an agent the
+/// daemon cannot read the transcript of -- leaves the tab knowing nothing about
+/// the agent.
+///
+/// Answering that with a fabricated `Idle` was wrong twice over. It painted a
+/// running agent as finished, and it satisfied the guard at the end of
+/// [`Transcript::replay`], which then took the permission bar down over a
+/// request the daemon was still holding. `seq` de-duplication means that
+/// request can never set `pending` again, so the tab said it was waiting, showed
+/// no bar, and the agent blocked forever.
+///
+/// Not a variant of the wire enum: the daemon always knows what state its agent
+/// is in, and this is the IDE's own ignorance rather than something the protocol
+/// can carry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TabAgentState {
+    /// Nothing has been heard yet, or `agent.history` failed.
+    #[default]
+    Unknown,
+    Known(AgentState),
+}
+
+impl TabAgentState {
+    /// The snake_case word the `state` property carries into C++.
+    ///
+    /// `Unknown` is a word of its own rather than an empty string: the view
+    /// turns Stop off for an empty state, and an agent whose history could not
+    /// be read is exactly one the user may still need to stop. The view has
+    /// nothing else to say about a word it does not recognise, which is the
+    /// right answer here.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Unknown => "unavailable",
+            Self::Known(state) => agent_state_word(state),
+        }
+    }
+
+    /// Whether the daemon has told the tab the agent is in `state`. `Unknown` is
+    /// never any particular state, which is the whole point of it.
+    pub fn is(self, state: AgentState) -> bool {
+        self == Self::Known(state)
+    }
+}
+
 /// A tool call waiting for the user's answer. Everything the permission bar
 /// shows is here, so it never parses a raw message itself.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -129,7 +178,7 @@ pub struct Transcript {
     /// only ever move through [`Transcript::expand_earlier`].
     earlier: Vec<TranscriptItem>,
     earlier_expanded: bool,
-    pub state: AgentState,
+    pub state: TabAgentState,
     /// The daemon's explanation of the state, or empty.
     pub state_detail: String,
     pub cost_usd: f64,
@@ -151,7 +200,7 @@ impl Default for Transcript {
             items: Vec::new(),
             earlier: Vec::new(),
             earlier_expanded: false,
-            state: AgentState::Idle,
+            state: TabAgentState::Unknown,
             state_detail: String::new(),
             cost_usd: 0.0,
             turns: 0,
@@ -335,7 +384,7 @@ impl Transcript {
     /// waiting, with no bar, and an agent that blocks forever.
     pub fn set_state(&mut self, state: AgentState, detail: Option<String>) {
         let leaving_wait =
-            self.state == AgentState::WaitingPermission && state != AgentState::WaitingPermission;
+            self.state.is(AgentState::WaitingPermission) && state != AgentState::WaitingPermission;
         if leaving_wait {
             self.pending = None;
         }
@@ -357,7 +406,7 @@ impl Transcript {
     }
 
     fn record_state(&mut self, state: AgentState, detail: Option<String>) {
-        self.state = state;
+        self.state = TabAgentState::Known(state);
         self.state_detail = detail.unwrap_or_default();
     }
 
@@ -398,7 +447,16 @@ impl Transcript {
         // back by `agent.history` and applied before the fold, so `Idle` here
         // means the agent really is idle rather than that nothing has been
         // heard yet.
-        if self.state != AgentState::WaitingPermission {
+        //
+        // `Unknown` is that second case and settles nothing. A history that
+        // failed says nothing about the agent, and taking the bar down on it
+        // would strand a request the daemon is still holding -- see
+        // [`TabAgentState`].
+        let moved_on = matches!(
+            self.state,
+            TabAgentState::Known(state) if state != AgentState::WaitingPermission
+        );
+        if moved_on {
             self.pending = None;
         }
         applied

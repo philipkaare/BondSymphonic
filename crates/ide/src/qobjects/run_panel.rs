@@ -12,7 +12,7 @@
 //! moves JSON and signals across the boundary and owns the subscriptions.
 
 use crate::client::router::EventRx;
-use crate::model::run_config::{denial_owner, run_state_word, RunView, WorkspaceRuns};
+use crate::model::run_config::{denial_owner, may_queue_denial, WorkspaceRuns};
 use crate::qobjects::app_controller::{
     connection_generation, on_reconnect, require_connection, runtime, state_store, Shared,
 };
@@ -234,6 +234,41 @@ pub fn warning_status(warnings: &[String]) -> String {
     }
 }
 
+/// One finished round of detection, as the panel applies it.
+#[derive(Debug, Default, PartialEq)]
+pub struct Detection {
+    pub configs: Vec<RunConfig>,
+    pub warnings: Vec<String>,
+    pub runs: Vec<RunInfo>,
+}
+
+/// What a finished detection hands the panel, or `None` when it must change
+/// nothing.
+///
+/// The two halves are not equals. `repo.detect_run_configs` failing leaves a
+/// worktree with nothing runnable in it, which is an ordinary state of the
+/// panel: an empty combo is a true thing to paint, and the next refresh fills it
+/// in.
+///
+/// `run.list` failing says nothing at all about what is running, and answering
+/// that with an empty list is what made the panel destroy its own state: every
+/// run off the screen, their logs dropped with them, their subscriptions ended
+/// by `apply_detection`'s stale-run sweep -- for a workspace whose dev server
+/// was still serving and still printing. A connection that drops mid-request is
+/// exactly when that happens, and the runs come back on the next refresh only if
+/// they were never forgotten.
+pub fn detection_to_apply(
+    configs: Vec<RunConfig>,
+    warnings: Vec<String>,
+    runs: Option<Vec<RunInfo>>,
+) -> Option<Detection> {
+    Some(Detection {
+        configs,
+        warnings,
+        runs: runs?,
+    })
+}
+
 /// Whether a run has to be subscribed to now.
 ///
 /// `existing` is the connection generation of the subscription the panel
@@ -306,10 +341,9 @@ fn report(qt: &QtHandle, message: String) {
 /// Detects the configurations of `worktree` and lists `workspace`'s runs, then
 /// applies both in one closure so the combo and the run list never disagree.
 ///
-/// A failure of either half is reported and answered with an empty list rather
-/// than abandoning the other: a worktree with no configurations is a normal
-/// state of the panel, and a run list that could not be read must not leave a
-/// stale one behind claiming another workspace's runs.
+/// Detection failing is reported and answered with an empty list; `run.list`
+/// failing is reported and applies nothing at all. [`detection_to_apply`] says
+/// why the two are not the same kind of failure.
 async fn detect_and_list(shared: Shared, qt: QtHandle, workspace: String, worktree: String) {
     let (configs, warnings) = if worktree.is_empty() {
         (Vec::new(), Vec::new())
@@ -337,13 +371,20 @@ async fn detect_and_list(shared: Shared, qt: QtHandle, workspace: String, worktr
         .request::<RunListResult>(Request::RunList(params))
         .await
     {
-        Ok(res) => res.runs,
+        Ok(res) => Some(res.runs),
         Err(e) => {
             report(&qt, format!("run.list failed: {e}"));
-            Vec::new()
+            None
         }
     };
-    let _ = qt.queue(move |q| q.apply_detection(workspace, configs, warnings, runs));
+    let Some(detection) = detection_to_apply(configs, warnings, runs) else {
+        // The panel keeps everything it had, subscriptions included, and the
+        // error is already on its way to the view. `end_request` still has to
+        // run, or the spinner never stops.
+        let _ = qt.queue(|q| q.end_request());
+        return;
+    };
+    let _ = qt.queue(move |q| q.apply_detection(workspace, detection));
 }
 
 /// Follows one run until it finishes or the panel lets go of it.
@@ -623,15 +664,17 @@ impl qobject::RunPanelModel {
     pub fn note_denied(mut self: Pin<&mut Self>, workspace_id: QString, host: QString) {
         let workspace = workspace_id.to_string();
         let host = host.to_string();
-        if workspace.is_empty() || host.is_empty() {
+        let known = self.as_ref().rust().by_workspace.contains_key(&workspace);
+        if !may_queue_denial(known, &workspace, &host) {
+            tracing::debug!("noteDenied: nothing to queue {host:?} on for {workspace:?}");
             return;
         }
         let queued = {
             let mut rust = self.as_mut().rust_mut();
-            rust.by_workspace
-                .entry(workspace.clone())
-                .or_default()
-                .note_denied(&host)
+            match rust.by_workspace.get_mut(&workspace) {
+                Some(entry) => entry.note_denied(&host),
+                None => false,
+            }
         };
         let showing = self.as_ref().rust().workspace_id.to_string() == workspace;
         // Only a host that reached the head of the queue is offered now: the
@@ -752,14 +795,13 @@ impl qobject::RunPanelModel {
     /// Applied to the workspace it was asked about even if the user has since
     /// switched tabs -- it is that workspace's own answer -- but published only
     /// while that workspace is the one on screen.
-    fn apply_detection(
-        mut self: Pin<&mut Self>,
-        workspace: String,
-        configs: Vec<RunConfig>,
-        warnings: Vec<String>,
-        runs: Vec<RunInfo>,
-    ) {
+    fn apply_detection(mut self: Pin<&mut Self>, workspace: String, detection: Detection) {
         self.as_mut().end_request();
+        let Detection {
+            configs,
+            warnings,
+            runs,
+        } = detection;
         let ids: Vec<String> = runs.iter().map(|r| r.run_id.to_string()).collect();
         {
             let mut rust = self.as_mut().rust_mut();
@@ -807,18 +849,7 @@ impl qobject::RunPanelModel {
             let Some(entry) = rust.by_workspace.get_mut(&workspace) else {
                 return;
             };
-            entry.runs.retain(|r| r.run_id != run_id);
-            entry.runs.push(RunView {
-                run_id: run_id.clone(),
-                config_name: config,
-                // The daemon publishes `starting` as well; recording it here
-                // means Stop is offered from the moment the call answers rather
-                // than from whenever that event arrives.
-                state: run_state_word(RunState::Starting).to_owned(),
-                host_port: res.host_port,
-                url: res.url,
-                detail: String::new(),
-            });
+            entry.record_started(run_id.clone(), config, res.host_port, res.url);
         }
         // Subscribing after the reply is what the router's early buffer is
         // for: the banner a dev server printed in between is replayed.

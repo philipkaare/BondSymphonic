@@ -9,9 +9,9 @@
 //! settled without a Qt event loop.
 
 use bondsymphonic_ide::model::run_config::{
-    denial_owner, parse_run_state, run_state_word, RunLog, RunView, WorkspaceRuns,
+    denial_owner, may_queue_denial, parse_run_state, run_state_word, RunLog, RunView, WorkspaceRuns,
 };
-use bondsymphonic_ide::qobjects::run_panel::needs_resubscribe;
+use bondsymphonic_ide::qobjects::run_panel::{detection_to_apply, needs_resubscribe};
 use bondsymphonic_proto::{RunConfig, RunConfigSource, RunId, RunInfo, RunState};
 use std::collections::BTreeMap;
 
@@ -202,7 +202,11 @@ fn apply_list_builds_views_and_apply_state_moves_them() {
     assert_eq!(runs.runs[0].detail, "exit code 2");
 
     // A relist drops the runs the daemon no longer has, and their logs with
-    // them.
+    // them. A run the panel still has as alive is one the daemon really has
+    // lost -- a restart loses every run -- so nothing is carried over here. The
+    // last *finished* run of a configuration is the one exception, and
+    // `a_finished_run_survives_a_relist_that_omits_it` is where it lives.
+    runs.apply_state("run_1", RunState::Ready, None, None);
     runs.apply_output("run_1", "hello");
     runs.apply_list(vec![]);
     assert!(runs.runs.is_empty());
@@ -475,4 +479,187 @@ fn detection_warnings_are_held_per_workspace_and_replaced_on_the_next_detection(
     // The next detection is the whole answer, so a fixed file clears the line.
     runs.set_warnings(Vec::new());
     assert!(runs.warnings.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Runs that finished, and a list that could not be read (review fixes, IQ4/IQ5).
+// ---------------------------------------------------------------------------
+
+/// The daemon's `run.list` answers with the runs it still holds, and a run that
+/// exited is not one of them. Detection runs again on every tab switch, so
+/// taking that list as the whole truth made the run the user had just stopped,
+/// and the output that says why it failed, disappear the moment they looked at
+/// another tab and came back.
+#[test]
+fn a_finished_run_survives_a_relist_that_omits_it() {
+    let mut runs = WorkspaceRuns::default();
+    runs.set_configs(vec![config("dev", 5173), config("api", 8080)]);
+    runs.apply_list(vec![
+        info("run_dev", "dev", RunState::Starting, 41873),
+        info("run_api", "api", RunState::Ready, 41874),
+    ]);
+    runs.apply_output("run_dev", "vite exiting");
+    assert!(runs.apply_state("run_dev", RunState::Failed, None, Some("exit code 1")));
+
+    // The tab switch: `run.list` comes back without the failed run.
+    runs.apply_list(vec![info("run_api", "api", RunState::Ready, 41874)]);
+    assert_eq!(
+        runs.runs
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["run_dev", "run_api"],
+        "the finished run of a configuration the list has nothing for is kept"
+    );
+    let failed = &runs.runs[0];
+    assert_eq!(failed.state, "failed");
+    assert_eq!(
+        failed.detail, "exit code 1",
+        "why it failed is the reason to keep it"
+    );
+    assert_eq!(
+        runs.log_text("run_dev"),
+        "vite exiting",
+        "its output is kept with it"
+    );
+    assert!(runs.runs_json().contains("run_dev"), "{}", runs.runs_json());
+
+    // It is history, not something to stop or open.
+    runs.select("dev");
+    assert_eq!(runs.active_run(), None);
+
+    // A relist that does carry a run for the configuration replaces it: the
+    // daemon's own answer for a configuration always wins over what was kept.
+    runs.apply_list(vec![
+        info("run_dev2", "dev", RunState::Ready, 41875),
+        info("run_api", "api", RunState::Ready, 41874),
+    ]);
+    assert_eq!(
+        runs.runs
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["run_dev2", "run_api"]
+    );
+    assert!(
+        runs.logs.is_empty() || !runs.logs.contains_key("run_dev"),
+        "the forgotten run's log goes with it"
+    );
+}
+
+/// Only the newest finished run of a configuration is worth a row: a dev server
+/// started and stopped twenty times in an afternoon must not leave twenty rows
+/// behind, and the one the user wants is the last one.
+#[test]
+fn only_the_last_finished_run_of_a_config_is_kept() {
+    let mut runs = WorkspaceRuns::default();
+    runs.set_configs(vec![config("dev", 5173)]);
+    for n in 1..=3 {
+        let id = format!("run_{n}");
+        runs.apply_list(vec![info(&id, "dev", RunState::Ready, 41873)]);
+        runs.apply_state(&id, RunState::Stopped, None, None);
+        runs.apply_list(vec![]);
+        assert_eq!(
+            runs.runs.len(),
+            1,
+            "one row per configuration, not one per run: {:?}",
+            runs.runs
+        );
+    }
+    assert_eq!(runs.runs[0].run_id, "run_3");
+}
+
+/// Starting the configuration again is what makes the finished run no longer
+/// worth a row. The panel records the new run the moment `run.start` answers,
+/// before the daemon's next list, so this path has to forget it too.
+#[test]
+fn starting_a_config_again_replaces_the_run_it_kept() {
+    let mut runs = WorkspaceRuns::default();
+    runs.set_configs(vec![config("dev", 5173), config("api", 8080)]);
+    runs.apply_list(vec![info("run_api", "api", RunState::Ready, 41874)]);
+    runs.apply_list(vec![info("run_1", "dev", RunState::Ready, 41873)]);
+    runs.apply_output("run_1", "stopping");
+    runs.apply_state("run_1", RunState::Stopped, None, None);
+
+    runs.record_started(
+        "run_2".to_owned(),
+        "dev".to_owned(),
+        41875,
+        "http://localhost:41875".to_owned(),
+    );
+    assert_eq!(
+        runs.runs
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["run_2"],
+        "the finished run of the same configuration goes, the new one stays"
+    );
+    assert_eq!(runs.runs[0].state, "starting");
+    assert_eq!(runs.runs[0].host_port, 41875);
+    assert_eq!(runs.log_text("run_1"), "", "its log goes with it");
+
+    // Another configuration's run is untouched by a start, finished or not.
+    runs.apply_list(vec![info("run_2", "dev", RunState::Ready, 41875)]);
+    runs.record_started("run_3".to_owned(), "api".to_owned(), 41876, String::new());
+    assert_eq!(
+        runs.runs
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["run_2", "run_3"]
+    );
+}
+
+/// `run.list` failing says nothing about what is running. Answering it with an
+/// empty list took every run off the screen, dropped the logs that explain them
+/// and ended their subscriptions -- for a workspace whose dev server was still
+/// serving -- and a connection that drops mid-request is exactly when it
+/// happened. Detection failing is different: a worktree with nothing runnable
+/// in it is an ordinary state of the panel.
+#[test]
+fn a_run_list_that_failed_leaves_the_panel_alone() {
+    assert_eq!(
+        detection_to_apply(vec![config("dev", 5173)], vec!["bad toml".to_owned()], None),
+        None,
+        "a failed run.list applies nothing at all, not even the configs"
+    );
+
+    let detected = detection_to_apply(
+        Vec::new(),
+        Vec::new(),
+        Some(vec![info("run_1", "dev", RunState::Ready, 41873)]),
+    )
+    .expect("a run list that answered is applied");
+    assert!(
+        detected.configs.is_empty(),
+        "detection failing is an empty combo, which is the truth about that worktree"
+    );
+    assert_eq!(detected.runs.len(), 1);
+
+    let both = detection_to_apply(
+        vec![config("dev", 5173)],
+        vec!["bad toml".to_owned()],
+        Some(Vec::new()),
+    )
+    .expect("both halves answered");
+    assert_eq!(both.configs.len(), 1);
+    assert_eq!(both.warnings, vec!["bad toml".to_owned()]);
+    assert!(both.runs.is_empty(), "an empty list really is empty");
+}
+
+/// A denial arrives from the proxy on its own event, and a workspace being
+/// destroyed does not stop the fetch that was already in flight. Queuing it
+/// under a workspace the panel has forgotten put the entry back: a workspace
+/// with a toast nothing can answer, runs nobody will list, and a `setWorkspace`
+/// that would find state waiting for a workspace that no longer exists.
+#[test]
+fn a_denial_for_a_workspace_the_panel_forgot_is_dropped() {
+    assert!(may_queue_denial(true, "ws_1", "example.com"));
+    assert!(
+        !may_queue_denial(false, "ws_1", "example.com"),
+        "a workspace the panel holds nothing for is one it has forgotten"
+    );
+    assert!(!may_queue_denial(true, "", "example.com"));
+    assert!(!may_queue_denial(true, "ws_1", ""));
 }

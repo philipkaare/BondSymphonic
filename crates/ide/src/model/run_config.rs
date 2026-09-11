@@ -134,6 +134,22 @@ pub fn denial_owner(
     fallback.map(str::to_owned)
 }
 
+/// Whether a blocked host may be queued for `workspace`.
+///
+/// `known` is whether the panel is holding state for that workspace at all.
+/// Only a workspace it knows: `forget_workspace` drops that state when the
+/// workspace is destroyed, and the proxy's report of a fetch the run made on its
+/// way down arrives behind it. Creating the entry to hold the denial brought the
+/// workspace back -- a toast raised for a workspace that no longer exists, which
+/// `allowHost` would then answer by editing the allowlist of a workspace the
+/// daemon has already thrown away.
+///
+/// An empty workspace or host is refused for the same reason `noteDenied` is
+/// worth guarding at all: the toast has to name something a user can answer for.
+pub fn may_queue_denial(known: bool, workspace: &str, host: &str) -> bool {
+    known && !workspace.is_empty() && !host.is_empty()
+}
+
 /// Everything the Run panel holds for one workspace.
 #[derive(Debug, Default)]
 pub struct WorkspaceRuns {
@@ -230,8 +246,18 @@ impl WorkspaceRuns {
     /// Replaces the run list from `run.list`. Detail already known for a run
     /// the daemon still reports is kept -- `RunInfo` does not carry it -- and
     /// the logs of runs that are gone are dropped with them.
+    ///
+    /// One run the daemon did *not* report survives: the last finished run of a
+    /// configuration the list has nothing for. `run.list` answers with the runs
+    /// the daemon still holds, and a run that exited is not one of them, while
+    /// detection runs again on every tab switch -- so taking the list as the
+    /// whole truth made the run the user had just stopped, and the output saying
+    /// why it failed, vanish the moment they looked at another tab and came
+    /// back. It is kept until a newer run for that configuration appears, in the
+    /// list or from [`WorkspaceRuns::record_started`], which bounds this at one
+    /// extra row per configuration rather than one per run ever started.
     pub fn apply_list(&mut self, runs: Vec<RunInfo>) {
-        self.runs = runs
+        let listed: Vec<RunView> = runs
             .into_iter()
             .map(|info| {
                 let id = info.run_id.to_string();
@@ -251,6 +277,57 @@ impl WorkspaceRuns {
                 }
             })
             .collect();
+        // A run still alive that the daemon has stopped reporting is gone for
+        // real -- a daemon restart loses every run -- so only finished ones are
+        // carried over, and only where the daemon's answer says nothing about
+        // that configuration at all.
+        let mut kept: Vec<RunView> = Vec::new();
+        for view in std::mem::take(&mut self.runs) {
+            let superseded =
+                view.is_live() || listed.iter().any(|r| r.config_name == view.config_name);
+            if superseded {
+                continue;
+            }
+            kept.retain(|r| r.config_name != view.config_name);
+            kept.push(view);
+        }
+        kept.extend(listed);
+        self.runs = kept;
+        self.prune_logs();
+    }
+
+    /// Records the run `run.start` has just created, as `starting`.
+    ///
+    /// Any finished run of the same configuration goes: it was kept by
+    /// [`apply_list`](WorkspaceRuns::apply_list) only until the configuration
+    /// was started again, and the row the panel shows for a configuration is
+    /// about the run that is happening now.
+    pub fn record_started(
+        &mut self,
+        run_id: String,
+        config_name: String,
+        host_port: u16,
+        url: String,
+    ) {
+        self.runs
+            .retain(|r| r.run_id != run_id && (r.is_live() || r.config_name != config_name));
+        self.runs.push(RunView {
+            run_id,
+            config_name,
+            // The daemon publishes `starting` as well; recording it here means
+            // Stop is offered from the moment the call answers rather than from
+            // whenever that event arrives.
+            state: run_state_word(RunState::Starting).to_owned(),
+            host_port,
+            url,
+            detail: String::new(),
+        });
+        self.prune_logs();
+    }
+
+    /// Drops the output of every run the list no longer holds, so a long-lived
+    /// workspace cannot accumulate the logs of runs that are gone.
+    fn prune_logs(&mut self) {
         self.logs
             .retain(|id, _| self.runs.iter().any(|r| &r.run_id == id));
     }
