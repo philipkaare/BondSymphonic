@@ -29,8 +29,9 @@ class NewAgentDialog : public QDialog {
     Q_OBJECT
 public:
     /// `initialPath` is the repository the dialog opens on, as the user would
-    /// type it. The window supplies the most recent one and has already asked
-    /// the daemon about it; see `applyInspection`.
+    /// type it; the window supplies the most recent one. The dialog inspects it
+    /// itself, from the constructor, so the branch combo fills in behind a
+    /// dialog that is already on screen.
     NewAgentDialog(AppController* controller, GroupModel* model, const QString& initialPath,
                    QWidget* parent = nullptr);
 
@@ -39,14 +40,6 @@ public:
     /// there is a dialog -- it inspects that path first, so the branch list is
     /// filled the moment the dialog appears rather than half a minute later.
     static QString initialRepoPath(AppController* controller);
-
-    /// Hands the dialog the `repo.inspect` answer the window already has for
-    /// its initial path. `infoJson` is a `RepoInfo`, or `error` says why there
-    /// is none; exactly one of the two is non-empty.
-    ///
-    /// Replayed rather than waited for: the answer arrived before this dialog
-    /// existed, so no `repoInspected` will reach it.
-    void applyInspection(const QString& path, const QString& infoJson, const QString& error);
 
     /// Preselects a group, adding it to the list if it is not there yet.
     void setGroup(const QString& name);

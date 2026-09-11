@@ -215,27 +215,16 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     updateNameHint();
     if (!initialPath.isEmpty()) {
         m_repoPath->setText(initialPath);
-        // The window has already asked about this path and will replay the
-        // answer through `applyInspection`; the inspection is marked as in
-        // flight so Create stays dead until it does. The run configurations are
-        // not pre-fetched: they are quick, and they do not gate Create.
-        m_pendingPath = repoPath();
-        m_inspectPending = true;
-        m_controller->detectRunConfigs(m_pendingPath);
+        // Asked for here, by the dialog that shows the answer. The window used
+        // to inspect the path first and open this dialog on the reply, which
+        // meant a repository on a slow mount left the user in front of a window
+        // that had gone quiet, with a wait cursor and a status line borrowed
+        // from whatever it said last. The dialog appears at once instead, says
+        // what it is doing in its own status line, and has a Cancel button --
+        // and Create stays dead until the branches are in.
+        inspectRepo();
     }
     updateOkEnabled();
-}
-
-void NewAgentDialog::applyInspection(const QString& path, const QString& infoJson,
-                                     const QString& error) {
-    if (path != m_pendingPath) {
-        return;
-    }
-    if (!error.isEmpty()) {
-        onInspectFailed(QStringLiteral("repo.inspect"), error);
-        return;
-    }
-    onRepoInspected(path, infoJson);
 }
 
 void NewAgentDialog::setGroup(const QString& name) {
@@ -356,7 +345,7 @@ void NewAgentDialog::inspectRepo() {
     m_repoState->clear();
     m_repoState->hide();
     m_initIfMissing = false;
-    m_status->setText(QString("Inspecting %1…").arg(path));
+    m_status->setText(QStringLiteral("Reading repository %1…").arg(path));
     updateOkEnabled();
     m_controller->inspectRepo(path);
     // Alongside, not after: the two answers are independent and the run
