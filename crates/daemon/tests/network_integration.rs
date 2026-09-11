@@ -508,6 +508,100 @@ async fn each_plain_http_request_on_a_kept_alive_connection_goes_to_its_own_host
     cancel.cancel();
 }
 
+/// A listener that accepts a connection and then drops it without a byte.
+///
+/// The one failure the close-delimited design creates: the proxy relays a
+/// response to end of stream, so an upstream whose end of stream comes first
+/// would leave the client waiting on a connection the proxy thinks is idle.
+async fn silent_server() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = listener.accept().await {
+            drop(s);
+        }
+    });
+    port
+}
+
+/// An upstream that takes the connection and then says nothing is answered,
+/// not waited on.
+#[tokio::test]
+async fn an_upstream_that_answers_nothing_is_a_502_and_not_a_hang() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "silent").await;
+    let sock = daemon.dirs.run(&ws.id).join("proxy.sock");
+    let upstream = silent_server().await;
+    set_allowlist(&mut c, &ws.id, &["127.0.0.1"]).await.unwrap();
+
+    let mut s = UnixStream::connect(&sock).await.unwrap();
+    s.write_all(
+        format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: 127.0.0.1:{upstream}\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let answer = read_all(&mut s).await;
+    assert!(answer.starts_with("HTTP/1.1 502 Bad Gateway"), "{answer:?}");
+
+    c.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+        workspace_id: ws.id.clone(),
+        force: true,
+    }))
+    .await
+    .unwrap();
+    cancel.cancel();
+}
+
+/// A connection is a sequence of trust decisions, and the allowlist it is
+/// decided against is the one live at the time.
+///
+/// A host taken off the list while a plain-HTTP connection is open must not
+/// keep being reachable on it until the client happens to hang up: the agent
+/// holding that connection is the one the user just narrowed the list against.
+#[tokio::test]
+async fn an_allowlist_narrowed_mid_connection_binds_the_next_request_on_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "relist").await;
+    let sock = daemon.dirs.run(&ws.id).join("proxy.sock");
+    let (upstream, seen) = recording_server().await;
+    set_allowlist(&mut c, &ws.id, &["127.0.0.1"]).await.unwrap();
+
+    let mut s = UnixStream::connect(&sock).await.unwrap();
+    let request =
+        format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: 127.0.0.1:{upstream}\r\n\r\n");
+    s.write_all(request.as_bytes()).await.unwrap();
+    let (head, _) = read_response(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+
+    // The user takes the host off the list while the connection is still open.
+    set_allowlist(&mut c, &ws.id, &["example.test"])
+        .await
+        .unwrap();
+    s.write_all(request.as_bytes()).await.unwrap();
+    let refused = read_all(&mut s).await;
+    assert!(refused.starts_with("HTTP/1.1 403 Forbidden"), "{refused:?}");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the second request reached the host after it was taken off the list"
+    );
+
+    c.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+        workspace_id: ws.id.clone(),
+        force: true,
+    }))
+    .await
+    .unwrap();
+    cancel.cancel();
+}
+
 /// A server that answers the moment the request head arrives - before the body
 /// it was promised - and then holds its connection open.
 ///
@@ -602,8 +696,10 @@ async fn a_refused_body_does_not_splice_a_400_onto_a_response_already_under_way(
 /// an *idle* deadline, measured from the last byte that moved in either
 /// direction rather than from the start of the request.
 ///
-/// Time is paused once the stall is set up, so the runtime jumps to the
-/// daemon's own deadline instead of the test waiting it out.
+/// Time is paused once the stall is set up and then wound forward by hand, so
+/// the test exercises the daemon's real deadline in milliseconds rather than
+/// waiting it out - and does so the same way whether or not the machine is
+/// busy, which leaving it to the runtime's own auto-advance does not.
 #[tokio::test]
 async fn a_request_body_that_stalls_does_not_hold_an_upstream_for_ever() {
     let dir = tempfile::tempdir().unwrap();
@@ -626,15 +722,21 @@ async fn a_request_body_that_stalls_does_not_hold_an_upstream_for_ever() {
     .unwrap();
     let head = read_head(&mut s).await;
     assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
-    // Not one byte of the million follows.
+    // Not one byte of the million follows. The daemon's idle deadline is a
+    // minute; four of them is past two consecutive idle intervals however the
+    // rounds line up, and still nothing the client has to sit through.
     tokio::time::pause();
-    let ended = tokio::time::timeout(std::time::Duration::from_secs(3600), read_all(&mut s)).await;
+    for _ in 0..4 {
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+    }
+    tokio::time::resume();
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(30), read_all(&mut s)).await;
     assert!(
         ended.is_ok(),
-        "the stalled request still held its client and its upstream an hour later"
+        "the stalled request still held its client and its upstream four minutes later"
     );
 
-    tokio::time::resume();
     c.call(Request::WorkspaceDestroy(WorkspaceDestroyParams {
         workspace_id: ws.id.clone(),
         force: true,
