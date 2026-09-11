@@ -1428,3 +1428,43 @@ mod refused_create_touches_nothing {
         cancel.cancel();
     }
 }
+
+/// The git identity a workspace's sandbox home is seeded with.
+mod seeded_identity {
+    use super::common::{self, create_ws, start_daemon, Client};
+
+    /// A name with spaces in it survives the trip into the sandbox home.
+    ///
+    /// The two `git config --get` calls this used to make became one
+    /// `--get-regexp`, whose output is `<key> <value>` with the value running to
+    /// the end of the line. Splitting that on whitespace rather than on the
+    /// first space would seed `Ada` for `Ada Lovelace`, and commits made inside
+    /// the workspace would carry a name the user never typed.
+    #[tokio::test]
+    async fn a_name_with_spaces_reaches_the_sandbox_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = common::init_repo(dir.path());
+        common::git_ok(&repo, &["config", "user.name", "Ada Lovelace"]);
+        common::git_ok(&repo, &["config", "user.email", "ada@example.test"]);
+
+        let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+        let mut c = Client::connect(port, &token).await;
+        let ws = create_ws(&mut c, &repo, "alpha").await;
+
+        let seeded = std::fs::read_to_string(
+            daemon
+                .workspace(&ws.id)
+                .map(|w| daemon.dirs.home(&w.id))
+                .unwrap()
+                .join(".gitconfig"),
+        )
+        .unwrap();
+        assert!(
+            seeded.contains("name = Ada Lovelace"),
+            "the whole name has to reach the sandbox home: {seeded}"
+        );
+        assert!(seeded.contains("email = ada@example.test"), "{seeded}");
+
+        cancel.cancel();
+    }
+}
