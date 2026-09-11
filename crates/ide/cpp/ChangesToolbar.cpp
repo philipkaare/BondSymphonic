@@ -69,7 +69,9 @@ QString changestoolbar::conflictList(const QString& conflictsJson) {
 
 ChangesToolbar::ChangesToolbar(AppController* controller, QWidget* parent)
     : QToolBar(parent), m_controller(controller) {
-    m_ask = [this](Ask ask) { return askModal(ask); };
+    m_ask = [this](Ask ask, const QString& workspaceId) {
+        return askModal(ask, workspaceId);
+    };
     setObjectName(QStringLiteral("ChangesToolbar"));
     setMovable(false);
     setToolButtonStyle(Qt::ToolButtonTextOnly);
@@ -185,20 +187,20 @@ bool ChangesToolbar::beginOperation(const QString& workspaceId) {
     return !workspaceId.isEmpty() && !m_controller.isNull() && !busy(workspaceId);
 }
 
-bool ChangesToolbar::stillOn(const QString& workspaceId, const QString& what) {
-    if (workspaceId == m_workspaceId) {
-        return true;
-    }
+bool ChangesToolbar::stillOn(const QString& workspaceId) const {
+    return workspaceId == m_workspaceId;
+}
+
+void ChangesToolbar::reportCancelled(const QString& what) {
     // Not sent to either one. The confirmation named the workspace it was
     // about, so the user has not agreed to anything happening to the one the
     // toolbar is pointed at now; and re-sending it to the workspace they did
     // agree about is just as wrong, because they are no longer looking at it
     // and the toolbar will report the answer under the wrong heading.
     emit statusMessage(QStringLiteral("Workspace changed, %1 cancelled").arg(what), QString());
-    return false;
 }
 
-ChangesToolbar::Answer ChangesToolbar::askModal(Ask ask) {
+ChangesToolbar::Answer ChangesToolbar::askModal(Ask ask, const QString& workspaceId) {
     Answer answer;
     switch (ask) {
     case Ask::Merge:
@@ -247,7 +249,6 @@ ChangesToolbar::Answer ChangesToolbar::askModal(Ask ask) {
         // discard they did not mean, so it is asked for here -- rather than on
         // every `changesLoaded`, which put one `workspace.summary` on the wire
         // per burst of agent output for a number nothing was showing.
-        const QString workspaceId = m_workspaceId;
         requestSummary(workspaceId);
 
         QMessageBox box(this);
@@ -280,7 +281,7 @@ ChangesToolbar::Answer ChangesToolbar::askModal(Ask ask) {
     return answer;
 }
 
-void ChangesToolbar::setConfirmPrompt(std::function<Answer(Ask)> ask) {
+void ChangesToolbar::setConfirmPrompt(std::function<Answer(Ask, const QString&)> ask) {
     if (ask) {
         m_ask = std::move(ask);
     }
@@ -299,11 +300,11 @@ void ChangesToolbar::onMerge(const QString& mode) {
         return;
     }
     const bool rebase = mode == QString::fromUtf8(kModeRebase);
-    if (!m_ask(rebase ? Ask::Rebase : Ask::Merge).accepted) {
+    if (!m_ask(rebase ? Ask::Rebase : Ask::Merge, workspaceId).accepted) {
         return;
     }
-    if (!stillOn(workspaceId,
-                 rebase ? QStringLiteral("rebase") : QStringLiteral("merge"))) {
+    if (!stillOn(workspaceId)) {
+        reportCancelled(rebase ? QStringLiteral("rebase") : QStringLiteral("merge"));
         return;
     }
     if (!beginOperation(workspaceId)) {
@@ -317,11 +318,12 @@ void ChangesToolbar::onSquash() {
     if (workspaceId.isEmpty()) {
         return;
     }
-    const Answer answer = m_ask(Ask::Squash);
+    const Answer answer = m_ask(Ask::Squash, workspaceId);
     if (!answer.accepted) {
         return;
     }
-    if (!stillOn(workspaceId, QStringLiteral("squash"))) {
+    if (!stillOn(workspaceId)) {
+        reportCancelled(QStringLiteral("squash"));
         return;
     }
     if (!beginOperation(workspaceId)) {
@@ -335,11 +337,12 @@ void ChangesToolbar::onCreatePr() {
     if (workspaceId.isEmpty()) {
         return;
     }
-    const Answer answer = m_ask(Ask::Pr);
+    const Answer answer = m_ask(Ask::Pr, workspaceId);
     if (!answer.accepted) {
         return;
     }
-    if (!stillOn(workspaceId, QStringLiteral("pull request"))) {
+    if (!stillOn(workspaceId)) {
+        reportCancelled(QStringLiteral("pull request"));
         return;
     }
     if (!beginOperation(workspaceId)) {
@@ -353,10 +356,11 @@ void ChangesToolbar::onDiscard() {
     if (workspaceId.isEmpty()) {
         return;
     }
-    if (!m_ask(Ask::Discard).accepted) {
+    if (!m_ask(Ask::Discard, workspaceId).accepted) {
         return;
     }
-    if (!stillOn(workspaceId, QStringLiteral("discard"))) {
+    if (!stillOn(workspaceId)) {
+        reportCancelled(QStringLiteral("discard"));
         return;
     }
     if (!beginOperation(workspaceId)) {
@@ -483,6 +487,61 @@ const ToolbarAction kToolbarActions[] = {
     { "ChangesDiscardAction", "Workspace changed, discard cancelled" },
 };
 
+/// Runs one action to its end with `confirm` answering its modal, and checks
+/// what the controller was asked to do afterwards.
+///
+/// Both checks below are the same walk with a different confirmation, so they
+/// share it: a controller and a toolbar of their own per action -- the
+/// controller books a workspace in for as long as the request is out and never
+/// lets it go without an event loop, so a shared one would refuse the second
+/// action for a reason neither check is about.
+///
+/// `switchTo` non-empty makes the confirmation move the toolbar to that
+/// workspace, the way the Explorer does when the active tab changes under a
+/// modal. Answers 0, or 100/200/300/400 plus `index` for the assertion that
+/// failed.
+std::int32_t runToolbarAction(const ToolbarAction& action, std::int32_t index,
+                              const QString& switchTo) {
+    AppController controller;
+    ChangesToolbar toolbar(&controller);
+    toolbar.setWorkspace(QStringLiteral("ws_1"), QStringLiteral("alpha"),
+                         QStringLiteral("bs/alpha"), QStringLiteral("main"));
+    QString status;
+    QObject::connect(&toolbar, &ChangesToolbar::statusMessage, &toolbar,
+                     [&status](const QString& text, const QString&) { status = text; });
+    toolbar.setConfirmPrompt([&toolbar, switchTo](ChangesToolbar::Ask, const QString&) {
+        if (!switchTo.isEmpty()) {
+            toolbar.setWorkspace(switchTo, QStringLiteral("beta"), QStringLiteral("bs/beta"),
+                                 QStringLiteral("main"));
+        }
+        ChangesToolbar::Answer answer;
+        answer.accepted = true;
+        return answer;
+    });
+    auto* trigger = toolbar.findChild<QAction*>(QString::fromUtf8(action.objectName));
+    if (trigger == nullptr) {
+        return 100 + index;
+    }
+    trigger->trigger();
+
+    const bool moved = !switchTo.isEmpty();
+    // The workspace the confirmation was about: acted on when it is still the
+    // one on show, and untouched when it is not.
+    if (controller.isWorkspaceBusy(QStringLiteral("ws_1")) == moved) {
+        return 200 + index;
+    }
+    // The one the toolbar moved to never agreed to anything.
+    if (moved && controller.isWorkspaceBusy(switchTo)) {
+        return 300 + index;
+    }
+    const QString expected =
+        moved ? QString::fromUtf8(action.cancelled) : QString();
+    if (status != expected) {
+        return 400 + index;
+    }
+    return 0;
+}
+
 } // namespace
 
 /// The workspace moved while the confirmation was up: nothing may be sent, for
@@ -494,38 +553,9 @@ const ToolbarAction kToolbarActions[] = {
 extern "C" std::int32_t bs_widget_test_changes_toolbar_cancels_a_switched_workspace() {
     std::int32_t index = 0;
     for (const ToolbarAction& action : kToolbarActions) {
-        // A controller of its own per action: the controller books a workspace
-        // in for as long as the request is out and never lets it go without an
-        // event loop, so a shared one would refuse the second action for a
-        // reason this check is not about.
-        AppController controller;
-        ChangesToolbar toolbar(&controller);
-        toolbar.setWorkspace(QStringLiteral("ws_1"), QStringLiteral("alpha"),
-                             QStringLiteral("bs/alpha"), QStringLiteral("main"));
-        QString status;
-        QObject::connect(&toolbar, &ChangesToolbar::statusMessage, &toolbar,
-                         [&status](const QString& text, const QString&) { status = text; });
-        toolbar.setConfirmPrompt([&toolbar](ChangesToolbar::Ask) {
-            // What the Explorer does when the active tab changes under a modal.
-            toolbar.setWorkspace(QStringLiteral("ws_2"), QStringLiteral("beta"),
-                                 QStringLiteral("bs/beta"), QStringLiteral("main"));
-            ChangesToolbar::Answer answer;
-            answer.accepted = true;
-            return answer;
-        });
-        auto* trigger = toolbar.findChild<QAction*>(QString::fromUtf8(action.objectName));
-        if (trigger == nullptr) {
-            return 100 + index;
-        }
-        trigger->trigger();
-        if (controller.isWorkspaceBusy(QStringLiteral("ws_1"))) {
-            return 200 + index;
-        }
-        if (controller.isWorkspaceBusy(QStringLiteral("ws_2"))) {
-            return 300 + index;
-        }
-        if (status != QString::fromUtf8(action.cancelled)) {
-            return 400 + index;
+        const std::int32_t code = runToolbarAction(action, index, QStringLiteral("ws_2"));
+        if (code != 0) {
+            return code;
         }
         ++index;
     }
@@ -537,31 +567,13 @@ extern "C" std::int32_t bs_widget_test_changes_toolbar_cancels_a_switched_worksp
 extern "C" std::int32_t bs_widget_test_changes_toolbar_acts_on_the_confirmed_workspace() {
     std::int32_t index = 0;
     for (const ToolbarAction& action : kToolbarActions) {
-        AppController controller;
-        ChangesToolbar toolbar(&controller);
-        toolbar.setWorkspace(QStringLiteral("ws_1"), QStringLiteral("alpha"),
-                             QStringLiteral("bs/alpha"), QStringLiteral("main"));
-        QString status;
-        QObject::connect(&toolbar, &ChangesToolbar::statusMessage, &toolbar,
-                         [&status](const QString& text, const QString&) { status = text; });
-        toolbar.setConfirmPrompt([](ChangesToolbar::Ask) {
-            ChangesToolbar::Answer answer;
-            answer.accepted = true;
-            return answer;
-        });
-        auto* trigger = toolbar.findChild<QAction*>(QString::fromUtf8(action.objectName));
-        if (trigger == nullptr) {
-            return 100 + index;
-        }
-        trigger->trigger();
-        if (!controller.isWorkspaceBusy(QStringLiteral("ws_1"))) {
-            return 200 + index;
-        }
-        if (!status.isEmpty()) {
-            return 300 + index;
+        const std::int32_t code = runToolbarAction(action, index, QString());
+        if (code != 0) {
+            return code;
         }
         ++index;
     }
     return 0;
 }
+
 #endif // BS_WIDGET_TESTS

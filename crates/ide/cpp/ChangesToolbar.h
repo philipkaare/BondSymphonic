@@ -97,7 +97,9 @@ public:
     /// modal box, input dialog or `PrDialog` the action would show; this is the
     /// seam that lets the answer -- and the pause while it is being given --
     /// come from somewhere else.
-    void setConfirmPrompt(std::function<Answer(Ask)> ask);
+    /// `workspaceId` is the workspace the action was started on, which is what
+    /// the question is about.
+    void setConfirmPrompt(std::function<Answer(Ask, const QString& workspaceId)> ask);
 
 signals:
     /// Something to put in the status bar. `url` is empty for a plain message;
@@ -132,8 +134,10 @@ private:
     void onSummarized(const QString& workspaceId, const QString& json);
 
     /// The prompt each action shows when nothing has replaced it: the one
-    /// place the five modals live.
-    Answer askModal(Ask ask);
+    /// place the five modals live. `workspaceId` is the one the caller read
+    /// before it asked, so the question and the request cannot be about
+    /// different workspaces even in the box that names a changed-file count.
+    Answer askModal(Ask ask, const QString& workspaceId);
 
     /// Greys the five actions out when there is no workspace, or when this
     /// workspace already has a request in flight.
@@ -152,18 +156,20 @@ private:
     /// be pointed at by the time the confirmation is answered.
     bool beginOperation(const QString& workspaceId);
 
-    /// Whether the toolbar is still pointed at `workspaceId`; when it is not,
-    /// says on the status bar that `what` was called off, and answers false.
+    /// Whether the toolbar is still pointed at `workspaceId`.
     ///
     /// Each of the five confirmations runs an event loop of its own, and the
     /// Explorer moves this toolbar to whatever tab becomes active while one is
     /// up. Every action asks this between its confirmation and its request, so
     /// a yes given about one workspace can never be spent on another.
-    bool stillOn(const QString& workspaceId, const QString& what);
+    bool stillOn(const QString& workspaceId) const;
+    /// Says on the status bar that `what` was called off because the workspace
+    /// moved. What every action does when [`stillOn`] answers false.
+    void reportCancelled(const QString& what);
 
     QPointer<AppController> m_controller;
     /// Never null: the constructor installs the modals.
-    std::function<Answer(Ask)> m_ask;
+    std::function<Answer(Ask, const QString& workspaceId)> m_ask;
     QString m_workspaceId;
     QString m_name;
     QString m_branch;
