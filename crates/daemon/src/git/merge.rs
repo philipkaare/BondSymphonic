@@ -11,17 +11,13 @@
 
 use crate::daemon::Daemon;
 use crate::git::worktree::Layout;
-use crate::git::{repo, Git};
+use crate::git::{path_arg, repo, Git};
 use crate::workspace::lifecycle::layout_for;
 use crate::workspace::Workspace;
 use bondsymphonic_proto::{
     ErrorCode, MergeMode, MergeResult, RpcError, WorkspaceId, WorkspaceState,
 };
 use std::path::{Path, PathBuf};
-
-fn s(p: &Path) -> String {
-    p.to_string_lossy().into_owned()
-}
 
 /// A path in the form the filesystem itself uses, for comparing two paths that
 /// were spelled differently.
@@ -217,7 +213,7 @@ async fn reap_scratch_worktrees(git: &Git, repo: &Path, scratch_root: &Path) {
     for path in &stale {
         tracing::warn!(path = %path.display(), "reaping a merge worktree left by an earlier run");
         if let Err(e) = git
-            .run(repo, &["worktree", "remove", "--force", &s(path)])
+            .run(repo, &["worktree", "remove", "--force", &path_arg(path)])
             .await
         {
             tracing::warn!(path = %path.display(), "removing it failed: {}", e.message);
@@ -244,14 +240,15 @@ async fn add_scratch(git: &Git, repo: &Path, base: &str, path: &Path) -> Result<
     // behind, and either one on its own makes `worktree add` refuse. Clearing
     // both is what keeps one crash from breaking every later merge.
     let _ = git
-        .run(repo, &["worktree", "remove", "--force", &s(path)])
+        .run(repo, &["worktree", "remove", "--force", &path_arg(path)])
         .await;
     let _ = std::fs::remove_dir_all(path);
     let _ = git.run(repo, &["worktree", "prune"]).await;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| RpcError::io(&e))?;
     }
-    git.run(repo, &["worktree", "add", &s(path), base]).await?;
+    git.run(repo, &["worktree", "add", &path_arg(path), base])
+        .await?;
     Ok(())
 }
 
@@ -264,7 +261,7 @@ async fn remove_scratch(git: &Git, repo: &Path, path: &Path) {
     // clears a registration without a directory.
     if path.exists() {
         if let Err(e) = git
-            .run(repo, &["worktree", "remove", "--force", &s(path)])
+            .run(repo, &["worktree", "remove", "--force", &path_arg(path)])
             .await
         {
             tracing::warn!(path = %path.display(), "removing the merge worktree failed: {}", e.message);

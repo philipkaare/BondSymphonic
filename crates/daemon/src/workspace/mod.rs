@@ -4,7 +4,7 @@ pub mod registry;
 
 use bondsymphonic_proto::{AgentId, RunId, WorkspaceId, WorkspaceInfo, WorkspaceState};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workspace {
@@ -96,9 +96,6 @@ impl DataDirs {
     pub fn run(&self, id: &WorkspaceId) -> PathBuf {
         self.run.join(id.as_str())
     }
-    pub fn bin(&self) -> PathBuf {
-        self.root.join("bin")
-    }
     /// Where a merge puts its scratch checkout of the base branch when the
     /// user's own checkout is on some other branch.
     ///
@@ -130,7 +127,6 @@ impl DataDirs {
         ] {
             std::fs::create_dir_all(d)?;
         }
-        std::fs::create_dir_all(self.bin())?;
         std::fs::create_dir_all(self.no_hooks())?;
         Ok(())
     }
@@ -161,8 +157,4 @@ impl DataDirs {
 
 pub fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
-pub fn path_str(p: &Path) -> String {
-    p.to_string_lossy().into_owned()
 }

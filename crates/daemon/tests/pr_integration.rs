@@ -65,21 +65,6 @@ fn use_gh_stub(py: &str, log: &Path, fail: bool) {
     }
 }
 
-fn git_out(dir: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?} in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 async fn commit_in_ws(d: &Arc<Daemon>, ws: &WorkspaceInfo, name: &str, msg: &str) {
     let w = d.workspace(&ws.id).unwrap();
     let env = lifecycle::layout_for(d, &w)
@@ -124,7 +109,7 @@ async fn create_pr_pushes_the_branch_and_returns_the_url_gh_printed() {
     // A real push: the origin has the branch, and it has the workspace's
     // commit, whose objects lived only in the private object directory.
     assert_eq!(
-        git_out(
+        common::git_out(
             &origin,
             &["log", "-1", "--format=%s", "refs/heads/bs/alpha/work"]
         ),
@@ -133,7 +118,7 @@ async fn create_pr_pushes_the_branch_and_returns_the_url_gh_printed() {
     // `-u`, so the branch is tracking and a later `git push` from the repo needs
     // no arguments.
     assert_eq!(
-        git_out(&repo, &["config", "--get", "branch.bs/alpha/work.remote"]),
+        common::git_out(&repo, &["config", "--get", "branch.bs/alpha/work.remote"]),
         "origin"
     );
 
@@ -201,14 +186,14 @@ async fn create_pr_still_runs_the_repositorys_pre_push_hook() {
 
     let fed = std::fs::read_to_string(&payload)
         .expect("the repository's pre-push hook must have run: git-lfs uploads from it");
-    let tip = git_out(&repo, &["rev-parse", "bs/alpha/work"]);
+    let tip = common::git_out(&repo, &["rev-parse", "bs/alpha/work"]);
     assert!(
         fed.contains("refs/heads/bs/alpha/work") && fed.contains(&tip),
         "the hook must get the real push payload on stdin, got: {fed:?}"
     );
     // And the push itself still happened.
     assert_eq!(
-        git_out(
+        common::git_out(
             &origin,
             &["log", "-1", "--format=%s", "refs/heads/bs/alpha/work"]
         ),
@@ -306,7 +291,7 @@ async fn the_remote_tracking_ref_still_reads_after_the_workspace_is_destroyed() 
     .unwrap();
 
     assert_eq!(
-        git_out(
+        common::git_out(
             &repo,
             &[
                 "log",
@@ -350,7 +335,7 @@ async fn create_pr_refuses_a_workspace_that_is_not_ready() {
     assert!(err.message.contains("is not ready"), "{err:?}");
 
     // Nothing was pushed: the origin never heard of the branch.
-    let refs = git_out(&origin, &["for-each-ref", "--format=%(refname)"]);
+    let refs = common::git_out(&origin, &["for-each-ref", "--format=%(refname)"]);
     assert!(!refs.contains("bs/alpha/work"), "{refs}");
 
     cancel.cancel();

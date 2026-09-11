@@ -145,10 +145,6 @@ impl Registry {
         save_locked(&g)?;
         Ok(removed)
     }
-
-    pub fn save(&self) -> Result<()> {
-        save_locked(&self.inner.read())
-    }
 }
 
 /// Writes the whole registry, atomically.

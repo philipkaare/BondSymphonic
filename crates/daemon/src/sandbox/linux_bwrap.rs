@@ -157,7 +157,8 @@ pub fn bwrap_args(
     self_exe: &Path,
     user: &str,
 ) -> Vec<String> {
-    let s = |p: &Path| p.to_string_lossy().into_owned();
+    // One spelling of "a path as an argument", shared with the git layer.
+    let s = crate::git::path_arg;
     // The caller's user, not the ambient `$USER`: the two differ on CI runners and
     // whenever the daemon is started under a different account than it was configured for.
     let home_in = format!("/home/{user}");
