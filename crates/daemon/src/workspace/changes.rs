@@ -40,18 +40,19 @@ pub async fn changes(d: &Daemon, id: &WorkspaceId) -> Result<ChangesResult, RpcE
     let cwd = ws.worktree_path.clone();
     let base = merge_base(&git, &ws).await?;
 
-    let name_status = git
-        .run(&cwd, &["diff", "--name-status", "-M", "-z", &base, "--"])
-        .await?;
-    let numstat = git
-        .run(&cwd, &["diff", "--numstat", "-M", "-z", &base, "--"])
-        .await?;
-    let status = git
-        .run(
-            &cwd,
-            &["status", "--porcelain=v2", "--untracked-files=all", "-z"],
-        )
-        .await?;
+    // Three reads of one commit range, asked at once. None of them looks at
+    // what another returned, and `workspace.changes` runs on every refresh of
+    // the Changes panel, so the call costs the slowest of the three rather than
+    // the sum. They are consistent with each other for the same reason they were
+    // before: the merge-base was resolved once, above, and all three are read-only.
+    let name_status_args = ["diff", "--name-status", "-M", "-z", &base, "--"];
+    let numstat_args = ["diff", "--numstat", "-M", "-z", &base, "--"];
+    let status_args = ["status", "--porcelain=v2", "--untracked-files=all", "-z"];
+    let (name_status, numstat, status) = tokio::try_join!(
+        git.run(&cwd, &name_status_args),
+        git.run(&cwd, &numstat_args),
+        git.run(&cwd, &status_args),
+    )?;
 
     let tracked = parse_name_status_z(&name_status.stdout);
     let counts = parse_numstat_z(&numstat.stdout);

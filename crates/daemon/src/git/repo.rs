@@ -280,12 +280,94 @@ pub fn not_a_repository_error(path: &Path) -> RpcError {
 /// [`classify`] with the four answers that are not a `bool` collapsed: a bare
 /// repository is the one that cannot be, because `false` would send
 /// `init_if_missing` on to write inside it.
+///
+/// **Test-facing surface.** No caller in the daemon asks the question this way
+/// any more — each of them needs a `RepoKind` to say what it will do next, and
+/// the collapse throws away exactly what they need. It is kept because the
+/// tests for [`classify`] read better through it: "is this a repository the
+/// daemon can use" is the property, and a test that spelled out the two
+/// matching variants would restate the implementation instead of checking it.
 pub async fn is_repo_root(git: &Git, path: &Path) -> Result<bool, RpcError> {
     match classify(git, path).await? {
         RepoKind::Root | RepoKind::Worktree => Ok(true),
         RepoKind::NotARepo | RepoKind::InsideEnclosing { .. } => Ok(false),
         RepoKind::Bare => Err(bare_repository_error(path)),
     }
+}
+
+/// Every local branch, in git's own order.
+async fn local_branches(git: &Git, repo: &Path) -> Result<Vec<String>, RpcError> {
+    Ok(git
+        .run(
+            repo,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+        )
+        .await?
+        .stdout
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// The branch the repository itself calls its default, or `None` when it does
+/// not say.
+///
+/// `refs/remotes/origin/HEAD` first, because that is the remote's answer and
+/// the one a clone was made against; the local `HEAD` second, for a repository
+/// with no remote. Neither failing is an error — a repository can have neither
+/// — so the caller falls back to the branch list instead.
+async fn configured_head(git: &Git, repo: &Path) -> Result<Option<String>, RpcError> {
+    if let Ok(o) = git
+        .run(
+            repo,
+            &[
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "refs/remotes/origin/HEAD",
+            ],
+        )
+        .await
+    {
+        return Ok(Some(
+            o.stdout.trim().trim_start_matches("origin/").to_string(),
+        ));
+    }
+    Ok(git
+        .run(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .await
+        .ok()
+        .map(|o| o.stdout.trim().to_string()))
+}
+
+/// Whether the checkout has uncommitted changes.
+///
+/// `--untracked-files=no`, the same question `workspace.merge`'s guard asks of
+/// the same checkout. An untracked file is not a change a merge can destroy —
+/// git refuses by name rather than overwriting one — and a log, a build output
+/// or a scratch note lying in a working directory is its ordinary state, not
+/// something to announce as uncommitted work. With the two disagreeing, the New
+/// Agent dialog said "Repository has uncommitted changes" about a repository
+/// the daemon would merge into without a murmur.
+async fn is_dirty(git: &Git, repo: &Path) -> Result<bool, RpcError> {
+    Ok(!git
+        .run(repo, &["status", "--porcelain", "--untracked-files=no"])
+        .await?
+        .stdout
+        .trim()
+        .is_empty())
+}
+
+async fn remotes(git: &Git, repo: &Path) -> Result<Vec<String>, RpcError> {
+    Ok(git
+        .run(repo, &["remote"])
+        .await?
+        .stdout
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
 }
 
 pub async fn inspect(git: &Git, repo: &Path) -> Result<RepoInfo, RpcError> {
@@ -313,57 +395,31 @@ pub async fn inspect(git: &Git, repo: &Path) -> Result<RepoInfo, RpcError> {
         }
         RepoKind::Bare => return Err(bare_repository_error(repo)),
     }
-    let branches: Vec<String> = git
-        .run(
-            repo,
-            &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
-        )
-        .await?
-        .stdout
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let default_branch = match git
-        .run(
-            repo,
-            &[
-                "symbolic-ref",
-                "--quiet",
-                "--short",
-                "refs/remotes/origin/HEAD",
-            ],
-        )
-        .await
-    {
-        Ok(o) => o.stdout.trim().trim_start_matches("origin/").to_string(),
-        Err(_) => match git
-            .run(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .await
-        {
-            Ok(o) => o.stdout.trim().to_string(),
-            Err(_) => branches
-                .iter()
-                .find(|b| *b == "main" || *b == "master")
-                .cloned()
-                .or_else(|| branches.first().cloned())
-                .unwrap_or_default(),
-        },
-    };
-    let is_dirty = !git
-        .run(repo, &["status", "--porcelain"])
-        .await?
-        .stdout
-        .trim()
-        .is_empty();
-    let remotes: Vec<String> = git
-        .run(repo, &["remote"])
-        .await?
-        .stdout
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    // Four independent questions, asked at once. `repo.inspect` is what the New
+    // Agent dialog waits on while the user looks at an empty panel, and on a
+    // large repository under `/mnt/c` the four answers took long enough in
+    // sequence to reach the IDE's 30 s timeout. None of them reads what another
+    // wrote, so nothing here depends on the order they come back in; the branch
+    // list is only *consulted* by the default-branch fallback, which is done
+    // below once both have arrived.
+    //
+    // `try_join!` rather than four spawned tasks: these are child processes, so
+    // there is nothing for a thread to do but wait, and the first failure still
+    // ends the call with that failure the way the sequence did.
+    let (branches, configured_head, is_dirty, remotes) = tokio::try_join!(
+        local_branches(git, repo),
+        configured_head(git, repo),
+        is_dirty(git, repo),
+        remotes(git, repo),
+    )?;
+    let default_branch = configured_head.unwrap_or_else(|| {
+        branches
+            .iter()
+            .find(|b| *b == "main" || *b == "master")
+            .cloned()
+            .or_else(|| branches.first().cloned())
+            .unwrap_or_default()
+    });
     Ok(RepoInfo {
         default_branch,
         branches,

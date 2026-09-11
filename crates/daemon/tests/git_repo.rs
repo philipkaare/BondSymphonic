@@ -1,5 +1,6 @@
 mod common;
 
+use bondsymphonic_daemon::git::repo::RepoKind;
 use bondsymphonic_daemon::git::{repo, Git};
 use bondsymphonic_proto::ErrorCode;
 use common::init_repo;
@@ -14,7 +15,14 @@ async fn inspect_reports_default_branch_and_clean_tree() {
     assert!(info.branches.contains(&"main".to_string()));
     assert!(!info.is_dirty);
     assert!(info.remotes.is_empty());
-    std::fs::write(repo_path.join("dirty.txt"), "x").unwrap();
+    // An edited *tracked* file. An untracked one is deliberately not dirty —
+    // see `an_untracked_file_alone_is_not_what_is_dirty_means`.
+    std::fs::write(
+        repo_path.join("README.md"),
+        "edited
+",
+    )
+    .unwrap();
     assert!(repo::inspect(&git, &repo_path).await.unwrap().is_dirty);
     assert!(repo::branch_exists(&git, &repo_path, "main").await.unwrap());
     assert!(!repo::branch_exists(&git, &repo_path, "nope").await.unwrap());
@@ -424,8 +432,8 @@ async fn init_repo_accepts_a_folder_that_already_has_files_in_it() {
     let info = repo::inspect(&git, &existing).await.unwrap();
     assert!(info.is_repo);
     assert!(
-        info.is_dirty,
-        "the files are still there, and still untracked"
+        !info.is_dirty,
+        "the files are still there and still untracked, which is not an uncommitted change"
     );
     assert_eq!(log_line(&existing, "--format=%s"), "Initial commit");
 }
@@ -481,8 +489,6 @@ async fn a_bare_repository_is_refused_by_name() {
 // ---------------------------------------------------------------------------
 // Task 4 (AL5): one classifier, five answers.
 // ---------------------------------------------------------------------------
-
-use bondsymphonic_daemon::git::repo::RepoKind;
 
 /// Adds a linked worktree on a new branch and returns its path.
 fn add_worktree(repo: &std::path::Path, branch: &str, at: &std::path::Path) {
@@ -613,4 +619,34 @@ async fn a_subdirectory_of_a_repository_is_refused_by_naming_the_repository() {
     // And `init_repo` there still makes a repository of its own rather than
     // adopting the parent.
     assert!(!repo::is_repo_root(&git, &inside).await.unwrap());
+}
+
+/// `RepoInfo.is_dirty` and the merge guard answer the same question the same
+/// way.
+///
+/// The merge guard asks `status --porcelain --untracked-files=no`, because an
+/// untracked file is not work a merge can destroy — git refuses by name rather
+/// than overwriting one — and a log, a build output or a scratch note lying in a
+/// checkout is the ordinary state of a working directory. `inspect` asked a
+/// bare `status --porcelain`, so the New Agent dialog announced "uncommitted
+/// changes" for a repository the daemon would merge into without a murmur.
+#[tokio::test]
+async fn an_untracked_file_alone_is_not_what_is_dirty_means() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_path = init_repo(dir.path());
+    let git = Git::new();
+
+    std::fs::write(repo_path.join("scratch.log"), "today's notes\n").unwrap();
+    assert!(
+        !repo::inspect(&git, &repo_path).await.unwrap().is_dirty,
+        "an untracked file is not an uncommitted change"
+    );
+
+    // A tracked file that has been edited is, and that is the whole of the
+    // difference: the flag still means something.
+    std::fs::write(repo_path.join("README.md"), "edited\n").unwrap();
+    assert!(
+        repo::inspect(&git, &repo_path).await.unwrap().is_dirty,
+        "an edited tracked file is an uncommitted change"
+    );
 }
