@@ -1338,7 +1338,15 @@ QJsonObject MainWindow::activeTab() const {
 }
 
 QString MainWindow::activeWorkspaceId() const {
-    return activeTab().value("workspace_id").toString();
+    // Asked off the model directly rather than pulled out of `activeTab`, which
+    // serialises the whole tab in Rust and parses it again here. Seven call
+    // sites ask this -- every file opened, every pane rebound, every run the
+    // panel is pointed at -- and none of them wants anything but the id. The
+    // two accessors read the same `active_group`/`active_tab` pair `activeTab`
+    // does, so the answer cannot differ from it; an index the model does not
+    // have answers empty, which is what no selection means.
+    return m_groupModel->tabWorkspaceId(m_groupModel->activeGroupIndex(),
+                                        m_groupModel->activeTabIndex());
 }
 
 void MainWindow::onActiveTabChanged() {
