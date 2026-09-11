@@ -171,7 +171,7 @@ git commit -m "fix(daemon,proto): one workspace-name validator, same-name create
   - AG2: `agent.send` while state is `WaitingPermission` returns `RpcError` reason `waiting_permission` and the state does not change.
   - AG3: fixture writes `boom` to stderr and exits 3; `exit_detail` in the published `Exited`/`Error` event contains `boom` every time (loop 20×).
   - AG4: start an agent, make `destroy` fail (a fixture-driven failure or by making the worktree undeletable on Windows via an open handle), then `agent.history` for that agent still answers.
-  - AG5: two concurrent `agent.start` on one workspace: one succeeds, the other is `Conflict` (reason `agent_running`), and `settings.json` in the sandbox home is intact.
+  - AG5: two concurrent `agent.start` on one workspace: one succeeds, the other is `Conflict` (reason `agent_starting`), and `settings.json` in the sandbox home is intact.
   - AG6: fixture prints an `is_error` result then exits; the final state is `Exited` with the error message as `detail`, `records_of` reports `Exited`, and `send` afterwards fails with reason `agent_exited` (not a broken pipe).
   - AG7: `claude --version` probe has a 10 s timeout (`BS_CLAUDE_BIN` pointing at a script that sleeps 20 s makes `agent.start` fail within ~10 s with reason `claude_probe_timeout`) and the failure is not cached: a second start with a working binary succeeds.
 - [ ] **Step 2: Run, watch fail.**
