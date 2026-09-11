@@ -1685,3 +1685,56 @@ mod task_10 {
         assert!(held.take(&x).is_none());
     }
 }
+
+/// Task 15: the auto-open decision as one value rather than a flag in C++ and
+/// a rule in Rust.
+///
+/// `MainWindow` used to hold `m_setupShownForBlock`, clear it on any answer
+/// that did not block, and pass it back into `shouldAutoOpenSetup` with a
+/// `blocked` it had asked the controller for separately. Three pieces of one
+/// decision, two of them in a file no test can reach. They are one value now,
+/// and this is the episode the split used to get wrong.
+mod task_15_setup_prompt {
+    use bondsymphonic_ide::qobjects::app_controller::SetupPrompt;
+
+    #[test]
+    fn settings_opens_itself_once_per_run_of_blocking_failures() {
+        let mut prompt = SetupPrompt::default();
+        // Before any answer there is nothing to open the dialog over.
+        assert!(!prompt.should_open());
+
+        // The first answer of the session blocks: the dialog is offered.
+        prompt.checked(true);
+        assert!(prompt.should_open());
+
+        // Asking twice does not change the answer; opening the dialog does.
+        assert!(prompt.should_open());
+        prompt.note_shown();
+        assert!(!prompt.should_open());
+
+        // Closing Settings re-checks, and on the machine the setup flow exists
+        // for that answer still blocks. It must not reopen the dialog.
+        prompt.checked(true);
+        assert!(!prompt.should_open());
+
+        // Nothing blocking any more: no dialog, and the rule re-arms on this
+        // answer rather than on the next failure.
+        prompt.checked(false);
+        assert!(!prompt.should_open());
+
+        // A prerequisite that breaks again later is a new run of failures.
+        prompt.checked(true);
+        assert!(prompt.should_open());
+    }
+
+    /// The user reaching Settings by hand counts as shown, so a blocking
+    /// failure they have decided to live with is not thrown back at them the
+    /// moment they close the dialog.
+    #[test]
+    fn opening_settings_by_hand_also_arms_the_rule() {
+        let mut prompt = SetupPrompt::default();
+        prompt.note_shown();
+        prompt.checked(true);
+        assert!(!prompt.should_open());
+    }
+}

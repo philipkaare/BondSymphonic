@@ -422,7 +422,11 @@ void MainWindow::openSettings(bool onSetup) {
     // Set for every open, not only the automatic one. A user who reaches
     // Settings by hand while a blocking prerequisite is failing must not have
     // it thrown back at them the moment they close it either.
-    m_setupShownForBlock = true;
+    //
+    // Recorded on the controller rather than here: the decision it feeds is
+    // the controller's, taken from the prerequisite answer it already holds,
+    // and half of it living in this file is what made the rule untestable.
+    m_controller->noteSetupShown();
     if (onSetup) {
         // Deferred by one turn of the event loop: the scroll area only knows
         // where its sections are once the dialog has been laid out, and it is
@@ -442,14 +446,15 @@ void MainWindow::openSettings(bool onSetup) {
 }
 
 void MainWindow::onPrereqsChecked(const QString& json) {
-    const QJsonArray items = QJsonDocument::fromJson(json.toUtf8()).array();
-    bool anyFailed = false;
-    for (const QJsonValue& value : items) {
-        anyFailed = anyFailed || !value.toObject().value("ok").toBool();
-    }
-    // Which of the failures they are is the controller's judgement, not this
-    // window's: it owns the list of prerequisites there is no working around.
-    const bool blocked = m_controller->prereqsBlock(json);
+    // The payload is carried for the setup page, which draws a row per entry;
+    // this window reads none of it. Counting the failures here meant parsing
+    // the list a second time, and classifying them meant handing it straight
+    // back for a third. Both answers are decided where the daemon's reply is
+    // decoded, and so is whether the dialog should open: the list of
+    // prerequisites there is no working around is the controller's, and so is
+    // the memory of having already shown Settings for this run of them.
+    Q_UNUSED(json);
+    const bool anyFailed = m_controller->prereqsAnyFailed();
 
     m_sandboxIdleText = anyFailed ? "sandbox: prerequisites missing" : "sandbox: -";
     if (!anyFailed) {
@@ -460,12 +465,7 @@ void MainWindow::onPrereqsChecked(const QString& json) {
     m_setupLabel->setVisible(anyFailed);
     updateWorkspaceStatus();
 
-    if (!blocked) {
-        // Re-arms the automatic open: the next run of blocking failures gets
-        // one of its own rather than being silent for the session.
-        m_setupShownForBlock = false;
-    }
-    if (m_controller->shouldAutoOpenSetup(blocked, m_setupShownForBlock)) {
+    if (m_controller->shouldAutoOpenSetup()) {
         // Deferred, because this runs inside the controller's own signal and
         // `openSettings` spins a nested event loop for the length of the
         // dialog. Queuing it lets this handler finish first.

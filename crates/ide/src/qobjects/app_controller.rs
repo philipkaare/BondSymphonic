@@ -453,8 +453,44 @@ pub mod qobject {
         fn output_dropped(self: Pin<&mut AppController>, count: i64);
 
         /// An asynchronous operation failed. `op` is the daemon method name.
+        ///
+        /// The catch-all, and the one a consumer should reach for last. A
+        /// window that has to tell a repository inspection from a prerequisite
+        /// check from a workspace operation by comparing `op` against a list of
+        /// method-name strings is one daemon rename away from putting a modal
+        /// box over a dialog that already reported the same failure inline, so
+        /// the three failures that are routed rather than shown each have a
+        /// signal of their own below. Those are emitted **alongside** this one,
+        /// not instead of it.
         #[qsignal]
         fn operation_failed(self: Pin<&mut AppController>, op: QString, message: QString);
+
+        /// A `system.check_prereqs` did not answer. Never a box: the commonest
+        /// way to see it is closing Settings during a reconnect, the status bar
+        /// is already saying the connection is down, and the check is re-run on
+        /// every reconnect.
+        #[qsignal]
+        fn prereqs_check_failed(self: Pin<&mut AppController>, message: QString);
+
+        /// A `repo.inspect` failed, naming the path it was asked about. The
+        /// New Agent dialog reports its own inspections in place, and `path`
+        /// is what lets a consumer tell the inspection it is showing from one
+        /// for a repository the user has since moved off.
+        #[qsignal]
+        fn repo_inspect_failed(self: Pin<&mut AppController>, path: QString, message: QString);
+
+        /// An operation belonging to one workspace failed, naming the
+        /// workspace and the daemon method. For the failures whose home is a
+        /// workspace's own pane rather than a box over the window;
+        /// `workspaceOperationFailed` is the richer form, carrying the error's
+        /// `data` for a banner that renders it.
+        #[qsignal]
+        fn workspace_op_failed(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            op: QString,
+            message: QString,
+        );
 
         /// The IDE is talking to a daemon again after a connection loss, and
         /// has already *attempted* `system.check_prereqs` and `workspace.list`:
@@ -628,19 +664,25 @@ pub mod qobject {
         #[qinvokable]
         fn prereqs_json(self: &AppController) -> QString;
 
-        /// Whether a prerequisite answer should open Settings on Setup by
-        /// itself. See [`super::should_auto_open_setup`]: `already_shown` is
-        /// what stops a still-blocked machine reopening the dialog every time
-        /// it is closed, and the window clears it when nothing blocks any more.
+        /// Whether anything in the last prerequisite answer failed, blocking
+        /// or not. What the status bar's "Set up…" link is shown on: Settings
+        /// is a dialog the user closes, so after closing it there has to be a
+        /// way back.
         #[qinvokable]
-        fn should_auto_open_setup(self: &AppController, blocked: bool, already_shown: bool)
-            -> bool;
+        fn prereqs_any_failed(self: &AppController) -> bool;
 
-        /// Whether any prerequisite in `json` is one the IDE cannot work
-        /// without. The window asks before deciding between the setup page and
-        /// a status-bar warning.
+        /// Whether the last prerequisite answer should open Settings on Setup
+        /// by itself. See [`super::SetupPrompt`]: the answer is no once the
+        /// dialog has been shown during this run of blocking failures, which is
+        /// what keeps a still-blocked machine from reopening it every time it
+        /// is closed.
         #[qinvokable]
-        fn prereqs_block(self: &AppController, json: QString) -> bool;
+        fn should_auto_open_setup(self: &AppController) -> bool;
+
+        /// Records that Settings has been opened. Call it from every open, not
+        /// only the automatic one, and before the dialog runs.
+        #[qinvokable]
+        fn note_setup_shown(self: Pin<&mut AppController>);
 
         /// What the daemon said it could do, as a JSON `Capabilities`, or an
         /// empty string before `hello` has answered. The New Agent dialog reads
@@ -1070,6 +1112,52 @@ pub fn should_auto_open_setup(blocked: bool, already_shown: bool) -> bool {
     blocked && !already_shown
 }
 
+/// The auto-open decision as one value: what the last prerequisite answer said,
+/// and whether Settings has been shown since that run of failures began.
+///
+/// It used to be three things. `MainWindow` held the "already shown" flag,
+/// cleared it on any answer that did not block, and passed it back into
+/// [`should_auto_open_setup`] beside a `blocked` it had asked the controller
+/// for separately -- which meant re-parsing the prerequisite JSON the
+/// controller had just parsed, and keeping half a state machine in a file no
+/// test can reach. The rule above stays pure and keeps its own test; this is
+/// the state it is applied to, and the window is left asking one question.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SetupPrompt {
+    /// Whether the last answer failed a prerequisite the IDE cannot work
+    /// around. False before the first answer, which is why a fresh prompt
+    /// opens nothing.
+    blocked: bool,
+    /// Whether Settings has been opened during the current run of blocking
+    /// failures, by the rule or by the user.
+    shown: bool,
+}
+
+impl SetupPrompt {
+    /// Records a prerequisite answer. An answer that does not block re-arms
+    /// the rule, so a prerequisite that breaks again later is a new run of
+    /// failures and gets a dialog of its own.
+    pub fn checked(&mut self, blocked: bool) {
+        self.blocked = blocked;
+        if !blocked {
+            self.shown = false;
+        }
+    }
+
+    /// Records that Settings was shown. Called for every open and not only the
+    /// automatic one: a user who reaches Settings by hand while a blocking
+    /// prerequisite is failing must not have it thrown back at them the moment
+    /// they close it either.
+    pub fn note_shown(&mut self) {
+        self.shown = true;
+    }
+
+    /// Whether this answer should open Settings on Setup by itself.
+    pub fn should_open(self) -> bool {
+        should_auto_open_setup(self.blocked, self.shown)
+    }
+}
+
 /// The workspace and host of a network denial, for an event that is one.
 ///
 /// The proxy announces a refused connection as a warn-level `daemon.log`
@@ -1177,6 +1265,17 @@ pub struct AppControllerRust {
     /// The last `prereqs_checked` payload, so a setup page built later can
     /// draw its rows without waiting for another check. See `prereqs_json`.
     prereqs_json: QString,
+    /// Whether anything in that payload failed, blocking or not. Decided where
+    /// the list is parsed rather than parsed again in C++ to be counted; it is
+    /// what the status bar's "Set up…" link is shown on.
+    prereqs_any_failed: bool,
+    /// The daemon's half of [`claude_logged_in`], from the same answer. Kept so
+    /// a key stored or removed later recomputes the gate without re-reading
+    /// the list.
+    claude_auth_ok: bool,
+    /// Whether a prerequisite answer should open Settings on Setup, and
+    /// whether one already has. See [`SetupPrompt`].
+    setup_prompt: SetupPrompt,
 }
 
 impl Default for AppControllerRust {
@@ -1195,6 +1294,9 @@ impl Default for AppControllerRust {
             // in the seconds before the first `system.check_prereqs` answers.
             claude_logged_in: false,
             prereqs_json: QString::from(""),
+            prereqs_any_failed: false,
+            claude_auth_ok: false,
+            setup_prompt: SetupPrompt::default(),
         }
     }
 }
@@ -1240,6 +1342,51 @@ pub fn failure_parts(e: &crate::client::ClientError) -> (String, String) {
 fn report_failure(qt: &QtHandle, op: &'static str, message: String) {
     tracing::warn!("{op} failed: {message}");
     let _ = qt.queue(move |q| q.operation_failed(QString::from(op), QString::from(&message)));
+}
+
+/// The same for a prerequisite check, which also gets its own signal so a
+/// consumer does not have to recognise it by the method name.
+fn report_prereqs_failure(qt: &QtHandle, message: String) {
+    tracing::warn!("system.check_prereqs failed: {message}");
+    let _ = qt.queue(move |mut q| {
+        q.as_mut().prereqs_check_failed(QString::from(&message));
+        q.operation_failed(
+            QString::from("system.check_prereqs"),
+            QString::from(&message),
+        )
+    });
+}
+
+/// The same for a repository inspection, which carries the path it was asked
+/// about: a dialog showing one repository must not report a failure for
+/// another it has since moved off.
+fn report_inspect_failure(qt: &QtHandle, path: String, message: String) {
+    tracing::warn!("repo.inspect failed for {path}: {message}");
+    let _ = qt.queue(move |mut q| {
+        q.as_mut()
+            .repo_inspect_failed(QString::from(&path), QString::from(&message));
+        q.operation_failed(QString::from("repo.inspect"), QString::from(&message))
+    });
+}
+
+/// The same for a failure that belongs to one workspace but is reported as a
+/// plain `operationFailed` today: both go out, so a consumer can move onto the
+/// typed one without the other changing under it.
+fn report_workspace_op_failure(
+    qt: &QtHandle,
+    workspace: String,
+    op: &'static str,
+    message: String,
+) {
+    tracing::warn!("{op} failed for {workspace}: {message}");
+    let _ = qt.queue(move |mut q| {
+        q.as_mut().workspace_op_failed(
+            QString::from(&workspace),
+            QString::from(op),
+            QString::from(&message),
+        );
+        q.operation_failed(QString::from(op), QString::from(&message))
+    });
 }
 
 /// Queues a `workspace_operation_failed` back onto the Qt thread. Used instead
@@ -1298,6 +1445,11 @@ fn end_destroy(qt: &QtHandle, workspace: String, message: String) {
     tracing::warn!("workspace.destroy failed for {workspace}: {message}");
     let _ = qt.queue(move |mut q| {
         q.as_mut().end_workspace_op(&workspace);
+        q.as_mut().workspace_op_failed(
+            QString::from(&workspace),
+            QString::from("workspace.destroy"),
+            QString::from(&message),
+        );
         q.operation_failed(QString::from("workspace.destroy"), QString::from(&message))
     });
 }
@@ -1429,7 +1581,7 @@ async fn run_prereq_check(client: &DaemonClient, qt: &QtHandle) -> bool {
     {
         Ok(res) => res.items,
         Err(e) => {
-            report_failure(qt, "system.check_prereqs", e.to_string());
+            report_prereqs_failure(qt, e.to_string());
             return false;
         }
     };
@@ -1451,22 +1603,45 @@ async fn run_prereq_check(client: &DaemonClient, qt: &QtHandle) -> bool {
         failed = failures.len(),
         "prerequisites checked"
     );
-    // Computed here rather than in C++: the transcript panes read a property,
-    // and deriving it from the JSON at each of them would put the same rule in
-    // as many places as there are panes. The credential store is read on this
-    // thread, off the Qt one, for the same reason the request above was.
-    let logged_in = claude_logged_in(&items, crate::qobjects::settings::api_key_set());
+    // Every question anyone downstream asks of this list is answered here,
+    // where it is already decoded: the window used to parse it again to count
+    // the failures and the controller a third time to classify them. The
+    // credential store is deliberately *not* read here -- it is read where the
+    // gate is composed, so a key stored between two checks still counts -- but
+    // the daemon's half of that answer comes out of this list.
+    let answer = PrereqAnswer {
+        json,
+        any_failed: !failures.is_empty(),
+        blocked: prereqs_blocking(&items),
+        claude_auth_ok: items
+            .iter()
+            .any(|item| item.name == CLAUDE_AUTH_PREREQ && item.ok),
+    };
     let _ = qt.queue(move |mut q| {
-        // Before the signal, so a pane the window rebuilds on `prereqsChecked`
-        // already sees the gate it is meant to draw.
-        q.as_mut().set_claude_logged_in(logged_in);
-        q.as_mut().rust_mut().prereqs_json = QString::from(&json);
-        q.as_mut().prereqs_checked(QString::from(&json));
+        q.as_mut().apply_prereqs(answer);
         if !failures.is_empty() {
             q.prereq_warning(QString::from(&failures.join("\n")));
         }
     });
     true
+}
+
+/// One prerequisite check, as the answers the UI actually asks for.
+///
+/// The list crosses the boundary as JSON because the setup page draws a row per
+/// entry, but nothing else parses it: the three booleans are what the status
+/// bar, the composer gate and the auto-open rule each wanted, and they are
+/// decided once, here, from the decoded reply.
+struct PrereqAnswer {
+    /// The list itself, as the setup page draws it.
+    json: String,
+    /// Whether anything failed, blocking or not.
+    any_failed: bool,
+    /// Whether any of what failed is one the IDE cannot work around.
+    blocked: bool,
+    /// The daemon's half of [`claude_logged_in`]; the key half is read from the
+    /// credential store whenever the gate is recomposed.
+    claude_auth_ok: bool,
 }
 
 /// Parses the options a dialog built and merges the stored API key in. An
@@ -1521,7 +1696,7 @@ async fn start_agent_and_prompt(
     {
         Ok(res) => res.agent_id,
         Err(e) => {
-            report_failure(&qt, "agent.start", e.to_string());
+            report_workspace_op_failure(&qt, workspace.to_string(), "agent.start", e.to_string());
             return;
         }
     };
@@ -1536,7 +1711,7 @@ async fn start_agent_and_prompt(
         text: initial_prompt,
     };
     if let Err(e) = shared.client.request_raw(Request::AgentSend(params)).await {
-        report_failure(&qt, "agent.send", e.to_string());
+        report_workspace_op_failure(&qt, workspace.to_string(), "agent.send", e.to_string());
     }
 }
 
@@ -2220,7 +2395,7 @@ impl qobject::AppController {
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(message) => {
-                report_failure(&qt, "repo.inspect", message.to_owned());
+                report_inspect_failure(&qt, path, message.to_owned());
                 return;
             }
         };
@@ -2237,7 +2412,7 @@ impl qobject::AppController {
                         q.repo_inspected(QString::from(&path), QString::from(&json))
                     });
                 }
-                Err(e) => report_failure(&qt, "repo.inspect", e.to_string()),
+                Err(e) => report_inspect_failure(&qt, path, e.to_string()),
             }
         });
     }
@@ -2277,14 +2452,16 @@ impl qobject::AppController {
 
     pub fn set_allowlist(self: Pin<&mut Self>, workspace_id: QString, hosts_json: QString) {
         let qt = self.qt_thread();
+        let workspace = workspace_id.to_string();
         let hosts: Vec<String> = match serde_json::from_str(&hosts_json.to_string()) {
             Ok(hosts) => hosts,
             Err(e) => {
                 // Refused here rather than sent on: an unparseable list would
                 // otherwise reach the daemon as an empty one and lock the
                 // workspace out of the network entirely.
-                report_failure(
+                report_workspace_op_failure(
                     &qt,
+                    workspace,
                     "workspace.set_allowlist",
                     format!("host list is not a JSON array of strings: {e}"),
                 );
@@ -2294,12 +2471,17 @@ impl qobject::AppController {
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(message) => {
-                report_failure(&qt, "workspace.set_allowlist", message.to_owned());
+                report_workspace_op_failure(
+                    &qt,
+                    workspace,
+                    "workspace.set_allowlist",
+                    message.to_owned(),
+                );
                 return;
             }
         };
         let params = WorkspaceSetAllowlistParams {
-            workspace_id: WorkspaceId(workspace_id.to_string()),
+            workspace_id: WorkspaceId(workspace.clone()),
             hosts,
         };
         runtime().spawn(async move {
@@ -2310,7 +2492,12 @@ impl qobject::AppController {
                 .request_raw(Request::WorkspaceSetAllowlist(params))
                 .await
             {
-                report_failure(&qt, "workspace.set_allowlist", e.to_string());
+                report_workspace_op_failure(
+                    &qt,
+                    workspace,
+                    "workspace.set_allowlist",
+                    e.to_string(),
+                );
             }
         });
     }
@@ -2399,21 +2586,37 @@ impl qobject::AppController {
         });
     }
 
-    pub fn prereqs_block(&self, json: QString) -> bool {
-        match serde_json::from_str::<Vec<PrereqStatus>>(&json.to_string()) {
-            Ok(items) => prereqs_blocking(&items),
-            // Unreadable is not blocking: the list is the daemon's own output,
-            // so failing to parse it is this build's problem, and hiding the
-            // workbench over it would leave the user nothing at all.
-            Err(e) => {
-                tracing::warn!("prereqs_block: unparseable prerequisite list: {e}");
-                false
-            }
-        }
+    pub fn prereqs_any_failed(&self) -> bool {
+        self.rust().prereqs_any_failed
     }
 
-    pub fn should_auto_open_setup(&self, blocked: bool, already_shown: bool) -> bool {
-        should_auto_open_setup(blocked, already_shown)
+    pub fn note_setup_shown(mut self: Pin<&mut Self>) {
+        self.as_mut().rust_mut().setup_prompt.note_shown();
+    }
+
+    /// Applies one prerequisite answer: the payload a setup page built later
+    /// draws from, the gate on every Claude composer, what the status bar shows
+    /// and whether Settings opens itself -- then the signal.
+    ///
+    /// Everything the window and the panes read is set before `prereqs_checked`
+    /// is emitted, so a pane rebuilt on that signal and the window's own
+    /// handler both see the answer that caused it rather than the one before.
+    /// The whole point of the struct is that nothing downstream parses the list
+    /// again: it is read once, where the daemon's reply is decoded.
+    fn apply_prereqs(mut self: Pin<&mut Self>, answer: PrereqAnswer) {
+        {
+            let mut rust = self.as_mut().rust_mut();
+            rust.prereqs_json = QString::from(&answer.json);
+            rust.prereqs_any_failed = answer.any_failed;
+            rust.claude_auth_ok = answer.claude_auth_ok;
+            rust.setup_prompt.checked(answer.blocked);
+        }
+        self.as_mut().refresh_claude_logged_in();
+        self.prereqs_checked(QString::from(&answer.json));
+    }
+
+    pub fn should_auto_open_setup(&self) -> bool {
+        self.rust().setup_prompt.should_open()
     }
 
     pub fn prereqs_json(&self) -> QString {
@@ -2446,7 +2649,7 @@ impl qobject::AppController {
         cleared
     }
 
-    /// Recomputes `claudeLoggedIn` from the last prerequisite list and the
+    /// Recomputes `claudeLoggedIn` from the last prerequisite answer and the
     /// credential store as it stands now.
     ///
     /// The prerequisite check is the usual trigger, but it is not the only one:
@@ -2454,17 +2657,13 @@ impl qobject::AppController {
     /// trip, and a composer that only reopened on the next check would leave a
     /// key-only user pressing "Log in to Claude Code…" after they had just
     /// supplied the credential in the section below it.
-    fn refresh_claude_logged_in(self: Pin<&mut Self>) {
-        let items: Vec<PrereqStatus> = {
-            let json = self.rust().prereqs_json.to_string();
-            if json.is_empty() {
-                Vec::new()
-            } else {
-                serde_json::from_str(&json).unwrap_or_default()
-            }
-        };
-        let logged_in = claude_logged_in(&items, crate::qobjects::settings::api_key_set());
-        self.set_claude_logged_in(logged_in);
+    ///
+    /// The daemon's half of [`claude_logged_in`] was decided when its answer
+    /// was decoded, so this re-reads the credential store and not the list.
+    fn refresh_claude_logged_in(mut self: Pin<&mut Self>) {
+        let logged_in =
+            self.as_ref().rust().claude_auth_ok || crate::qobjects::settings::api_key_set();
+        self.as_mut().set_claude_logged_in(logged_in);
     }
 
     pub fn api_key_set(&self) -> bool {
