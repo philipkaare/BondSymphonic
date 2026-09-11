@@ -28,12 +28,18 @@ inline bool isDark(const QPalette& palette) {
     return palette.base().color().lightness() < kDarkLightnessCutoff;
 }
 
-/// A line or a file that is new: green.
+/// A line or a file that is new: green. Also the IDE's one "in place", which
+/// is the same judgement told about something that is not a line: the tick on
+/// a prerequisite the daemon found.
 inline QColor added() {
     return QColor(0x2e, 0xa0, 0x43);
 }
 
-/// A line or a file that is gone: red.
+/// A line or a file that is gone: red. Also the IDE's one "wrong", which is
+/// the same judgement told about something that is not a line: an agent that
+/// failed, a prerequisite that is missing, a terminal that could not be
+/// reached. There is deliberately no separate error colour -- a second red
+/// would only be this one drifting.
 inline QColor removed() {
     return QColor(0xd0, 0x39, 0x33);
 }

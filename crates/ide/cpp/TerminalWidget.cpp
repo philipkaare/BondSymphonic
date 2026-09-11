@@ -1,8 +1,10 @@
 #include "TerminalWidget.h"
+#include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
 #include <QColor>
 #include <QFontDatabase>
 #include <QFontMetrics>
+#include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -14,6 +16,7 @@
 #include <QShowEvent>
 #include <QTimer>
 #include <QWheelEvent>
+#include <cstdint>
 #include <utility>
 
 namespace {
@@ -22,8 +25,6 @@ namespace {
 constexpr int kBlinkMs = 500;
 /// One wheel notch is 120 units of angle delta; three lines per notch.
 constexpr int kWheelUnitsPerLine = 40;
-/// The error banner's colour, matching the error tab colour in `GroupBar`.
-const QColor kErrorColour(0xeb, 0x57, 0x57);
 
 /// Maps character index -> UTF-16 offset in `text`, plus a final sentinel.
 ///
@@ -100,6 +101,12 @@ TerminalWidget::TerminalWidget(TerminalSession* session, QWidget* parent)
     });
 
     if (m_session) {
+        // The grid is parsed out of `rowsJson`, which is a property: this is
+        // the only way it can move, and it is set once per frame. `frame` is
+        // not the signal to invalidate on -- it also means "repaint" for a
+        // blink, a scroll or an error, none of which rewrite the grid.
+        QObject::connect(m_session, &TerminalSession::rowsJsonChanged, this,
+                         [this] { invalidateRows(); });
         // `frame` means "repaint now": it fires on output, scroll, resize and
         // error alike.
         QObject::connect(m_session, &TerminalSession::frame, this, [this] { update(); });
@@ -164,13 +171,33 @@ QSize TerminalWidget::minimumSizeHint() const {
     return QSize(8 * m_charWidth, 2 * m_lineHeight);
 }
 
+const QJsonArray& TerminalWidget::rows() {
+    if (m_parsedRowsValid) {
+        return m_parsedRows;
+    }
+    m_parsedRows = m_session.isNull()
+                       ? QJsonArray()
+                       : QJsonDocument::fromJson(m_session->getRowsJson().toUtf8()).array();
+    m_parsedRowsValid = true;
+    ++m_parsedRowsCount;
+    return m_parsedRows;
+}
+
+void TerminalWidget::invalidateRows() {
+    m_parsedRowsValid = false;
+}
+
+int TerminalWidget::rowsParseCount() const {
+    return m_parsedRowsCount;
+}
+
 void TerminalWidget::paintEvent(QPaintEvent*) {
     QPainter painter(this);
     painter.fillRect(rect(), palette().base());
     if (!m_session) {
         return;
     }
-    const QJsonArray rows = QJsonDocument::fromJson(m_session->getRowsJson().toUtf8()).array();
+    const QJsonArray& rows = this->rows();
     painter.setFont(m_font);
     paintRows(painter, rows);
     paintCursor(painter, rows);
@@ -293,7 +320,10 @@ void TerminalWidget::paintError(QPainter& painter) {
     const QFontMetrics metrics(font);
     const QRect box = metrics.boundingRect(rect(), Qt::AlignCenter | Qt::TextWordWrap, message);
     painter.fillRect(box.adjusted(-8, -4, 8, 4), palette().base());
-    painter.setPen(kErrorColour);
+    // `theme::removed` is the IDE's one red: a line that is gone, an agent
+    // that failed and a terminal that could not be reached are the same
+    // judgement, and `GroupBar` already reads it from there for its error tabs.
+    painter.setPen(theme::removed());
     painter.drawText(rect(), Qt::AlignCenter | Qt::TextWordWrap, message);
 }
 
@@ -330,8 +360,7 @@ void TerminalWidget::updateReopenButton() {
     const QString marker = m_session->restartMarker();
     bool restarted = false;
     if (m_session->getExited() && !marker.isEmpty()) {
-        const QJsonArray rows = QJsonDocument::fromJson(m_session->getRowsJson().toUtf8()).array();
-        for (const QJsonValue& value : rows) {
+        for (const QJsonValue& value : rows()) {
             if (value.toObject().value(QStringLiteral("text")).toString().contains(marker)) {
                 restarted = true;
                 break;
@@ -402,4 +431,30 @@ void TerminalWidget::showEvent(QShowEvent* event) {
 
 bool TerminalWidget::focusNextPrevChild(bool) {
     return false;
+}
+
+// --- offscreen test entries --------------------------------------------------
+//
+// See the note in `EditorArea.cpp`. `bs_widget_test_begin` must have run first.
+
+/// One frame, a hundred repaints. The cursor blinks twice a second over a
+/// shell that has printed nothing, and every one of those repaints used to
+/// re-parse the whole grid.
+extern "C" std::int32_t bs_widget_test_terminal_parses_its_rows_once_per_frame() {
+    TerminalSession session;
+    TerminalWidget widget(&session);
+    widget.resize(320, 240);
+    session.setRowsJson(QStringLiteral(
+        "[{\"text\":\"hello\",\"spans\":[{\"start\":0,\"len\":5}]}]"));
+    QImage canvas(widget.size(), QImage::Format_ARGB32);
+    for (int i = 0; i < 100; ++i) {
+        widget.render(&canvas);
+    }
+    const int parses = widget.rowsParseCount();
+    if (parses == 1) {
+        return 0;
+    }
+    // The count itself is the report: 100 says every repaint re-read the grid,
+    // 0 says nothing painted at all and the check proved nothing.
+    return parses == 0 ? 1 : parses;
 }

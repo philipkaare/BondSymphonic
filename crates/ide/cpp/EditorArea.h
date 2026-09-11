@@ -68,6 +68,11 @@ public:
     /// Returns whether the tab is gone: a cancelled prompt and a save still in
     /// flight both answer false, and the save closes the tab once the write has
     /// landed and nothing has been typed since.
+    ///
+    /// The question runs an event loop of its own, so a workspace destroyed
+    /// while it is up can take this tab before the answer gets back. That
+    /// answers true -- the tab is gone -- and nothing further is asked of the
+    /// page, which no longer exists.
     bool closeTab(int index);
 
     /// The open file tabs, per workspace, as
@@ -79,6 +84,14 @@ public:
     /// start-up would ask the daemon for both sides of each. A workspace with
     /// no file tabs is absent rather than present and empty.
     QString openEditorsJson() const;
+
+    /// How many tabs are waiting on a write before they close.
+    ///
+    /// A test seam. What a close must never leave behind is an entry here
+    /// keyed by a page that no longer exists -- a workspace destroyed while
+    /// the unsaved prompt was up takes the page with it -- and nothing else
+    /// about the area says whether one is there.
+    int pendingCloseCount() const;
 
 signals:
     /// A file tab was opened, closed or replaced, so `openEditorsJson` has

@@ -4,6 +4,7 @@
 #include <QStringList>
 #include <QString>
 #include <QToolBar>
+#include <functional>
 
 class AppController;
 class QAction;
@@ -73,6 +74,31 @@ public:
     void noteBranches(const QString& workspaceId, const QString& branch,
                       const QString& baseBranch);
 
+    /// Which confirmation an action puts in front of the user.
+    enum class Ask { Merge, Rebase, Squash, Pr, Discard };
+
+    /// What one came back with.
+    ///
+    /// `accepted` false is a cancelled prompt and the only field the caller
+    /// always reads; each of the others belongs to the one action that asked
+    /// for it.
+    struct Answer {
+        bool accepted = false;
+        /// Squash: the subject line for the squashed commit. Empty is a real
+        /// answer and lets the daemon take the workspace's last commit subject.
+        QString summary;
+        /// Create PR.
+        QString title;
+        QString body;
+        bool draft = false;
+    };
+
+    /// Replaces the confirmation every action puts up. The default is the
+    /// modal box, input dialog or `PrDialog` the action would show; this is the
+    /// seam that lets the answer -- and the pause while it is being given --
+    /// come from somewhere else.
+    void setConfirmPrompt(std::function<Answer(Ask)> ask);
+
 signals:
     /// Something to put in the status bar. `url` is empty for a plain message;
     /// when it is set the window shows the text as a link to it.
@@ -105,6 +131,10 @@ private:
                            const QString& dataJson);
     void onSummarized(const QString& workspaceId, const QString& json);
 
+    /// The prompt each action shows when nothing has replaced it: the one
+    /// place the five modals live.
+    Answer askModal(Ask ask);
+
     /// Greys the five actions out when there is no workspace, or when this
     /// workspace already has a request in flight.
     void updateActions();
@@ -113,16 +143,27 @@ private:
     /// the close-group runner or a destroy from the tab context menu greys this
     /// toolbar out too.
     bool busy(const QString& workspaceId) const;
-    /// Whether a request may be started for the current workspace. Only a
-    /// pre-check: the controller books the workspace in and refuses a second
-    /// one itself, and answers `workspaceBusyChanged` either way.
-    bool beginOperation();
+    /// Whether a request may be started for `workspaceId`. Only a pre-check:
+    /// the controller books the workspace in and refuses a second one itself,
+    /// and answers `workspaceBusyChanged` either way.
+    ///
+    /// Takes the workspace rather than reading `m_workspaceId`, so it checks
+    /// the one the confirmation named and not whatever the toolbar happens to
+    /// be pointed at by the time the confirmation is answered.
+    bool beginOperation(const QString& workspaceId);
 
-    /// The number of changed files in the current workspace, or -1 when the
-    /// daemon has not been asked or could not answer.
-    int changedFiles() const;
+    /// Whether the toolbar is still pointed at `workspaceId`; when it is not,
+    /// says on the status bar that `what` was called off, and answers false.
+    ///
+    /// Each of the five confirmations runs an event loop of its own, and the
+    /// Explorer moves this toolbar to whatever tab becomes active while one is
+    /// up. Every action asks this between its confirmation and its request, so
+    /// a yes given about one workspace can never be spent on another.
+    bool stillOn(const QString& workspaceId, const QString& what);
 
     QPointer<AppController> m_controller;
+    /// Never null: the constructor installs the modals.
+    std::function<Answer(Ask)> m_ask;
     QString m_workspaceId;
     QString m_name;
     QString m_branch;

@@ -1,8 +1,10 @@
 #include "SetupPage.h"
 #include "TerminalWidget.h"
+#include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
 #include <QClipboard>
+#include <QColor>
 #include <QDesktopServices>
 #include <QFont>
 #include <QFontMetrics>
@@ -20,6 +22,8 @@
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
+#include <cstdint>
+#include <utility>
 
 namespace {
 
@@ -46,6 +50,20 @@ constexpr int kMinLinkWidth = 40;
 
 SetupPage::SetupPage(AppController* controller, QWidget* parent)
     : QWidget(parent), m_controller(controller) {
+    m_closePty = [this](const QString& ptyId) {
+        if (m_session == nullptr) {
+            return;
+        }
+        // The session learns its own id a turn of the event loop after
+        // `attach`, and a page being torn down has no turn left, so it is told
+        // here before being asked to close.
+        m_session->setPtyId(ptyId);
+        m_session->close();
+        // Told once. The session closes whatever id it is still holding when it
+        // is destroyed a moment after this, and a second `pty.close` for a PTY
+        // the daemon has already reaped comes back an error.
+        m_session->setPtyId(QString());
+    };
     auto* outer = new QVBoxLayout(this);
 
     auto* subtitle = new QLabel(
@@ -162,6 +180,26 @@ SetupPage::SetupPage(AppController* controller, QWidget* parent)
     }
 }
 
+SetupPage::~SetupPage() {
+    // Nothing from the session may reach this page any more: it is half
+    // destroyed, and the close below can make the session emit.
+    if (m_session != nullptr) {
+        QObject::disconnect(m_session, nullptr, this, nullptr);
+    }
+    if (m_ptyId.isEmpty()) {
+        return;
+    }
+    const QString ptyId = m_ptyId;
+    m_ptyId.clear();
+    m_closePty(ptyId);
+}
+
+void SetupPage::setPtyCloser(std::function<void(const QString& ptyId)> close) {
+    if (close) {
+        m_closePty = std::move(close);
+    }
+}
+
 void SetupPage::applyPrereqs(const QString& json) {
     clearRows();
     const QJsonArray items = QJsonDocument::fromJson(json.toUtf8()).array();
@@ -230,7 +268,12 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
     layout->setContentsMargins(0, 2, 0, 2);
 
     auto* glyph = new QLabel(ok ? kOk : kBad, row);
-    glyph->setStyleSheet(ok ? "color:#4caf50" : "color:#eb5757");
+    // The IDE's two judgements, read from `theme` rather than written out
+    // again here: a prerequisite that is in place is the same green as a line
+    // that was added, and one that is missing the same red as a line that is
+    // gone, which is the red `GroupBar` already puts on a failed agent.
+    const QColor glyphColour = ok ? theme::added() : theme::removed();
+    glyph->setStyleSheet(QStringLiteral("color:%1").arg(glyphColour.name()));
     glyph->setFixedWidth(glyph->fontMetrics().horizontalAdvance(kBad) * 2);
     layout->addWidget(glyph);
 
@@ -242,6 +285,12 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
     layout->addWidget(label);
 
     auto* detailLabel = new QLabel(detail, row);
+    // The daemon wrote this sentence, and it names commands and paths. Left at
+    // `AutoText` a detail that happens to contain angle brackets is guessed to
+    // be HTML: the tags vanish from the row and what is left reads as a
+    // different sentence, and an `<img src=...>` in one would make the page
+    // fetch it.
+    detailLabel->setTextFormat(Qt::PlainText);
     detailLabel->setWordWrap(true);
     // Selectable so a failure can be pasted into a bug report.
     detailLabel->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
@@ -312,6 +361,12 @@ void SetupPage::onSetupPtyOpened(const QString& action, const QString& ptyId) {
     }
     m_pendingAction.clear();
     setActionsEnabled(true);
+    // Before `attach`, and kept here rather than read back off the session: the
+    // session learns its own id a turn of the event loop later, so a page torn
+    // down in between would have nothing to close and would leave a login
+    // prompt running in the distro with nobody attached. `attach` closes
+    // whatever PTY the session was holding before this one.
+    m_ptyId = ptyId;
     m_session->attach(ptyId, terminalCols(), terminalRows());
     m_terminal->setFocus();
 }
@@ -401,6 +456,9 @@ void SetupPage::resizeEvent(QResizeEvent* event) {
 }
 
 void SetupPage::onTerminalExited() {
+    // That PTY is spent: the daemon reaped it when the process ended, and
+    // closing it on the way out would only ask about a PTY that is gone.
+    m_ptyId.clear();
     // The link belonged to the process that has just ended. Whether the login
     // worked or not that URL is spent, and offering it afterwards would send
     // the user to a page that answers with an expired code.
@@ -419,4 +477,68 @@ int SetupPage::terminalCols() const {
 int SetupPage::terminalRows() const {
     const int rows = m_session == nullptr ? 0 : m_session->getRows();
     return rows > 0 ? rows : kTerminalRows;
+}
+
+// --- offscreen test entries --------------------------------------------------
+//
+// See the note in `EditorArea.cpp`. `bs_widget_test_begin` must have run first.
+
+namespace {
+
+/// One failing prerequisite the IDE knows how to fix, whose detail reads as
+/// markup. The daemon writes these details, and a `<b>` in one is text about a
+/// command, never a request for bold.
+const char* const kMarkupPrereq =
+    "[{\"name\":\"claude\",\"ok\":false,\"detail\":\"<b>x</b>\",\"fix_hint\":\"\"}]";
+
+/// The page's fix button for that row, or null.
+QPushButton* fixButton(const SetupPage& page) {
+    for (QPushButton* button : page.findChildren<QPushButton*>()) {
+        if (button->text() == QLatin1String("Install Claude Code")) {
+            return button;
+        }
+    }
+    return nullptr;
+}
+
+} // namespace
+
+/// A detail the daemon wrote is shown as the text it is.
+extern "C" std::int32_t bs_widget_test_setup_page_detail_is_plain_text() {
+    AppController controller;
+    SetupPage page(&controller);
+    controller.prereqsChecked(QString::fromUtf8(kMarkupPrereq));
+    for (QLabel* label : page.findChildren<QLabel*>()) {
+        if (label->text() == QLatin1String("<b>x</b>")) {
+            return label->textFormat() == Qt::PlainText ? 0 : 2;
+        }
+    }
+    // No label carries the detail at all: either the row was not built or the
+    // markup was already swallowed by a rich-text render.
+    return 1;
+}
+
+/// The page closes the host PTY it was given when it goes away.
+extern "C" std::int32_t bs_widget_test_setup_page_closes_its_pty() {
+    AppController controller;
+    QString closed;
+    {
+        SetupPage page(&controller);
+        page.setPtyCloser([&closed](const QString& ptyId) { closed = ptyId; });
+        controller.prereqsChecked(QString::fromUtf8(kMarkupPrereq));
+        QPushButton* fix = fixButton(page);
+        if (fix == nullptr) {
+            return 1;
+        }
+        // The request itself is deferred by a turn of the event loop, which is
+        // not running here; what the click does now is mark the action as the
+        // one being waited for, which is what makes the reply below this
+        // page's.
+        fix->click();
+        controller.setupPtyOpened(QStringLiteral("install_claude"), QStringLiteral("pty_7"));
+    }
+    if (closed != QStringLiteral("pty_7")) {
+        return 2;
+    }
+    return 0;
 }

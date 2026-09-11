@@ -9,6 +9,8 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QStringList>
+#include <cstdint>
+#include <utility>
 
 namespace {
 
@@ -67,6 +69,7 @@ QString changestoolbar::conflictList(const QString& conflictsJson) {
 
 ChangesToolbar::ChangesToolbar(AppController* controller, QWidget* parent)
     : QToolBar(parent), m_controller(controller) {
+    m_ask = [this](Ask ask) { return askModal(ask); };
     setObjectName(QStringLiteral("ChangesToolbar"));
     setMovable(false);
     setToolButtonStyle(Qt::ToolButtonTextOnly);
@@ -150,10 +153,6 @@ void ChangesToolbar::requestSummary(const QString& workspaceId) {
     m_controller->workspaceSummary(workspaceId);
 }
 
-int ChangesToolbar::changedFiles() const {
-    return changedFilesFor(m_workspaceId);
-}
-
 int ChangesToolbar::changedFilesFor(const QString& workspaceId) const {
     return m_changedFiles.value(workspaceId, -1);
 }
@@ -177,114 +176,193 @@ void ChangesToolbar::updateActions() {
     }
 }
 
-bool ChangesToolbar::beginOperation() {
+bool ChangesToolbar::beginOperation(const QString& workspaceId) {
     // Only a pre-check, and deliberately not a booking: the controller books the
     // workspace in when the call reaches it and refuses a second one itself, so
     // this is what stops the confirmation being *asked* rather than what makes
     // the interlock hold. `workspaceBusyChanged` greys the actions out a moment
     // later.
-    return !m_workspaceId.isEmpty() && !m_controller.isNull() && !busy(m_workspaceId);
+    return !workspaceId.isEmpty() && !m_controller.isNull() && !busy(workspaceId);
 }
 
+bool ChangesToolbar::stillOn(const QString& workspaceId, const QString& what) {
+    if (workspaceId == m_workspaceId) {
+        return true;
+    }
+    // Not sent to either one. The confirmation named the workspace it was
+    // about, so the user has not agreed to anything happening to the one the
+    // toolbar is pointed at now; and re-sending it to the workspace they did
+    // agree about is just as wrong, because they are no longer looking at it
+    // and the toolbar will report the answer under the wrong heading.
+    emit statusMessage(QStringLiteral("Workspace changed, %1 cancelled").arg(what), QString());
+    return false;
+}
+
+ChangesToolbar::Answer ChangesToolbar::askModal(Ask ask) {
+    Answer answer;
+    switch (ask) {
+    case Ask::Merge:
+    case Ask::Rebase: {
+        const bool rebase = ask == Ask::Rebase;
+        QMessageBox box(this);
+        box.setIcon(QMessageBox::Question);
+        box.setWindowTitle(rebase ? QStringLiteral("Rebase workspace")
+                                  : QStringLiteral("Merge workspace"));
+        box.setText(rebase ? QStringLiteral("Replay %1 (%2) onto %3 and fast-forward %3?")
+                                 .arg(m_name, m_branch, m_baseBranch)
+                           : QStringLiteral("Merge %1 (%2) into %3?")
+                                 .arg(m_name, m_branch, m_baseBranch));
+        box.setInformativeText(
+            QStringLiteral("The workspace and its branch stay; only %1 moves.").arg(m_baseBranch));
+        box.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
+        box.setDefaultButton(QMessageBox::Cancel);
+        answer.accepted = box.exec() == QMessageBox::Yes;
+        return answer;
+    }
+    case Ask::Squash: {
+        bool ok = false;
+        // Empty is a real answer, not a cancelled one: the daemon then takes
+        // the subject of the workspace's last commit, which is usually the
+        // right line.
+        const QString summary = QInputDialog::getText(
+            this, QStringLiteral("Squash workspace"),
+            QStringLiteral("Summary line for the squashed commit on %1\n(leave empty to use the "
+                           "workspace's last commit subject):")
+                .arg(m_baseBranch),
+            QLineEdit::Normal, QString(), &ok);
+        answer.accepted = ok;
+        answer.summary = summary.trimmed();
+        return answer;
+    }
+    case Ask::Pr: {
+        PrDialog dialog(m_name, m_branch, m_baseBranch, this);
+        answer.accepted = dialog.exec() == QDialog::Accepted;
+        answer.title = dialog.title();
+        answer.body = dialog.body();
+        answer.draft = dialog.draft();
+        return answer;
+    }
+    case Ask::Discard: {
+        // The count this box names is the one thing that talks a user out of a
+        // discard they did not mean, so it is asked for here -- rather than on
+        // every `changesLoaded`, which put one `workspace.summary` on the wire
+        // per burst of agent output for a number nothing was showing.
+        const QString workspaceId = m_workspaceId;
+        requestSummary(workspaceId);
+
+        QMessageBox box(this);
+        box.setIcon(QMessageBox::Warning);
+        box.setWindowTitle(QStringLiteral("Discard workspace"));
+        box.setText(QStringLiteral("Discard %1?").arg(m_name));
+        box.setInformativeText(discardWarning(changedFilesFor(workspaceId)));
+        box.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
+        box.setDefaultButton(QMessageBox::Cancel);
+        // `exec` runs its own event loop, so the answer to the request above
+        // arrives while the box is up and the sentence is rewritten under the
+        // user rather than being one tab switch out of date. The connection is
+        // scoped to the box, so it is gone the moment the box is.
+        if (!m_controller.isNull()) {
+            QObject::connect(m_controller, &AppController::workspaceSummarized, &box,
+                             [this, &box, workspaceId](const QString& answered, const QString&) {
+                                 // `onSummarized` is connected first and has
+                                 // already recorded the count by the time this
+                                 // runs.
+                                 if (answered == workspaceId) {
+                                     box.setInformativeText(
+                                         discardWarning(changedFilesFor(answered)));
+                                 }
+                             });
+        }
+        answer.accepted = box.exec() == QMessageBox::Yes;
+        return answer;
+    }
+    }
+    return answer;
+}
+
+void ChangesToolbar::setConfirmPrompt(std::function<Answer(Ask)> ask) {
+    if (ask) {
+        m_ask = std::move(ask);
+    }
+}
+
+// Every one of the four below reads the workspace once, before it asks, and
+// uses that id for the rest of the call. The confirmation runs a nested event
+// loop: the Explorer can switch tabs in it, and `setWorkspace` then points the
+// toolbar somewhere else while the box is still on screen. Reading
+// `m_workspaceId` after the answer is how a "Discard alpha?" that the user said
+// yes to destroys beta.
+
 void ChangesToolbar::onMerge(const QString& mode) {
-    if (m_workspaceId.isEmpty()) {
+    const QString workspaceId = m_workspaceId;
+    if (workspaceId.isEmpty()) {
         return;
     }
     const bool rebase = mode == QString::fromUtf8(kModeRebase);
-    QMessageBox box(this);
-    box.setIcon(QMessageBox::Question);
-    box.setWindowTitle(rebase ? QStringLiteral("Rebase workspace") : QStringLiteral("Merge workspace"));
-    box.setText(rebase ? QStringLiteral("Replay %1 (%2) onto %3 and fast-forward %3?")
-                             .arg(m_name, m_branch, m_baseBranch)
-                       : QStringLiteral("Merge %1 (%2) into %3?").arg(m_name, m_branch, m_baseBranch));
-    box.setInformativeText(
-        QStringLiteral("The workspace and its branch stay; only %1 moves.").arg(m_baseBranch));
-    box.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
-    box.setDefaultButton(QMessageBox::Cancel);
-    if (box.exec() != QMessageBox::Yes) {
+    if (!m_ask(rebase ? Ask::Rebase : Ask::Merge).accepted) {
         return;
     }
-    if (!beginOperation()) {
+    if (!stillOn(workspaceId,
+                 rebase ? QStringLiteral("rebase") : QStringLiteral("merge"))) {
         return;
     }
-    m_controller->mergeWorkspace(m_workspaceId, mode, QString());
+    if (!beginOperation(workspaceId)) {
+        return;
+    }
+    m_controller->mergeWorkspace(workspaceId, mode, QString());
 }
 
 void ChangesToolbar::onSquash() {
-    if (m_workspaceId.isEmpty()) {
+    const QString workspaceId = m_workspaceId;
+    if (workspaceId.isEmpty()) {
         return;
     }
-    bool ok = false;
-    // Empty is a real answer, not a cancelled one: the daemon then takes the
-    // subject of the workspace's last commit, which is usually the right line.
-    const QString summary = QInputDialog::getText(
-        this, QStringLiteral("Squash workspace"),
-        QStringLiteral("Summary line for the squashed commit on %1\n(leave empty to use the "
-                       "workspace's last commit subject):")
-            .arg(m_baseBranch),
-        QLineEdit::Normal, QString(), &ok);
-    if (!ok) {
+    const Answer answer = m_ask(Ask::Squash);
+    if (!answer.accepted) {
         return;
     }
-    if (!beginOperation()) {
+    if (!stillOn(workspaceId, QStringLiteral("squash"))) {
         return;
     }
-    m_controller->mergeWorkspace(m_workspaceId, QStringLiteral("squash"), summary.trimmed());
+    if (!beginOperation(workspaceId)) {
+        return;
+    }
+    m_controller->mergeWorkspace(workspaceId, QStringLiteral("squash"), answer.summary);
 }
 
 void ChangesToolbar::onCreatePr() {
-    if (m_workspaceId.isEmpty()) {
+    const QString workspaceId = m_workspaceId;
+    if (workspaceId.isEmpty()) {
         return;
     }
-    PrDialog dialog(m_name, m_branch, m_baseBranch, this);
-    if (dialog.exec() != QDialog::Accepted) {
+    const Answer answer = m_ask(Ask::Pr);
+    if (!answer.accepted) {
         return;
     }
-    if (!beginOperation()) {
+    if (!stillOn(workspaceId, QStringLiteral("pull request"))) {
         return;
     }
-    m_controller->createPr(m_workspaceId, dialog.title(), dialog.body(), dialog.draft());
+    if (!beginOperation(workspaceId)) {
+        return;
+    }
+    m_controller->createPr(workspaceId, answer.title, answer.body, answer.draft);
 }
 
 void ChangesToolbar::onDiscard() {
-    if (m_workspaceId.isEmpty()) {
-        return;
-    }
-    // The count this box names is the one thing that talks a user out of a
-    // discard they did not mean, so it is asked for here -- rather than on
-    // every `changesLoaded`, which put one `workspace.summary` on the wire per
-    // burst of agent output for a number nothing was showing.
     const QString workspaceId = m_workspaceId;
-    requestSummary(workspaceId);
-
-    QMessageBox box(this);
-    box.setIcon(QMessageBox::Warning);
-    box.setWindowTitle(QStringLiteral("Discard workspace"));
-    box.setText(QStringLiteral("Discard %1?").arg(m_name));
-    box.setInformativeText(discardWarning(changedFiles()));
-    box.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
-    box.setDefaultButton(QMessageBox::Cancel);
-    // `exec` runs its own event loop, so the answer to the request above
-    // arrives while the box is up and the sentence is rewritten under the
-    // user rather than being one tab switch out of date. The connection is
-    // scoped to the box, so it is gone the moment the box is.
-    if (!m_controller.isNull()) {
-        QObject::connect(m_controller, &AppController::workspaceSummarized, &box,
-                         [this, &box, workspaceId](const QString& answered, const QString&) {
-                             // `onSummarized` is connected first and has
-                             // already recorded the count by the time this runs.
-                             if (answered == workspaceId) {
-                                 box.setInformativeText(discardWarning(changedFilesFor(answered)));
-                             }
-                         });
-    }
-    if (box.exec() != QMessageBox::Yes) {
+    if (workspaceId.isEmpty()) {
         return;
     }
-    if (!beginOperation()) {
+    if (!m_ask(Ask::Discard).accepted) {
         return;
     }
-    m_controller->discardWorkspace(m_workspaceId);
+    if (!stillOn(workspaceId, QStringLiteral("discard"))) {
+        return;
+    }
+    if (!beginOperation(workspaceId)) {
+        return;
+    }
+    m_controller->discardWorkspace(workspaceId);
 }
 
 void ChangesToolbar::onMergeFinished(const QString& workspaceId, bool ok,
@@ -333,9 +411,11 @@ void ChangesToolbar::onPrCreated(const QString& workspaceId, const QString& url)
 
 void ChangesToolbar::onOperationFailed(const QString& workspaceId, const QString& op,
                                        const QString& message, const QString& dataJson) {
-    const QJsonObject data = QJsonDocument::fromJson(dataJson.toUtf8()).object();
-    const QString reason = data.value(QStringLiteral("reason")).toString();
-    const QString stderrText = data.value(QStringLiteral("stderr")).toString();
+    // Not `data`: `QWidget` has a member of that name, and a local hiding it
+    // is a warning this build treats as one to fix.
+    const QJsonObject payload = QJsonDocument::fromJson(dataJson.toUtf8()).object();
+    const QString reason = payload.value(QStringLiteral("reason")).toString();
+    const QString stderrText = payload.value(QStringLiteral("stderr")).toString();
 
     QString title = op;
     QString detail = message;
@@ -363,4 +443,118 @@ void ChangesToolbar::onSummarized(const QString& workspaceId, const QString& jso
     // daemon could not build.
     m_changedFiles.insert(workspaceId,
                           summary.value(QStringLiteral("changed_files")).toInt(-1));
+}
+
+// --- offscreen test entries --------------------------------------------------
+//
+// See the note in `EditorArea.cpp`: the widget checks live beside the widget
+// and answer a code. `bs_widget_test_begin` must have run first.
+//
+// The stand-in for a daemon is a real `AppController` that was never started.
+// `discardWorkspace` books the workspace in before it discovers it has no
+// connection, and un-books it through the Qt event loop, which is not running
+// here -- so `isWorkspaceBusy` says, synchronously and without a daemon,
+// exactly which workspace the toolbar acted on.
+
+namespace {
+
+/// One of the five actions: the object name of the `QAction` that starts it,
+/// and the line a user is owed when it is called off because the workspace
+/// moved under the confirmation.
+struct ToolbarAction {
+    const char* objectName;
+    const char* cancelled;
+};
+
+/// All five, because the mistake is the same one in each of them: the
+/// confirmation names one workspace and the request is addressed to whichever
+/// one the toolbar is pointed at when the answer comes back.
+const ToolbarAction kToolbarActions[] = {
+    { "ChangesMergeAction", "Workspace changed, merge cancelled" },
+    { "ChangesRebaseAction", "Workspace changed, rebase cancelled" },
+    { "ChangesSquashAction", "Workspace changed, squash cancelled" },
+    { "ChangesCreatePrAction", "Workspace changed, pull request cancelled" },
+    { "ChangesDiscardAction", "Workspace changed, discard cancelled" },
+};
+
+} // namespace
+
+/// The workspace moved while the confirmation was up: nothing may be sent, for
+/// either workspace, and the user has to be told why their click did nothing.
+///
+/// A failure answers 100, 200, 300 or 400 plus the index of the action it
+/// happened on, so the code says both what went wrong and which of the five it
+/// went wrong on.
+extern "C" std::int32_t bs_widget_test_changes_toolbar_cancels_a_switched_workspace() {
+    std::int32_t index = 0;
+    for (const ToolbarAction& action : kToolbarActions) {
+        // A controller of its own per action: the controller books a workspace
+        // in for as long as the request is out and never lets it go without an
+        // event loop, so a shared one would refuse the second action for a
+        // reason this check is not about.
+        AppController controller;
+        ChangesToolbar toolbar(&controller);
+        toolbar.setWorkspace(QStringLiteral("ws_1"), QStringLiteral("alpha"),
+                             QStringLiteral("bs/alpha"), QStringLiteral("main"));
+        QString status;
+        QObject::connect(&toolbar, &ChangesToolbar::statusMessage, &toolbar,
+                         [&status](const QString& text, const QString&) { status = text; });
+        toolbar.setConfirmPrompt([&toolbar](ChangesToolbar::Ask) {
+            // What the Explorer does when the active tab changes under a modal.
+            toolbar.setWorkspace(QStringLiteral("ws_2"), QStringLiteral("beta"),
+                                 QStringLiteral("bs/beta"), QStringLiteral("main"));
+            ChangesToolbar::Answer answer;
+            answer.accepted = true;
+            return answer;
+        });
+        auto* trigger = toolbar.findChild<QAction*>(QString::fromUtf8(action.objectName));
+        if (trigger == nullptr) {
+            return 100 + index;
+        }
+        trigger->trigger();
+        if (controller.isWorkspaceBusy(QStringLiteral("ws_1"))) {
+            return 200 + index;
+        }
+        if (controller.isWorkspaceBusy(QStringLiteral("ws_2"))) {
+            return 300 + index;
+        }
+        if (status != QString::fromUtf8(action.cancelled)) {
+            return 400 + index;
+        }
+        ++index;
+    }
+    return 0;
+}
+
+/// The control for the check above: an action whose workspace did not move
+/// still reaches the daemon, and reaches the workspace that was confirmed.
+extern "C" std::int32_t bs_widget_test_changes_toolbar_acts_on_the_confirmed_workspace() {
+    std::int32_t index = 0;
+    for (const ToolbarAction& action : kToolbarActions) {
+        AppController controller;
+        ChangesToolbar toolbar(&controller);
+        toolbar.setWorkspace(QStringLiteral("ws_1"), QStringLiteral("alpha"),
+                             QStringLiteral("bs/alpha"), QStringLiteral("main"));
+        QString status;
+        QObject::connect(&toolbar, &ChangesToolbar::statusMessage, &toolbar,
+                         [&status](const QString& text, const QString&) { status = text; });
+        toolbar.setConfirmPrompt([](ChangesToolbar::Ask) {
+            ChangesToolbar::Answer answer;
+            answer.accepted = true;
+            return answer;
+        });
+        auto* trigger = toolbar.findChild<QAction*>(QString::fromUtf8(action.objectName));
+        if (trigger == nullptr) {
+            return 100 + index;
+        }
+        trigger->trigger();
+        if (!controller.isWorkspaceBusy(QStringLiteral("ws_1"))) {
+            return 200 + index;
+        }
+        if (!status.isEmpty()) {
+            return 300 + index;
+        }
+        ++index;
+    }
+    return 0;
 }

@@ -1,12 +1,12 @@
 #pragma once
 #include <QFont>
+#include <QJsonArray>
 #include <QPointer>
 #include <QSize>
 #include <QString>
 #include <QWidget>
 
 class TerminalSession;
-class QJsonArray;
 class QPainter;
 class QPushButton;
 class QTimer;
@@ -37,6 +37,14 @@ public:
     QSize sizeHint() const override;
     QSize minimumSizeHint() const override;
 
+    /// How many times the widget has parsed the session's grid.
+    ///
+    /// A test seam. The grid changes once per frame and is repainted far more
+    /// often than that -- the cursor blinks twice a second over a shell that
+    /// has printed nothing -- and nothing else about the widget says whether a
+    /// repaint re-read it.
+    int rowsParseCount() const;
+
 protected:
     void paintEvent(QPaintEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
@@ -49,6 +57,13 @@ protected:
     bool focusNextPrevChild(bool next) override;
 
 private:
+    /// The session's grid, parsed once per frame and handed out as often as
+    /// the widget is painted.
+    const QJsonArray& rows();
+    /// The next reader parses again. Connected to the session's `rowsJson`,
+    /// which is the only thing that can move the grid.
+    void invalidateRows();
+
     void paintRows(QPainter& painter, const QJsonArray& rows);
     void paintCursor(QPainter& painter, const QJsonArray& rows);
     void paintExitLine(QPainter& painter);
@@ -67,6 +82,12 @@ private:
     void placeReopenButton();
 
     QPointer<TerminalSession> m_session;
+    /// The last parse of the session's `rowsJson`, and whether it still
+    /// describes the session.
+    QJsonArray m_parsedRows;
+    bool m_parsedRowsValid = false;
+    /// How many parses there have been. Test seam; see `rowsParseCount`.
+    int m_parsedRowsCount = 0;
     QFont m_font;
     /// Cell metrics, cached from `QFontMetrics` once in the constructor.
     int m_charWidth = 8;

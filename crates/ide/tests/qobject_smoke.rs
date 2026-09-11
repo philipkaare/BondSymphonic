@@ -1496,3 +1496,87 @@ fn setup_opens_itself_once_per_run_of_blocking_failures() {
     // is offered again rather than staying silent for the session.
     assert!(should_auto_open_setup(true, false));
 }
+
+/// The C++ widgets, driven offscreen.
+///
+/// The IDE's shell is Qt Widgets in `crates/ide/cpp` and its suites are Rust,
+/// so the checks that need a live widget are written beside the widget they are
+/// about and exported from its own translation unit as a plain C entry point.
+/// Each answers 0 for a pass and a small non-zero code naming the assertion
+/// that failed, which is all that has to cross the boundary.
+///
+/// One `#[test]`, with every entry called from it in turn: Qt allows widgets
+/// only on the thread that built the `QApplication`, and libtest hands each
+/// test function a thread of its own.
+mod cpp_widgets {
+    use bondsymphonic_ide::testing::skip_without_qt;
+
+    extern "C" {
+        /// Builds the offscreen `QApplication` the entries below need. Called
+        /// once; a second call is a no-op.
+        fn bs_widget_test_begin();
+        fn bs_widget_test_editor_area_survives_a_destroyed_workspace() -> i32;
+        fn bs_widget_test_changes_toolbar_cancels_a_switched_workspace() -> i32;
+        fn bs_widget_test_changes_toolbar_acts_on_the_confirmed_workspace() -> i32;
+        fn bs_widget_test_setup_page_detail_is_plain_text() -> i32;
+        fn bs_widget_test_setup_page_closes_its_pty() -> i32;
+        fn bs_widget_test_terminal_parses_its_rows_once_per_frame() -> i32;
+    }
+
+    /// Every widget check, in one run of one thread.
+    ///
+    /// The codes are printed as they come back rather than only at the end: a
+    /// use-after-free that takes the process with it leaves no assertion
+    /// message behind, and the last line printed is then what says which check
+    /// was running.
+    #[test]
+    fn widgets_behave_offscreen() {
+        if skip_without_qt("qobject_smoke::cpp_widgets") {
+            return;
+        }
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 6] = [
+            (
+                "EditorArea closes a tab under a destroyed workspace",
+                bs_widget_test_editor_area_survives_a_destroyed_workspace,
+            ),
+            (
+                "ChangesToolbar cancels an action whose workspace moved",
+                bs_widget_test_changes_toolbar_cancels_a_switched_workspace,
+            ),
+            (
+                "ChangesToolbar acts on the workspace it confirmed",
+                bs_widget_test_changes_toolbar_acts_on_the_confirmed_workspace,
+            ),
+            (
+                "SetupPage renders a daemon detail as text",
+                bs_widget_test_setup_page_detail_is_plain_text,
+            ),
+            (
+                "SetupPage closes the PTY it opened",
+                bs_widget_test_setup_page_closes_its_pty,
+            ),
+            (
+                "TerminalWidget parses its rows once per frame",
+                bs_widget_test_terminal_parses_its_rows_once_per_frame,
+            ),
+        ];
+
+        // SAFETY: each entry is a C function in this crate's own C++, takes
+        // nothing, returns a code and touches only widgets it builds itself.
+        // They run in sequence on this thread, which is the thread
+        // `bs_widget_test_begin` builds the QApplication on.
+        unsafe { bs_widget_test_begin() };
+        let mut failed = Vec::new();
+        for (what, run) in checks {
+            let code = unsafe { run() };
+            eprintln!("cpp_widgets: {what} -> {code}");
+            if code != 0 {
+                failed.push(format!("{what} (code {code})"));
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "offscreen widget checks failed: {failed:?}"
+        );
+    }
+}

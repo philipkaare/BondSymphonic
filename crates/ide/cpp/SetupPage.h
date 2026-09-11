@@ -2,6 +2,7 @@
 #include <QList>
 #include <QString>
 #include <QWidget>
+#include <functional>
 
 class AppController;
 class TerminalSession;
@@ -31,6 +32,19 @@ class SetupPage : public QWidget {
     Q_OBJECT
 public:
     explicit SetupPage(AppController* controller, QWidget* parent = nullptr);
+
+    /// Closes the terminal the page opened, if it still has one.
+    ///
+    /// The PTY the page asked the daemon for is a host process outside any
+    /// workspace. Nothing else knows about it: the page is the only thing that
+    /// was ever told its id, so a page that goes away without closing it leaves
+    /// a login prompt running in the distro with nobody attached.
+    ~SetupPage() override;
+
+    /// Replaces what the page does with that PTY when it is torn down. The
+    /// default tells the terminal session to close it; this is the seam a test
+    /// answers through.
+    void setPtyCloser(std::function<void(const QString& ptyId)> close);
 
 protected:
     /// Re-elides the sign-in URL: the label's width is only known once the
@@ -125,4 +139,11 @@ private:
     /// The fix buttons of the current rows, so they can be disabled together.
     /// Cleared with the rows they belong to.
     QList<QPushButton*> m_actionButtons;
+    /// The PTY the last `setupPtyOpened` named, empty once its process has
+    /// ended or it has been closed. Remembered here rather than read back off
+    /// the session, which learns the id a turn of the event loop later and so
+    /// cannot answer for a page that is being destroyed right now.
+    QString m_ptyId;
+    /// Never null: the constructor installs the session close.
+    std::function<void(const QString& ptyId)> m_closePty;
 };

@@ -4,17 +4,22 @@
 #include "EditorWidget.h"
 #include "bondsymphonic-ide/src/qobjects/diff_document.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/editor_document.cxxqt.h"
+#include <QApplication>
+#include <QCoreApplication>
+#include <QEvent>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLatin1Char>
 #include <QMessageBox>
+#include <QPointer>
 #include <QStackedWidget>
 #include <QTabBar>
 #include <QTabWidget>
 #include <QVBoxLayout>
 #include <QtGlobal>
+#include <cstdint>
 #include <utility>
 
 namespace {
@@ -261,37 +266,62 @@ void EditorArea::closeWorkspace(const QString& workspaceId) {
 }
 
 bool EditorArea::closeTab(int index) {
-    QWidget* page = m_tabs->widget(index);
-    if (page == nullptr) {
+    // Guarded rather than raw, because the question below runs a nested event
+    // loop and the page can be destroyed inside it.
+    QPointer<QWidget> page = m_tabs->widget(index);
+    if (page.isNull()) {
         return false;
     }
-    auto* editor = qobject_cast<EditorWidget*>(page);
-    if (EditorDocument* doc = dirtyDocument(page)) {
+    if (dirtyDocument(page) != nullptr) {
         // Asked once. A second close request while the write is out would only
         // put the same question up again over a tab that is already leaving.
         if (m_closing.contains(page)) {
             return false;
         }
         const Unsaved answer = m_ask(page->property(kTabTitle).toString(), false);
+        // The modal ran an event loop of its own, and everything the daemon
+        // had to say arrived in it. Destroying the workspace this tab belongs
+        // to closes its tabs, which takes the page, the editor inside it and
+        // that editor's document; the answer then comes back to a `page` that
+        // names freed memory. Nothing read before the question survives it, so
+        // every one of them is derived again here.
+        if (page.isNull() || m_tabs->indexOf(page) < 0) {
+            // Gone, by a route that did not come through this call. There is
+            // no tab left to save, to close, or to arm a close on -- an entry
+            // in `m_closing` keyed by this page would never be taken out
+            // again, and the pointer keying it names memory the next tab may
+            // be handed.
+            return true;
+        }
         if (answer == Unsaved::Cancel) {
             return false;
         }
-        if (answer == Unsaved::Save) {
+        EditorDocument* doc = dirtyDocument(page);
+        if (answer == Unsaved::Save && doc != nullptr) {
+            QWidget* const alive = page.data();
             PendingClose pending;
             pending.saved = QObject::connect(doc, &EditorDocument::saved, this,
-                                             [this, page] { onSavedForClose(page); });
+                                             [this, alive] { onSavedForClose(alive); });
             // A save that failed leaves the tab and its edits alone, and takes
             // the close with it: without this the connection would sit armed
             // and a save ten minutes later would close the tab by itself.
-            pending.failed = QObject::connect(doc, &EditorDocument::saveFailed, this,
-                                              [this, page](const QString&) { abandonClose(page); });
-            m_closing.insert(page, pending);
-            editor->save();
+            pending.failed =
+                QObject::connect(doc, &EditorDocument::saveFailed, this,
+                                 [this, alive](const QString&) { abandonClose(alive); });
+            m_closing.insert(alive, pending);
+            qobject_cast<EditorWidget*>(alive)->save();
             return false;
         }
+        // `Save` with nothing dirty left to write falls through with `Discard`:
+        // the write it would have waited for is never going to happen, and
+        // there is nothing in the buffer to lose.
     }
     removePage(page);
     return true;
+}
+
+int EditorArea::pendingCloseCount() const {
+    return static_cast<int>(m_closing.size());
 }
 
 void EditorArea::onSavedForClose(QWidget* page) {
@@ -382,4 +412,68 @@ int EditorArea::indexOfKey(const QString& key) const {
         }
     }
     return -1;
+}
+
+// --- offscreen test entries --------------------------------------------------
+//
+// The IDE's shell is C++ and its test suites are Rust, so the checks that need
+// a live widget are written here, beside the widget they are about, and
+// exported as plain C entry points that `crates/ide/tests/qobject_smoke.rs`
+// calls. Each answers 0 for a pass and a small non-zero code naming the
+// assertion that failed, which is all that has to cross the boundary.
+
+extern "C" void bs_widget_test_begin() {
+    if (QCoreApplication::instance() != nullptr) {
+        return;
+    }
+    // Offscreen unconditionally: the suite must never put a window on the
+    // developer's desktop, and no test here looks at a pixel.
+    qputenv("QT_QPA_PLATFORM", "offscreen");
+    static int argc = 1;
+    static char name[] = "bs-widget-tests";
+    static char* argv[] = { name, nullptr };
+    // Deliberately leaked. Qt wants the application to outlive every widget,
+    // and the test process ends with it.
+    new QApplication(argc, argv);
+}
+
+/// A dirty tab closed while the workspace it belongs to is destroyed under the
+/// prompt: the page, its editor and its document are all gone by the time the
+/// answer comes back, and nothing may be asked of any of them afterwards.
+extern "C" std::int32_t bs_widget_test_editor_area_survives_a_destroyed_workspace() {
+    EditorArea area;
+    // The area asks nothing of the daemon, so an unconnected process is
+    // enough: the document's `open` reports that it has no connection and the
+    // tab is otherwise a real one.
+    area.openFile(QStringLiteral("ws_1"), QStringLiteral("a.txt"));
+    EditorWidget* editor = area.currentEditor();
+    if (editor == nullptr || editor->document() == nullptr) {
+        return 1;
+    }
+    editor->document()->setDirty(true);
+    QPointer<QWidget> page = editor;
+    area.setUnsavedPrompt([&area](const QString&, bool) {
+        // What a real modal's nested event loop does when the workspace goes
+        // while the box is up: the tabs are removed and their deferred
+        // deletion is delivered before the answer gets back to `closeTab`.
+        area.closeWorkspace(QStringLiteral("ws_1"));
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        return EditorArea::Unsaved::Save;
+    });
+    // True: the question was answered, the tab is not there any more, and that
+    // is what the answer reports. Which of the two routes took it away is not
+    // something the caller can act on differently.
+    if (!area.closeTab(0)) {
+        return 2;
+    }
+    if (!page.isNull()) {
+        return 3;
+    }
+    // The close must not have been armed on a page that no longer exists: that
+    // entry would never be taken out again, and the pointer keying it names
+    // memory the next tab may be handed.
+    if (area.pendingCloseCount() != 0) {
+        return 4;
+    }
+    return 0;
 }
