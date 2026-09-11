@@ -1184,8 +1184,16 @@ port = {port}
     // The delay sweeps the mark across it: too early and the start is refused
     // before it began, too late and it finishes first, and one workspace put
     // back to `Ready` between attempts is all it takes to try again.
+    //
+    // The sweep reaches far past that couple of milliseconds because spawning
+    // a process is the slowest thing in the window and the one that suffers
+    // most when the machine is busy: with the rest of the suite running, the
+    // whole window can sit beyond where a 12 ms sweep ever marks, and every
+    // attempt is then refused for being too early. Reaching further costs
+    // nothing on an idle host, where the loop breaks at the first attempt that
+    // lands.
     let mut landed_in_the_window = false;
-    for micros in (0..12_000).step_by(250) {
+    for micros in (0..40_000).step_by(250) {
         d.set_state(&ws.id, WorkspaceState::Ready).await.unwrap();
         let _ = c.drain_events();
         let start = c

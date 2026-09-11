@@ -96,7 +96,7 @@ impl Registry {
             // insert or update rewrites the file anyway, so a data directory we
             // cannot write to is a reason to complain rather than to refuse to
             // start.
-            if let Err(e) = prepare(&mut inner, &written).write_now() {
+            if let Err(e) = prepare(&mut inner, &written).and_then(PendingWrite::write_now) {
                 tracing::warn!(path = %path.display(), error = %e, "could not rewrite the migrated registry");
             }
         }
@@ -133,7 +133,7 @@ impl Registry {
             let mut g = self.inner.write();
             g.workspaces.retain(|w| w.id != ws.id);
             g.workspaces.push(ws);
-            prepare(&mut g, &self.written)
+            prepare(&mut g, &self.written)?
         };
         write.commit().await
     }
@@ -152,7 +152,9 @@ impl Registry {
                 .ok_or_else(|| RpcError::not_found(format!("workspace {id}")))?;
             f(ws);
             let out = ws.clone();
-            (out, prepare(&mut g, &self.written))
+            let write = prepare(&mut g, &self.written)
+                .map_err(|e| RpcError::io(&std::io::Error::other(e.to_string())))?;
+            (out, write)
         };
         write
             .commit()
@@ -166,7 +168,7 @@ impl Registry {
             let mut g = self.inner.write();
             let pos = g.workspaces.iter().position(|w| &w.id == id);
             let removed = pos.map(|i| g.workspaces.remove(i));
-            (removed, prepare(&mut g, &self.written))
+            (removed, prepare(&mut g, &self.written)?)
         };
         write.commit().await?;
         Ok(removed)
@@ -189,21 +191,24 @@ struct PendingWrite {
 
 /// Serialises the registry as it stands and claims the next sequence number.
 /// Called with the registry's write lock held; does no I/O.
-fn prepare(inner: &mut Inner, written: &Arc<std::sync::Mutex<u64>>) -> PendingWrite {
-    inner.seq += 1;
+///
+/// The error is the serialisation, which a list of workspace records cannot
+/// realistically fail at -- but it is answered rather than swallowed, because
+/// the alternative to "this update failed" would be writing whatever came out
+/// of a failure over the daemon's only record of its workspaces.
+fn prepare(inner: &mut Inner, written: &Arc<std::sync::Mutex<u64>>) -> Result<PendingWrite> {
     let data = FileFormat {
         version: FORMAT_VERSION,
         workspaces: inner.workspaces.clone(),
     };
-    PendingWrite {
+    let bytes = serde_json::to_vec_pretty(&data)?;
+    inner.seq += 1;
+    Ok(PendingWrite {
         path: inner.path.clone(),
-        // The registry is a list of workspace records; serialising it cannot
-        // fail, and a `Result` here would only push an impossible error into
-        // every caller.
-        bytes: serde_json::to_vec_pretty(&data).unwrap_or_default(),
+        bytes,
         seq: inner.seq,
         written: written.clone(),
-    }
+    })
 }
 
 impl PendingWrite {
