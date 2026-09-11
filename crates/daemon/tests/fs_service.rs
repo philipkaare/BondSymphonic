@@ -68,9 +68,16 @@ fn list_read_write_roundtrip() {
     );
 }
 
+/// A symlink is listed as what the service can actually do with it: nothing.
+///
+/// The unix service walks a path one component at a time and refuses to follow
+/// a symlink at any of them, so a link to a directory is a folder that answers
+/// every click with a refusal. Reporting it as a directory was the Explorer
+/// advertising something it cannot open. It is listed, because it is really
+/// there and hiding it would be its own lie, but as a plain entry of no size.
 #[test]
 #[cfg(unix)]
-fn list_dir_follows_symlinks_to_directories_and_handles_dangling_links() {
+fn list_dir_reports_a_symlink_as_a_file_because_nothing_can_descend_into_one() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("wt");
     std::fs::create_dir_all(root.join("real_dir")).unwrap();
@@ -82,10 +89,10 @@ fn list_dir_follows_symlinks_to_directories_and_handles_dangling_links() {
 
     let link = l.entries.iter().find(|e| e.name == "link_dir").unwrap();
     assert!(
-        link.is_dir,
-        "a symlink to a directory must be listed as a directory"
+        !link.is_dir,
+        "a symlink must not be listed as a directory: nothing can descend into it"
     );
-    assert_eq!(link.size, 0);
+    assert_eq!(link.size, 0, "a symlink has no content to offer");
 
     let dangling = l.entries.iter().find(|e| e.name == "dangling").unwrap();
     assert!(
@@ -94,10 +101,77 @@ fn list_dir_follows_symlinks_to_directories_and_handles_dangling_links() {
     );
     assert_eq!(dangling.size, 0);
 
-    // Directories sort before regular files: link_dir (a directory) must
-    // come before z.txt (a plain file).
+    // The real directory still sorts before the plain files, and the link now
+    // sorts among them rather than with the directories.
     let idx = |n: &str| l.entries.iter().position(|e| e.name == n).unwrap();
-    assert!(idx("link_dir") < idx("z.txt"));
+    assert!(idx("real_dir") < idx("z.txt"));
+    assert!(idx("link_dir") > idx("real_dir"));
+}
+
+/// Refusing to follow a symlink and refusing to leave the worktree are two
+/// different answers, and the service has to say which one it gave.
+///
+/// Every symlink is refused, including one that points squarely inside the
+/// worktree, because the walk cannot tell the two apart without following the
+/// link -- which is the thing it must not do. Answering an in-tree
+/// `docs -> shared/docs` with "path escapes the worktree" told the user their
+/// own repository was trying to break out. The containment message is reserved
+/// for containment; a link gets a message about links.
+#[test]
+#[cfg(unix)]
+fn a_symlink_is_refused_with_its_own_message_not_the_containment_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("wt");
+    std::fs::create_dir_all(root.join("shared/docs")).unwrap();
+    std::fs::write(root.join("shared/docs/x.txt"), "x").unwrap();
+    std::fs::write(root.join("real.txt"), "real").unwrap();
+    // Both links point inside the worktree: nothing here is an escape attempt.
+    std::os::unix::fs::symlink(root.join("shared/docs"), root.join("docs")).unwrap();
+    std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+
+    let refused = |what: &str, e: bondsymphonic_proto::RpcError| {
+        assert_eq!(e.code, ErrorCode::InvalidParams, "{what}: {e:?}");
+        assert!(
+            e.message.contains("symlinks are not followed"),
+            "{what}: expected the symlink message, got {:?}",
+            e.message
+        );
+        assert!(
+            !e.message.contains("escapes the worktree"),
+            "{what}: an in-tree link must not be reported as an escape: {:?}",
+            e.message
+        );
+    };
+
+    // The link as an intermediate component of the path.
+    refused(
+        "read through a linked directory",
+        fs::read_file(&root, "docs/x.txt").unwrap_err(),
+    );
+    refused(
+        "write through a linked directory",
+        fs::write_file(&root, "docs/y.txt", "y").unwrap_err(),
+    );
+    // The same links as the final component, which each call opens its own way.
+    refused(
+        "list a linked directory",
+        fs::list_dir(&root, "docs").unwrap_err(),
+    );
+    refused(
+        "read a linked file",
+        fs::read_file(&root, "link.txt").unwrap_err(),
+    );
+    refused(
+        "write a linked file",
+        fs::write_file(&root, "link.txt", "y").unwrap_err(),
+    );
+
+    // The refusal is total: neither write reached the link's target.
+    assert_eq!(
+        std::fs::read_to_string(root.join("real.txt")).unwrap(),
+        "real"
+    );
+    assert!(!root.join("shared/docs/y.txt").exists());
 }
 
 #[test]

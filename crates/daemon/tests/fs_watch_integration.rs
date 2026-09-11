@@ -226,10 +226,28 @@ async fn watch_reports_relative_paths_debounced_and_ignores_target_dir() {
     cancel.cancel();
 }
 
+/// Serialises the two tests that either measure this process's inotify watches
+/// or install thousands of them.
+///
+/// The count below is per *process*, not per watcher, and the harness runs the
+/// whole file on threads of its own. `enabling_a_big_tree_does_not_block_other_workspaces_watches`
+/// installs about 5,000 watches; overlapping the measurement window it would
+/// inflate the reading into a false "node_modules/ is being watched", or, if
+/// its watcher were dropped inside the window, push the subtraction below zero
+/// and panic. Neither test is slow, so taking turns costs nothing.
+///
+/// A `tokio::sync::Mutex` rather than a `std` one: the guard is held across
+/// `.await` in both tests, and this one has no poisoning, so a failure in one
+/// test reports itself rather than reappearing as a poisoned-lock panic in the
+/// other.
+static WATCH_COUNT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// How many inotify watches this process holds, summed over every inotify
 /// descriptor it has open. The kernel lists them in `/proc/self/fdinfo/<fd>`,
 /// one `inotify wd:` line per watch, so this is the watcher's real footprint
 /// against `max_user_watches` rather than anything the daemon claims.
+///
+/// Only ever read while [`WATCH_COUNT`] is held.
 #[cfg(target_os = "linux")]
 fn inotify_watch_count() -> usize {
     std::fs::read_dir("/proc/self/fdinfo")
@@ -255,6 +273,7 @@ fn inotify_watch_count() -> usize {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn ignored_directories_are_not_watched_and_new_directories_are() {
+    let _serial = WATCH_COUNT.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let repo = init_repo(dir.path());
     let (port, token, _daemon, cancel) = start_daemon(dir.path()).await;
@@ -339,6 +358,9 @@ async fn ignored_directories_are_not_watched_and_new_directories_are() {
 /// timing measured is the lock's and not the connection's.
 #[tokio::test]
 async fn enabling_a_big_tree_does_not_block_other_workspaces_watches() {
+    // Held for the whole test: the 5,000 watches this installs must not be in
+    // place while the test above is counting this process's watches.
+    let _serial = WATCH_COUNT.lock().await;
     use bondsymphonic_daemon::fs_watch::Watchers;
     use bondsymphonic_daemon::server::broadcast::{EventBus, EVENT_BUS_CAPACITY};
     use std::sync::Arc;

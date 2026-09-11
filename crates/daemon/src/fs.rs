@@ -10,6 +10,12 @@
 //! that the kernel refuses to follow through a symlink, so what is opened is
 //! exactly what was checked. On Windows, where the daemon exists only for the
 //! test suite, the path is canonicalised and checked against the root.
+//!
+//! A symlink refused on the way and a path that left the worktree are two
+//! different answers and are worded as two: the walk refuses every link,
+//! in-tree ones included, so most refusals are not escapes and must not be
+//! reported as one. `list_dir` matches, listing a link as a plain entry rather
+//! than as a folder nothing can then open.
 
 use bondsymphonic_proto::*;
 use std::path::{Component, Path, PathBuf};
@@ -222,8 +228,17 @@ mod unix {
         RpcError::io(&std::io::Error::from_raw_os_error(e as i32))
     }
 
-    fn escapes() -> RpcError {
-        RpcError::invalid_params(ESCAPES)
+    /// What a symlink anywhere on a path is refused with. Deliberately not
+    /// [`ESCAPES`]: the walk refuses every link, including one pointing
+    /// squarely inside the worktree, because it cannot tell the two apart
+    /// without following the link -- which is the thing it must not do. Telling
+    /// a user that their own in-tree `docs -> shared/docs` was trying to break
+    /// out of the worktree would be a false accusation, and it would spend the
+    /// containment message on the case that is not a containment failure.
+    const SYMLINK: &str = "symlinks are not followed";
+
+    fn not_followed() -> RpcError {
+        RpcError::invalid_params(SYMLINK)
     }
 
     /// What the kernel answers when `O_NOFOLLOW` meets a symlink: `ELOOP` on
@@ -272,10 +287,10 @@ mod unix {
             match openat(Some(parent.as_raw_fd()), name, flags, Mode::empty()) {
                 // SAFETY: `openat` just returned this descriptor and nothing else owns it.
                 Ok(fd) => return Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
-                Err(e) if is_symlink_refusal(e) => return Err(escapes()),
+                Err(e) if is_symlink_refusal(e) => return Err(not_followed()),
                 // A symlink and a plain file in the way both come back as
-                // `ENOTDIR`; the one that was an escape attempt is named as one.
-                Err(Errno::ENOTDIR) if is_symlink(parent, name) => return Err(escapes()),
+                // `ENOTDIR`; the one that was a link is named as one.
+                Err(Errno::ENOTDIR) if is_symlink(parent, name) => return Err(not_followed()),
                 Err(Errno::ENOTDIR) => return Err(RpcError::invalid_params("not a directory")),
                 Err(Errno::ENOENT) if create => {
                     match mkdirat(
@@ -407,27 +422,28 @@ mod unix {
             if os_name.as_bytes() == b".git" {
                 continue;
             }
-            // Stat through the handle, following a symlink so a linked
-            // directory is listed as one rather than as a file the size of the
-            // link; a dangling link falls back to the link's own metadata just
-            // to confirm it exists, and is listed as a zero-size file.
-            let (is_dir, size) = match fstatat(Some(dirfd), os_name.as_os_str(), AtFlags::empty()) {
-                Ok(st) => {
-                    let is_dir = SFlag::from_bits_truncate(st.st_mode).contains(SFlag::S_IFDIR);
-                    (is_dir, if is_dir { 0 } else { st.st_size as u64 })
-                }
-                Err(_) => {
-                    if fstatat(
-                        Some(dirfd),
-                        os_name.as_os_str(),
-                        AtFlags::AT_SYMLINK_NOFOLLOW,
-                    )
-                    .is_err()
-                    {
-                        continue;
-                    }
-                    (false, 0)
-                }
+            // Stat the entry itself, never what a link points at. Following
+            // the link would list a linked directory as a directory, and the
+            // client would then be told "symlinks are not followed" for every
+            // call that tried to open the folder it had just been shown. A
+            // link is listed -- it is really there, and hiding it would be its
+            // own lie -- as a plain entry of no size, which is exactly what
+            // this service can do with it. That covers a dangling link too,
+            // with no second stat to fall back on.
+            let Ok(st) = fstatat(
+                Some(dirfd),
+                os_name.as_os_str(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) else {
+                // Gone between the `readdir` and the stat: not an entry any more.
+                continue;
+            };
+            let kind = SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT;
+            let is_dir = kind == SFlag::S_IFDIR;
+            let size = if is_dir || kind == SFlag::S_IFLNK {
+                0
+            } else {
+                st.st_size as u64
             };
             entries.push(FileEntry {
                 name: os_name.to_string_lossy().into_owned(),
@@ -453,7 +469,7 @@ mod unix {
             Mode::empty(),
         ) {
             Ok(fd) => fd,
-            Err(e) if is_symlink_refusal(e) => return Err(escapes()),
+            Err(e) if is_symlink_refusal(e) => return Err(not_followed()),
             Err(Errno::ENOENT) => return Err(RpcError::not_found(rel)),
             Err(e) => return Err(io_err(e)),
         };
@@ -478,7 +494,7 @@ mod unix {
             Ok(st) => {
                 let kind = SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT;
                 if kind == SFlag::S_IFLNK {
-                    return Err(escapes());
+                    return Err(not_followed());
                 }
                 (kind == SFlag::S_IFREG).then(|| Mode::from_bits_truncate(st.st_mode & 0o7777))
             }

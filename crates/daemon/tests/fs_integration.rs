@@ -77,7 +77,7 @@ async fn fs_list_read_write_over_the_protocol() {
 /// that window. Each test here runs the swap in a tight loop on one thread
 /// while the service is called on another, and asserts what must hold whatever
 /// the interleaving: nothing lands outside, nothing outside is read, and every
-/// call is either a success or the containment error.
+/// call is either a success or a refusal.
 #[cfg(unix)]
 mod symlink_races {
     use bondsymphonic_daemon::fs;
@@ -132,8 +132,13 @@ mod symlink_races {
         }
     }
 
-    fn is_escape_refusal(e: &bondsymphonic_proto::RpcError) -> bool {
-        e.code == ErrorCode::InvalidParams && e.message.contains("escapes the worktree")
+    /// The refusal that says the call met the swapper's symlink, rather than
+    /// finding the directory simply missing that round. The service refuses a
+    /// link without following it, so it never learns that this particular one
+    /// pointed outside, and says so in the link's own words rather than in the
+    /// containment message.
+    fn is_symlink_refusal(e: &bondsymphonic_proto::RpcError) -> bool {
+        e.code == ErrorCode::InvalidParams && e.message.contains("symlinks are not followed")
     }
 
     #[test]
@@ -147,15 +152,15 @@ mod symlink_races {
         let stop = Arc::new(AtomicBool::new(false));
         let swap = swapper(&wt, &outside, stop.clone());
         let mut outcomes = Vec::new();
-        let mut escapes_refused = 0;
+        let mut links_refused = 0;
         for i in 0..ROUNDS {
             let r = fs::write_file(&wt, "notes/config", &format!("round {i}"));
             assert!(
                 is_ok_or_refused(&r),
                 "round {i}: a write may succeed or be refused, not {r:?}"
             );
-            if r.as_ref().is_err_and(is_escape_refusal) {
-                escapes_refused += 1;
+            if r.as_ref().is_err_and(is_symlink_refusal) {
+                links_refused += 1;
             }
             outcomes.push(r.is_ok());
             let stray: Vec<_> = std::fs::read_dir(&outside)
@@ -171,10 +176,10 @@ mod symlink_races {
         stop.store(true, Ordering::Relaxed);
         swap.join().unwrap();
         // The swapper was really racing, or the test proved nothing: some
-        // writes went through, and some met the symlink and were named as escapes.
+        // writes went through, and some met the symlink and were refused for it.
         assert!(
-            outcomes.iter().any(|ok| *ok) && escapes_refused > 0,
-            "the race never bit: {} of {ROUNDS} writes succeeded, {escapes_refused} refused as escapes",
+            outcomes.iter().any(|ok| *ok) && links_refused > 0,
+            "the race never bit: {} of {ROUNDS} writes succeeded, {links_refused} refused as links",
             outcomes.iter().filter(|ok| **ok).count()
         );
     }
@@ -190,7 +195,7 @@ mod symlink_races {
 
         let stop = Arc::new(AtomicBool::new(false));
         let swap = swapper(&wt, &outside, stop.clone());
-        let mut escapes_refused = 0;
+        let mut links_refused = 0;
         for i in 0..ROUNDS {
             match fs::read_file(&wt, "notes/secret") {
                 Ok(r) => panic!("round {i}: read a file from outside the worktree: {r:?}"),
@@ -199,8 +204,8 @@ mod symlink_races {
                         is_ok_or_refused::<()>(&Err(e.clone())),
                         "round {i}: unexpected error {e:?}"
                     );
-                    if is_escape_refusal(&e) {
-                        escapes_refused += 1;
+                    if is_symlink_refusal(&e) {
+                        links_refused += 1;
                     }
                 }
             }
@@ -208,7 +213,7 @@ mod symlink_races {
         stop.store(true, Ordering::Relaxed);
         swap.join().unwrap();
         assert!(
-            escapes_refused > 0,
+            links_refused > 0,
             "the race never bit: no read met the symlink"
         );
     }
