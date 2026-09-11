@@ -1308,21 +1308,9 @@ void MainWindow::onOperationFailed(const QString& op, const QString& message) {
     if (takeRoutedFailure(message)) {
         return;
     }
-    // The two compatibility branches below are the failures `AppController`
-    // still reports on this signal alone, both on the path where the request
-    // never reaches the daemon because there is no connection. They go when
-    // those two call sites report through the typed signals as the rest do.
-    if (op == QLatin1String("agent.start")) {
-        // No workspace is named, so every mark comes down; only one start is
-        // ever in flight.
-        m_agentArea->clearStarting();
-    }
-    if (op == QLatin1String("system.check_prereqs")) {
-        onPrereqsCheckFailed(message);
-        // Routed, not deferred: nothing follows this one.
-        takeRoutedFailure(message);
-        return;
-    }
+    // Nothing is told apart by its method name here any more: a failure that
+    // reaches this handler is one no family claimed, and a box over the window
+    // is what the window has to say about it.
     reportFailure(op, message);
 }
 
