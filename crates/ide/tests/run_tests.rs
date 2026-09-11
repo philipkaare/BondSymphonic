@@ -9,7 +9,8 @@
 //! settled without a Qt event loop.
 
 use bondsymphonic_ide::model::run_config::{
-    denial_owner, may_queue_denial, parse_run_state, run_state_word, RunLog, RunView, WorkspaceRuns,
+    denial_owner, may_queue_denial, parse_run_state, run_state_word, Detection, RunLog, RunView,
+    WorkspaceRuns,
 };
 use bondsymphonic_ide::qobjects::run_panel::{detection_to_apply, needs_resubscribe};
 use bondsymphonic_proto::{RunConfig, RunConfigSource, RunId, RunInfo, RunState};
@@ -611,35 +612,35 @@ fn starting_a_config_again_replaces_the_run_it_kept() {
     );
 }
 
-/// `run.list` failing says nothing about what is running. Answering it with an
-/// empty list took every run off the screen, dropped the logs that explain them
-/// and ended their subscriptions -- for a workspace whose dev server was still
-/// serving -- and a connection that drops mid-request is exactly when it
-/// happened. Detection failing is different: a worktree with nothing runnable
-/// in it is an ordinary state of the panel.
+/// The two halves of a detection round fail differently, and `detection_to_apply`
+/// is where that asymmetry lives. Detection failing leaves a worktree with
+/// nothing runnable in it, which is an ordinary state of the panel, so it still
+/// produces something to apply. A failed `run.list` produces nothing at all.
 #[test]
-fn a_run_list_that_failed_leaves_the_panel_alone() {
+fn a_failed_detection_still_applies_but_a_failed_run_list_does_not() {
     assert_eq!(
-        detection_to_apply(vec![config("dev", 5173)], vec!["bad toml".to_owned()], None),
+        detection_to_apply(
+            Some((vec![config("dev", 5173)], vec!["bad toml".to_owned()])),
+            None,
+        ),
         None,
-        "a failed run.list applies nothing at all, not even the configs"
+        "a failed run.list applies nothing at all, not even the configs it did read"
     );
 
     let detected = detection_to_apply(
-        Vec::new(),
-        Vec::new(),
+        None,
         Some(vec![info("run_1", "dev", RunState::Ready, 41873)]),
     )
-    .expect("a run list that answered is applied");
+    .expect("a failed detection is still applied");
     assert!(
         detected.configs.is_empty(),
         "detection failing is an empty combo, which is the truth about that worktree"
     );
-    assert_eq!(detected.runs.len(), 1);
+    assert!(detected.warnings.is_empty());
+    assert_eq!(detected.runs.len(), 1, "the list it did read is applied");
 
     let both = detection_to_apply(
-        vec![config("dev", 5173)],
-        vec!["bad toml".to_owned()],
+        Some((vec![config("dev", 5173)], vec!["bad toml".to_owned()])),
         Some(Vec::new()),
     )
     .expect("both halves answered");
@@ -648,18 +649,101 @@ fn a_run_list_that_failed_leaves_the_panel_alone() {
     assert!(both.runs.is_empty(), "an empty list really is empty");
 }
 
+/// `run.list` failing says nothing about what is running. Answering that silence
+/// with an empty list took every run off the screen, dropped the logs that
+/// explain them and ended their subscriptions -- for a workspace whose dev
+/// server was still serving -- and a connection that drops mid-request is
+/// exactly when it happened.
+///
+/// The run ids this answers with are what drives the panel's stale-run sweep and
+/// its `watch_run` calls, so `None` is also what leaves the subscriptions alone.
+#[test]
+fn a_run_list_that_failed_leaves_the_runs_logs_and_subscriptions_alone() {
+    let mut runs = WorkspaceRuns::default();
+    runs.apply_detection(Some(Detection {
+        configs: vec![config("dev", 5173)],
+        warnings: Vec::new(),
+        runs: vec![info("run_1", "dev", RunState::Ready, 41873)],
+    }))
+    .expect("a detection that answered is applied");
+    runs.apply_output("run_1", "serving on 5173");
+    let before = runs.runs_json();
+
+    assert_eq!(
+        runs.apply_detection(None),
+        None,
+        "no ids to follow means the panel keeps every subscription it has"
+    );
+    assert_eq!(
+        runs.runs_json(),
+        before,
+        "the runs are exactly as they were, states and detail included"
+    );
+    assert_eq!(
+        runs.log_text("run_1"),
+        "serving on 5173",
+        "the output that explains the run is not dropped with it"
+    );
+    assert_eq!(
+        runs.configs.len(),
+        1,
+        "nor are the configurations it could still start"
+    );
+
+    // And a round that did answer is applied in full, which is what makes the
+    // check above mean something.
+    let ids = runs
+        .apply_detection(Some(Detection {
+            configs: vec![config("api", 8080)],
+            warnings: vec!["bad toml".to_owned()],
+            runs: vec![info("run_2", "api", RunState::Ready, 41874)],
+        }))
+        .expect("a detection that answered is applied");
+    assert_eq!(ids, vec!["run_2".to_owned()], "the ids the panel follows");
+    assert_eq!(runs.configs[0].name, "api");
+    assert_eq!(runs.warnings, vec!["bad toml".to_owned()]);
+    assert_eq!(runs.log_text("run_1"), "", "run_1 is gone now, and its log");
+}
+
 /// A denial arrives from the proxy on its own event, and a workspace being
 /// destroyed does not stop the fetch that was already in flight. Queuing it
 /// under a workspace the panel has forgotten put the entry back: a workspace
 /// with a toast nothing can answer, runs nobody will list, and a `setWorkspace`
 /// that would find state waiting for a workspace that no longer exists.
+///
+/// Destroyed is the only case. A workspace the panel simply holds nothing for
+/// yet is the ordinary one -- entries are made by `setWorkspace`, which the
+/// window calls for the tab that just became active, so in a restored session
+/// every tab but one has none -- and those are precisely the denials the queue
+/// exists to hold until that tab is shown.
 #[test]
-fn a_denial_for_a_workspace_the_panel_forgot_is_dropped() {
-    assert!(may_queue_denial(true, "ws_1", "example.com"));
+fn a_denial_is_dropped_only_for_a_workspace_that_was_destroyed() {
     assert!(
-        !may_queue_denial(false, "ws_1", "example.com"),
-        "a workspace the panel holds nothing for is one it has forgotten"
+        may_queue_denial(false, "ws_1", "example.com"),
+        "a workspace that was never destroyed queues its denial, shown or not"
     );
-    assert!(!may_queue_denial(true, "", "example.com"));
-    assert!(!may_queue_denial(true, "ws_1", ""));
+    assert!(
+        !may_queue_denial(true, "ws_1", "example.com"),
+        "a workspace `forgetWorkspace` ran for has nothing left to answer a toast"
+    );
+    assert!(!may_queue_denial(false, "", "example.com"));
+    assert!(!may_queue_denial(false, "ws_1", ""));
+}
+
+/// The other half of that: what `noteDenied`'s `or_default()` builds for a
+/// workspace whose tab has never been active is an empty `WorkspaceRuns`, and
+/// the host has to survive in it until `setWorkspace` pumps the queue.
+#[test]
+fn a_denial_for_a_workspace_never_shown_waits_to_be_offered() {
+    let mut fresh = WorkspaceRuns::default();
+    assert!(fresh.note_denied("example.com"), "queued on a bare entry");
+    assert_eq!(
+        fresh.current_denial(),
+        Some("example.com"),
+        "and offered the moment that workspace is shown"
+    );
+    assert!(
+        fresh.runs.is_empty() && fresh.configs.is_empty(),
+        "holding a denial does not invent runs or configurations for it"
+    );
 }

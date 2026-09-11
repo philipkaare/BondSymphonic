@@ -136,18 +136,38 @@ pub fn denial_owner(
 
 /// Whether a blocked host may be queued for `workspace`.
 ///
-/// `known` is whether the panel is holding state for that workspace at all.
-/// Only a workspace it knows: `forget_workspace` drops that state when the
-/// workspace is destroyed, and the proxy's report of a fetch the run made on its
-/// way down arrives behind it. Creating the entry to hold the denial brought the
-/// workspace back -- a toast raised for a workspace that no longer exists, which
-/// `allowHost` would then answer by editing the allowlist of a workspace the
-/// daemon has already thrown away.
+/// `destroyed` is whether the panel has been told that workspace is *gone* --
+/// that `forget_workspace` ran for it. The proxy's report of a fetch the run
+/// made on its way down arrives behind that, and creating an entry to hold the
+/// denial brought the workspace back: a toast raised for a workspace that no
+/// longer exists, which `allowHost` would then answer by editing the allowlist
+/// of a workspace the daemon has already thrown away.
+///
+/// Only that. "Destroyed" is not the same as "the panel is holding nothing for
+/// it yet", and reading the absence of an entry as a denial to drop was a bug of
+/// its own: entries are created by `setWorkspace`, which the window calls for
+/// the tab that just became active, so in a restored session every tab but one
+/// has no entry. Those denials are exactly the ones the per-workspace queue
+/// exists for -- a host blocked behind another tab waits until that workspace is
+/// shown -- and dropping them meant the user was never told at all.
 ///
 /// An empty workspace or host is refused for the same reason `noteDenied` is
 /// worth guarding at all: the toast has to name something a user can answer for.
-pub fn may_queue_denial(known: bool, workspace: &str, host: &str) -> bool {
-    known && !workspace.is_empty() && !host.is_empty()
+pub fn may_queue_denial(destroyed: bool, workspace: &str, host: &str) -> bool {
+    !destroyed && !workspace.is_empty() && !host.is_empty()
+}
+
+/// One finished round of detection, as the panel applies it.
+///
+/// Built by `detection_to_apply` and consumed by
+/// [`WorkspaceRuns::apply_detection`]; it exists so that "what a detection round
+/// does to a workspace" is one decision in one place rather than something the
+/// QObject spells out between two `rust_mut()` borrows.
+#[derive(Debug, Default, PartialEq)]
+pub struct Detection {
+    pub configs: Vec<RunConfig>,
+    pub warnings: Vec<String>,
+    pub runs: Vec<RunInfo>,
 }
 
 /// Everything the Run panel holds for one workspace.
@@ -241,6 +261,36 @@ impl WorkspaceRuns {
     pub fn selected_config(&self) -> Option<&RunConfig> {
         let name = self.selected.as_ref()?;
         self.configs.iter().find(|c| &c.name == name)
+    }
+
+    /// Applies one finished round of detection, and answers with the run ids
+    /// the panel must be following afterwards.
+    ///
+    /// `None` in means `run.list` did not answer, and `None` out means the
+    /// panel changes nothing: not the runs, not their logs, and not the
+    /// subscriptions, because the caller's stale-run sweep is driven by the ids
+    /// this returns. A failed list says nothing at all about what is running,
+    /// and answering that silence with an empty list is what made the panel
+    /// destroy its own state -- every run off the screen, their logs dropped
+    /// with them, their subscriptions ended -- for a workspace whose dev server
+    /// was still serving and still printing. A connection that drops
+    /// mid-request is exactly when that happens.
+    ///
+    /// A detection that failed is not the same kind of failure and does not
+    /// reach here as `None`: it arrives as empty configurations, because a
+    /// worktree with nothing runnable in it is an ordinary state of the panel
+    /// and an empty combo is a true thing to paint.
+    pub fn apply_detection(&mut self, detection: Option<Detection>) -> Option<Vec<String>> {
+        let Detection {
+            configs,
+            warnings,
+            runs,
+        } = detection?;
+        let ids = runs.iter().map(|r| r.run_id.to_string()).collect();
+        self.set_configs(configs);
+        self.set_warnings(warnings);
+        self.apply_list(runs);
+        Some(ids)
     }
 
     /// Replaces the run list from `run.list`. Detail already known for a run

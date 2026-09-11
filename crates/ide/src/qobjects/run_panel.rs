@@ -12,7 +12,7 @@
 //! moves JSON and signals across the boundary and owns the subscriptions.
 
 use crate::client::router::EventRx;
-use crate::model::run_config::{denial_owner, may_queue_denial, WorkspaceRuns};
+use crate::model::run_config::{denial_owner, may_queue_denial, Detection, WorkspaceRuns};
 use crate::qobjects::app_controller::{
     connection_generation, on_reconnect, require_connection, runtime, state_store, Shared,
 };
@@ -21,7 +21,7 @@ use bondsymphonic_proto::{
     RunListResult, RunStartParams, RunStartResult, RunState, WorkspaceId, WorkspaceIdParams,
     WorkspaceInfo, WorkspaceSetAllowlistParams,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -234,34 +234,30 @@ pub fn warning_status(warnings: &[String]) -> String {
     }
 }
 
-/// One finished round of detection, as the panel applies it.
-#[derive(Debug, Default, PartialEq)]
-pub struct Detection {
-    pub configs: Vec<RunConfig>,
-    pub warnings: Vec<String>,
-    pub runs: Vec<RunInfo>,
-}
-
 /// What a finished detection hands the panel, or `None` when it must change
 /// nothing.
 ///
-/// The two halves are not equals. `repo.detect_run_configs` failing leaves a
-/// worktree with nothing runnable in it, which is an ordinary state of the
-/// panel: an empty combo is a true thing to paint, and the next refresh fills it
-/// in.
+/// Both halves arrive as `Option`s, each `None` when its request failed, and the
+/// two are deliberately not treated as equals.
+///
+/// `repo.detect_run_configs` failing leaves a worktree with nothing runnable in
+/// it, which is an ordinary state of the panel: an empty combo is a true thing
+/// to paint, and the next refresh fills it in. So a `None` detection still
+/// produces a [`Detection`], carrying no configurations and no warnings.
 ///
 /// `run.list` failing says nothing at all about what is running, and answering
 /// that with an empty list is what made the panel destroy its own state: every
 /// run off the screen, their logs dropped with them, their subscriptions ended
-/// by `apply_detection`'s stale-run sweep -- for a workspace whose dev server
-/// was still serving and still printing. A connection that drops mid-request is
-/// exactly when that happens, and the runs come back on the next refresh only if
-/// they were never forgotten.
+/// by the stale-run sweep -- for a workspace whose dev server was still serving
+/// and still printing. A connection that drops mid-request is exactly when that
+/// happens, and the runs come back on the next refresh only if they were never
+/// forgotten. So a `None` list produces nothing to apply at all, and
+/// [`WorkspaceRuns::apply_detection`] leaves the workspace as it was.
 pub fn detection_to_apply(
-    configs: Vec<RunConfig>,
-    warnings: Vec<String>,
+    detected: Option<(Vec<RunConfig>, Vec<String>)>,
     runs: Option<Vec<RunInfo>>,
 ) -> Option<Detection> {
+    let (configs, warnings) = detected.unwrap_or_default();
     Some(Detection {
         configs,
         warnings,
@@ -307,6 +303,18 @@ pub struct RunPanelModelRust {
     /// Which workspace each known run belongs to. Run events carry a run id
     /// and the envelope's workspace id is not something this depends on.
     run_workspace: BTreeMap<String, String>,
+    /// Workspaces `forget_workspace` has been called for: destroyed, not merely
+    /// unvisited. Only a denial for one of these is dropped, because the proxy
+    /// reports a fetch the dying run made after the workspace is already gone.
+    /// The absence of a `by_workspace` entry cannot stand in for this -- entries
+    /// are created by `set_workspace`, so every tab that has not been activated
+    /// yet has none, and those denials are the ones the queue exists to hold.
+    ///
+    /// One short id per workspace destroyed in this run of the IDE, which is a
+    /// deliberate user action taken a handful of times at most; there is nothing
+    /// here worth bounding, and evicting an id would let exactly the late denial
+    /// this guards against back in.
+    destroyed: BTreeSet<String>,
     /// One entry per run being followed.
     subscriptions: BTreeMap<String, Subscription>,
     /// The `(workspace, host)` the toast is showing, or `None` when none is up.
@@ -341,12 +349,14 @@ fn report(qt: &QtHandle, message: String) {
 /// Detects the configurations of `worktree` and lists `workspace`'s runs, then
 /// applies both in one closure so the combo and the run list never disagree.
 ///
-/// Detection failing is reported and answered with an empty list; `run.list`
-/// failing is reported and applies nothing at all. [`detection_to_apply`] says
-/// why the two are not the same kind of failure.
+/// Each half is `None` when its request failed. Nothing is decided here:
+/// [`detection_to_apply`] says why the two failures are not the same kind, and
+/// [`WorkspaceRuns::apply_detection`] carries out whichever it produced. An
+/// empty worktree is a detection that succeeded and found nothing, which is why
+/// it is `Some` of two empty vectors rather than `None`.
 async fn detect_and_list(shared: Shared, qt: QtHandle, workspace: String, worktree: String) {
-    let (configs, warnings) = if worktree.is_empty() {
-        (Vec::new(), Vec::new())
+    let detected = if worktree.is_empty() {
+        Some((Vec::new(), Vec::new()))
     } else {
         let params = RepoPathParams {
             path: worktree.clone(),
@@ -356,10 +366,10 @@ async fn detect_and_list(shared: Shared, qt: QtHandle, workspace: String, worktr
             .request::<DetectRunConfigsResult>(Request::RepoDetectRunConfigs(params))
             .await
         {
-            Ok(res) => (res.configs, res.warnings),
+            Ok(res) => Some((res.configs, res.warnings)),
             Err(e) => {
                 report(&qt, format!("repo.detect_run_configs failed: {e}"));
-                (Vec::new(), Vec::new())
+                None
             }
         }
     };
@@ -377,13 +387,7 @@ async fn detect_and_list(shared: Shared, qt: QtHandle, workspace: String, worktr
             None
         }
     };
-    let Some(detection) = detection_to_apply(configs, warnings, runs) else {
-        // The panel keeps everything it had, subscriptions included, and the
-        // error is already on its way to the view. `end_request` still has to
-        // run, or the spinner never stops.
-        let _ = qt.queue(|q| q.end_request());
-        return;
-    };
+    let detection = detection_to_apply(detected, runs);
     let _ = qt.queue(move |q| q.apply_detection(workspace, detection));
 }
 
@@ -429,6 +433,9 @@ impl qobject::RunPanelModel {
             let mut rust = self.as_mut().rust_mut();
             rust.by_workspace.entry(workspace.clone()).or_default();
             rust.worktrees.insert(workspace.clone(), worktree.clone());
+            // Being shown a workspace is the window saying it exists, which
+            // settles it however it was marked before.
+            rust.destroyed.remove(&workspace);
         }
         // Whatever is already known about this workspace is painted at once;
         // the detection below refreshes it when it answers.
@@ -664,17 +671,20 @@ impl qobject::RunPanelModel {
     pub fn note_denied(mut self: Pin<&mut Self>, workspace_id: QString, host: QString) {
         let workspace = workspace_id.to_string();
         let host = host.to_string();
-        let known = self.as_ref().rust().by_workspace.contains_key(&workspace);
-        if !may_queue_denial(known, &workspace, &host) {
+        let destroyed = self.as_ref().rust().destroyed.contains(&workspace);
+        if !may_queue_denial(destroyed, &workspace, &host) {
             tracing::debug!("noteDenied: nothing to queue {host:?} on for {workspace:?}");
             return;
         }
+        // `or_default` on purpose: a workspace whose tab has never been the
+        // active one holds nothing yet, and its denial waits here until
+        // `setWorkspace` shows it.
         let queued = {
             let mut rust = self.as_mut().rust_mut();
-            match rust.by_workspace.get_mut(&workspace) {
-                Some(entry) => entry.note_denied(&host),
-                None => false,
-            }
+            rust.by_workspace
+                .entry(workspace.clone())
+                .or_default()
+                .note_denied(&host)
         };
         let showing = self.as_ref().rust().workspace_id.to_string() == workspace;
         // Only a host that reached the head of the queue is offered now: the
@@ -701,6 +711,10 @@ impl qobject::RunPanelModel {
             let mut rust = self.as_mut().rust_mut();
             rust.by_workspace.remove(&workspace);
             rust.worktrees.remove(&workspace);
+            // Remembered, so a denial the proxy reports for the fetch this
+            // workspace's run made on its way down is dropped rather than
+            // bringing the entry back.
+            rust.destroyed.insert(workspace.clone());
         }
         if self.as_ref().rust().workspace_id.to_string() == workspace {
             self.as_mut().set_workspace_id(QString::from(""));
@@ -795,24 +809,24 @@ impl qobject::RunPanelModel {
     /// Applied to the workspace it was asked about even if the user has since
     /// switched tabs -- it is that workspace's own answer -- but published only
     /// while that workspace is the one on screen.
-    fn apply_detection(mut self: Pin<&mut Self>, workspace: String, detection: Detection) {
+    fn apply_detection(mut self: Pin<&mut Self>, workspace: String, detection: Option<Detection>) {
+        // Before any early return: the spinner has to stop whether or not there
+        // is anything to apply.
         self.as_mut().end_request();
-        let Detection {
-            configs,
-            warnings,
-            runs,
-        } = detection;
-        let ids: Vec<String> = runs.iter().map(|r| r.run_id.to_string()).collect();
-        {
+        let ids = {
             let mut rust = self.as_mut().rust_mut();
             // Gone: the workspace was destroyed while this was in flight.
             let Some(entry) = rust.by_workspace.get_mut(&workspace) else {
                 return;
             };
-            entry.set_configs(configs);
-            entry.set_warnings(warnings);
-            entry.apply_list(runs);
-        }
+            entry.apply_detection(detection)
+        };
+        // `run.list` did not answer. The runs, their logs and their
+        // subscriptions stay exactly as they were, and the error is already on
+        // its way to the view.
+        let Some(ids) = ids else {
+            return;
+        };
         // The daemon's list is authoritative: a run it no longer has is one
         // this panel stops following, so `subscriptions` and the run list stay
         // in step even after a daemon restart lost a run without an event.
