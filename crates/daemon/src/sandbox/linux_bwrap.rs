@@ -97,6 +97,17 @@ static SPAWNER: OnceLock<tokio::sync::mpsc::UnboundedSender<SpawnerJob>> = OnceL
 /// so the channel is never closed and `blocking_recv` never returns `None`.
 /// That is the whole point — see the module documentation. Thread names are
 /// capped at 15 bytes by the kernel, which [`SPAWNER_THREAD`] stays inside.
+///
+/// A job that panics is caught rather than allowed to end the loop. Ending it
+/// would be the worst version of the bug this thread exists to prevent: every
+/// live `bwrap` has armed `PR_SET_PDEATHSIG` against this one thread, so the
+/// kernel would SIGKILL every sandbox in the daemon at once, and the sender in
+/// the `static` would outlive its receiver so that every later
+/// `workspace.create` failed until a restart. `f` is a `Command::spawn`, which
+/// answers an `io::Result` rather than panicking — except that
+/// `tokio::process::Command::spawn` panics when the runtime it is entered into
+/// has no process driver. That is not how this daemon builds its runtime, so
+/// the guard is for the panic nobody predicted rather than for a known one.
 fn spawner() -> &'static tokio::sync::mpsc::UnboundedSender<SpawnerJob> {
     SPAWNER.get_or_init(|| {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SpawnerJob>();
@@ -104,12 +115,35 @@ fn spawner() -> &'static tokio::sync::mpsc::UnboundedSender<SpawnerJob> {
             .name(SPAWNER_THREAD.to_string())
             .spawn(move || {
                 while let Some(job) = rx.blocking_recv() {
-                    job();
+                    // `AssertUnwindSafe` because the job owns everything it
+                    // touches: it is a `FnOnce` that is dropped either way, and
+                    // what it borrows across the boundary is the channel this
+                    // loop keeps reading from.
+                    if let Err(payload) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+                    {
+                        tracing::error!(
+                            thread = SPAWNER_THREAD,
+                            "a sandbox spawn panicked: {}; the spawner thread is carrying on, \
+                             because ending it would kill every sandbox in this daemon",
+                            panic_message(&payload)
+                        );
+                    }
                 }
             })
             .expect("starting the bwrap spawner thread");
         tx
     })
+}
+
+/// What a caught panic said, for the two payload types `panic!` produces.
+/// Anything else is reported as unprintable rather than dropped silently.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a panic payload that is not a string")
 }
 
 /// Runs `f` on the spawner thread and awaits its answer.
@@ -133,8 +167,10 @@ async fn on_the_spawner_thread<T: Send + 'static>(
     spawner()
         .send(job)
         .map_err(|_| sandbox_error("the bwrap spawner thread is gone".to_string()))?;
+    // No answer means the job panicked: the spawner thread catches that and
+    // carries on, and the sender went with the job it was part of.
     rx.await
-        .map_err(|_| sandbox_error("the bwrap spawner thread dropped the job".to_string()))
+        .map_err(|_| sandbox_error("the sandbox spawn panicked; see the log".to_string()))
 }
 
 /// Where the daemon binary is bound when its own path is hidden inside the
@@ -495,6 +531,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(name.as_deref(), Some(SPAWNER_THREAD));
+    }
+
+    /// Every live sandbox has armed `PR_SET_PDEATHSIG` against the spawner
+    /// thread, so a panic that ended it would SIGKILL all of them at once and
+    /// leave every later `workspace.create` with a sender whose receiver is
+    /// gone. The thread has to outlive a job that panics.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_job_does_not_take_the_spawner_thread_with_it() {
+        let before = on_the_spawner_thread(|| std::thread::current().id())
+            .await
+            .unwrap();
+
+        // The default hook would print this test's deliberate panic and read as
+        // a failure in the suite's output, so it is silenced for the one call.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let answer = on_the_spawner_thread(|| panic!("a sandbox spawn went wrong")).await;
+        std::panic::set_hook(hook);
+        assert!(
+            answer.is_err(),
+            "a job that panicked must not be reported as an answer"
+        );
+
+        let after = on_the_spawner_thread(|| std::thread::current().id())
+            .await
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "the spawner thread must be the same one after a job panicked"
+        );
     }
 
     /// The spawner thread is not part of any runtime, so a

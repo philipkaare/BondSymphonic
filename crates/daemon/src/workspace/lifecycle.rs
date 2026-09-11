@@ -377,7 +377,13 @@ fn watch_sandbox(
         // the listener it is about to need.
         d.proxies.stop_generation(&id, proxy);
         tracing::warn!(ws = %id, "sandbox died");
-        let _ = d.set_state(&id, WorkspaceState::SandboxDown).await;
+        // Nobody is waiting on this one -- there is no request behind it to
+        // answer -- so a registry that would not take the write can only say so
+        // here. Without that line the workspace goes on reading `Ready` in
+        // `workspace.list` with no sandbox behind it and nothing said about why.
+        if let Err(e) = d.set_state(&id, WorkspaceState::SandboxDown).await {
+            tracing::warn!(ws = %id, error = %e.message, "could not record the sandbox as down");
+        }
     });
 }
 
