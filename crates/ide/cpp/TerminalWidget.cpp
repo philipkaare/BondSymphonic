@@ -1,22 +1,29 @@
 #include "TerminalWidget.h"
 #include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
+#include <QAction>
+#include <QClipboard>
 #include <QColor>
+#include <QContextMenuEvent>
 #include <QFontDatabase>
 #include <QFontMetrics>
+#include <QGuiApplication>
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeyEvent>
 #include <QList>
+#include <QMenu>
 #include <QPainter>
 #include <QPushButton>
+#include <QStringList>
 #include <QPalette>
 #include <QShowEvent>
 #include <QTimer>
 #include <QWheelEvent>
 #include <cstdint>
+#include <functional>
 #include <utility>
 
 namespace {
@@ -63,6 +70,29 @@ QColor spanColour(const QString& hex, const QColor& fallback) {
     return parsed.isValid() ? parsed : fallback;
 }
 
+/// Whether this key press is the user asking to paste rather than something
+/// to send to the program.
+///
+/// Three spellings, because all three are in the fingers of somebody using a
+/// terminal: Ctrl+V is what the rest of the desktop uses and what this IDE's
+/// own editor uses, Ctrl+Shift+V is what terminal emulators use because the
+/// shell wanted plain Ctrl+V for itself, and Shift+Insert is what X11
+/// terminals have always used.
+///
+/// Alt disqualifies all of them. Windows reports AltGr as Ctrl+Alt, and on the
+/// Danish and German layouts that is how characters are typed -- a paste that
+/// swallowed those would be worse than no paste at all.
+bool isPasteShortcut(const QKeyEvent* event) {
+    const Qt::KeyboardModifiers modifiers = event->modifiers();
+    if (modifiers.testFlag(Qt::AltModifier)) {
+        return false;
+    }
+    if (event->key() == Qt::Key_V && modifiers.testFlag(Qt::ControlModifier)) {
+        return true;
+    }
+    return event->key() == Qt::Key_Insert && modifiers.testFlag(Qt::ShiftModifier);
+}
+
 } // namespace
 
 TerminalWidget::TerminalWidget(TerminalSession* session, QWidget* parent)
@@ -75,6 +105,12 @@ TerminalWidget::TerminalWidget(TerminalSession* session, QWidget* parent)
     m_charWidth = qMax(1, metrics.horizontalAdvance(QStringLiteral("M")));
     m_lineHeight = qMax(1, metrics.lineSpacing());
     m_ascent = metrics.ascent();
+
+    m_paste = [this](const QString& text) {
+        if (m_session) {
+            m_session->paste(text);
+        }
+    };
 
     setFocusPolicy(Qt::StrongFocus);
     // Every paint fills the whole rect, so Qt need not clear it first.
@@ -161,6 +197,23 @@ void TerminalWidget::maybeOpen() {
     m_cols = qMax(2, width() / m_charWidth);
     m_rows = qMax(1, height() / m_lineHeight);
     m_session->open(m_pendingWorkspace, m_cols, m_rows, m_pendingCommand);
+}
+
+void TerminalWidget::paste(const QString& text) {
+    if (text.isEmpty()) {
+        return;
+    }
+    m_paste(text);
+}
+
+void TerminalWidget::pasteFromClipboard() {
+    paste(QGuiApplication::clipboard()->text());
+}
+
+void TerminalWidget::setPasteSink(std::function<void(const QString& text)> sink) {
+    if (sink) {
+        m_paste = std::move(sink);
+    }
 }
 
 QSize TerminalWidget::sizeHint() const {
@@ -337,11 +390,33 @@ void TerminalWidget::paintError(QPainter& painter) {
 }
 
 void TerminalWidget::keyPressEvent(QKeyEvent* event) {
+    // Before the session, and whether or not there is one: Ctrl+V reaches a
+    // terminal as the control code 0x16, so a paste forwarded as a key press
+    // is a paste silently thrown away. The sign-in code `claude auth login`
+    // asks for arrives on the clipboard and nowhere else.
+    if (isPasteShortcut(event)) {
+        pasteFromClipboard();
+        event->accept();
+        return;
+    }
     if (!m_session) {
         QWidget::keyPressEvent(event);
         return;
     }
     m_session->writeKey(event->key(), event->modifiers().toInt(), event->text());
+    event->accept();
+}
+
+void TerminalWidget::contextMenuEvent(QContextMenuEvent* event) {
+    // The discoverable half of the paste: a shortcut nobody is told about is a
+    // shortcut nobody finds, and this is the terminal a first-time user meets
+    // in the middle of a login.
+    QMenu menu(this);
+    QAction* paste = menu.addAction(QStringLiteral("Paste"));
+    paste->setShortcut(QKeySequence::Paste);
+    paste->setEnabled(!QGuiApplication::clipboard()->text().isEmpty());
+    QObject::connect(paste, &QAction::triggered, this, [this] { pasteFromClipboard(); });
+    menu.exec(event->globalPos());
     event->accept();
 }
 
@@ -500,5 +575,66 @@ extern "C" std::int32_t bs_widget_test_terminal_parses_its_rows_once_per_frame()
     // The count itself is the report: 100 says every repaint re-read the grid,
     // 0 says nothing painted at all and the check proved nothing.
     return parses == 0 ? 1 : parses;
+}
+/// The step that ended the first real sign-in: `claude auth login` prints its
+/// URL, the browser answers with a code, and the terminal asks for it back.
+/// Ctrl+V reaches a terminal as the control code 0x16, so before this the
+/// paste went to the program as a keystroke and the code could only have been
+/// typed out by hand.
+extern "C" std::int32_t bs_widget_test_terminal_pastes_the_clipboard() {
+    TerminalSession session;
+    TerminalWidget widget(&session);
+    QStringList pasted;
+    widget.setPasteSink([&pasted](const QString& text) { pasted.append(text); });
+
+    const QString code = QStringLiteral("code-123");
+    QGuiApplication::clipboard()->setText(code);
+    if (QGuiApplication::clipboard()->text() != code) {
+        // No clipboard under this platform plugin: the checks below would all
+        // pass against a widget that pasted nothing, so say so instead.
+        return 1;
+    }
+
+    QKeyEvent ctrlV(QEvent::KeyPress, Qt::Key_V, Qt::ControlModifier);
+    QCoreApplication::sendEvent(&widget, &ctrlV);
+    if (pasted != QStringList { code }) {
+        return 2;
+    }
+
+    // The other two spellings a terminal user's fingers know.
+    QKeyEvent ctrlShiftV(QEvent::KeyPress, Qt::Key_V, Qt::ControlModifier | Qt::ShiftModifier);
+    QCoreApplication::sendEvent(&widget, &ctrlShiftV);
+    QKeyEvent shiftInsert(QEvent::KeyPress, Qt::Key_Insert, Qt::ShiftModifier);
+    QCoreApplication::sendEvent(&widget, &shiftInsert);
+    if (pasted.size() != 3) {
+        return 3;
+    }
+
+    // An ordinary key is not a paste: it goes to the program as the key it is.
+    QKeyEvent letter(QEvent::KeyPress, Qt::Key_A, Qt::NoModifier, QStringLiteral("a"));
+    QCoreApplication::sendEvent(&widget, &letter);
+    if (pasted.size() != 3) {
+        return 4;
+    }
+
+    // Windows reports AltGr as Ctrl+Alt, which is how a Danish layout types
+    // the characters this IDE's own agent prompts are full of. Reading one of
+    // those as a paste would be worse than having no paste at all.
+    QKeyEvent altGr(QEvent::KeyPress, Qt::Key_V, Qt::ControlModifier | Qt::AltModifier,
+                    QStringLiteral("v"));
+    QCoreApplication::sendEvent(&widget, &altGr);
+    if (pasted.size() != 3) {
+        return 5;
+    }
+
+    // An empty clipboard is not a paste either: an empty write would reach a
+    // bracketed-paste prompt as a pair of markers with nothing between them.
+    QGuiApplication::clipboard()->setText(QString());
+    QKeyEvent again(QEvent::KeyPress, Qt::Key_V, Qt::ControlModifier);
+    QCoreApplication::sendEvent(&widget, &again);
+    if (pasted.size() != 3) {
+        return 6;
+    }
+    return 0;
 }
 #endif // BS_WIDGET_TESTS

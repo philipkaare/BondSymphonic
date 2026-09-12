@@ -105,6 +105,9 @@ private:
     void openLink();
     /// Copy and open together: what clicking the URL text itself does.
     void useLink();
+    /// Puts the focus back on the terminal, which is where a sign-in carries
+    /// on once the browser has been dealt with.
+    void focusTerminal();
     /// Re-renders the URL label at the width it now has, elided in the middle
     /// so the host and the tail of the query both stay readable.
     void updateLinkElide();

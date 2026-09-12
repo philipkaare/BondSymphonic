@@ -156,6 +156,13 @@ Use the row when the automatic open did not work, or when you want to finish the
 sign-in on another machine. The row goes away when the terminal exits, because
 the URL it carried is spent.
 
+**Paste the code with Ctrl+V.** The code the browser gives back is too long to
+read off a screen and type in again, so the terminal pane takes a paste:
+**Ctrl+V**, **Ctrl+Shift+V** or **Shift+Insert**, and right-clicking the pane
+offers **Paste** as well. Every terminal in the IDE takes one, not just this
+pane. AltGr characters are unaffected -- Windows reports AltGr as Ctrl+Alt, and
+a paste is Ctrl without Alt.
+
 **Keep Settings open until the login terminal finishes.** Closing the dialog
 ends the `claude auth login` process it was running, so a sign-in half way
 through is abandoned. Closing it after a successful login is safe: the checks

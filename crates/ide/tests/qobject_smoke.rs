@@ -1568,6 +1568,7 @@ mod cpp_widgets {
         fn bs_widget_test_setup_page_reports_a_started_action() -> i32;
         fn bs_widget_test_terminal_parses_its_rows_once_per_frame() -> i32;
         fn bs_widget_test_terminal_error_ink_follows_the_palette() -> i32;
+        fn bs_widget_test_terminal_pastes_the_clipboard() -> i32;
         fn bs_widget_test_transcript_coalesces_a_streamed_answer() -> i32;
         fn bs_widget_test_new_agent_dialog_takes_its_own_inspect_failure() -> i32;
     }
@@ -1583,7 +1584,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 11] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 12] = [
             (
                 "EditorArea closes a tab under a destroyed workspace",
                 bs_widget_test_editor_area_survives_a_destroyed_workspace,
@@ -1619,6 +1620,10 @@ mod cpp_widgets {
             (
                 "TerminalWidget inks its error banner for the palette",
                 bs_widget_test_terminal_error_ink_follows_the_palette,
+            ),
+            (
+                "TerminalWidget pastes the clipboard rather than sending Ctrl+V",
+                bs_widget_test_terminal_pastes_the_clipboard,
             ),
             (
                 "TranscriptView coalesces a streamed answer",

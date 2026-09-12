@@ -351,7 +351,11 @@ void SetupPage::runAction(const QString& action) {
     // and closes the PTY it held. What that cannot cover is a *second* request
     // made before the first is answered, because the reply is the only thing
     // that names the pty id -- which is what the guard above refuses.
-    m_terminalLabel->setText(QString("Running %1. Answer its questions here.").arg(action));
+    // The paste is named here because the one question this terminal asks
+    // that cannot be typed is the sign-in code, and a shortcut nobody is
+    // told about is a shortcut nobody finds.
+    m_terminalLabel->setText(
+        QString("Running %1. Answer its questions here; Ctrl+V pastes.").arg(action));
     m_terminal->setVisible(true);
     m_terminalHost->setVisible(true);
     // Deferred by one turn of the event loop: the pane has only just been
@@ -417,6 +421,7 @@ void SetupPage::copyLink() {
     m_linkFeedback->setText("Link copied");
     m_linkFeedback->setVisible(true);
     m_linkFeedbackTimer->start();
+    focusTerminal();
 }
 
 void SetupPage::openLink() {
@@ -424,6 +429,7 @@ void SetupPage::openLink() {
         return;
     }
     QDesktopServices::openUrl(QUrl(m_linkUrl));
+    focusTerminal();
 }
 
 void SetupPage::useLink() {
@@ -431,6 +437,15 @@ void SetupPage::useLink() {
     // this link" without saying what for, and either one alone is a guess.
     copyLink();
     openLink();
+}
+
+void SetupPage::focusTerminal() {
+    // Where the next thing happens. The browser answers the sign-in with a
+    // code, the prompt in the terminal is what waits for it, and a paste only
+    // reaches that prompt while the terminal has the focus -- so a user who
+    // used one of these buttons, signed in, came back and pressed Ctrl+V would
+    // otherwise be pasting into the button they last clicked.
+    m_terminal->setFocus();
 }
 
 void SetupPage::updateLinkElide() {

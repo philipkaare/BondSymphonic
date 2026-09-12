@@ -880,3 +880,61 @@ fn an_api_key_is_trimmed_before_it_is_stored() {
     assert_eq!(normalise_api_key("\n"), None);
     assert_eq!(normalise_api_key(""), None);
 }
+
+// ---------------------------------------------------------------------------
+// Pasting into a terminal.
+// ---------------------------------------------------------------------------
+
+/// The step the login flow ends on: `claude auth login` prints its URL, the
+/// browser hands back a code, and the terminal's `Paste code here if prompted >`
+/// is waiting for it. A code copied out of a browser usually arrives with the
+/// line break the copy picked up, and that break has to be the carriage return
+/// Enter sends or the prompt never sees a line at all.
+#[test]
+fn a_paste_is_the_text_a_program_would_have_been_typed() {
+    use bondsymphonic_ide::model::terminal_grid::paste_bytes;
+
+    assert_eq!(paste_bytes("code-123\n", false), b"code-123\r");
+    // Both line-break conventions, and either one already a carriage return.
+    assert_eq!(paste_bytes("a\r\nb\nc\r", false), b"a\rb\rc\r");
+    // A tab is a character a pasted line legitimately contains.
+    assert_eq!(paste_bytes("a\tb\x07c", false), b"a\tbc");
+    // An escape sequence on the clipboard is text somebody copied, not a
+    // command for the terminal: the ESC goes and the rest stays visible.
+    assert_eq!(paste_bytes("\x1b[31mred", false), b"[31mred");
+    assert!(paste_bytes("", false).is_empty());
+    assert!(paste_bytes("\x1b", false).is_empty());
+}
+
+/// A program that asked for bracketed paste is told where the block begins and
+/// ends, so it can take it as data rather than as the keystrokes it looks
+/// like. Claude Code's prompt asks for it, which is why a multi-line paste into
+/// it must not arrive as a series of Enters.
+#[test]
+fn a_bracketed_paste_is_wrapped_and_cannot_be_broken_out_of() {
+    use bondsymphonic_ide::model::terminal_grid::paste_bytes;
+
+    assert_eq!(paste_bytes("hi", true), b"\x1b[200~hi\x1b[201~");
+    // The end marker cannot be forged from the clipboard: its ESC leaves with
+    // every other control character, so the wrapper still bounds the paste.
+    assert_eq!(
+        paste_bytes("a\x1b[201~b", true),
+        b"\x1b[200~a[201~b\x1b[201~"
+    );
+    // Nothing to paste sends nothing at all, brackets included: an empty
+    // wrapper is a keystroke the program never asked for.
+    assert!(paste_bytes("", true).is_empty());
+    assert!(paste_bytes("\0", true).is_empty());
+}
+
+/// Which of the two the terminal is in is the application's to say, and the
+/// grid is what heard it say so.
+#[test]
+fn grid_tracks_bracketed_paste_mode() {
+    let mut g = TerminalGrid::new(20, 3);
+    assert!(!g.bracketed_paste());
+    g.feed(b"\x1b[?2004h");
+    assert!(g.bracketed_paste(), "DECSET 2004 turns it on");
+    g.feed(b"\x1b[?2004l");
+    assert!(!g.bracketed_paste(), "DECRST 2004 turns it off again");
+}

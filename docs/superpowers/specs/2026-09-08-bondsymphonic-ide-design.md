@@ -327,7 +327,22 @@ using the same `RustHighlighter`.
   bg, flags}` for the visible region plus scrollback offset.
 - `TerminalWidget` paints with `QPainter` on a monospace font, handles key events
   (mapping Qt keys to VT sequences for arrows, function keys, Ctrl combos),
-  selection and copy, mouse-wheel scrollback, and resize → `pty.resize`.
+  pasting, mouse-wheel scrollback, and resize → `pty.resize`. Selection and
+  copy are not built: nothing in the widget handles a mouse press today.
+- **A paste is not the keys that would have typed it.** Ctrl+V, Ctrl+Shift+V and
+  Shift+Insert — Ctrl *without* Alt, so the AltGr characters a Danish or German
+  layout composes are still characters — and the right-click menu all reach
+  `TerminalWidget::pasteFromClipboard`, then `TerminalSession::paste`, then
+  `paste_bytes` in `terminal_grid.rs`. There the line breaks of either
+  convention become the carriage return Enter sends, every other control
+  character is dropped, and the result is wrapped in `ESC [ 200 ~ … ESC [ 201 ~`
+  when the program has asked for bracketed paste (DECSET 2004, which
+  `TerminalGrid::bracketed_paste` reports). Dropping the controls is what stops
+  a clipboard forging the end marker and having the rest of its own paste read
+  as keystrokes. Without any of this the sign-in code `claude auth login` asks
+  for could only be typed out by hand — Ctrl+V reaches a terminal as the control
+  code 0x16, which the widget forwarded — and that is where the first real
+  login stopped.
 - One `TerminalSession` per shell tab and per terminal-adapter agent.
 
 ## 10. New Agent dialog

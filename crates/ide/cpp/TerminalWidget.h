@@ -6,8 +6,10 @@
 #include <QSize>
 #include <QString>
 #include <QWidget>
+#include <functional>
 
 class TerminalSession;
+class QContextMenuEvent;
 class QPainter;
 class QPushButton;
 class QTimer;
@@ -38,6 +40,22 @@ public:
     QSize sizeHint() const override;
     QSize minimumSizeHint() const override;
 
+    /// Pastes `text` into the session as one block, rather than as the keys
+    /// that would have typed it.
+    void paste(const QString& text);
+
+    /// Pastes what the desktop clipboard holds. What Ctrl+V, Shift+Insert and
+    /// the context menu all do.
+    ///
+    /// A terminal with no paste is a terminal that cannot answer `claude auth
+    /// login`: the browser hands back a sign-in code far too long to read off
+    /// a screen and type in again.
+    void pasteFromClipboard();
+
+    /// Replaces what a paste does with its text. The default hands it to the
+    /// session; this is the seam a test answers through.
+    void setPasteSink(std::function<void(const QString& text)> sink);
+
     /// The colour the error banner's text is drawn in.
     ///
     /// Its own function so the painter and the check that the palette is
@@ -59,6 +77,9 @@ protected:
     void resizeEvent(QResizeEvent* event) override;
     void focusInEvent(QFocusEvent* event) override;
     void focusOutEvent(QFocusEvent* event) override;
+    /// The right-click menu, which is the paste a keyboard shortcut does not
+    /// announce.
+    void contextMenuEvent(QContextMenuEvent* event) override;
     void showEvent(QShowEvent* event) override;
     /// Keeps Tab out of the focus chain so it reaches the shell.
     bool focusNextPrevChild(bool next) override;
@@ -89,6 +110,8 @@ private:
     void placeReopenButton();
 
     QPointer<TerminalSession> m_session;
+    /// Never null: the constructor installs the session paste.
+    std::function<void(const QString& text)> m_paste;
     /// The last parse of the session's `rowsJson`, and whether it still
     /// describes the session.
     QJsonArray m_parsedRows;

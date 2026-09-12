@@ -11,7 +11,7 @@
 //! regenerated inside that closure, never on a property read.
 
 use crate::client::router::{EventRouter, EventRx, Release};
-use crate::model::terminal_grid::{key_to_bytes, TerminalGrid};
+use crate::model::terminal_grid::{key_to_bytes, paste_bytes, TerminalGrid};
 use crate::qobjects::app_controller::{on_reconnect, require_connection, runtime, shared};
 use base64::Engine as _;
 use bondsymphonic_proto::{
@@ -93,9 +93,14 @@ pub mod qobject {
         #[qinvokable]
         fn attach(self: Pin<&mut TerminalSession>, pty_id: QString, cols: i32, rows: i32);
 
-        /// Sends text (a paste, or composed input) to the PTY.
+        /// Pastes `text` into the PTY: the clipboard, or any other block of
+        /// text the user did not type a key at a time.
+        ///
+        /// Not the keys that would have produced it. `paste_bytes` is what
+        /// turns the text into what a program reading the terminal expects a
+        /// paste to look like.
         #[qinvokable]
-        fn write_text(self: Pin<&mut TerminalSession>, text: QString);
+        fn paste(self: Pin<&mut TerminalSession>, text: QString);
 
         /// Sends one key press: `qt_key` is a `Qt::Key`, `modifiers` the
         /// `Qt::KeyboardModifiers` bits, `text` the event text.
@@ -755,8 +760,15 @@ impl qobject::TerminalSession {
         });
     }
 
-    pub fn write_text(self: Pin<&mut Self>, text: QString) {
-        let bytes = text.to_string().into_bytes();
+    pub fn paste(self: Pin<&mut Self>, text: QString) {
+        // Whether the program wants the paste bracketed is the grid's to
+        // answer: it is the half of the session that heard the program ask.
+        let bracketed = self
+            .rust()
+            .grid
+            .as_ref()
+            .is_some_and(|grid| grid.bracketed_paste());
+        let bytes = paste_bytes(&text.to_string(), bracketed);
         self.send(bytes);
     }
 

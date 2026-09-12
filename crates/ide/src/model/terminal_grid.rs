@@ -229,6 +229,59 @@ impl TerminalGrid {
     pub fn app_cursor_keys(&self) -> bool {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
+
+    /// Whether the application asked for bracketed paste (DECSET 2004).
+    ///
+    /// A program that asks for it wants to be told where a paste begins and
+    /// ends, so that it can take the whole block as data rather than as the
+    /// keystrokes it looks like. Claude Code's prompt and every modern shell
+    /// ask for it; [`paste_bytes`] is what answers.
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+}
+
+/// The bytes a paste of `text` sends to the PTY.
+///
+/// Two things happen to the text on the way. Line breaks -- in either
+/// convention -- become the carriage return the Enter key sends, because that
+/// is the only thing a program reading a terminal understands a new line to
+/// be; and every other control character is dropped. The second is what keeps
+/// a paste data: the clipboard is filled by whatever the user last copied, and
+/// an escape sequence in it would otherwise be obeyed by the terminal rather
+/// than read by the program -- including, in `bracketed` mode, a forged
+/// `ESC [ 201 ~` that ends the bracket early and hands the rest of the paste
+/// to the program as keystrokes.
+///
+/// Tab survives because it is a character a pasted line legitimately contains.
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let mut body = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                // CRLF is one line break, not two.
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                body.push('\r');
+            }
+            '\n' => body.push('\r'),
+            '\t' => body.push('\t'),
+            c if c.is_control() => {}
+            c => body.push(c),
+        }
+    }
+    if body.is_empty() {
+        return Vec::new();
+    }
+    if !bracketed {
+        return body.into_bytes();
+    }
+    let mut out = b"\x1b[200~".to_vec();
+    out.extend_from_slice(body.as_bytes());
+    out.extend_from_slice(b"\x1b[201~");
+    out
 }
 
 /// Render a cell colour as `#rrggbb`, or empty for the terminal defaults.
