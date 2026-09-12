@@ -13,9 +13,13 @@
 
 mod common;
 
+use bondsymphonic_daemon::sandbox::{
+    backend_for, SandboxBackend, SandboxChild, SandboxCommand, SandboxHandle, SandboxSpec,
+};
 use bondsymphonic_proto::*;
-use common::{create_ws, init_repo, start_daemon, Client, PortGuard};
+use common::{create_ws, init_repo, start_daemon, start_daemon_with_backend, Client, PortGuard};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1144,6 +1148,121 @@ async fn a_start_that_races_a_destroy_leaves_no_run_behind() {
     cancel.cancel();
 }
 
+// ---------------------------------------------------------------------------
+// Holding the start's window open.
+// ---------------------------------------------------------------------------
+
+/// One spawn's worth of hold on the sandbox: armed by a test, entered by the
+/// daemon, released by the test.
+///
+/// `run.start` reads the workspace state, spawns the process, registers the run
+/// and reads the state again. The window the test below is about lies between
+/// those two reads, and the daemon crosses it in the couple of milliseconds a
+/// config read and a spawn take. Sleeping for a guessed number of microseconds
+/// and hoping to land inside it is how that test used to be written; on a CI
+/// runner busy with the rest of the suite the whole window sat past the end of
+/// a 40 ms sweep, every attempt was refused for being too early, and the test
+/// failed having proved nothing. Holding the spawn makes the window last as
+/// long as the test needs it to and costs nothing on any host.
+#[derive(Default)]
+struct SpawnGate {
+    /// Whether the *next* spawn waits. One spawn only: a workspace spawns other
+    /// things, and only the one this test starts may be held.
+    armed: std::sync::atomic::AtomicBool,
+    /// The daemon has reached the held spawn, so the start is past its own
+    /// readiness check and has not registered its run.
+    entered: tokio::sync::Notify,
+    /// The test is done with the window.
+    release: tokio::sync::Notify,
+}
+
+impl SpawnGate {
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Waits for the daemon to reach the held spawn. Bounded, so a start that
+    /// never gets there fails the test instead of hanging it.
+    async fn entered(&self) {
+        tokio::time::timeout(SETTLED, self.entered.notified())
+            .await
+            .expect("the start never reached the spawn the gate holds");
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+/// The backend that answers a [`SpawnGate`]: the no-sandbox backend in every
+/// respect but the one spawn it holds.
+struct GatedBackend {
+    inner: Arc<dyn SandboxBackend>,
+    gate: Arc<SpawnGate>,
+}
+
+impl GatedBackend {
+    fn over_noop(gate: Arc<SpawnGate>) -> Arc<dyn SandboxBackend> {
+        Arc::new(Self {
+            inner: backend_for("noop"),
+            gate,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl SandboxBackend for GatedBackend {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    async fn check(&self) -> Vec<PrereqStatus> {
+        self.inner.check().await
+    }
+
+    async fn start(&self, spec: &SandboxSpec) -> Result<Arc<dyn SandboxHandle>, RpcError> {
+        Ok(Arc::new(GatedHandle {
+            inner: self.inner.start(spec).await?,
+            gate: self.gate.clone(),
+        }))
+    }
+}
+
+struct GatedHandle {
+    inner: Arc<dyn SandboxHandle>,
+    gate: Arc<SpawnGate>,
+}
+
+#[async_trait::async_trait]
+impl SandboxHandle for GatedHandle {
+    async fn spawn(&self, cmd: SandboxCommand) -> Result<SandboxChild, RpcError> {
+        // Disarmed by the same read that takes the hold, so the second spawn
+        // through this handle -- and every one after it -- goes straight to the
+        // backend underneath.
+        if self
+            .gate
+            .armed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.gate.entered.notify_one();
+            self.gate.release.notified().await;
+        }
+        self.inner.spawn(cmd).await
+    }
+
+    async fn shutdown(&self) -> Result<(), RpcError> {
+        self.inner.shutdown().await
+    }
+
+    fn helper_exe(&self) -> std::path::PathBuf {
+        self.inner.helper_exe()
+    }
+
+    fn died(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.inner.died()
+    }
+}
+
 /// A `run.start` that is already past the workspace's readiness check when that
 /// workspace is marked for destruction is refused, and leaves nothing behind.
 ///
@@ -1154,6 +1273,11 @@ async fn a_start_that_races_a_destroy_leaves_no_run_behind() {
 /// went on holding the port, and announced state changes for a workspace the
 /// client had already been told was gone. Marking the state here is that first
 /// half of a destroy on its own, at a moment the start cannot have seen it.
+///
+/// The window is held by the sandbox rather than aimed at with a sleep: see
+/// [`SpawnGate`]. The daemon is stopped inside the spawn, which is past the
+/// start's own readiness check and before the run is registered, so the mark
+/// lands where this test needs it every time and on every host.
 #[tokio::test]
 async fn a_start_whose_workspace_is_marked_for_destruction_is_refused() {
     let Some(py) = python() else {
@@ -1173,118 +1297,111 @@ port = {port}
 "
         ),
     );
-    let (p, token, d, cancel) = start_daemon(&dir.path().join("data")).await;
+    let gate = Arc::new(SpawnGate::default());
+    let (p, token, d, cancel) = start_daemon_with_backend(
+        &dir.path().join("data"),
+        GatedBackend::over_noop(gate.clone()),
+    )
+    .await;
     let mut c = Client::connect(p, &token).await;
     let ws = create_ws(&mut c, &repo, "marked").await;
     let mut guard = PortGuard::new(port);
 
-    // The window runs from the start's own readiness check to the moment it
-    // registers its run, and how long that takes is a config read and a process
-    // spawn -- a couple of milliseconds, and a different couple on every host.
-    // The delay sweeps the mark across it: too early and the start is refused
-    // before it began, too late and it finishes first, and one workspace put
-    // back to `Ready` between attempts is all it takes to try again.
-    //
-    // The sweep reaches far past that couple of milliseconds because spawning
-    // a process is the slowest thing in the window and the one that suffers
-    // most when the machine is busy: with the rest of the suite running, the
-    // whole window can sit beyond where a 12 ms sweep ever marks, and every
-    // attempt is then refused for being too early. Reaching further costs
-    // nothing on an idle host, where the loop breaks at the first attempt that
-    // lands.
-    let mut landed_in_the_window = false;
-    for micros in (0..40_000).step_by(250) {
-        d.set_state(&ws.id, WorkspaceState::Ready).await.unwrap();
-        let _ = c.drain_events();
-        let start = c
-            .send(Request::RunStart(RunStartParams {
-                workspace_id: ws.id.clone(),
-                config_name: "web".into(),
-                port: None,
-            }))
-            .await;
-        tokio::time::sleep(Duration::from_micros(micros)).await;
-        d.set_state(&ws.id, WorkspaceState::Destroying)
-            .await
-            .unwrap();
+    // Armed after the workspace exists, so the spawn this holds is the run's
+    // and not something the create needed.
+    gate.arm();
+    let start = c
+        .send(Request::RunStart(RunStartParams {
+            workspace_id: ws.id.clone(),
+            config_name: "web".into(),
+            port: None,
+        }))
+        .await;
+    gate.entered().await;
+    // Inside the window: the start read `Ready` at the top of the call and has
+    // not registered its run.
+    d.set_state(&ws.id, WorkspaceState::Destroying)
+        .await
+        .unwrap();
+    gate.release();
 
-        let mut events = Vec::new();
-        let answer = c.recv_response(start, &mut events).await;
-        let reason: Option<String> = answer.as_ref().err().and_then(|e| {
-            e.data
-                .as_ref()
-                .and_then(|v| v.get("reason"))
-                .and_then(|r| r.as_str())
-                .map(str::to_owned)
-        });
-        if let Ok(v) = answer {
-            // The whole start landed ahead of the mark, which is not this
-            // test's subject. Its run still has to go before the next attempt:
-            // a live run left behind a panicking test keeps the runtime waiting
-            // on its pipes instead of letting the test fail.
+    let mut events = Vec::new();
+    let answer = c.recv_response(start, &mut events).await;
+    let refusal = match answer {
+        Err(e) => e,
+        Ok(v) => {
+            // The failure this test exists to catch, and it has to be reported
+            // rather than panicked straight out of: the run it was told about
+            // is alive, and a live run left behind by a panicking test keeps
+            // the runtime waiting on its pipes instead of letting the test
+            // fail. Stopped first, then failed.
             let started: RunStartResult = serde_json::from_value(v).unwrap();
-            c.call(Request::RunStop(RunIdParams {
-                run_id: started.run_id.clone(),
-            }))
-            .await
-            .unwrap();
-            let evs = run_events(&mut c, &started.run_id, SETTLED, |e| {
+            let _ = c
+                .call(Request::RunStop(RunIdParams {
+                    run_id: started.run_id.clone(),
+                }))
+                .await;
+            let _ = run_events(&mut c, &started.run_id, SETTLED, |e| {
                 has_state(e, RunState::Stopped)
             })
             .await;
-            assert!(has_state(&evs, RunState::Stopped), "{:?}", states(&evs));
+            guard.disarm();
+            cancel.cancel();
+            panic!("a start marked mid-spawn was allowed to run: {started:?}");
         }
-        assert!(
-            d.runs.runs_of(&ws.id).is_empty(),
-            "a run outlived the workspace it belonged to ({micros} us)"
-        );
-        if reason.as_deref() != Some("workspace_not_ready") {
-            // Refused before it ever began, or finished before the mark.
-            continue;
-        }
+    };
+    let reason = refusal
+        .data
+        .as_ref()
+        .and_then(|v| v.get("reason"))
+        .and_then(|r| r.as_str());
+    assert_eq!(reason, Some("workspace_not_ready"), "{refusal:?}");
+    // Which of the two checks refused it, said in the one place the two differ.
+    // The first cannot have: the workspace was `Ready` until the spawn was
+    // already running.
+    assert!(
+        refusal.message.contains("no longer ready"),
+        "the refusal must come from the check after the insert: {refusal:?}"
+    );
+    assert!(
+        d.runs.runs_of(&ws.id).is_empty(),
+        "a run outlived the workspace it belonged to"
+    );
 
-        // This is the one: the start was past its own check and the check after
-        // the insert caught it. Nothing of that run may be left -- and since the
-        // client was told the start did not happen, not one word may be said
-        // about a run whose id it was never given.
-        landed_in_the_window = true;
-        let mut seen: Vec<Event> = events.into_iter().map(|(_, e)| e).collect();
-        let quiet = Instant::now() + Duration::from_millis(500);
-        while Instant::now() < quiet {
-            let _ = c.call(Request::WorkspaceList {}).await;
-            seen.extend(c.drain_events().into_iter().map(|(_, e)| e));
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        let announced: Vec<&Event> = seen
-            .iter()
-            .filter(|e| matches!(e, Event::RunStateChanged { .. }))
-            .collect();
-        assert!(
-            announced.is_empty(),
-            "a start that was refused announced a run: {announced:?}"
-        );
-        // Its output counts as a word said about it. The readers are attached
-        // before the run is registered -- they have to be, or the first lines
-        // of a run that starts normally are lost -- so on this path they were
-        // publishing `run.output` for a run id the client was never given and
-        // could not have subscribed to, unsubscribed from, or stopped.
-        let said = output(&seen);
-        assert!(
-            said.is_empty(),
-            "a start that was refused streamed a run's output: {said:?}"
-        );
-        assert!(
-            http_get(port).await.is_none(),
-            "the web app must not have been left running"
-        );
-        break;
+    // Nothing of that run may be left -- and since the client was told the
+    // start did not happen, not one word may be said about a run whose id it
+    // was never given.
+    let mut seen: Vec<Event> = events.into_iter().map(|(_, e)| e).collect();
+    let quiet = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < quiet {
+        let _ = c.call(Request::WorkspaceList {}).await;
+        seen.extend(c.drain_events().into_iter().map(|(_, e)| e));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    let announced: Vec<&Event> = seen
+        .iter()
+        .filter(|e| matches!(e, Event::RunStateChanged { .. }))
+        .collect();
+    assert!(
+        announced.is_empty(),
+        "a start that was refused announced a run: {announced:?}"
+    );
+    // Its output counts as a word said about it. The readers are attached
+    // before the run is registered -- they have to be, or the first lines of a
+    // run that starts normally are lost -- so on this path they were publishing
+    // `run.output` for a run id the client was never given and could not have
+    // subscribed to, unsubscribed from, or stopped.
+    let said = output(&seen);
+    assert!(
+        said.is_empty(),
+        "a start that was refused streamed a run's output: {said:?}"
+    );
+    assert!(
+        http_get(port).await.is_none(),
+        "the web app must not have been left running"
+    );
 
     guard.disarm();
-    assert!(
-        landed_in_the_window,
-        "no attempt reached the check after the insert; the sweep needs widening"
-    );
     cancel.cancel();
 }
 

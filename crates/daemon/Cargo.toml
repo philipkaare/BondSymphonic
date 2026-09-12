@@ -44,3 +44,7 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+# A suite implements `SandboxBackend` itself, to hold one spawn open where a
+# race the daemon runs in two instructions has to be stepped through; the trait
+# is declared with `#[async_trait]`, so implementing it needs the same macro.
+async-trait = "0.1"

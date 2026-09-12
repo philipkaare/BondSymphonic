@@ -142,7 +142,7 @@ pub fn init_repo_with_origin(dir: &Path) -> (PathBuf, PathBuf) {
 // ---------------------------------------------------------------------------
 
 use bondsymphonic_daemon::daemon::Daemon;
-use bondsymphonic_daemon::sandbox::backend_for;
+use bondsymphonic_daemon::sandbox::{backend_for, SandboxBackend};
 use bondsymphonic_daemon::server::dispatch::SystemHandler;
 use bondsymphonic_daemon::server::handlers::WorkspaceHandler;
 use bondsymphonic_daemon::server::{Server, ServerConfig};
@@ -244,8 +244,22 @@ impl Client {
 
 /// Binds a server on an ephemeral port with a workspace handler over `root`.
 pub async fn start_daemon(root: &std::path::Path) -> (u16, String, Arc<Daemon>, CancellationToken) {
+    start_daemon_with_backend(root, backend_for("noop")).await
+}
+
+/// The same, over a backend of the caller's choosing.
+///
+/// Every suite here wants the no-sandbox backend and calls `start_daemon`. This
+/// is for a test that wants to wrap it: a decorator that holds one `spawn` open
+/// turns a race the daemon runs in a couple of milliseconds into one the test
+/// can step through, which is the difference between proving something and
+/// guessing at a sleep.
+pub async fn start_daemon_with_backend(
+    root: &std::path::Path,
+    backend: Arc<dyn SandboxBackend>,
+) -> (u16, String, Arc<Daemon>, CancellationToken) {
     let server = Server::bind(ServerConfig::default()).await.unwrap();
-    let daemon = Daemon::new(DataDirs::new(root), backend_for("noop"), server.event_bus()).unwrap();
+    let daemon = Daemon::new(DataDirs::new(root), backend, server.event_bus()).unwrap();
     let system = SystemHandler {
         token: server.token().to_string(),
         capabilities: ServerConfig::default().capabilities,
