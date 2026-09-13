@@ -1600,6 +1600,31 @@ mod cpp_widgets {
             return;
         }
         let checks: [(&str, unsafe extern "C" fn() -> i32); 27] = [
+            // These four build a whole MainWindow, and each begins by pointing
+            // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
+            // is load-bearing rather than tidy: the state store settles its
+            // path at first use and keeps it for the life of the process, so a
+            // check ahead of them that touched it would fix that path on the
+            // developer's real state.json -- and these four would then read it
+            // and write it back, redirect or no redirect. Nothing above them
+            // touches it today, which is exactly the kind of fact that stops
+            // being true without anyone noticing.
+            (
+                "MainWindow docks the agent pane",
+                bs_widget_test_main_window_docks_the_agent_pane,
+            ),
+            (
+                "Window menu brings a closed dock back",
+                bs_widget_test_window_menu_brings_a_closed_dock_back,
+            ),
+            (
+                "Workspace menu gathers the git actions",
+                bs_widget_test_workspace_menu_gathers_the_git_actions,
+            ),
+            (
+                "Run menu drives the run panel",
+                bs_widget_test_run_menu_drives_the_run_panel,
+            ),
             (
                 "EditorArea closes a tab under a destroyed workspace",
                 bs_widget_test_editor_area_survives_a_destroyed_workspace,
@@ -1691,25 +1716,6 @@ mod cpp_widgets {
             (
                 "GroupBar does not lift a band off the last band",
                 bs_widget_test_group_bar_does_not_lift_a_band_off_a_band,
-            ),
-            // These four build a whole MainWindow and point BS_STATE_PATH at a
-            // throwaway file, which is process-wide. Last in the list, so no
-            // check above them runs against a state store they redirected.
-            (
-                "MainWindow docks the agent pane",
-                bs_widget_test_main_window_docks_the_agent_pane,
-            ),
-            (
-                "Window menu brings a closed dock back",
-                bs_widget_test_window_menu_brings_a_closed_dock_back,
-            ),
-            (
-                "Workspace menu gathers the git actions",
-                bs_widget_test_workspace_menu_gathers_the_git_actions,
-            ),
-            (
-                "Run menu drives the run panel",
-                bs_widget_test_run_menu_drives_the_run_panel,
             ),
         ];
 
