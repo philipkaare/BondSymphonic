@@ -142,6 +142,26 @@ pub mod qobject {
         #[qinvokable]
         fn restart_options_json(self: &TranscriptModel) -> QString;
 
+        /// The same options, with the model or the permission mode replaced by
+        /// what the composer's dropdowns now say.
+        ///
+        /// `claude -p` reads both flags once, when the process starts, so
+        /// changing either is a restart; sending it through this rather than
+        /// through options of its own is what makes the restart continue the
+        /// conversation instead of beginning a new one.
+        ///
+        /// An empty string leaves that field alone -- it is the "no change"
+        /// signal, so a call that means to change only the mode passes it for
+        /// the model. The one id that *is* empty, "let Claude Code decide", is
+        /// spelled `-` here and turned back into an empty id on the Rust side,
+        /// because a C++ combo has no way to say "empty, and I mean it".
+        #[qinvokable]
+        fn restart_options_choosing(
+            self: &TranscriptModel,
+            model: QString,
+            permission_mode: QString,
+        ) -> QString;
+
         /// Puts the items the transcript folded away back on the list, and
         /// emits `resetItems()` when there were any. This is what the "load
         /// earlier" block's button calls.
@@ -519,6 +539,24 @@ impl qobject::TranscriptModel {
         ))
     }
 
+    pub fn restart_options_choosing(&self, model: QString, permission_mode: QString) -> QString {
+        let model = model.to_string();
+        let mode = permission_mode.to_string();
+        // See the bridge's comment: empty is "leave this one alone" and `-` is
+        // the one model id that really is empty.
+        let model = match model.as_str() {
+            "" => None,
+            "-" => Some(""),
+            other => Some(other),
+        };
+        QString::from(&restart_options_with(
+            &self.options_json().to_string(),
+            self.rust().transcript.session_id.as_deref(),
+            model,
+            (!mode.is_empty()).then_some(mode.as_str()),
+        ))
+    }
+
     pub fn expand_earlier(mut self: Pin<&mut Self>) -> bool {
         if !self.as_mut().rust_mut().transcript.expand_earlier() {
             return false;
@@ -757,11 +795,54 @@ impl qobject::TranscriptModel {
 /// with the key absent rather than null, so the request asks for a fresh
 /// session rather than for one named "nothing".
 pub fn restart_options(options_json: &str, session: Option<&str>) -> String {
+    restart_options_with(options_json, session, None, None)
+}
+
+/// [`restart_options`], and one or both of the two fields the user can change
+/// from the composer replaced on the way through.
+///
+/// The model and the permission mode are `--model` and `--permission-mode`, and
+/// `claude -p` reads both once, when the process starts. There is no way to
+/// change either in flight, so the composer's two dropdowns are restarts -- and
+/// a restart that began a new conversation would not be a switch at all, which
+/// is why they go through the same merge the Restart button uses rather than
+/// building options of their own.
+///
+/// `None` for either leaves whatever the tab holds, which is what a plain
+/// Restart passes. `Some("")` for the model is a choice rather than an absence
+/// -- "let Claude Code decide" -- and removes the key, because a key that is
+/// present says the tab pinned a model and an empty one would say it pinned
+/// nothing. The permission mode has no such spelling: it is always sent, so
+/// `Some("")` there is ignored rather than obeyed.
+pub fn restart_options_with(
+    options_json: &str,
+    session: Option<&str>,
+    model: Option<&str>,
+    permission_mode: Option<&str>,
+) -> String {
     let mut options = serde_json::from_str::<serde_json::Value>(options_json)
         .ok()
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
     if let Some(map) = options.as_object_mut() {
+        match model {
+            Some("") => {
+                map.remove("model");
+            }
+            Some(model) => {
+                map.insert(
+                    "model".to_owned(),
+                    serde_json::Value::String(model.to_owned()),
+                );
+            }
+            None => {}
+        }
+        if let Some(mode) = permission_mode.filter(|m| !m.is_empty()) {
+            map.insert(
+                "permission_mode".to_owned(),
+                serde_json::Value::String(mode.to_owned()),
+            );
+        }
         match session {
             Some(session) => {
                 map.insert(

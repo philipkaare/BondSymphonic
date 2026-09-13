@@ -6,7 +6,7 @@ use bondsymphonic_ide::model::transcript::{
     decide_permission, tool_summary, Applied, LiveEvent, PendingPermission, TabAgentState,
     Transcript, TranscriptItem,
 };
-use bondsymphonic_ide::qobjects::transcript_model::carry_always_allow;
+use bondsymphonic_ide::qobjects::transcript_model::{carry_always_allow, restart_options_with};
 use bondsymphonic_proto::{AgentMessage, AgentMessageBody, AgentState, PermissionDecision};
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -781,4 +781,58 @@ fn always_allow_survives_a_reattach_to_the_same_agent() {
         BTreeSet::new(),
         "a first attach starts with nothing"
     );
+}
+
+/// `claude -p` fixes its model and its permission mode when the process starts,
+/// so changing either is a restart -- and a restart that loses the conversation
+/// is not a switch, it is a new agent. The session id the history carries is
+/// what makes it the same one, and everything the tab was created with that is
+/// not being changed has to come through untouched.
+#[test]
+fn changing_the_model_keeps_the_session_and_the_other_options() {
+    let options = r#"{"model":"claude-opus-5","permission_mode":"manual","api_key":"kept"}"#;
+    let merged = restart_options_with(
+        options,
+        Some("sess_42"),
+        Some("claude-haiku-4-5-20251001"),
+        None,
+    );
+    let value: serde_json::Value = serde_json::from_str(&merged).expect("json");
+    assert_eq!(value["model"], "claude-haiku-4-5-20251001");
+    assert_eq!(value["permission_mode"], "manual");
+    assert_eq!(value["resume_session"], "sess_42");
+    assert_eq!(value["api_key"], "kept");
+}
+
+/// The other dropdown, and the two together. A mode is always sent, so an
+/// options string that never had one gains it rather than being left to the
+/// CLI's own default -- which is a fifth behaviour nobody chose and nobody can
+/// see from the pane.
+#[test]
+fn changing_the_permission_mode_sends_one_even_when_the_tab_had_none() {
+    let merged = restart_options_with(r#"{"model":"claude-opus-5"}"#, None, None, Some("plan"));
+    let value: serde_json::Value = serde_json::from_str(&merged).expect("json");
+    assert_eq!(value["permission_mode"], "plan");
+    assert_eq!(value["model"], "claude-opus-5");
+
+    let both = restart_options_with("{}", Some("s"), Some(""), Some("bypassPermissions"));
+    let value: serde_json::Value = serde_json::from_str(&both).expect("json");
+    assert_eq!(value["permission_mode"], "bypassPermissions");
+    // The empty model id is "let Claude Code decide", which is a choice and not
+    // an absence: the key is removed rather than sent empty, because the daemon
+    // filters an empty string out anyway and a key that is there says the tab
+    // pinned a model.
+    assert!(value.get("model").is_none());
+}
+
+/// Neither override is given, which is what the Restart button sends. The
+/// stored model and mode survive exactly as they were.
+#[test]
+fn a_plain_restart_changes_nothing_but_the_session() {
+    let options = r#"{"model":"claude-opus-5","permission_mode":"acceptEdits"}"#;
+    let merged = restart_options_with(options, Some("sess_1"), None, None);
+    let value: serde_json::Value = serde_json::from_str(&merged).expect("json");
+    assert_eq!(value["model"], "claude-opus-5");
+    assert_eq!(value["permission_mode"], "acceptEdits");
+    assert_eq!(value["resume_session"], "sess_1");
 }
