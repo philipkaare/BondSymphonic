@@ -1,5 +1,6 @@
 #include "AgentChoices.h"
 #include <QComboBox>
+#include <QLineEdit>
 
 namespace {
 
@@ -24,7 +25,11 @@ void fill(QComboBox* combo, const QList<agentchoices::Choice>& list) {
 
 const QList<agentchoices::Choice>& agentchoices::models() {
     static const QList<Choice> kModels{
-        { "Default (Claude Code decides)", "" },
+        // Just "Default". The pane is a dock and is routinely narrow enough
+        // that a longer label scrolls its editable line edit to the end and
+        // shows the user "ode decides)", which is worse than saying less. The
+        // combo's tooltip carries the meaning.
+        { "Default", "" },
         { "Opus 5", "claude-opus-5" },
         { "Sonnet 5", "claude-sonnet-5" },
         { "Haiku 4.5", "claude-haiku-4-5-20251001" },
@@ -78,6 +83,12 @@ void agentchoices::fillModelCombo(QComboBox* combo, const QString& selected) {
         combo->setCurrentIndex(index);
     } else {
         combo->setEditText(selected);
+    }
+    // Wound back to the start. A line edit narrower than its text keeps
+    // whichever end the cursor is at, and a model combo that has just been
+    // filled shows the tail -- "…5-20251001" -- which names nothing.
+    if (QLineEdit* edit = combo->lineEdit()) {
+        edit->setCursorPosition(0);
     }
 }
 
@@ -169,7 +180,8 @@ extern "C" std::int32_t bs_widget_test_agent_choices_are_one_list() {
     if (modes.currentData().toString() != QLatin1String("bypassPermissions")) {
         return 8;
     }
-    // An unknown mode falls back to the loudest entry, never to a quieter one.
+    // An unknown mode falls back to the one that refuses, never to YOLO: a
+    // settings file this build cannot read is not consent to run every tool.
     QComboBox stale;
     agentchoices::fillPermissionCombo(&stale, QStringLiteral("default"));
     if (stale.currentData().toString() != QLatin1String("manual")) {
