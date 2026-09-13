@@ -108,6 +108,10 @@ private:
     void onGroupChanged(int index);
     /// Shows the fields the selected adapter has and hides the rest.
     void onAdapterChanged();
+    /// The `--model` argument the Model row stands for: the id behind a label
+    /// picked off the list, or whatever was typed instead. Empty means the row
+    /// was left alone, and the option is then not sent at all.
+    QString chosenModel() const;
     void updateOkEnabled();
 
     AppController* m_controller;
@@ -120,7 +124,10 @@ private:
     QLineEdit* m_name = nullptr;
     QComboBox* m_adapter = nullptr;
     QLineEdit* m_command = nullptr;
-    QLineEdit* m_claudeModel = nullptr;
+    /// The model Claude Code runs, as a list of the ones there are plus room
+    /// to type one there is not. Editable because the CLI takes any name and
+    /// a new model must not need a new build of the IDE to reach.
+    QComboBox* m_claudeModel = nullptr;
     QComboBox* m_permissionMode = nullptr;
     QComboBox* m_runConfig = nullptr;
     /// Names the hosts this repository's own `bondsymphonic.toml` would add to

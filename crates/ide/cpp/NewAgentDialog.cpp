@@ -41,16 +41,40 @@ constexpr int kPromptRows = 4;
 /// than with a guess.
 const char* kNoRunConfig = "(none)";
 
-/// Whether the daemon said it has the Claude adapter, from the capabilities it
-/// reported in `hello`. Offering Claude Code by default against a daemon that
-/// cannot run it would make the dialog's first suggestion its only dead end.
-bool daemonHasClaude(AppController* controller) {
-    const QJsonArray adapters = QJsonDocument::fromJson(controller->capabilitiesJson().toUtf8())
-                                    .object()
-                                    .value("adapters")
-                                    .toArray();
-    return adapters.contains(QJsonValue(QString::fromUtf8(kClaudeAdapter)));
+/// Whether the daemon has *said* it cannot run Claude Code.
+///
+/// Read this way round on purpose. The capabilities arrive with the `hello`
+/// reply, and this dialog can be built before that lands -- the window opens
+/// it the moment the user asks -- so "the list does not mention Claude" is not
+/// the same as "there is no Claude". Treating the two alike is what created
+/// terminal workspaces for users who asked for an agent and got a shell: every
+/// daemon this IDE talks to offers both adapters, and the only thing missing
+/// was the answer that says so. A daemon that really does report a list
+/// without Claude in it is still believed.
+bool daemonLacksClaude(AppController* controller) {
+    const QJsonObject capabilities =
+        QJsonDocument::fromJson(controller->capabilitiesJson().toUtf8()).object();
+    if (!capabilities.contains(QStringLiteral("adapters"))) {
+        return false;
+    }
+    const QJsonArray adapters = capabilities.value(QStringLiteral("adapters")).toArray();
+    return !adapters.contains(QJsonValue(QString::fromUtf8(kClaudeAdapter)));
 }
+
+/// The models to offer, newest and most capable first, as label and `--model`
+/// argument. The list is a convenience and not a limit: the combo is editable,
+/// the daemon passes whatever it is given straight to the CLI, and an empty
+/// choice leaves `--model` off altogether so Claude Code's own default wins.
+struct ModelChoice {
+    const char* label;
+    const char* id;
+};
+const ModelChoice kModels[] = {
+    { "Default (Claude Code decides)", "" },
+    { "Opus 5", "claude-opus-5" },
+    { "Sonnet 5", "claude-sonnet-5" },
+    { "Haiku 4.5", "claude-haiku-4-5-20251001" },
+};
 
 } // namespace
 
@@ -127,15 +151,26 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     // a terminal workspace is the fallback rather than the usual case.
     m_adapter->addItem("Claude Code", kClaudeAdapter);
     m_adapter->addItem("Terminal", kTerminalAdapter);
-    m_adapter->setCurrentIndex(daemonHasClaude(m_controller) ? 0 : 1);
+    m_adapter->setCurrentIndex(daemonLacksClaude(m_controller) ? 1 : 0);
     form->addRow("Adapter:", m_adapter);
 
     m_command = new QLineEdit(this);
     m_command->setPlaceholderText("default shell");
     form->addRow("Command:", m_command);
 
-    m_claudeModel = new QLineEdit(this);
-    m_claudeModel->setPlaceholderText("default");
+    m_claudeModel = new QComboBox(this);
+    m_claudeModel->setObjectName(QStringLiteral("NewAgentModel"));
+    // Editable, so a model that is not on the list is still one keystroke
+    // away; `optionsJson` reads the text rather than the selection because of
+    // it.
+    m_claudeModel->setEditable(true);
+    m_claudeModel->setInsertPolicy(QComboBox::NoInsert);
+    m_claudeModel->setToolTip("Which model the agent runs. Anything Claude Code accepts can be "
+                              "typed here as well.");
+    for (const ModelChoice& choice : kModels) {
+        m_claudeModel->addItem(QString::fromUtf8(choice.label), QString::fromUtf8(choice.id));
+    }
+    m_claudeModel->setCurrentIndex(0);
     form->addRow("Model:", m_claudeModel);
 
     m_permissionMode = new QComboBox(this);
@@ -263,7 +298,7 @@ QString NewAgentDialog::optionsJson() const {
         return QString();
     }
     QJsonObject options;
-    const QString model = m_claudeModel->text().trimmed();
+    const QString model = chosenModel();
     if (!model.isEmpty()) {
         // Left out rather than sent empty: the daemon's own default is what an
         // untouched field means, and "" is not a model name.
@@ -274,6 +309,17 @@ QString NewAgentDialog::optionsJson() const {
         options.insert("permission_mode", mode);
     }
     return QString::fromUtf8(QJsonDocument(options).toJson(QJsonDocument::Compact));
+}
+
+QString NewAgentDialog::chosenModel() const {
+    const QString shown = m_claudeModel->currentText().trimmed();
+    // A label off the list stands for the id behind it -- nobody types
+    // "Opus 5" at a CLI -- and anything else is an id typed by hand.
+    const int listed = m_claudeModel->findText(shown);
+    if (listed >= 0) {
+        return m_claudeModel->itemData(listed).toString();
+    }
+    return shown;
 }
 
 QString NewAgentDialog::initialPrompt() const {
@@ -608,6 +654,55 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_takes_its_own_inspect_fa
     emit path->editingFinished();
     if (!isReading(dialog)) {
         return 7;
+    }
+    return 0;
+}
+
+/// What the user asked for is an agent, so the dialog offers one.
+///
+/// The adapter used to be chosen by looking for "claude" in the daemon's
+/// capabilities, which arrive with the `hello` reply -- and this dialog is
+/// built the moment the user asks for it, which can be before that lands. The
+/// answer was then "no Claude here", the form came up on Terminal, and a user
+/// who pressed Create got a shell in a workspace they had asked for an agent
+/// in.
+extern "C" std::int32_t bs_widget_test_new_agent_dialog_offers_claude_before_the_daemon_answers() {
+    AppController controller;
+    GroupModel model;
+    // No `hello` has been answered, so the controller has no capabilities --
+    // exactly the state the dialog used to read as "Claude is unavailable".
+    if (!controller.capabilitiesJson().isEmpty()) {
+        return 1;
+    }
+    NewAgentDialog dialog(&controller, &model, QString::fromUtf8(kDialogRepo));
+    if (dialog.adapter() != QLatin1String("claude")) {
+        return 2;
+    }
+
+    // The model row is a list now, not a field to be told an id by heart. What
+    // goes on the wire is the id behind the label.
+    auto* models = dialog.findChild<QComboBox*>(QStringLiteral("NewAgentModel"));
+    if (models == nullptr || models->count() < 2) {
+        return 3;
+    }
+    const QJsonObject none = QJsonDocument::fromJson(dialog.optionsJson().toUtf8()).object();
+    if (none.contains(QStringLiteral("model"))) {
+        // The first entry is Claude Code's own default, which is sent by not
+        // being sent: "" is not a model name.
+        return 4;
+    }
+    models->setCurrentIndex(1);
+    const QJsonObject listed = QJsonDocument::fromJson(dialog.optionsJson().toUtf8()).object();
+    if (!listed.value(QStringLiteral("model")).toString().startsWith(QLatin1String("claude-"))) {
+        return 5;
+    }
+
+    // And a model that is not on the list is still one keystroke away: the CLI
+    // takes any name, so a new one must not need a new build of the IDE.
+    models->setCurrentText(QStringLiteral("claude-something-new"));
+    const QJsonObject typed = QJsonDocument::fromJson(dialog.optionsJson().toUtf8()).object();
+    if (typed.value(QStringLiteral("model")).toString() != QLatin1String("claude-something-new")) {
+        return 6;
     }
     return 0;
 }

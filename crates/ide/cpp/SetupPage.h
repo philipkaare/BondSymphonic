@@ -108,6 +108,17 @@ private:
     /// Puts the focus back on the terminal, which is where a sign-in carries
     /// on once the browser has been dealt with.
     void focusTerminal();
+    /// Says over the terminal that a paste of `characters` went in, because the
+    /// terminal itself cannot.
+    ///
+    /// `claude auth login` reads its sign-in code with the echo turned off, the
+    /// way a password prompt does, so a paste that worked perfectly leaves the
+    /// screen exactly as it was. That is the step this page exists for, and a
+    /// user with no sign that the code landed has no reason to press Enter.
+    void onPasted(int characters);
+    /// Sets the line above the terminal and remembers it, so a transient note
+    /// -- a paste, say -- has something to go back to.
+    void setTerminalNote(const QString& text);
     /// Re-renders the URL label at the width it now has, elided in the middle
     /// so the host and the tail of the query both stay readable.
     void updateLinkElide();
@@ -128,6 +139,12 @@ private:
     TerminalSession* m_session = nullptr;
     TerminalWidget* m_terminal = nullptr;
     QLabel* m_terminalLabel = nullptr;
+    /// What the label says when nothing transient is being said: the running
+    /// action, or why it could not start.
+    QString m_terminalNote;
+    /// Takes a paste's acknowledgement back off the label. One timer, restarted
+    /// by a second paste.
+    QTimer* m_pasteNoteTimer = nullptr;
     QPushButton* m_recheckButton = nullptr;
     /// The "Sign-in link" row under the terminal, hidden until a login URL is
     /// detected and taken down again when the terminal exits.

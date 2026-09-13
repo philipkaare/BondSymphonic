@@ -11,7 +11,9 @@
 //! regenerated inside that closure, never on a property read.
 
 use crate::client::router::{EventRouter, EventRx, Release};
-use crate::model::terminal_grid::{key_to_bytes, paste_bytes, TerminalGrid};
+use crate::model::terminal_grid::{
+    key_to_bytes, parse_hex_rgb, paste_bytes, Appearance, TerminalGrid,
+};
 use crate::qobjects::app_controller::{on_reconnect, require_connection, runtime, shared};
 use base64::Engine as _;
 use bondsymphonic_proto::{
@@ -106,6 +108,55 @@ pub mod qobject {
         /// `Qt::KeyboardModifiers` bits, `text` the event text.
         #[qinvokable]
         fn write_key(self: Pin<&mut TerminalSession>, qt_key: i32, modifiers: i32, text: QString);
+
+        /// Tells the terminal what the widget paints with: the default
+        /// foreground and background as `#rrggbb`, and the pixel size of one
+        /// cell. Unparseable colours and zero sizes leave the current answer
+        /// alone.
+        ///
+        /// A program is allowed to ask any of this -- a CLI asks the
+        /// background colour to decide whether it is on a light or a dark
+        /// terminal -- and the grid has no other way to know: the pane's
+        /// colours come from the Qt palette, which follows the desktop.
+        /// Remembered across a `reopen`, because the widget is the same one.
+        #[qinvokable]
+        fn set_appearance(
+            self: Pin<&mut TerminalSession>,
+            fg: QString,
+            bg: QString,
+            cell_width: i32,
+            cell_height: i32,
+        );
+
+        /// Starts a selection at the cell `col`, `row` of the visible screen.
+        /// `right_half` says which side of that cell the pointer is on, and
+        /// `word` picks out the word under it -- what a double-click does.
+        #[qinvokable]
+        fn begin_selection(
+            self: Pin<&mut TerminalSession>,
+            col: i32,
+            row: i32,
+            right_half: bool,
+            word: bool,
+        );
+
+        /// Drags the loose end of the selection to `col`, `row`.
+        #[qinvokable]
+        fn extend_selection(self: Pin<&mut TerminalSession>, col: i32, row: i32, right_half: bool);
+
+        /// Drops the selection.
+        #[qinvokable]
+        fn clear_selection(self: Pin<&mut TerminalSession>);
+
+        /// The selected text, empty when nothing is selected. What Copy puts
+        /// on the clipboard.
+        #[qinvokable]
+        fn selection_text(self: &TerminalSession) -> QString;
+
+        /// Whether anything is selected, which is what a Copy that is about to
+        /// be offered needs to know.
+        #[qinvokable]
+        fn has_selection(self: &TerminalSession) -> bool;
 
         /// Resizes the screen now and tells the daemon. After the process has
         /// exited only the screen is resized.
@@ -382,6 +433,10 @@ pub struct TerminalSessionRust {
     /// restarted when it does. Replaced on every `open`/`attach`, aborted on
     /// Drop.
     reconnect_task: Option<tokio::task::JoinHandle<()>>,
+    /// What the widget paints with, for the programs that ask. Kept here as
+    /// well as on the grid because `begin` builds a new grid for every PTY
+    /// while the widget in front of it has not changed.
+    appearance: Appearance,
 }
 
 /// The arguments of an `open`, kept so `reopen` can repeat it.
@@ -412,6 +467,7 @@ impl Default for TerminalSessionRust {
             unsubscribe: None,
             last_open: None,
             reconnect_task: None,
+            appearance: Appearance::default(),
         }
     }
 }
@@ -451,6 +507,15 @@ fn close_pty(pty_id: String) {
             tracing::warn!("pty.close for {pty_id} during teardown failed: {e}");
         }
     });
+}
+
+/// A widget's cell coordinates as the grid takes them. Negative is what a
+/// drag above or left of the pane reports, and it means the first cell.
+fn cell_at(col: i32, row: i32) -> (u16, u16) {
+    (
+        col.clamp(0, u16::MAX as i32) as u16,
+        row.clamp(0, u16::MAX as i32) as u16,
+    )
 }
 
 /// Clamps a requested size into what a terminal grid accepts.
@@ -772,6 +837,37 @@ impl qobject::TerminalSession {
         self.send(bytes);
     }
 
+    pub fn set_appearance(
+        mut self: Pin<&mut Self>,
+        fg: QString,
+        bg: QString,
+        cell_width: i32,
+        cell_height: i32,
+    ) {
+        let appearance = {
+            let mut appearance = self.as_ref().rust().appearance;
+            if let Some(rgb) = parse_hex_rgb(&fg.to_string()) {
+                appearance.fg = rgb;
+            }
+            if let Some(rgb) = parse_hex_rgb(&bg.to_string()) {
+                appearance.bg = rgb;
+            }
+            // Zero is what a widget that has not been laid out yet measures,
+            // and a cell of no size is worse than the last honest answer.
+            if cell_width > 0 {
+                appearance.cell_width = cell_width.min(u16::MAX as i32) as u16;
+            }
+            if cell_height > 0 {
+                appearance.cell_height = cell_height.min(u16::MAX as i32) as u16;
+            }
+            appearance
+        };
+        self.as_mut().rust_mut().appearance = appearance;
+        if let Some(grid) = self.as_mut().rust_mut().grid.as_mut() {
+            grid.set_appearance(appearance);
+        }
+    }
+
     pub fn write_key(self: Pin<&mut Self>, qt_key: i32, modifiers: i32, text: QString) {
         let app_cursor = self
             .rust()
@@ -780,6 +876,66 @@ impl qobject::TerminalSession {
             .is_some_and(|grid| grid.app_cursor_keys());
         let bytes = key_to_bytes(qt_key, modifiers as u32, &text.to_string(), app_cursor);
         self.send(bytes);
+    }
+
+    pub fn begin_selection(
+        mut self: Pin<&mut Self>,
+        col: i32,
+        row: i32,
+        right_half: bool,
+        word: bool,
+    ) {
+        let (col, row) = cell_at(col, row);
+        if let Some(grid) = self.as_mut().rust_mut().grid.as_mut() {
+            grid.begin_selection(col, row, right_half, word);
+        }
+        // The selection is part of what the widget paints, so moving it is a
+        // frame like any other.
+        self.apply_frame();
+    }
+
+    pub fn extend_selection(mut self: Pin<&mut Self>, col: i32, row: i32, right_half: bool) {
+        let (col, row) = cell_at(col, row);
+        if let Some(grid) = self.as_mut().rust_mut().grid.as_mut() {
+            grid.extend_selection(col, row, right_half);
+        }
+        self.apply_frame();
+    }
+
+    pub fn clear_selection(mut self: Pin<&mut Self>) {
+        let had = self
+            .as_ref()
+            .rust()
+            .grid
+            .as_ref()
+            .is_some_and(|grid| grid.has_selection());
+        if let Some(grid) = self.as_mut().rust_mut().grid.as_mut() {
+            grid.clear_selection();
+        }
+        // Only when there was something to take away: every key press clears
+        // the selection, and a repaint per keystroke over a terminal with
+        // nothing selected is a repaint for nothing.
+        if had {
+            self.apply_frame();
+        }
+    }
+
+    pub fn selection_text(&self) -> QString {
+        QString::from(
+            &self
+                .rust()
+                .grid
+                .as_ref()
+                .map(|grid| grid.selection_text())
+                .unwrap_or_default(),
+        )
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.rust()
+            .grid
+            .as_ref()
+            .is_some_and(|grid| grid.has_selection())
     }
 
     pub fn resize(mut self: Pin<&mut Self>, cols: i32, rows: i32) {
@@ -939,7 +1095,11 @@ impl qobject::TerminalSession {
         {
             let mut rust = self.as_mut().rust_mut();
             rust.close_requested = false;
-            rust.grid = Some(TerminalGrid::new(cols, rows));
+            let mut grid = TerminalGrid::new(cols, rows);
+            // The widget in front of this session has not changed, so neither
+            // has what it paints with.
+            grid.set_appearance(rust.appearance);
+            rust.grid = Some(grid);
             // A fresh flag: any closure still queued by an older pump clears
             // that pump's flag, not this session's.
             rust.frame_pending = Arc::new(AtomicBool::new(false));
@@ -960,11 +1120,24 @@ impl qobject::TerminalSession {
         pending
     }
 
-    /// Feeds PTY bytes into the screen. No-op before `open`.
+    /// Feeds PTY bytes into the screen, and answers anything the program asked
+    /// for on the way past. No-op before `open`.
+    ///
+    /// The answers go out here rather than on the next frame because they are
+    /// not for the user to look at: a program that has asked where the cursor
+    /// is, or what the terminal is, has stopped reading its input until the
+    /// report arrives. `gh auth login` does exactly that before each of its
+    /// yes/no prompts, and a terminal that never replies leaves the question on
+    /// screen refusing every keystroke.
     fn feed(mut self: Pin<&mut Self>, bytes: &[u8]) {
-        if let Some(grid) = self.as_mut().rust_mut().grid.as_mut() {
-            grid.feed(bytes);
-        }
+        let replies = match self.as_mut().rust_mut().grid.as_mut() {
+            Some(grid) => {
+                grid.feed(bytes);
+                grid.take_replies()
+            }
+            None => return,
+        };
+        self.send(replies);
     }
 
     /// Regenerates every property the widget paints from, then asks for a

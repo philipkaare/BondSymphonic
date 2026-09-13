@@ -4,6 +4,7 @@
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
 #include <QClipboard>
+#include <QCoreApplication>
 #include <QColor>
 #include <QDesktopServices>
 #include <QFont>
@@ -42,6 +43,11 @@ const QString kBad = QStringLiteral("✗");
 
 /// How long "Link copied" stays on the sign-in row.
 constexpr int kCopiedFeedbackMs = 3000;
+
+/// How long the line above the terminal acknowledges a paste. Longer than the
+/// "Link copied" flash: this one is a sentence to be read in the middle of a
+/// sign-in, not a nod at a button that was just clicked.
+constexpr int kPastedFeedbackMs = 8000;
 
 /// The narrowest the URL label will elide to. Below this the elision is all
 /// ellipsis and says nothing; the tooltip and the buttons still work.
@@ -148,6 +154,11 @@ SetupPage::SetupPage(AppController* controller, QWidget* parent)
     m_linkFeedbackTimer->setSingleShot(true);
     m_linkFeedbackTimer->setInterval(kCopiedFeedbackMs);
 
+    m_pasteNoteTimer = new QTimer(this);
+    m_pasteNoteTimer->setObjectName(QStringLiteral("SetupPastedNoteTimer"));
+    m_pasteNoteTimer->setSingleShot(true);
+    m_pasteNoteTimer->setInterval(kPastedFeedbackMs);
+
     auto* buttons = new QHBoxLayout();
     m_recheckButton = new QPushButton("Re-check", this);
     m_recheckButton->setToolTip("Ask the daemon about these again");
@@ -166,6 +177,9 @@ SetupPage::SetupPage(AppController* controller, QWidget* parent)
     QObject::connect(m_session, &TerminalSession::exitedSignal, this, &SetupPage::onTerminalExited);
     QObject::connect(m_linkFeedbackTimer, &QTimer::timeout, this,
                      [this] { m_linkFeedback->setVisible(false); });
+    QObject::connect(m_terminal, &TerminalWidget::pasted, this, &SetupPage::onPasted);
+    QObject::connect(m_pasteNoteTimer, &QTimer::timeout, this,
+                     [this] { m_terminalLabel->setText(m_terminalNote); });
     QObject::connect(m_copyLink, &QPushButton::clicked, this, &SetupPage::copyLink);
     QObject::connect(m_openLink, &QPushButton::clicked, this, &SetupPage::openLink);
     QObject::connect(m_linkLabel, &QLabel::linkActivated, this,
@@ -354,8 +368,7 @@ void SetupPage::runAction(const QString& action) {
     // The paste is named here because the one question this terminal asks
     // that cannot be typed is the sign-in code, and a shortcut nobody is
     // told about is a shortcut nobody finds.
-    m_terminalLabel->setText(
-        QString("Running %1. Answer its questions here; Ctrl+V pastes.").arg(action));
+    setTerminalNote(QString("Running %1. Answer its questions here; Ctrl+V pastes.").arg(action));
     m_terminal->setVisible(true);
     m_terminalHost->setVisible(true);
     // Deferred by one turn of the event loop: the pane has only just been
@@ -394,7 +407,7 @@ void SetupPage::onOperationFailed(const QString& op, const QString& message) {
     setActionsEnabled(true);
     // The pane header says what went wrong, over a hidden terminal: nothing was
     // opened, so an empty black rectangle would only read as a hang.
-    m_terminalLabel->setText(QString("%1 could not start: %2").arg(action, message));
+    setTerminalNote(QString("%1 could not start: %2").arg(action, message));
     m_terminal->setVisible(false);
     m_terminalHost->setVisible(true);
 }
@@ -437,6 +450,27 @@ void SetupPage::useLink() {
     // this link" without saying what for, and either one alone is a guess.
     copyLink();
     openLink();
+}
+
+void SetupPage::setTerminalNote(const QString& text) {
+    m_terminalNote = text;
+    m_pasteNoteTimer->stop();
+    m_terminalLabel->setText(text);
+}
+
+void SetupPage::onPasted(int characters) {
+    // The count, because it is the only thing anybody can check: the prompt
+    // that asked for the code does not echo it, so "22 characters went in" is
+    // the whole of what the IDE can honestly show, and it is enough to tell a
+    // paste that landed from a clipboard that was empty.
+    const bool one = characters == 1;
+    const QString unit = one ? QStringLiteral("character") : QStringLiteral("characters");
+    const QString those = one ? QStringLiteral("it") : QStringLiteral("them");
+    m_terminalLabel->setText(QString("Pasted %1 %2. Press Enter to send %3 -- a sign-in code is "
+                                     "not shown as it goes in.")
+                                 .arg(characters)
+                                 .arg(unit, those));
+    m_pasteNoteTimer->start();
 }
 
 void SetupPage::focusTerminal() {
@@ -527,6 +561,20 @@ const char* const kMarkupPrereq =
 const char* const kMixedPrereqs =
     "[{\"name\":\"git\",\"ok\":true,\"detail\":\"2.43.0\",\"fix_hint\":\"\"},"
     "{\"name\":\"claude\",\"ok\":false,\"detail\":\"not installed\",\"fix_hint\":\"\"}]";
+
+/// The line above the terminal: what is running in it, or what a paste just
+/// did. The first label the terminal pane holds, which is where the page puts
+/// it.
+QString terminalNote(const SetupPage& page) {
+    for (QLabel* label : page.findChildren<QLabel*>()) {
+        const QString text = label->text();
+        if (text.startsWith(QLatin1String("Running ")) ||
+            text.startsWith(QLatin1String("Pasted "))) {
+            return text;
+        }
+    }
+    return QString();
+}
 
 /// The page's fix button for that row, or null.
 QPushButton* fixButton(const SetupPage& page) {
@@ -675,4 +723,59 @@ extern "C" std::int32_t bs_widget_test_setup_page_reports_a_started_action() {
     }
     return 0;
 }
+/// The paste the user cannot see. `claude auth login` reads its sign-in code
+/// with the terminal's echo off, the way a password prompt does, so a paste
+/// that landed perfectly leaves the screen exactly as it was -- which is what
+/// the first real sign-in through this page looked like from the outside. The
+/// page says it instead, because nothing else can.
+extern "C" std::int32_t bs_widget_test_setup_page_says_what_was_pasted() {
+    AppController controller;
+    SetupPage page(&controller);
+    controller.prereqsChecked(QString::fromUtf8(kMarkupPrereq));
+    QPushButton* fix = fixButton(page);
+    if (fix == nullptr) {
+        return 1;
+    }
+    fix->click();
+    auto* terminal = page.findChild<TerminalWidget*>();
+    if (terminal == nullptr) {
+        return 2;
+    }
+    // The line above the terminal, which says what is running in it.
+    const QString running = terminalNote(page);
+    if (!running.startsWith(QLatin1String("Running "))) {
+        return 3;
+    }
+
+    // A paste of eight characters, with the session's own write stubbed out:
+    // there is no daemon here, and what is being checked is what the page
+    // says, not what the PTY got.
+    terminal->setPasteSink([](const QString&) {});
+    terminal->paste(QStringLiteral("code-123"));
+    const QString said = terminalNote(page);
+    if (!said.contains(QLatin1String("Pasted 8 characters"))) {
+        return 4;
+    }
+    // And it says which way the code now goes, because the prompt will not.
+    if (!said.contains(QLatin1String("Enter"))) {
+        return 5;
+    }
+
+    // The acknowledgement is transient: the line goes back to naming what is
+    // running, rather than leaving a stale count over a live terminal.
+    auto* timer = page.findChild<QTimer*>(QStringLiteral("SetupPastedNoteTimer"));
+    if (timer == nullptr || !timer->isActive()) {
+        return 6;
+    }
+    timer->setInterval(0);
+    timer->start();
+    // A zero-interval timer fires on the next pass of the loop, and this test
+    // has no loop of its own to wait in.
+    QCoreApplication::processEvents();
+    if (terminalNote(page) != running) {
+        return 7;
+    }
+    return 0;
+}
+
 #endif // BS_WIDGET_TESTS

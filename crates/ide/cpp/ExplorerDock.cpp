@@ -14,6 +14,7 @@
 #include <QLabel>
 #include <QList>
 #include <QPalette>
+#include <QResizeEvent>
 #include <QSizePolicy>
 #include <QStandardItem>
 #include <QStandardItemModel>
@@ -49,6 +50,10 @@ QColor statusColour(const QString& status, bool dark) {
     }
     return colour.isValid() ? theme::ink(colour, dark) : colour;
 }
+
+/// The narrowest the worktree path is elided to. Below this the elision eats
+/// the whole path and leaves an ellipsis, which says less than a clipped path.
+constexpr int kMinPathWidth = 40;
 
 /// The tail of a repository path -- its last two components -- which is what
 /// tells two checkouts apart without spending the strip's width on the prefix.
@@ -139,7 +144,7 @@ ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, AppContr
     QObject::connect(m_changes, &ChangesModel::loadFailed, this, &ExplorerDock::onChangesFailed);
 
     // The empty state, so the strip is never blank before the first tab.
-    setWorkspaceHeader(QString(), QString(), QString(), QString());
+    setWorkspaceHeader(QString(), QString(), QString(), QString(), QString());
 }
 
 ChangesToolbar* ExplorerDock::changesToolbar() const {
@@ -185,6 +190,20 @@ QWidget* ExplorerDock::buildHeader() {
     m_headerDetail->setTextInteractionFlags(Qt::TextSelectableByMouse);
     m_headerDetail->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     lines->addWidget(m_headerDetail);
+
+    m_headerPath = new QLabel(header);
+    m_headerPath->setObjectName(QStringLiteral("ExplorerHeaderPath"));
+    QPalette pathPalette = m_headerPath->palette();
+    pathPalette.setColor(QPalette::WindowText, theme::muted(palette()));
+    m_headerPath->setPalette(pathPalette);
+    // The daemon wrote this path and an agent chose part of it; it is shown as
+    // the text it is, and it can be selected because a path is something people
+    // paste into a shell.
+    m_headerPath->setTextFormat(Qt::PlainText);
+    m_headerPath->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_headerPath->setMinimumWidth(1);
+    m_headerPath->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    lines->addWidget(m_headerPath);
     layout->addLayout(lines, 1);
 
     m_refreshButton = new QToolButton(header);
@@ -200,7 +219,9 @@ QWidget* ExplorerDock::buildHeader() {
 }
 
 void ExplorerDock::setWorkspaceHeader(const QString& name, const QString& branch,
-                                      const QString& repoPath, const QString& baseBranch) {
+                                      const QString& repoPath, const QString& baseBranch,
+                                      const QString& worktreePath) {
+    m_worktreePath = worktreePath;
     m_name = name;
     m_branch = branch;
     m_baseBranch = baseBranch;
@@ -213,6 +234,8 @@ void ExplorerDock::setWorkspaceHeader(const QString& name, const QString& branch
         m_headerName->setToolTip(QString());
         m_headerDetail->clear();
         m_headerDetail->setToolTip(QString());
+        m_worktreePath.clear();
+        updatePathElide();
         m_refreshButton->setEnabled(false);
         return;
     }
@@ -224,7 +247,29 @@ void ExplorerDock::setWorkspaceHeader(const QString& name, const QString& branch
     const QString separator = QStringLiteral("  ") + QString(QChar(0x00B7)) + QStringLiteral("  ");
     m_headerDetail->setText(branch + separator + pathTail(repoPath));
     m_headerDetail->setToolTip(repoPath);
+    updatePathElide();
     m_refreshButton->setEnabled(true);
+}
+
+void ExplorerDock::updatePathElide() {
+    if (m_worktreePath.isEmpty()) {
+        m_headerPath->clear();
+        m_headerPath->setToolTip(QString());
+        m_headerPath->setVisible(false);
+        return;
+    }
+    m_headerPath->setVisible(true);
+    // From the left: every worktree of every agent shares a prefix, and what
+    // tells them apart is at the end.
+    const int room = qMax(m_headerPath->width(), kMinPathWidth);
+    m_headerPath->setText(
+        m_headerPath->fontMetrics().elidedText(m_worktreePath, Qt::ElideLeft, room));
+    m_headerPath->setToolTip(m_worktreePath);
+}
+
+void ExplorerDock::resizeEvent(QResizeEvent* event) {
+    QDockWidget::resizeEvent(event);
+    updatePathElide();
 }
 
 void ExplorerDock::setWorkspace(const QString& workspaceId) {
@@ -245,7 +290,7 @@ void ExplorerDock::setWorkspace(const QString& workspaceId) {
     // clearing of its own.
     m_changes->setWorkspace(workspaceId);
     if (workspaceId.isEmpty()) {
-        setWorkspaceHeader(QString(), QString(), QString(), QString());
+        setWorkspaceHeader(QString(), QString(), QString(), QString(), QString());
         return;
     }
     // The window calls `setWorkspaceHeader` right after this, but the id has to

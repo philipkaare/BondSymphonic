@@ -7,10 +7,12 @@
 //! the C++ side never has to parse that JSON just to paint a tab: it asks for
 //! the label, the tooltip, the status word and the counts directly.
 
-use crate::model::app_state::{AgentTab, TabStatus, Workspaces, UNSORTED_GROUP};
+use crate::model::app_state::{
+    adapter_from_name, adapter_name, AgentTab, TabStatus, Workspaces, UNSORTED_GROUP,
+};
 use crate::model::persistence::{PersistedGroup, PersistedGroups};
 use crate::model::transcript::parse_agent_state;
-use bondsymphonic_proto::{AgentAdapterKind, AgentId, WorkspaceId, WorkspaceInfo, WorkspaceState};
+use bondsymphonic_proto::{AgentId, WorkspaceId, WorkspaceInfo, WorkspaceState};
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -473,23 +475,6 @@ fn index(value: i32) -> Option<usize> {
     usize::try_from(value).ok()
 }
 
-/// The serialised name of an adapter kind, as the daemon spells it.
-fn adapter_name(kind: AgentAdapterKind) -> &'static str {
-    match kind {
-        AgentAdapterKind::Claude => "claude",
-        AgentAdapterKind::Terminal => "terminal",
-    }
-}
-
-/// Parses an adapter name coming from the UI. Anything unrecognised is a plain
-/// terminal, which is the adapter that always works.
-fn parse_adapter(name: &str) -> AgentAdapterKind {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "claude" => AgentAdapterKind::Claude,
-        _ => AgentAdapterKind::Terminal,
-    }
-}
-
 /// What the user chose for a tab, as `workspaceCreated` echoes it back.
 ///
 /// Every field is "not supplied" when empty: the signal carries no adapter for
@@ -507,7 +492,7 @@ pub struct TabChoices {
 impl TabChoices {
     pub fn apply(&self, tab: &mut AgentTab) {
         if !self.adapter.is_empty() {
-            tab.adapter = parse_adapter(&self.adapter);
+            tab.adapter = adapter_from_name(&self.adapter);
         }
         if !self.command.is_empty() {
             tab.command = Some(self.command.clone());

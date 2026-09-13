@@ -278,6 +278,10 @@ struct Journals {
     merges: Journal,
     /// Every `workspace.create_pr` as `<title>|<body>|<draft>`.
     prs: Journal,
+    /// Every `pty.write` as the bytes it carried, escaped. This is where the
+    /// answers to the terminal's own questions show up: a program asking where
+    /// the cursor is writes nothing else and reads nothing until it is told.
+    pty_writes: Journal,
 }
 
 impl Journals {
@@ -289,6 +293,7 @@ impl Journals {
             allowlists: fresh(),
             merges: fresh(),
             prs: fresh(),
+            pty_writes: fresh(),
         }
     }
 
@@ -354,12 +359,14 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
     let allowed = Journals::read(&journals.allowlists);
     let merges = Journals::read(&journals.merges);
     let prs = Journals::read(&journals.prs);
+    let pty_writes = Journals::read(&journals.pty_writes);
     // Read before the assertions, so a failure prints the file the run left
     // behind rather than only the fact that it was wrong.
     let state_json = std::fs::read_to_string(&state_path).unwrap_or_default();
     let context = format!(
         "requests: {seen:?}\npermission replies: {answered:?}\nallowlists: {allowed:?}\n\
-         merges: {merges:?}\npull requests: {prs:?}\nstate.json: {state_json}\n\
+         merges: {merges:?}\npull requests: {prs:?}\n\
+         pty writes: {pty_writes:?}\nstate.json: {state_json}\n\
          --- stdout ---\n{out}\n--- stderr ---\n{err}"
     );
     // Both pipes together. `tracing_subscriber::fmt()` writes to *stdout* by
@@ -401,6 +408,21 @@ fn the_ide_drives_a_workspace_pty_and_file_tree_then_exits_cleanly() {
              {count}\n{context}"
         );
     }
+    // The terminal answered the question the daemon's output asked. Every PTY
+    // this daemon opens asks where the cursor is, which is what `gh auth login`
+    // does before each of its yes/no prompts -- and until this, the answer went
+    // nowhere: the emulator parsed the query, handed the report to a listener
+    // that dropped it, and the program waited for a terminal that was never
+    // going to speak. On screen that was a question refusing every keystroke.
+    let report = pty_writes
+        .iter()
+        .find(|w| w.starts_with("\\u{1b}[") && w.ends_with('R'));
+    assert!(
+        report.is_some(),
+        "the IDE never reported the cursor position the daemon asked for
+{context}"
+    );
+
     // The Changes tab and the editor's watch are the window's own doing, and
     // both only make sense once there is a workspace: `set_workspace` on the
     // changes model issues `workspace.changes` and turns `fs.watch` on, and
@@ -742,6 +764,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journals) {
             allowlists: recorded_allowlists,
             merges: recorded_merges,
             prs: recorded_prs,
+            pty_writes: recorded_pty_writes,
         } = recording;
         // How many merges have been asked for. The first is answered as work
         // that landed and the ones after it as a conflict, so one script can
@@ -900,11 +923,19 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journals) {
                         ptys += 1;
                         let pty_id = PtyId(format!("pty_smoke{ptys}"));
                         open_ptys.push((p.workspace_id.clone(), pty_id.clone()));
+                        // A prompt, and then the question `gh auth login` asks
+                        // before each of its yes/no prompts: park the cursor
+                        // past the far corner and ask where it ended up, which
+                        // is how a program measures a screen. It reads nothing
+                        // until the answer comes back, so a terminal that does
+                        // not reply is a terminal whose prompts cannot be
+                        // answered -- and the reply has to come from the IDE,
+                        // which is what `pty_writes` below records.
                         follow_ups.push(ServerMessage::event(
                             Some(p.workspace_id.clone()),
                             Event::PtyOutput {
                                 pty_id: pty_id.clone(),
-                                data_b64: BASE64.encode("prompt$ "),
+                                data_b64: BASE64.encode("prompt$ \x1b[999;999f\x1b[6n"),
                             },
                         ));
                         Some(ServerMessage::ok(id, &PtyOpenResult { pty_id }))
@@ -1069,9 +1100,15 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journals) {
                         RpcError::internal("the smoke run never logs in"),
                     )),
                     // The terminal widget restates its size once the PTY exists.
-                    Request::PtyResize(_) | Request::PtyWrite(_) => {
+                    Request::PtyWrite(p) => {
+                        let bytes = BASE64.decode(p.data_b64.as_bytes()).unwrap_or_default();
+                        Journals::push(
+                            &recorded_pty_writes,
+                            String::from_utf8_lossy(&bytes).escape_debug().to_string(),
+                        );
                         Some(ServerMessage::ok(id, &Empty {}))
                     }
+                    Request::PtyResize(_) => Some(ServerMessage::ok(id, &Empty {})),
                     Request::FsListDir(_) => Some(ServerMessage::ok(
                         id,
                         &ListDirResult {

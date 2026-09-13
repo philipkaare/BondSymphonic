@@ -5,6 +5,7 @@
 #include <QClipboard>
 #include <QColor>
 #include <QContextMenuEvent>
+#include <QEvent>
 #include <QFontDatabase>
 #include <QFontMetrics>
 #include <QGuiApplication>
@@ -15,6 +16,7 @@
 #include <QKeyEvent>
 #include <QList>
 #include <QMenu>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPushButton>
 #include <QStringList>
@@ -93,6 +95,56 @@ bool isPasteShortcut(const QKeyEvent* event) {
     return event->key() == Qt::Key_Insert && modifiers.testFlag(Qt::ShiftModifier);
 }
 
+/// Whether this key press is the user asking to copy.
+///
+/// Ctrl+Shift+C and Ctrl+Insert, and no bare Ctrl+C: that one is the interrupt,
+/// and a terminal that swallowed it would leave a runaway program with nothing
+/// to stop it. Ctrl+C over a selection is handled separately, where the
+/// selection can be seen; a pane with nothing selected never treats it as a
+/// copy.
+bool isCopyShortcut(const QKeyEvent* event) {
+    const Qt::KeyboardModifiers modifiers = event->modifiers();
+    if (modifiers.testFlag(Qt::AltModifier)) {
+        return false;
+    }
+    if (event->key() == Qt::Key_C && modifiers.testFlag(Qt::ControlModifier) &&
+        modifiers.testFlag(Qt::ShiftModifier)) {
+        return true;
+    }
+    return event->key() == Qt::Key_Insert && modifiers.testFlag(Qt::ControlModifier);
+}
+
+/// Whether this is a plain Ctrl+C -- the interrupt, unless there is something
+/// selected to copy instead.
+bool isPlainCtrlC(const QKeyEvent* event) {
+    return event->key() == Qt::Key_C && event->modifiers() == Qt::ControlModifier;
+}
+
+/// Whether this press is a modifier on its own.
+///
+/// Qt delivers one for each modifier *before* the key it modifies, so Ctrl and
+/// Shift both arrive as key presses of their own on the way to Ctrl+Shift+C.
+/// Counting those as typing is how a selection disappears in the moment
+/// between reaching for the copy shortcut and pressing it -- and the copy then
+/// finds nothing to take.
+bool isModifierKey(const QKeyEvent* event) {
+    switch (event->key()) {
+    case Qt::Key_Shift:
+    case Qt::Key_Control:
+    case Qt::Key_Meta:
+    case Qt::Key_Alt:
+    case Qt::Key_AltGr:
+    case Qt::Key_CapsLock:
+    case Qt::Key_NumLock:
+    case Qt::Key_ScrollLock:
+    case Qt::Key_Super_L:
+    case Qt::Key_Super_R:
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace
 
 TerminalWidget::TerminalWidget(TerminalSession* session, QWidget* parent)
@@ -111,6 +163,11 @@ TerminalWidget::TerminalWidget(TerminalSession* session, QWidget* parent)
             m_session->paste(text);
         }
     };
+
+    // Before anything can be painted or asked about: a program may query the
+    // background colour in its first breath, and the terminal has no other
+    // source for the answer.
+    applyAppearance();
 
     setFocusPolicy(Qt::StrongFocus);
     // Every paint fills the whole rect, so Qt need not clear it first.
@@ -204,10 +261,124 @@ void TerminalWidget::paste(const QString& text) {
         return;
     }
     m_paste(text);
+    emit pasted(static_cast<int>(text.size()));
+}
+
+void TerminalWidget::applyAppearance() {
+    if (!m_session) {
+        return;
+    }
+    // The same two colours `paintRows` draws a cell with, named the way the
+    // grid's own spans name colours.
+    m_session->setAppearance(palette().text().color().name(QColor::HexRgb),
+                             palette().base().color().name(QColor::HexRgb), m_charWidth,
+                             m_lineHeight);
+}
+
+void TerminalWidget::changeEvent(QEvent* event) {
+    QWidget::changeEvent(event);
+    // The desktop switched to a dark theme, or this pane was restyled: what a
+    // program asking about the terminal's colours should be told has changed
+    // with it.
+    if (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange) {
+        applyAppearance();
+    }
 }
 
 void TerminalWidget::pasteFromClipboard() {
     paste(QGuiApplication::clipboard()->text());
+}
+
+void TerminalWidget::copySelection() {
+    if (!m_session) {
+        return;
+    }
+    const QString text = m_session->selectionText();
+    if (text.isEmpty()) {
+        return;
+    }
+    QGuiApplication::clipboard()->setText(text);
+}
+
+bool TerminalWidget::hasSelection() const {
+    return m_session && m_session->hasSelection();
+}
+
+void TerminalWidget::cellAt(const QPointF& position, int& col, int& row, bool& rightHalf) const {
+    const qreal x = qMax(qreal(0), position.x());
+    const qreal y = qMax(qreal(0), position.y());
+    col = qMin(static_cast<int>(x) / m_charWidth, qMax(0, m_cols - 1));
+    row = qMin(static_cast<int>(y) / m_lineHeight, qMax(0, m_rows - 1));
+    // Which half the pointer is on decides whether that cell is inside the
+    // selection or outside it: a drag that stops left of a character stops
+    // before it, one that goes past its middle takes it. Strictly past, so the
+    // exact middle belongs to the left half -- the boundary every other
+    // terminal draws.
+    rightHalf = (static_cast<int>(x) % m_charWidth) * 2 > m_charWidth;
+}
+
+void TerminalWidget::mousePressEvent(QMouseEvent* event) {
+    if (event->button() != Qt::LeftButton) {
+        QWidget::mousePressEvent(event);
+        return;
+    }
+    // A click in a terminal is also how it is focused: the pane takes input
+    // from wherever the pointer went, not from wherever the tab order left off.
+    setFocus(Qt::MouseFocusReason);
+    if (!m_session) {
+        event->accept();
+        return;
+    }
+    int col = 0;
+    int row = 0;
+    bool rightHalf = false;
+    cellAt(event->position(), col, row, rightHalf);
+    m_selecting = true;
+    m_selectingWords = false;
+    m_session->beginSelection(col, row, rightHalf, false);
+    event->accept();
+}
+
+void TerminalWidget::mouseDoubleClickEvent(QMouseEvent* event) {
+    if (event->button() != Qt::LeftButton || !m_session) {
+        QWidget::mouseDoubleClickEvent(event);
+        return;
+    }
+    int col = 0;
+    int row = 0;
+    bool rightHalf = false;
+    cellAt(event->position(), col, row, rightHalf);
+    m_selecting = true;
+    m_selectingWords = true;
+    m_session->beginSelection(col, row, rightHalf, true);
+    event->accept();
+}
+
+void TerminalWidget::mouseMoveEvent(QMouseEvent* event) {
+    if (!m_selecting || !m_session) {
+        QWidget::mouseMoveEvent(event);
+        return;
+    }
+    int col = 0;
+    int row = 0;
+    bool rightHalf = false;
+    cellAt(event->position(), col, row, rightHalf);
+    m_session->extendSelection(col, row, rightHalf);
+    event->accept();
+}
+
+void TerminalWidget::mouseReleaseEvent(QMouseEvent* event) {
+    if (event->button() != Qt::LeftButton) {
+        QWidget::mouseReleaseEvent(event);
+        return;
+    }
+    // The selection stays: it is what Copy acts on, and it is taken away by
+    // the next click or the next keystroke. Nothing is put on the clipboard
+    // here -- a terminal that copied on every drag would overwrite whatever
+    // the user had just copied somewhere else.
+    m_selecting = false;
+    m_selectingWords = false;
+    event->accept();
 }
 
 void TerminalWidget::setPasteSink(std::function<void(const QString& text)> sink) {
@@ -299,6 +470,13 @@ void TerminalWidget::paintRows(QPainter& painter, const QJsonArray& rows) {
             QColor fg = spanColour(span.value(QStringLiteral("fg")).toString(), defaultFg);
             QColor bg = spanColour(span.value(QStringLiteral("bg")).toString(), defaultBg);
             if (span.value(QStringLiteral("inverse")).toBool()) {
+                std::swap(fg, bg);
+            }
+            // A selection is drawn the way terminals have always drawn one: the
+            // two colours change places. Over text that is already inverse the
+            // two swaps cancel, which is what makes the selection visible there
+            // too.
+            if (span.value(QStringLiteral("selected")).toBool()) {
                 std::swap(fg, bg);
             }
             const bool underline = span.value(QStringLiteral("underline")).toBool();
@@ -399,9 +577,30 @@ void TerminalWidget::keyPressEvent(QKeyEvent* event) {
         event->accept();
         return;
     }
+    if (isCopyShortcut(event)) {
+        copySelection();
+        event->accept();
+        return;
+    }
     if (!m_session) {
         QWidget::keyPressEvent(event);
         return;
+    }
+    // Ctrl+C is the interrupt, except over a selection, where every terminal
+    // on this desktop copies. The selection is dropped with it, so the second
+    // Ctrl+C reaches the program -- which is what somebody hammering it for a
+    // runaway build needs.
+    if (isPlainCtrlC(event) && m_session->hasSelection()) {
+        copySelection();
+        m_session->clearSelection();
+        event->accept();
+        return;
+    }
+    // Typing is the end of a selection: the text it was made on is about to
+    // move, and a highlight left behind would be over whatever scrolled into
+    // its place. A modifier on its own is not typing -- see `isModifierKey`.
+    if (!isModifierKey(event)) {
+        m_session->clearSelection();
     }
     m_session->writeKey(event->key(), event->modifiers().toInt(), event->text());
     event->accept();
@@ -412,6 +611,10 @@ void TerminalWidget::contextMenuEvent(QContextMenuEvent* event) {
     // shortcut nobody finds, and this is the terminal a first-time user meets
     // in the middle of a login.
     QMenu menu(this);
+    QAction* copy = menu.addAction(QStringLiteral("Copy"));
+    copy->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_C));
+    copy->setEnabled(hasSelection());
+    QObject::connect(copy, &QAction::triggered, this, [this] { copySelection(); });
     QAction* paste = menu.addAction(QStringLiteral("Paste"));
     paste->setShortcut(QKeySequence::Paste);
     paste->setEnabled(!QGuiApplication::clipboard()->text().isEmpty());
@@ -586,6 +789,11 @@ extern "C" std::int32_t bs_widget_test_terminal_pastes_the_clipboard() {
     TerminalWidget widget(&session);
     QStringList pasted;
     widget.setPasteSink([&pasted](const QString& text) { pasted.append(text); });
+    // The count the widget announces, which is what a host page says over a
+    // prompt that shows nothing of a paste itself.
+    QList<int> announced;
+    QObject::connect(&widget, &TerminalWidget::pasted,
+                     [&announced](int characters) { announced.append(characters); });
 
     const QString code = QStringLiteral("code-123");
     QGuiApplication::clipboard()->setText(code);
@@ -635,6 +843,112 @@ extern "C" std::int32_t bs_widget_test_terminal_pastes_the_clipboard() {
     if (pasted.size() != 3) {
         return 6;
     }
+
+    // One announcement per paste, each carrying the length: three pastes of
+    // `code-123` went in, and the empty clipboard announced nothing.
+    const int length = static_cast<int>(code.size());
+    if (announced != QList<int> { length, length, length }) {
+        return 7;
+    }
     return 0;
 }
+/// Selecting output with the mouse and copying it. The output of a command is
+/// the one thing in this IDE that cannot be opened in an editor and copied
+/// from there, so without this the way to get an error message out of a
+/// terminal was to retype it.
+extern "C" std::int32_t bs_widget_test_terminal_selects_and_copies() {
+    TerminalSession session;
+    TerminalWidget widget(&session);
+    // The widget's own metrics, which is the only way a test can know where a
+    // cell is: the font is the desktop's fixed-pitch one and its size is not
+    // this test's to decide.
+    const QSize hint = widget.sizeHint();
+    const int cellWidth = hint.width() / 80;
+    const int cellHeight = hint.height() / 24;
+    if (cellWidth <= 0 || cellHeight <= 0) {
+        return 1;
+    }
+    const int cols = 40;
+    const int rows = 5;
+    widget.resize(cols * cellWidth, rows * cellHeight);
+    // No daemon here, so `open` fails -- but it builds the screen before it
+    // tries, which is what this needs. The marker is the one way a test can
+    // put known text on that screen without a PTY.
+    session.open(QStringLiteral("ws_1"), cols, rows, QString());
+    session.noteOutputDropped();
+    const QString marker = QStringLiteral("[output dropped]");
+
+    // A move carries no button of its own -- it carries the ones held down --
+    // and a widget that is sent one spelled the other way is a widget this
+    // check never actually dragged across.
+    const auto mouse = [&](qreal col, int row, QEvent::Type type, Qt::MouseButton button) {
+        const QPointF at(col * cellWidth, (row + 0.5) * cellHeight);
+        QMouseEvent event(type, at, at, button, Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(&widget, &event);
+    };
+
+    if (widget.hasSelection()) {
+        return 2;
+    }
+    // The marker lands on the second row: it opens with a line break.
+    // From the middle of the first cell to the far side of the last one.
+    const qreal lastCell = marker.size() - 0.1;
+    mouse(0.5, 1, QEvent::MouseButtonPress, Qt::LeftButton);
+    mouse(lastCell, 1, QEvent::MouseMove, Qt::NoButton);
+    mouse(lastCell, 1, QEvent::MouseButtonRelease, Qt::LeftButton);
+    if (!widget.hasSelection()) {
+        return 3;
+    }
+    if (session.selectionText() != marker) {
+        return 4;
+    }
+
+    // Dragging selects; it does not copy. Whatever was on the clipboard is
+    // still there until the user asks for the copy.
+    QGuiApplication::clipboard()->setText(QStringLiteral("untouched"));
+    mouse(lastCell, 1, QEvent::MouseMove, Qt::NoButton);
+    if (QGuiApplication::clipboard()->text() != QLatin1String("untouched")) {
+        return 5;
+    }
+
+    widget.copySelection();
+    if (QGuiApplication::clipboard()->text() != marker) {
+        return 6;
+    }
+
+    // Reaching for the copy shortcut must not lose the selection on the way.
+    // Qt delivers a press for each modifier before the key it modifies, so
+    // Ctrl and Shift both arrive first; a widget that read those as typing
+    // copied nothing, every time, in the real window.
+    QGuiApplication::clipboard()->setText(QStringLiteral("untouched"));
+    QKeyEvent ctrl(QEvent::KeyPress, Qt::Key_Control, Qt::NoModifier);
+    QCoreApplication::sendEvent(&widget, &ctrl);
+    QKeyEvent shift(QEvent::KeyPress, Qt::Key_Shift, Qt::ControlModifier);
+    QCoreApplication::sendEvent(&widget, &shift);
+    if (!widget.hasSelection()) {
+        return 7;
+    }
+    QKeyEvent copy(QEvent::KeyPress, Qt::Key_C, Qt::ControlModifier | Qt::ShiftModifier);
+    QCoreApplication::sendEvent(&widget, &copy);
+    if (QGuiApplication::clipboard()->text() != marker) {
+        return 8;
+    }
+
+    // Typing ends the selection: the text it was made on is about to move.
+    QKeyEvent letter(QEvent::KeyPress, Qt::Key_A, Qt::NoModifier, QStringLiteral("a"));
+    QCoreApplication::sendEvent(&widget, &letter);
+    if (widget.hasSelection()) {
+        return 9;
+    }
+
+    // And a copy with nothing selected leaves the clipboard alone rather than
+    // emptying it.
+    QGuiApplication::clipboard()->setText(QStringLiteral("kept"));
+    widget.copySelection();
+    if (QGuiApplication::clipboard()->text() != QLatin1String("kept")) {
+        return 10;
+    }
+    return 0;
+}
+
 #endif // BS_WIDGET_TESTS

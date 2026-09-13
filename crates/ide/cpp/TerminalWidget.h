@@ -2,6 +2,7 @@
 #include <QColor>
 #include <QFont>
 #include <QJsonArray>
+#include <QPointF>
 #include <QPointer>
 #include <QSize>
 #include <QString>
@@ -10,6 +11,8 @@
 
 class TerminalSession;
 class QContextMenuEvent;
+class QEvent;
+class QMouseEvent;
 class QPainter;
 class QPushButton;
 class QTimer;
@@ -56,6 +59,26 @@ public:
     /// session; this is the seam a test answers through.
     void setPasteSink(std::function<void(const QString& text)> sink);
 
+    /// Puts the selected text on the clipboard. Nothing selected, nothing
+    /// copied -- and in particular the clipboard is left as it was, so a Copy
+    /// that finds no selection cannot lose what was on it.
+    void copySelection();
+
+    /// Whether anything is selected in this pane.
+    bool hasSelection() const;
+
+signals:
+    /// A paste went to the program, carrying how many characters.
+    ///
+    /// Whether any of them appear on screen is the program's decision, and one
+    /// of the programs this IDE opens a terminal for decides not to:
+    /// `claude auth login` reads its sign-in code with the terminal's echo
+    /// turned off, exactly as a password prompt does, so a correct paste looks
+    /// from the outside like a paste that never happened. Anything hosting a
+    /// terminal where that matters can say so itself; see `SetupPage`.
+    void pasted(int characters);
+
+public:
     /// The colour the error banner's text is drawn in.
     ///
     /// Its own function so the painter and the check that the palette is
@@ -73,6 +96,15 @@ public:
 protected:
     void paintEvent(QPaintEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
+    /// Left button: starts a selection, and takes the focus. Anything else is
+    /// left to Qt, which is what raises the context menu.
+    void mousePressEvent(QMouseEvent* event) override;
+    /// Drags the loose end of the selection while the button is held.
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
+    /// Selects the word under the pointer, and keeps selecting by words if the
+    /// press turns into a drag.
+    void mouseDoubleClickEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     void focusInEvent(QFocusEvent* event) override;
@@ -83,6 +115,9 @@ protected:
     void showEvent(QShowEvent* event) override;
     /// Keeps Tab out of the focus chain so it reaches the shell.
     bool focusNextPrevChild(bool next) override;
+    /// Re-tells the session what the pane paints with when the desktop theme
+    /// or the widget's style changes under it.
+    void changeEvent(QEvent* event) override;
 
 private:
     /// The session's grid, parsed once per frame and handed out as often as
@@ -108,6 +143,14 @@ private:
     void updateReopenButton();
     /// Puts it in the top right corner, clear of the cursor's home position.
     void placeReopenButton();
+    /// The cell under a point in the widget, and which half of it, as the
+    /// session's selection calls take them. Clamped to the grid: a drag runs
+    /// off the edge of the pane all the time.
+    void cellAt(const QPointF& position, int& col, int& row, bool& rightHalf) const;
+    /// Tells the session the pane's default colours and cell size, which is
+    /// what the terminal answers a program that asks about either. The palette
+    /// follows the desktop, so this is not a constant and cannot be one.
+    void applyAppearance();
 
     QPointer<TerminalSession> m_session;
     /// Never null: the constructor installs the session paste.
@@ -128,6 +171,11 @@ private:
     int m_cols = 80;
     int m_rows = 24;
     QTimer* m_blinkTimer = nullptr;
+    /// Whether the left button is down and dragging out a selection.
+    bool m_selecting = false;
+    /// Whether that drag selects by word rather than by cell, which is what a
+    /// double-click and drag does.
+    bool m_selectingWords = false;
     /// Offered only over a shell the daemon's restart took away. A real child
     /// widget rather than a painted hotspot, so it is reachable from the
     /// keyboard and looks like the button it is.

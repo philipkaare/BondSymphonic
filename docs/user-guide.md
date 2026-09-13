@@ -163,6 +163,13 @@ offers **Paste** as well. Every terminal in the IDE takes one, not just this
 pane. AltGr characters are unaffected -- Windows reports AltGr as Ctrl+Alt, and
 a paste is Ctrl without Alt.
 
+**Nothing appears when you paste the code, and that is right.**
+`claude auth login` reads the code with the terminal's echo turned off, the way
+a password prompt does, so the screen does not change however you get the code
+in -- pasted or typed, in this IDE or in any other terminal. The line above the
+terminal says what happened instead: *Pasted 71 characters. Press Enter to send
+them.* Press **Enter** and the sign-in goes through.
+
 **Keep Settings open until the login terminal finishes.** Closing the dialog
 ends the `claude auth login` process it was running, so a sign-in half way
 through is abandoned. Closing it after a successful login is safe: the checks
@@ -203,9 +210,9 @@ greyed out while the repository in the box has not been read.
 | Repository | The git repository to branch from. **Browse…** picks one; **Recent** lists repositories you have used before. |
 | Base branch | The branch the workspace starts from and later merges back into. |
 | Name | Names the workspace and its branch, `bs/<name>/work`. Defaults to `agent-<n>`. One word: letters, digits, `-` or `_`, starting with a letter or a digit, at most 64 characters. A space, a `/`, a `.` or a leading `-` is refused as you type, with the reason under the field, and **Create** stays greyed out until you fix it. The daemon applies the same rule, so nothing the dialog accepts can fail later inside git. |
-| Adapter | **Claude Code** (the default when the daemon has it) or **Terminal**. |
+| Adapter | **Claude Code**, which is the default, or **Terminal**. |
 | Command | For a Terminal workspace, the command to run. Empty means your default shell. |
-| Model | Claude Code's `--model`. Empty means its default. |
+| Model | A list of the models, or type any name Claude Code accepts. **Default** leaves `--model` off, so Claude Code decides. |
 | Permission mode | `default`, `acceptEdits`, `plan` or `dontAsk` — the words Claude Code's `--permission-mode` accepts. |
 | Initial prompt | Sent to the agent as soon as it is up. |
 | Run config | Which run configuration the Run panel offers first. |
@@ -293,6 +300,19 @@ Colours, text attributes and resize work, and each session keeps 10,000 lines of
 scrollback. Two workspaces keep independent terminals, and destroying one leaves
 the other running.
 
+**Select with the mouse, copy with Ctrl+Shift+C.** Drag to select, double-click
+to take a word, and copy with **Ctrl+Shift+C**, **Ctrl+Insert** or right-click
+**Copy**. Plain **Ctrl+C** copies when something is selected and sends the
+interrupt when nothing is -- so it still stops a runaway command, and pressing
+it twice always does. Typing clears the selection, because the text it was made
+on is about to move.
+
+**Questions the terminal is asked are answered.** Programs ask a terminal where
+the cursor is, what it is and what colours it uses, and they stop reading input
+until the answer comes back. `gh auth login` does this before each of its
+yes/no prompts. The one question that is refused is a program asking to *read*
+your clipboard: that belongs to you, not to whatever is running in a workspace.
+
 When the daemon has to drop events under load, the affected screen prints
 `[output dropped]` rather than quietly losing bytes.
 
@@ -300,7 +320,11 @@ When the daemon has to drop events under load, the affected screen prints
 
 ## Files and Changes
 
-The Explorer dock has two tabs and a header naming the active workspace.
+The Explorer dock has two tabs and a header naming the active workspace: its
+name, its branch and repository, and the worktree the tree below is listing.
+The path is shown in full in the tooltip, elided from the left when the dock is
+narrow -- the end is the part that says which agent this is -- and it can be
+selected and copied.
 
 **Files** lists the workspace's worktree one directory at a time, as you expand
 them. The **Refresh** button in the Explorer header reloads the file tree and
@@ -311,10 +335,17 @@ highlighting for Rust, JavaScript, TypeScript, TSX, Python, JSON, TOML, YAML,
 HTML, CSS, Markdown, Bash, C, C++ and Go. Anything else opens as plain text. A
 binary file, or one over 4 MiB, opens as a read-only notice.
 
+**The open files belong to the agent.** Each agent works in a worktree of its
+own, so `src/main.rs` in one is not the file of that name in another: switching
+agent tab switches the whole row of editor tabs with it, back to the files that
+agent had open and to the one that was in front. Nothing is closed by
+switching -- edits, undo history and scroll position all wait where they were.
+
 Typing marks the tab with a dot. **File > Save** (Ctrl+S) writes the file back
 through the daemon into the sandboxed worktree; **Save All** (Ctrl+Shift+S)
-writes every dirty tab. Closing a tab with unsaved edits asks first, and so does
-closing the window.
+writes every dirty tab, in every agent's row and not only the one on show.
+Closing a tab with unsaved edits asks first, and so does closing the window --
+which counts the files of agents you are not looking at.
 
 While a file is open the IDE watches it. A change made on disk by an agent or a
 shell reloads an unmodified tab silently, keeping the caret and the scroll

@@ -59,6 +59,13 @@ QString pathOfKey(const QString& key) {
     return key.section(QLatin1Char('\n'), 2);
 }
 
+/// What a tab's tooltip says: the workspace and the path, which is the whole
+/// of what the key holds and the one place two same-named files in two
+/// worktrees can be told apart.
+QString tabTooltip(const QString& key) {
+    return key.section(QLatin1Char('\n'), 1).replace(QLatin1Char('\n'), QLatin1Char(':'));
+}
+
 /// The workspace a tab key names, empty for a page that has no key. Reading it
 /// back off the key is what lets a workspace be closed without knowing what
 /// kinds of page it has open.
@@ -101,6 +108,12 @@ EditorArea::EditorArea(QWidget* parent) : QWidget(parent) {
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
 
+    // The pages of workspaces that are not in front hang from here. Never laid
+    // out and never shown: it exists so that a set-aside page has a parent,
+    // because a widget with none is a window.
+    m_park = new QWidget(this);
+    m_park->hide();
+
     m_stack = new QStackedWidget(this);
     m_placeholder = new QLabel(QStringLiteral("Open a file from the Explorer"), m_stack);
     m_placeholder->setAlignment(Qt::AlignCenter);
@@ -122,16 +135,135 @@ EditorArea::EditorArea(QWidget* parent) : QWidget(parent) {
                      [this](int, int) { emit openEditorsChanged(); });
 }
 
+QString EditorArea::workspace() const {
+    return m_workspaceId;
+}
+
+void EditorArea::setWorkspace(const QString& workspaceId) {
+    if (workspaceId == m_workspaceId) {
+        return;
+    }
+    parkCurrent();
+    m_workspaceId = workspaceId;
+    restoreParked(workspaceId);
+    m_stack->setCurrentWidget(m_tabs->count() == 0 ? static_cast<QWidget*>(m_placeholder)
+                                                   : static_cast<QWidget*>(m_tabs));
+    // The window's Edit menu acts on the current editor, and it has just
+    // changed to another workspace's -- or to none.
+    emit currentEditorChanged(currentEditor());
+}
+
+void EditorArea::parkCurrent() {
+    if (m_tabs->count() == 0) {
+        m_parked.remove(m_workspaceId);
+        m_parkedCurrent.remove(m_workspaceId);
+        return;
+    }
+    QWidget* front = m_tabs->currentWidget();
+    QList<QWidget*> pages;
+    // From the front each time: removing a tab renumbers the rest, and taking
+    // index 0 over and over keeps the row's order.
+    while (m_tabs->count() > 0) {
+        QWidget* page = m_tabs->widget(0);
+        m_tabs->removeTab(0);
+        page->setParent(m_park);
+        page->hide();
+        pages.append(page);
+    }
+    m_parked.insert(m_workspaceId, pages);
+    m_parkedCurrent.insert(m_workspaceId, front);
+}
+
+void EditorArea::restoreParked(const QString& workspaceId) {
+    if (workspaceId.isEmpty()) {
+        return;
+    }
+    const QList<QWidget*> pages = m_parked.take(workspaceId);
+    QWidget* front = m_parkedCurrent.take(workspaceId).data();
+    for (QWidget* page : pages) {
+        const int index = m_tabs->addTab(page, page->property(kTabTitle).toString());
+        m_tabs->setTabToolTip(index, tabTooltip(page->property(kTabKey).toString()));
+        // The dirty marker lives on the tab, not on the page, so it has to be
+        // put back with it.
+        updateTabTitle(page);
+    }
+    const int index = front == nullptr ? -1 : m_tabs->indexOf(front);
+    if (index >= 0) {
+        m_tabs->setCurrentIndex(index);
+    }
+}
+
+bool EditorArea::addPage(QWidget* page, const QString& workspaceId, const QString& title,
+                         const QString& tooltip) {
+    // The first file opened settles which workspace the row belongs to, so an
+    // area nobody has told about a workspace behaves as it always did.
+    if (m_workspaceId.isEmpty()) {
+        m_workspaceId = workspaceId;
+    }
+    if (workspaceId != m_workspaceId) {
+        page->setParent(m_park);
+        page->hide();
+        m_parked[workspaceId].append(page);
+        // The one just opened is the one that workspace comes back to.
+        m_parkedCurrent.insert(workspaceId, page);
+        return false;
+    }
+    const int index = m_tabs->addTab(page, title);
+    m_tabs->setTabToolTip(index, tooltip);
+    m_tabs->setCurrentIndex(index);
+    m_stack->setCurrentWidget(m_tabs);
+    return true;
+}
+
+QWidget* EditorArea::pageForKey(const QString& key) const {
+    for (QWidget* page : allPages()) {
+        if (page->property(kTabKey).toString() == key) {
+            return page;
+        }
+    }
+    return nullptr;
+}
+
+QList<QWidget*> EditorArea::allPages() const {
+    QList<QWidget*> pages;
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        pages.append(m_tabs->widget(i));
+    }
+    for (auto it = m_parked.constBegin(); it != m_parked.constEnd(); ++it) {
+        pages.append(it.value());
+    }
+    return pages;
+}
+
+bool EditorArea::forgetParked(QWidget* page) {
+    for (auto it = m_parked.begin(); it != m_parked.end(); ++it) {
+        if (it.value().removeOne(page)) {
+            if (it.value().isEmpty()) {
+                m_parkedCurrent.remove(it.key());
+                m_parked.erase(it);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 void EditorArea::openFile(const QString& workspaceId, const QString& path) {
     if (workspaceId.isEmpty() || path.isEmpty()) {
         return;
     }
     const QString key = tabKey(QStringLiteral("file"), workspaceId, path);
-    const int existing = indexOfKey(key);
-    if (existing >= 0) {
-        m_tabs->setCurrentIndex(existing);
+    if (QWidget* existing = pageForKey(key)) {
+        // A page that is set aside is already open, and it is where it
+        // belongs: bringing it here would put another agent's file in this
+        // agent's row.
+        const int index = m_tabs->indexOf(existing);
+        if (index < 0) {
+            return;
+        }
+        m_tabs->setCurrentIndex(index);
         m_stack->setCurrentWidget(m_tabs);
-        if (auto* open = qobject_cast<EditorWidget*>(m_tabs->widget(existing))) {
+        if (auto* open = qobject_cast<EditorWidget*>(existing)) {
             open->view()->setFocus();
         }
         return;
@@ -143,8 +275,7 @@ void EditorArea::openFile(const QString& workspaceId, const QString& path) {
     editor->setProperty(kTabKey, key);
     editor->setProperty(kTabTitle, title);
 
-    const int index = m_tabs->addTab(editor, title);
-    m_tabs->setTabToolTip(index, workspaceId + QLatin1Char(':') + path);
+    const bool shown = addPage(editor, workspaceId, title, tabTooltip(key));
     QObject::connect(doc, &EditorDocument::dirtyChanged, this, [this, editor] {
         updateTabTitle(editor);
         emit unsavedStateChanged();
@@ -153,12 +284,13 @@ void EditorArea::openFile(const QString& workspaceId, const QString& path) {
     // waiting when one of the writes comes back a failure.
     QObject::connect(doc, &EditorDocument::saveFailed, this,
                      [this](const QString& message) { emit saveFailed(message); });
-    m_tabs->setCurrentIndex(index);
-    m_stack->setCurrentWidget(m_tabs);
     // A file you just opened takes the caret. Without this the focus stays in
     // whatever asked for it -- the Explorer tree, usually -- and the window's
-    // Edit menu has nothing to act on.
-    editor->view()->setFocus();
+    // Edit menu has nothing to act on. Nothing to focus when the file belongs
+    // to a workspace that is not in front: it was opened set aside.
+    if (shown) {
+        editor->view()->setFocus();
+    }
     // Last: `open` is asynchronous, and the pane has to be wired up before its
     // answer arrives.
     doc->open(workspaceId, path);
@@ -172,10 +304,12 @@ void EditorArea::openDiff(const QString& workspaceId, const QString& path) {
     // A different kind from the file tab on the same path, so opening a diff
     // does not take the place of the file the user is editing.
     const QString key = tabKey(QStringLiteral("diff"), workspaceId, path);
-    const int existing = indexOfKey(key);
-    if (existing >= 0) {
-        m_tabs->setCurrentIndex(existing);
-        m_stack->setCurrentWidget(m_tabs);
+    if (QWidget* existing = pageForKey(key)) {
+        const int index = m_tabs->indexOf(existing);
+        if (index >= 0) {
+            m_tabs->setCurrentIndex(index);
+            m_stack->setCurrentWidget(m_tabs);
+        }
         return;
     }
 
@@ -185,18 +319,19 @@ void EditorArea::openDiff(const QString& workspaceId, const QString& path) {
     widget->setProperty(kTabKey, key);
     widget->setProperty(kTabTitle, title);
 
-    const int index = m_tabs->addTab(widget, title);
-    m_tabs->setTabToolTip(index, workspaceId + QLatin1Char(':') + path);
-    m_tabs->setCurrentIndex(index);
-    m_stack->setCurrentWidget(m_tabs);
+    addPage(widget, workspaceId, title, tabTooltip(key));
     // Last: `load` is asynchronous, and the pane has to be wired up before its
     // answer arrives.
     doc->load(workspaceId, path);
 }
 
 bool EditorArea::hasUnsavedEditors() const {
-    for (int i = 0; i < m_tabs->count(); ++i) {
-        if (dirtyDocument(m_tabs->widget(i)) != nullptr) {
+    // Every page, not only the row on show: a file with unsaved edits is
+    // unsaved whether or not its workspace is the one in front, and a window
+    // that closed on the strength of the visible tabs would throw the rest
+    // away without asking.
+    for (QWidget* page : allPages()) {
+        if (dirtyDocument(page) != nullptr) {
             return true;
         }
     }
@@ -206,8 +341,7 @@ bool EditorArea::hasUnsavedEditors() const {
 EditorArea::Unsaved EditorArea::askUnsavedAll() {
     QString title;
     int dirty = 0;
-    for (int i = 0; i < m_tabs->count(); ++i) {
-        QWidget* page = m_tabs->widget(i);
+    for (QWidget* page : allPages()) {
         if (dirtyDocument(page) == nullptr) {
             continue;
         }
@@ -238,8 +372,7 @@ EditorWidget* EditorArea::currentEditor() const {
 }
 
 void EditorArea::saveAll() {
-    for (int i = 0; i < m_tabs->count(); ++i) {
-        QWidget* page = m_tabs->widget(i);
+    for (QWidget* page : allPages()) {
         // A page with a dirty document is an `EditorWidget` by construction:
         // that is the only kind of page `dirtyDocument` answers for.
         if (dirtyDocument(page) != nullptr) {
@@ -251,6 +384,19 @@ void EditorArea::saveAll() {
 void EditorArea::closeWorkspace(const QString& workspaceId) {
     if (workspaceId.isEmpty()) {
         return;
+    }
+    // The workspace is gone, so its set-aside pages have nothing to be saved
+    // to either. Taken first, because `removePage` below would walk the same
+    // lists.
+    const QList<QWidget*> parked = m_parked.take(workspaceId);
+    m_parkedCurrent.remove(workspaceId);
+    for (QWidget* page : parked) {
+        abandonClose(page);
+        page->deleteLater();
+    }
+    if (!parked.isEmpty()) {
+        emit unsavedStateChanged();
+        emit openEditorsChanged();
     }
     // Backwards: removing a tab renumbers everything after it.
     for (int i = m_tabs->count() - 1; i >= 0; --i) {
@@ -347,16 +493,19 @@ void EditorArea::abandonClose(QWidget* page) {
 }
 
 void EditorArea::removePage(QWidget* page) {
-    const int index = m_tabs->indexOf(page);
-    if (index < 0) {
-        return;
-    }
     // Before the page goes: the entry is keyed by a pointer that is about to
     // name nothing.
     abandonClose(page);
-    // `removeTab` publishes the new current tab, which is what tells the window
-    // its Edit actions have moved on.
-    m_tabs->removeTab(index);
+    const int index = m_tabs->indexOf(page);
+    if (index >= 0) {
+        // `removeTab` publishes the new current tab, which is what tells the
+        // window its Edit actions have moved on.
+        m_tabs->removeTab(index);
+    } else if (!forgetParked(page)) {
+        // Neither on a tab nor set aside: not this area's page, or one that
+        // has already gone.
+        return;
+    }
     page->deleteLater();
     if (m_tabs->count() == 0) {
         m_stack->setCurrentWidget(m_placeholder);
@@ -379,12 +528,20 @@ void EditorArea::updateTabTitle(QWidget* page) {
 
 QString EditorArea::openEditorsJson() const {
     QJsonObject byWorkspace;
-    const QString currentKey =
-        m_tabs->currentWidget() == nullptr
-            ? QString()
-            : m_tabs->currentWidget()->property(kTabKey).toString();
-    for (int i = 0; i < m_tabs->count(); ++i) {
-        const QString key = m_tabs->widget(i)->property(kTabKey).toString();
+    // The tab in front of each workspace, the set-aside ones included: coming
+    // back to a session should come back to the file each agent was on, not to
+    // the first of its tabs.
+    QHash<QString, QString> frontKeys;
+    if (QWidget* current = m_tabs->currentWidget()) {
+        frontKeys.insert(m_workspaceId, current->property(kTabKey).toString());
+    }
+    for (auto it = m_parkedCurrent.constBegin(); it != m_parkedCurrent.constEnd(); ++it) {
+        if (!it.value().isNull()) {
+            frontKeys.insert(it.key(), it.value()->property(kTabKey).toString());
+        }
+    }
+    for (QWidget* page : allPages()) {
+        const QString key = page->property(kTabKey).toString();
         if (kindOfKey(key) != QLatin1String("file")) {
             continue;
         }
@@ -397,7 +554,7 @@ QString EditorArea::openEditorsJson() const {
         QJsonArray open = entry.value(QStringLiteral("open")).toArray();
         open.append(path);
         entry.insert(QStringLiteral("open"), open);
-        if (key == currentKey) {
+        if (key == frontKeys.value(workspaceId)) {
             entry.insert(QStringLiteral("active"), path);
         }
         byWorkspace.insert(workspaceId, entry);
@@ -480,6 +637,96 @@ extern "C" std::int32_t bs_widget_test_editor_area_survives_a_destroyed_workspac
     // memory the next tab may be handed.
     if (area.pendingCloseCount() != 0) {
         return 4;
+    }
+    return 0;
+}
+
+/// The row of tabs belongs to the agent in front of it.
+///
+/// Every agent has a worktree of its own, so `a.txt` in one is not `a.txt` in
+/// another; one row holding both is a row where switching agent leaves the
+/// same files open over a different checkout, and where saving the tab in
+/// front writes into a workspace the user is no longer looking at.
+extern "C" std::int32_t bs_widget_test_editor_area_tabs_follow_the_workspace() {
+    EditorArea area;
+    auto* tabs = area.findChild<QTabWidget*>();
+    if (tabs == nullptr) {
+        return 1;
+    }
+    area.setWorkspace(QStringLiteral("ws_1"));
+    area.openFile(QStringLiteral("ws_1"), QStringLiteral("a.txt"));
+    area.openFile(QStringLiteral("ws_1"), QStringLiteral("b.txt"));
+    if (tabs->count() != 2) {
+        return 2;
+    }
+    // Something unsaved in the workspace about to be left, so the checks below
+    // are about a row that still matters rather than one nobody would miss.
+    EditorWidget* first = area.currentEditor();
+    if (first == nullptr || first->document() == nullptr) {
+        return 3;
+    }
+    first->document()->setDirty(true);
+
+    area.setWorkspace(QStringLiteral("ws_2"));
+    if (tabs->count() != 0) {
+        return 4;
+    }
+    // Set aside, not closed: the edits are still there and the window must
+    // still ask about them before it lets itself be closed.
+    if (!area.hasUnsavedEditors()) {
+        return 5;
+    }
+    area.openFile(QStringLiteral("ws_2"), QStringLiteral("c.txt"));
+    if (tabs->count() != 1 || tabs->tabText(0) != QLatin1String("c.txt")) {
+        return 6;
+    }
+
+    // Both workspaces are still open files, and the session records them per
+    // workspace, which is how they come back.
+    const QJsonObject open = QJsonDocument::fromJson(area.openEditorsJson().toUtf8()).object();
+    if (open.value(QStringLiteral("ws_1")).toObject().value(QStringLiteral("open")).toArray().size()
+        != 2) {
+        return 7;
+    }
+    if (open.value(QStringLiteral("ws_2")).toObject().value(QStringLiteral("open")).toArray().size()
+        != 1) {
+        return 8;
+    }
+
+    // Back again: the same tabs, in the same order, with the same one in front.
+    area.setWorkspace(QStringLiteral("ws_1"));
+    if (tabs->count() != 2) {
+        return 9;
+    }
+    if (tabs->tabText(0) != QLatin1String("a.txt")) {
+        return 10;
+    }
+    // `b.txt` was the one in front and the one with unsaved edits. Both come
+    // back: the marker is drawn on the tab rather than held by the page, so it
+    // has to be put back with it.
+    if (!tabs->tabText(1).endsWith(QLatin1String("b.txt")) ||
+        tabs->tabText(1) == QLatin1String("b.txt")) {
+        return 11;
+    }
+    if (tabs->currentIndex() != 1) {
+        return 12;
+    }
+
+    // A file of a workspace that is not in front is opened where it belongs,
+    // not into this row.
+    area.openFile(QStringLiteral("ws_2"), QStringLiteral("d.txt"));
+    if (tabs->count() != 2) {
+        return 13;
+    }
+
+    // And a workspace that is destroyed takes its set-aside tabs with it.
+    area.closeWorkspace(QStringLiteral("ws_2"));
+    const QJsonObject after = QJsonDocument::fromJson(area.openEditorsJson().toUtf8()).object();
+    if (after.contains(QStringLiteral("ws_2"))) {
+        return 14;
+    }
+    if (!after.contains(QStringLiteral("ws_1"))) {
+        return 15;
     }
     return 0;
 }

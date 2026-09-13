@@ -1560,6 +1560,7 @@ mod cpp_widgets {
         /// once; a second call is a no-op.
         fn bs_widget_test_begin();
         fn bs_widget_test_editor_area_survives_a_destroyed_workspace() -> i32;
+        fn bs_widget_test_editor_area_tabs_follow_the_workspace() -> i32;
         fn bs_widget_test_changes_toolbar_cancels_a_switched_workspace() -> i32;
         fn bs_widget_test_changes_toolbar_acts_on_the_confirmed_workspace() -> i32;
         fn bs_widget_test_setup_page_detail_is_plain_text() -> i32;
@@ -1569,8 +1570,11 @@ mod cpp_widgets {
         fn bs_widget_test_terminal_parses_its_rows_once_per_frame() -> i32;
         fn bs_widget_test_terminal_error_ink_follows_the_palette() -> i32;
         fn bs_widget_test_terminal_pastes_the_clipboard() -> i32;
+        fn bs_widget_test_terminal_selects_and_copies() -> i32;
         fn bs_widget_test_transcript_coalesces_a_streamed_answer() -> i32;
         fn bs_widget_test_new_agent_dialog_takes_its_own_inspect_failure() -> i32;
+        fn bs_widget_test_new_agent_dialog_offers_claude_before_the_daemon_answers() -> i32;
+        fn bs_widget_test_setup_page_says_what_was_pasted() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1584,10 +1588,14 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 12] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 16] = [
             (
                 "EditorArea closes a tab under a destroyed workspace",
                 bs_widget_test_editor_area_survives_a_destroyed_workspace,
+            ),
+            (
+                "EditorArea keeps a row of tabs per workspace",
+                bs_widget_test_editor_area_tabs_follow_the_workspace,
             ),
             (
                 "ChangesToolbar cancels an action whose workspace moved",
@@ -1626,12 +1634,24 @@ mod cpp_widgets {
                 bs_widget_test_terminal_pastes_the_clipboard,
             ),
             (
+                "TerminalWidget selects text with the mouse and copies it",
+                bs_widget_test_terminal_selects_and_copies,
+            ),
+            (
                 "TranscriptView coalesces a streamed answer",
                 bs_widget_test_transcript_coalesces_a_streamed_answer,
             ),
             (
                 "NewAgentDialog takes its own inspect failure and no other",
                 bs_widget_test_new_agent_dialog_takes_its_own_inspect_failure,
+            ),
+            (
+                "NewAgentDialog offers Claude before the daemon has answered",
+                bs_widget_test_new_agent_dialog_offers_claude_before_the_daemon_answers,
+            ),
+            (
+                "SetupPage says what was pasted, since the prompt will not",
+                bs_widget_test_setup_page_says_what_was_pasted,
             ),
         ];
 

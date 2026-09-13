@@ -308,6 +308,24 @@ pub fn permission_attention(name: &str) -> String {
 /// one function because it used to be an inline `match` here and a copy of the
 /// same `match` in `GroupModel`, which is two places to decide that a workspace
 /// that has stopped failing still has something to say about it.
+/// The serialised name of an adapter kind, as the daemon and `state.json`
+/// spell it.
+pub fn adapter_name(kind: AgentAdapterKind) -> &'static str {
+    match kind {
+        AgentAdapterKind::Claude => "claude",
+        AgentAdapterKind::Terminal => "terminal",
+    }
+}
+
+/// An adapter name from the UI or from `state.json`. Anything unrecognised is
+/// Claude, which is what a workspace in this IDE is for.
+pub fn adapter_from_name(name: &str) -> AgentAdapterKind {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "terminal" => AgentAdapterKind::Terminal,
+        _ => AgentAdapterKind::Claude,
+    }
+}
+
 pub fn state_detail(state: &WorkspaceState) -> String {
     match state {
         WorkspaceState::Error(detail) => detail.clone(),
@@ -344,6 +362,14 @@ impl AgentTab {
     /// came back as a terminal tab bound to no agent, and the transcript the
     /// daemon was still serving had no pane in the UI that could reach it.
     ///
+    /// A workspace with no agent at all is a Claude tab too. It has to be a
+    /// guess either way -- the daemon records the adapter of an *agent*, and
+    /// there is none -- and this is the guess that leaves the user somewhere
+    /// they can work: a Claude pane with a prompt to type into, rather than a
+    /// shell in a workspace they created to run an agent in. A deliberate
+    /// terminal workspace is remembered locally instead; see
+    /// [`Workspaces::from_persisted`].
+    ///
     /// The last entry rather than a search for a running one: the daemon lists
     /// a workspace's agents oldest first, handing restored ones their place
     /// before any new agent can take it, and an agent that has ended is exactly
@@ -363,7 +389,7 @@ impl AgentTab {
             status: TabStatus::from_workspace_state(&info.state),
             detail: state_detail(&info.state),
             worktree_path: info.worktree_path.clone(),
-            adapter: agent.map_or(AgentAdapterKind::Terminal, |a| a.adapter),
+            adapter: agent.map_or(AgentAdapterKind::Claude, |a| a.adapter),
             command: None,
             run_config: None,
             agent_id: agent.map(|a| a.id.clone()),
@@ -485,13 +511,23 @@ impl Workspaces {
                     continue;
                 }
                 let mut tab = AgentTab::from_workspace_info(info);
-                // The two fields the daemon knows nothing about. Everything
-                // else on the tab is rebuilt from `WorkspaceInfo`, on purpose;
-                // these exist only in `state.json`, so this is the one place
-                // they can come back from.
+                // The fields the daemon knows nothing about. Everything else
+                // on the tab is rebuilt from `WorkspaceInfo`, on purpose; these
+                // exist only in `state.json`, so this is the one place they can
+                // come back from.
                 if let Some(saved) = persisted.tab(id) {
                     tab.command = saved.command.clone();
                     tab.run_config = saved.run_config.clone();
+                    // Only for a workspace the daemon has no agent for. An
+                    // agent record says what actually ran, which beats what
+                    // was asked for months ago; with no record there is
+                    // nothing to beat, and a workspace the user deliberately
+                    // made a terminal must not come back as a Claude pane.
+                    if info.agent_records.is_empty() {
+                        if let Some(adapter) = saved.adapter.as_deref() {
+                            tab.adapter = adapter_from_name(adapter);
+                        }
+                    }
                 }
                 tabs.push(tab);
             }
@@ -552,11 +588,20 @@ impl Workspaces {
                 tabs: g
                     .tabs
                     .iter()
-                    .filter(|t| t.command.is_some() || t.run_config.is_some())
+                    .filter(|t| {
+                        t.command.is_some()
+                            || t.run_config.is_some()
+                            || t.adapter != AgentAdapterKind::Claude
+                    })
                     .map(|t| PersistedTab {
                         workspace_id: t.workspace_id.0.clone(),
                         command: t.command.clone(),
                         run_config: t.run_config.clone(),
+                        // Recorded only when it is not the default, so the
+                        // file holds the choice a user made rather than a copy
+                        // of the one they did not.
+                        adapter: (t.adapter != AgentAdapterKind::Claude)
+                            .then(|| adapter_name(t.adapter).to_owned()),
                     })
                     .collect(),
             })

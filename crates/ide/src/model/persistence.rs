@@ -48,6 +48,15 @@ pub struct PersistedTab {
     pub command: Option<String>,
     /// The run configuration the Run panel opens on for this workspace.
     pub run_config: Option<String>,
+    /// The adapter chosen for this workspace, when it is not the default.
+    ///
+    /// Only the daemon can say what an *agent* ran under, and a workspace
+    /// whose agent was never started has no record there -- so without this a
+    /// terminal workspace came back as a Claude pane after an IDE restart.
+    /// `None` means "whatever the default is", which is how every Claude tab
+    /// is written.
+    #[serde(default)]
+    pub adapter: Option<String>,
 }
 
 /// One group as the file records it: a name and the workspaces in it, in the

@@ -46,15 +46,27 @@ Rust with a thin C++ Qt Widgets shell bridged by cxx-qt.
   colour: idle (grey), working (blue, animated), waiting for permission (amber),
   error (red), exited/done (green check). Tooltip shows repo, branch, adapter.
   "+" opens the New Agent dialog.
-- **Explorer dock** (left): "Files" tree of the active workspace's worktree with
-  git status colouring; "Changes" list of files changed vs base with +/- counts.
+- **Explorer dock** (left): a header naming the workspace, its branch and
+  repository, and the worktree path the tree is listing — elided from the left,
+  since every agent's worktree shares a prefix and the end is what tells them
+  apart, and selectable, because a path is something people paste into a shell.
+  Below it: "Files" tree of the active workspace's worktree with git status
+  colouring; "Changes" list of files changed vs base with +/- counts.
   Double-click opens in the editor (Files) or in the diff view (Changes). Changes
   has Merge, Rebase, Squash, Create PR, Discard buttons in its toolbar.
 - **Center splitter**: editor area left, agent area right by default. View menu:
   "Swap editor and agent". The splitter ratio persists.
 - **Editor area**: tabbed documents; each tab is an editor or a diff view.
   Modified-indicator, Ctrl+S saves through the daemon, external change prompts
-  reload.
+  reload. **One row of tabs per workspace.** Each agent has a worktree of its
+  own, so a row mixing them is a row where `src/main.rs` means two different
+  files; switching agent switches the row, back to that agent's files and to
+  the one that was in front. The others are set aside rather than closed —
+  `EditorArea::parkCurrent` hangs them from a hidden parent with their edits,
+  undo history and scroll position intact — and everything that counts open
+  files (`hasUnsavedEditors`, `saveAll`, `askUnsavedAll`, `openEditorsJson`)
+  counts them, because a file with unsaved edits is unsaved whether or not it
+  is the one on screen.
 - **Agent area**: a stacked widget, one page per workspace: for Claude agents a
   transcript, permission bar, and input box; for terminal agents a terminal.
 - **Bottom dock**: "Run" panel and "Terminal" (shell in the workspace sandbox).
@@ -103,7 +115,7 @@ crates/ide/
     MainWindow.{h,cpp}      docks, splitter, menus, status bar, persistence hooks
     GroupBar.{h,cpp}        two QTabBars (groups, agents) with status glyphs
     ExplorerDock.{h,cpp}    Files tree (QTreeView) + Changes list
-    EditorArea.{h,cpp}      QTabWidget of EditorWidget / DiffWidget
+    EditorArea.{h,cpp}      QTabWidget of EditorWidget / DiffWidget, one row per workspace
     EditorWidget.{h,cpp}    QPlainTextEdit + line numbers + RustHighlighter
     DiffWidget.{h,cpp}      two synced QPlainTextEdits with row colouring
     AgentArea.{h,cpp}       QStackedWidget of TranscriptView / TerminalWidget
@@ -327,8 +339,8 @@ using the same `RustHighlighter`.
   bg, flags}` for the visible region plus scrollback offset.
 - `TerminalWidget` paints with `QPainter` on a monospace font, handles key events
   (mapping Qt keys to VT sequences for arrows, function keys, Ctrl combos),
-  pasting, mouse-wheel scrollback, and resize → `pty.resize`. Selection and
-  copy are not built: nothing in the widget handles a mouse press today.
+  pasting, selection and copy with the mouse, mouse-wheel scrollback, and
+  resize → `pty.resize`.
 - **A paste is not the keys that would have typed it.** Ctrl+V, Ctrl+Shift+V and
   Shift+Insert — Ctrl *without* Alt, so the AltGr characters a Danish or German
   layout composes are still characters — and the right-click menu all reach
@@ -343,6 +355,43 @@ using the same `RustHighlighter`.
   for could only be typed out by hand — Ctrl+V reaches a terminal as the control
   code 0x16, which the widget forwarded — and that is where the first real
   login stopped.
+- **A terminal that is asked a question answers it.** Some escape sequences are
+  questions -- where is the cursor (`ESC [ 6 n`), what are you (`ESC [ c`), how
+  big is your window (`CSI 14 t`), what colour is entry 11 (OSC 4/10/11) -- and
+  the program that asks stops reading its input until the report comes back.
+  `alacritty_terminal` parses them and hands each answer to its `EventListener`
+  as `PtyWrite`, `ColorRequest` or `TextAreaSizeRequest`; the `Listener` in
+  `terminal_grid.rs` queues them, `TerminalGrid::take_replies` spells them, and
+  `TerminalSession::feed` writes them to the PTY in the same breath as the
+  output that asked. Colour and pixel answers need what the widget paints with,
+  which no part of the model can know -- the pane's colours come from the Qt
+  palette -- so `TerminalWidget` states it through `setAppearance` on
+  construction and on every palette change. The one question that is refused is
+  OSC 52's *read* the clipboard: it belongs to the person at the keyboard, not
+  to a program in a workspace. Without the answers, `gh auth login` asked where
+  the cursor was before its `Authenticate Git with your GitHub credentials?
+  (Y/n)` prompt and then ignored every key, which is where the first real
+  GitHub sign-in stopped.
+- **Selection and copy are the mouse's half of the same job.** A press starts a
+  `Simple` selection in `alacritty_terminal`, a double-click a `Semantic` one,
+  and a drag updates its loose end; which half of a cell the pointer is on
+  decides whether that cell is in, so a drag that stops before a character
+  stops before it. `TerminalGrid::rows` marks the cells the range covers and
+  the widget paints them by swapping the two colours, which is what a selection
+  has looked like since before terminals had colours to swap.
+  `selection_to_string` is what reaches the clipboard, so trailing blanks are
+  gone and a line that only wrapped is joined. Ctrl+Shift+C and Ctrl+Insert
+  copy; plain Ctrl+C copies only when something is selected and is the
+  interrupt otherwise, and it drops the selection, so a second Ctrl+C always
+  reaches the program.
+- **A paste is not always visible, and that is the program's call.**
+  `claude auth login` reads its sign-in code with the terminal in raw mode and
+  the echo off, exactly as a password prompt does, so a paste that landed
+  perfectly leaves the screen unchanged -- in this IDE and in every other
+  terminal. `TerminalWidget` therefore emits `pasted(int)`, and `SetupPage`,
+  which is the page where that prompt appears, says the count above the
+  terminal. Showing the code itself would be the IDE undoing a decision the
+  program made about a credential.
 - One `TerminalSession` per shell tab and per terminal-adapter agent.
 
 ## 10. New Agent dialog
@@ -372,6 +421,21 @@ Three rules govern when it opens and what it will accept:
   in red under the field, and greys Create out. Create is also greyed out while
   the path in the box has not been inspected, while an inspection is out, and
   after one has failed.
+- **The adapter is Claude unless the daemon says otherwise.** The capabilities
+  arrive with the `hello` reply and the dialog can be built before that lands,
+  so the question asked is "has the daemon *said* it cannot run Claude Code?"
+  rather than "did it say it can?". Reading it the other way round is what gave
+  users who asked for an agent a shell: every daemon offers both adapters, and
+  the only thing missing was the answer saying so. The same default runs
+  through `AgentTab::from_workspace_info`, where a workspace with no agent
+  record at all is a Claude tab; a workspace that really is a terminal is
+  remembered in `state.json` beside its command, because the daemon records the
+  adapter of an *agent* and that workspace has none.
+- **The model is a list.** Claude Code takes any `--model` name, so the combo is
+  editable, but nobody should have to know a model id by heart to start an
+  agent: the entries are the current models, the first is Claude Code's own
+  default and sends no `--model` at all, and what crosses the wire is the id
+  behind the label.
 - **A folder that is not a repository is explained.** `RepoInfo.is_repo == false`
   puts a line under the path — "This folder is not a git repository. It will be
   initialised with an empty first commit when the agent is created.", or "This

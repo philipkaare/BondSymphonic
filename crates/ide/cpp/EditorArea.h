@@ -1,6 +1,8 @@
 #pragma once
 #include <QHash>
+#include <QList>
 #include <QMetaObject>
+#include <QPointer>
 #include <QString>
 #include <QWidget>
 #include <functional>
@@ -18,13 +20,40 @@ class QTabWidget;
 /// rearranged. The area asks nothing of the daemon itself: it creates one
 /// `EditorDocument` per tab, hands it to an `EditorWidget`, and lets the pane
 /// and the document settle everything between them.
+///
+/// The row of tabs belongs to one workspace at a time -- see `setWorkspace`.
+/// Every other workspace's tabs are set aside rather than closed: they are
+/// still open files with their edits, their undo history and their scroll
+/// position, and they come back exactly as they were when that agent is in
+/// front again.
 class EditorArea : public QWidget {
     Q_OBJECT
 public:
     explicit EditorArea(QWidget* parent = nullptr);
 
+    /// Shows the open files of `workspaceId` and no others.
+    ///
+    /// Each agent works in a worktree of its own, so `src/main.rs` in one is a
+    /// different file from `src/main.rs` in another. A single row mixing them
+    /// is a row where most of the tabs belong to something the user is not
+    /// looking at, and where the tab that is in front after switching agent is
+    /// whatever happened to be there before. Switching moves the whole row.
+    ///
+    /// Nothing is closed and nothing is saved: the other workspaces' tabs are
+    /// set aside with their editors intact, and `hasUnsavedEditors`,
+    /// `saveAll`, `askUnsavedAll` and `openEditorsJson` all still count them,
+    /// because a file with unsaved edits is unsaved whether or not it is the
+    /// one on screen.
+    ///
+    /// An empty id sets every tab aside, which is the no-workspace state.
+    void setWorkspace(const QString& workspaceId);
+
+    /// The workspace whose tabs are on show.
+    QString workspace() const;
+
     /// Shows `path` of `workspaceId`, activating the tab that already has it or
-    /// opening a new one.
+    /// opening a new one. A file of a workspace that is not in front is opened
+    /// set aside, and appears when that workspace does.
     void openFile(const QString& workspaceId, const QString& path);
 
     /// Shows `path`'s working copy against its base, side by side, activating
@@ -75,7 +104,7 @@ public:
     /// page, which no longer exists.
     bool closeTab(int index);
 
-    /// The open file tabs, per workspace, as
+    /// The open file tabs of every workspace, the ones set aside included, as
     /// `{"<workspace>": {"open": [...], "active": "..."}}` -- exactly what
     /// `AppController::noteEditors` takes for each entry.
     ///
@@ -126,9 +155,27 @@ private:
     /// save can never close a tab nobody asked to close.
     void abandonClose(QWidget* page);
 
-    /// Removes `page` from the tabs and deletes it, showing the placeholder
-    /// again when it was the last one.
+    /// Removes `page` from the tabs -- or from the pages set aside -- and
+    /// deletes it, showing the placeholder again when it was the last one.
     void removePage(QWidget* page);
+    /// Takes `page` out of the set-aside lists. Answers whether it was there.
+    bool forgetParked(QWidget* page);
+    /// Every page of every workspace: the tabs on show, then the ones set
+    /// aside. What anything counting open files has to ask.
+    QList<QWidget*> allPages() const;
+    /// Sets the tabs on show aside under the workspace they belong to,
+    /// remembering which was in front.
+    void parkCurrent();
+    /// Puts `workspaceId`'s set-aside pages back into the row, in their order
+    /// and with the one that was in front in front again.
+    void restoreParked(const QString& workspaceId);
+    /// The page showing `key`, whether it is on a tab or set aside.
+    QWidget* pageForKey(const QString& key) const;
+    /// Puts a freshly built page on a tab, or sets it aside when it belongs to
+    /// a workspace that is not in front. Answers whether it went on a tab,
+    /// which is whether there is anything to focus.
+    bool addPage(QWidget* page, const QString& workspaceId, const QString& title,
+                 const QString& tooltip);
     /// Puts the dirty marker in front of the tab's file name, or takes it away.
     void updateTabTitle(QWidget* page);
     /// The index of the tab showing `key`, or -1.
@@ -137,6 +184,17 @@ private:
     QStackedWidget* m_stack = nullptr;
     QLabel* m_placeholder = nullptr;
     QTabWidget* m_tabs = nullptr;
+    /// The workspace whose tabs are in `m_tabs`. Empty before the first file
+    /// is opened, and adopted from that file.
+    QString m_workspaceId;
+    /// The pages of every other workspace, in tab order. Parented to `m_park`
+    /// while they wait: a page with no parent at all would be a window.
+    QHash<QString, QList<QWidget*>> m_parked;
+    /// Which of a set-aside workspace's pages was in front. Guarded, because a
+    /// page can be destroyed -- a workspace torn down -- while it waits.
+    QHash<QString, QPointer<QWidget>> m_parkedCurrent;
+    /// The hidden parent the set-aside pages hang from. Never shown.
+    QWidget* m_park = nullptr;
     /// Never null: the constructor installs the modal box.
     std::function<Unsaved(const QString&, bool)> m_ask;
     /// Tabs whose close is waiting on a write. A second close request for one

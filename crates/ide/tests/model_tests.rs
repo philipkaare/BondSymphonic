@@ -172,7 +172,7 @@ fn file_tree_cache_paths_and_invalidation() {
 
 // --- Task 4: terminal grid ---------------------------------------------------
 
-use bondsymphonic_ide::model::terminal_grid::{key_to_bytes, qt, TerminalGrid};
+use bondsymphonic_ide::model::terminal_grid::{key_to_bytes, qt, Appearance, Rgb, TerminalGrid};
 
 #[test]
 fn grid_renders_text_and_tracks_cursor() {
@@ -466,15 +466,70 @@ fn the_latest_agent_is_the_one_the_tab_reattaches_to() {
     assert_eq!(tab.agent_id, Some(AgentId("ag_new".into())));
 }
 
-/// A workspace the daemon has no agent for is still a plain terminal tab, which
-/// is what every workspace created without one is.
+/// A workspace the daemon has no agent for is a Claude tab with no agent yet,
+/// not a terminal.
+///
+/// It is a guess either way -- the daemon records the adapter of an *agent*,
+/// and there is none -- and this is the guess that leaves the user somewhere
+/// they can work. A Claude workspace whose agent was never started, or whose
+/// `agent.start` failed, used to come back after an IDE restart as a shell:
+/// the pane that could have offered a prompt was not the pane that was built.
 #[test]
-fn a_workspace_with_no_agents_is_still_a_terminal_tab() {
+fn a_workspace_with_no_agents_is_a_claude_tab_with_no_agent() {
     let w = info("ws_1", "alpha", WorkspaceState::Ready);
     let tab = AgentTab::from_workspace_info(&w);
-    assert_eq!(tab.adapter, AgentAdapterKind::Terminal);
+    assert_eq!(tab.adapter, AgentAdapterKind::Claude);
     assert_eq!(tab.agent_id, None);
     assert_eq!(tab.options_json, "");
+}
+
+/// A terminal workspace is still a terminal workspace tomorrow.
+///
+/// The daemon cannot answer for this one: it records what an agent ran under,
+/// and a terminal workspace has no agent record to read. So the choice is kept
+/// in `state.json` beside the command, and it is only consulted when the
+/// daemon has nothing to say -- an agent that actually ran beats a preference
+/// saved months ago.
+#[test]
+fn a_terminal_workspace_is_remembered_as_one() {
+    let mut model = Workspaces::new_default();
+    let listed = info("ws_1", "alpha", WorkspaceState::Ready);
+    let mut terminal = AgentTab::from_workspace_info(&listed);
+    terminal.adapter = AgentAdapterKind::Terminal;
+    terminal.command = Some("htop".to_owned());
+    model.add_tab(0, terminal);
+
+    let persisted = model.persisted_groups();
+    let restored = Workspaces::from_persisted(&persisted, std::slice::from_ref(&listed), None);
+    let tab = restored.active().expect("the only tab");
+    assert_eq!(tab.adapter, AgentAdapterKind::Terminal);
+    assert_eq!(tab.command.as_deref(), Some("htop"));
+
+    // A Claude tab writes no adapter at all -- it is the default -- and comes
+    // back as one regardless.
+    let mut claude = Workspaces::new_default();
+    claude.add_tab(0, AgentTab::from_workspace_info(&listed));
+    let persisted = claude.persisted_groups();
+    let restored = Workspaces::from_persisted(&persisted, std::slice::from_ref(&listed), None);
+    assert_eq!(
+        restored.active().expect("the only tab").adapter,
+        AgentAdapterKind::Claude
+    );
+
+    // And once the daemon has an agent for the workspace, the agent is what
+    // answers: it says what actually ran.
+    let mut with_agent = listed;
+    with_agent.agent_records = vec![agent("ag_1", AgentAdapterKind::Claude)];
+    let mut model = Workspaces::new_default();
+    let mut terminal = AgentTab::from_workspace_info(&with_agent);
+    terminal.adapter = AgentAdapterKind::Terminal;
+    model.add_tab(0, terminal);
+    let persisted = model.persisted_groups();
+    let restored = Workspaces::from_persisted(&persisted, &[with_agent], None);
+    assert_eq!(
+        restored.active().expect("the only tab").adapter,
+        AgentAdapterKind::Claude
+    );
 }
 
 /// An agent with nothing but an id and an adapter leaves the options empty
@@ -937,4 +992,184 @@ fn grid_tracks_bracketed_paste_mode() {
     assert!(g.bracketed_paste(), "DECSET 2004 turns it on");
     g.feed(b"\x1b[?2004l");
     assert!(!g.bracketed_paste(), "DECRST 2004 turns it off again");
+}
+
+/// The bug that stopped a GitHub sign-in dead: `gh auth login` asks the
+/// terminal where the cursor is before each of its yes/no prompts and reads
+/// nothing until the report arrives, so a terminal that drops the question
+/// leaves "Authenticate Git with your GitHub credentials? (Y/n)" on screen
+/// refusing every key. The sequence here is the one `gh` sends: park the
+/// cursor past the far corner, then ask where it ended up, which is how a
+/// program measures a screen it was not told the size of.
+#[test]
+fn a_cursor_position_query_is_answered() {
+    let mut g = TerminalGrid::new(100, 30);
+    g.feed(b"\x1b[999;999f\x1b[6n");
+    assert_eq!(g.take_replies(), b"\x1b[30;100R");
+    // Handed over once: a second write would be a keystroke the program never
+    // asked for, and at a `(Y/n)` prompt that is an answer nobody gave.
+    assert!(g.take_replies().is_empty());
+}
+
+/// "What are you?", which a program asks before it trusts the terminal with
+/// anything clever. Claude Code's own UI asks it on startup.
+#[test]
+fn a_device_attributes_query_is_answered() {
+    let mut g = TerminalGrid::new(80, 24);
+    g.feed(b"\x1b[c");
+    let reply = g.take_replies();
+    assert!(
+        reply.starts_with(b"\x1b[?"),
+        "a device-attributes report: {reply:?}"
+    );
+}
+
+/// A CLI asks the background colour to decide whether it is drawing on a light
+/// or a dark terminal. The pane's colours come from the Qt palette, which the
+/// grid only knows because the widget tells it, so the answer has to carry
+/// what the widget said rather than a fixed pair.
+#[test]
+fn a_colour_query_is_answered_with_what_the_widget_paints() {
+    let mut g = TerminalGrid::new(80, 24);
+    g.set_appearance(Appearance {
+        fg: Rgb {
+            r: 0x20,
+            g: 0x21,
+            b: 0x22,
+        },
+        bg: Rgb {
+            r: 0xf0,
+            g: 0xf1,
+            b: 0xf2,
+        },
+        cell_width: 9,
+        cell_height: 19,
+    });
+    g.feed(b"\x1b]11;?\x07");
+    let reply = String::from_utf8(g.take_replies()).expect("utf-8");
+    assert!(
+        reply.contains("f0f0/f1f1/f2f2"),
+        "the background as the widget paints it: {reply:?}"
+    );
+
+    // And a colour the program set itself wins over any of it: it did set it.
+    g.feed(b"\x1b]4;1;rgb:aa/bb/cc\x07\x1b]4;1;?\x07");
+    let reply = String::from_utf8(g.take_replies()).expect("utf-8");
+    assert!(reply.contains("aaaa/bbbb/cccc"), "{reply:?}");
+}
+
+/// The window in pixels, which is how a program that draws images works out
+/// how big a cell is. Answered from the widget's own font metrics.
+#[test]
+fn a_text_area_size_query_is_answered() {
+    let mut g = TerminalGrid::new(80, 24);
+    g.set_appearance(Appearance {
+        cell_width: 9,
+        cell_height: 19,
+        ..Appearance::default()
+    });
+    g.feed(b"\x1b[14t");
+    let reply = String::from_utf8(g.take_replies()).expect("utf-8");
+    // 24 rows of 19 pixels by 80 columns of 9.
+    assert!(reply.contains("456") && reply.contains("720"), "{reply:?}");
+}
+
+/// OSC 52 with a `?` asks the terminal to hand the clipboard to the program,
+/// and this one does not. The clipboard belongs to the person at the keyboard;
+/// a program in a workspace -- or a build script that printed the sequence --
+/// has no business being told what they last copied. Silence is what a
+/// terminal without clipboard access looks like, and every terminal is allowed
+/// to be one.
+#[test]
+fn the_clipboard_is_never_handed_to_the_program() {
+    let mut g = TerminalGrid::new(80, 24);
+    g.feed(b"\x1b]52;c;?\x07");
+    assert!(g.take_replies().is_empty());
+}
+
+/// Selecting text and copying it, which a terminal without a mouse cannot do:
+/// the output of a command is the one thing in this IDE that cannot be opened
+/// in an editor and copied from there.
+#[test]
+fn a_dragged_selection_is_the_text_it_was_dragged_over() {
+    let mut g = TerminalGrid::new(20, 3);
+    g.feed(b"hello world\r\nsecond line");
+    assert!(!g.has_selection(), "nothing is selected to begin with");
+    assert_eq!(g.selection_text(), "");
+
+    // From the `w` of "world" to the end of the word.
+    g.begin_selection(6, 0, false, false);
+    g.extend_selection(10, 0, true);
+    assert!(g.has_selection());
+    assert_eq!(g.selection_text(), "world");
+
+    // Down a line: the terminal joins the rows the way it would be read.
+    g.extend_selection(5, 1, true);
+    assert_eq!(g.selection_text(), "world\nsecond");
+
+    g.clear_selection();
+    assert!(!g.has_selection());
+    assert_eq!(g.selection_text(), "");
+}
+
+/// A double-click takes the word under the pointer, without the user having to
+/// place either end of it.
+#[test]
+fn a_word_selection_takes_the_whole_word() {
+    let mut g = TerminalGrid::new(20, 2);
+    g.feed(b"alpha beta gamma");
+    g.begin_selection(7, 0, false, true);
+    assert_eq!(g.selection_text(), "beta");
+}
+
+/// The selection is part of what the widget paints, and it is painted by
+/// swapping the two colours -- so the spans have to say which cells are in it,
+/// and they have to break where it begins and ends.
+#[test]
+fn selected_cells_are_marked_in_the_rows() {
+    let mut g = TerminalGrid::new(20, 2);
+    g.feed(b"abcdef");
+    g.begin_selection(1, 0, false, false);
+    g.extend_selection(3, 0, true);
+
+    let rows = g.rows();
+    let selected: Vec<usize> = rows[0]
+        .spans
+        .iter()
+        .filter(|span| span.selected)
+        .flat_map(|span| span.start..span.start + span.len)
+        .collect();
+    assert_eq!(selected, vec![1, 2, 3], "{:?}", rows[0].spans);
+    // And the selection has no colours of its own: the widget swaps the two
+    // the cell already had.
+    assert!(rows[0].spans.iter().all(|span| span.fg.is_empty()));
+}
+
+/// A selection is anchored to the text, not to the screen: scrolling the
+/// viewport moves the highlight with the line it was made on.
+#[test]
+fn a_selection_follows_its_text_through_the_scrollback() {
+    let mut g = TerminalGrid::new(20, 2);
+    g.feed(b"one\r\ntwo\r\nthree\r\n");
+    // Two rows of screen and four lines written, so what is on it is "three"
+    // and the empty line the last newline opened.
+    assert_eq!(g.rows()[0].text.trim_end(), "three");
+    g.begin_selection(0, 0, false, false);
+    g.extend_selection(4, 0, true);
+    assert_eq!(g.selection_text(), "three");
+    // One line back into the history: the same text, now a row further down.
+    g.scroll(1);
+    assert_eq!(g.selection_text(), "three", "the text it was made on");
+    let rows = g.rows();
+    let selected: Vec<usize> = rows[1]
+        .spans
+        .iter()
+        .filter(|span| span.selected)
+        .flat_map(|span| span.start..span.start + span.len)
+        .collect();
+    assert_eq!(
+        selected,
+        vec![0, 1, 2, 3, 4],
+        "one row further down: {rows:?}"
+    );
 }

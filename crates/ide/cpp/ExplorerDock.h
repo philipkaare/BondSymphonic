@@ -11,6 +11,7 @@ class ChangesToolbar;
 class FileTreeModel;
 class QLabel;
 class QModelIndex;
+class QResizeEvent;
 class QStandardItem;
 class QStandardItemModel;
 class QToolButton;
@@ -54,16 +55,24 @@ public:
     void setWorkspace(const QString& workspaceId);
 
     /// Names the workspace the two tabs are showing, in the strip above them:
-    /// `name` on its own line, then the branch and the tail of `repoPath`, with
-    /// the whole path in the tooltip. An empty `name` is the no-workspace
-    /// state: the strip says so and the Refresh button is disabled.
+    /// `name` on its own line, then the branch and the tail of `repoPath`, then
+    /// `worktreePath` -- the directory the tree below is actually listing.
+    /// An empty `name` is the no-workspace state: the strip says so and the
+    /// Refresh button is disabled.
+    ///
+    /// The worktree path is on the strip rather than only in a tooltip because
+    /// every agent has a checkout of its own: two tabs showing `src/main.rs`
+    /// are two different files, and the path is what says which one this is.
+    /// It is elided from the left, so the part that differs stays readable, and
+    /// it can be selected and copied -- a path is something people paste into
+    /// a shell.
     ///
     /// The strings are the active tab's, passed straight through from the
     /// window; nothing here looks a workspace up or shortens a branch.
     /// `baseBranch` is not shown in the strip: it is what the Changes toolbar
     /// names in the confirmation before it moves anything.
     void setWorkspaceHeader(const QString& name, const QString& branch, const QString& repoPath,
-                            const QString& baseBranch);
+                            const QString& baseBranch, const QString& worktreePath);
 
     /// The Changes tab's toolbar, so the window can connect its results to the
     /// status bar and to the workspace banners. Never null.
@@ -82,6 +91,11 @@ signals:
     /// A changed file was double-clicked. The window answers by opening the
     /// file's diff.
     void diffActivated(const QString& path);
+
+protected:
+    /// Re-elides the worktree path: the label's width is only known once the
+    /// layout has run, and it changes with the dock.
+    void resizeEvent(QResizeEvent* event) override;
 
 private:
     void onExpanded(const QModelIndex& index);
@@ -111,9 +125,11 @@ private:
     static QStandardItem* makePlaceholder();
     static QStandardItem* makeError(const QString& message);
 
-    /// Builds the header strip -- the two labels and the Refresh button -- and
-    /// returns it for the dock's layout.
+    /// Builds the header strip -- the three labels and the Refresh button --
+    /// and returns it for the dock's layout.
     QWidget* buildHeader();
+    /// Re-renders the worktree path at the width the label now has.
+    void updatePathElide();
 
     FileTreeModel* m_model;
     ChangesModel* m_changes;
@@ -127,6 +143,9 @@ private:
     QLabel* m_headerName = nullptr;
     /// Its second line: branch and the tail of the repository path.
     QLabel* m_headerDetail = nullptr;
+    /// Its third line: the worktree the tree below is listing, elided from the
+    /// left so the end of the path -- the part that names this agent -- stays.
+    QLabel* m_headerPath = nullptr;
     /// Reload, beside the two labels. Disabled while no workspace is shown.
     QToolButton* m_refreshButton = nullptr;
     QIcon m_dirIcon;
@@ -139,6 +158,10 @@ private:
     QString m_name;
     QString m_branch;
     QString m_baseBranch;
+    /// The worktree path as the daemon spells it, which is what is copied and
+    /// what the tooltip carries. The label shows an elided rendering of it and
+    /// is never the source.
+    QString m_worktreePath;
     /// How many listings are out for each directory. Usually one; a refresh
     /// asks again for a directory that already has a request out, and both
     /// answers have to be booked in before the directory counts as settled.

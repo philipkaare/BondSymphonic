@@ -1411,6 +1411,9 @@ void MainWindow::onActiveTabChanged() {
         m_agentArea->showPlaceholder();
         m_shellArea->showPlaceholder();
         m_explorer->setWorkspace(QString());
+        // The editor row belongs to a workspace too: with none selected there
+        // is nothing of anybody's to show.
+        m_editorArea->setWorkspace(QString());
         m_pendingRunConfig.clear();
         m_runModel->setWorkspace(QString(), QString());
         rebindCost();
@@ -1435,13 +1438,19 @@ void MainWindow::onActiveTabChanged() {
     m_previousWorkspaceId = workspaceId;
     m_groupModel->refreshAttention(previousWorkspaceId);
     m_explorer->setWorkspace(workspaceId);
+    // The open files move with the agent: each has a worktree of its own, so a
+    // row of tabs mixing them is a row where most of them belong to something
+    // the user is not looking at. Before `restoreEditorsFor` below, which opens
+    // this workspace's saved tabs into the row this just put in front.
+    m_editorArea->setWorkspace(workspaceId);
     // After `setWorkspace`, which clears the header when it is handed an empty
     // id, and on every model change rather than only on a switch, so a branch
     // the daemon renamed reaches the strip.
     m_explorer->setWorkspaceHeader(active.value("name").toString(),
                                    active.value("branch").toString(),
                                    active.value("repo_path").toString(),
-                                   active.value("base_branch").toString());
+                                   active.value("base_branch").toString(),
+                                   active.value("worktree_path").toString());
     // The tab's choice first, because `setWorkspace` publishes the list it
     // already has synchronously and the `configsChanged` slot above applies
     // this to it; the worktree path is the daemon's, from `WorkspaceInfo`.
