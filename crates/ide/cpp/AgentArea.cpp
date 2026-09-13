@@ -76,24 +76,34 @@ QWidget* AgentArea::makePage(const QString& workspaceId, QWidget* body) {
     m_banners.insert(workspaceId, banner);
     QObject::connect(banner, &WorkspaceBanner::dismissed, this,
                      [this, workspaceId] { emit bannerDismissed(workspaceId); });
+    // The banner's Restart is the same request the pane used to make with its
+    // own button, so it goes out as the same signal and the window answers it
+    // the same way.
+    QObject::connect(banner, &WorkspaceBanner::restartRequested, this,
+                     [this, workspaceId] { emit startAgentRequested(workspaceId); });
     // A failure reported before this pane existed: raise it now, which is the
-    // first moment the user could have seen it.
-    const QStringList pending = m_pendingBanners.take(workspaceId);
-    if (pending.size() == 3) {
-        banner->showError(pending.at(0), pending.at(1), pending.at(2));
+    // first moment the user could have seen it, and with the restart it was
+    // raised with -- an agent that died before its tab was ever opened is
+    // exactly the case that needs the button.
+    if (m_pendingBanners.contains(workspaceId)) {
+        const PendingBanner pending = m_pendingBanners.take(workspaceId);
+        banner->showError(pending.title, pending.detail, pending.stderrText);
+        banner->setRestartOffered(pending.restartable);
+
     }
     return page;
 }
 
 void AgentArea::showBanner(const QString& workspaceId, const QString& title,
-                           const QString& detail, const QString& stderrText) {
+                           const QString& detail, const QString& stderrText, bool restartable) {
     if (WorkspaceBanner* banner = m_banners.value(workspaceId)) {
         banner->showError(title, detail, stderrText);
+        banner->setRestartOffered(restartable);
         return;
     }
     // No pane yet. Held rather than dropped: the tab is about to go red, and
     // opening it has to explain why.
-    m_pendingBanners.insert(workspaceId, { title, detail, stderrText });
+    m_pendingBanners.insert(workspaceId, { title, detail, stderrText, restartable });
 }
 
 void AgentArea::clearBanner(const QString& workspaceId) {
@@ -275,3 +285,108 @@ QList<TerminalSession*> AgentArea::sessions() const {
     }
     return result;
 }
+
+// --- offscreen test entries --------------------------------------------------
+//
+// Compiled only into a development build: this is test code -- it builds
+// widgets, leaks a QApplication and asserts -- and a shipped IDE has no caller
+// for any of it. `build.rs` defines `BS_WIDGET_TESTS` for every profile but
+// `release`, which is the one the packaged executable is built with.
+#if defined(BS_WIDGET_TESTS)
+//
+// See the note in `EditorArea.cpp`. `bs_widget_test_begin` must have run first.
+#include <QPushButton>
+#include <cstdint>
+
+namespace {
+
+/// The banner's Restart, for the one page a check has built.
+QPushButton* restartButton(const AgentArea& area) {
+    return area.findChild<QPushButton*>(QStringLiteral("WorkspaceBannerRestartButton"));
+}
+
+/// Builds `workspaceId`'s Claude pane, which is what replays a held banner.
+void openPane(AgentArea& area, const QString& workspaceId) {
+    area.showWorkspace(workspaceId, QStringLiteral("claude"), QString());
+}
+
+} // namespace
+
+/// A failure held for a workspace with no pane keeps its Restart.
+///
+/// A banner raised before the tab was ever opened is held and replayed when the
+/// pane is built, and an agent that died that early is precisely the one that
+/// needs the button: nothing else in the pane offers a restart now that agents
+/// start themselves. A flag dropped on the way through the hold leaves that
+/// user looking at a banner telling them their agent is gone and offering
+/// nothing to do about it.
+extern "C" std::int32_t bs_widget_test_agent_area_holds_a_restartable_banner() {
+    const QString workspace = QStringLiteral("ws_held");
+    {
+        AgentArea area;
+        // Before any pane exists, which is the whole point of the hold.
+        area.showBanner(workspace, QStringLiteral("agent exited"), QStringLiteral("status 1"),
+                        QString(), true);
+        if (restartButton(area) != nullptr) {
+            return 1;
+        }
+        openPane(area, workspace);
+        QPushButton* restart = restartButton(area);
+        if (restart == nullptr) {
+            return 2;
+        }
+        if (restart->isHidden()) {
+            // The flag did not survive the hold.
+            return 3;
+        }
+        QString asked;
+        QObject::connect(&area, &AgentArea::startAgentRequested, &area,
+                         [&asked](const QString& id) { asked = id; });
+        restart->click();
+        if (asked != workspace) {
+            // The banner is the only restart left, so its button has to reach
+            // the window as the same request the pane's own used to make.
+            return 4;
+        }
+    }
+
+    {
+        // The same hold for a failure a restart does not repair. A merge that
+        // conflicted has a live agent behind it, and restarting it would
+        // interrupt the agent rather than mend the merge.
+        AgentArea area;
+        area.showBanner(workspace, QStringLiteral("merge failed"), QStringLiteral("conflict"),
+                        QString());
+        openPane(area, workspace);
+        QPushButton* restart = restartButton(area);
+        if (restart == nullptr) {
+            return 5;
+        }
+        if (!restart->isHidden()) {
+            return 6;
+        }
+    }
+
+    {
+        // And the direct path, for a pane that already exists: the flag reaches
+        // the banner rather than only the hold.
+        AgentArea area;
+        openPane(area, workspace);
+        if (restartButton(area) == nullptr || !restartButton(area)->isHidden()) {
+            return 7;
+        }
+        area.showBanner(workspace, QStringLiteral("agent exited"), QString(), QString(), true);
+        if (restartButton(area)->isHidden()) {
+            return 8;
+        }
+        // A later failure that is not an exit takes it away again: the agent it
+        // was offering to restart is the one that has since come back.
+        area.showBanner(workspace, QStringLiteral("merge failed"), QString(), QString());
+        if (!restartButton(area)->isHidden()) {
+            return 9;
+        }
+    }
+    return 0;
+}
+
+#endif // BS_WIDGET_TESTS

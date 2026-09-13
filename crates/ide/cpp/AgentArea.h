@@ -111,8 +111,13 @@ public:
     /// opened its tab -- has nowhere to put a banner, so the strings are held
     /// and raised when that pane is first built. Without that the tab's red
     /// glyph would lead to a pane that says nothing about why it is red.
+    /// `restartable` is for the one failure a restart repairs: an agent that
+    /// exited. Every other failure a banner reports -- a merge that conflicted,
+    /// a pull request that was refused -- has a live agent behind it that a
+    /// restart would interrupt rather than mend, so the default is false and
+    /// only the caller that knows an agent is down says otherwise.
     void showBanner(const QString& workspaceId, const QString& title, const QString& detail,
-                    const QString& stderrText);
+                    const QString& stderrText, bool restartable = false);
 
     /// Takes it down again, without emitting `bannerDismissed`. What a
     /// successful operation on that workspace does to the banner its last
@@ -144,6 +149,17 @@ private:
     /// lines. Does nothing for a workspace the window has not described.
     void applyWelcome(const QString& workspaceId, TranscriptView* view);
 
+    /// A failure raised for a workspace whose pane did not exist yet, held
+    /// until it does. The restart flag is part of it: a workspace whose agent
+    /// died before its tab was ever opened would otherwise get a banner saying
+    /// so with no way to act on it, which is the case the hold exists for.
+    struct PendingBanner {
+        QString title;
+        QString detail;
+        QString stderrText;
+        bool restartable = false;
+    };
+
     /// Wraps `body` in the page this area actually stacks: a banner above the
     /// pane, hidden until something fails. Records both and returns the page.
     QWidget* makePage(const QString& workspaceId, QWidget* body);
@@ -162,9 +178,8 @@ private:
     /// The tab JSON each workspace's welcome is written from, kept because the
     /// window says it once and the pane may be built long afterwards.
     QHash<QString, QString> m_welcomes;
-    /// A banner raised for a workspace that had no pane yet: its title, detail
-    /// and stderr, in that order, waiting for the pane to be built.
-    QHash<QString, QStringList> m_pendingBanners;
+    /// The failures waiting for a pane to be built. See [`PendingBanner`].
+    QHash<QString, PendingBanner> m_pendingBanners;
     /// The agent id each transcript is attached to, so re-showing a tab does
     /// not replay its history again.
     QHash<QString, QString> m_attached;
