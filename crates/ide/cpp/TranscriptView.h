@@ -11,6 +11,7 @@ class PromptInput;
 class TranscriptModel;
 class QJsonArray;
 class QJsonObject;
+class QEvent;
 class QLabel;
 class QPushButton;
 class QScrollArea;
@@ -89,7 +90,16 @@ signals:
     /// Settings on its Setup section; this view knows nothing about dialogs.
     void loginRequested();
 
+protected:
+    /// A palette change is the theme moving under the pane. The banner's red
+    /// is mixed into the pane's own background, so it has to be mixed again
+    /// rather than kept.
+    void changeEvent(QEvent* event) override;
+
 private:
+    /// Mixes the banner's red into whatever the pane is now and installs it.
+    /// Called from the constructor and from every palette change.
+    void applyBannerWash();
     void rebuild();
     void onItemAppended(int index);
     void onItemChanged(int index);

@@ -11,6 +11,7 @@ class ChangesToolbar;
 class FileTreeModel;
 class QLabel;
 class QModelIndex;
+class QEvent;
 class QResizeEvent;
 class QStandardItem;
 class QStandardItemModel;
@@ -98,6 +99,10 @@ protected:
     /// Re-elides the worktree path: the label's width is only known once the
     /// layout has run, and it changes with the dock.
     void resizeEvent(QResizeEvent* event) override;
+    /// A palette change is the theme moving under the dock. The header's band
+    /// and the grey of the two lines under the name are both derived from the
+    /// dock's own colours, so they have to be derived again rather than kept.
+    void changeEvent(QEvent* event) override;
 
 private:
     void onExpanded(const QModelIndex& index);
@@ -130,6 +135,10 @@ private:
     /// Builds the header strip -- the three labels and the Refresh button --
     /// and returns it for the dock's layout.
     QWidget* buildHeader();
+    /// Re-derives the header's band fill and the grey of the detail and path
+    /// lines from the dock's palette. Called from `buildHeader` and from every
+    /// palette change.
+    void applyHeaderColours();
     /// Re-renders the worktree path at the width the label now has.
     void updatePathElide();
 
@@ -142,6 +151,9 @@ private:
     QTreeView* m_changesView = nullptr;
     QStandardItemModel* m_changeItems = nullptr;
     /// The header strip's first line: the workspace name, or the empty state.
+    /// The header strip itself, kept because its fill is re-derived whenever
+    /// the palette changes.
+    QWidget* m_header = nullptr;
     QLabel* m_headerName = nullptr;
     /// Its second line: the repository the work came from and the branch it
     /// will go back to.

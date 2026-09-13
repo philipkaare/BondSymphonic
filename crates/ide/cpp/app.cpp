@@ -1,12 +1,15 @@
 #include "app.h"
 #include "Branding.h"
 #include "MainWindow.h"
+#include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/run_panel.cxxqt.h"
 #include <QApplication>
+#include <QObject>
+#include <QStyleHints>
 
 std::int32_t run_app() {
     static int argc = 1;
@@ -28,6 +31,23 @@ std::int32_t run_app() {
     // One for the whole application, like the Changes model: a run keeps
     // running, and keeps printing, while the user is looking at another tab.
     auto* runModel = new RunPanelModel(&app);
+    // After the controller, because the choice is a setting and the controller
+    // is what reads the settings file; before the window, so nothing is ever
+    // built against a palette it is about to be told to stop wearing.
+    theme::apply(app, theme::choiceFromName(controller->theme()));
+    // "Follow system" means following it as it changes, not as it was at
+    // startup: Windows flips at dusk and the application is often older than
+    // that. A window on either of the two explicit choices hears the flip and
+    // ignores it, which is the whole point of having chosen.
+    QObject::connect(app.styleHints(), &QStyleHints::colorSchemeChanged, &app,
+                     [&app, controller](Qt::ColorScheme) {
+                         const theme::Choice choice =
+                             theme::choiceFromName(controller->theme());
+                         if (choice == theme::Choice::System) {
+                             theme::apply(app, choice);
+                         }
+                     });
+
     MainWindow window(controller, groupModel, fileTreeModel, changesModel, runModel);
     window.show();
     controller->start();

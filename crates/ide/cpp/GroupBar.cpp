@@ -7,6 +7,7 @@
 #include <QByteArray>
 #include <QChar>
 #include <QColor>
+#include <QEvent>
 #include <QFont>
 #include <QHBoxLayout>
 #include <QInputDialog>
@@ -138,12 +139,6 @@ GroupBar::GroupBar(GroupModel* model, QWidget* parent) : QWidget(parent), m_mode
     // A fill of its own, so the two rows read as one band of agents rather than
     // as whatever happens to sit above the editor.
     setAutoFillBackground(true);
-    // Derived from the unwashed palette, and kept for the captions below: once
-    // the band colour is installed, `palette()` would hand back the wash.
-    const QPalette basePalette = palette();
-    QPalette barPalette = basePalette;
-    barPalette.setColor(QPalette::Window, theme::band(basePalette));
-    setPalette(barPalette);
 
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(8, 2, 8, 2);
@@ -153,14 +148,12 @@ GroupBar::GroupBar(GroupModel* model, QWidget* parent) : QWidget(parent), m_mode
     captionRow->setContentsMargins(0, 0, 0, 0);
     captionRow->setSpacing(8);
     auto* caption = new QLabel(QStringLiteral("Agents"), this);
+    m_caption = caption;
     caption->setObjectName(QStringLiteral("GroupBarCaption"));
     QFont captionFont = caption->font();
     captionFont.setCapitalization(QFont::SmallCaps);
     captionFont.setBold(true);
     caption->setFont(captionFont);
-    QPalette captionPalette = caption->palette();
-    captionPalette.setColor(QPalette::WindowText, theme::muted(basePalette));
-    caption->setPalette(captionPalette);
     captionRow->addWidget(caption, 0, Qt::AlignVCenter);
 
     m_groupTabs = new QTabBar(this);
@@ -189,9 +182,6 @@ GroupBar::GroupBar(GroupModel* model, QWidget* parent) : QWidget(parent), m_mode
 
     m_emptyLabel = new QLabel(QStringLiteral("No agents in this group yet"), this);
     m_emptyLabel->setObjectName(QStringLiteral("GroupBarEmptyLabel"));
-    QPalette emptyPalette = m_emptyLabel->palette();
-    emptyPalette.setColor(QPalette::WindowText, theme::muted(basePalette));
-    m_emptyLabel->setPalette(emptyPalette);
     m_emptyLabel->setVisible(false);
     agentRow->addWidget(m_emptyLabel, 0, Qt::AlignVCenter);
 
@@ -218,7 +208,40 @@ GroupBar::GroupBar(GroupModel* model, QWidget* parent) : QWidget(parent), m_mode
 
     m_menuTestSteps = menuTestSteps();
 
+    applyBand();
     rebuild();
+}
+
+void GroupBar::applyBand() {
+    if (m_banding) {
+        return;
+    }
+    m_banding = true;
+    // Clearing first, because the band installed below is the bar's own from
+    // then on: `palette()` would otherwise answer with the last band instead
+    // of with the window behind it, and a band lifted off a band walks away
+    // from the window a step on every theme change.
+    setPalette(QPalette());
+    // A fill of its own, so the two rows read as one band of agents rather
+    // than as whatever happens to sit above the editor. Derived before it is
+    // installed, and the captions with it, because installing it is what makes
+    // `palette()` stop answering with the window.
+    const QPalette basePalette = palette();
+    QPalette barPalette;
+    barPalette.setColor(QPalette::Window, theme::band(basePalette));
+    QPalette captionPalette;
+    captionPalette.setColor(QPalette::WindowText, theme::muted(basePalette));
+    setPalette(barPalette);
+    m_caption->setPalette(captionPalette);
+    m_emptyLabel->setPalette(captionPalette);
+    m_banding = false;
+}
+
+void GroupBar::changeEvent(QEvent* event) {
+    QWidget::changeEvent(event);
+    if (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange) {
+        applyBand();
+    }
 }
 
 QString GroupBar::currentGroupName() const {

@@ -6,6 +6,7 @@
 #include "ToolCard.h"
 #include "bondsymphonic-ide/src/qobjects/transcript_model.cxxqt.h"
 #include <QChar>
+#include <QEvent>
 #include <QFont>
 #include <QFontMetrics>
 #include <QFrame>
@@ -152,11 +153,7 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     m_banner->setWordWrap(true);
     m_banner->setMargin(4);
     m_banner->setAutoFillBackground(true);
-    QPalette bannerPalette = m_banner->palette();
-    bannerPalette.setColor(QPalette::Window,
-                           codeview::wash(palette().base().color(), theme::removed(),
-                                          codeview::kWashAmount));
-    m_banner->setPalette(bannerPalette);
+    applyBannerWash();
     m_banner->hide();
     outer->addWidget(m_banner);
 
@@ -293,6 +290,24 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
 }
 
 TranscriptModel* TranscriptView::model() const { return m_model.data(); }
+
+void TranscriptView::applyBannerWash() {
+    // A palette of one role, rather than the banner's own with that role
+    // overwritten: everything else the label paints with is the pane's, and
+    // must stay the pane's when the pane changes.
+    QPalette bannerPalette;
+    bannerPalette.setColor(QPalette::Window, codeview::wash(palette().base().color(),
+                                                           theme::removed(),
+                                                           codeview::kWashAmount));
+    m_banner->setPalette(bannerPalette);
+}
+
+void TranscriptView::changeEvent(QEvent* event) {
+    QWidget::changeEvent(event);
+    if (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange) {
+        applyBannerWash();
+    }
+}
 
 void TranscriptView::rebuild() {
     clearFrames();

@@ -8,8 +8,9 @@ class QLineEdit;
 class QPushButton;
 class QScrollArea;
 
-/// The application settings: setup and logins, the Anthropic API key, and what
-/// permission mode a new agent starts on.
+/// The application settings: setup and logins, the Anthropic API key, what
+/// permission mode a new agent starts on, and which palette the application
+/// wears.
 ///
 /// Setup is the first section, and it is the whole `SetupPage`: the
 /// prerequisite rows, their fix buttons, the login terminal and the sign-in
@@ -35,6 +36,11 @@ public:
 
     void accept() override;
 
+    /// Puts the palette back to the stored choice. The Theme combo applies as
+    /// it is picked, so a dialog dismissed without this would leave the window
+    /// wearing a palette the user just declined to keep.
+    void reject() override;
+
 private:
     /// Points the field's placeholder at whatever the credential store now
     /// says, and greys "Remove key" out when there is nothing to remove.
@@ -50,4 +56,5 @@ private:
     QLineEdit* m_apiKey = nullptr;
     QPushButton* m_removeKey = nullptr;
     QComboBox* m_permissionMode = nullptr;
+    QComboBox* m_theme = nullptr;
 };

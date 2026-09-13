@@ -6,6 +6,7 @@
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
 #include <QChar>
 #include <QColor>
+#include <QEvent>
 #include <QFont>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -139,13 +140,11 @@ ChangesToolbar* ExplorerDock::changesToolbar() const {
 
 QWidget* ExplorerDock::buildHeader() {
     auto* header = new QWidget(this);
+    m_header = header;
     header->setObjectName(QStringLiteral("ExplorerHeader"));
     // Its own fill, so the strip reads as a band naming what is below it rather
     // than as the first row of the Files tab.
     header->setAutoFillBackground(true);
-    QPalette headerPalette = header->palette();
-    headerPalette.setColor(QPalette::Window, theme::band(palette()));
-    header->setPalette(headerPalette);
 
     auto* layout = new QHBoxLayout(header);
     layout->setContentsMargins(8, 6, 4, 6);
@@ -170,18 +169,12 @@ QWidget* ExplorerDock::buildHeader() {
 
     m_headerDetail = new QLabel(header);
     m_headerDetail->setObjectName(QStringLiteral("ExplorerHeaderDetail"));
-    QPalette detailPalette = m_headerDetail->palette();
-    detailPalette.setColor(QPalette::WindowText, theme::muted(palette()));
-    m_headerDetail->setPalette(detailPalette);
     m_headerDetail->setTextInteractionFlags(Qt::TextSelectableByMouse);
     m_headerDetail->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     lines->addWidget(m_headerDetail);
 
     m_headerPath = new QLabel(header);
     m_headerPath->setObjectName(QStringLiteral("ExplorerHeaderPath"));
-    QPalette pathPalette = m_headerPath->palette();
-    pathPalette.setColor(QPalette::WindowText, theme::muted(palette()));
-    m_headerPath->setPalette(pathPalette);
     // The daemon wrote this path and an agent chose part of it; it is shown as
     // the text it is, and it can be selected because a path is something people
     // paste into a shell.
@@ -201,7 +194,32 @@ QWidget* ExplorerDock::buildHeader() {
     m_refreshButton->setObjectName(QStringLiteral("ExplorerRefreshButton"));
     QObject::connect(m_refreshButton, &QToolButton::clicked, this, &ExplorerDock::refresh);
     layout->addWidget(m_refreshButton, 0, Qt::AlignTop);
+    applyHeaderColours();
     return header;
+}
+
+void ExplorerDock::applyHeaderColours() {
+    if (m_header == nullptr) {
+        return;
+    }
+    // A palette of one role each, rather than the widget's own with that role
+    // overwritten: everything else these three paint with is the dock's, and
+    // must stay the dock's when the dock changes.
+    QPalette headerPalette;
+    headerPalette.setColor(QPalette::Window, theme::band(palette()));
+    m_header->setPalette(headerPalette);
+
+    QPalette linePalette;
+    linePalette.setColor(QPalette::WindowText, theme::muted(palette()));
+    m_headerDetail->setPalette(linePalette);
+    m_headerPath->setPalette(linePalette);
+}
+
+void ExplorerDock::changeEvent(QEvent* event) {
+    QDockWidget::changeEvent(event);
+    if (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange) {
+        applyHeaderColours();
+    }
 }
 
 void ExplorerDock::setWorkspaceHeader(const QString& name, const QString& branch,

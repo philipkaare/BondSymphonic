@@ -5,6 +5,7 @@
 
 class GroupModel;
 class QAction;
+class QEvent;
 class QJsonArray;
 class QLabel;
 class QMenu;
@@ -47,7 +48,17 @@ signals:
     /// workspaces; the bar only says which group.
     void closeGroupRequested(const QString& groupName);
 
+protected:
+    /// A palette change is the theme moving under the bar. Its band fill and
+    /// the grey of the two captions are derived from the window's own colours,
+    /// so they have to be derived again rather than kept.
+    void changeEvent(QEvent* event) override;
+
 private:
+    /// Re-derives the band fill and the muted captions from the palette the
+    /// bar would otherwise wear. Called from the constructor and from every
+    /// palette change.
+    void applyBand();
     void rebuild();
     /// The displayed group's tabs, as the model's `stateJson` describes them.
     /// Neither a tab's name nor its branch is an invokable of its own, and the
@@ -99,6 +110,13 @@ private:
     /// Says so, in the agent row, while the displayed group has no tabs. An
     /// empty group is otherwise a bare strip with a button on it.
     QLabel* m_emptyLabel = nullptr;
+    /// The "Agents" caption, kept because its grey is re-derived whenever the
+    /// palette changes.
+    QLabel* m_caption = nullptr;
+    /// Set while [`applyBand`] is installing a palette. Installing one is
+    /// itself a palette change, which arrives back here as `changeEvent`, and
+    /// without this the bar would band its own band until the stack ran out.
+    bool m_banding = false;
     /// Which group's tabs the agent row shows. Usually the model's active
     /// group; it differs only while an empty group is selected, which the model
     /// cannot represent because it has no tab to make active.

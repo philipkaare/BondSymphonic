@@ -1,6 +1,8 @@
 #include "SettingsDialog.h"
 #include "SetupPage.h"
+#include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
+#include <QApplication>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -91,6 +93,25 @@ SettingsDialog::SettingsDialog(AppController* controller, QWidget* parent)
     }
     form->addRow("Default permission mode:", m_permissionMode);
 
+    auto* lookBox = new QGroupBox("Appearance", body);
+    auto* lookForm = new QFormLayout(lookBox);
+    bodyLayout->addWidget(lookBox);
+    m_theme = new QComboBox(lookBox);
+    m_theme->addItem("Follow system", theme::nameOfChoice(theme::Choice::System));
+    m_theme->addItem("Light", theme::nameOfChoice(theme::Choice::Light));
+    m_theme->addItem("Dark", theme::nameOfChoice(theme::Choice::Dark));
+    const int themeIndex = m_theme->findData(m_controller->theme());
+    if (themeIndex >= 0) {
+        m_theme->setCurrentIndex(themeIndex);
+    }
+    lookForm->addRow("Theme:", m_theme);
+    // Applied as it is picked rather than on OK: a palette is the one setting
+    // whose effect is the whole point of choosing it, and a preview that waits
+    // for a dialog to close is not a preview. `reject` is what puts it back.
+    QObject::connect(m_theme, &QComboBox::currentIndexChanged, this, [this](int) {
+        theme::apply(*qApp, theme::choiceFromName(m_theme->currentData().toString()));
+    });
+
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     outer->addWidget(buttons);
 
@@ -127,6 +148,7 @@ void SettingsDialog::removeKey() {
 
 void SettingsDialog::accept() {
     m_controller->setDefaultPermissionMode(m_permissionMode->currentData().toString());
+    m_controller->setTheme(m_theme->currentData().toString());
     // An empty field means "leave the stored key alone", which is what makes
     // the placeholder honest: a dialog opened to change the permission mode
     // must not wipe the key on the way out.
@@ -138,4 +160,11 @@ void SettingsDialog::accept() {
     }
     m_apiKey->clear();
     QDialog::accept();
+}
+
+void SettingsDialog::reject() {
+    // The stored word, not the combo's: the combo is what the user was trying
+    // out, and Cancel is them saying they would rather not keep it.
+    theme::apply(*qApp, theme::choiceFromName(m_controller->theme()));
+    QDialog::reject();
 }
