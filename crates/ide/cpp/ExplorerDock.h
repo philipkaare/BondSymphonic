@@ -55,10 +55,10 @@ public:
     void setWorkspace(const QString& workspaceId);
 
     /// Names the workspace the two tabs are showing, in the strip above them:
-    /// `name` on its own line, then the branch and the tail of `repoPath`, then
-    /// `worktreePath` -- the directory the tree below is actually listing.
-    /// An empty `name` is the no-workspace state: the strip says so and the
-    /// Refresh button is disabled.
+    /// `name` on its own line, then the repository and the branch it forked
+    /// from, then `worktreePath` -- the directory the tree below is actually
+    /// listing. An empty `name` is the no-workspace state: the strip says so
+    /// and the Refresh button is disabled.
     ///
     /// The worktree path is on the strip rather than only in a tooltip because
     /// every agent has a checkout of its own: two tabs showing `src/main.rs`
@@ -68,9 +68,11 @@ public:
     /// a shell.
     ///
     /// The strings are the active tab's, passed straight through from the
-    /// window; nothing here looks a workspace up or shortens a branch.
-    /// `baseBranch` is not shown in the strip: it is what the Changes toolbar
-    /// names in the confirmation before it moves anything.
+    /// window; nothing here looks a workspace up or shortens a branch. `branch`
+    /// is the one the agent commits to, which is generated from its name and
+    /// says nothing the line above does not -- it belongs to the tooltip, and
+    /// to the Changes toolbar, which names both branches in the confirmation
+    /// before it moves anything.
     void setWorkspaceHeader(const QString& name, const QString& branch, const QString& repoPath,
                             const QString& baseBranch, const QString& worktreePath);
 
@@ -141,7 +143,8 @@ private:
     QStandardItemModel* m_changeItems = nullptr;
     /// The header strip's first line: the workspace name, or the empty state.
     QLabel* m_headerName = nullptr;
-    /// Its second line: branch and the tail of the repository path.
+    /// Its second line: the repository the work came from and the branch it
+    /// will go back to.
     QLabel* m_headerDetail = nullptr;
     /// Its third line: the worktree the tree below is listing, elided from the
     /// left so the end of the path -- the part that names this agent -- stays.

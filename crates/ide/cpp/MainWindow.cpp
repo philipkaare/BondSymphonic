@@ -13,6 +13,7 @@
 #include "SettingsDialog.h"
 #include "SetupPage.h"
 #include "Theme.h"
+#include "WorkspaceLabel.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
@@ -523,7 +524,7 @@ void MainWindow::buildStatusBar() {
     m_sandboxIdleText = "sandbox: -";
     m_daemonLabel = new QLabel(this);
     m_sandboxLabel = new QLabel(m_sandboxIdleText, this);
-    m_branchLabel = new QLabel("branch: -", this);
+    m_branchLabel = new QLabel("-", this);
     m_costLabel = new QLabel(this);
     // Rich text so the offer is a link rather than an instruction to go and
     // find a menu item. The href is never followed by Qt itself.
@@ -1487,7 +1488,7 @@ void MainWindow::updateWindowTitle(const QJsonObject& active) {
     // literal, so no compiler's idea of this file's source encoding can change
     // what it means.
     const QString dash = QStringLiteral(" ") + QString(QChar(0x2014)) + QStringLiteral(" ");
-    setWindowTitle(name + dash + active.value("branch").toString() + dash +
+    setWindowTitle(name + dash + workspacelabel::origin(active) + dash +
                    QStringLiteral("BondSymphonic"));
 }
 
@@ -1543,11 +1544,16 @@ void MainWindow::updateWorkspaceStatus() {
     m_attentionLabel->setText(attention);
     m_attentionLabel->setVisible(!attention.isEmpty());
     if (active.isEmpty()) {
-        m_branchLabel->setText("branch: -");
+        m_branchLabel->setText("-");
+        m_branchLabel->setToolTip(QString());
         m_sandboxLabel->setText(m_sandboxIdleText);
         return;
     }
-    m_branchLabel->setText(QString("branch: %1").arg(active.value("branch").toString()));
+    // The status bar is the widest of the four places a workspace is named, so
+    // it is the one that spells the repository path out; the generated branch
+    // and the worktree are a hover away.
+    m_branchLabel->setText(workspacelabel::originFull(active));
+    m_branchLabel->setToolTip(workspacelabel::detail(active));
     // The word itself comes from the model; this only frames it.
     m_sandboxLabel->setText(QString("sandbox: %1").arg(m_groupModel->statusWord(group, tab)));
 }

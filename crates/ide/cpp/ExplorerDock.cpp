@@ -1,6 +1,7 @@
 #include "ExplorerDock.h"
 #include "ChangesToolbar.h"
 #include "Theme.h"
+#include "WorkspaceLabel.h"
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
 #include <QChar>
@@ -54,21 +55,6 @@ QColor statusColour(const QString& status, bool dark) {
 /// The narrowest the worktree path is elided to. Below this the elision eats
 /// the whole path and leaves an ellipsis, which says less than a clipped path.
 constexpr int kMinPathWidth = 40;
-
-/// The tail of a repository path -- its last two components -- which is what
-/// tells two checkouts apart without spending the strip's width on the prefix.
-/// Both separators, because the daemon reports POSIX paths and the New Agent
-/// dialog takes Windows ones. The whole path stays in the tooltip.
-QString pathTail(const QString& repoPath) {
-    QString normalised = repoPath;
-    normalised.replace(QLatin1Char('\\'), QLatin1Char('/'));
-    const QStringList parts = normalised.split(QLatin1Char('/'), Qt::SkipEmptyParts);
-    if (parts.isEmpty()) {
-        return repoPath;
-    }
-    const int from = parts.size() > 2 ? parts.size() - 2 : 0;
-    return QStringList(parts.mid(from)).join(QLatin1Char('/'));
-}
 
 /// One right-aligned count for the `+` and `−` columns.
 QStandardItem* makeCount(int n) {
@@ -241,12 +227,8 @@ void ExplorerDock::setWorkspaceHeader(const QString& name, const QString& branch
     }
     m_headerName->setText(name);
     m_headerName->setToolTip(name);
-    // U+00B7, the middle dot, as a code point rather than as a character in a
-    // literal, so no compiler's idea of this file's source encoding can change
-    // what it means.
-    const QString separator = QStringLiteral("  ") + QString(QChar(0x00B7)) + QStringLiteral("  ");
-    m_headerDetail->setText(branch + separator + pathTail(repoPath));
-    m_headerDetail->setToolTip(repoPath);
+    m_headerDetail->setText(workspacelabel::origin(repoPath, baseBranch));
+    m_headerDetail->setToolTip(workspacelabel::detail(repoPath, baseBranch, branch, worktreePath));
     updatePathElide();
     m_refreshButton->setEnabled(true);
 }

@@ -1,5 +1,6 @@
 #include "GroupBar.h"
 #include "Theme.h"
+#include "WorkspaceLabel.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/smoke.cxx.h"
 #include <QAction>
@@ -79,6 +80,21 @@ QString statusDot() {
 /// perfectly healthy. The tab's tooltip says what it is waiting for.
 QString attentionDot() {
     return QStringLiteral(" ") + QString(QChar(0x2022));
+}
+
+/// What one agent tab is called, after its status dot: the agent's name, then
+/// the repository it is working in and the branch it forked from. The tab's own
+/// branch is deliberately absent; see `WorkspaceLabel.h`.
+///
+/// Empty when the tab JSON names nothing, which is the caller's signal to fall
+/// back on the model's own label.
+QString workspaceLabel(const QJsonObject& tab) {
+    const QString name = tab.value(QStringLiteral("name")).toString();
+    const QString origin = workspacelabel::origin(tab);
+    if (name.isEmpty() || origin.isEmpty()) {
+        return name;
+    }
+    return name + separator() + origin;
 }
 
 /// A `QString` as the borrowed UTF-8 slice the script's fixture builders take.
@@ -252,16 +268,12 @@ void GroupBar::rebuild() {
     const bool dark = theme::isDark(palette());
     for (int i = 0; i < tabs; ++i) {
         const QJsonObject tabJson = i < tabsJson.size() ? tabsJson.at(i).toObject() : QJsonObject();
-        const QString name = tabJson.value(QStringLiteral("name")).toString();
-        const QString branch = tabJson.value(QStringLiteral("branch")).toString();
+        const QString named = workspaceLabel(tabJson);
         // `tabLabel` is the fallback, not the source: it already carries the
         // model's own glyph and name, so a state JSON that does not describe
         // this tab still leaves the tab named.
-        QString label = name.isEmpty() ? m_model->tabLabel(m_displayGroup, i)
-                                       : statusDot() + QLatin1Char(' ') + name;
-        if (!name.isEmpty() && !branch.isEmpty()) {
-            label += separator() + branch;
-        }
+        QString label = named.isEmpty() ? m_model->tabLabel(m_displayGroup, i)
+                                        : statusDot() + QLatin1Char(' ') + named;
         // Last, so it is the same distance from the tab's edge whether or not
         // the branch is spelled out beside the name.
         if (!tabJson.value(QStringLiteral("attention")).toString().isEmpty()) {
@@ -502,3 +514,48 @@ void GroupBar::runMenuTests() {
         }
     }
 }
+
+// --- offscreen test entries --------------------------------------------------
+//
+// Compiled only into a development build: this is test code -- it builds
+// strings and asserts -- and a shipped IDE has no caller for any of it.
+// `build.rs` defines `BS_WIDGET_TESTS` for every profile but `release`, which
+// is the one the packaged executable is built with.
+#if defined(BS_WIDGET_TESTS)
+#include <cstdint>
+
+/// A tab names the repository the agent is in, not the branch generated from
+/// the agent's own name.
+extern "C" std::int32_t bs_widget_test_group_bar_names_the_repository() {
+    const QJsonObject tab{
+        { QStringLiteral("workspace_id"), QStringLiteral("ws_1") },
+        { QStringLiteral("name"), QStringLiteral("agent-4") },
+        { QStringLiteral("branch"), QStringLiteral("bs/agent-4/work") },
+        { QStringLiteral("base_branch"), QStringLiteral("main") },
+        { QStringLiteral("repo_path"), QStringLiteral("C:/git/BondSymphonic") },
+        { QStringLiteral("worktree_path"), QStringLiteral("C:/git/.bs/agent-4") },
+    };
+    const QString label = workspaceLabel(tab);
+    if (label.contains(QLatin1String("bs/agent-4/work"))) {
+        // The generated branch is the agent's own name spelled a second way.
+        return 1;
+    }
+    if (!label.contains(QLatin1String("agent-4")) ||
+        !label.contains(QLatin1String("BondSymphonic")) ||
+        !label.contains(QLatin1String("main"))) {
+        return 2;
+    }
+    if (!workspacelabel::detail(tab).contains(QLatin1String("bs/agent-4/work"))) {
+        // Still what gets merged, and a user who needs it in a git command
+        // needs it exactly.
+        return 3;
+    }
+    // The status bar and the window title have the width the tab has not, so
+    // the repository is spelled in full there rather than by its last part.
+    if (!workspacelabel::originFull(tab).contains(QLatin1String("C:/git/BondSymphonic"))) {
+        return 4;
+    }
+    return 0;
+}
+
+#endif // BS_WIDGET_TESTS
