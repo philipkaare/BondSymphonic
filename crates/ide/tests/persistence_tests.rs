@@ -668,10 +668,10 @@ fn an_unchanged_arrangement_neither_dirties_the_store_nor_writes_the_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A settings file written before the mode list was corrected holds
-/// `"default"`, which the pinned CLI rejects -- so every agent that user starts
-/// dies of a usage error. Reading it back as `manual` is the only repair that
-/// does not require them to find the setting that is poisoning their IDE.
+/// `"default"` and `"manual"` are one mode under two spellings, and the CLI
+/// documents only the second. A settings file holding the first reads back as
+/// the second, so every word the IDE shows in a dropdown is one the user can
+/// find in `claude --help`.
 #[test]
 fn a_stored_default_permission_mode_reads_back_as_manual() {
     use bondsymphonic_ide::qobjects::settings::{

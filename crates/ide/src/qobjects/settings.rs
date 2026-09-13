@@ -109,10 +109,12 @@ const KEYRING_USER: &str = "anthropic_api_key";
 /// the one to default to.
 const DEFAULT_PERMISSION_MODE: &str = "manual";
 
-/// The mode the CLI dropped. Anything reading a settings file written before
-/// the list was corrected finds this and must not pass it on: see
-/// [`DEFAULT_PERMISSION_MODE`].
-const RETIRED_PERMISSION_MODE: &str = "default";
+/// The other spelling of [`DEFAULT_PERMISSION_MODE`]. The CLI takes both and
+/// means the same thing by them -- an agent started either way reports
+/// `"permissionMode":"default"` itself -- but only one of the two is in its
+/// help text, so a settings file holding this one is read as the documented
+/// spelling rather than left showing the user a word they cannot look up.
+const UNDOCUMENTED_PERMISSION_MODE: &str = "default";
 
 /// Why [`Settings::try_load`] could not answer with the user's settings.
 ///
@@ -263,7 +265,7 @@ impl Settings {
             .and_then(|raw| serde_json::from_str::<Self>(raw).map_err(|e| e.to_string()));
         match parsed {
             Ok(mut settings) => {
-                if settings.default_permission_mode == RETIRED_PERMISSION_MODE {
+                if settings.default_permission_mode == UNDOCUMENTED_PERMISSION_MODE {
                     settings.default_permission_mode = DEFAULT_PERMISSION_MODE.to_owned();
                 }
                 Ok(settings)
