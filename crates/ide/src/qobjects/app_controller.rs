@@ -731,6 +731,15 @@ pub mod qobject {
         #[qinvokable]
         fn set_theme(self: &AppController, theme: QString);
 
+        /// Whether transcripts show the turn cost and the agent's own system
+        /// lines.
+        #[qinvokable]
+        fn show_agent_meta(self: &AppController) -> bool;
+
+        /// Records whether those lines are shown.
+        #[qinvokable]
+        fn set_show_agent_meta(self: &AppController, show: bool);
+
         /// Someone in Rust asked the window to open a file in an editor tab.
         #[qsignal]
         fn open_file_requested(self: Pin<&mut AppController>, workspace_id: QString, path: QString);
@@ -2740,6 +2749,30 @@ impl qobject::AppController {
         settings.theme = theme;
         if let Err(e) = settings.save() {
             tracing::warn!("the theme choice could not be saved: {e}");
+        }
+    }
+
+    pub fn show_agent_meta(&self) -> bool {
+        Settings::load().show_agent_meta
+    }
+
+    pub fn set_show_agent_meta(&self, show: bool) {
+        // `try_load` for the same reason [`Self::set_theme`] uses it: an
+        // unreadable `settings.json` must stop the write rather than have the
+        // defaults saved over everything else the user chose.
+        let mut settings = match Settings::try_load() {
+            Ok(settings) => settings,
+            Err(e) => {
+                tracing::warn!("the transcript's small grey lines were not recorded: {e}");
+                return;
+            }
+        };
+        if settings.show_agent_meta == show {
+            return;
+        }
+        settings.show_agent_meta = show;
+        if let Err(e) = settings.save() {
+            tracing::warn!("the transcript's small grey lines could not be saved: {e}");
         }
     }
 

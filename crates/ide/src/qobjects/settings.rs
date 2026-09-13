@@ -171,6 +171,15 @@ fn default_theme() -> String {
     DEFAULT_THEME.to_owned()
 }
 
+/// Whether a settings file that predates the switch shows the turn cost and
+/// the system lines. It does: they were the only behaviour there was, and an
+/// absent field is not an answer of "hide".
+pub const DEFAULT_SHOW_AGENT_META: bool = true;
+
+fn default_show_agent_meta() -> bool {
+    DEFAULT_SHOW_AGENT_META
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -191,6 +200,11 @@ pub struct Settings {
     /// missing answer.
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Whether a transcript shows the small grey lines -- what a turn cost and
+    /// how long it took, and what the agent's own startup reported. Useful
+    /// while you are learning what an agent costs, and noise for ever after.
+    #[serde(default = "default_show_agent_meta")]
+    pub show_agent_meta: bool,
 }
 
 impl Default for Settings {
@@ -202,6 +216,7 @@ impl Default for Settings {
             api_key_set: false,
             default_permission_mode: DEFAULT_PERMISSION_MODE.into(),
             theme: DEFAULT_THEME.into(),
+            show_agent_meta: DEFAULT_SHOW_AGENT_META,
         }
     }
 }

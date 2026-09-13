@@ -721,3 +721,30 @@ fn the_theme_choice_round_trips_and_defaults_to_the_system_one() {
 
     std::env::remove_var(SETTINGS_PATH_ENV);
 }
+
+/// The turn cost and the agent's own system lines are on until someone says
+/// otherwise, so a settings file that predates the switch reads back as
+/// showing them -- an absent field is not an answer of "hide".
+#[test]
+fn the_small_grey_lines_round_trip_and_default_to_shown() {
+    use bondsymphonic_ide::qobjects::settings::{
+        Settings, LEGACY_SETTINGS_PATH_ENV, SETTINGS_PATH_ENV, STATE_PATH_ENV,
+    };
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = temp_dir("show-agent-meta");
+    let path = dir.join("settings.json");
+    std::fs::write(&path, r#"{"distro":"bondsymphonic"}"#).expect("settings");
+    std::env::set_var(SETTINGS_PATH_ENV, &path);
+    std::env::remove_var(LEGACY_SETTINGS_PATH_ENV);
+    std::env::remove_var(STATE_PATH_ENV);
+
+    let mut settings = Settings::load();
+    assert!(settings.show_agent_meta);
+
+    settings.show_agent_meta = false;
+    settings.save().expect("settings save");
+    assert!(!Settings::load().show_agent_meta);
+
+    std::env::remove_var(SETTINGS_PATH_ENV);
+}
