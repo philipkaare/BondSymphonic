@@ -78,10 +78,12 @@ void PermissionBar::applyWash() {
         return;
     }
     m_mixing = true;
-    // Clearing first, because the palette installed below is the bar's own
-    // from then on: `palette()` would otherwise answer with the last mix
-    // instead of with the pane behind it, and amber washed into amber drifts
-    // a shade further from the window on every theme change.
+    // Clearing first so the mix below is taken from the pane rather than from
+    // the bar's own last answer. It changes no colour here -- the mix reads
+    // `Base` and installs only `Window`, which cannot compound -- and is kept
+    // because the mix's inputs are the thing most likely to change: `GroupBar`
+    // runs the same shape and does read the role it installs, so a band lifted
+    // off the last band walks away from the window a step per theme change.
     setPalette(QPalette());
     // Amber: the bar is asking, not reporting a failure, and "changed" is the
     // one accent the theme reserves for something waiting on the user.
