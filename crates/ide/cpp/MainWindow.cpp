@@ -508,6 +508,11 @@ void MainWindow::openSettings(bool onSetup) {
     }
     dialog.exec();
     m_settingsDialog = nullptr;
+    // Whether the turn cost and the agent's own system lines are shown is a
+    // setting, and the panes holding them are already on screen. Applied on the
+    // way out rather than watched for: a checkbox the user can still cancel out
+    // of has not changed anything yet, and `accept` is what writes it.
+    m_agentArea->setShowMeta(m_controller->showAgentMeta());
     // Closing the dialog destroys the setup page, and with it the login
     // terminal's session, which closes the PTY. That is correct cleanup, but it
     // means `SetupPage::onTerminalExited` never runs -- so a user who pastes
@@ -754,7 +759,14 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::workspacesRestored, this,
                      [this](const QString& json) { m_groupModel->loadWorkspaces(json); });
     QObject::connect(m_controller, &AppController::workspacesListed, this,
-                     [this](const QString& json) { m_groupModel->reconcile(json); });
+                     [this](const QString& json) {
+                         m_groupModel->reconcile(json);
+                         // After the reconcile, not the restore: the restore
+                         // places the tabs the session file remembered, and it
+                         // is this list -- the daemon's own answer -- that says
+                         // which of them still has an agent behind it.
+                         startAgentsThatHaveNone();
+                     });
     // Every arrangement the user makes -- a rename, a drag between groups, a
     // group closed -- reaches `state.json` from here. The model is the
     // authority on the arrangement; the controller only records what it says.
@@ -776,6 +788,10 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::reconnected, this, [this](::std::int64_t) {
         onConnectionStateChanged();
         updateWorkspaceStatus();
+        // A daemon that restarted has no agents, and the panes that re-attached
+        // themselves found nothing to attach to. Nobody has to press anything
+        // to get them back.
+        startAgentsThatHaveNone();
         showOperationMessage(QStringLiteral("Reconnected to the daemon."), QString());
     });
     QObject::connect(m_controller, &AppController::workspaceCreated, this,
@@ -864,6 +880,23 @@ void MainWindow::connectController() {
     // restarted agent gets the model and permission mode the user chose.
     QObject::connect(m_agentArea, &AgentArea::startAgentRequested, this,
                      &MainWindow::onStartAgentRequested);
+    // A model or permission mode chosen in the composer. It is answered exactly
+    // as a restart is, because it is one: `claude -p` reads both flags when the
+    // process starts and there is no way to change either in flight. The
+    // options already carry the session id, so the conversation continues.
+    QObject::connect(m_agentArea, &AgentArea::agentOptionsChanged, this,
+                     [this](const QString& workspaceId, const QString& optionsJson) {
+                         if (workspaceId.isEmpty() || optionsJson.isEmpty()) {
+                             return;
+                         }
+                         m_groupModel->setTabOptions(workspaceId, optionsJson);
+                         m_agentArea->setStarting(workspaceId, true);
+                         m_controller->startAgent(workspaceId, optionsJson);
+                     });
+    // The small grey lines are a setting, so a pane built at any point after
+    // this has to be born with the answer rather than showing them until the
+    // next time Settings is closed.
+    m_agentArea->setShowMeta(m_controller->showAgentMeta());
     // The chat gate. `claudeLoggedIn` is derived from the daemon's own
     // `claude_auth` prerequisite, so the composer comes back on the re-check a
     // successful login triggers -- no restart, and no second source of truth
@@ -883,6 +916,7 @@ void MainWindow::connectController() {
                      [this](const QString& agentId, const QString& state, const QString& detail) {
                          m_groupModel->setAgentStatus(agentId, state, detail);
                          noteAgentAttention(agentId, state);
+                         onAgentExited(agentId, state, detail);
                      });
     // The daemon discarded events, so every terminal has a hole in it and says so.
     QObject::connect(m_controller, &AppController::outputDropped, this, [this](::std::int64_t) {
@@ -1126,6 +1160,63 @@ TranscriptModel* MainWindow::activeAgentModel(const QString& agentId, const char
         return nullptr;
     }
     return model;
+}
+
+void MainWindow::onAgentExited(const QString& agentId, const QString& state,
+                               const QString& detail) {
+    if (state != QLatin1String("exited")) {
+        return;
+    }
+    const QString workspaceId = m_groupModel->agentWorkspaceId(agentId);
+    if (workspaceId.isEmpty()) {
+        return;
+    }
+    // The one banner the IDE raises about an agent rather than about a git
+    // command, and the only one that offers to act. It exists because the
+    // composer's Start button does not any more: agents start themselves now,
+    // so an agent that stopped by itself is the single case left where the
+    // user has to be told and given something to press.
+    //
+    // Not restarted automatically. A crash that repeats would become a loop
+    // reporting itself as a working agent, and the difference between "it came
+    // back" and "it has died eleven times" is the thing the user most needs to
+    // see.
+    m_agentArea->showBanner(workspaceId, QStringLiteral("The agent stopped."), detail, QString(),
+                            true);
+    m_groupModel->setWorkspaceError(workspaceId, detail.isEmpty()
+                                                     ? QStringLiteral("The agent stopped.")
+                                                     : QStringLiteral("The agent stopped.\n") + detail);
+}
+
+void MainWindow::startAgentsThatHaveNone() {
+    const QJsonArray groups = QJsonDocument::fromJson(m_groupModel->getStateJson().toUtf8())
+                                  .object()
+                                  .value("groups")
+                                  .toArray();
+    for (const QJsonValue& groupValue : groups) {
+        for (const QJsonValue& tabValue : groupValue.toObject().value("tabs").toArray()) {
+            const QJsonObject tab = tabValue.toObject();
+            if (tab.value("adapter").toString() != QLatin1String("claude")) {
+                continue;
+            }
+            if (!tab.value("agent_id").toString().isEmpty()) {
+                continue;
+            }
+            // An agent that exited is left alone. That is a failure with a
+            // banner and a Restart button on it, and starting it again from
+            // here would turn one crash into a loop that reports itself as a
+            // working agent.
+            if (tab.value("agent_status").toString() == QLatin1String("exited")) {
+                continue;
+            }
+            const QString workspaceId = tab.value("workspace_id").toString();
+            if (workspaceId.isEmpty()) {
+                continue;
+            }
+            m_agentArea->setStarting(workspaceId, true);
+            m_controller->startAgent(workspaceId, tab.value("options_json").toString());
+        }
+    }
 }
 
 void MainWindow::onStartAgentRequested(const QString& workspaceId) {
@@ -1581,6 +1672,11 @@ void MainWindow::onActiveTabChanged() {
     // this to it; the worktree path is the daemon's, from `WorkspaceInfo`.
     m_pendingRunConfig = active.value("run_config").toString();
     m_runModel->setWorkspace(workspaceId, active.value("worktree_path").toString());
+    // Before `showWorkspace`, which is what builds the pane: the welcome is the
+    // first thing an empty transcript has to say, and a pane built without it
+    // would come up blank for as long as it took the next model change to
+    // arrive.
+    m_agentArea->setWelcome(workspaceId, QString::fromUtf8(QJsonDocument(active).toJson()));
     // Both areas create their terminal on the workspace's first activation and
     // keep it afterwards, so this runs on every model change and is a no-op
     // once the pane exists.

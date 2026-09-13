@@ -819,6 +819,25 @@ impl Workspaces {
         None
     }
 
+    /// Replaces the `AgentStartOptions` a tab carries, as JSON. False when the
+    /// workspace is not tracked, or when `options` is empty.
+    ///
+    /// Empty is refused rather than stored because an empty options string
+    /// means "whatever the daemon defaults to", and the one caller is a user
+    /// choosing a model or a permission mode. Letting an empty string through
+    /// would turn a choice into its absence, which is the one thing this must
+    /// not do quietly.
+    pub fn set_tab_options(&mut self, id: &WorkspaceId, options: &str) -> bool {
+        if options.is_empty() {
+            return false;
+        }
+        let Some((g, t)) = self.find(id) else {
+            return false;
+        };
+        self.groups[g].tabs[t].options_json = options.to_owned();
+        true
+    }
+
     /// Updates the tab's status, branch and detail from a daemon `WorkspaceInfo`.
     /// Returns `None` without modifying anything if `info.id` is not tracked.
     ///

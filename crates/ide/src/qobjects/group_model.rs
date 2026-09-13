@@ -294,6 +294,27 @@ pub mod qobject {
             workspace_id: QString,
             run_config: QString,
         ) -> bool;
+
+        /// Replaces the `AgentStartOptions` the tab was created with. False
+        /// when the workspace is not tracked, or when `options_json` is empty
+        /// -- an empty string is the absence of a choice, and writing it would
+        /// turn a model the user picked into "whatever the daemon defaults to".
+        ///
+        /// What the composer's model and permission dropdowns call. Not for
+        /// the sake of the next IDE start: a restored tab reads its options
+        /// from the daemon's record of what the agent was actually started
+        /// with (see `app_state::restart_options_json`), so the switch already
+        /// survives a restart without this. It is for the rest of *this*
+        /// session -- Workspace > Restart agent, and everything else that
+        /// reads the tab -- which would otherwise keep handing back the model
+        /// the workspace was created with and quietly undo the switch on the
+        /// next restart.
+        #[qinvokable]
+        fn set_tab_options(
+            self: Pin<&mut GroupModel>,
+            workspace_id: QString,
+            options_json: QString,
+        ) -> bool;
     }
 }
 
@@ -993,6 +1014,25 @@ impl qobject::GroupModel {
         {
             let mut rust = self.as_mut().rust_mut();
             rust.workspaces.groups[g].tabs[t].run_config = (!name.is_empty()).then_some(name);
+        }
+        self.publish();
+        true
+    }
+
+    pub fn set_tab_options(
+        mut self: Pin<&mut Self>,
+        workspace_id: QString,
+        options_json: QString,
+    ) -> bool {
+        let id = WorkspaceId(workspace_id.to_string());
+        let options = options_json.to_string();
+        if !self
+            .as_mut()
+            .rust_mut()
+            .workspaces
+            .set_tab_options(&id, &options)
+        {
+            return false;
         }
         self.publish();
         true

@@ -1173,3 +1173,29 @@ fn a_selection_follows_its_text_through_the_scrollback() {
         "one row further down: {rows:?}"
     );
 }
+
+/// Choosing a model or a permission mode in the composer restarts the agent,
+/// and the tab has to carry the choice afterwards.
+///
+/// Not for the sake of the next IDE start -- a restored tab reads its options
+/// off the daemon's record of what the agent was actually started with -- but
+/// for the rest of this session. Workspace > Restart agent reads the tab, and
+/// a tab still holding the model the workspace was created with would undo the
+/// switch the moment the user pressed it.
+#[test]
+fn a_tab_carries_the_options_the_composer_chose() {
+    let mut w = Workspaces::new_default();
+    w.add_tab(0, tab("ws_1", "agent-1"));
+
+    let chosen = r#"{"model":"claude-haiku-4-5-20251001","permission_mode":"bypassPermissions"}"#;
+    assert!(w.set_tab_options(&"ws_1".into(), chosen));
+    assert_eq!(w.groups[0].tabs[0].options_json, chosen);
+
+    // An empty string is the absence of a choice, and storing it would turn the
+    // model the user picked into "whatever the daemon defaults to".
+    assert!(!w.set_tab_options(&"ws_1".into(), ""));
+    assert_eq!(w.groups[0].tabs[0].options_json, chosen);
+
+    // A workspace that is not tracked is not silently created.
+    assert!(!w.set_tab_options(&"ws_missing".into(), chosen));
+}

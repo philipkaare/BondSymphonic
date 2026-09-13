@@ -269,6 +269,28 @@ private:
     /// Starts (or restarts) an agent for `workspaceId` with the options its tab
     /// was created with.
     void onStartAgentRequested(const QString& workspaceId);
+
+    /// Raises the one banner that is about an agent rather than about a git
+    /// command: `state` is `exited`, so this workspace's agent stopped by
+    /// itself. Does nothing for every other state.
+    ///
+    /// It offers a Restart, and it is the only thing that does now that agents
+    /// start themselves and the composer has no Start button. Deliberately not
+    /// a restart of its own: see [`startAgentsThatHaveNone`].
+    void onAgentExited(const QString& agentId, const QString& state, const QString& detail);
+
+    /// Starts an agent for every Claude workspace that has none.
+    ///
+    /// Called after a session restore and after a reconnect, which are the two
+    /// ways a Claude tab comes to exist without a start already on its way;
+    /// creation is the third and starts one itself. Nobody presses anything:
+    /// a Start button was a button for a thing with exactly one sensible
+    /// answer.
+    ///
+    /// A workspace whose agent exited is skipped. That is a failure with a
+    /// banner and a Restart button on it, and starting it again from here
+    /// would turn one crash into a loop that looks like a working agent.
+    void startAgentsThatHaveNone();
     /// Adds one Edit menu item forwarding to the current editor's view, and
     /// books it in for enabling and disabling together with its siblings.
     ///
