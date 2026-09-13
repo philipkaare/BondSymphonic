@@ -111,18 +111,27 @@ public:
     /// opened its tab -- has nowhere to put a banner, so the strings are held
     /// and raised when that pane is first built. Without that the tab's red
     /// glyph would lead to a pane that says nothing about why it is red.
-    /// `restartable` is for the one failure a restart repairs: an agent that
-    /// exited. Every other failure a banner reports -- a merge that conflicted,
-    /// a pull request that was refused -- has a live agent behind it that a
-    /// restart would interrupt rather than mend, so the default is false and
-    /// only the caller that knows an agent is down says otherwise.
     void showBanner(const QString& workspaceId, const QString& title, const QString& detail,
-                    const QString& stderrText, bool restartable = false);
+                    const QString& stderrText);
 
     /// Takes it down again, without emitting `bannerDismissed`. What a
     /// successful operation on that workspace does to the banner its last
     /// failure left.
     void clearBanner(const QString& workspaceId);
+
+    /// Whether `workspaceId`'s pane offers to restart its agent.
+    ///
+    /// A fact about the agent -- is it down? -- and not about the latest
+    /// failure, which is why it does not ride in on `showBanner`. Tying the two
+    /// together is wrong in both directions: a merge that fails over a
+    /// still-dead agent would take away the one way back, and an agent that
+    /// came back would keep a button that kills a working conversation.
+    ///
+    /// Independent of whether a banner is up. Raising it on a workspace with
+    /// nothing to report is remembered and applied to the next banner, and held
+    /// for a workspace whose pane does not exist yet, because an agent that
+    /// died before its tab was ever opened is exactly the one that needs it.
+    void setRestartOffered(const QString& workspaceId, bool offered);
 
     /// Records what `workspaceId`'s pane should say while its transcript is
     /// empty, from the tab JSON the window already holds: the agent's name, the
@@ -149,15 +158,20 @@ private:
     /// lines. Does nothing for a workspace the window has not described.
     void applyWelcome(const QString& workspaceId, TranscriptView* view);
 
+    /// Puts the remembered restart offer on the workspace's banner. Called
+    /// wherever the banner could have lost it -- when it is built, and after a
+    /// failure is raised on it -- so the widget always agrees with the fact
+    /// rather than with whatever the last `showError` left behind.
+    void applyRestartOffer(const QString& workspaceId);
+
     /// A failure raised for a workspace whose pane did not exist yet, held
-    /// until it does. The restart flag is part of it: a workspace whose agent
-    /// died before its tab was ever opened would otherwise get a banner saying
-    /// so with no way to act on it, which is the case the hold exists for.
+    /// until it does. Three strings and nothing about the agent: whether a
+    /// restart is offered is [`setRestartOffered`]'s business and outlives any
+    /// one failure.
     struct PendingBanner {
         QString title;
         QString detail;
         QString stderrText;
-        bool restartable = false;
     };
 
     /// Wraps `body` in the page this area actually stacks: a banner above the
@@ -180,6 +194,11 @@ private:
     QHash<QString, QString> m_welcomes;
     /// The failures waiting for a pane to be built. See [`PendingBanner`].
     QHash<QString, PendingBanner> m_pendingBanners;
+    /// Which workspaces offer a restart. Kept apart from the banners on
+    /// purpose: see [`setRestartOffered`]. A workspace absent from this offers
+    /// none, which is what a workspace nobody has said anything about should
+    /// do.
+    QHash<QString, bool> m_restartOffered;
     /// The agent id each transcript is attached to, so re-showing a tab does
     /// not replay its history again.
     QHash<QString, QString> m_attached;

@@ -82,28 +82,46 @@ QWidget* AgentArea::makePage(const QString& workspaceId, QWidget* body) {
     QObject::connect(banner, &WorkspaceBanner::restartRequested, this,
                      [this, workspaceId] { emit startAgentRequested(workspaceId); });
     // A failure reported before this pane existed: raise it now, which is the
-    // first moment the user could have seen it, and with the restart it was
-    // raised with -- an agent that died before its tab was ever opened is
-    // exactly the case that needs the button.
+    // first moment the user could have seen it.
     if (m_pendingBanners.contains(workspaceId)) {
         const PendingBanner pending = m_pendingBanners.take(workspaceId);
         banner->showError(pending.title, pending.detail, pending.stderrText);
-        banner->setRestartOffered(pending.restartable);
-
     }
+    // And whatever was said about the agent while this pane did not exist. An
+    // agent that died before its tab was ever opened is exactly the one that
+    // needs the button, and it has nothing to do with whether a failure was
+    // held above.
+    applyRestartOffer(workspaceId);
     return page;
 }
 
 void AgentArea::showBanner(const QString& workspaceId, const QString& title,
-                           const QString& detail, const QString& stderrText, bool restartable) {
+                           const QString& detail, const QString& stderrText) {
     if (WorkspaceBanner* banner = m_banners.value(workspaceId)) {
         banner->showError(title, detail, stderrText);
-        banner->setRestartOffered(restartable);
+        // The offer is re-stated rather than assumed: a banner that was reset
+        // between the two failures hid its button on the way down, and the
+        // agent this one is about may well still be the dead one.
+        applyRestartOffer(workspaceId);
         return;
     }
     // No pane yet. Held rather than dropped: the tab is about to go red, and
     // opening it has to explain why.
-    m_pendingBanners.insert(workspaceId, { title, detail, stderrText, restartable });
+    m_pendingBanners.insert(workspaceId, { title, detail, stderrText });
+}
+
+void AgentArea::setRestartOffered(const QString& workspaceId, bool offered) {
+    if (workspaceId.isEmpty()) {
+        return;
+    }
+    m_restartOffered.insert(workspaceId, offered);
+    applyRestartOffer(workspaceId);
+}
+
+void AgentArea::applyRestartOffer(const QString& workspaceId) {
+    if (WorkspaceBanner* banner = m_banners.value(workspaceId)) {
+        banner->setRestartOffered(m_restartOffered.value(workspaceId, false));
+    }
 }
 
 void AgentArea::clearBanner(const QString& workspaceId) {
@@ -234,6 +252,7 @@ void AgentArea::showPlaceholder() {
 
 void AgentArea::removeWorkspace(const QString& workspaceId) {
     m_welcomes.remove(workspaceId);
+    m_restartOffered.remove(workspaceId);
     m_attached.remove(workspaceId);
     m_starting.remove(workspaceId);
     m_banners.remove(workspaceId);
@@ -312,21 +331,24 @@ void openPane(AgentArea& area, const QString& workspaceId) {
 
 } // namespace
 
-/// A failure held for a workspace with no pane keeps its Restart.
+/// The offer to restart survives a pane that does not exist yet, and a failure
+/// that has nothing to do with it.
 ///
-/// A banner raised before the tab was ever opened is held and replayed when the
-/// pane is built, and an agent that died that early is precisely the one that
-/// needs the button: nothing else in the pane offers a restart now that agents
-/// start themselves. A flag dropped on the way through the hold leaves that
-/// user looking at a banner telling them their agent is gone and offering
-/// nothing to do about it.
+/// Whether to offer a Restart is a fact about the agent -- is it down? -- and a
+/// banner is a fact about the latest failure. Carrying the first on the second
+/// is wrong in both directions: a merge that fails over a still-dead agent
+/// would take away the one way back the pane has left now that agents start
+/// themselves, and an agent that came back would keep a button that kills a
+/// working conversation to resume it.
 extern "C" std::int32_t bs_widget_test_agent_area_holds_a_restartable_banner() {
     const QString workspace = QStringLiteral("ws_held");
     {
         AgentArea area;
-        // Before any pane exists, which is the whole point of the hold.
+        // The agent died before the tab was ever opened, so there is nothing
+        // yet to put the offer on.
+        area.setRestartOffered(workspace, true);
         area.showBanner(workspace, QStringLiteral("agent exited"), QStringLiteral("status 1"),
-                        QString(), true);
+                        QString());
         if (restartButton(area) != nullptr) {
             return 1;
         }
@@ -336,7 +358,7 @@ extern "C" std::int32_t bs_widget_test_agent_area_holds_a_restartable_banner() {
             return 2;
         }
         if (restart->isHidden()) {
-            // The flag did not survive the hold.
+            // The offer did not survive the hold.
             return 3;
         }
         QString asked;
@@ -348,41 +370,43 @@ extern "C" std::int32_t bs_widget_test_agent_area_holds_a_restartable_banner() {
             // the window as the same request the pane's own used to make.
             return 4;
         }
-    }
 
-    {
-        // The same hold for a failure a restart does not repair. A merge that
-        // conflicted has a live agent behind it, and restarting it would
-        // interrupt the agent rather than mend the merge.
-        AgentArea area;
+        // A second failure that says nothing about the agent. The agent is
+        // still down, so the way back is still there.
         area.showBanner(workspace, QStringLiteral("merge failed"), QStringLiteral("conflict"),
                         QString());
-        openPane(area, workspace);
-        QPushButton* restart = restartButton(area);
-        if (restart == nullptr) {
+        if (restartButton(area)->isHidden()) {
             return 5;
         }
-        if (!restart->isHidden()) {
+
+        // And the agent coming back is what takes it away, from the one caller
+        // that knows it did.
+        area.setRestartOffered(workspace, false);
+        if (!restartButton(area)->isHidden()) {
             return 6;
         }
     }
 
     {
-        // And the direct path, for a pane that already exists: the flag reaches
-        // the banner rather than only the hold.
+        // The same two facts arriving the other way round, on a pane that
+        // already exists.
         AgentArea area;
         openPane(area, workspace);
         if (restartButton(area) == nullptr || !restartButton(area)->isHidden()) {
+            // A workspace nobody has said anything about offers nothing.
             return 7;
         }
-        area.showBanner(workspace, QStringLiteral("agent exited"), QString(), QString(), true);
+        // Raised with no banner up at all, which is a state the window reaches:
+        // an agent can exit without anything having failed.
+        area.setRestartOffered(workspace, true);
         if (restartButton(area)->isHidden()) {
             return 8;
         }
-        // A later failure that is not an exit takes it away again: the agent it
-        // was offering to restart is the one that has since come back.
+        // A failure raised afterwards leaves it alone, and so does one raised
+        // after the banner has been taken down and put back up.
+        area.clearBanner(workspace);
         area.showBanner(workspace, QStringLiteral("merge failed"), QString(), QString());
-        if (!restartButton(area)->isHidden()) {
+        if (restartButton(area)->isHidden()) {
             return 9;
         }
     }
