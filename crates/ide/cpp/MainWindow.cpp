@@ -873,6 +873,12 @@ void MainWindow::connectController() {
                          m_agentArea->setStarting(workspaceId, false);
                          m_groupModel->setAgent(workspaceId, agentId);
                          m_agentArea->setAgent(workspaceId, agentId);
+                         // The other half of the fact `onAgentExited` raises:
+                         // this workspace has a live agent again, so there is
+                         // nothing left to restart. Without this a workspace
+                         // whose agent died and came back keeps a button that
+                         // would kill the conversation it just resumed.
+                         m_agentArea->setRestartOffered(workspaceId, false);
                          rebindCost();
                      });
     // A transcript pane with no agent -- a restored session, or one whose agent
@@ -1181,8 +1187,13 @@ void MainWindow::onAgentExited(const QString& agentId, const QString& state,
     // reporting itself as a working agent, and the difference between "it came
     // back" and "it has died eleven times" is the thing the user most needs to
     // see.
-    m_agentArea->showBanner(workspaceId, QStringLiteral("The agent stopped."), detail, QString(),
-                            true);
+    m_agentArea->showBanner(workspaceId, QStringLiteral("The agent stopped."), detail, QString());
+    // Said separately from the banner, because they are different facts. The
+    // banner reports the latest failure; this reports that the agent is down,
+    // and only the second one decides whether there is anything to press. Tied
+    // together, a merge that failed over a still-dead agent would take the
+    // user's only way back away with it.
+    m_agentArea->setRestartOffered(workspaceId, true);
     m_groupModel->setWorkspaceError(workspaceId, detail.isEmpty()
                                                      ? QStringLiteral("The agent stopped.")
                                                      : QStringLiteral("The agent stopped.\n") + detail);
