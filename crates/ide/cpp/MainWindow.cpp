@@ -22,6 +22,7 @@
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/transcript_model.cxxqt.h"
 #include <QAction>
+#include <QActionGroup>
 #include <QApplication>
 #include <QByteArray>
 #include <QChar>
@@ -293,7 +294,31 @@ void MainWindow::buildMenus() {
     m_closeGroupAction =
         workspace->addAction("&Close group…", this, [this] { onCloseGroup(activeGroupName()); });
 
-    menuBar()->addMenu("&Run");
+    // The panel's own actions again, for the same reason: Start and Stop were
+    // buttons inside one tab of one dock, so running the thing you have just
+    // built meant finding that tab first. A disabled Stop is now disabled in
+    // both places because it is one action, not two that agree.
+    m_runMenu = menuBar()->addMenu("&Run");
+    m_runMenu->addAction(m_runPanel->runAction());
+    m_runPanel->runAction()->setShortcut(QKeySequence(Qt::Key_F5));
+    m_runMenu->addAction(m_runPanel->stopAction());
+    m_runPanel->stopAction()->setShortcut(QKeySequence(Qt::ShiftModifier | Qt::Key_F5));
+    m_runMenu->addAction(m_runPanel->restartAction());
+    m_runMenu->addSeparator();
+    // The detected configurations go between these two separators. Qt collapses
+    // the pair while there are none, so a workspace the daemon found nothing in
+    // shows one separator rather than an empty gap.
+    m_runConfigMenuAnchor = m_runMenu->addSeparator();
+    m_runMenu->addAction(m_runPanel->openAction());
+    m_runMenu->addSeparator();
+    m_runMenu->addAction(m_runPanel->clearOutputAction());
+    m_runMenu->addAction(m_runPanel->copyOutputAction());
+    m_runMenu->addAction(m_runPanel->allowHostAction());
+    QObject::connect(m_runPanel, &RunPanel::configurationsChanged, this,
+                     &MainWindow::rebuildRunConfigMenu);
+    // The panel built its first list in its own constructor, before this menu
+    // existed to hear about it.
+    rebuildRunConfigMenu();
 
     // Qt's own toggle actions rather than hand-written ones: the tick and the
     // dock cannot then disagree, and a dock closed by its own X updates the
@@ -589,6 +614,12 @@ void MainWindow::buildDocks() {
                          [this](bool) { noteWindowState(); });
         QObject::connect(dock, &QDockWidget::visibilityChanged, this,
                          [this](bool) { noteWindowState(); });
+    }
+}
+
+void MainWindow::rebuildRunConfigMenu() {
+    for (QAction* action : m_runPanel->configurationActions()) {
+        m_runMenu->insertAction(m_runConfigMenuAnchor, action);
     }
 }
 
@@ -1941,6 +1972,86 @@ extern "C" std::int32_t bs_widget_test_workspace_menu_gathers_the_git_actions() 
     if (menuAction(menu, QStringLiteral("Restart agent"))->shortcut() !=
         QKeySequence(QStringLiteral("Ctrl+Shift+R"))) {
         return 6;
+    }
+    return 0;
+}
+
+/// The Run menu drives the panel rather than copying it: the same actions, F5
+/// where a hand expects it, and the detected configurations as one checkable
+/// group so exactly one of them is what F5 will start.
+extern "C" std::int32_t bs_widget_test_run_menu_drives_the_run_panel() {
+    useThrowawayState();
+    WindowFixture fixture;
+    MainWindow& window = fixture.window;
+
+    QMenu* menu = menuTitled(window, QStringLiteral("&Run"));
+    auto* panel = window.findChild<RunPanel*>();
+    if (menu == nullptr || panel == nullptr) {
+        return 1;
+    }
+    for (const QString& text :
+         QStringList{ QStringLiteral("Run"), QStringLiteral("Stop"), QStringLiteral("Restart"),
+                      QStringLiteral("Open in browser"), QStringLiteral("Clear output"),
+                      QStringLiteral("Copy output"), QStringLiteral("Allow blocked host") }) {
+        if (!menuHasAction(menu, text)) {
+            return 2;
+        }
+    }
+    if (menuAction(menu, QStringLiteral("Run")) != panel->runAction() ||
+        menuAction(menu, QStringLiteral("Stop")) != panel->stopAction()) {
+        return 3;
+    }
+    if (panel->runAction()->shortcut() != QKeySequence(Qt::Key_F5) ||
+        panel->stopAction()->shortcut() != QKeySequence(Qt::ShiftModifier | Qt::Key_F5)) {
+        return 4;
+    }
+    // Nothing is running and no host has been refused, so the three that need
+    // one or the other are dead.
+    if (menuActionEnabled(menu, QStringLiteral("Stop")) ||
+        menuActionEnabled(menu, QStringLiteral("Open in browser")) ||
+        menuActionEnabled(menu, QStringLiteral("Allow blocked host"))) {
+        return 5;
+    }
+
+    panel->noteConfigsForTest(
+        QStringLiteral(R"([{"name":"web","port":3000},{"name":"api","port":8080}])"));
+    const QList<QAction*> configs = panel->configurationActions();
+    if (configs.size() != 2) {
+        return 6;
+    }
+    int checkable = 0;
+    for (QAction* action : menu->actions()) {
+        if (action->isCheckable()) {
+            ++checkable;
+        }
+    }
+    if (checkable != 2) {
+        // In the menu, not merely in the group: the entries are inserted in
+        // front of an anchor, and an insertion that missed would leave the
+        // list somewhere only the panel can see.
+        return 7;
+    }
+    // One exclusive group, so picking the second unpicks the first and exactly
+    // one configuration is what a Run will start. Asserted on the group rather
+    // than by triggering one: which is ticked follows the model's own
+    // selection, and the model here has no daemon to have detected anything,
+    // so it would answer that none of these exists.
+    QActionGroup* group = configs.at(0)->actionGroup();
+    if (group == nullptr || !group->isExclusive() || configs.at(1)->actionGroup() != group) {
+        return 8;
+    }
+
+    // A second answer from the daemon replaces the list rather than appending
+    // to it, in the menu as well as in the panel.
+    panel->noteConfigsForTest(QStringLiteral(R"([{"name":"web","port":3000}])"));
+    checkable = 0;
+    for (QAction* action : menu->actions()) {
+        if (action->isCheckable()) {
+            ++checkable;
+        }
+    }
+    if (checkable != 1) {
+        return 9;
     }
     return 0;
 }

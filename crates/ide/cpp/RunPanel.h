@@ -5,6 +5,8 @@
 #include <QWidget>
 
 class AppController;
+class QAction;
+class QActionGroup;
 class QComboBox;
 class QFrame;
 class QLabel;
@@ -55,8 +57,66 @@ public:
     /// be null in a test that builds the panel on its own.
     RunPanel(RunPanelModel* model, AppController* controller, QWidget* parent = nullptr);
 
+    /// What the panel can do, as actions it owns.
+    ///
+    /// Every button in the panel is the face of one of these rather than the
+    /// other way round, so the Run menu offers the same objects: a Stop that is
+    /// dead because nothing is running is dead in both places for one reason,
+    /// and a panel nobody has opened is not a reason the menu cannot drive a
+    /// run. Three of them -- restart, and the two that act on the output -- have
+    /// no button at all and exist only here.
+    QAction* runAction() const;
+    QAction* stopAction() const;
+    QAction* restartAction() const;
+    QAction* openAction() const;
+    QAction* clearOutputAction() const;
+    QAction* copyOutputAction() const;
+    QAction* allowHostAction() const;
+
+    /// One checkable action per detected configuration, in the combo's order
+    /// and in one exclusive group, so exactly one of them is the one a Run will
+    /// start. Rebuilt whenever the combo is, which is what
+    /// [`configurationsChanged`] announces.
+    QList<QAction*> configurationActions() const;
+
+#if defined(BS_WIDGET_TESTS)
+    /// Fills the configuration list from `configsJson` as a `configsChanged`
+    /// from the model would.
+    ///
+    /// The one thing a check cannot reach any other way: the list is the
+    /// daemon's answer to a detection, and an offscreen panel has no daemon to
+    /// answer it. Everything downstream of the list -- the combo, the checkable
+    /// actions, the menu they are inserted into -- is the real path.
+    void noteConfigsForTest(const QString& configsJson);
+#endif
+
+signals:
+    /// The configuration list has been rebuilt, so anything mirroring it --
+    /// the Run menu -- must ask for [`configurationActions`] again. The
+    /// actions from before the signal have been deleted.
+    void configurationsChanged();
+
 private:
     void buildTopRow(QVBoxLayout* outer);
+    /// Builds the actions above. First, before the buttons: each of them binds
+    /// to the action it is the face of.
+    void buildActions();
+    /// Rebuilds the checkable configuration actions from the combo and emits
+    /// [`configurationsChanged`].
+    void rebuildConfigActions();
+    /// Ticks the configuration action for what the model says is selected, and
+    /// unticks the rest.
+    void syncConfigActionChecks();
+    /// Offers `name` to the model and takes back whatever it settled on. What
+    /// both the combo and the menu's configuration entries go through.
+    void selectConfig(const QString& name);
+    /// Starts the selected configuration. The Run action's body.
+    void startRun();
+    /// Stops what is running and starts it again once the daemon says it has
+    /// stopped. A run cannot be replaced in one call: the model refuses a
+    /// second run of a configuration that is still alive, so the start has to
+    /// wait for the stop to land.
+    void onRestart();
     void buildToast(QVBoxLayout* outer);
     void buildLog(QVBoxLayout* outer);
     void connectModel();
@@ -126,6 +186,19 @@ private:
     /// Set while `syncPort` writes into the box, so the `valueChanged` it
     /// provokes is not recorded as a change the user made.
     bool m_syncingPort = false;
+    QAction* m_runAction = nullptr;
+    QAction* m_stopAction = nullptr;
+    QAction* m_restartAction = nullptr;
+    QAction* m_openAction = nullptr;
+    QAction* m_clearOutputAction = nullptr;
+    QAction* m_copyOutputAction = nullptr;
+    QAction* m_allowHostAction = nullptr;
+    /// The configuration actions, exclusive: picking one unpicks the last.
+    QActionGroup* m_configActions = nullptr;
+    /// Set between a restart's stop and the start that follows it. Cleared by
+    /// the start, and by a failure, so a stop that never lands cannot make an
+    /// unrelated idle moment start a run nobody asked for.
+    bool m_restartPending = false;
     QPushButton* m_start = nullptr;
     QPushButton* m_stop = nullptr;
     QLabel* m_glyph = nullptr;

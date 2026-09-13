@@ -3,11 +3,15 @@
 #include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/run_panel.cxxqt.h"
+#include <QAction>
+#include <QActionGroup>
+#include <QClipboard>
 #include <QComboBox>
 #include <QDesktopServices>
 #include <QFont>
 #include <QFontDatabase>
 #include <QFrame>
+#include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -58,6 +62,20 @@ void tint(QLabel* label, const QColor& accent) {
 /// Restores `label` to the palette's ordinary text colour.
 void untint(QLabel* label) {
     label->setPalette(QPalette());
+}
+
+/// Makes `button` the face of `action`: the click goes through the action, and
+/// the button is greyed out exactly when the action is.
+///
+/// One direction only. The panel and the Run menu show the same action, and
+/// the enablement rules live in `updateRow`, which sets them on the action; a
+/// button that could also be disabled on its own would be a second opinion
+/// about whether a run can start.
+void bindButton(QPushButton* button, QAction* action) {
+    QObject::connect(button, &QPushButton::clicked, action, &QAction::trigger);
+    QObject::connect(action, &QAction::changed, button,
+                     [button, action] { button->setEnabled(action->isEnabled()); });
+    button->setEnabled(action->isEnabled());
 }
 
 } // namespace
@@ -114,11 +132,59 @@ RunPanel::RunPanel(RunPanelModel* model, AppController* controller, QWidget* par
     auto* outer = new QVBoxLayout(this);
     outer->setContentsMargins(6, 4, 6, 4);
     outer->setSpacing(4);
+    // Before the widgets: every button below is the face of one of these.
+    buildActions();
     buildTopRow(outer);
     buildToast(outer);
     buildLog(outer);
     connectModel();
     rebuildConfigs();
+}
+
+void RunPanel::buildActions() {
+    m_runAction = new QAction(QStringLiteral("&Run"), this);
+    m_runAction->setObjectName(QStringLiteral("RunStartAction"));
+    m_runAction->setToolTip(QStringLiteral("Start the selected run configuration"));
+    QObject::connect(m_runAction, &QAction::triggered, this, &RunPanel::startRun);
+
+    m_stopAction = new QAction(QStringLiteral("&Stop"), this);
+    m_stopAction->setObjectName(QStringLiteral("RunStopAction"));
+    QObject::connect(m_stopAction, &QAction::triggered, this, [this] {
+        if (!m_model.isNull()) {
+            m_model->stop();
+        }
+    });
+
+    m_restartAction = new QAction(QStringLiteral("Res&tart run"), this);
+    m_restartAction->setObjectName(QStringLiteral("RunRestartAction"));
+    QObject::connect(m_restartAction, &QAction::triggered, this, &RunPanel::onRestart);
+
+    m_openAction = new QAction(QStringLiteral("&Open in browser"), this);
+    m_openAction->setObjectName(QStringLiteral("RunOpenAction"));
+    QObject::connect(m_openAction, &QAction::triggered, this, &RunPanel::openUrl);
+
+    // The widget's own copy, not the model's ring buffer: a user clearing the
+    // output wants the screen empty, and the lines a finished run left behind
+    // are still what `logText` answers with if anything asks for them again.
+    m_clearOutputAction = new QAction(QStringLiteral("C&lear output"), this);
+    m_clearOutputAction->setObjectName(QStringLiteral("RunClearOutputAction"));
+    QObject::connect(m_clearOutputAction, &QAction::triggered, this, [this] { m_log->clear(); });
+
+    m_copyOutputAction = new QAction(QStringLiteral("&Copy output"), this);
+    m_copyOutputAction->setObjectName(QStringLiteral("RunCopyOutputAction"));
+    QObject::connect(m_copyOutputAction, &QAction::triggered, this, [this] {
+        QGuiApplication::clipboard()->setText(m_log->toPlainText());
+    });
+
+    m_allowHostAction = new QAction(QStringLiteral("&Allow blocked host…"), this);
+    m_allowHostAction->setObjectName(QStringLiteral("RunAllowHostAction"));
+    // Dead until there is a host to allow. The toast raises it with the offer
+    // and `setToastBusy` is the one place that decides.
+    m_allowHostAction->setEnabled(false);
+    QObject::connect(m_allowHostAction, &QAction::triggered, this, &RunPanel::onAllowClicked);
+
+    m_configActions = new QActionGroup(this);
+    m_configActions->setExclusive(true);
 }
 
 void RunPanel::buildTopRow(QVBoxLayout* outer) {
@@ -190,21 +256,9 @@ void RunPanel::buildTopRow(QVBoxLayout* outer) {
 
     QObject::connect(m_configs, &QComboBox::activated, this, &RunPanel::onConfigActivated);
     QObject::connect(m_port, &QSpinBox::valueChanged, this, &RunPanel::onPortChanged);
-    QObject::connect(m_start, &QPushButton::clicked, this, [this] {
-        if (m_model.isNull()) {
-            return;
-        }
-        // A new run's first news replaces the last one's obituary.
-        m_lastError.clear();
-        m_model->start();
-        updateRow();
-    });
-    QObject::connect(m_stop, &QPushButton::clicked, this, [this] {
-        if (!m_model.isNull()) {
-            m_model->stop();
-        }
-    });
-    QObject::connect(m_open, &QPushButton::clicked, this, &RunPanel::openUrl);
+    bindButton(m_start, m_runAction);
+    bindButton(m_stop, m_stopAction);
+    bindButton(m_open, m_openAction);
     QObject::connect(m_url, &QLabel::linkActivated, this, [this](const QString&) { openUrl(); });
 }
 
@@ -239,7 +293,7 @@ void RunPanel::buildToast(QVBoxLayout* outer) {
     m_toast->hide();
     outer->addWidget(m_toast);
 
-    QObject::connect(m_allow, &QPushButton::clicked, this, &RunPanel::onAllowClicked);
+    bindButton(m_allow, m_allowHostAction);
     QObject::connect(m_dismiss, &QPushButton::clicked, this, &RunPanel::onDismissClicked);
 }
 
@@ -285,6 +339,10 @@ void RunPanel::connectModel() {
     QObject::connect(model, &RunPanelModel::deniedCleared, this, &RunPanel::hideToast);
     QObject::connect(model, &RunPanelModel::errorOccurred, this, [this](const QString& message) {
         m_lastError = message;
+        // A stop that failed is a restart that will not happen. Leaving the
+        // flag set would arm a run at whatever unrelated moment the panel next
+        // found itself idle.
+        m_restartPending = false;
         updateRow();
     });
     // A different workspace has a different log and its own last failure.
@@ -301,6 +359,33 @@ void RunPanel::connectModel() {
     });
 }
 
+void RunPanel::startRun() {
+    if (m_model.isNull()) {
+        return;
+    }
+    // A new run's first news replaces the last one's obituary.
+    m_lastError.clear();
+    m_model->start();
+    updateRow();
+}
+
+void RunPanel::onRestart() {
+    if (m_model.isNull()) {
+        return;
+    }
+    if (m_model->getActiveState().isEmpty()) {
+        // Nothing to replace: a restart of a run that has already ended is a
+        // run, and refusing it would be pedantry.
+        startRun();
+        return;
+    }
+    // The model refuses a second run of a configuration that is still alive,
+    // so the start waits for the daemon's own `stopped` to come back through
+    // `updateRow`.
+    m_restartPending = true;
+    m_model->stop();
+}
+
 void RunPanel::rebuildConfigs() {
     if (m_model.isNull()) {
         return;
@@ -308,6 +393,48 @@ void RunPanel::rebuildConfigs() {
     m_configs->clear();
     runpanel::appendConfigItems(m_configs, m_model->configsJson());
     updateWarnings();
+    syncSelection();
+    rebuildConfigActions();
+}
+
+void RunPanel::rebuildConfigActions() {
+    // Deleted rather than reused: the list is the daemon's, and a run
+    // configuration that has gone from `bondsymphonic.toml` must leave the
+    // menu with it. Whatever is showing them is told to ask again.
+    for (QAction* action : m_configActions->actions()) {
+        m_configActions->removeAction(action);
+        delete action;
+    }
+    for (int index = 0; index < m_configs->count(); ++index) {
+        const QString name = m_configs->itemData(index).toString();
+        auto* action = new QAction(m_configs->itemText(index), m_configActions);
+        action->setCheckable(true);
+        action->setData(name);
+        action->setToolTip(m_configs->itemData(index, Qt::ToolTipRole).toString());
+        // A configuration the daemon disabled is shown and unpickable in the
+        // menu exactly as it is in the combo: visible without being offerable
+        // is the whole point of listing it.
+        action->setEnabled(m_configs->model()->index(index, 0).flags().testFlag(Qt::ItemIsEnabled));
+        QObject::connect(action, &QAction::triggered, this, [this, name] { selectConfig(name); });
+    }
+    syncConfigActionChecks();
+    Q_EMIT configurationsChanged();
+}
+
+void RunPanel::syncConfigActionChecks() {
+    const QString selected = m_model.isNull() ? QString() : m_model->getSelectedConfig();
+    for (QAction* action : m_configActions->actions()) {
+        action->setChecked(action->data().toString() == selected);
+    }
+}
+
+void RunPanel::selectConfig(const QString& name) {
+    if (m_model.isNull()) {
+        return;
+    }
+    m_model->selectConfig(name);
+    // The model refuses an unknown or disabled name in silence, so what it
+    // settled on is read back rather than assumed.
     syncSelection();
 }
 
@@ -344,6 +471,7 @@ void RunPanel::syncSelection() {
     // `findData` on an empty name finds nothing, which is the index -1 an empty
     // selection wants anyway.
     m_configs->setCurrentIndex(selected.isEmpty() ? -1 : m_configs->findData(selected));
+    syncConfigActionChecks();
     syncPort();
     updateRow();
 }
@@ -407,13 +535,7 @@ void RunPanel::onPortChanged(int port) {
 }
 
 void RunPanel::onConfigActivated(int index) {
-    if (m_model.isNull()) {
-        return;
-    }
-    m_model->selectConfig(m_configs->itemData(index).toString());
-    // The model refuses an unknown or disabled name in silence, so what it
-    // settled on is read back rather than assumed.
-    syncSelection();
+    selectConfig(m_configs->itemData(index).toString());
 }
 
 void RunPanel::showLogOf(const QString& runId) {
@@ -462,10 +584,24 @@ void RunPanel::updateRow() {
     const bool ready = state == QLatin1String(kReady);
     const bool starting = state == QLatin1String(kStarting);
 
-    m_start->setEnabled(!m_model->getSelectedConfig().isEmpty() && state.isEmpty() &&
-                        !m_model->getBusy());
-    m_stop->setEnabled(ready || starting);
-    m_open->setEnabled(ready && !url.isEmpty());
+    if (m_restartPending && state.isEmpty() && !m_model->getBusy()) {
+        // The stop a restart asked for has landed. Cleared first: `startRun`
+        // comes back through here, and a flag still set would start a second
+        // run of the one it has just started.
+        m_restartPending = false;
+        startRun();
+        return;
+    }
+
+    const bool canStart =
+        !m_model->getSelectedConfig().isEmpty() && state.isEmpty() && !m_model->getBusy();
+    m_runAction->setEnabled(canStart);
+    m_stopAction->setEnabled(ready || starting);
+    m_openAction->setEnabled(ready && !url.isEmpty());
+    // Restart is a stop and a start, so it is offered whenever either half
+    // would be: on a live run it replaces it, and on a finished one it is a
+    // second way to say Run.
+    m_restartAction->setEnabled(canStart || ready || starting);
 
     if (ready && !url.isEmpty()) {
         m_url->setText(QStringLiteral("<a href=\"%1\">%1</a>").arg(url.toHtmlEscaped()));
@@ -548,7 +684,10 @@ void RunPanel::hideToast() {
 }
 
 void RunPanel::setToastBusy(bool busy) {
-    m_allow->setEnabled(!busy);
+    // The action rather than the button, which follows it: the Run menu offers
+    // the same action, and there it must be dead whenever there is no host
+    // waiting rather than offering to allow nothing.
+    m_allowHostAction->setEnabled(!busy && !m_deniedHost.isEmpty());
     m_dismiss->setEnabled(!busy);
     if (m_deniedHost.isEmpty()) {
         return;
@@ -603,6 +742,30 @@ void RunPanel::onDismissClicked() {
     // before this returns.
     m_model->dismissDenied(host);
 }
+
+QAction* RunPanel::runAction() const { return m_runAction; }
+
+QAction* RunPanel::stopAction() const { return m_stopAction; }
+
+QAction* RunPanel::restartAction() const { return m_restartAction; }
+
+QAction* RunPanel::openAction() const { return m_openAction; }
+
+QAction* RunPanel::clearOutputAction() const { return m_clearOutputAction; }
+
+QAction* RunPanel::copyOutputAction() const { return m_copyOutputAction; }
+
+QAction* RunPanel::allowHostAction() const { return m_allowHostAction; }
+
+QList<QAction*> RunPanel::configurationActions() const { return m_configActions->actions(); }
+
+#if defined(BS_WIDGET_TESTS)
+void RunPanel::noteConfigsForTest(const QString& configsJson) {
+    m_configs->clear();
+    runpanel::appendConfigItems(m_configs, configsJson);
+    rebuildConfigActions();
+}
+#endif
 
 void RunPanel::openUrl() {
     if (m_model.isNull()) {

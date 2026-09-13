@@ -120,6 +120,11 @@ private:
     /// on Setup, a status-bar warning with a way there, and neither.
     void onPrereqsChecked(const QString& json);
     void buildDocks();
+    /// Puts the Run panel's configuration actions back into the Run menu, in
+    /// front of [`m_runConfigMenuAnchor`]. The old ones are gone by the time
+    /// this runs: the panel deletes them, and a deleted `QAction` takes itself
+    /// out of every menu showing it.
+    void rebuildRunConfigMenu();
     void buildStatusBar();
     void connectController();
     void onConnectionStateChanged();
@@ -318,6 +323,12 @@ private:
     /// The two that need a *second* tab to go to rather than merely one tab.
     QAction* m_nextAgentAction = nullptr;
     QAction* m_prevAgentAction = nullptr;
+    /// The Run menu, and the separator the detected configurations are
+    /// inserted in front of. The list is the daemon's and is rebuilt whenever
+    /// the panel rebuilds its combo, so the menu needs a fixed place to put it
+    /// back into rather than an index that moves.
+    QMenu* m_runMenu = nullptr;
+    QAction* m_runConfigMenuAnchor = nullptr;
     /// The right-hand dock, holding the agent pane.
     QDockWidget* m_agentDock = nullptr;
     /// The per-workspace agent pane inside it.
