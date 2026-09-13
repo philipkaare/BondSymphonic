@@ -23,13 +23,14 @@ class GroupModel;
 class NewAgentDialog;
 class QAction;
 class QCloseEvent;
+class QDockWidget;
+class QEvent;
 class QJsonObject;
 class QLabel;
 class QMenu;
 class QMoveEvent;
 class QPlainTextEdit;
 class QResizeEvent;
-class QSplitter;
 class QTabWidget;
 class RunPanel;
 class RunPanelModel;
@@ -41,6 +42,15 @@ class MainWindow : public QMainWindow {
 public:
     MainWindow(AppController* controller, GroupModel* groupModel, FileTreeModel* fileTreeModel,
                ChangesModel* changesModel, RunPanelModel* runModel, QWidget* parent = nullptr);
+
+    /// Puts the three docks back where `buildDocks` puts them: Explorer left,
+    /// Agent right, Output along the bottom, none of them floating or closed.
+    ///
+    /// Not a `restoreState` of a remembered default. A window the user has
+    /// dragged into a corner needs the one arrangement that is guaranteed to
+    /// exist rather than the one that happened to be saved, and the code that
+    /// builds the window is where that arrangement is written down.
+    void resetLayout();
 
 protected:
     /// Refuses to close over unsaved editors without asking. Both ways out of
@@ -57,6 +67,12 @@ protected:
     /// user moved or resized comes back where they left it.
     void moveEvent(QMoveEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
+
+    /// A palette change is the theme moving under the window, and the dock
+    /// separators are painted in a colour mixed from it, so they have to be
+    /// mixed again rather than kept. Deliberately deaf to `StyleChange`, which
+    /// is what [`applySeparatorBand`]'s own `setStyleSheet` raises.
+    void changeEvent(QEvent* event) override;
 
 private:
     /// Where a close request has got to. `Idle` is the ordinary state; the
@@ -81,6 +97,11 @@ private:
 
     void buildMenus();
     void buildCentral();
+    /// Widens the separators between the docks and paints them in the band
+    /// colour. Six pixels rather than Qt's three: the separator is the only
+    /// thing saying where one pane stops and the next begins, and three pixels
+    /// of window grey is neither grabbable nor visible.
+    void applySeparatorBand();
     /// Opens Settings on its Setup section: the prerequisite rows, the fix
     /// buttons, the login terminal and the sign-in link.
     ///
@@ -151,16 +172,14 @@ private:
 
     // --- persistence -------------------------------------------------------
 
-    /// Applies `state.json` to the window: geometry, dock layout, the centre
-    /// splitter and its swap, and the editor tabs to reopen per workspace.
-    /// Called once, before the daemon is connected.
+    /// Applies `state.json` to the window: geometry, the dock layout, and the
+    /// editor tabs to reopen per workspace. Called once, before the daemon is
+    /// connected.
     void onStateLoaded(const QString& json);
     /// Records `saveState()` and `saveGeometry()`. A no-op while the restore is
     /// still running, so the layout being installed is not written back over
     /// itself.
     void noteWindowState();
-    /// Records the centre splitter's sizes and whether its halves are swapped.
-    void noteSplitterState();
     /// Records every workspace's open editor tabs, and empties the record of a
     /// workspace whose last tab has just gone.
     void noteEditorState();
@@ -274,13 +293,20 @@ private:
     /// nothing here. See [`noteFailureRouted`] and [`takeRoutedFailure`].
     QString m_routedFailure;
     bool m_routedFailureSet = false;
-    QSplitter* m_centerSplitter = nullptr;
-    /// The centre pane: one tab per open file.
+    /// The centre pane: one tab per open file. Central and fixed, in the shape
+    /// Visual Studio uses -- the documents are what the window is for, and the
+    /// tool windows dock around them.
     EditorArea* m_editorArea = nullptr;
     /// Undo, Redo, Cut, Copy, Paste and Select All, enabled together.
     QList<QAction*> m_editActions;
-    /// The per-workspace agent pane beside the editor.
+    /// The right-hand dock, holding the agent pane.
+    QDockWidget* m_agentDock = nullptr;
+    /// The per-workspace agent pane inside it.
     AgentArea* m_agentArea = nullptr;
+    /// The bottom dock, holding the Run and Terminal tabs. A member rather than
+    /// a local in `buildDocks` because the Window menu and `resetLayout` both
+    /// have to reach it.
+    QDockWidget* m_bottomDock = nullptr;
     QTabWidget* m_bottomTabs = nullptr;
     /// The bottom dock's Terminal tab: one shell per workspace.
     AgentArea* m_shellArea = nullptr;
@@ -317,12 +343,8 @@ private:
     /// What the sandbox label shows when no tab is selected: normally a dash,
     /// or the prerequisite warning once the controller has reported one.
     QString m_sandboxIdleText;
-    /// Whether the swap in the View menu has been applied, so the arrangement
-    /// can be persisted and restored. The splitter itself only knows the order
-    /// of its children.
-    bool m_swapped = false;
-    /// Set while `onStateLoaded` installs a layout, so the geometry and
-    /// splitter changes it provokes are not written straight back.
+    /// Set while `onStateLoaded` installs a layout, so the geometry and dock
+    /// changes it provokes are not written straight back.
     ///
     /// Starts true and is cleared at the end of that call, which is the last
     /// thing the constructor does: the resizes the window issues while it is

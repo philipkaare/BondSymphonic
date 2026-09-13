@@ -29,6 +29,7 @@
 #include <QCloseEvent>
 #include <QDesktopServices>
 #include <QDockWidget>
+#include <QEvent>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -39,7 +40,6 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPlainTextEdit>
-#include <QSplitter>
 #include <QTabBar>
 #include <QStatusBar>
 #include <QTabWidget>
@@ -50,6 +50,16 @@
 #include <cstdio>
 
 namespace {
+
+/// The version `saveState` stamps the dock layout with, and the only one
+/// `restoreState` will take back.
+///
+/// Version 1 was the arrangement with the agent pane in a splitter in the
+/// centre, whose `splitter_sizes` are gone from `state.json` with it. A state
+/// saved then describes a window with two docks where there are now three, and
+/// the version number is what makes Qt discard it rather than apply the half it
+/// recognises.
+constexpr int kWindowStateVersion = 2;
 
 /// The steps in `BS_MENU_TEST`, as one string. **Test-only**: empty in every
 /// ordinary run, and then everything below that reads it is inert.
@@ -89,11 +99,14 @@ MainWindow::MainWindow(AppController* controller, GroupModel* groupModel, FileTr
       m_fileTreeModel(fileTreeModel), m_changesModel(changesModel), m_runModel(runModel) {
     setWindowTitle("BondSymphonic");
     resize(1400, 900);
-    // Central first: the File, Edit and View items act on the editor area, so
-    // it has to exist before the menus that reach into it are built.
+    // The widgets before the menus that act on them: the File, Edit and View
+    // items reach into the editor area, and the Window menu is made of the
+    // docks' own toggle actions, so both have to exist before `buildMenus`
+    // runs. A menu built first could only hold hand-written stand-ins for
+    // them.
     buildCentral();
-    buildMenus();
     buildDocks();
+    buildMenus();
     buildStatusBar();
     connectController();
     // Last, and before the controller connects: the layout is installed on a
@@ -161,12 +174,13 @@ void MainWindow::moveEvent(QMoveEvent* event) {
 void MainWindow::resizeEvent(QResizeEvent* event) {
     QMainWindow::resizeEvent(event);
     noteWindowState();
-    // The splitter's own `splitterMoved` only fires when the user drags it, so
-    // a session where they never did would persist no sizes at all and come
-    // back on the seeded default. Its children are re-divided on every window
-    // resize, and the write is debounced, so recording here is what makes the
-    // ratio the user is actually looking at the one that comes back.
-    noteSplitterState();
+}
+
+void MainWindow::changeEvent(QEvent* event) {
+    QMainWindow::changeEvent(event);
+    if (event->type() == QEvent::PaletteChange) {
+        applySeparatorBand();
+    }
 }
 
 void MainWindow::armCloseAfterSaves() {
@@ -235,16 +249,15 @@ void MainWindow::buildMenus() {
 
     auto* view = menuBar()->addMenu("&View");
     view->addAction("&Swap editor and agent", this, [this] {
-        // `insertWidget` re-parents, and the splitter then re-derives its
-        // division from size hints -- losing the 3:2 `buildCentral` seeded
-        // precisely because the agent pane's hint is wrong.
-        const QList<int> sizes = m_centerSplitter->sizes();
-        m_centerSplitter->insertWidget(0, m_centerSplitter->widget(1));
-        if (sizes.size() == 2) {
-            m_centerSplitter->setSizes({ sizes.at(1), sizes.at(0) });
-        }
-        m_swapped = !m_swapped;
-        noteSplitterState();
+        // Which side the agent is on is now a fact about the dock, and the one
+        // fact: `dockWidgetArea` is where the menu reads it and `saveState`
+        // is what remembers it, so there is nothing left for the window to
+        // keep a second copy of.
+        const Qt::DockWidgetArea now = dockWidgetArea(m_agentDock);
+        addDockWidget(now == Qt::RightDockWidgetArea ? Qt::LeftDockWidgetArea
+                                                     : Qt::RightDockWidgetArea,
+                      m_agentDock);
+        noteWindowState();
     });
     menuBar()->addMenu("&Workspace");
     menuBar()->addMenu("&Run");
@@ -287,30 +300,18 @@ void MainWindow::buildCentral() {
     m_groupBar = new GroupBar(m_groupModel, central);
     layout->addWidget(m_groupBar);
 
-    m_centerSplitter = new QSplitter(Qt::Horizontal, central);
-    m_editorArea = new EditorArea(m_centerSplitter);
-    m_agentArea = new AgentArea(m_centerSplitter);
-    m_agentArea->setPlaceholderText("No agent selected");
-    m_centerSplitter->addWidget(m_editorArea);
-    m_centerSplitter->addWidget(m_agentArea);
-    m_centerSplitter->setStretchFactor(0, 3);
-    m_centerSplitter->setStretchFactor(1, 2);
-    // The stretch factors only govern space handed out on a later resize. The
-    // first division comes from the children's size hints, and the agent area's
-    // is the placeholder label's until a terminal is created in it, which
-    // leaves the pane a couple of dozen columns wide for the life of the
-    // window. Seeding the same 3:2 explicitly gives the terminal a usable width
-    // from the start; the splitter rescales the pair to the width it has.
-    m_centerSplitter->setSizes({ 900, 600 });
-    layout->addWidget(m_centerSplitter, 1);
+    // The editor and nothing else. The agent pane used to share a splitter
+    // with it here and is a dock now, so what is left in the centre is the
+    // group bar and the documents under it -- which is the part of the window
+    // that cannot be closed, moved or floated away.
+    m_editorArea = new EditorArea(central);
+    layout->addWidget(m_editorArea, 1);
 
     setCentralWidget(central);
 
     QObject::connect(m_groupBar, &GroupBar::newAgentRequested, this, &MainWindow::onNewAgent);
     QObject::connect(m_groupBar, &GroupBar::destroyRequested, this, &MainWindow::onDestroyRequested);
     QObject::connect(m_groupBar, &GroupBar::closeGroupRequested, this, &MainWindow::onCloseGroup);
-    QObject::connect(m_centerSplitter, &QSplitter::splitterMoved, this,
-                     [this](int, int) { noteSplitterState(); });
 
     if (menuTest().contains(QLatin1String("widgets"))) {
         // Not `singleShot(0)`: one of the four values is a tab's text colour,
@@ -497,20 +498,40 @@ void MainWindow::buildDocks() {
         m_editorArea->openDiff(activeWorkspaceId(), path);
     });
 
-    auto* bottom = new QDockWidget("Output", this);
-    bottom->setObjectName("BottomDock");
-    m_bottomTabs = new QTabWidget(bottom);
+    // The agent pane, on the right of the documents. A dock rather than the
+    // other half of a splitter: it gives the boundary the splitter never had --
+    // a title bar and a separator wide enough to grab -- and it can be dragged
+    // to the other side, torn off onto a second monitor, or closed by a user
+    // who wants the whole width for the code.
+    m_agentDock = new QDockWidget("Agent", this);
+    m_agentDock->setObjectName("AgentDock");
+    m_agentArea = new AgentArea(m_agentDock);
+    m_agentArea->setPlaceholderText("No agent selected");
+    m_agentDock->setWidget(m_agentArea);
+    addDockWidget(Qt::RightDockWidgetArea, m_agentDock);
+
+    m_bottomDock = new QDockWidget("Output", this);
+    m_bottomDock->setObjectName("BottomDock");
+    m_bottomTabs = new QTabWidget(m_bottomDock);
     m_runPanel = new RunPanel(m_runModel, m_controller, m_bottomTabs);
     m_bottomTabs->addTab(m_runPanel, "Run");
     m_shellArea = new AgentArea(m_bottomTabs);
     m_shellArea->setPlaceholderText("No workspace selected");
     m_bottomTabs->addTab(m_shellArea, "Terminal");
-    bottom->setWidget(m_bottomTabs);
-    addDockWidget(Qt::BottomDockWidgetArea, bottom);
+    m_bottomDock->setWidget(m_bottomTabs);
+    addDockWidget(Qt::BottomDockWidgetArea, m_bottomDock);
+
+    // The agent pane's own size hint is the placeholder label's until a
+    // terminal is created in it, which would leave it a couple of dozen
+    // columns wide for the life of the window. The widths are seeded here
+    // instead; a restored layout overwrites them, which is what it is for.
+    resizeDocks({ static_cast<QDockWidget*>(m_explorer), m_agentDock }, { 280, 600 },
+                Qt::Horizontal);
+    applySeparatorBand();
 
     // A dock that was moved, floated or hidden is part of what `saveState`
     // records, and none of those raise a resize on the window itself.
-    for (QDockWidget* dock : { static_cast<QDockWidget*>(m_explorer), bottom }) {
+    for (QDockWidget* dock : { static_cast<QDockWidget*>(m_explorer), m_agentDock, m_bottomDock }) {
         QObject::connect(dock, &QDockWidget::dockLocationChanged, this,
                          [this](Qt::DockWidgetArea) { noteWindowState(); });
         QObject::connect(dock, &QDockWidget::topLevelChanged, this,
@@ -518,6 +539,33 @@ void MainWindow::buildDocks() {
         QObject::connect(dock, &QDockWidget::visibilityChanged, this,
                          [this](bool) { noteWindowState(); });
     }
+}
+
+void MainWindow::applySeparatorBand() {
+    // A stylesheet because there is no other way at the separator: it is drawn
+    // by the window's layout rather than by a widget anything can reach. The
+    // selector names only the separator, so nothing else in the window is
+    // handed a stylesheet style it did not ask for.
+    setStyleSheet(QStringLiteral("QMainWindow::separator { background: %1; width: 6px; "
+                                 "height: 6px; }")
+                      .arg(theme::band(palette()).name()));
+}
+
+void MainWindow::resetLayout() {
+    for (QDockWidget* dock : { static_cast<QDockWidget*>(m_explorer), m_agentDock, m_bottomDock }) {
+        // Unfloated before it is re-docked: `addDockWidget` on a floating dock
+        // records the area without bringing the window back, so a user who
+        // tore one off and lost it behind the IDE would get a menu entry that
+        // appeared to do nothing.
+        dock->setFloating(false);
+        dock->show();
+    }
+    addDockWidget(Qt::LeftDockWidgetArea, m_explorer);
+    addDockWidget(Qt::RightDockWidgetArea, m_agentDock);
+    addDockWidget(Qt::BottomDockWidgetArea, m_bottomDock);
+    resizeDocks({ static_cast<QDockWidget*>(m_explorer), m_agentDock }, { 280, 600 },
+                Qt::Horizontal);
+    noteWindowState();
 }
 
 void MainWindow::buildStatusBar() {
@@ -1157,23 +1205,13 @@ void MainWindow::onStateLoaded(const QString& json) {
     if (!windowState.isEmpty()) {
         // Named docks only: `restoreState` matches by object name, and a dock
         // whose name it does not find is left where `buildDocks` put it.
-        restoreState(windowState);
-    }
-    if (state.value("swapped").toBool() && !m_swapped) {
-        const QList<int> sizes = m_centerSplitter->sizes();
-        m_centerSplitter->insertWidget(0, m_centerSplitter->widget(1));
-        if (sizes.size() == 2) {
-            m_centerSplitter->setSizes({ sizes.at(1), sizes.at(0) });
-        }
-        m_swapped = true;
-    }
-    // After the swap, so the sizes land on the arrangement they were saved for.
-    QList<int> sizes;
-    for (const QJsonValue& value : state.value("splitter_sizes").toArray()) {
-        sizes.append(value.toInt());
-    }
-    if (sizes.size() == m_centerSplitter->count()) {
-        m_centerSplitter->setSizes(sizes);
+        //
+        // Version 2 is the layout with the agent pane as a dock. A state saved
+        // by a version that knew nothing of `AgentDock` is refused outright by
+        // the version number rather than half-applied, which leaves the
+        // default arrangement -- exactly what a session from before the dock
+        // existed should come back as.
+        restoreState(windowState, kWindowStateVersion);
     }
 
     // Held rather than opened: a workspace's editors are reopened the first
@@ -1211,20 +1249,8 @@ void MainWindow::noteWindowState() {
     if (m_restoring || m_controller == nullptr) {
         return;
     }
-    m_controller->noteWindow(QString::fromLatin1(saveState().toBase64()),
+    m_controller->noteWindow(QString::fromLatin1(saveState(kWindowStateVersion).toBase64()),
                              QString::fromLatin1(saveGeometry().toBase64()));
-}
-
-void MainWindow::noteSplitterState() {
-    if (m_restoring) {
-        return;
-    }
-    QJsonArray sizes;
-    for (const int size : m_centerSplitter->sizes()) {
-        sizes.append(size);
-    }
-    m_controller->noteSplitter(
-        QString::fromUtf8(QJsonDocument(sizes).toJson(QJsonDocument::Compact)), m_swapped);
 }
 
 void MainWindow::noteEditorState() {
@@ -1578,3 +1604,115 @@ void MainWindow::noteAgentAttention(const QString& agentId, const QString& state
     }
 }
 
+
+// --- offscreen test entries --------------------------------------------------
+//
+// Compiled only into a development build: this is test code -- it builds
+// widgets, leaks a QApplication and asserts -- and a shipped IDE has no caller
+// for any of it. `build.rs` defines `BS_WIDGET_TESTS` for every profile but
+// `release`, which is the one the packaged executable is built with.
+#if defined(BS_WIDGET_TESTS)
+//
+// See the note in `EditorArea.cpp`: the checks live beside the widget and
+// answer a code. `bs_widget_test_begin` must have run first.
+#include <QDir>
+#include <QFile>
+#include <cstdint>
+
+namespace {
+
+/// Points the IDE's `state.json` at a throwaway file, before any window exists.
+///
+/// A `MainWindow` reads that file in its constructor and writes it back
+/// whenever a dock moves, and the path is settled once, at first use, for the
+/// life of the process. Without this the checks below would restore the
+/// developer's own session and then record this offscreen one over it.
+void useThrowawayState() {
+    const QString path = QDir::tempPath() + QStringLiteral("/bs-widget-tests-state.json");
+    qputenv("BS_STATE_PATH", QFile::encodeName(path));
+}
+
+/// A window and the five models it is built from, all on the stack and in the
+/// order that has the window destroyed first.
+///
+/// The models are real ones that were never connected to a daemon, which is
+/// what the rest of this suite uses too: a window asks them for the tabs, the
+/// file tree and the runs, and an unconnected model answers "none of those" to
+/// every one of them without a socket anywhere.
+struct WindowFixture {
+    WindowFixture() = default;
+
+    AppController controller;
+    GroupModel groupModel;
+    FileTreeModel fileTreeModel;
+    ChangesModel changesModel;
+    RunPanelModel runModel;
+    MainWindow window{ &controller, &groupModel, &fileTreeModel, &changesModel, &runModel };
+};
+
+} // namespace
+
+/// The agent pane is a dock: on the right, closable, floatable, movable, and
+/// reachable again through its own toggle action once it has been closed.
+///
+/// The editor is the central widget and stays one, because a window whose
+/// documents can be closed out from under it has nothing left to be.
+extern "C" std::int32_t bs_widget_test_main_window_docks_the_agent_pane() {
+    useThrowawayState();
+    WindowFixture fixture;
+    MainWindow& window = fixture.window;
+
+    auto* agent = window.findChild<QDockWidget*>(QStringLiteral("AgentDock"));
+    if (agent == nullptr) {
+        return 1;
+    }
+    if (!agent->features().testFlag(QDockWidget::DockWidgetClosable) ||
+        !agent->features().testFlag(QDockWidget::DockWidgetFloatable) ||
+        !agent->features().testFlag(QDockWidget::DockWidgetMovable)) {
+        return 2;
+    }
+    if (window.centralWidget() == nullptr) {
+        return 3;
+    }
+
+    // Put back to the default first. The constructor restored whatever this
+    // process last recorded, so what is checked below is the arrangement
+    // `buildDocks` and `resetLayout` agree on rather than the one an earlier
+    // check happened to leave behind.
+    window.resetLayout();
+    if (window.dockWidgetArea(agent) != Qt::RightDockWidgetArea) {
+        return 4;
+    }
+    auto* explorer = window.findChild<QDockWidget*>(QStringLiteral("ExplorerDock"));
+    if (explorer == nullptr || window.dockWidgetArea(explorer) != Qt::LeftDockWidgetArea) {
+        return 5;
+    }
+    auto* bottom = window.findChild<QDockWidget*>(QStringLiteral("BottomDock"));
+    if (bottom == nullptr || window.dockWidgetArea(bottom) != Qt::BottomDockWidgetArea) {
+        return 6;
+    }
+
+    // `isHidden` rather than `isVisible`: nothing in this suite shows a window,
+    // and every widget inside one that was never shown reports itself
+    // invisible whatever its own state is.
+    agent->close();
+    if (!agent->isHidden()) {
+        return 7;
+    }
+    agent->toggleViewAction()->trigger();
+    if (agent->isHidden()) {
+        return 8;
+    }
+
+    // And a dock dragged somewhere silly comes back from one call, which is
+    // the whole of what Window > Reset layout offers.
+    window.addDockWidget(Qt::LeftDockWidgetArea, agent);
+    agent->setFloating(true);
+    window.resetLayout();
+    if (agent->isFloating() || window.dockWidgetArea(agent) != Qt::RightDockWidgetArea) {
+        return 9;
+    }
+    return 0;
+}
+
+#endif // BS_WIDGET_TESTS
