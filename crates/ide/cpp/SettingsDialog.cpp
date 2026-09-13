@@ -4,6 +4,7 @@
 #include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -92,6 +93,14 @@ SettingsDialog::SettingsDialog(AppController* controller, QWidget* parent)
     // carried on as it was.
     form->addRow("New agents start on:", m_permissionMode);
 
+    m_showMeta = new QCheckBox("Show turn cost and system lines", agentBox);
+    m_showMeta->setObjectName(QStringLiteral("SettingsShowAgentMeta"));
+    m_showMeta->setChecked(m_controller->showAgentMeta());
+    m_showMeta->setToolTip(QStringLiteral(
+        "The small italic lines under an answer: what the turn cost, how long it took, and what "
+        "the agent's own startup reported."));
+    form->addRow(QString(), m_showMeta);
+
     auto* lookBox = new QGroupBox("Appearance", body);
     auto* lookForm = new QFormLayout(lookBox);
     bodyLayout->addWidget(lookBox);
@@ -147,6 +156,7 @@ void SettingsDialog::removeKey() {
 
 void SettingsDialog::accept() {
     m_controller->setDefaultPermissionMode(m_permissionMode->currentData().toString());
+    m_controller->setShowAgentMeta(m_showMeta->isChecked());
     m_controller->setTheme(m_theme->currentData().toString());
     // An empty field means "leave the stored key alone", which is what makes
     // the placeholder honest: a dialog opened to change the permission mode

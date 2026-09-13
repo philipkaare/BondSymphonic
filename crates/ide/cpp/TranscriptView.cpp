@@ -60,6 +60,12 @@ constexpr int kCoalesceMs = 50;
 
 /// The daemon's state words this view reacts to. Anything else is a state it
 /// has nothing to say about, which is the right answer for a word added later.
+/// The two item kinds `setShowMeta` hides: what the turn cost, and what the
+/// agent's own start-up reported. They are the only two that go through
+/// `applySmallGrey`, which is the same observation from the other side.
+const char* kKindResult = "result";
+const char* kKindSystem = "system";
+
 const char* kStateWorking = "working";
 const char* kStateError = "error";
 const char* kStateExited = "exited";
@@ -369,8 +375,13 @@ void TranscriptView::rebuild() {
     const QJsonArray items = readItems();
     for (int i = 0; i < items.size(); ++i) {
         QWidget* frame = makeFrame(items.at(i).toObject(), i);
+        // Appended either way: the list is indexed by item, and a hidden meta
+        // line keeps its slot so every index after it still names its own
+        // frame.
         m_frames.append(frame);
-        m_frameLayout->insertWidget(m_frameLayout->count() - 1, frame);
+        if (frame != nullptr) {
+            m_frameLayout->insertWidget(m_frameLayout->count() - 1, frame);
+        }
     }
     // A rebuild is a fresh look at the conversation, and the foot of it is
     // where the newest message is.
@@ -398,7 +409,9 @@ void TranscriptView::onItemAppended(int index) {
     m_stickToBottom = atBottom();
     QWidget* frame = makeFrame(itemAt(index), index);
     m_frames.append(frame);
-    m_frameLayout->insertWidget(m_frameLayout->count() - 1, frame);
+    if (frame != nullptr) {
+        m_frameLayout->insertWidget(m_frameLayout->count() - 1, frame);
+    }
     // The first real message is what the welcome was standing in for.
     updateWelcome();
 }
@@ -530,6 +543,47 @@ void TranscriptView::onStateChanged() {
     refreshBanner();
 }
 
+void TranscriptView::setShowMeta(bool show) {
+    if (m_showMeta == show) {
+        return;
+    }
+    m_showMeta = show;
+    // A rebuild rather than a sweep over the frames: the setting changes which
+    // items have a frame at all, and rebuilding is the one path that already
+    // knows how to answer that question for every item at once.
+    rebuild();
+}
+
+bool TranscriptView::isHiddenMeta(const QString& kind) const {
+    if (m_showMeta) {
+        return false;
+    }
+    return kind == QString::fromUtf8(kKindResult) || kind == QString::fromUtf8(kKindSystem);
+}
+
+int TranscriptView::shownFrames() const {
+    int shown = 0;
+    for (QWidget* frame : m_frames) {
+        if (frame != nullptr) {
+            ++shown;
+        }
+    }
+    return shown;
+}
+
+int TranscriptView::columnPositionFor(int index) const {
+    // The welcome is the column's first entry and the stretch its last, so a
+    // frame's place is one past the welcome plus however many frames before it
+    // exist.
+    int position = 1;
+    for (int i = 0; i < index && i < m_frames.size(); ++i) {
+        if (m_frames.at(i) != nullptr) {
+            ++position;
+        }
+    }
+    return position;
+}
+
 void TranscriptView::setWelcome(const QString& name, const QString& origin,
                                 const QString& worktree) {
     m_welcomeName = name;
@@ -541,7 +595,7 @@ void TranscriptView::setWelcome(const QString& name, const QString& origin,
 void TranscriptView::updateWelcome() {
     // Nothing to say without a name, and nothing to say over a conversation
     // that has already started.
-    if (m_welcomeName.isEmpty() || !m_frames.isEmpty()) {
+    if (m_welcomeName.isEmpty() || shownFrames() > 0) {
         m_welcome->hide();
         return;
     }
@@ -635,6 +689,12 @@ void TranscriptView::refreshBanner() {
 
 QWidget* TranscriptView::makeFrame(const QJsonObject& item, int index) {
     const QString kind = item.value(QStringLiteral("kind")).toString();
+    if (isHiddenMeta(kind)) {
+        // No frame at all rather than a hidden one: the setting is about a pane
+        // with less in it, and a hidden widget still costs a layout pass on
+        // every resize of a conversation that may be a thousand items long.
+        return nullptr;
+    }
     if (kind == QStringLiteral("earlier")) {
         // The fold. One widget standing for however many items the model took
         // off the top of a long conversation; clicking it puts them all back.
@@ -697,6 +757,19 @@ void TranscriptView::updateFrame(int index, const QJsonObject& item) {
     }
     QWidget* frame = m_frames.at(index);
     const QString kind = item.value(QStringLiteral("kind")).toString();
+    if (frame == nullptr) {
+        // A meta line the setting is hiding. It stays hidden while it is still
+        // one; an item that has changed into something else gets its frame
+        // built now, in its own place rather than at the foot of the column.
+        QWidget* built = makeFrame(item, index);
+        if (built == nullptr) {
+            return;
+        }
+        m_frameLayout->insertWidget(columnPositionFor(index), built);
+        m_frames[index] = built;
+        updateWelcome();
+        return;
+    }
     if (auto* card = qobject_cast<ToolCard*>(frame)) {
         if (kind == QStringLiteral("tool_use")) {
             card->update(item);
@@ -722,6 +795,17 @@ void TranscriptView::updateFrame(int index, const QJsonObject& item) {
     // model does that today, but a frame showing the wrong item is worse than
     // one rebuilt for nothing.
     QWidget* replacement = makeFrame(item, index);
+    if (replacement == nullptr) {
+        // It has become one of the two kinds the meta setting is hiding. The
+        // slot stays, holding nothing, so every index after it still names its
+        // own frame.
+        m_frameLayout->removeWidget(frame);
+        m_frames[index] = nullptr;
+        frame->hide();
+        frame->deleteLater();
+        updateWelcome();
+        return;
+    }
     // `replaceWidget` hands back the old widget's layout item, which the caller
     // owns from then on.
     delete m_frameLayout->replaceWidget(frame, replacement);
@@ -733,6 +817,9 @@ void TranscriptView::updateFrame(int index, const QJsonObject& item) {
 
 void TranscriptView::clearFrames() {
     for (QWidget* frame : m_frames) {
+        if (frame == nullptr) {
+            continue;
+        }
         m_frameLayout->removeWidget(frame);
         frame->hide();
         frame->deleteLater();
@@ -789,7 +876,7 @@ void TranscriptView::setTestItems(const QStringList& items) {
     m_testItemsSet = true;
 }
 
-int TranscriptView::frameCount() const { return m_frames.size(); }
+int TranscriptView::frameCount() const { return shownFrames(); }
 
 QWidget* TranscriptView::frameAt(int index) const {
     return index >= 0 && index < m_frames.size() ? m_frames.at(index) : nullptr;
@@ -1072,6 +1159,57 @@ extern "C" std::int32_t bs_widget_test_transcript_welcomes_an_empty_pane() {
     TranscriptView unnamed(&bare);
     if (!unnamed.welcomeTextForTest().isEmpty()) {
         return 7;
+    }
+    return 0;
+}
+
+/// The small grey lines can be taken away without taking the conversation with
+/// them.
+///
+/// What a turn cost and what the agent's own start-up reported are useful while
+/// you are learning what an agent costs and noise for ever after. Hidden means
+/// no frame at all rather than a hidden one -- a widget that is never painted
+/// still costs a layout pass on every resize, and a long conversation has
+/// hundreds of these -- so the list the view keeps is indexed by item and holds
+/// nothing in the slots the setting is suppressing.
+extern "C" std::int32_t bs_widget_test_transcript_hides_the_small_grey_lines() {
+    TranscriptModel model;
+    TranscriptView view(&model);
+    view.setTestItems(QStringList{
+        QStringLiteral(R"({"kind":"assistant","text":"done","streaming":false})"),
+        QStringLiteral(R"({"kind":"result","cost_usd":0.0042,"duration_ms":1200,"num_turns":3})"),
+        QStringLiteral(R"({"kind":"system","text":"session started"})"),
+        QStringLiteral(R"({"kind":"user","text":"and again"})"),
+    });
+    model.resetItems();
+    if (view.frameCount() != 4) {
+        return 1;
+    }
+
+    view.setShowMeta(false);
+    if (view.frameCount() != 2) {
+        // The answer and the prompt stay; the turn cost and the system line are
+        // what the setting is about.
+        return 2;
+    }
+    // The slots the hidden items keep are what holds the rest in place: the
+    // prompt after them must still be the prompt and not the answer.
+    QLabel* last = bodyLabel(view.frameAt(3));
+    if (last == nullptr || last->text() != QLatin1String("and again")) {
+        return 3;
+    }
+    if (view.frameAt(1) != nullptr || view.frameAt(2) != nullptr) {
+        return 4;
+    }
+
+    view.setShowMeta(true);
+    if (view.frameCount() != 4) {
+        return 5;
+    }
+    QLabel* cost = bodyLabel(view.frameAt(1));
+    if (cost == nullptr || !cost->text().contains(QLatin1String("turn 3"))) {
+        // Back in its own place, not appended at the foot.
+        return 6;
     }
     return 0;
 }

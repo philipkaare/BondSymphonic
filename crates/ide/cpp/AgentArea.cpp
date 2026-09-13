@@ -193,6 +193,7 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
         // And with what the window said about this workspace before the pane
         // existed, which for a workspace just created is all of it.
         applyWelcome(workspaceId, view);
+        view->setShowMeta(m_showMeta);
     }
     setAgent(workspaceId, agentId);
     return view;
@@ -203,6 +204,15 @@ void AgentArea::setClaudeLoggedIn(bool loggedIn) {
     for (TranscriptView* view : m_transcripts) {
         if (view != nullptr) {
             view->setClaudeLoggedIn(loggedIn);
+        }
+    }
+}
+
+void AgentArea::setShowMeta(bool show) {
+    m_showMeta = show;
+    for (TranscriptView* view : m_transcripts) {
+        if (view != nullptr) {
+            view->setShowMeta(show);
         }
     }
 }

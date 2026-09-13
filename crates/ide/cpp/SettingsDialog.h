@@ -3,6 +3,7 @@
 
 class AppController;
 class SetupPage;
+class QCheckBox;
 class QComboBox;
 class QLineEdit;
 class QPushButton;
@@ -56,5 +57,9 @@ private:
     QLineEdit* m_apiKey = nullptr;
     QPushButton* m_removeKey = nullptr;
     QComboBox* m_permissionMode = nullptr;
+    /// Whether the transcripts show the turn cost and the agent's own system
+    /// lines. Applied to every open pane when this dialog closes, which is the
+    /// window's job: this dialog knows the setting and no transcripts.
+    QCheckBox* m_showMeta = nullptr;
     QComboBox* m_theme = nullptr;
 };

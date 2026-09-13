@@ -78,6 +78,15 @@ public:
     /// for a prompt for a minute should say what is waiting.
     void setWelcome(const QString& name, const QString& origin, const QString& worktree);
 
+    /// Whether the small grey lines are on show: the `turn 3 . $0.0042 . 1.2 s`
+    /// under an answer, and the italic lines the agent's own start-up reports.
+    ///
+    /// Off hides both, live, in a transcript that is already built. Nothing
+    /// else is touched -- an answer, a prompt and a tool card are what the pane
+    /// is for -- and nothing is dropped: the items are still in the model, and
+    /// turning it back on puts them back where they were.
+    void setShowMeta(bool show);
+
     /// How many times the view has read transcript JSON out of the model and
     /// parsed it, whether one item or the whole list. Test seam: what says that
     /// a streamed answer costs a handful of reads rather than one per delta.
@@ -160,6 +169,16 @@ private:
     void updateFrame(int index, const QJsonObject& item);
     /// Drops every frame. The stretch at the foot of the column stays.
     void clearFrames();
+    /// Whether an item of this kind is one of the two the meta setting hides.
+    bool isHiddenMeta(const QString& kind) const;
+    /// How many frames are actually on show. Not [`m_frames`]'s length: a
+    /// hidden meta item keeps its slot there so the list stays indexed by item,
+    /// and holds a null.
+    int shownFrames() const;
+    /// Where in the column a frame for item `index` belongs, counting only the
+    /// frames that exist. What puts a meta line back in its own place rather
+    /// than at the foot when the setting is turned on again.
+    int columnPositionFor(int index) const;
     /// Repaints every frame marked by [`onItemChanged`] since the last flush,
     /// one read per frame however many deltas landed on it.
     void flushChangedItems();
@@ -176,7 +195,13 @@ private:
     QScrollArea* m_scroll = nullptr;
     /// The column of frames, with a stretch as its last entry.
     QVBoxLayout* m_frameLayout = nullptr;
+    /// One entry per item in the model, so an index from the model indexes this
+    /// directly. An entry is null for an item whose frame is not built, which
+    /// today means a meta line while [`setShowMeta`] is off.
     QList<QWidget*> m_frames;
+    /// See [`setShowMeta`]. True until the window says otherwise, so a view
+    /// built without one behaves as it always did.
+    bool m_showMeta = true;
     /// The three lines an empty pane shows, at the head of the frame column so
     /// the first real message appears under them and then replaces them. Never
     /// in [`m_frames`]: it is not an item, and a rebuild must not take it away.

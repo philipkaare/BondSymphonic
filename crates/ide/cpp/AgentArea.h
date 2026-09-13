@@ -90,6 +90,13 @@ public:
     /// Code is logged in -- and the setup terminal is where the login happens.
     void setClaudeLoggedIn(bool loggedIn);
 
+    /// Whether every transcript shows the turn cost and the agent's own system
+    /// lines. Applied to the panes that exist and remembered for the ones built
+    /// afterwards, for the same reason the login gate is: a workspace whose tab
+    /// has never been opened has no pane to tell, and it must not be built
+    /// showing lines the user turned off.
+    void setShowMeta(bool show);
+
     /// Closes the workspace's PTY or transcript and drops its pane.
     void removeWorkspace(const QString& workspaceId);
 
@@ -164,6 +171,9 @@ private:
     /// Workspaces with an `agent.start` in flight, kept here rather than only
     /// on the pane because the start begins before the pane exists.
     QSet<QString> m_starting;
+    /// See [`setShowMeta`]. True until the window says otherwise, which is the
+    /// setting's own default.
+    bool m_showMeta = true;
     /// See [`setClaudeLoggedIn`]. False until the first prerequisite check
     /// answers, so a pane built in the seconds before it opens no composer.
     bool m_claudeLoggedIn = false;
