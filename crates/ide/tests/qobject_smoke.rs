@@ -726,7 +726,7 @@ fn settings_round_trip_the_api_key_flag_and_permission_mode() {
     // A file that is not there yet reads as the defaults.
     let fresh = Settings::load();
     assert!(!fresh.api_key_set);
-    assert_eq!(fresh.default_permission_mode, "default");
+    assert_eq!(fresh.default_permission_mode, "manual");
 
     let mut settings = Settings::load();
     settings.api_key_set = true;
@@ -748,7 +748,7 @@ fn settings_round_trip_the_api_key_flag_and_permission_mode() {
     let legacy = Settings::load();
     assert_eq!(legacy.distro, "other");
     assert!(!legacy.api_key_set);
-    assert_eq!(legacy.default_permission_mode, "default");
+    assert_eq!(legacy.default_permission_mode, "manual");
 
     std::env::remove_var(SETTINGS_PATH_ENV);
     let _ = std::fs::remove_dir_all(&dir);
