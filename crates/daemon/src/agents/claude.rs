@@ -35,17 +35,18 @@ use tracing::warn;
 /// degrades gracefully — but it is worth one warning in the log.
 pub const TESTED_CLAUDE_VERSION: &str = "2.1.263";
 
-/// Values the CLI accepts for `--permission-mode`. Checked here so a bad one is
+/// Values the CLI accepts for `--permission-mode`, verbatim from
+/// `claude --help` at [`TESTED_CLAUDE_VERSION`]. Checked here so a bad one is
 /// an `InvalidParams` on `agent.start` rather than a process that exits with a
-/// usage error a second later.
-const PERMISSION_MODES: [&str; 7] = [
-    "default",
+/// usage error a second later -- which is what `default` used to do, from an
+/// allow-list that was supposed to prevent exactly that.
+const PERMISSION_MODES: [&str; 6] = [
+    "manual",
     "acceptEdits",
     "plan",
+    "auto",
     "dontAsk",
     "bypassPermissions",
-    "auto",
-    "manual",
 ];
 
 /// How long `interrupt` waits for the CLI to abandon its turn on its own before
@@ -1250,6 +1251,38 @@ settings = \"s.json\"
         );
     }
 
+    /// The allow-list is the CLI's own list, not a superset of it. `default` was
+    /// in ours and has never been in the CLI's: `--permission-mode default` is a
+    /// usage error, and an agent that dies of one looks from the pane exactly like
+    /// an agent that hung.
+    #[test]
+    fn the_permission_modes_are_the_ones_the_cli_accepts() {
+        let mut sorted = PERMISSION_MODES;
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            [
+                "acceptEdits",
+                "auto",
+                "bypassPermissions",
+                "dontAsk",
+                "manual",
+                "plan"
+            ]
+        );
+
+        let options = |mode: &str| AgentStartOptions {
+            command: None,
+            resume_session: None,
+            model: None,
+            permission_mode: Some(mode.to_owned()),
+            api_key: None,
+        };
+        assert!(claude_argv(&options("default"), "linux_bwrap").is_err());
+        assert!(claude_argv(&options("manual"), "linux_bwrap").is_ok());
+        assert!(claude_argv(&options("bypassPermissions"), "linux_bwrap").is_ok());
+    }
+
     /// `BS_CLAUDE_BIN` is process-wide, so every case that touches it lives in
     /// one test -- the probe's choice of program included.
     #[test]
@@ -1309,7 +1342,7 @@ settings = \"s.json\"
             claude_argv(&bad, NOOP).unwrap_err().code,
             ErrorCode::InvalidParams
         );
-        // Every mode the CLI documents, plus `default`, is accepted.
+        // Every mode the CLI documents is accepted.
         for mode in PERMISSION_MODES {
             let opts = AgentStartOptions {
                 permission_mode: Some(mode.into()),

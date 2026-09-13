@@ -104,9 +104,15 @@ fn migrate_legacy_settings() {
 const KEYRING_SERVICE: &str = "BondSymphonic";
 const KEYRING_USER: &str = "anthropic_api_key";
 
-/// What `permission_mode` means when the user has never chosen one. Spelled as
-/// the Claude CLI spells it, because it is passed through verbatim.
-const DEFAULT_PERMISSION_MODE: &str = "default";
+/// What a new Claude agent starts on. `manual` -- every tool that would prompt,
+/// prompts -- because the mode is always sent and the safe end of the range is
+/// the one to default to.
+const DEFAULT_PERMISSION_MODE: &str = "manual";
+
+/// The mode the CLI dropped. Anything reading a settings file written before
+/// the list was corrected finds this and must not pass it on: see
+/// [`DEFAULT_PERMISSION_MODE`].
+const RETIRED_PERMISSION_MODE: &str = "default";
 
 /// Why [`Settings::try_load`] could not answer with the user's settings.
 ///
@@ -227,7 +233,12 @@ impl Settings {
             .map_err(|e| e.to_string())
             .and_then(|raw| serde_json::from_str::<Self>(raw).map_err(|e| e.to_string()));
         match parsed {
-            Ok(settings) => Ok(settings),
+            Ok(mut settings) => {
+                if settings.default_permission_mode == RETIRED_PERMISSION_MODE {
+                    settings.default_permission_mode = DEFAULT_PERMISSION_MODE.to_owned();
+                }
+                Ok(settings)
+            }
             Err(detail) => {
                 let backup = keep_aside(&path);
                 match &backup {

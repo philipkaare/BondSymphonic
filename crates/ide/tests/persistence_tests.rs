@@ -667,3 +667,30 @@ fn an_unchanged_arrangement_neither_dirties_the_store_nor_writes_the_file() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A settings file written before the mode list was corrected holds
+/// `"default"`, which the pinned CLI rejects -- so every agent that user starts
+/// dies of a usage error. Reading it back as `manual` is the only repair that
+/// does not require them to find the setting that is poisoning their IDE.
+#[test]
+fn a_stored_default_permission_mode_reads_back_as_manual() {
+    use bondsymphonic_ide::qobjects::settings::{
+        Settings, LEGACY_SETTINGS_PATH_ENV, SETTINGS_PATH_ENV, STATE_PATH_ENV,
+    };
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = temp_dir("permission-mode");
+    let path = dir.join("settings.json");
+    std::fs::write(&path, r#"{"default_permission_mode":"default"}"#).expect("settings");
+    std::env::set_var(SETTINGS_PATH_ENV, &path);
+    std::env::remove_var(LEGACY_SETTINGS_PATH_ENV);
+    std::env::remove_var(STATE_PATH_ENV);
+
+    assert_eq!(Settings::load().default_permission_mode, "manual");
+
+    // A mode the CLI does take is left exactly as it was.
+    std::fs::write(&path, r#"{"default_permission_mode":"plan"}"#).expect("settings");
+    assert_eq!(Settings::load().default_permission_mode, "plan");
+
+    std::env::remove_var(SETTINGS_PATH_ENV);
+}
