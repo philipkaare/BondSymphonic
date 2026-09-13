@@ -19,6 +19,14 @@
 - **Widget tests** live at the foot of their own `.cpp` inside `#if defined(BS_WIDGET_TESTS)`, are `extern "C" std::int32_t bs_widget_test_<name>()` returning `0` for pass and a distinct small integer per failure, and are registered in `crates/ide/tests/qobject_smoke.rs` in **both** the `extern "C"` block and the `checks` array — whose declared length `[(&str, unsafe extern "C" fn() -> i32); N]` must be bumped by hand.
 - **Comment style:** the codebase explains *why*, in prose, in complete sentences. Match it. Do not add comments that restate the code.
 - **Every commit message ends with** `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>` on its own last line.
+- **Qt must be on the environment before any IDE build.** In PowerShell, `. .\scripts\env.ps1`. In the Bash tool, the equivalent is:
+  ```bash
+  export QT_DIR="C:\Qt\6.9.2\msvc2022_64" QMAKE="C:\Qt\6.9.2\msvc2022_64\bin\qmake.exe"
+  export PATH="/c/Qt/6.9.2/msvc2022_64/bin:$PATH"
+  ```
+  Without it the build dies in `cxx-qt-build` with "Could not find Qt installation", which is an environment error and never a code one.
+- **`packaged_smoke` fails by design in a local `require-qt` run.** It demands `BS_PACKAGED_EXE` point at a built `dist\BondSymphonic\bondsymphonic-ide.exe` and panics under `require-qt` when it is unset, precisely so CI cannot pass while the package goes untested. It aborts the run before later suites, so use `--no-fail-fast` and read past it. **It is not a regression, and it is never yours to fix.**
+- **Only the lead edits `crates/ide/tests/qobject_smoke.rs`.** Write your `bs_widget_test_*` entries in their own `.cpp` and report their names and one-line descriptions; the lead registers them. Two agents editing that file concurrently corrupt the `checks` array's declared length.
 - **CI gates, all three must pass before a task is done:**
   - `cargo fmt --all -- --check`
   - `cargo test -p bondsymphonic-proto -p bondsymphonic-ide --features bondsymphonic-ide/require-qt`
