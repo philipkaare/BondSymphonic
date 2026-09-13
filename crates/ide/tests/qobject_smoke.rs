@@ -1580,6 +1580,7 @@ mod cpp_widgets {
         fn bs_widget_test_agent_choices_are_one_list() -> i32;
         fn bs_widget_test_banner_offers_restart_only_to_a_dead_agent() -> i32;
         fn bs_widget_test_banner_remixes_its_red_for_a_new_palette() -> i32;
+        fn bs_widget_test_permission_bar_follows_the_palette() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1593,7 +1594,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 21] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 22] = [
             (
                 "EditorArea closes a tab under a destroyed workspace",
                 bs_widget_test_editor_area_survives_a_destroyed_workspace,
@@ -1677,6 +1678,10 @@ mod cpp_widgets {
             (
                 "WorkspaceBanner re-mixes its red for a new palette",
                 bs_widget_test_banner_remixes_its_red_for_a_new_palette,
+            ),
+            (
+                "PermissionBar re-mixes its amber for a new palette",
+                bs_widget_test_permission_bar_follows_the_palette,
             ),
         ];
 
