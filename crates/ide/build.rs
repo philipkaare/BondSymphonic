@@ -100,6 +100,7 @@ fn main() {
     for header in [
         "cpp/Theme.h",
         "cpp/AgentChoices.h",
+        "cpp/WorkspaceLabel.h",
         "cpp/Branding.h",
         "cpp/LogoData.h",
         "cpp/app.h",
