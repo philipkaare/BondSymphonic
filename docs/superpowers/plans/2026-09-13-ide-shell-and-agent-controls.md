@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **Claude CLI is pinned at 2.1.263** (`TESTED_CLAUDE_VERSION` in `crates/daemon/src/agents/claude.rs`). Its `--permission-mode` choices are exactly `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`. **`default` is not one of them.**
+- **Claude CLI is pinned at 2.1.263** (`TESTED_CLAUDE_VERSION` in `crates/daemon/src/agents/claude.rs`). Its documented `--permission-mode` choices are `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`. **`default` is undocumented but still accepted** — probed directly; `nonsense` is rejected and `default` is not — and it is the same mode as `manual`, which the CLI's own `init` line spells `default`. The daemon keeps accepting it; the IDE standardises on `manual`.
 - **The permission mode is always sent.** No Claude agent starts with `permission_mode: None`. The floor is `manual`.
 - **The IDE offers four modes**, in this order and with these words: `Ask every time` → `manual`, `Accept edits` → `acceptEdits`, `Plan only` → `plan`, `YOLO (sandboxed)` → `bypassPermissions`. `auto` and `dontAsk` are accepted by the daemon and never offered.
 - **The models offered** are `Default (Claude Code decides)` → `""`, `Opus 5` → `claude-opus-5`, `Sonnet 5` → `claude-sonnet-5`, `Haiku 4.5` → `claude-haiku-4-5-20251001`. Every model combo is editable.
@@ -54,9 +54,17 @@
 
 # Group 1 — Permissions
 
-## Task 1: The daemon's mode list is the CLI's mode list
+## Task 1: One spelling of the permission mode leaves the IDE
 
-The allow-list exists so a bad mode is an `InvalidParams` on `agent.start` rather than a process that dies of a usage error a second later. It currently lets through `default`, which the pinned CLI rejects — so it is failing at the one job it has.
+**Revised mid-flight.** This task was written around the belief that
+`--permission-mode default` is a usage error. It is not: probed against the
+pinned binary, `nonsense` is rejected and `default` is accepted, and a run with
+`manual` reports `"permissionMode":"default"` in its own `init` line. So
+`default` is an undocumented alias for `manual`, the daemon **keeps** accepting
+it, and Steps 1–4 below are replaced by a comment recording that. The IDE-side
+half stands on its own reasoning: one spelling should leave the IDE, and it
+should be the one the CLI documents. **No commit from this task may claim it
+fixes the permission hang.**
 
 **Files:**
 - Modify: `crates/daemon/src/agents/claude.rs:41-49` (`PERMISSION_MODES`)

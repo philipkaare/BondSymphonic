@@ -41,18 +41,38 @@ approve them"*.
                                or "none" ... (default: "host")
 ```
 
-`default` is **not** among the choices. It is the first entry in the IDE's
-Settings dropdown (`SettingsDialog.cpp`, `kPermissionModes`) and the first entry
-in the daemon's own allow-list (`claude.rs`, `PERMISSION_MODES`), which exists
-precisely so that a bad mode is an `InvalidParams` rather than a process that
-dies of a usage error a second later — and it is letting through the one value
-the CLI rejects. A `--permission-mode default` spawn exits on a usage error,
-which from the pane looks exactly like an agent that hangs.
+`default` is **not** among the choices, which made it the prime suspect: it is
+the first entry in the IDE's Settings dropdown (`SettingsDialog.cpp`,
+`kPermissionModes`) and the first entry in the daemon's own allow-list
+(`claude.rs`, `PERMISSION_MODES`).
+
+**Probed, and false.** The choices are enforced — `--permission-mode nonsense`
+is rejected, and the error names exactly those six — but `--permission-mode
+default` is accepted anyway: it is a working alias the help text no longer
+lists. Confirmation from the other side: a run with `manual` reports
+`"permissionMode":"default"` in its own `init` line, so the two spellings are
+one mode. The IDE still standardises on `manual`, because that is the spelling
+the CLI documents, but that is tidiness and not a fix, and nothing may claim it
+as one.
 
 `--permission-prompts host` is right, and `claude_stream::parse_line` already
 turns a `control_request` of subtype `can_use_tool` into a `PermissionRequest`
-message and a `WaitingPermission` state. So the plumbing exists; something on
-the path is not running.
+message and a `WaitingPermission` state. `TranscriptModel::sync_pending`
+publishes it, `TranscriptView` connects `permissionRequested` to
+`onPermissionRequested` (`TranscriptView.cpp:236`), and six tests in
+`transcript_tests.rs` cover the model's half. So the plumbing exists and is
+wired end to end; something on the path is not running, and it is not any of
+the wires.
+
+**The hunt is blocked on a login.** The distro's Claude Code OAuth has expired —
+`claude auth status` reports `"loggedIn": false`, and a real turn answers
+"Failed to authenticate: OAuth session expired and could not be refreshed" — so
+no turn reaches a tool and no `can_use_tool` line can be observed at all. That
+is also a candidate explanation for the original report: an agent whose every
+turn dies at authentication runs no tools, so it never asks for permission, and
+from the pane that looks exactly like one that cannot be approved. A candidate,
+not a conclusion. See
+`docs/superpowers/plans/notes/2026-09-13-permission-hang-finding.md`.
 
 ### What happens first
 
@@ -69,10 +89,10 @@ CLI stdout line
   -> TranscriptView -> PermissionBar   (does the bar show?)
 ```
 
-The first boundary that does not see it is the one to investigate. The two
-standing suspicions — the `default` mode above, and a control-protocol
-handshake the daemon may owe the CLI before it will ask — are suspicions, not
-conclusions; the instrumentation decides.
+The first boundary that does not see it is the one to investigate. One
+suspicion is left standing — a control-protocol handshake the daemon may owe
+the CLI before it will ask — and it is a suspicion, not a conclusion; the
+instrumentation decides.
 
 The fix goes where the break is, with a regression test at that level: a
 `claude_stream` unit test if it is parsing, a daemon integration test if it is
@@ -83,12 +103,12 @@ lands first and alone.
 
 ### Also fixed here
 
-`PERMISSION_MODES` in the daemon becomes exactly what the CLI accepts:
-`acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`.
-`default` is removed. A stored setting of `default` — which any user who has
-pressed OK in Settings now has in `state.json` — is migrated to `manual` on
-read, because the alternative is an IDE that refuses to start an agent until
-the user finds the setting that is poisoning it.
+`PERMISSION_MODES` in the daemon keeps all seven values and gains a comment
+saying why: six are the CLI's documented choices and the seventh is the
+undocumented alias it still accepts, so a mode stored by an older IDE is not
+turned into an error. The IDE's own floor moves to `manual` and a stored
+`default` reads back as `manual`, so one spelling reaches the CLI from here —
+the documented one.
 
 ## 3. Permission mode, per agent, with YOLO
 
