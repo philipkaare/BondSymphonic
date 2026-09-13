@@ -535,6 +535,14 @@ void TranscriptView::onStateChanged() {
     if (m_starting && agentId != m_startFromAgentId) {
         m_starting = false;
     }
+    // A different agent is attached than the one a switch was asked for from:
+    // the restart landed, and what answers the user has changed. Said here
+    // rather than where the combo moved, because until now the switch had not
+    // happened and might never have.
+    if (!agentId.isEmpty() && agentId != m_announcedAgentId) {
+        m_announcedAgentId = agentId;
+        announceSwitch();
+    }
     const bool noAgent = agentId.isEmpty();
     if (m_starting) {
         m_input->setBusy(true, QStringLiteral("starting the agent") + QChar(kEllipsis));
@@ -678,7 +686,38 @@ void TranscriptView::emitOptionsChanged() {
     }
     m_sentModel = model;
     m_sentMode = mode;
+    // Held, not announced. Saying "switched to Haiku 4.5" the moment the combo
+    // moves would announce something that has not happened: the restart can
+    // still fail, and what answers afterwards would be the old agent.
+    // `onStateChanged` posts it when a different agent id arrives, which is the
+    // switch having actually taken place.
+    m_pendingSwitch = agentchoices::labelForModel(model) + QStringLiteral(" · ") +
+                      agentchoices::labelForPermissionMode(mode);
     emit optionsChanged(m_model->restartOptionsChoosing(model, mode));
+}
+
+void TranscriptView::announceSwitch() {
+    if (m_pendingSwitch.isEmpty()) {
+        return;
+    }
+    const QString what = m_pendingSwitch;
+    m_pendingSwitch.clear();
+    // A frame the view writes, like the welcome: the daemon has never heard of
+    // it, it is not a transcript item and it is not replayed. What it records
+    // is an event in this pane -- the user changed what is answering them --
+    // and that the conversation either side of it is one conversation, which is
+    // the thing the line exists to say.
+    auto* label = new QLabel(QStringLiteral("switched to ") + what +
+                                 QStringLiteral(", conversation resumed"),
+                             m_scroll->widget());
+    label->setWordWrap(true);
+    label->setAlignment(Qt::AlignHCenter);
+    applySmallGrey(label, true);
+    m_frameLayout->insertWidget(m_frameLayout->count() - 1, label);
+    // Deliberately not in `m_frames`: an index there is a transcript item's
+    // index, and a widget belonging to no item would shift every frame after it
+    // onto the wrong message. Its own list, torn down with them.
+    m_notices.append(label);
 }
 
 void TranscriptView::refreshBanner() {
@@ -838,6 +877,14 @@ void TranscriptView::clearFrames() {
         frame->deleteLater();
     }
     m_frames.clear();
+    // The view's own notices go with them. A rebuild replays the conversation
+    // out of the model, and the model has never heard of these.
+    for (QWidget* notice : m_notices) {
+        m_frameLayout->removeWidget(notice);
+        notice->hide();
+        notice->deleteLater();
+    }
+    m_notices.clear();
     // The indices waiting for a repaint named frames that no longer exist.
     m_changedItems.clear();
     m_coalesce->stop();
@@ -893,6 +940,16 @@ int TranscriptView::frameCount() const { return shownFrames(); }
 
 QWidget* TranscriptView::frameAt(int index) const {
     return index >= 0 && index < m_frames.size() ? m_frames.at(index) : nullptr;
+}
+
+QStringList TranscriptView::noticeTextsForTest() const {
+    QStringList texts;
+    for (QWidget* notice : m_notices) {
+        if (auto* label = qobject_cast<QLabel*>(notice)) {
+            texts.append(label->text());
+        }
+    }
+    return texts;
 }
 
 QString TranscriptView::welcomeTextForTest() const {
@@ -1223,6 +1280,58 @@ extern "C" std::int32_t bs_widget_test_transcript_hides_the_small_grey_lines() {
     if (cost == nullptr || !cost->text().contains(QLatin1String("turn 3"))) {
         // Back in its own place, not appended at the foot.
         return 6;
+    }
+    return 0;
+}
+
+/// A model switch says so in the transcript, and says it when the switch has
+/// happened rather than when the combo moved.
+///
+/// The gap is the whole point: a restart can fail, and a line posted on the
+/// click would be claiming a model is answering that never came up.
+extern "C" std::int32_t bs_widget_test_transcript_announces_a_switch_when_it_lands() {
+    TranscriptModel model;
+    model.setOptionsJson(
+        QStringLiteral(R"({"model":"claude-opus-5","permission_mode":"manual"})"));
+    model.setAgentId(QStringLiteral("ag_first"));
+    TranscriptView view(&model);
+
+    auto* models = view.findChild<QComboBox*>(QStringLiteral("TranscriptModelChoice"));
+    if (models == nullptr) {
+        return 1;
+    }
+    if (!view.noticeTextsForTest().isEmpty()) {
+        // Nothing has been switched yet.
+        return 2;
+    }
+
+    models->setCurrentIndex(models->findData(QStringLiteral("claude-haiku-4-5-20251001")));
+    if (!view.noticeTextsForTest().isEmpty()) {
+        // Asked for, not landed: the restart is still in flight and may fail.
+        return 3;
+    }
+
+    // The restart lands -- a different agent is attached.
+    model.setAgentId(QStringLiteral("ag_second"));
+    const QStringList after = view.noticeTextsForTest();
+    if (after.size() != 1) {
+        return 4;
+    }
+    if (!after.at(0).contains(QLatin1String("Haiku 4.5"))) {
+        // The label, not the id: `claude-haiku-4-5-20251001` is not what a
+        // person picked off a list.
+        return 5;
+    }
+    if (!after.at(0).contains(QLatin1String("resumed"))) {
+        // That the conversation continued is the thing the line exists to say.
+        return 6;
+    }
+
+    // The same id arriving again is not a second switch: `onStateChanged` runs
+    // on every state change, not only on a restart.
+    model.setAgentId(QStringLiteral("ag_second"));
+    if (view.noticeTextsForTest().size() != 1) {
+        return 7;
     }
     return 0;
 }

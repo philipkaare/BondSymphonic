@@ -1592,6 +1592,7 @@ mod cpp_widgets {
         fn bs_widget_test_transcript_welcomes_an_empty_pane() -> i32;
         fn bs_widget_test_transcript_hides_the_small_grey_lines() -> i32;
         fn bs_widget_test_agent_area_holds_a_restartable_banner() -> i32;
+        fn bs_widget_test_transcript_announces_a_switch_when_it_lands() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1605,7 +1606,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 33] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 34] = [
             // These four build a whole MainWindow, and each begins by pointing
             // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
             // is load-bearing rather than tidy: the state store settles its
@@ -1746,6 +1747,10 @@ mod cpp_widgets {
             (
                 "AgentArea holds a restartable banner until the pane exists",
                 bs_widget_test_agent_area_holds_a_restartable_banner,
+            ),
+            (
+                "A model switch is announced when it lands, not when it is asked for",
+                bs_widget_test_transcript_announces_a_switch_when_it_lands,
             ),
         ];
 

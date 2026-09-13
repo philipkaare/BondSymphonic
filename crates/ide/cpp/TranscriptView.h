@@ -103,6 +103,9 @@ public:
     QWidget* frameAt(int index) const;
     /// The welcome's three lines, or empty when it is not on show.
     QString welcomeTextForTest() const;
+    /// The view-level notices on show, newest last -- today the "switched to
+    /// ..." lines. Separate from `frameCount`, which counts transcript items.
+    QStringList noticeTextsForTest() const;
 #endif
 
 signals:
@@ -147,6 +150,10 @@ private:
     /// Emits [`optionsChanged`] for whatever the two dropdowns now say, unless
     /// this view is the one that just set them or they say what was sent last.
     void emitOptionsChanged();
+    /// Puts [`m_pendingSwitch`] in the transcript as a view-level notice, and
+    /// forgets it. Called when a different agent id arrives, which is the
+    /// switch having actually happened rather than merely been asked for.
+    void announceSwitch();
     /// The `--model` argument the model dropdown stands for: the id behind a
     /// label picked off the list, or whatever was typed instead. The one id
     /// that is empty -- "let Claude Code decide" -- is spelled `-`, which is
@@ -238,6 +245,19 @@ private:
     /// for is the most expensive possible answer to that.
     QString m_sentModel;
     QString m_sentMode;
+    /// What the last switch chose, as the words it will be announced in, held
+    /// from the combo moving until a different agent id proves it happened.
+    /// Empty when there is nothing waiting to be said.
+    QString m_pendingSwitch;
+    /// The agent id the last notice was posted for, so re-reading the same id
+    /// -- `onStateChanged` runs on every state change, not only on a restart --
+    /// does not post a second one.
+    QString m_announcedAgentId;
+    /// Frames the view wrote itself: today the "switched to …" notices. Kept
+    /// apart from `m_frames`, where an index is a transcript item's index and a
+    /// widget belonging to no item would shift every frame after it onto the
+    /// wrong message.
+    QList<QWidget*> m_notices;
     /// See [`setStarting`].
     bool m_starting = false;
     /// See [`setClaudeLoggedIn`]. True until told otherwise, so a view built
