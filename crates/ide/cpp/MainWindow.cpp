@@ -261,6 +261,24 @@ void MainWindow::buildMenus() {
     });
     menuBar()->addMenu("&Workspace");
     menuBar()->addMenu("&Run");
+
+    // Qt's own toggle actions rather than hand-written ones: the tick and the
+    // dock cannot then disagree, and a dock closed by its own X updates the
+    // menu without anything here having to notice. Each entry's text is the
+    // dock's window title, which is also what its title bar reads, so the way
+    // back is spelled the same as the thing that went.
+    //
+    // `Wi&ndow` rather than the obvious `&Window`: `&Workspace` is already in
+    // the bar and claims Alt+W, and it comes first, so the obvious spelling
+    // would give this menu an accelerator that opens somebody else's. Alt+N is
+    // free.
+    auto* window = menuBar()->addMenu("Wi&ndow");
+    window->addAction(m_explorer->toggleViewAction());
+    window->addAction(m_agentDock->toggleViewAction());
+    window->addAction(m_bottomDock->toggleViewAction());
+    window->addSeparator();
+    window->addAction("&Reset layout", this, &MainWindow::resetLayout);
+
     auto* help = menuBar()->addMenu("&Help");
     // No "Setup..." here any more. Logging in to Claude Code or GitHub is a
     // setting the user comes back to -- a token expires, an account changes --
@@ -1650,6 +1668,44 @@ struct WindowFixture {
     MainWindow window{ &controller, &groupModel, &fileTreeModel, &changesModel, &runModel };
 };
 
+/// The menu bar's menu with this exact title, or null.
+///
+/// By title rather than by position: the order of the menus is a decision the
+/// window is free to change, and a check that broke when Window moved past Run
+/// would be checking the wrong thing.
+QMenu* menuTitled(const MainWindow& window, const QString& title) {
+    for (QMenu* candidate : window.menuBar()->findChildren<QMenu*>()) {
+        if (candidate->title() == title) {
+            return candidate;
+        }
+    }
+    return nullptr;
+}
+
+/// The menu's first entry whose text holds `text`, or null. A fragment rather
+/// than the whole text, so the checks do not have to spell the accelerator's
+/// ampersand or the ellipsis that marks an entry which asks something first.
+QAction* menuAction(const QMenu* menu, const QString& text) {
+    if (menu == nullptr) {
+        return nullptr;
+    }
+    for (QAction* action : menu->actions()) {
+        if (action->text().contains(text)) {
+            return action;
+        }
+    }
+    return nullptr;
+}
+
+bool menuHasAction(const QMenu* menu, const QString& text) {
+    return menuAction(menu, text) != nullptr;
+}
+
+bool menuActionEnabled(const QMenu* menu, const QString& text) {
+    const QAction* action = menuAction(menu, text);
+    return action != nullptr && action->isEnabled();
+}
+
 } // namespace
 
 /// The agent pane is a dock: on the right, closable, floatable, movable, and
@@ -1711,6 +1767,59 @@ extern "C" std::int32_t bs_widget_test_main_window_docks_the_agent_pane() {
     window.resetLayout();
     if (agent->isFloating() || window.dockWidgetArea(agent) != Qt::RightDockWidgetArea) {
         return 9;
+    }
+    return 0;
+}
+
+/// A dock closed by its own X has a way back, and the entry that is it says so
+/// by being unticked.
+///
+/// The Output dock is the one this is really about: it is the one a user closes
+/// by accident, and Qt's only route back to it is a right-click on the menu bar
+/// that nobody finds.
+extern "C" std::int32_t bs_widget_test_window_menu_brings_a_closed_dock_back() {
+    useThrowawayState();
+    WindowFixture fixture;
+    MainWindow& window = fixture.window;
+
+    QMenu* menu = menuTitled(window, QStringLiteral("Wi&ndow"));
+    if (menu == nullptr || menu->actions().isEmpty()) {
+        return 1;
+    }
+    for (const QString& text :
+         QStringList{ QStringLiteral("Explorer"), QStringLiteral("Agent"),
+                      QStringLiteral("Output"), QStringLiteral("Reset layout") }) {
+        if (!menuHasAction(menu, text)) {
+            return 2;
+        }
+    }
+    auto* dock = window.findChild<QDockWidget*>(QStringLiteral("BottomDock"));
+    QAction* entry = menuAction(menu, QStringLiteral("Output"));
+    if (dock == nullptr || entry == nullptr || !entry->isCheckable()) {
+        return 3;
+    }
+    // The entry *is* the dock's own toggle action, which is how the tick and
+    // the dock are kept from disagreeing. Asserted by identity rather than by
+    // reading the tick: Qt sets it from the show and hide events the dock
+    // receives, and a window that is never shown -- which is every window in
+    // this offscreen suite -- receives neither, so reading it here would be a
+    // fact about the harness and not about the menu.
+    if (entry != dock->toggleViewAction()) {
+        return 4;
+    }
+    auto* agent = window.findChild<QDockWidget*>(QStringLiteral("AgentDock"));
+    if (agent == nullptr || menuAction(menu, QStringLiteral("Agent")) != agent->toggleViewAction()) {
+        return 5;
+    }
+
+    window.resetLayout();
+    dock->close();
+    if (!dock->isHidden()) {
+        return 6;
+    }
+    entry->trigger();
+    if (dock->isHidden()) {
+        return 7;
     }
     return 0;
 }
