@@ -326,12 +326,26 @@ A Claude Code workspace's pane shows the conversation as it arrives.
   `claude -p` reads both when the process starts and there is no way to change
   either in flight, so choosing one restarts the agent with `--resume` pointed
   at the session id — the conversation continues, and a line in the transcript
-  records the switch. A turn in flight is interrupted. The permission modes are
-  **Ask every time**, **Accept edits**, **Plan only** and **YOLO (sandboxed)**;
-  the last asks about nothing at all, which is reasonable because the agent is
-  already inside a sandbox, in a worktree of its own, behind a network proxy.
-  There is no confirmation dialog for it: the sandbox is what makes it safe, not
-  a warning.
+  records the switch. A turn in flight is interrupted.
+- **Permissions do not prompt yet, and the modes say so.** Claude Code asks its
+  *host* before running a tool that needs approval. The daemon tells the CLI it
+  is that host and cannot yet answer, so the CLI resolves the question by
+  refusing: the tool comes back with *"The following part requires approval:
+  …"*, the agent works around it or gives up, and nothing ever reaches the amber
+  bar. A command the CLI's own safety check considers harmless — `echo`, a plain
+  `git ls-files` — runs without any of this.
+
+  So the list reads **YOLO (sandboxed)**, **Accept edits (other tools
+  blocked)**, **Plan only** and **Ask every time (blocks instead)**, and YOLO is
+  what a new agent starts on. It is the loud end of the range and it is the only
+  end that lets an agent finish a job; what makes it defensible is structural,
+  not a warning dialog — the agent is inside a sandbox, in a worktree of its
+  own, behind a network proxy. An existing setting is never rewritten to it:
+  only a fresh install gets that default.
+
+  When the host protocol lands, the modes go back to their plain names and the
+  amber bar starts asking. `docs/superpowers/plans/notes/2026-09-13-permission-hang-finding.md`
+  has the reproduction.
 - **Interrupt** abandons the current turn and leaves the agent alive. It is the
   only one of the old three buttons left, because ending a turn acts on the
   conversation rather than on the process.

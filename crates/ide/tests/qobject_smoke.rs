@@ -723,10 +723,12 @@ fn settings_round_trip_the_api_key_flag_and_permission_mode() {
     let _ = std::fs::remove_file(&path);
     std::env::set_var(SETTINGS_PATH_ENV, &path);
 
-    // A file that is not there yet reads as the defaults.
+    // A file that is not there yet reads as the defaults. The permission floor
+    // is the loud one while Claude Code cannot reach the window to ask: every
+    // quieter mode turns an approval into a refusal nobody sees.
     let fresh = Settings::load();
     assert!(!fresh.api_key_set);
-    assert_eq!(fresh.default_permission_mode, "manual");
+    assert_eq!(fresh.default_permission_mode, "bypassPermissions");
 
     let mut settings = Settings::load();
     settings.api_key_set = true;
@@ -748,7 +750,12 @@ fn settings_round_trip_the_api_key_flag_and_permission_mode() {
     let legacy = Settings::load();
     assert_eq!(legacy.distro, "other");
     assert!(!legacy.api_key_set);
-    assert_eq!(legacy.default_permission_mode, "manual");
+    // A file that never carried the field gets the floor, like a fresh install.
+    // A file that carried the retired spelling does NOT: that one is migrated
+    // to `manual`, because rewriting a stored "ask me" into "run everything
+    // unasked" would escalate a user who never agreed to it. See
+    // `a_stored_default_permission_mode_reads_back_as_manual`.
+    assert_eq!(legacy.default_permission_mode, "bypassPermissions");
 
     std::env::remove_var(SETTINGS_PATH_ENV);
     let _ = std::fs::remove_dir_all(&dir);

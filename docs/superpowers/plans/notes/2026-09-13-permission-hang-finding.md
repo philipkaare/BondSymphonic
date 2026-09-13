@@ -1,8 +1,68 @@
 # Where a permission request stops — what is established so far
 
 **Date:** 2026-09-13
-**Status:** Blocked on a login. Two of the plan's suspicions are dead; the
-remaining boundary cannot be observed until Claude Code is signed in again.
+**Status:** Root cause found. Not fixed — the IDE tells the truth about it
+instead, and the fix is scoped below.
+
+## The answer
+
+`--permission-prompts host` tells the CLI that a *host* will answer permission
+questions. The daemon passes it and never becomes a host that can, so the CLI
+resolves every question by **refusing**:
+
+```
+TOOL RESULT (is_error=True): This Bash command contains multiple operations.
+  The following part requires approval: git -C /tmp/… ls-files README.md
+```
+
+The agent sees the refusal, works around it or gives up, and nothing ever
+reaches the amber bar. Nobody is asked because the CLI already answered.
+
+Reproduced against 2.1.263 with the daemon's exact argv. Established along the
+way, all empirically:
+
+- A command the CLI's own safety check considers harmless (`echo hello`, a
+  plain `git ls-files`) runs with no permission step at all. That is why the
+  defect looks intermittent: benign work succeeds, and only real work stalls.
+- `--permission-mode` is not the lever. `manual`, `plan` and no flag at all
+  behave identically here, and the CLI reports `"permissionMode":"default"` in
+  its `init` line whatever is passed.
+- `--permission-prompts none` behaves the same as `host`, which is the clue:
+  with no reachable host, `host` *is* `none`.
+- Sending an SDK `initialize` control-request does not help. Tried bare, with
+  `hooks`, with `canUseTool: true`, with `capabilities: ["can_use_tool"]` and
+  with `permissionPromptToolName`. The CLI accepts the handshake and answers
+  it — and still never sends `can_use_tool`.
+
+## What was done instead
+
+The UI stopped claiming a protection it does not provide (option C of three put
+to the user). The modes are labelled by what they do here — `YOLO (sandboxed)`,
+`Accept edits (other tools blocked)`, `Plan only`, `Ask every time (blocks
+instead)` — YOLO is the default for a fresh install, and a note beside every
+chooser says why. An existing stored mode is never rewritten to YOLO: migrating
+somebody's "ask me" into "run everything unasked" would escalate a user who
+never agreed to it.
+
+## The fix, when it is picked up
+
+`claude --help` says `host` means "the SDK host **or** `--permission-prompt-tool`".
+The documented, upgrade-resistant path is the second one: the daemon serves a
+small MCP server exposing a permission-prompt tool, names it with
+`--permission-prompt-tool`, and forwards the call to the IDE's existing
+`PermissionBar` — which already works end to end and is covered by six tests in
+`crates/ide/tests/transcript_tests.rs`. Only the CLI-facing half is missing.
+
+The alternative — reverse-engineering the host control protocol far enough to
+receive `can_use_tool` — is smaller if the handshake is found quickly, and it
+is an undocumented surface that can move under us. Five probes did not find it.
+
+---
+
+## What was believed before the login was renewed
+
+Kept because two of the plan's suspicions were wrong, and both were the kind
+worth recording.
 
 ## The report
 

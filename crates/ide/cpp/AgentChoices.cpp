@@ -33,13 +33,29 @@ const QList<agentchoices::Choice>& agentchoices::models() {
 }
 
 const QList<agentchoices::Choice>& agentchoices::permissionModes() {
+    // The labels say what these modes DO here, which is not what their names
+    // promise. Claude Code asks its host before running a tool that needs
+    // approval, and the daemon passes `--permission-prompts host` without ever
+    // becoming a host that can answer -- so the CLI resolves the question by
+    // refusing. Nothing reaches the amber bar, and a mode called "Ask every
+    // time" that silently denies is worse than one that says it denies.
+    //
+    // See `docs/superpowers/plans/notes/2026-09-13-permission-hang-finding.md`.
+    // When the host protocol lands these go back to their plain names.
     static const QList<Choice> kModes{
-        { "Ask every time", "manual" },
-        { "Accept edits", "acceptEdits" },
-        { "Plan only", "plan" },
         { "YOLO (sandboxed)", "bypassPermissions" },
+        { "Accept edits (other tools blocked)", "acceptEdits" },
+        { "Plan only", "plan" },
+        { "Ask every time (blocks instead)", "manual" },
     };
     return kModes;
+}
+
+QString agentchoices::permissionNote() {
+    return QStringLiteral(
+        "Claude Code cannot reach this window to ask, so a tool that needs approval is refused "
+        "rather than queued. YOLO runs everything — the sandbox, the worktree and the network "
+        "proxy are what make that reasonable.");
 }
 
 QString agentchoices::labelForModel(const QString& id) {
@@ -69,10 +85,17 @@ void agentchoices::fillPermissionCombo(QComboBox* combo, const QString& selected
     combo->setEditable(false);
     fill(combo, permissionModes());
     const int index = combo->findData(selected);
-    // Not the edit text and not an empty combo: an unknown mode falls back to
-    // the entry that asks about everything, because every other direction to
-    // fall is quieter than what the user last chose.
-    combo->setCurrentIndex(index >= 0 ? index : 0);
+    if (index >= 0) {
+        combo->setCurrentIndex(index);
+        return;
+    }
+    // An unknown mode falls back to the most restrictive entry by name, never
+    // to index 0 -- index 0 is YOLO now, and a settings file this build cannot
+    // read is not consent to run every tool unasked. Restrictive here means
+    // "refuses", which is useless but is the user's to discover rather than
+    // ours to decide for them.
+    const int manual = combo->findData(QStringLiteral("manual"));
+    combo->setCurrentIndex(manual >= 0 ? manual : 0);
 }
 
 // The offscreen widget checks. See the note in `EditorArea.cpp`; `build.rs`
@@ -85,12 +108,32 @@ extern "C" std::int32_t bs_widget_test_agent_choices_are_one_list() {
     if (agentchoices::permissionModes().size() != 4) {
         return 1;
     }
-    const QStringList ids{ QStringLiteral("manual"), QStringLiteral("acceptEdits"),
-                           QStringLiteral("plan"), QStringLiteral("bypassPermissions") };
+    // YOLO first, because it is the default and the only mode an agent can
+    // finish a job in while the CLI cannot reach this window to ask.
+    const QStringList ids{ QStringLiteral("bypassPermissions"), QStringLiteral("acceptEdits"),
+                           QStringLiteral("plan"), QStringLiteral("manual") };
     for (int i = 0; i < ids.size(); ++i) {
         if (QString::fromUtf8(agentchoices::permissionModes().at(i).id) != ids.at(i)) {
             return 2;
         }
+    }
+    if (QString::fromUtf8(agentchoices::defaultPermissionMode()) !=
+        QLatin1String("bypassPermissions")) {
+        return 10;
+    }
+    // Every mode whose name promises a prompt says in its label that it does
+    // not give one. The day the host protocol lands, this is the assertion that
+    // says the labels have to go back to their plain names.
+    for (const agentchoices::Choice& choice : agentchoices::permissionModes()) {
+        const QString id = QString::fromUtf8(choice.id);
+        const QString label = QString::fromUtf8(choice.label);
+        if ((id == QLatin1String("manual") || id == QLatin1String("acceptEdits")) &&
+            !label.contains(QLatin1String("block"))) {
+            return 11;
+        }
+    }
+    if (!agentchoices::permissionNote().contains(QLatin1String("refused"))) {
+        return 12;
     }
     for (const agentchoices::Choice& choice : agentchoices::permissionModes()) {
         const QString id = QString::fromUtf8(choice.id);

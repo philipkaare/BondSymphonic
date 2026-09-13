@@ -686,11 +686,25 @@ fn a_stored_default_permission_mode_reads_back_as_manual() {
     std::env::remove_var(LEGACY_SETTINGS_PATH_ENV);
     std::env::remove_var(STATE_PATH_ENV);
 
-    assert_eq!(Settings::load().default_permission_mode, "manual");
+    // `manual`, which is what the stored word meant -- and emphatically not
+    // the floor a fresh install gets, which is `bypassPermissions`. Rewriting
+    // somebody's stored "ask me" into "run every tool unasked" would be this
+    // migration escalating a user who never agreed to it.
+    let migrated = Settings::load().default_permission_mode;
+    assert_eq!(migrated, "manual");
+    assert_ne!(migrated, "bypassPermissions");
 
     // A mode the CLI does take is left exactly as it was.
     std::fs::write(&path, r#"{"default_permission_mode":"plan"}"#).expect("settings");
     assert_eq!(Settings::load().default_permission_mode, "plan");
+
+    // A file that has never carried the field is a fresh install, and that is
+    // the only case that gets the loud default.
+    std::fs::write(&path, r#"{"distro":"bondsymphonic"}"#).expect("settings");
+    assert_eq!(
+        Settings::load().default_permission_mode,
+        "bypassPermissions"
+    );
 
     std::env::remove_var(SETTINGS_PATH_ENV);
 }

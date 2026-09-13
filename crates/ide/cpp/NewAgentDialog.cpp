@@ -185,6 +185,12 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     agentchoices::fillPermissionCombo(m_permissionMode, m_controller->defaultPermissionMode());
     form->addRow("Permissions:", m_permissionMode);
 
+    auto* permissionNote = new QLabel(agentchoices::permissionNote(), this);
+    permissionNote->setObjectName(QStringLiteral("NewAgentPermissionNote"));
+    permissionNote->setWordWrap(true);
+    permissionNote->setEnabled(false);
+    form->addRow(QString(), permissionNote);
+
     m_initialPrompt = new QPlainTextEdit(this);
     m_initialPrompt->setPlaceholderText("What should the agent start on?");
     const QFontMetrics promptMetrics(m_initialPrompt->font());

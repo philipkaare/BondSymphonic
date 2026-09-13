@@ -93,6 +93,16 @@ SettingsDialog::SettingsDialog(AppController* controller, QWidget* parent)
     // carried on as it was.
     form->addRow("New agents start on:", m_permissionMode);
 
+    // Beside the chooser, because the labels alone cannot say why a mode called
+    // "Ask every time" blocks instead. One string from `agentchoices`, so the
+    // day the host protocol lands there is one sentence to delete rather than
+    // three to find.
+    auto* permissionNote = new QLabel(agentchoices::permissionNote(), agentBox);
+    permissionNote->setObjectName(QStringLiteral("SettingsPermissionNote"));
+    permissionNote->setWordWrap(true);
+    permissionNote->setEnabled(false);
+    form->addRow(QString(), permissionNote);
+
     m_showMeta = new QCheckBox("Show turn cost and system lines", agentBox);
     m_showMeta->setObjectName(QStringLiteral("SettingsShowAgentMeta"));
     m_showMeta->setChecked(m_controller->showAgentMeta());

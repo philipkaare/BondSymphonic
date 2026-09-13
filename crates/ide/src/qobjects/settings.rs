@@ -104,13 +104,25 @@ fn migrate_legacy_settings() {
 const KEYRING_SERVICE: &str = "BondSymphonic";
 const KEYRING_USER: &str = "anthropic_api_key";
 
-/// What a new Claude agent starts on. `manual` -- every tool that would prompt,
-/// prompts -- because the mode is always sent and the safe end of the range is
-/// the one to default to.
-const DEFAULT_PERMISSION_MODE: &str = "manual";
+/// What a new Claude agent starts on.
+///
+/// `bypassPermissions`, which is the loud end of the range and is chosen anyway
+/// because it is the only end that works. Claude Code asks its host before
+/// running a tool that needs approval; the daemon claims to be that host and
+/// cannot answer, so the CLI refuses instead of asking -- and every quieter
+/// mode turns an approval into a refusal the user never sees and cannot
+/// overrule. An agent runs in a sandbox, in a worktree of its own, behind a
+/// network proxy, and that is what makes this defensible in the meantime.
+///
+/// This goes back to `manual` when the CLI can reach the window to ask. See
+/// `docs/superpowers/plans/notes/2026-09-13-permission-hang-finding.md`.
+const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 
-/// The other spelling of [`DEFAULT_PERMISSION_MODE`]. The CLI takes both and
-/// means the same thing by them -- an agent started either way reports
+/// "Ask before every tool", as the CLI's help spells it.
+const DOCUMENTED_ASK_MODE: &str = "manual";
+
+/// The other spelling of [`DOCUMENTED_ASK_MODE`]. The CLI takes both and means
+/// the same thing by them -- an agent started either way reports
 /// `"permissionMode":"default"` itself -- but only one of the two is in its
 /// help text, so a settings file holding this one is read as the documented
 /// spelling rather than left showing the user a word they cannot look up.
@@ -266,7 +278,12 @@ impl Settings {
         match parsed {
             Ok(mut settings) => {
                 if settings.default_permission_mode == UNDOCUMENTED_PERMISSION_MODE {
-                    settings.default_permission_mode = DEFAULT_PERMISSION_MODE.to_owned();
+                    // To `manual`, which is what the word meant, and NOT to
+                    // [`DEFAULT_PERMISSION_MODE`]: that is `bypassPermissions`
+                    // now, and rewriting a stored "ask me" into "run everything
+                    // unasked" would be this migration escalating a user who
+                    // never agreed to it. Only a fresh install gets the floor.
+                    settings.default_permission_mode = DOCUMENTED_ASK_MODE.to_owned();
                 }
                 Ok(settings)
             }
