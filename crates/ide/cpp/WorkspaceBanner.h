@@ -2,6 +2,7 @@
 #include <QFrame>
 #include <QString>
 
+class QEvent;
 class QLabel;
 class QPlainTextEdit;
 class QPushButton;
@@ -31,14 +32,41 @@ public:
     /// Empties the banner and hides it, without emitting `dismissed`.
     void reset();
 
+    /// Whether this banner offers to restart the agent.
+    ///
+    /// Only an agent that exited gets the button. Every other failure a banner
+    /// reports -- a merge that conflicted, a pull request that was refused --
+    /// has a live agent behind it that a restart would interrupt rather than
+    /// repair. It is the one Start-shaped control left in the pane now that
+    /// agents start themselves, and it is here because a failure is the one
+    /// state where an agent being down is news rather than a transient.
+    ///
+    /// Sticky across `showError` and cleared by `reset`, so a second failure on
+    /// the same dead agent still offers it.
+    void setRestartOffered(bool offered);
+
 signals:
     /// The user pressed Dismiss. The window answers by clearing the tab's error
     /// mark; this widget does not touch the model.
     void dismissed();
 
+    /// The user pressed Restart. The area turns this into the workspace id the
+    /// window needs; this widget knows nothing about agents.
+    void restartRequested();
+
+protected:
+    /// A palette change is the theme moving under the banner. Its red is mixed
+    /// into the pane's own background, so it has to be mixed again rather than
+    /// kept.
+    void changeEvent(QEvent* event) override;
+
 private:
     /// Shows or hides the stderr box and puts the right arrow on the button.
     void setExpanded(bool expanded);
+
+    /// Mixes the red into whatever the pane is now and installs it. Called from
+    /// the constructor and from every palette change.
+    void applyWash();
 
     QLabel* m_title = nullptr;
     QLabel* m_detail = nullptr;
@@ -46,4 +74,10 @@ private:
     QToolButton* m_disclose = nullptr;
     QPlainTextEdit* m_stderr = nullptr;
     QPushButton* m_dismiss = nullptr;
+    /// See [`setRestartOffered`]. Hidden unless the failure is an agent that
+    /// exited.
+    QPushButton* m_restart = nullptr;
+    /// Whether [`applyWash`] is already running. Installing a palette raises
+    /// the change event that calls it, so without this it would call itself.
+    bool m_mixing = false;
 };

@@ -1578,6 +1578,8 @@ mod cpp_widgets {
         fn bs_widget_test_group_bar_names_the_repository() -> i32;
         fn bs_widget_test_new_agent_dialog_says_branches_are_loading() -> i32;
         fn bs_widget_test_agent_choices_are_one_list() -> i32;
+        fn bs_widget_test_banner_offers_restart_only_to_a_dead_agent() -> i32;
+        fn bs_widget_test_banner_remixes_its_red_for_a_new_palette() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1591,7 +1593,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 19] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 21] = [
             (
                 "EditorArea closes a tab under a destroyed workspace",
                 bs_widget_test_editor_area_survives_a_destroyed_workspace,
@@ -1667,6 +1669,14 @@ mod cpp_widgets {
             (
                 "AgentChoices is one list of models and one of permission modes",
                 bs_widget_test_agent_choices_are_one_list,
+            ),
+            (
+                "WorkspaceBanner offers Restart only for an agent that exited",
+                bs_widget_test_banner_offers_restart_only_to_a_dead_agent,
+            ),
+            (
+                "WorkspaceBanner re-mixes its red for a new palette",
+                bs_widget_test_banner_remixes_its_red_for_a_new_palette,
             ),
         ];
 
