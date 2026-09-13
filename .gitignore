@@ -1,4 +1,8 @@
 /target/
+# A second build directory, for someone building beside a build that is holding
+# the shared one open: a running bondsymphonic-ide.exe blocks every relink of
+# itself, and CARGO_TARGET_DIR is how two of them stop fighting over it.
+/target-*/
 # scripts\package.ps1 stages the redistributable folder and its zip here.
 /dist/
 /cpp/build/
