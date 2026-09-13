@@ -1582,6 +1582,10 @@ mod cpp_widgets {
         fn bs_widget_test_banner_remixes_its_red_for_a_new_palette() -> i32;
         fn bs_widget_test_permission_bar_follows_the_palette() -> i32;
         fn bs_widget_test_group_bar_does_not_lift_a_band_off_a_band() -> i32;
+        fn bs_widget_test_main_window_docks_the_agent_pane() -> i32;
+        fn bs_widget_test_window_menu_brings_a_closed_dock_back() -> i32;
+        fn bs_widget_test_workspace_menu_gathers_the_git_actions() -> i32;
+        fn bs_widget_test_run_menu_drives_the_run_panel() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1595,7 +1599,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 23] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 27] = [
             (
                 "EditorArea closes a tab under a destroyed workspace",
                 bs_widget_test_editor_area_survives_a_destroyed_workspace,
@@ -1687,6 +1691,25 @@ mod cpp_widgets {
             (
                 "GroupBar does not lift a band off the last band",
                 bs_widget_test_group_bar_does_not_lift_a_band_off_a_band,
+            ),
+            // These four build a whole MainWindow and point BS_STATE_PATH at a
+            // throwaway file, which is process-wide. Last in the list, so no
+            // check above them runs against a state store they redirected.
+            (
+                "MainWindow docks the agent pane",
+                bs_widget_test_main_window_docks_the_agent_pane,
+            ),
+            (
+                "Window menu brings a closed dock back",
+                bs_widget_test_window_menu_brings_a_closed_dock_back,
+            ),
+            (
+                "Workspace menu gathers the git actions",
+                bs_widget_test_workspace_menu_gathers_the_git_actions,
+            ),
+            (
+                "Run menu drives the run panel",
+                bs_widget_test_run_menu_drives_the_run_panel,
             ),
         ];
 
