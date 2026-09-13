@@ -10,6 +10,7 @@ class QFormLayout;
 class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
+class QProgressBar;
 class QToolButton;
 
 /// Collects everything a new workspace needs: which repository and base branch
@@ -105,6 +106,12 @@ private:
     /// Puts the "Repository" line under the path: nothing for an ordinary
     /// repository, and what is about to be created for anything else.
     void showRepoState(bool isRepo, bool exists);
+    /// Puts the base-branch row into whichever of its three states the two
+    /// inspection flags describe: reading the repository, unable to read it, or
+    /// offering the branches it read. Called from every place either flag
+    /// moves, because a control that is empty and enabled is indistinguishable
+    /// from a repository that genuinely has no branches.
+    void updateBranchState();
     void onGroupChanged(int index);
     /// Shows the fields the selected adapter has and hides the rest.
     void onAdapterChanged();
@@ -121,6 +128,15 @@ private:
     /// Drops down the repositories the user has created workspaces in before.
     QToolButton* m_recent = nullptr;
     QComboBox* m_baseBranch = nullptr;
+    /// An indeterminate bar beside the combo while `repo.inspect` is out, which
+    /// is the one part of the row that says the wait is going somewhere. Hidden
+    /// in both settled states.
+    QProgressBar* m_branchBusy = nullptr;
+    /// The branch the user last had in the combo, so an explicit choice
+    /// survives a move to another repository. It is kept here rather than read
+    /// off the combo when the answer arrives, because by then the combo has
+    /// been through the loading state and holds that state's own words.
+    QString m_branchChoice;
     QLineEdit* m_name = nullptr;
     QComboBox* m_adapter = nullptr;
     QLineEdit* m_command = nullptr;

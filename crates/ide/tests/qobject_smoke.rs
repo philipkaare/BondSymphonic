@@ -1576,6 +1576,7 @@ mod cpp_widgets {
         fn bs_widget_test_new_agent_dialog_offers_claude_before_the_daemon_answers() -> i32;
         fn bs_widget_test_setup_page_says_what_was_pasted() -> i32;
         fn bs_widget_test_group_bar_names_the_repository() -> i32;
+        fn bs_widget_test_new_agent_dialog_says_branches_are_loading() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1589,7 +1590,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 17] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 18] = [
             (
                 "EditorArea closes a tab under a destroyed workspace",
                 bs_widget_test_editor_area_survives_a_destroyed_workspace,
@@ -1657,6 +1658,10 @@ mod cpp_widgets {
             (
                 "GroupBar names the repository rather than the generated branch",
                 bs_widget_test_group_bar_names_the_repository,
+            ),
+            (
+                "NewAgentDialog says the branch list is loading, and when it could not be read",
+                bs_widget_test_new_agent_dialog_says_branches_are_loading,
             ),
         ];
 

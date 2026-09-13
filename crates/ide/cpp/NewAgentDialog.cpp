@@ -18,6 +18,7 @@
 #include <QLineEdit>
 #include <QMenu>
 #include <QPlainTextEdit>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QStringList>
 #include <QToolButton>
@@ -31,6 +32,10 @@ const char* kNewGroupEntry = "New group…";
 /// The adapters as the daemon spells them.
 const char* kClaudeAdapter = "claude";
 const char* kTerminalAdapter = "terminal";
+
+/// How wide the busy bar beside the base-branch combo is. Narrow enough that
+/// the combo keeps the row, wide enough for the sweep to read as motion.
+constexpr int kBranchBusyWidth = 16;
 
 /// How many lines of opening prompt are visible before the box scrolls.
 constexpr int kPromptRows = 4;
@@ -122,8 +127,22 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     form->addRow(QString(), m_repoState);
 
     m_baseBranch = new QComboBox(this);
+    m_baseBranch->setObjectName(QStringLiteral("NewAgentBaseBranch"));
     m_baseBranch->setEditable(true);
-    form->addRow("Base branch:", m_baseBranch);
+    m_branchBusy = new QProgressBar(this);
+    // A range of nothing is Qt's indeterminate bar: there is no progress to
+    // report, only that something is still out.
+    m_branchBusy->setRange(0, 0);
+    m_branchBusy->setTextVisible(false);
+    m_branchBusy->setMaximumWidth(kBranchBusyWidth);
+    auto* branchRow = new QHBoxLayout();
+    branchRow->setContentsMargins(0, 0, 0, 0);
+    branchRow->addWidget(m_baseBranch, 1);
+    branchRow->addWidget(m_branchBusy);
+    form->addRow("Base branch:", branchRow);
+    // The settled state, so the bar is not on screen for the instant before the
+    // constructor's own inspection puts it there.
+    updateBranchState();
 
     int tabs = 0;
     for (int g = 0; g < m_model->groupCount(); ++g) {
@@ -386,6 +405,13 @@ void NewAgentDialog::inspectRepo() {
         return;
     }
     m_pendingPath = path;
+    // Taken before the row goes into its loading state, which is about to
+    // replace whatever is in the combo, and only from a combo that is actually
+    // offering branches: "Loading branches…" and "Could not read branches" are
+    // the row's own words and were never a choice the user made.
+    if (m_baseBranch->isEnabled()) {
+        m_branchChoice = m_baseBranch->currentText();
+    }
     m_inspectPending = true;
     m_inspectFailed = false;
     // Both notes belong to the repository that was inspected, so they go down
@@ -397,11 +423,32 @@ void NewAgentDialog::inspectRepo() {
     m_repoState->hide();
     m_initIfMissing = false;
     m_status->setText(QStringLiteral("Reading repository %1…").arg(path));
+    updateBranchState();
     updateOkEnabled();
     m_controller->inspectRepo(path);
     // Alongside, not after: the two answers are independent and the run
     // configurations are not worth another round trip's delay.
     m_controller->detectRunConfigs(path);
+}
+
+void NewAgentDialog::updateBranchState() {
+    if (m_inspectPending) {
+        m_baseBranch->setEnabled(false);
+        m_baseBranch->clear();
+        // An item rather than a placeholder: a placeholder is invisible on an
+        // editable combo whose edit is empty, which is exactly this state.
+        m_baseBranch->addItem(QStringLiteral("Loading branches…"));
+        m_branchBusy->show();
+        return;
+    }
+    m_branchBusy->hide();
+    if (m_inspectFailed) {
+        m_baseBranch->setEnabled(false);
+        m_baseBranch->clear();
+        m_baseBranch->addItem(QStringLiteral("Could not read branches"));
+        return;
+    }
+    m_baseBranch->setEnabled(true);
 }
 
 void NewAgentDialog::onRepoInspected(const QString& path, const QString& infoJson) {
@@ -410,16 +457,20 @@ void NewAgentDialog::onRepoInspected(const QString& path, const QString& infoJso
     }
     m_inspectPending = false;
     m_inspectFailed = false;
+    // Before the combo is filled, not after: this is what takes the loading
+    // item back out, and a branch list added on top of it would be one entry
+    // longer than the repository has branches.
+    updateBranchState();
     const QJsonObject info = QJsonDocument::fromJson(infoJson.toUtf8()).object();
     // A daemon too old to send these answered nothing but repositories, so an
     // absent `is_repo` is a repository. `exists` only matters when it is not.
     showRepoState(info.value("is_repo").toBool(true), info.value("exists").toBool(false));
-    const QString current = m_baseBranch->currentText();
     m_baseBranch->clear();
     for (const QJsonValue& branch : info.value("branches").toArray()) {
         m_baseBranch->addItem(branch.toString());
     }
-    const QString preferred = current.isEmpty() ? info.value("default_branch").toString() : current;
+    const QString preferred =
+        m_branchChoice.isEmpty() ? info.value("default_branch").toString() : m_branchChoice;
     const int index = m_baseBranch->findText(preferred);
     if (index >= 0) {
         m_baseBranch->setCurrentIndex(index);
@@ -530,6 +581,7 @@ void NewAgentDialog::onRepoInspectFailed(const QString& path, const QString& mes
     m_inspectPending = false;
     m_inspectFailed = true;
     m_status->setText(message);
+    updateBranchState();
     updateOkEnabled();
 }
 
@@ -703,6 +755,58 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_offers_claude_before_the
     const QJsonObject typed = QJsonDocument::fromJson(dialog.optionsJson().toUtf8()).object();
     if (typed.value(QStringLiteral("model")).toString() != QLatin1String("claude-something-new")) {
         return 6;
+    }
+    return 0;
+}
+
+/// The Base branch combo says which of its three states it is in.
+///
+/// An empty enabled combo is indistinguishable from a repository with no
+/// branches, and `repo.inspect` on a cold or remote repository takes seconds to
+/// answer. Create refuses to act through both the pending and the failed state
+/// already; this is those two states said where the user is looking.
+extern "C" std::int32_t bs_widget_test_new_agent_dialog_says_branches_are_loading() {
+    AppController controller;
+    GroupModel model;
+    NewAgentDialog dialog(&controller, &model, QString::fromUtf8(kDialogRepo));
+    auto* combo = dialog.findChild<QComboBox*>(QStringLiteral("NewAgentBaseBranch"));
+    if (combo == nullptr) {
+        return 1;
+    }
+
+    // The constructor inspected, so the dialog is waiting for the branch list.
+    if (combo->isEnabled()) {
+        return 2;
+    }
+    if (!combo->currentText().contains(QLatin1String("Loading"))) {
+        return 3;
+    }
+
+    controller.repoInspected(
+        QString::fromUtf8(kDialogRepo),
+        QStringLiteral(R"({"is_repo":true,"branches":["main","dev"],"default_branch":"main"})"));
+    if (!combo->isEnabled() || combo->count() != 2 ||
+        combo->currentText() != QLatin1String("main")) {
+        // The loading item has to be gone before the branches go in, or it is
+        // a third entry in a list of two.
+        return 4;
+    }
+
+    auto* path = dialog.findChild<QLineEdit*>(QStringLiteral("NewAgentRepoPath"));
+    if (path == nullptr) {
+        return 5;
+    }
+    path->setText(QString::fromUtf8(kOtherRepo));
+    emit path->editingFinished();
+    if (combo->isEnabled()) {
+        return 6;
+    }
+    controller.repoInspectFailed(QString::fromUtf8(kOtherRepo), QStringLiteral("boom"));
+    if (combo->isEnabled()) {
+        return 7;
+    }
+    if (!combo->currentText().contains(QLatin1String("Could not read"))) {
+        return 8;
     }
     return 0;
 }
