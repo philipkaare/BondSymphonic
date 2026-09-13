@@ -287,6 +287,16 @@ void ChangesToolbar::setConfirmPrompt(std::function<Answer(Ask, const QString&)>
     }
 }
 
+QAction* ChangesToolbar::mergeAction() const { return m_merge; }
+
+QAction* ChangesToolbar::rebaseAction() const { return m_rebase; }
+
+QAction* ChangesToolbar::squashAction() const { return m_squash; }
+
+QAction* ChangesToolbar::prAction() const { return m_pr; }
+
+QAction* ChangesToolbar::discardAction() const { return m_discard; }
+
 // Every one of the four below reads the workspace once, before it asks, and
 // uses that id for the rest of the call. The confirmation runs a nested event
 // loop: the Explorer can switch tabs in it, and `setWorkspace` then points the

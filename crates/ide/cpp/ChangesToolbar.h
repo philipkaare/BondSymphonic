@@ -101,6 +101,19 @@ public:
     /// the question is about.
     void setConfirmPrompt(std::function<Answer(Ask, const QString& workspaceId)> ask);
 
+    /// The five git actions, as the toolbar's own `QAction`s.
+    ///
+    /// The Workspace menu offers these objects rather than a second set of its
+    /// own. Enablement is the hard part -- no workspace, or one with a request
+    /// already out, greys all five -- and it is written once here; a parallel
+    /// set would have to be greyed in parallel and would eventually drift from
+    /// these.
+    QAction* mergeAction() const;
+    QAction* rebaseAction() const;
+    QAction* squashAction() const;
+    QAction* prAction() const;
+    QAction* discardAction() const;
+
 signals:
     /// Something to put in the status bar. `url` is empty for a plain message;
     /// when it is set the window shows the text as a link to it.

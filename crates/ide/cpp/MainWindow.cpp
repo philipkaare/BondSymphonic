@@ -259,7 +259,40 @@ void MainWindow::buildMenus() {
                       m_agentDock);
         noteWindowState();
     });
-    menuBar()->addMenu("&Workspace");
+    // Nothing here is new. Five of these are the Changes tab's toolbar, which
+    // is invisible unless that tab is open, and two were reachable only by
+    // right-clicking a tab. The menu offers the toolbar's own `QAction`
+    // objects rather than a second set: their enablement is the awkward part
+    // -- no workspace, or one with a request already out -- and a parallel set
+    // would have to be greyed in parallel and would drift.
+    auto* workspace = menuBar()->addMenu("&Workspace");
+    workspace->addAction("&New Agent…", this, &MainWindow::onNewAgent);
+    m_restartAgentAction = workspace->addAction(
+        "&Restart agent", this, [this] { onStartAgentRequested(activeWorkspaceId()); });
+    m_restartAgentAction->setShortcut(QKeySequence("Ctrl+Shift+R"));
+    workspace->addSeparator();
+    m_nextAgentAction = workspace->addAction("Ne&xt agent", this, [this] { stepAgent(1); });
+    m_nextAgentAction->setShortcut(QKeySequence("Ctrl+PgDown"));
+    m_prevAgentAction = workspace->addAction("&Previous agent", this, [this] { stepAgent(-1); });
+    m_prevAgentAction->setShortcut(QKeySequence("Ctrl+PgUp"));
+    workspace->addSeparator();
+    ChangesToolbar* changes = m_explorer->changesToolbar();
+    workspace->addAction(changes->mergeAction());
+    workspace->addAction(changes->rebaseAction());
+    workspace->addAction(changes->squashAction());
+    workspace->addAction(changes->prAction());
+    workspace->addAction(changes->discardAction());
+    workspace->addSeparator();
+    // Both go through the handlers the tab's context menu uses, which read the
+    // workspace once and put a named question in front of the user. The menu
+    // supplies the name from the same tab it took the id from, so the question
+    // and the act cannot be about different workspaces.
+    m_destroyAction = workspace->addAction("&Destroy workspace…", this, [this] {
+        onDestroyRequested(activeWorkspaceId(), activeTab().value("name").toString());
+    });
+    m_closeGroupAction =
+        workspace->addAction("&Close group…", this, [this] { onCloseGroup(activeGroupName()); });
+
     menuBar()->addMenu("&Run");
 
     // Qt's own toggle actions rather than hand-written ones: the tick and the
@@ -1446,6 +1479,22 @@ QString MainWindow::activeWorkspaceId() const {
                                         m_groupModel->activeTabIndex());
 }
 
+QString MainWindow::activeGroupName() const {
+    return m_groupModel->groupName(m_groupModel->activeGroupIndex());
+}
+
+void MainWindow::stepAgent(int delta) {
+    const int group = m_groupModel->activeGroupIndex();
+    const int count = m_groupModel->tabCount(group);
+    if (count <= 0) {
+        return;
+    }
+    // The second modulo is not redundant: C++ leaves a negative dividend's
+    // remainder negative, and Previous on the first tab is exactly that.
+    const int next = ((m_groupModel->activeTabIndex() + delta) % count + count) % count;
+    m_groupModel->setActive(group, next);
+}
+
 void MainWindow::onActiveTabChanged() {
     const QJsonObject active = activeTab();
     updateWindowTitle(active);
@@ -1587,6 +1636,19 @@ void MainWindow::updateWorkspaceStatus() {
     const QString attention = m_groupModel->attentionText();
     m_attentionLabel->setText(attention);
     m_attentionLabel->setVisible(!attention.isEmpty());
+    // Before the early return below, because the Workspace menu has to be
+    // greyed out precisely in the case that returns early. Everything here
+    // acts on the active workspace, and an entry that can only fail is worse
+    // than one that is visibly unavailable; the five git actions grey
+    // themselves, in the toolbar these are shared with. Next and Previous need
+    // somewhere to go rather than merely something to leave.
+    const bool live = !active.isEmpty();
+    m_restartAgentAction->setEnabled(live);
+    m_destroyAction->setEnabled(live);
+    m_closeGroupAction->setEnabled(live);
+    const bool several = m_groupModel->tabCount(group) > 1;
+    m_nextAgentAction->setEnabled(several);
+    m_prevAgentAction->setEnabled(several);
     if (active.isEmpty()) {
         m_branchLabel->setText("-");
         m_branchLabel->setToolTip(QString());
@@ -1682,15 +1744,19 @@ QMenu* menuTitled(const MainWindow& window, const QString& title) {
     return nullptr;
 }
 
-/// The menu's first entry whose text holds `text`, or null. A fragment rather
-/// than the whole text, so the checks do not have to spell the accelerator's
-/// ampersand or the ellipsis that marks an entry which asks something first.
+/// The menu's first entry whose text holds `text`, or null.
+///
+/// A fragment rather than the whole text, so a check need not spell the
+/// ellipsis that marks an entry which asks something first. The accelerator's
+/// ampersand is taken out before the comparison, because it sits in the middle
+/// of a word as often as in front of one -- `Ne&xt agent` -- and a check that
+/// had to know where would be pinning the accelerator rather than the entry.
 QAction* menuAction(const QMenu* menu, const QString& text) {
     if (menu == nullptr) {
         return nullptr;
     }
     for (QAction* action : menu->actions()) {
-        if (action->text().contains(text)) {
+        if (QString(action->text()).remove(QLatin1Char('&')).contains(text)) {
             return action;
         }
     }
@@ -1820,6 +1886,61 @@ extern "C" std::int32_t bs_widget_test_window_menu_brings_a_closed_dock_back() {
     entry->trigger();
     if (dock->isHidden()) {
         return 7;
+    }
+    return 0;
+}
+
+/// The Workspace menu holds every action that used to be somewhere less
+/// findable, and the five git ones are the Changes toolbar's own objects
+/// rather than copies.
+///
+/// The identity is the point. Enablement for those five is written once, in
+/// the toolbar, and a menu carrying a second set would offer a merge on a
+/// workspace that already has one out.
+extern "C" std::int32_t bs_widget_test_workspace_menu_gathers_the_git_actions() {
+    useThrowawayState();
+    WindowFixture fixture;
+    MainWindow& window = fixture.window;
+
+    QMenu* menu = menuTitled(window, QStringLiteral("&Workspace"));
+    if (menu == nullptr) {
+        return 1;
+    }
+    for (const QString& text :
+         QStringList{ QStringLiteral("New Agent"), QStringLiteral("Restart agent"),
+                      QStringLiteral("Next agent"), QStringLiteral("Previous agent"),
+                      QStringLiteral("Merge"), QStringLiteral("Rebase"), QStringLiteral("Squash"),
+                      QStringLiteral("Create PR"), QStringLiteral("Discard"),
+                      QStringLiteral("Destroy workspace"), QStringLiteral("Close group") }) {
+        if (!menuHasAction(menu, text)) {
+            return 2;
+        }
+    }
+    auto* explorer = window.findChild<ExplorerDock*>(QStringLiteral("ExplorerDock"));
+    if (explorer == nullptr ||
+        menuAction(menu, QStringLiteral("Merge")) != explorer->changesToolbar()->mergeAction() ||
+        menuAction(menu, QStringLiteral("Discard")) !=
+            explorer->changesToolbar()->discardAction()) {
+        return 3;
+    }
+    // With no workspace, everything that acts on one is dead rather than
+    // offering an action that can only fail.
+    for (const QString& text :
+         QStringList{ QStringLiteral("Merge"), QStringLiteral("Discard"),
+                      QStringLiteral("Restart agent"), QStringLiteral("Destroy workspace"),
+                      QStringLiteral("Close group"), QStringLiteral("Next agent") }) {
+        if (menuActionEnabled(menu, text)) {
+            return 4;
+        }
+    }
+    // New Agent needs nothing to act on: it is how a window with no workspaces
+    // stops being one.
+    if (!menuActionEnabled(menu, QStringLiteral("New Agent"))) {
+        return 5;
+    }
+    if (menuAction(menu, QStringLiteral("Restart agent"))->shortcut() !=
+        QKeySequence(QStringLiteral("Ctrl+Shift+R"))) {
+        return 6;
     }
     return 0;
 }

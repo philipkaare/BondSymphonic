@@ -248,6 +248,15 @@ private:
     QJsonObject activeTab() const;
     /// The workspace the Explorer, the panes and a newly opened file belong to.
     QString activeWorkspaceId() const;
+    /// The group whose tabs are in front, or an empty string when the model has
+    /// no group at that index. What Workspace > Close group acts on.
+    QString activeGroupName() const;
+    /// Selects the agent `delta` places along in the active group, wrapping at
+    /// either end.
+    ///
+    /// Wrapping because the alternative is a menu entry that does nothing on
+    /// the last tab, which a user cannot tell from one that is broken.
+    void stepAgent(int delta);
     /// The transcript model of the visible pane when it is attached to
     /// `agentId`, or null after warning that the request was not routed.
     /// `what` names the request, for that warning.
@@ -299,6 +308,16 @@ private:
     EditorArea* m_editorArea = nullptr;
     /// Undo, Redo, Cut, Copy, Paste and Select All, enabled together.
     QList<QAction*> m_editActions;
+    /// The Workspace menu's own entries -- the ones that are not the Changes
+    /// toolbar's, which grey themselves. Each acts on the active workspace, so
+    /// each is dead while there is not one; `updateWorkspaceStatus` is where
+    /// that is decided, because it already runs on every tab change.
+    QAction* m_restartAgentAction = nullptr;
+    QAction* m_destroyAction = nullptr;
+    QAction* m_closeGroupAction = nullptr;
+    /// The two that need a *second* tab to go to rather than merely one tab.
+    QAction* m_nextAgentAction = nullptr;
+    QAction* m_prevAgentAction = nullptr;
     /// The right-hand dock, holding the agent pane.
     QDockWidget* m_agentDock = nullptr;
     /// The per-workspace agent pane inside it.
