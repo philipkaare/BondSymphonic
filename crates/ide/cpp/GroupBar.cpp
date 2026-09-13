@@ -7,6 +7,7 @@
 #include <QByteArray>
 #include <QChar>
 #include <QColor>
+#include <QCoreApplication>
 #include <QEvent>
 #include <QFont>
 #include <QHBoxLayout>
@@ -577,6 +578,58 @@ extern "C" std::int32_t bs_widget_test_group_bar_names_the_repository() {
     // the repository is spelled in full there rather than by its last part.
     if (!workspacelabel::originFull(tab).contains(QLatin1String("C:/git/BondSymphonic"))) {
         return 4;
+    }
+    return 0;
+}
+
+/// The band comes back to where it started after a round trip through the other
+/// palette, rather than a step further from the window each time.
+///
+/// `theme::band` lifts the *window* colour and `applyBand` installs the result
+/// as this widget's own window colour, so the next band is lifted off the last
+/// one unless the palette is cleared first. Nothing about that is visible in a
+/// single switch: the bar simply drifts a shade paler every time the theme
+/// changes, and is only obviously wrong after several. That is what makes it
+/// worth a check rather than a comment -- removing the clear fails this on the
+/// first round trip.
+extern "C" std::int32_t bs_widget_test_group_bar_does_not_lift_a_band_off_a_band() {
+    QPalette dark;
+    dark.setColor(QPalette::Window, QColor(0x25, 0x25, 0x26));
+    dark.setColor(QPalette::Base, QColor(0x1e, 0x1e, 0x1e));
+    dark.setColor(QPalette::WindowText, QColor(0xdc, 0xdc, 0xdc));
+    QPalette light;
+    light.setColor(QPalette::Window, QColor(0xf0, 0xf0, 0xf0));
+    light.setColor(QPalette::Base, QColor(0xff, 0xff, 0xff));
+    light.setColor(QPalette::WindowText, QColor(0x1e, 0x1e, 0x1e));
+
+    QWidget host;
+    host.setPalette(dark);
+    GroupModel model;
+    auto* bar = new GroupBar(&model, &host);
+    const QColor first = bar->palette().color(QPalette::Window);
+
+    host.setPalette(light);
+    QCoreApplication::processEvents();
+    if (bar->palette().color(QPalette::Window) == first) {
+        // The band never heard the palette change at all.
+        return 1;
+    }
+
+    host.setPalette(dark);
+    QCoreApplication::processEvents();
+    if (bar->palette().color(QPalette::Window) != first) {
+        return 2;
+    }
+    // Twice more, because one round trip of drift can be too small to see and
+    // three is not.
+    for (int i = 0; i < 2; ++i) {
+        host.setPalette(light);
+        QCoreApplication::processEvents();
+        host.setPalette(dark);
+        QCoreApplication::processEvents();
+    }
+    if (bar->palette().color(QPalette::Window) != first) {
+        return 3;
     }
     return 0;
 }
