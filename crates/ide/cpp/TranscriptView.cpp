@@ -226,10 +226,17 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
                                       QString::fromUtf8(agentchoices::defaultPermissionMode()));
     m_interrupt = new QPushButton(QStringLiteral("Interrupt"), m_composer);
     m_interrupt->setToolTip(QStringLiteral("End this turn; the agent stays alive"));
-    choices->addWidget(m_modelChoice);
-    choices->addWidget(m_permissionChoice);
-    choices->addStretch(1);
-    choices->addWidget(m_interrupt);
+    // Both combos share what is left after Interrupt, and both may shrink well
+    // below the width their longest entry wants -- "Default (Claude Code
+    // decides)" is a wide thing to demand of a dock somebody has dragged narrow.
+    // Without this the row sets a floor under the whole pane's width.
+    for (QComboBox* choice : { m_modelChoice, m_permissionChoice }) {
+        choice->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+        choice->setMinimumContentsLength(6);
+    }
+    choices->addWidget(m_modelChoice, 1);
+    choices->addWidget(m_permissionChoice, 1);
+    choices->addWidget(m_interrupt, 0);
     bottom->addLayout(choices, 0);
     outer->addWidget(m_composer);
 
@@ -254,7 +261,13 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     // wait for something that is never going to happen on its own, whereas
     // this says what is missing and leads to the one place it can be fixed.
     m_loginGate = new QWidget(this);
-    auto* gateLayout = new QHBoxLayout(m_loginGate);
+    // Stacked, not side by side. The agent pane is a dock now and is routinely
+    // a couple of hundred pixels wide; beside a button whose text sets its
+    // width, a wrapped sentence is squeezed into whatever is left and comes out
+    // one word per line. Nothing about that is visible until the pane is
+    // narrow, which is why it survived the offscreen checks and did not survive
+    // looking at it.
+    auto* gateLayout = new QVBoxLayout(m_loginGate);
     gateLayout->setContentsMargins(4, 4, 4, 4);
     gateLayout->setSpacing(4);
     auto* gateText = new QLabel(
@@ -262,13 +275,13 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
         m_loginGate);
     gateText->setWordWrap(true);
     gateText->setEnabled(false);
-    gateLayout->addWidget(gateText, 1);
+    gateLayout->addWidget(gateText);
     auto* loginButton =
         new QPushButton(QStringLiteral("Log in to Claude Code") + QChar(kEllipsis), m_loginGate);
     // Named so a test can find it without the view growing an accessor for it.
     loginButton->setObjectName(QStringLiteral("bsClaudeLogin"));
     loginButton->setToolTip(QStringLiteral("Open Settings on the Setup section"));
-    gateLayout->addWidget(loginButton, 0);
+    gateLayout->addWidget(loginButton, 0, Qt::AlignLeft);
     m_loginGate->hide();
     outer->addWidget(m_loginGate);
     QObject::connect(loginButton, &QPushButton::clicked, this,

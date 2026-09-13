@@ -827,7 +827,15 @@ void MainWindow::connectController() {
                          }
                      });
     QObject::connect(m_controller, &AppController::workspaceChanged, this,
-                     [this](const QString& info) { m_groupModel->applyWorkspaceInfo(info); });
+                     [this](const QString& info) {
+                         m_groupModel->applyWorkspaceInfo(info);
+                         // A workspace whose sandbox has just come up is a
+                         // workspace that can now take an agent. On a restore
+                         // every one of them is still starting when the list
+                         // arrives, so this -- not the list -- is where most
+                         // agents actually start.
+                         startAgentsThatHaveNone();
+                     });
     // Before `onWorkspaceDestroyed`, which takes the tab out and so provokes
     // the active-tab change that points the Run panel at whatever survived: the
     // dead workspace's runs, logs and blocked hosts have to be gone by then.
@@ -879,6 +887,7 @@ void MainWindow::connectController() {
                          // whose agent died and came back keeps a button that
                          // would kill the conversation it just resumed.
                          m_agentArea->setRestartOffered(workspaceId, false);
+                         m_autoStarting.remove(workspaceId);
                          rebindCost();
                      });
     // A transcript pane with no agent -- a restored session, or one whose agent
@@ -1216,14 +1225,31 @@ void MainWindow::startAgentsThatHaveNone() {
             // An agent that exited is left alone. That is a failure with a
             // banner and a Restart button on it, and starting it again from
             // here would turn one crash into a loop that reports itself as a
-            // working agent.
-            if (tab.value("agent_status").toString() == QLatin1String("exited")) {
+            // working agent. `Done` is what an exit is called here:
+            // `TabStatus::from_agent_state` maps `AgentState::Exited` onto it.
+            if (tab.value("agent_status").toString() == QLatin1String("Done")) {
+                continue;
+            }
+            // The sandbox has to be up first. `agent.start` against a workspace
+            // whose sandbox is still coming up fails with `SandboxError`, and
+            // on a restore every workspace is in that state for the first few
+            // seconds — so starting on the workspace list alone produced one
+            // failed start per workspace, every launch. The workspaces that are
+            // not ready yet are picked up by `workspaceChanged` as each one
+            // becomes so.
+            const QString status = tab.value("status").toString();
+            if (status == QLatin1String("Creating") || status == QLatin1String("SandboxDown") ||
+                status == QLatin1String("Error")) {
                 continue;
             }
             const QString workspaceId = tab.value("workspace_id").toString();
-            if (workspaceId.isEmpty()) {
+            if (workspaceId.isEmpty() || m_autoStarting.contains(workspaceId)) {
                 continue;
             }
+            // Remembered until the start answers either way. This runs on every
+            // workspace change, and a second `agent.start` for a workspace whose
+            // first one is still in flight would give it two agents.
+            m_autoStarting.insert(workspaceId);
             m_agentArea->setStarting(workspaceId, true);
             m_controller->startAgent(workspaceId, tab.value("options_json").toString());
         }
@@ -1559,6 +1585,10 @@ void MainWindow::onWorkspaceOpFailed(const QString& workspaceId, const QString& 
         // The pane must stop saying it is starting something. The signal names
         // the workspace, so only the pane that asked comes out of it.
         m_agentArea->setStarting(workspaceId, false);
+        // And the automatic start is no longer in flight, so a later workspace
+        // change may try again. A sandbox that was still coming up is exactly
+        // the failure worth retrying, and it is the common one.
+        m_autoStarting.remove(workspaceId);
     }
     reportFailure(op, message);
 }

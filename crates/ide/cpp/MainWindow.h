@@ -291,6 +291,16 @@ private:
     /// banner and a Restart button on it, and starting it again from here
     /// would turn one crash into a loop that looks like a working agent.
     void startAgentsThatHaveNone();
+
+    /// Workspaces whose automatic `agent.start` is still in flight.
+    ///
+    /// [`startAgentsThatHaveNone`] runs on every workspace change, because a
+    /// sandbox that was not up on the first pass usually is on a later one. A
+    /// workspace is in here from the moment its start is sent until it answers
+    /// — `agentStarted` or an `agent.start` failure — so those repeated passes
+    /// cannot ask for a second agent while the first request is still on the
+    /// wire.
+    QSet<QString> m_autoStarting;
     /// Adds one Edit menu item forwarding to the current editor's view, and
     /// books it in for enabling and disabling together with its siblings.
     ///
