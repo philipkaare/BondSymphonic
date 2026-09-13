@@ -35,18 +35,27 @@ use tracing::warn;
 /// degrades gracefully — but it is worth one warning in the log.
 pub const TESTED_CLAUDE_VERSION: &str = "2.1.263";
 
-/// Values the CLI accepts for `--permission-mode`, verbatim from
-/// `claude --help` at [`TESTED_CLAUDE_VERSION`]. Checked here so a bad one is
+/// Values the CLI accepts for `--permission-mode`. Checked here so a bad one is
 /// an `InvalidParams` on `agent.start` rather than a process that exits with a
-/// usage error a second later -- which is what `default` used to do, from an
-/// allow-list that was supposed to prevent exactly that.
-const PERMISSION_MODES: [&str; 6] = [
+/// usage error a second later.
+///
+/// Six of these are what `claude --help` lists at [`TESTED_CLAUDE_VERSION`].
+/// The seventh, `default`, is not listed any more but is still accepted --
+/// probed against the binary, which rejects `nonsense` and takes `default`
+/// without complaint -- and it is the same mode as `manual`, which the CLI's
+/// own `system`/`init` line reports as `"permissionMode":"default"`. It stays
+/// in the list because an older IDE, or a workspace whose options were stored
+/// before the IDE settled on one spelling, sends it; refusing it here would
+/// turn a word the CLI is perfectly happy with into an agent that will not
+/// start.
+const PERMISSION_MODES: [&str; 7] = [
     "manual",
     "acceptEdits",
     "plan",
     "auto",
     "dontAsk",
     "bypassPermissions",
+    "default",
 ];
 
 /// How long `interrupt` waits for the CLI to abandon its turn on its own before
@@ -1251,10 +1260,13 @@ settings = \"s.json\"
         );
     }
 
-    /// The allow-list is the CLI's own list, not a superset of it. `default` was
-    /// in ours and has never been in the CLI's: `--permission-mode default` is a
-    /// usage error, and an agent that dies of one looks from the pane exactly like
-    /// an agent that hung.
+    /// The allow-list is the six modes `claude --help` lists plus `default`,
+    /// which it no longer lists and still accepts.
+    ///
+    /// Pinning the seventh is the point of this test. It is tempting to read
+    /// the help text and delete the word that is not in it; the binary says
+    /// otherwise, and deleting it would refuse a mode the CLI takes -- which
+    /// an older IDE still sends -- and stop those agents from starting at all.
     #[test]
     fn the_permission_modes_are_the_ones_the_cli_accepts() {
         let mut sorted = PERMISSION_MODES;
@@ -1265,6 +1277,7 @@ settings = \"s.json\"
                 "acceptEdits",
                 "auto",
                 "bypassPermissions",
+                "default",
                 "dontAsk",
                 "manual",
                 "plan"
@@ -1278,9 +1291,10 @@ settings = \"s.json\"
             permission_mode: Some(mode.to_owned()),
             api_key: None,
         };
-        assert!(claude_argv(&options("default"), "linux_bwrap").is_err());
+        assert!(claude_argv(&options("default"), "linux_bwrap").is_ok());
         assert!(claude_argv(&options("manual"), "linux_bwrap").is_ok());
         assert!(claude_argv(&options("bypassPermissions"), "linux_bwrap").is_ok());
+        assert!(claude_argv(&options("nonsense"), "linux_bwrap").is_err());
     }
 
     /// `BS_CLAUDE_BIN` is process-wide, so every case that touches it lives in
@@ -1342,7 +1356,8 @@ settings = \"s.json\"
             claude_argv(&bad, NOOP).unwrap_err().code,
             ErrorCode::InvalidParams
         );
-        // Every mode the CLI documents is accepted.
+        // Every mode the list holds is accepted, the undocumented alias
+        // included.
         for mode in PERMISSION_MODES {
             let opts = AgentStartOptions {
                 permission_mode: Some(mode.into()),
