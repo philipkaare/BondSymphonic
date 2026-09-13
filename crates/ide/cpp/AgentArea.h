@@ -112,6 +112,16 @@ public:
     /// failure left.
     void clearBanner(const QString& workspaceId);
 
+    /// Records what `workspaceId`'s pane should say while its transcript is
+    /// empty, from the tab JSON the window already holds: the agent's name, the
+    /// repository and branch the work forked from, and the worktree it happens
+    /// in.
+    ///
+    /// Held for a workspace whose pane has not been built yet, for the same
+    /// reason a banner is: a Claude workspace is created before its tab is
+    /// first shown, and the welcome is the one thing that pane has to say.
+    void setWelcome(const QString& workspaceId, const QString& tabJson);
+
     /// Records the `AgentStartOptions` the workspace's tab was created with on
     /// its transcript model, so a Restart resumes the same conversation with
     /// the same model and permission mode. A workspace with no transcript is
@@ -122,6 +132,10 @@ private:
     /// Creates the transcript pane for `workspaceId` if it has none, and
     /// attaches it to `agentId` when that is new. Returns the pane.
     TranscriptView* ensureTranscript(const QString& workspaceId, const QString& agentId);
+
+    /// Puts the workspace's held tab JSON on its pane as the welcome's three
+    /// lines. Does nothing for a workspace the window has not described.
+    void applyWelcome(const QString& workspaceId, TranscriptView* view);
 
     /// Wraps `body` in the page this area actually stacks: a banner above the
     /// pane, hidden until something fails. Records both and returns the page.
@@ -138,6 +152,9 @@ private:
     /// terminal or a transcript without either widget knowing about it.
     QHash<QString, QWidget*> m_pages;
     QHash<QString, WorkspaceBanner*> m_banners;
+    /// The tab JSON each workspace's welcome is written from, kept because the
+    /// window says it once and the pane may be built long afterwards.
+    QHash<QString, QString> m_welcomes;
     /// A banner raised for a workspace that had no pane yet: its title, detail
     /// and stderr, in that order, waiting for the pane to be built.
     QHash<QString, QStringList> m_pendingBanners;

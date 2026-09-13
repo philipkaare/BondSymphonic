@@ -67,6 +67,17 @@ public:
     /// happens in the setup terminal, which is a PTY and can.
     void setClaudeLoggedIn(bool loggedIn);
 
+    /// What the pane says while the transcript is empty: that the agent is
+    /// there, what it will answer as, where the work came from and where it
+    /// happens. `origin` is `workspacelabel::origin`'s repository and base
+    /// branch; `worktree` is the directory the agent is standing in.
+    ///
+    /// A frame the view writes, not a transcript item: it is not persisted, not
+    /// replayed, and the first real message takes its place. The daemon has
+    /// nothing to say until the agent speaks, and a pane that has been waiting
+    /// for a prompt for a minute should say what is waiting.
+    void setWelcome(const QString& name, const QString& origin, const QString& worktree);
+
     /// How many times the view has read transcript JSON out of the model and
     /// parsed it, whether one item or the whole list. Test seam: what says that
     /// a streamed answer costs a handful of reads rather than one per delta.
@@ -81,6 +92,8 @@ public:
     /// The frames on show, for a check that reads one back.
     int frameCount() const;
     QWidget* frameAt(int index) const;
+    /// The welcome's three lines, or empty when it is not on show.
+    QString welcomeTextForTest() const;
 #endif
 
 signals:
@@ -130,6 +143,11 @@ private:
     /// that is empty -- "let Claude Code decide" -- is spelled `-`, which is
     /// how `restartOptionsChoosing` tells it apart from "leave this alone".
     QString chosenModelId() const;
+    /// Rewrites the welcome's three lines and shows or hides it. Called from
+    /// everything that could change any of the four things it says: the
+    /// transcript filling or emptying, the dropdowns moving, and the workspace
+    /// naming itself.
+    void updateWelcome();
     /// Puts `message` in the banner, or takes it down when both the daemon's
     /// state and the last request are clean.
     void refreshBanner();
@@ -159,6 +177,18 @@ private:
     /// The column of frames, with a stretch as its last entry.
     QVBoxLayout* m_frameLayout = nullptr;
     QList<QWidget*> m_frames;
+    /// The three lines an empty pane shows, at the head of the frame column so
+    /// the first real message appears under them and then replaces them. Never
+    /// in [`m_frames`]: it is not an item, and a rebuild must not take it away.
+    QWidget* m_welcome = nullptr;
+    QLabel* m_welcomeReady = nullptr;
+    QLabel* m_welcomeWhat = nullptr;
+    QLabel* m_welcomeWhere = nullptr;
+    /// What [`setWelcome`] was told. Empty until the window says, which is why
+    /// a view built without one shows nothing rather than "  is ready.".
+    QString m_welcomeName;
+    QString m_welcomeOrigin;
+    QString m_welcomeWorktree;
     QLabel* m_banner = nullptr;
     PermissionBar* m_permission = nullptr;
     /// The prompt box and its three buttons as one widget, so the login gate

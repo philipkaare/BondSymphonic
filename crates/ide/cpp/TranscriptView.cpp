@@ -144,6 +144,29 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     m_frameLayout = new QVBoxLayout(column);
     m_frameLayout->setContentsMargins(0, 4, 0, 4);
     m_frameLayout->setSpacing(4);
+    // At the head of the column, before the stretch and before any frame, so
+    // the first real message appears under it and then takes its place. It is
+    // laid out here rather than above the scroll because an empty pane and a
+    // pane with one message should not put their first line in two different
+    // places.
+    m_welcome = new QWidget(column);
+    auto* welcomeLayout = new QVBoxLayout(m_welcome);
+    welcomeLayout->setContentsMargins(6, 8, 6, 8);
+    welcomeLayout->setSpacing(2);
+    m_welcomeReady = new QLabel(m_welcome);
+    m_welcomeWhat = new QLabel(m_welcome);
+    m_welcomeWhere = new QLabel(m_welcome);
+    for (QLabel* line : { m_welcomeReady, m_welcomeWhat, m_welcomeWhere }) {
+        line->setTextFormat(Qt::PlainText);
+        line->setWordWrap(true);
+        welcomeLayout->addWidget(line);
+    }
+    // The same grey the result and system lines wear. What the pane is about to
+    // do is not news, and it must not read as the agent's first answer.
+    applySmallGrey(m_welcomeWhat, false);
+    applySmallGrey(m_welcomeWhere, false);
+    m_welcome->hide();
+    m_frameLayout->addWidget(m_welcome);
     // The stretch is the column's last entry for the life of the view; every
     // frame is inserted in front of it, so a short conversation sits at the top
     // instead of being spread down the pane.
@@ -204,10 +227,14 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     bottom->addLayout(choices, 0);
     outer->addWidget(m_composer);
 
-    QObject::connect(m_modelChoice, &QComboBox::currentIndexChanged, this,
-                     [this](int) { emitOptionsChanged(); });
-    QObject::connect(m_permissionChoice, &QComboBox::currentIndexChanged, this,
-                     [this](int) { emitOptionsChanged(); });
+    QObject::connect(m_modelChoice, &QComboBox::currentIndexChanged, this, [this](int) {
+        emitOptionsChanged();
+        updateWelcome();
+    });
+    QObject::connect(m_permissionChoice, &QComboBox::currentIndexChanged, this, [this](int) {
+        emitOptionsChanged();
+        updateWelcome();
+    });
     if (QLineEdit* typed = m_modelChoice->lineEdit()) {
         // A model name typed rather than picked is still a choice, and the CLI
         // takes names this build has never heard of. On the edit being finished
@@ -356,6 +383,7 @@ void TranscriptView::rebuild() {
     // replaced.
     m_requestError.clear();
     refreshBanner();
+    updateWelcome();
 }
 
 void TranscriptView::onItemAppended(int index) {
@@ -371,6 +399,8 @@ void TranscriptView::onItemAppended(int index) {
     QWidget* frame = makeFrame(itemAt(index), index);
     m_frames.append(frame);
     m_frameLayout->insertWidget(m_frameLayout->count() - 1, frame);
+    // The first real message is what the welcome was standing in for.
+    updateWelcome();
 }
 
 void TranscriptView::onItemChanged(int index) {
@@ -500,6 +530,40 @@ void TranscriptView::onStateChanged() {
     refreshBanner();
 }
 
+void TranscriptView::setWelcome(const QString& name, const QString& origin,
+                                const QString& worktree) {
+    m_welcomeName = name;
+    m_welcomeOrigin = origin;
+    m_welcomeWorktree = worktree;
+    updateWelcome();
+}
+
+void TranscriptView::updateWelcome() {
+    // Nothing to say without a name, and nothing to say over a conversation
+    // that has already started.
+    if (m_welcomeName.isEmpty() || !m_frames.isEmpty()) {
+        m_welcome->hide();
+        return;
+    }
+    m_welcomeReady->setText(m_welcomeName + QStringLiteral(" is ready."));
+    const QString dot = QStringLiteral(" ") + QChar(kMiddleDot) + QStringLiteral(" ");
+    // Read off the dropdowns rather than off the options, so the line says what
+    // the pane is showing even in the seconds between a switch being chosen and
+    // the restarted agent coming back with it.
+    const QString model = chosenModelId();
+    QStringList what{
+        agentchoices::labelForModel(model == QStringLiteral("-") ? QString() : model),
+        agentchoices::labelForPermissionMode(m_permissionChoice->currentData().toString())
+    };
+    if (!m_welcomeOrigin.isEmpty()) {
+        what.append(m_welcomeOrigin);
+    }
+    m_welcomeWhat->setText(what.join(dot));
+    m_welcomeWhere->setText(m_welcomeWorktree);
+    m_welcomeWhere->setVisible(!m_welcomeWorktree.isEmpty());
+    m_welcome->show();
+}
+
 void TranscriptView::applyOptionsToChoices() {
     if (m_model.isNull()) {
         return;
@@ -519,6 +583,7 @@ void TranscriptView::applyOptionsToChoices() {
     m_applyingOptions = false;
     m_sentModel = chosenModelId();
     m_sentMode = m_permissionChoice->currentData().toString();
+    updateWelcome();
 }
 
 QString TranscriptView::chosenModelId() const {
@@ -730,6 +795,18 @@ QWidget* TranscriptView::frameAt(int index) const {
     return index >= 0 && index < m_frames.size() ? m_frames.at(index) : nullptr;
 }
 
+QString TranscriptView::welcomeTextForTest() const {
+    // `isHidden` rather than `isVisible`: an offscreen check never shows a
+    // window, so every widget in it is invisible and only the explicit hide
+    // says anything.
+    if (m_welcome->isHidden()) {
+        return QString();
+    }
+    return QStringList{ m_welcomeReady->text(), m_welcomeWhat->text(),
+                        m_welcomeWhere->text() }
+        .join(QLatin1Char('\n'));
+}
+
 #endif // BS_WIDGET_TESTS
 
 bool TranscriptView::atBottom() const {
@@ -934,6 +1011,67 @@ extern "C" std::int32_t bs_widget_test_transcript_composer_offers_model_and_mode
     }
     if (sent.size() != 3) {
         return 13;
+    }
+    return 0;
+}
+
+/// A pane with nothing in it says what is waiting, and stops saying it the
+/// moment there is something to read instead.
+///
+/// An empty transcript said nothing at all, which after the Start button went
+/// away left a blank pane over a prompt box. What it says is written here and
+/// not by the daemon -- the daemon has nothing to say until the agent speaks --
+/// and it is a frame rather than an item, so it is never persisted, never
+/// replayed, and never something the user scrolls back past a week later.
+extern "C" std::int32_t bs_widget_test_transcript_welcomes_an_empty_pane() {
+    TranscriptModel model;
+    model.setOptionsJson(
+        QStringLiteral(R"({"model":"claude-opus-5","permission_mode":"bypassPermissions"})"));
+    TranscriptView view(&model);
+    view.setWelcome(QStringLiteral("agent-4"), QStringLiteral("BondSymphonic @ main"),
+                    QStringLiteral("/home/bs/.bondsymphonic/worktrees/ws_1"));
+    view.setTestItems(QStringList());
+    model.resetItems();
+
+    const QString shown = view.welcomeTextForTest();
+    if (!shown.contains(QLatin1String("agent-4 is ready."))) {
+        return 1;
+    }
+    if (!shown.contains(QLatin1String("BondSymphonic @ main")) ||
+        !shown.contains(QLatin1String("/home/bs/.bondsymphonic/worktrees/ws_1"))) {
+        return 2;
+    }
+    // What it will answer as, in the words the dropdowns use rather than in the
+    // ids the CLI takes: a line the user reads is not a command line.
+    if (!shown.contains(QLatin1String("Opus 5")) ||
+        !shown.contains(QLatin1String("YOLO (sandboxed)"))) {
+        return 3;
+    }
+
+    // The first real message takes its place: a welcome that stays is a frame
+    // the user scrolls past for the rest of the conversation.
+    view.setTestItems(QStringList{ QStringLiteral(R"({"kind":"user","text":"hello"})") });
+    model.resetItems();
+    if (!view.welcomeTextForTest().isEmpty()) {
+        return 4;
+    }
+    if (view.frameCount() != 1) {
+        return 5;
+    }
+
+    // And comes back for a transcript that empties, which is what attaching to
+    // a fresh agent does to a pane that has been used.
+    view.setTestItems(QStringList());
+    model.resetItems();
+    if (view.welcomeTextForTest().isEmpty()) {
+        return 6;
+    }
+
+    // A view nobody has described says nothing rather than "  is ready.".
+    TranscriptModel bare;
+    TranscriptView unnamed(&bare);
+    if (!unnamed.welcomeTextForTest().isEmpty()) {
+        return 7;
     }
     return 0;
 }

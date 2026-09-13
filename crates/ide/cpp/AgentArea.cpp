@@ -2,8 +2,11 @@
 #include "TerminalWidget.h"
 #include "TranscriptView.h"
 #include "WorkspaceBanner.h"
+#include "WorkspaceLabel.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/transcript_model.cxxqt.h"
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QVBoxLayout>
 
@@ -109,6 +112,26 @@ void AgentArea::setOptionsJson(const QString& workspaceId, const QString& option
     model->setOptionsJson(optionsJson);
 }
 
+void AgentArea::setWelcome(const QString& workspaceId, const QString& tabJson) {
+    if (workspaceId.isEmpty() || tabJson.isEmpty()) {
+        return;
+    }
+    m_welcomes.insert(workspaceId, tabJson);
+    if (TranscriptView* view = m_transcripts.value(workspaceId)) {
+        applyWelcome(workspaceId, view);
+    }
+}
+
+void AgentArea::applyWelcome(const QString& workspaceId, TranscriptView* view) {
+    const QJsonObject tab =
+        QJsonDocument::fromJson(m_welcomes.value(workspaceId).toUtf8()).object();
+    if (tab.isEmpty()) {
+        return;
+    }
+    view->setWelcome(tab.value(QStringLiteral("name")).toString(), workspacelabel::origin(tab),
+                     tab.value(QStringLiteral("worktree_path")).toString());
+}
+
 void AgentArea::setStarting(const QString& workspaceId, bool starting) {
     if (workspaceId.isEmpty()) {
         return;
@@ -167,6 +190,9 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
         // Built with the gate the area already knows about, rather than with a
         // composer that is taken away a moment later.
         view->setClaudeLoggedIn(m_claudeLoggedIn);
+        // And with what the window said about this workspace before the pane
+        // existed, which for a workspace just created is all of it.
+        applyWelcome(workspaceId, view);
     }
     setAgent(workspaceId, agentId);
     return view;
@@ -187,6 +213,7 @@ void AgentArea::showPlaceholder() {
 }
 
 void AgentArea::removeWorkspace(const QString& workspaceId) {
+    m_welcomes.remove(workspaceId);
     m_attached.remove(workspaceId);
     m_starting.remove(workspaceId);
     m_banners.remove(workspaceId);
