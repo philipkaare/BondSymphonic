@@ -164,6 +164,13 @@ fn keep_aside(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The palette a settings file that predates the choice reads back as.
+pub const DEFAULT_THEME: &str = "system";
+
+fn default_theme() -> String {
+    DEFAULT_THEME.to_owned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -178,6 +185,12 @@ pub struct Settings {
     /// The permission mode a new Claude agent starts on, as the New Agent
     /// dialog's initial combo value.
     pub default_permission_mode: String,
+    /// Which palette the application wears: `system` (whatever Windows is
+    /// doing, and whatever it changes to at dusk), `light` or `dark`. A word
+    /// rather than a bool because "follow the system" is a third state, not a
+    /// missing answer.
+    #[serde(default = "default_theme")]
+    pub theme: String,
 }
 
 impl Default for Settings {
@@ -188,6 +201,7 @@ impl Default for Settings {
             log_level: "info".into(),
             api_key_set: false,
             default_permission_mode: DEFAULT_PERMISSION_MODE.into(),
+            theme: DEFAULT_THEME.into(),
         }
     }
 }

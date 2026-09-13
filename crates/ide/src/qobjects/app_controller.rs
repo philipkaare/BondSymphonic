@@ -721,6 +721,16 @@ pub mod qobject {
         #[qinvokable]
         fn set_default_permission_mode(self: &AppController, mode: QString);
 
+        /// The palette the user chose: `system`, `light` or `dark`.
+        #[qinvokable]
+        fn theme(self: &AppController) -> QString;
+
+        /// Records the palette choice. A word this does not know is ignored,
+        /// because the settings file is the only writer and an unknown one
+        /// could only come from a hand edit.
+        #[qinvokable]
+        fn set_theme(self: &AppController, theme: QString);
+
         /// Someone in Rust asked the window to open a file in an editor tab.
         #[qsignal]
         fn open_file_requested(self: Pin<&mut AppController>, workspace_id: QString, path: QString);
@@ -2701,6 +2711,35 @@ impl qobject::AppController {
         settings.default_permission_mode = mode;
         if let Err(e) = settings.save() {
             tracing::warn!("settings.json could not be written: {e}");
+        }
+    }
+
+    pub fn theme(&self) -> QString {
+        QString::from(&Settings::load().theme)
+    }
+
+    pub fn set_theme(&self, theme: QString) {
+        let theme = theme.to_string();
+        if !["system", "light", "dark"].contains(&theme.as_str()) {
+            return;
+        }
+        // `try_load` for the same reason [`Self::set_default_permission_mode`]
+        // uses it: this writes the whole object back, so a `settings.json` that
+        // could not be read must stop it rather than have the defaults saved
+        // over the user's distro and daemon path.
+        let mut settings = match Settings::try_load() {
+            Ok(settings) => settings,
+            Err(e) => {
+                tracing::warn!("the theme choice was not recorded: {e}");
+                return;
+            }
+        };
+        if settings.theme == theme {
+            return;
+        }
+        settings.theme = theme;
+        if let Err(e) = settings.save() {
+            tracing::warn!("the theme choice could not be saved: {e}");
         }
     }
 

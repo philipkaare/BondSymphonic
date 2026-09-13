@@ -694,3 +694,30 @@ fn a_stored_default_permission_mode_reads_back_as_manual() {
 
     std::env::remove_var(SETTINGS_PATH_ENV);
 }
+
+/// The palette is a setting like any other: chosen once, remembered, and
+/// absent from a file written before it existed -- which must read back as
+/// "follow the system" rather than as an empty string nothing can apply.
+#[test]
+fn the_theme_choice_round_trips_and_defaults_to_the_system_one() {
+    use bondsymphonic_ide::qobjects::settings::{
+        Settings, LEGACY_SETTINGS_PATH_ENV, SETTINGS_PATH_ENV, STATE_PATH_ENV,
+    };
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = temp_dir("theme");
+    let path = dir.join("settings.json");
+    std::fs::write(&path, r#"{"distro":"bondsymphonic"}"#).expect("settings");
+    std::env::set_var(SETTINGS_PATH_ENV, &path);
+    std::env::remove_var(LEGACY_SETTINGS_PATH_ENV);
+    std::env::remove_var(STATE_PATH_ENV);
+
+    let mut settings = Settings::load();
+    assert_eq!(settings.theme, "system");
+
+    settings.theme = "light".to_owned();
+    settings.save().expect("settings save");
+    assert_eq!(Settings::load().theme, "light");
+
+    std::env::remove_var(SETTINGS_PATH_ENV);
+}
