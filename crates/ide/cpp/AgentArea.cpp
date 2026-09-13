@@ -157,6 +157,10 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
                          [this, workspaceId] { emit startAgentRequested(workspaceId); });
         QObject::connect(view, &TranscriptView::loginRequested, this,
                          &AgentArea::loginRequested);
+        QObject::connect(view, &TranscriptView::optionsChanged, this,
+                         [this, workspaceId](const QString& optionsJson) {
+                             emit agentOptionsChanged(workspaceId, optionsJson);
+                         });
         // A start that began before this pane existed -- which is every
         // workspace created with an agent, since the tab is shown first.
         view->setStarting(m_starting.contains(workspaceId));

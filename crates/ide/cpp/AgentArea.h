@@ -34,6 +34,12 @@ signals:
     /// with and how to reach the controller.
     void startAgentRequested(const QString& workspaceId);
 
+    /// `workspaceId`'s composer chose a different model or permission mode, and
+    /// `optionsJson` is the whole `AgentStartOptions` that choice means. The
+    /// window answers it the way it answers a restart, because that is what it
+    /// is: `claude -p` reads both flags once, when the process starts.
+    void agentOptionsChanged(const QString& workspaceId, const QString& optionsJson);
+
     /// The user dismissed `workspaceId`'s error banner. The window answers by
     /// clearing the tab's error mark; the area touches no model.
     void bannerDismissed(const QString& workspaceId);

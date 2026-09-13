@@ -1,4 +1,5 @@
 #include "TranscriptView.h"
+#include "AgentChoices.h"
 #include "CodeView.h"
 #include "PermissionBar.h"
 #include "PromptInput.h"
@@ -6,6 +7,7 @@
 #include "ToolCard.h"
 #include "bondsymphonic-ide/src/qobjects/transcript_model.cxxqt.h"
 #include <QChar>
+#include <QComboBox>
 #include <QEvent>
 #include <QFont>
 #include <QFontMetrics>
@@ -16,6 +18,7 @@
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QLabel>
+#include <QLineEdit>
 #include <QPalette>
 #include <QPushButton>
 #include <QScrollArea>
@@ -163,27 +166,55 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     // The composer as one widget rather than a bare layout, so the login gate
     // can take its place without every child having to be hidden by hand.
     m_composer = new QWidget(this);
-    auto* bottom = new QHBoxLayout(m_composer);
+    auto* bottom = new QVBoxLayout(m_composer);
     bottom->setContentsMargins(4, 4, 4, 4);
     bottom->setSpacing(4);
     m_input = new PromptInput(this);
-    m_interrupt = new QPushButton(QStringLiteral("Interrupt"), this);
-    m_interrupt->setToolTip(QStringLiteral("End this turn; the agent stays alive"));
-    m_stop = new QPushButton(QStringLiteral("Stop"), this);
-    m_stop->setToolTip(QStringLiteral("Stop the agent process"));
-    m_start = new QPushButton(QStringLiteral("Start agent"), this);
-    // Named so a test can find it without the view growing an accessor for it.
-    m_start->setObjectName(QStringLiteral("bsStartAgent"));
-    m_start->setToolTip(QStringLiteral("Start a Claude agent in this workspace"));
-    m_start->hide();
     bottom->addWidget(m_input, 1);
-    auto* buttons = new QVBoxLayout();
-    buttons->setSpacing(4);
-    buttons->addWidget(m_start);
-    buttons->addWidget(m_interrupt);
-    buttons->addWidget(m_stop);
-    bottom->addLayout(buttons, 0);
+
+    // The second row: what this agent is, and the one button that acts on the
+    // conversation rather than on the process. Start and Stop stood here once;
+    // a workspace starts its own agent now, and killing a process is not
+    // something anybody wants from the place they type a sentence.
+    auto* choices = new QHBoxLayout();
+    choices->setSpacing(4);
+    m_modelChoice = new QComboBox(m_composer);
+    m_modelChoice->setObjectName(QStringLiteral("TranscriptModelChoice"));
+    m_modelChoice->setToolTip(QStringLiteral(
+        "The model this agent answers with. Changing it restarts the agent and resumes the "
+        "conversation; a turn in flight is interrupted."));
+    agentchoices::fillModelCombo(m_modelChoice, QString());
+    // Nothing typed here joins the list: an id that only ever existed in one
+    // pane would outlive that pane and be offered to the next agent as though
+    // somebody had chosen it.
+    m_modelChoice->setInsertPolicy(QComboBox::NoInsert);
+    m_permissionChoice = new QComboBox(m_composer);
+    m_permissionChoice->setObjectName(QStringLiteral("TranscriptPermissionChoice"));
+    m_permissionChoice->setToolTip(QStringLiteral(
+        "What this agent asks before it acts. Changing it restarts the agent and resumes the "
+        "conversation."));
+    agentchoices::fillPermissionCombo(m_permissionChoice,
+                                      QString::fromUtf8(agentchoices::defaultPermissionMode()));
+    m_interrupt = new QPushButton(QStringLiteral("Interrupt"), m_composer);
+    m_interrupt->setToolTip(QStringLiteral("End this turn; the agent stays alive"));
+    choices->addWidget(m_modelChoice);
+    choices->addWidget(m_permissionChoice);
+    choices->addStretch(1);
+    choices->addWidget(m_interrupt);
+    bottom->addLayout(choices, 0);
     outer->addWidget(m_composer);
+
+    QObject::connect(m_modelChoice, &QComboBox::currentIndexChanged, this,
+                     [this](int) { emitOptionsChanged(); });
+    QObject::connect(m_permissionChoice, &QComboBox::currentIndexChanged, this,
+                     [this](int) { emitOptionsChanged(); });
+    if (QLineEdit* typed = m_modelChoice->lineEdit()) {
+        // A model name typed rather than picked is still a choice, and the CLI
+        // takes names this build has never heard of. On the edit being finished
+        // rather than on every keystroke: half a model name is not a model.
+        QObject::connect(typed, &QLineEdit::editingFinished, this,
+                         [this] { emitOptionsChanged(); });
+    }
 
     // Shown in the composer's place until `claude_auth` passes. A button and a
     // sentence, not a disabled prompt box: a greyed box invites the user to
@@ -271,19 +302,13 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
             m_model->interrupt();
         }
     });
-    QObject::connect(m_stop, &QPushButton::clicked, this, [this] {
-        if (!m_model.isNull()) {
-            m_model->stop();
-        }
-    });
-    QObject::connect(m_start, &QPushButton::clicked, this, [this] {
-        // The view neither knows the workspace nor talks to the controller: it
-        // says what the user asked for and the area routes it.
-        m_requestError.clear();
-        setStarting(true);
-        emit startAgentRequested();
-    });
+    // The tab's options are set on the model after this view is built, and
+    // again every time a restart lands, so the dropdowns follow the property
+    // rather than being filled once from whatever it said at construction.
+    QObject::connect(model, &TranscriptModel::optionsJsonChanged, this,
+                     &TranscriptView::applyOptionsToChoices);
 
+    applyOptionsToChoices();
     rebuild();
     onBusyChanged();
     onStateChanged();
@@ -455,12 +480,6 @@ void TranscriptView::onStateChanged() {
         m_starting = false;
     }
     const bool noAgent = agentId.isEmpty();
-    // A pane with no agent and no start in flight is not starting -- it is
-    // empty, which is what a restored session or a stopped agent leaves, and
-    // saying "starting the agent" there is a promise nothing will keep.
-    const bool startable = (noAgent || exited) && !m_starting;
-    m_start->setVisible(startable);
-    m_start->setText(exited ? QStringLiteral("Restart agent") : QStringLiteral("Start agent"));
     if (m_starting) {
         m_input->setBusy(true, QStringLiteral("starting the agent") + QChar(kEllipsis));
     } else if (noAgent) {
@@ -471,10 +490,63 @@ void TranscriptView::onStateChanged() {
         m_input->setBusy(working);
     }
     m_interrupt->setEnabled(!noAgent && !m_starting && !busy && working);
-    // Nothing left to stop once the process is gone, and nothing yet to stop
-    // before it exists.
-    m_stop->setEnabled(!noAgent && !m_starting && !busy && !exited && !state.isEmpty());
+    // Shut only while a start is already in flight or the history is still
+    // being replayed. A pane whose agent has exited keeps them open on purpose:
+    // choosing the model it should come back on is a reasonable way to ask for
+    // it back.
+    const bool choosable = !m_starting && !busy;
+    m_modelChoice->setEnabled(choosable);
+    m_permissionChoice->setEnabled(choosable);
     refreshBanner();
+}
+
+void TranscriptView::applyOptionsToChoices() {
+    if (m_model.isNull()) {
+        return;
+    }
+    const QJsonObject options =
+        QJsonDocument::fromJson(m_model->getOptionsJson().toUtf8()).object();
+    const QString model = options.value(QStringLiteral("model")).toString();
+    // Options with no mode in them are older than the rule that the mode is
+    // always sent. Showing the floor is honest about what such an agent got:
+    // the CLI's own default is that same mode, spelled its other way.
+    const QString mode = options.value(QStringLiteral("permission_mode")).toString();
+    m_applyingOptions = true;
+    agentchoices::fillModelCombo(m_modelChoice, model);
+    agentchoices::fillPermissionCombo(
+        m_permissionChoice,
+        mode.isEmpty() ? QString::fromUtf8(agentchoices::defaultPermissionMode()) : mode);
+    m_applyingOptions = false;
+    m_sentModel = chosenModelId();
+    m_sentMode = m_permissionChoice->currentData().toString();
+}
+
+QString TranscriptView::chosenModelId() const {
+    const QString shown = m_modelChoice->currentText().trimmed();
+    // A label off the list stands for the id behind it -- nobody types "Opus 5"
+    // at a CLI -- and anything else is an id typed by hand.
+    const int listed = m_modelChoice->findText(shown);
+    const QString id = listed >= 0 ? m_modelChoice->itemData(listed).toString() : shown;
+    // See the bridge: an empty string there means "leave the stored model
+    // alone", so the one id that really is empty needs a word of its own.
+    return id.isEmpty() ? QStringLiteral("-") : id;
+}
+
+void TranscriptView::emitOptionsChanged() {
+    if (m_applyingOptions || m_model.isNull()) {
+        return;
+    }
+    const QString model = chosenModelId();
+    const QString mode = m_permissionChoice->currentData().toString();
+    if (model == m_sentModel && mode == m_sentMode) {
+        // Nothing moved. An editable combo reports its text again every time
+        // the focus leaves it, and a restart is the most expensive possible
+        // answer to a user who tabbed past a field.
+        return;
+    }
+    m_sentModel = model;
+    m_sentMode = mode;
+    emit optionsChanged(m_model->restartOptionsChoosing(model, mode));
 }
 
 void TranscriptView::refreshBanner() {
@@ -671,6 +743,7 @@ bool TranscriptView::atBottom() const {
 // See the note in `EditorArea.cpp`. `bs_widget_test_begin` must have run first.
 #if defined(BS_WIDGET_TESTS)
 #include <QCoreApplication>
+#include <QJsonValue>
 #include <QLatin1Char>
 #include <QThread>
 #include <cstdint>
@@ -767,6 +840,100 @@ extern "C" std::int32_t bs_widget_test_transcript_coalesces_a_streamed_answer() 
     }
     if (label->textFormat() != Qt::MarkdownText) {
         return 6;
+    }
+    return 0;
+}
+
+/// The composer chooses what this agent is, and says so as options rather than
+/// as a choice.
+///
+/// `claude -p` reads `--model` and `--permission-mode` once, when the process
+/// starts, so neither can be changed in flight: what a dropdown here means is a
+/// restart that resumes the conversation, and the options that describe it can
+/// only be built where the session id is. Start and Stop are gone from this row
+/// -- a workspace starts its own agent, and killing a process is not something
+/// anybody wants from the place they type a sentence -- and Interrupt stays,
+/// because ending a turn acts on the conversation rather than on the agent.
+extern "C" std::int32_t bs_widget_test_transcript_composer_offers_model_and_mode() {
+    TranscriptModel model;
+    model.setOptionsJson(
+        QStringLiteral(R"({"model":"claude-opus-5","permission_mode":"manual"})"));
+    TranscriptView view(&model);
+
+    auto* models = view.findChild<QComboBox*>(QStringLiteral("TranscriptModelChoice"));
+    auto* modes = view.findChild<QComboBox*>(QStringLiteral("TranscriptPermissionChoice"));
+    if (models == nullptr || modes == nullptr) {
+        return 1;
+    }
+    if (view.findChild<QPushButton*>(QStringLiteral("bsStartAgent")) != nullptr) {
+        return 2;
+    }
+
+    // Seeded from the tab's own options, and in silence: a pane shown what it
+    // already runs on has not been asked for anything.
+    QStringList sent;
+    QObject::connect(&view, &TranscriptView::optionsChanged, &view,
+                     [&sent](const QString& optionsJson) { sent.append(optionsJson); });
+    if (models->currentData().toString() != QLatin1String("claude-opus-5") ||
+        modes->currentData().toString() != QLatin1String("manual")) {
+        return 3;
+    }
+    if (!sent.isEmpty()) {
+        return 4;
+    }
+
+    modes->setCurrentIndex(modes->findData(QStringLiteral("bypassPermissions")));
+    if (sent.size() != 1) {
+        return 5;
+    }
+    const QJsonObject chosen =
+        QJsonDocument::fromJson(sent.at(0).toUtf8()).object();
+    if (chosen.value(QStringLiteral("permission_mode")).toString() !=
+        QLatin1String("bypassPermissions")) {
+        return 6;
+    }
+    if (chosen.value(QStringLiteral("model")).toString() != QLatin1String("claude-opus-5")) {
+        // One field changes; the rest of the tab's options go along untouched,
+        // which is what makes this a switch rather than a new agent.
+        return 7;
+    }
+
+    models->setCurrentIndex(models->findData(QStringLiteral("claude-haiku-4-5-20251001")));
+    if (sent.size() != 2) {
+        return 8;
+    }
+    const QJsonObject switched =
+        QJsonDocument::fromJson(sent.at(1).toUtf8()).object();
+    if (switched.value(QStringLiteral("model")).toString() !=
+        QLatin1String("claude-haiku-4-5-20251001") ||
+        switched.value(QStringLiteral("permission_mode")).toString() !=
+            QLatin1String("bypassPermissions")) {
+        return 9;
+    }
+
+    // "Let Claude Code decide" is a choice, not an absence: the key goes away
+    // rather than being sent empty, and it has to reach the merge as something
+    // the merge can tell apart from "leave this one alone".
+    models->setCurrentIndex(models->findData(QString()));
+    if (sent.size() != 3) {
+        return 10;
+    }
+    const QJsonObject undecided =
+        QJsonDocument::fromJson(sent.at(2).toUtf8()).object();
+    if (undecided.contains(QStringLiteral("model"))) {
+        return 11;
+    }
+
+    // The tab's options arriving again -- which is what a restart landing looks
+    // like -- resets the row without asking for another one.
+    model.setOptionsJson(
+        QStringLiteral(R"({"model":"claude-sonnet-5","permission_mode":"plan"})"));
+    if (models->currentData().toString() != QLatin1String("claude-sonnet-5") ||
+        modes->currentData().toString() != QLatin1String("plan")) {
+        return 12;
+    }
+    if (sent.size() != 3) {
+        return 13;
     }
     return 0;
 }

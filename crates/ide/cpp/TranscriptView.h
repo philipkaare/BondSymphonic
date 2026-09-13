@@ -11,6 +11,7 @@ class PromptInput;
 class TranscriptModel;
 class QJsonArray;
 class QJsonObject;
+class QComboBox;
 class QEvent;
 class QLabel;
 class QPushButton;
@@ -23,10 +24,10 @@ class QVBoxLayout;
 ///
 /// The view paints and forwards, and decides nothing. What a frame says, which
 /// tool is waiting, what the turn cost and whether a card is folded are all
-/// read back out of the `TranscriptModel`; Allow, Deny, Interrupt, Stop and a
-/// typed prompt go straight back into it. There is no "always allow" rule here
-/// and no cost arithmetic: the model answers a tool it has been told to allow
-/// without this view ever hearing about it.
+/// read back out of the `TranscriptModel`; Allow, Deny, Interrupt and a typed
+/// prompt go straight back into it. There is no "always allow" rule here and no
+/// cost arithmetic: the model answers a tool it has been told to allow without
+/// this view ever hearing about it.
 ///
 /// Frames are built once and updated in place. `resetItems` is the only thing
 /// that rebuilds, which is what makes replaying a long history one layout pass
@@ -48,10 +49,11 @@ public:
 
     TranscriptModel* model() const;
 
-    /// Whether an `agent.start` for this pane is in flight. The pane says
-    /// "starting the agent" only while this is true; with no agent and nothing
-    /// in flight it offers the Start button instead, because the alternative is
-    /// a pane that waits for something nobody asked for.
+    /// Whether an `agent.start` for this pane is in flight. The prompt box says
+    /// "starting the agent" only while this is true, and the two dropdowns are
+    /// shut for as long: a second restart asked for while the first is in
+    /// flight would race it, and the winner would be whichever process came up
+    /// last.
     void setStarting(bool starting);
 
     /// Opens or closes the composer according to whether Claude Code is logged
@@ -82,9 +84,19 @@ public:
 #endif
 
 signals:
-    /// The user pressed Start (or Restart). The area turns this into the
-    /// workspace id the window needs; this view knows only its model.
+    /// A restart was asked for. The area turns this into the workspace id the
+    /// window needs; this view knows only its model.
     void startAgentRequested();
+
+    /// The user chose a different model or permission mode, and `optionsJson`
+    /// is the whole `AgentStartOptions` that choice means -- this tab's own
+    /// options, the session to resume, and the one field they changed.
+    ///
+    /// `claude -p` reads both flags once, when the process starts, so there is
+    /// nothing to change in flight: the answer to this signal is a restart. It
+    /// carries the options rather than the choice because the merge needs the
+    /// session id, which lives on the model and nowhere the window can see.
+    void optionsChanged(const QString& optionsJson);
 
     /// The user pressed "Log in to Claude Code…". The window answers by opening
     /// Settings on its Setup section; this view knows nothing about dialogs.
@@ -106,6 +118,18 @@ private:
     void onPermissionRequested();
     void onBusyChanged();
     void onStateChanged();
+    /// Puts the tab's own options into the two dropdowns. Guarded, because a
+    /// combo told what the agent already runs on must not read as the user
+    /// asking for a restart.
+    void applyOptionsToChoices();
+    /// Emits [`optionsChanged`] for whatever the two dropdowns now say, unless
+    /// this view is the one that just set them or they say what was sent last.
+    void emitOptionsChanged();
+    /// The `--model` argument the model dropdown stands for: the id behind a
+    /// label picked off the list, or whatever was typed instead. The one id
+    /// that is empty -- "let Claude Code decide" -- is spelled `-`, which is
+    /// how `restartOptionsChoosing` tells it apart from "leave this alone".
+    QString chosenModelId() const;
     /// Puts `message` in the banner, or takes it down when both the daemon's
     /// state and the last request are clean.
     void refreshBanner();
@@ -144,9 +168,21 @@ private:
     QWidget* m_loginGate = nullptr;
     PromptInput* m_input = nullptr;
     QPushButton* m_interrupt = nullptr;
-    QPushButton* m_stop = nullptr;
-    /// Starts an agent for a pane that has none, or restarts one that exited.
-    QPushButton* m_start = nullptr;
+    /// Which model answers here, and what this agent asks before it acts. Both
+    /// are `claude -p` flags read once at process start, so both are restarts;
+    /// they sit under the message box because that is where the user is when
+    /// the question occurs to them.
+    QComboBox* m_modelChoice = nullptr;
+    QComboBox* m_permissionChoice = nullptr;
+    /// True while [`applyOptionsToChoices`] is setting the dropdowns. Without
+    /// it, showing a tab what it already runs on would restart it.
+    bool m_applyingOptions = false;
+    /// What the dropdowns last agreed with the agent on. A choice that comes
+    /// back to one of these is not a choice: an editable combo reports its
+    /// text again every time the focus leaves it, and a restart nobody asked
+    /// for is the most expensive possible answer to that.
+    QString m_sentModel;
+    QString m_sentMode;
     /// See [`setStarting`].
     bool m_starting = false;
     /// See [`setClaudeLoggedIn`]. True until told otherwise, so a view built
