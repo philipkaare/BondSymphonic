@@ -1,4 +1,5 @@
 #include "NewAgentDialog.h"
+#include "AgentChoices.h"
 #include "RunPanel.h"
 #include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
@@ -65,21 +66,6 @@ bool daemonLacksClaude(AppController* controller) {
     const QJsonArray adapters = capabilities.value(QStringLiteral("adapters")).toArray();
     return !adapters.contains(QJsonValue(QString::fromUtf8(kClaudeAdapter)));
 }
-
-/// The models to offer, newest and most capable first, as label and `--model`
-/// argument. The list is a convenience and not a limit: the combo is editable,
-/// the daemon passes whatever it is given straight to the CLI, and an empty
-/// choice leaves `--model` off altogether so Claude Code's own default wins.
-struct ModelChoice {
-    const char* label;
-    const char* id;
-};
-const ModelChoice kModels[] = {
-    { "Default (Claude Code decides)", "" },
-    { "Opus 5", "claude-opus-5" },
-    { "Sonnet 5", "claude-sonnet-5" },
-    { "Haiku 4.5", "claude-haiku-4-5-20251001" },
-};
 
 } // namespace
 
@@ -179,28 +165,25 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
 
     m_claudeModel = new QComboBox(this);
     m_claudeModel->setObjectName(QStringLiteral("NewAgentModel"));
-    // Editable, so a model that is not on the list is still one keystroke
-    // away; `optionsJson` reads the text rather than the selection because of
-    // it.
-    m_claudeModel->setEditable(true);
-    m_claudeModel->setInsertPolicy(QComboBox::NoInsert);
     m_claudeModel->setToolTip("Which model the agent runs. Anything Claude Code accepts can be "
                               "typed here as well.");
-    for (const ModelChoice& choice : kModels) {
-        m_claudeModel->addItem(QString::fromUtf8(choice.label), QString::fromUtf8(choice.id));
-    }
-    m_claudeModel->setCurrentIndex(0);
+    // Filled from the one list, which makes it editable: a model that is not on
+    // it is still one keystroke away, and `optionsJson` reads the text rather
+    // than the selection because of that. Nothing typed is added to the list --
+    // an id that only ever existed in this dialog would outlive the dialog and
+    // be offered to the next agent as though somebody had chosen it.
+    agentchoices::fillModelCombo(m_claudeModel, QString());
+    m_claudeModel->setInsertPolicy(QComboBox::NoInsert);
     form->addRow("Model:", m_claudeModel);
 
     m_permissionMode = new QComboBox(this);
-    // The words the daemon validates `--permission-mode` against; it rejects
-    // anything else, so they are spelled exactly as the CLI spells them.
-    for (const char* mode : { "default", "acceptEdits", "plan", "dontAsk" }) {
-        m_permissionMode->addItem(QString::fromUtf8(mode), QString::fromUtf8(mode));
-    }
-    m_permissionMode->setCurrentIndex(
-        qMax(0, m_permissionMode->findData(m_controller->defaultPermissionMode())));
-    form->addRow("Permission mode:", m_permissionMode);
+    m_permissionMode->setObjectName(QStringLiteral("NewAgentPermissionMode"));
+    m_permissionMode->setToolTip("What this agent asks before it acts. Settings is where the "
+                                 "answer a new agent starts on is chosen.");
+    // Seeded from the setting rather than from the first entry, because the
+    // setting exists precisely to say what a new agent should start on.
+    agentchoices::fillPermissionCombo(m_permissionMode, m_controller->defaultPermissionMode());
+    form->addRow("Permissions:", m_permissionMode);
 
     m_initialPrompt = new QPlainTextEdit(this);
     m_initialPrompt->setPlaceholderText("What should the agent start on?");
@@ -323,10 +306,10 @@ QString NewAgentDialog::optionsJson() const {
         // untouched field means, and "" is not a model name.
         options.insert("model", model);
     }
-    const QString mode = m_permissionMode->currentData().toString();
-    if (!mode.isEmpty()) {
-        options.insert("permission_mode", mode);
-    }
+    // Always, never conditionally. A permission mode left out is the CLI's own
+    // default -- a fifth behaviour nobody chose, that nothing in the IDE can
+    // show and that the combo the user just looked at does not describe.
+    options.insert("permission_mode", m_permissionMode->currentData().toString());
     return QString::fromUtf8(QJsonDocument(options).toJson(QJsonDocument::Compact));
 }
 
@@ -807,6 +790,54 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_says_branches_are_loadin
     }
     if (!combo->currentText().contains(QLatin1String("Could not read"))) {
         return 8;
+    }
+    return 0;
+}
+
+/// A new agent leaves this dialog with a permission mode on it, and the mode is
+/// one of the four the IDE offers.
+///
+/// The dialog used to write the mode only when it was non-empty, out of a list
+/// that still held `default` and `dontAsk`. Both halves were wrong in the same
+/// direction: an option left out is the CLI's own default, `dontAsk` denies in
+/// silence, and each of those is an agent behaving in a way nobody chose and
+/// nothing on screen describes.
+extern "C" std::int32_t bs_widget_test_new_agent_dialog_always_sends_a_permission_mode() {
+    AppController controller;
+    GroupModel model;
+    NewAgentDialog dialog(&controller, &model, QString::fromUtf8(kDialogRepo));
+
+    auto* modes = dialog.findChild<QComboBox*>(QStringLiteral("NewAgentPermissionMode"));
+    if (modes == nullptr) {
+        return 1;
+    }
+    if (modes->count() != agentchoices::permissionModes().size()) {
+        // The dialog kept a list of its own, which is a list free to drift.
+        return 2;
+    }
+    for (int i = 0; i < modes->count(); ++i) {
+        if (modes->itemData(i).toString() !=
+            QString::fromUtf8(agentchoices::permissionModes().at(i).id)) {
+            return 3;
+        }
+    }
+
+    // Untouched, and still on the wire: what the dialog opened on is a choice
+    // as much as one the user made by hand.
+    const QJsonObject untouched = QJsonDocument::fromJson(dialog.optionsJson().toUtf8()).object();
+    if (!untouched.contains(QStringLiteral("permission_mode"))) {
+        return 4;
+    }
+    if (untouched.value(QStringLiteral("permission_mode")).toString() !=
+        modes->currentData().toString()) {
+        return 5;
+    }
+
+    modes->setCurrentIndex(modes->findData(QStringLiteral("bypassPermissions")));
+    const QJsonObject yolo = QJsonDocument::fromJson(dialog.optionsJson().toUtf8()).object();
+    if (yolo.value(QStringLiteral("permission_mode")).toString() !=
+        QLatin1String("bypassPermissions")) {
+        return 6;
     }
     return 0;
 }

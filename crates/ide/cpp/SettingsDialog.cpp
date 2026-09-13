@@ -1,4 +1,5 @@
 #include "SettingsDialog.h"
+#include "AgentChoices.h"
 #include "SetupPage.h"
 #include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
@@ -17,10 +18,6 @@
 #include <QVBoxLayout>
 
 namespace {
-
-/// The words the daemon validates `--permission-mode` against; it rejects
-/// anything else, so they are spelled exactly as the CLI spells them.
-const char* kPermissionModes[] = { "default", "acceptEdits", "plan", "dontAsk" };
 
 /// The size the dialog opens at. It hosts a terminal now, so the old
 /// three-field height would start every login in a pane a few lines tall.
@@ -84,14 +81,16 @@ SettingsDialog::SettingsDialog(AppController* controller, QWidget* parent)
     form->addRow(QString(), note);
 
     m_permissionMode = new QComboBox(agentBox);
-    for (const char* mode : kPermissionModes) {
-        m_permissionMode->addItem(QString::fromUtf8(mode), QString::fromUtf8(mode));
-    }
-    const int index = m_permissionMode->findData(m_controller->defaultPermissionMode());
-    if (index >= 0) {
-        m_permissionMode->setCurrentIndex(index);
-    }
-    form->addRow("Default permission mode:", m_permissionMode);
+    m_permissionMode->setObjectName(QStringLiteral("SettingsPermissionMode"));
+    m_permissionMode->setToolTip(QStringLiteral(
+        "What an agent created from here on asks before it acts. An agent that already exists is "
+        "changed from the dropdown under its own transcript."));
+    agentchoices::fillPermissionCombo(m_permissionMode, m_controller->defaultPermissionMode());
+    // "New agents start on", not "Default permission mode": this setting has
+    // never reached an agent that already exists, and a label saying "default"
+    // invites the user to change it here and wonder why the running agent
+    // carried on as it was.
+    form->addRow("New agents start on:", m_permissionMode);
 
     auto* lookBox = new QGroupBox("Appearance", body);
     auto* lookForm = new QFormLayout(lookBox);
@@ -168,3 +167,46 @@ void SettingsDialog::reject() {
     theme::apply(*qApp, theme::choiceFromName(m_controller->theme()));
     QDialog::reject();
 }
+
+// --- offscreen test entries --------------------------------------------------
+//
+// Compiled only into a development build: this is test code -- it builds
+// widgets, leaks a QApplication and asserts -- and a shipped IDE has no caller
+// for any of it. `build.rs` defines `BS_WIDGET_TESTS` for every profile but
+// `release`, which is the one the packaged executable is built with.
+#if defined(BS_WIDGET_TESTS)
+//
+// See the note in `EditorArea.cpp`. `bs_widget_test_begin` must have run first.
+#include <cstdint>
+
+/// Settings offers the same four modes the rest of the IDE does.
+///
+/// This dropdown had its own array, and that array had gone stale: it still
+/// held `default`, the spelling the IDE retired, and `dontAsk`, which denies in
+/// silence. A user who picked either from here was choosing a behaviour for
+/// every agent they would create afterwards out of a list nothing else in the
+/// application agreed with.
+extern "C" std::int32_t bs_widget_test_settings_offers_the_one_permission_list() {
+    AppController controller;
+    SettingsDialog dialog(&controller);
+    auto* modes = dialog.findChild<QComboBox*>(QStringLiteral("SettingsPermissionMode"));
+    if (modes == nullptr) {
+        return 1;
+    }
+    if (modes->count() != agentchoices::permissionModes().size()) {
+        return 2;
+    }
+    for (int i = 0; i < modes->count(); ++i) {
+        if (modes->itemData(i).toString() !=
+            QString::fromUtf8(agentchoices::permissionModes().at(i).id)) {
+            return 3;
+        }
+    }
+    if (modes->findData(QStringLiteral("default")) >= 0 ||
+        modes->findData(QStringLiteral("dontAsk")) >= 0) {
+        return 4;
+    }
+    return 0;
+}
+
+#endif // BS_WIDGET_TESTS
