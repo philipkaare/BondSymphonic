@@ -44,6 +44,7 @@ fn main() {
         .file("src/qobjects/smoke.rs")
         // Headers are run through moc, sources are compiled.
         .cpp_files([
+            "cpp/AgentChoices.cpp",
             "cpp/GroupBar.h",
             "cpp/GroupBar.cpp",
             "cpp/TerminalWidget.h",
@@ -93,11 +94,12 @@ fn main() {
         ])
         .build();
     // cxx-qt-build emits a rerun line for every file it is handed, which covers
-    // `cpp_files` and the bridges above. These four are included by those files
-    // but named in no list, so without this a change to the one header that
-    // defines every accent colour would leave the build stale.
+    // `cpp_files` and the bridges above. These are included by those files but
+    // named in no list, so without this a change to the one header that defines
+    // every accent colour would leave the build stale.
     for header in [
         "cpp/Theme.h",
+        "cpp/AgentChoices.h",
         "cpp/Branding.h",
         "cpp/LogoData.h",
         "cpp/app.h",

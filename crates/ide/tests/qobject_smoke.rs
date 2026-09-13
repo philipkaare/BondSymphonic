@@ -1577,6 +1577,7 @@ mod cpp_widgets {
         fn bs_widget_test_setup_page_says_what_was_pasted() -> i32;
         fn bs_widget_test_group_bar_names_the_repository() -> i32;
         fn bs_widget_test_new_agent_dialog_says_branches_are_loading() -> i32;
+        fn bs_widget_test_agent_choices_are_one_list() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1590,7 +1591,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 18] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 19] = [
             (
                 "EditorArea closes a tab under a destroyed workspace",
                 bs_widget_test_editor_area_survives_a_destroyed_workspace,
@@ -1662,6 +1663,10 @@ mod cpp_widgets {
             (
                 "NewAgentDialog says the branch list is loading, and when it could not be read",
                 bs_widget_test_new_agent_dialog_says_branches_are_loading,
+            ),
+            (
+                "AgentChoices is one list of models and one of permission modes",
+                bs_widget_test_agent_choices_are_one_list,
             ),
         ];
 
