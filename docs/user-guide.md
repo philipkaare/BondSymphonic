@@ -240,6 +240,48 @@ The dialog also warns when the repository has uncommitted changes.
 Each workspace is one tab in the group bar. Groups are just tabs of tabs; a
 workspace the daemon has that no group claims lands in **Unsorted**.
 
+A tab reads `agent-4 · BondSymphonic @ main` — the agent's name, the repository
+it is working in and the branch it forked from. Not its own branch: every
+workspace gets one called `bs/<name>/work`, which is the agent's name spelled a
+second way and says nothing the tab does not already say. The generated branch
+is still what gets merged, so it is in the tab's tooltip, spelled exactly, for
+when you need it in a `git` command.
+
+---
+
+## The window
+
+The shape is Visual Studio's: the editor is the fixed centre, and everything
+else is a tool window docked around it.
+
+- **Explorer** (left), **Agent** (right) and **Output** (bottom) can each be
+  dragged to another edge, floated off the window, tabbed together, or closed.
+  The editor cannot — it is the centre, and a window with nowhere to put a file
+  would not be an IDE.
+- **Wi&ndow** in the menu bar lists the three with a tick each; that tick is the
+  dock's own, so it cannot disagree with what is on screen. **Reset layout**
+  puts everything back where it started, which is the way out of a layout you
+  have dragged yourself into a corner with. It is `Alt+N` rather than `Alt+W`,
+  because Workspace sits earlier in the bar and takes that one.
+- **View > Swap editor and agent** moves the Agent dock to the other side.
+- The **Workspace** menu gathers what used to be reachable only from the Changes
+  tab's toolbar or a right-click: New Agent…, Restart agent (`Ctrl+Shift+R`),
+  Next/Previous agent, Merge, Rebase, Squash…, Create PR…, Discard…, Destroy
+  workspace… and Close group….
+- The **Run** menu gathers the Run panel's buttons: Run (`F5`), Stop
+  (`Shift+F5`), Restart run, the detected configurations as one checkable group,
+  Open in browser, Clear output, Copy output and Allow blocked host….
+
+Both menus offer the same `QAction` objects the toolbars and panels do, so an
+entry that is greyed is greyed in both places for the same reason.
+
+### Theme
+
+**Settings > Appearance > Theme** is **Follow system**, **Light** or **Dark**.
+Follow system means following it as it changes, so a desktop that switches at
+dusk takes the IDE with it. The choice applies as you pick it — the point of
+choosing a palette is seeing it — and Cancel puts back the one you had.
+
 ---
 
 ## The Claude tab
@@ -272,14 +314,40 @@ A Claude Code workspace's pane shows the conversation as it arrives.
   the answer leaves, or when you switch to that tab.
 - **Cost.** The status bar shows the cost of the tab you are looking at, not the
   total across every agent.
-- **Interrupt** abandons the current turn and leaves the agent alive. **Stop**
-  ends the process.
-- **Restart.** An agent that has exited puts the reason in a banner and offers
-  **Restart agent**. Restart starts a new agent with `--resume` pointed at the
-  session id, so the conversation continues rather than beginning again. The
-  session id is read out of the transcript, and when the transcript cannot
-  supply one — a damaged or truncated history — the id the daemon recorded for
-  that agent is used instead.
+- **The agent starts itself.** A Claude workspace starts its agent when it is
+  created, when a saved session is restored, and when the IDE reconnects to a
+  daemon that has forgotten it. There is no Start button: it was a button for a
+  thing with exactly one sensible answer. While a start is in flight the pane
+  says so.
+- **A welcome** stands in an empty transcript, naming the agent, the model and
+  permission mode it will answer as, the repository and branch it forked from,
+  and the worktree it works in. The first real message replaces it.
+- **Model and permissions** are the two dropdowns under the prompt box.
+  `claude -p` reads both when the process starts and there is no way to change
+  either in flight, so choosing one restarts the agent with `--resume` pointed
+  at the session id — the conversation continues, and a line in the transcript
+  records the switch. A turn in flight is interrupted. The permission modes are
+  **Ask every time**, **Accept edits**, **Plan only** and **YOLO (sandboxed)**;
+  the last asks about nothing at all, which is reasonable because the agent is
+  already inside a sandbox, in a worktree of its own, behind a network proxy.
+  There is no confirmation dialog for it: the sandbox is what makes it safe, not
+  a warning.
+- **Interrupt** abandons the current turn and leaves the agent alive. It is the
+  only one of the old three buttons left, because ending a turn acts on the
+  conversation rather than on the process.
+- **Restart.** An agent that exits on its own is not restarted automatically — a
+  crash that repeated would become a loop reporting itself as a working agent.
+  It puts the reason in a banner offering **Restart agent**, and the same action
+  is in **Workspace > Restart agent** (`Ctrl+Shift+R`) and in Settings' Agents
+  section. Restart starts a new agent with `--resume` pointed at the session id,
+  so the conversation continues rather than beginning again. The session id is
+  read out of the transcript, and when the transcript cannot supply one — a
+  damaged or truncated history — the id the daemon recorded for that agent is
+  used instead.
+- **The turn cost and the agent's own system lines** are the small grey italics
+  under an answer. Settings' Agents section has **Show turn cost and system
+  lines**, on by default; turning it off hides both in every open transcript at
+  once and leaves the answers alone.
 - **Long conversations.** Above 2,000 items per agent the oldest are folded into
   a single **Load earlier (N)** block at the top. Nothing is discarded: clicking
   it puts every item back and stops folding for the rest of that tab's life.
@@ -499,9 +567,11 @@ Three things worth knowing before you rely on this:
 
 `%APPDATA%\BondSymphonic\state.json` records the groups and their order, the
 active tab, the open editor tabs per workspace and which was in front, the
-splitter sizes and whether the two halves are swapped, the window geometry and
-dock layout, the recently used repositories, and the per-workspace run port
-overrides. It also records the command a terminal tab was opened with and the
+window geometry and the dock layout — where each pane is docked, which are
+floating and which are closed — the recently used repositories, and the
+per-workspace run port overrides. The layout is Qt's own `saveState`, stamped
+with a version: a layout saved before the agent pane became a dock is discarded
+rather than half-applied. It also records the command a terminal tab was opened with and the
 run configuration chosen for each workspace, since neither exists anywhere else.
 It is written 500 ms after the last change and again on exit. `settings.json`
 sits beside it.

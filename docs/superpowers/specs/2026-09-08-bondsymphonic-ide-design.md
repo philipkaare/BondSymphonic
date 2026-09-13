@@ -15,10 +15,10 @@ Rust with a thin C++ Qt Widgets shell bridged by cxx-qt.
 
 ```
 +------------------------------------------------------------------------------+
-| File  Edit  View  Workspace  Run  Help                                       |
+| File  Edit  View  Workspace  Run  Window  Help                               |
 +------------------------------------------------------------------------------+
 | [Group: Frontend] [Group: API] [+]                                           |  group tabs
-| ( * agent-1  main-repo ) ( o agent-2  main-repo ) ( ! agent-3  other ) [+]   |  agent tabs w/ status
+| ( * agent-1 . main-repo @ main ) ( o agent-2 . main-repo @ main ) [+]        |  agent tabs w/ status
 +---------------+------------------------------------+-------------------------+
 | EXPLORER      | src/App.tsx  x | README.md  x      | Agent: agent-1  claude  |
 | [Files][Chg]  |------------------------------------|-------------------------|
@@ -36,7 +36,7 @@ Rust with a thin C++ Qt Widgets shell bridged by cxx-qt.
 | RUN   [web v] [Start] http://localhost:41873 [Open]  | TERMINAL               |
 |  > VITE ready in 312 ms                              | $ ls                    |
 +------------------------------------------------------------------------------+
-| daemon: connected | sandbox: up | bs/agent-1/work | $0.42                     |
+| daemon: connected | sandbox: up | C:\git\main-repo @ main | $0.42           |
 +------------------------------------------------------------------------------+
 ```
 
@@ -54,8 +54,14 @@ Rust with a thin C++ Qt Widgets shell bridged by cxx-qt.
   colouring; "Changes" list of files changed vs base with +/- counts.
   Double-click opens in the editor (Files) or in the diff view (Changes). Changes
   has Merge, Rebase, Squash, Create PR, Discard buttons in its toolbar.
-- **Center splitter**: editor area left, agent area right by default. View menu:
-  "Swap editor and agent". The splitter ratio persists.
+- **The editor is the central widget** and the agent area is a `QDockWidget` on
+  the right, beside the Explorer's dock and the Output dock — Visual Studio's
+  shape, where the documents are the fixed centre and every tool window docks,
+  floats, tabs or closes around them. A dock separator, six pixels of
+  `theme::band`, is also the clear edge a 1px splitter handle never was. View
+  menu: "Swap editor and agent", which re-docks the agent pane to the left area.
+  `QMainWindow::saveState()` carries the whole arrangement, stamped version 2 so
+  a layout saved when this was a splitter is discarded rather than half-applied.
 - **Editor area**: tabbed documents; each tab is an editor or a diff view.
   Modified-indicator, Ctrl+S saves through the daemon, external change prompts
   reload. **One row of tabs per workspace.** Each agent has a worktree of its
@@ -112,7 +118,7 @@ crates/ide/
       theme.rs              style ids -> colours (light + dark)
   cpp/
     main.cpp                QApplication, style, MainWindow
-    MainWindow.{h,cpp}      docks, splitter, menus, status bar, persistence hooks
+    MainWindow.{h,cpp}      docks, menus, status bar, persistence hooks
     GroupBar.{h,cpp}        two QTabBars (groups, agents) with status glyphs
     ExplorerDock.{h,cpp}    Files tree (QTreeView) + Changes list
     EditorArea.{h,cpp}      QTabWidget of EditorWidget / DiffWidget, one row per workspace
@@ -447,12 +453,22 @@ Three rules govern when it opens and what it will accept:
 ## 11. Persistence
 
 `%APPDATA%\BondSymphonic\` (or XDG/macOS equivalents via `directories` crate):
-- `settings.json`: distro, daemon path, editor font/size, theme, default
-  permission mode, `api_key_set: bool` (the key itself is stored in the Windows
-  Credential Manager via the `keyring` crate and passed to the daemon at start).
+- `settings.json`: distro, daemon path, editor font/size, `theme` (`system`,
+  `light` or `dark`), `show_agent_meta` (whether transcripts show the turn cost
+  and the agent's own system lines), the permission mode a new agent starts on,
+  `api_key_set: bool` (the key itself is stored in the Windows Credential
+  Manager via the `keyring` crate and passed to the daemon at start).
+
+  The IDE offers four of the modes the CLI accepts, spelled for a person: `Ask
+  every time` (`manual`), `Accept edits` (`acceptEdits`), `Plan only` (`plan`)
+  and `YOLO (sandboxed)` (`bypassPermissions`). `auto` and `dontAsk` are
+  accepted by the daemon and offered by nobody — `dontAsk` denies in silence,
+  which is indistinguishable from an agent that hung. The mode is **always**
+  sent: an unset flag means the CLI's own default, which is a behaviour nobody
+  chose and nobody can see from the pane.
 - `state.json`: `version`, groups with ordered workspace ids, the active
   workspace, the open editor tabs per workspace and which of them was in front,
-  the agent-area splitter sizes and whether its halves are swapped, recent repos
+  recent repos
   (most recent first, capped at 10), the base64 of `QMainWindow::saveState()`
   and of `saveGeometry()`, and the per-start run port overrides keyed by
   workspace and configuration name.
@@ -466,7 +482,7 @@ paths for tests, and naming the first also turns the migration off, so a test
 can never read the developer's own settings.
 
 State is written on every structural change (debounced 500 ms: a burst — a
-splitter dragged, five tabs closed — is one write, 500 ms after it stops) and
+dock dragged, five tabs closed -- is one write, 500 ms after it stops) and
 again on exit, through a temporary file and a rename. A `state.json` that will
 not parse is renamed `.corrupt` and read as defaults, since a layout is not
 worth refusing to start over.
@@ -492,7 +508,15 @@ and the IDE then builds the terminal tab it always did.
 `AgentTab::from_workspace_info` adopts the last of them, so a Claude
 workspace comes back as a Claude tab whose transcript pane attaches to the same
 agent id, replays `agent.history`, reads back `exited`, and offers Restart with
-the model and permission mode the user originally chose. Without that the
+the model and permission mode the user last chose — the tab's own, which the
+composer's dropdowns update whenever either is switched, so a Restart does not
+quietly hand back the model the workspace was created with.
+
+A workspace restored with no agent at all does not wait to be asked: the window
+starts one, here and on a reconnect to a daemon that has forgotten it. The only
+Start-shaped control left is on the banner an agent raises by exiting, which is
+deliberately not automatic — a crash that repeated would become a loop
+reporting itself as a working agent. Without that the
 records file, the transcripts and the resumable sessions were reachable only
 while the IDE process itself survived: every Claude workspace returned as a
 terminal tab bound to no agent. There is deliberately no field in
