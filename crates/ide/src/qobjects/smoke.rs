@@ -74,6 +74,9 @@
 //!   and the step then fails on its own timeout rather than dropping anything.
 //!   Every step after it runs on the new connection, because this is the one
 //!   step that hands the script a fresh client.
+//! * `wait` — do nothing for [`WAIT_SETTLE`], so what the window does on its
+//!   own after the workspace list -- a menu seam pressing a banner's button,
+//!   the requests that follow -- has landed before the next step.
 //! * `quit` — let the window settle, then end the process with status 0.
 //!
 //! A failing step logs and stops the script *without* quitting, so a broken run
@@ -194,6 +197,10 @@ const OPERATION_SETTLE: Duration = Duration::from_millis(750);
 /// every pane's own re-attach have landed before the next step acts.
 const RECONNECT_SETTLE: Duration = Duration::from_millis(1_500);
 
+/// How long `wait` does nothing for. The work it waits on is a handful of
+/// round trips to a fake daemon that answers at once.
+const WAIT_SETTLE: Duration = Duration::from_secs(3);
+
 /// The steps in `BS_SMOKE_SCRIPT`, or `None` when it is unset or empty.
 pub(crate) fn script() -> Option<Vec<String>> {
     let raw = std::env::var(SCRIPT_ENV).ok()?;
@@ -260,6 +267,10 @@ pub(crate) async fn run(steps: Vec<String>, mut client: DaemonClient, qt: QtHand
             "pr" => pr(&qt, workspace.as_ref()).await,
             "destroy" => destroy(&client, &qt, workspace.take()).await,
             "reconnect" => reconnect(&client).await.map(|fresh| client = fresh),
+            "wait" => {
+                tokio::time::sleep(WAIT_SETTLE).await;
+                Ok(())
+            }
             "quit" => quit(&qt).await,
             other => Err(format!("unknown step {other:?}")),
         };

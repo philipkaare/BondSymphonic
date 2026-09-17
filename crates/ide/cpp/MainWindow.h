@@ -301,6 +301,31 @@ private:
     /// cannot ask for a second agent while the first request is still on the
     /// wire.
     QSet<QString> m_autoStarting;
+
+    // --- a workspace that cannot run ----------------------------------------
+
+    /// Puts every workspace's problem -- a sandbox that is down, a workspace
+    /// that could not be started -- on its pane's banner, and takes it down
+    /// from the ones that recovered. Runs on every model change; the area
+    /// ignores a problem it is already showing.
+    void syncWorkspaceProblems();
+    /// The banner's Retry: `workspace.restart`, with the button busy until it
+    /// answers.
+    void onRetryWorkspace(const QString& workspaceId);
+    /// The restart answered with the workspace running. The user asked for the
+    /// workspace back, so its agent comes back too -- including one that had
+    /// ended, which the automatic start leaves alone.
+    void onWorkspaceRestarted(const QString& workspaceId, const QString& infoJson);
+    /// The tab JSON for `workspaceId`, or an empty object.
+    QJsonObject tabFor(const QString& workspaceId) const;
+    /// Test seam: presses the named button on `workspaceId`'s banner once, if
+    /// `BS_MENU_TEST` asked for `step`. See [`announceMenuTest`].
+    void pressBannerForTest(const QString& workspaceId, const char* step, const char* button);
+    /// What each workspace's banner is showing as its problem, title and
+    /// detail joined, so a sync only touches the ones that changed.
+    QHash<QString, QString> m_workspaceProblems;
+    /// The banner buttons the seam has already pressed, by step and workspace.
+    QSet<QString> m_bannerTestPressed;
     /// Adds one Edit menu item forwarding to the current editor's view, and
     /// books it in for enabling and disabling together with its siblings.
     ///

@@ -422,6 +422,18 @@ pub mod qobject {
         #[qsignal]
         fn workspace_destroyed(self: Pin<&mut AppController>, id: QString);
 
+        /// A `restart_workspace` call succeeded: `info_json` is the
+        /// `WorkspaceInfo` the daemon answered with, its sandbox running again.
+        /// Separate from `workspace_changed` because the window does one thing
+        /// more for it -- the user asked for the workspace back, so its agent
+        /// is started again too.
+        #[qsignal]
+        fn workspace_restarted(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            info_json: QString,
+        );
+
         /// `agent.start` succeeded: `workspace_id` is now running `agent_id`.
         /// Emitted before any initial prompt is sent, so the transcript is
         /// attached and subscribed before the first answer arrives.
@@ -602,6 +614,14 @@ pub mod qobject {
         /// `operation_failed`.
         #[qinvokable]
         fn destroy_workspace(self: Pin<&mut AppController>, id: QString, force: bool);
+
+        /// Bring a workspace whose sandbox is down, or which failed to start,
+        /// back up (`workspace.restart`). Answers with `workspace_restarted`,
+        /// or with `workspace_op_failed("workspace.restart", ...)` carrying the
+        /// daemon's reason -- the workspace is then in `Error` with that same
+        /// reason.
+        #[qinvokable]
+        fn restart_workspace(self: Pin<&mut AppController>, workspace_id: QString);
 
         /// Inspect a git repository. Answers with `repo_inspected` or
         /// `operation_failed`.
@@ -2403,6 +2423,48 @@ impl qobject::AppController {
                     });
                 }
                 Err(e) => end_destroy(&qt, id, e.to_string()),
+            }
+        });
+    }
+
+    pub fn restart_workspace(self: Pin<&mut Self>, workspace_id: QString) {
+        let qt = self.qt_thread();
+        let id = workspace_id.to_string();
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_workspace_op_failure(&qt, id, "workspace.restart", message.to_owned());
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            let params = WorkspaceIdParams {
+                workspace_id: WorkspaceId(id.clone()),
+            };
+            // The wait is the client's per-method one: a sandbox start is slow,
+            // and giving up early would report a failure for a Retry that is
+            // about to work.
+            match shared
+                .client
+                .request::<WorkspaceInfo>(Request::WorkspaceRestart(params))
+                .await
+            {
+                Ok(info) => {
+                    let json = serde_json::to_string(&info).unwrap_or_default();
+                    let _ = qt.queue(move |q| {
+                        q.workspace_restarted(QString::from(&id), QString::from(&json))
+                    });
+                }
+                // The message alone, not `failure_parts`: the daemon's refusal
+                // is a sentence written for the user, and it is what the banner
+                // shows as the workspace's new reason.
+                Err(e) => {
+                    let message = match e {
+                        ClientError::Rpc(rpc) => rpc.message,
+                        other => other.to_string(),
+                    };
+                    report_workspace_op_failure(&qt, id, "workspace.restart", message);
+                }
             }
         });
     }

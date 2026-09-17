@@ -13,6 +13,7 @@
 #include "SettingsDialog.h"
 #include "SetupPage.h"
 #include "Theme.h"
+#include "WorkspaceBanner.h"
 #include "WorkspaceLabel.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
@@ -41,6 +42,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPlainTextEdit>
+#include <QPushButton>
 #include <QTabBar>
 #include <QStatusBar>
 #include <QTabWidget>
@@ -842,6 +844,8 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::workspaceDestroyed, m_runModel,
                      &RunPanelModel::forgetWorkspace);
     QObject::connect(m_controller, &AppController::workspaceDestroyed, this, &MainWindow::onWorkspaceDestroyed);
+    QObject::connect(m_controller, &AppController::workspaceRestarted, this,
+                     &MainWindow::onWorkspaceRestarted);
     // A host the workspace's proxy refused. The queue is per workspace and
     // lives in the model, so one blocked while another tab is in front waits
     // there rather than being shown over the wrong workspace.
@@ -921,6 +925,15 @@ void MainWindow::connectController() {
     });
     m_agentArea->setClaudeLoggedIn(m_controller->getClaudeLoggedIn());
     QObject::connect(m_agentArea, &AgentArea::loginRequested, this, &MainWindow::showSetupPage);
+    // A workspace that cannot run. Retry is its own request; Remove is the
+    // tab menu's destroy, confirmation and busy check included, because it is
+    // the same act reached from somewhere else.
+    QObject::connect(m_agentArea, &AgentArea::retryWorkspaceRequested, this,
+                     &MainWindow::onRetryWorkspace);
+    QObject::connect(m_agentArea, &AgentArea::removeWorkspaceRequested, this,
+                     [this](const QString& workspaceId) {
+                         onDestroyRequested(workspaceId, m_groupModel->workspaceName(workspaceId));
+                     });
     // Dismissing the banner is the user saying they have read it, which is also
     // what takes the red glyph off the tab.
     QObject::connect(m_agentArea, &AgentArea::bannerDismissed, this,
@@ -959,6 +972,10 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::operationFailed, this, &MainWindow::onOperationFailed);
     QObject::connect(m_groupModel, &GroupModel::changed, this, &MainWindow::updateWorkspaceStatus);
     QObject::connect(m_groupModel, &GroupModel::changed, this, &MainWindow::onActiveTabChanged);
+    // After the active tab has been shown, so the pane in front already exists
+    // when its problem is put on it.
+    QObject::connect(m_groupModel, &GroupModel::changed, this,
+                     &MainWindow::syncWorkspaceProblems);
 
     // These three are the only way anything on the Rust side reaches the
     // editor area.
@@ -1254,6 +1271,133 @@ void MainWindow::startAgentsThatHaveNone() {
             m_controller->startAgent(workspaceId, tab.value("options_json").toString());
         }
     }
+}
+
+void MainWindow::syncWorkspaceProblems() {
+    const QJsonArray groups = QJsonDocument::fromJson(m_groupModel->getStateJson().toUtf8())
+                                  .object()
+                                  .value("groups")
+                                  .toArray();
+    const bool report = menuTest().contains(QLatin1String("sandbox-banner"));
+    QSet<QString> present;
+    for (const QJsonValue& groupValue : groups) {
+        for (const QJsonValue& tabValue : groupValue.toObject().value("tabs").toArray()) {
+            const QJsonObject tab = tabValue.toObject();
+            const QString workspaceId = tab.value("workspace_id").toString();
+            if (workspaceId.isEmpty()) {
+                continue;
+            }
+            present.insert(workspaceId);
+            const QJsonObject problem = tab.value("workspace_problem").toObject();
+            if (problem.isEmpty()) {
+                if (m_workspaceProblems.remove(workspaceId) > 0) {
+                    m_agentArea->clearWorkspaceProblem(workspaceId);
+                    if (report) {
+                        announceMenuTest("sandbox-banner", workspaceId, QStringLiteral("cleared"));
+                    }
+                }
+                continue;
+            }
+            const QString title = problem.value("title").toString();
+            const QString detail = problem.value("detail").toString();
+            const QString shown = title + QLatin1Char('\n') + detail;
+            const auto known = m_workspaceProblems.constFind(workspaceId);
+            if (known != m_workspaceProblems.constEnd() && *known == shown) {
+                continue;
+            }
+            m_workspaceProblems.insert(workspaceId, shown);
+            m_agentArea->setWorkspaceProblem(workspaceId, title, detail);
+            if (report) {
+                announceMenuTest("sandbox-banner", workspaceId,
+                                 title + QStringLiteral(" | ") + detail);
+            }
+            pressBannerForTest(workspaceId, "sandbox-retry", "WorkspaceBannerRetryButton");
+            pressBannerForTest(workspaceId, "sandbox-remove", "WorkspaceBannerRemoveButton");
+        }
+    }
+    // A workspace that went away took its pane, and its banner, with it.
+    for (auto it = m_workspaceProblems.begin(); it != m_workspaceProblems.end();) {
+        if (present.contains(it.key())) {
+            ++it;
+        } else {
+            it = m_workspaceProblems.erase(it);
+        }
+    }
+}
+
+void MainWindow::pressBannerForTest(const QString& workspaceId, const char* step,
+                                    const char* button) {
+    const QString name = QString::fromLatin1(step);
+    const QString key = name + QLatin1Char(' ') + workspaceId;
+    if (!menuTest().contains(name) || m_bannerTestPressed.contains(key)) {
+        return;
+    }
+    // After this turn, so the pane the model change is about to build is there.
+    // The banner's own button and nothing else: this is the workspace the
+    // fixture put in trouble, and a click anywhere wider could land on
+    // something the run never asked about.
+    const QString objectName = QString::fromLatin1(button);
+    QTimer::singleShot(0, this, [this, workspaceId, key, objectName] {
+        WorkspaceBanner* banner = m_agentArea->banner(workspaceId);
+        QPushButton* target =
+            banner == nullptr ? nullptr : banner->findChild<QPushButton*>(objectName);
+        if (target == nullptr || target->isHidden() || !target->isEnabled() ||
+            m_bannerTestPressed.contains(key)) {
+            return;
+        }
+        m_bannerTestPressed.insert(key);
+        target->click();
+    });
+}
+
+void MainWindow::onRetryWorkspace(const QString& workspaceId) {
+    if (workspaceId.isEmpty()) {
+        return;
+    }
+    if (menuTest().contains(QLatin1String("sandbox-retry"))) {
+        announceMenuTest("sandbox-retry", workspaceId, QString());
+    }
+    m_agentArea->setRetrying(workspaceId, true);
+    m_controller->restartWorkspace(workspaceId);
+}
+
+void MainWindow::onWorkspaceRestarted(const QString& workspaceId, const QString& infoJson) {
+    // Applying the answer is what takes the banner down: the model change it
+    // provokes finds the workspace without a problem.
+    m_groupModel->applyWorkspaceInfo(infoJson);
+    m_agentArea->setRetrying(workspaceId, false);
+    // Unlike the automatic start this includes an agent that had ended -- the
+    // one a daemon restart leaves behind in every workspace -- because the user
+    // just asked for this workspace back and an agent is what it is for. Booked
+    // in the same set, so the pass below cannot ask for a second one.
+    if (m_groupModel->agentNeedsStart(workspaceId) && !m_autoStarting.contains(workspaceId)) {
+        m_autoStarting.insert(workspaceId);
+        m_agentArea->setStarting(workspaceId, true);
+        // The transcript's options when it has them, for the same reason a
+        // Restart uses them: they carry the session to resume.
+        TranscriptModel* model = m_agentArea->transcriptModel(workspaceId);
+        const QString options = model == nullptr
+                                    ? tabFor(workspaceId).value("options_json").toString()
+                                    : model->restartOptionsJson();
+        m_controller->startAgent(workspaceId, options);
+    }
+    startAgentsThatHaveNone();
+}
+
+QJsonObject MainWindow::tabFor(const QString& workspaceId) const {
+    const QJsonArray groups = QJsonDocument::fromJson(m_groupModel->getStateJson().toUtf8())
+                                  .object()
+                                  .value("groups")
+                                  .toArray();
+    for (const QJsonValue& groupValue : groups) {
+        for (const QJsonValue& tabValue : groupValue.toObject().value("tabs").toArray()) {
+            const QJsonObject tab = tabValue.toObject();
+            if (tab.value("workspace_id").toString() == workspaceId) {
+                return tab;
+            }
+        }
+    }
+    return QJsonObject();
 }
 
 void MainWindow::onStartAgentRequested(const QString& workspaceId) {
@@ -1581,6 +1725,17 @@ void MainWindow::onRepoInspectFailed(const QString& path, const QString& message
 void MainWindow::onWorkspaceOpFailed(const QString& workspaceId, const QString& op,
                                      const QString& message) {
     noteFailureRouted(message);
+    if (op == QLatin1String("workspace.restart")) {
+        // The banner is where this belongs, not a box: the daemon has left the
+        // workspace failed with this very sentence as its reason, and the
+        // banner that asked is the one that shows it, with Retry pressable
+        // again.
+        m_groupModel->noteRestartFailed(workspaceId, message);
+        m_agentArea->setRetrying(workspaceId, false);
+        qWarning("workspace restart failed for %s: %s", qUtf8Printable(workspaceId),
+                 qUtf8Printable(message));
+        return;
+    }
     if (op == QLatin1String("agent.start")) {
         // The pane must stop saying it is starting something. The signal names
         // the workspace, so only the pane that asked comes out of it.
