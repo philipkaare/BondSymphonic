@@ -67,7 +67,7 @@ To check that a package unzipped intact:
 
 ```powershell
 C:\Tools\BondSymphonic\bondsymphonic-ide.exe --version
-# bondsymphonic-ide 0.1.0 (protocol 1)
+# bondsymphonic-ide 0.1.0 (protocol 2)
 ```
 
 It answers before a window or a daemon is started, so it needs no display, no Qt
@@ -208,6 +208,7 @@ greyed out while the repository in the box has not been read.
 | Field | What it does |
 | --- | --- |
 | Repository | The git repository to branch from. **Browse…** picks one; **Recent** lists repositories you have used before. |
+| Work in | **Work in a new worktree** (the default) or **Work directly in this checkout**. See below. |
 | Base branch | The branch the workspace starts from and later merges back into. |
 | Name | Names the workspace and its branch, `bs/<name>/work`. Defaults to `agent-<n>`. One word: letters, digits, `-` or `_`, starting with a letter or a digit, at most 64 characters. A space, a `/`, a `.` or a leading `-` is refused as you type, with the reason under the field, and **Create** stays greyed out until you fix it. The daemon applies the same rule, so nothing the dialog accepts can fail later inside git. |
 | Adapter | **Claude Code**, which is the default, or **Terminal**. |
@@ -224,6 +225,26 @@ only the worktree, the workspace's own git object directory and its cache are
 writable; the repository's shared `refs/heads` and object store are read-only;
 the sandbox has its own PID namespace; and it reaches the network only through
 an allowlisting proxy.
+
+**Work in a new worktree, or directly in this checkout.** The default keeps
+the agent off your own branch, in a worktree of its own — the paragraph above.
+Choosing **Work directly in this checkout** instead disables Base branch,
+which then simply shows the branch already checked out (or "detached HEAD")
+rather than something you pick, since nothing is switched or created. The help
+text under the choice says why: "The agent edits this folder on its current
+branch. Its changes are not isolated on a branch of their own." If the
+repository runs its git hooks from inside the working tree itself — the way
+husky does — a warning names the path: "This repository runs git hooks from
+\<path\> inside the working tree. The agent can change them, and they run
+outside the sandbox the next time you use git here." The choice is greyed out,
+with the reason as its tooltip, for a repository the daemon cannot work in
+directly at all — a linked worktree of another repository, or one whose
+`.git` is a file rather than a directory (a separate git directory, or a
+submodule checkout) — and the dialog falls back to a new worktree for those.
+The dialog remembers whichever choice you last created a workspace with and
+opens on it next time; a fallback forced by a greyed-out choice does not
+overwrite what you had chosen. See "Working directly in a checkout" below for
+what that mode does, what it does not, and its residual risks.
 
 **A folder that is not a repository yet.** Point the dialog at one and it says
 so under the path: "This folder is not a git repository. It will be initialised
@@ -246,6 +267,114 @@ workspace gets one called `bs/<name>/work`, which is the agent's name spelled a
 second way and says nothing the tab does not already say. The generated branch
 is still what gets merged, so it is in the tab's tooltip, spelled exactly, for
 when you need it in a `git` command.
+
+---
+
+## Working directly in a checkout
+
+Choosing **Work directly in this checkout** in the New Agent dialog is what it
+sounds like: the agent edits your own folder, on whatever branch is already
+checked out there, inside the same sandbox, network allowlist, runs and agent
+tabs every other workspace gets. There is no branch of the workspace's own and
+nothing to merge — the changes are simply in the checkout, exactly as if you
+had run Claude Code there yourself.
+
+**When to use it.** A quick change you plan to review and commit yourself,
+without the extra step of merging a workspace branch back afterwards; or a
+repository whose tooling — a dev server watching the working tree, a build
+that assumes it is the only checkout — cannot usefully live in a second
+worktree. For anything you would rather keep isolated until you decide to
+bring it in, a new worktree (the default) is still the better choice.
+
+**What the agent may do with git, and what it may not.** Inside the sandbox
+the agent can stage, commit, switch branches and stash, exactly as you could
+from a terminal in that folder. What it cannot do is write to the files a git
+running *outside* the sandbox would execute: `.git/config`, hooks, `.git/info`,
+`.git/commondir`, `.git/worktrees`, `.git/remotes`, `.git/branches`, or the
+git directory of an existing submodule (`.git/modules`). Those are bound
+read-only. A git command that writes into one of them therefore fails inside
+the sandbox — `git push -u`, `git remote add`, the tracking setup behind `git
+switch -c x origin/x`, and `git sparse-checkout` among them.
+
+**What BondSymphonic writes into `.git`.** Before the sandbox starts, the
+daemon writes `.git/commondir` containing a single `.` (git already treats the
+git directory as its own common directory; this makes that explicit and
+protects it from being pointed anywhere else), and creates `hooks`, `info`,
+`worktrees`, `remotes` and `branches` when any of them is missing — git makes
+these itself as soon as it needs them, so an empty one changes nothing. It
+also creates `config.worktree`, empty, when it is not already there, and binds
+it read-only regardless of whether the repository has
+`extensions.worktreeConfig` turned on, since an agent could turn that on
+itself. **Close workspace…** removes the `commondir` guard again, and removes
+each of `worktrees`, `remotes`, `branches` and `config.worktree` that the
+daemon itself created — and only those, and only while they are still empty;
+anything git or the agent has put there since is left alone.
+
+**The read-only binds are not proof against something outside the sandbox.**
+They hold against the agent, but not against anything that runs *outside* the
+sandbox, in the same repository, while the workspace is open — your own `git
+config`, `git branch -u`, `git push -u`, `git remote add`, removing the last
+worktree of the repository, or `git sparse-checkout`. Each of those replaces
+or removes the very file or directory a bind was made on, which detaches the
+bind in the sandbox the same way any rename or removal of a mounted-over path
+does; nothing running inside the sandbox can stop that. The daemon watches for
+it instead: it takes a snapshot of the protected entries right before the
+sandbox starts and rechecks it several times a second while the sandbox is up.
+The moment something is replaced, removed, or no longer mounted where it
+should be, the sandbox is stopped, the workspace's tab shows the reason, and
+the daemon's log names what changed and shows a line diff of `.git/config`
+(and the other protected files) so you can see exactly what is different.
+**Retry** re-protects the checkout and starts the sandbox again — but review
+that diff first: anything written in the brief window before the check caught
+it is still sitting in `.git/config`, and Retry does not undo it. Because the
+daemon cannot tell your own git command from the agent's, **any command that
+writes into a protected file, run by you in that repository while the
+workspace is open, stops the workspace the same way** — this is by design, not
+something to work around.
+
+**The Changes tab shows changes against `HEAD`.** Merge, Rebase, Squash,
+Create PR and Discard are all shaped around a workspace branch this kind does
+not have, so none of them appear, on the toolbar or the Workspace menu, for a
+workspace working directly in a checkout.
+
+**Closing it.** The Workspace menu, the tab's own menu and the workspace's
+banner all read **Close workspace…** instead of **Destroy workspace…**, and it
+asks a shorter question: *Close workspace "\<name\>"? The agent and its
+sandbox stop. Your files, branches and git history are not touched.* There is
+no Force box and no second confirmation — closing an in-place workspace never
+discards anything, so there is nothing to force.
+
+**One in-place workspace per checkout.** A second **Work directly in this
+checkout** on a folder that already has one is refused: "this checkout already
+has an in-place workspace: \<name\>". A worktree workspace on the same
+repository is unaffected and can run alongside it.
+
+**Residual risks.** Working in the checkout itself means a few things the
+sandbox cannot fully close off:
+
+- **`core.hooksPath` inside the working tree.** A repository that points its
+  hooks somewhere inside the tree (husky does this) has ordinary files there
+  the agent can edit like any other, and your own git runs them the next time
+  you use it. The dialog warns about this when it is set (see "Creating an
+  agent workspace" above).
+- **`.gitattributes` in the working tree** can select which filter or diff
+  driver runs over a file — but only a driver your own configuration already
+  defines. This is not new to this mode: it is true of merged worktree content
+  too.
+- **A rebase left in progress.** A sequencer state the agent leaves behind can
+  carry `exec` lines that run a command when you type `git rebase --continue`.
+- **Scripts in the tree** — `package.json` scripts, a `Makefile` — run when
+  you run them, exactly as they would after any other edit.
+- **An embedded repository.** An agent can `git init` a directory in the tree,
+  set something like `core.fsmonitor` in *its* `.git/config`, and commit it as
+  a submodule. The next time your own git looks at the parent checkout, that
+  command runs. BondSymphonic's own status and diff calls are hardened against
+  this; your own git is not.
+- **History can be destroyed.** `rm -rf .git` cannot remove the files
+  BondSymphonic protects, but it deletes everything else — `HEAD`, the index,
+  every object and every ref — just as the agent can delete any other file in
+  the checkout. Keep a remote or a backup; there is no undo inside
+  BondSymphonic for this.
 
 ---
 
@@ -568,6 +697,14 @@ name was allowed, unless the allowlist entry *is* that literal address.
 
 ## Finishing a workspace
 
+**A workspace working directly in a checkout has nothing here to finish.**
+Its changes are already in your checkout, on your own branch — there is no
+Merge, Rebase, Squash, Create PR or Discard, because there is no workspace
+branch for any of them to act on. Commit and push it the way you always have,
+from your own `git` or the agent's; when you are done with the workspace,
+**Close workspace…** stops the agent and its sandbox without touching any of
+it (see "Working directly in a checkout" above).
+
 The **Changes** tab's toolbar is where work goes back.
 
 - **Merge** runs `git merge --no-ff` of `bs/<name>/work` into the base branch.
@@ -685,7 +822,9 @@ it installs the daemon binary it ships with before every launch, so a mismatch
 means that binary is itself from a different build. Fix it by making the pair
 match: reinstall the package, or rebuild the daemon with
 `.\scripts\build-daemon.ps1` from the same checkout as the IDE. An IDE and a
-daemon are shipped as a pair.
+daemon are shipped as a pair. This IDE speaks protocol **2** (the version that
+added working directly in a checkout, below); a daemon still on protocol 1
+answers this way rather than silently ignoring a request it has never heard of.
 
 **Reading the logs.** Neither side writes a log file. The daemon's own output
 and its `daemon.log` protocol events are folded into the IDE's log stream, so
@@ -726,6 +865,33 @@ despite the lock — or the daemon is stopped mid-write and leaves the
 registration half built — its tab shows the reason and a **Retry** button that
 puts the registration back, keeping uncommitted work as unstaged changes. See
 "When a workspace cannot run" above.
+
+**"The repository \<path\> is missing or is no longer a git repository."** A
+workspace working directly in a checkout (see "Working directly in a
+checkout") found, on restore or restart, that its folder was moved, deleted,
+or is no longer a git repository at all. Nothing was touched by BondSymphonic
+— it does not create, move or delete that folder — so this means something
+else did. **Retry** checks again and brings the sandbox back once the folder
+is a repository at that path again; **Close workspace…** removes the
+workspace's own bookkeeping and stops offering it, without expecting anything
+back from the folder.
+
+**"Git files this workspace protects were replaced while the agent was
+running (…), so its sandbox was stopped."** An in-place workspace's sandbox
+stopped itself because something outside it — the agent could not have done
+this from inside its own sandbox — replaced or removed one of the git files it
+protects: `.git/config`, `commondir`, `hooks`, `info`, `worktrees`, `remotes`,
+`branches`, `config.worktree`. This is not only what an agent might do; **any
+git command that writes into one of those, including one you run yourself in
+that repository** (`git config`, `git branch -u`, `git push -u`, `git remote
+add`, `git sparse-checkout`, or removing the last worktree of the repository),
+stops the workspace this way — the daemon cannot tell your own command from an
+agent's. The daemon's log names what changed and shows a line diff of
+`.git/config` (and the other protected files) between what it last checked and
+now; read that before pressing **Retry** — a setting planted in the brief
+window before the check caught it is still sitting in `.git/config`, and
+Retry does not undo it, only re-protects and restarts. **Close workspace…**
+works regardless, since it never depends on the sandbox being up.
 
 **Sandbox failures.** The sandbox is bubblewrap. If the `bwrap` or `userns`
 check fails, unprivileged user namespaces are usually restricted:

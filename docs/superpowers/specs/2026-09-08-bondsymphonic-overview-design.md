@@ -118,6 +118,12 @@ future VS Code extension and the future Linux/macOS builds cheap.
   daemon are shipped as a pair, so a pair that does not match is refused at the
   handshake instead of failing later on a field one of the two has never heard
   of. See 6.3.
+- `PROTOCOL_VERSION` is `2`. Version 2 added in-place workspaces
+  (`WorkspaceCreateParams::in_place`, `WorkspaceInfo::kind`,
+  `RepoInfo::{head_branch, in_place_refusal, hooks_path_in_tree}`); `hello`
+  gates on it, so a peer that sends none of that — a version-1 build — reads as
+  `PRE_M7_PROTOCOL_VERSION` (`1`) and is refused rather than being sent, or
+  asked for, a field it has never heard of.
 - Multiple authenticated connections are permitted; events are broadcast to all.
 
 ### 6.2 Message envelope
@@ -149,7 +155,7 @@ crate.
 **system**
 - `hello {token, client_version, protocol_version}` →
   `{daemon_version, capabilities, protocol_version}`. `protocol_version` is
-  `bondsymphonic_proto::PROTOCOL_VERSION`, which is `1`. Both fields are
+  `bondsymphonic_proto::PROTOCOL_VERSION`, which is `2` (6.1). Both fields are
   optional on the wire: a peer that sends none predates the field, and is
   treated as speaking version 1, which is what everything before Milestone 7
   spoke.
@@ -172,7 +178,17 @@ crate.
 - `system.shutdown`
 
 **repo**
-- `repo.inspect {path}` → `{default_branch, branches[], is_dirty, remotes[]}`
+- `repo.inspect {path}` → `{default_branch, branches[], is_dirty, remotes[],
+  head_branch, in_place_refusal, hooks_path_in_tree}`. The last three are
+  `#[serde(default)] Option<String>`, added with in-place workspaces:
+  `head_branch` is the branch actually checked out (`None` when `HEAD` is
+  detached — `default_branch` is the *remote's* default and answers a
+  different question); `in_place_refusal` is why the path cannot be worked on
+  in place (a linked worktree, a `.git` that is a file), the same sentence
+  `workspace.create` would refuse with, or `None`; `hooks_path_in_tree` is the
+  repository's effective `core.hooksPath`, relative to the root, when it
+  resolves inside the working tree rather than inside `.git` (husky does
+  this), or `None`.
 - `repo.detect_run_configs {path}` → `RunConfig[]` (from `bondsymphonic.toml` or
   auto-detection, with `source` field), plus `network_allow[]` and `warnings[]`.
   `warnings` is one line per part of the repository's `bondsymphonic.toml` that
@@ -180,19 +196,37 @@ crate.
   finds nothing to report.
 
 **workspace**
-- `workspace.create {repo_path, base_branch, name}` → `WorkspaceInfo`
+- `workspace.create {repo_path, base_branch, name, init_if_missing, in_place}` →
+  `WorkspaceInfo`. `in_place` (`#[serde(default)]`, added with protocol
+  version 2) works the checkout at `repo_path` directly instead of creating a
+  worktree; `base_branch` is then ignored and may be empty. Refused
+  (`InvalidParams`) for a linked worktree, a `.git` that is a file, a bare
+  repository, a path inside another repository, `/`, the daemon's own
+  `$HOME`, or a path inside or containing the daemon's data directory; a
+  second in-place create on the same checkout is `Conflict`.
 - `workspace.list` → `WorkspaceInfo[]`
-- `workspace.get {workspace_id}` → `WorkspaceInfo`
-- `workspace.destroy {workspace_id, force}` — stops all processes, removes sandbox
-  and worktree, deletes branch
+- `workspace.get {workspace_id}` → `WorkspaceInfo`. Every `WorkspaceInfo`
+  carries `kind` (`#[serde(default)]`, `"worktree"` or `"in_place"`,
+  `WorkspaceKind`); for an in-place workspace, `worktree_path` is the
+  repository root, `branch` is the branch checked out when it was created (or
+  `""` when `HEAD` was detached, display only), and `base_branch` repeats
+  `branch`.
+- `workspace.destroy {workspace_id, force}` — stops all processes and removes
+  the sandbox. For a `worktree` workspace this also removes the worktree and
+  deletes its branch; for an `in_place` workspace `force` is ignored, nothing
+  of the checkout is touched, and only the daemon's own protective entries in
+  `.git` are taken back (see the daemon design, §4.x and §6.2).
 - `workspace.status {workspace_id}` → git status entries
 - `workspace.changes {workspace_id}` → files changed vs base
-  `{path, status, additions, deletions}`
+  `{path, status, additions, deletions}`. For an in-place workspace this is
+  against `HEAD`, not `merge-base(base_branch, HEAD)`.
 - `workspace.diff {workspace_id, path}` → `{base_text, work_text}` (the IDE
   computes the diff)
 - `workspace.merge {workspace_id, mode: "merge"|"rebase"|"squash"}` →
-  `{ok, conflicts[]}`
-- `workspace.create_pr {workspace_id, title, body, draft}` → `{url}`
+  `{ok, conflicts[]}`. Refused for an in-place workspace: `InvalidParams`,
+  `data.reason = "in_place"`.
+- `workspace.create_pr {workspace_id, title, body, draft}` → `{url}`. Refused
+  for an in-place workspace the same way as `workspace.merge`.
 - `workspace.set_allowlist {workspace_id, hosts[]}`
 - `workspace.restart {workspace_id}` → `WorkspaceInfo`. Restarts the sandbox of
   a `Ready`, `SandboxDown` or `Error` workspace, re-registering a pruned

@@ -1,6 +1,6 @@
 # In-place workspaces — design
 
-Date: 2026-09-17. Status: approved in chat by the user; amended the same day while planning (`.git/commondir`, `worktrees`, `remotes` and `branches` read-only, `--ignore-submodules=all`, the extra `repo.inspect` fields and refusals, measured bwrap and git behaviour). The plan is `docs/superpowers/plans/2026-09-17-in-place-workspaces.md`.
+Date: 2026-09-17. Status: approved in chat by the user; amended the same day while planning (`.git/commondir`, `worktrees`, `remotes` and `branches` read-only, `--ignore-submodules=all`, the extra `repo.inspect` fields and refusals, measured bwrap and git behaviour), and amended again during implementation (§4.1: `config.worktree` is bound unconditionally, not only when `extensions.worktreeConfig` is on; §4.2: a read-only bind can be detached from outside the sandbox, so the daemon detects and stops the sandbox instead of relying on the bind alone). The plan is `docs/superpowers/plans/2026-09-17-in-place-workspaces.md`.
 
 ## 1. Goal
 
@@ -112,10 +112,11 @@ For `in_place`:
   `homes/<id>`, `caches/<id>`, `run/<id>` and the agent records and transcripts,
   as today.
 - **Never** run `worktree::remove` and never touch `worktree_path`, its files, or
-  any branch. The only writes to `.git` are taking back what §4.1 step 6 put
+  any branch. The only writes to `.git` are taking back what §4.1 step 5 put
   there: the `commondir` guard if it still holds exactly `.`, and each of
-  `worktrees`, `remotes` and `branches` that the daemon's record says it created
-  and that is still empty. The record is then deleted. A test asserts that the
+  `worktrees`, `remotes`, `branches` and `config.worktree` that the daemon's
+  record says it created and that is still empty. The record is then deleted.
+  A test asserts that the
   repository is byte-identical afterwards (tree listing with contents, `.git`
   included, plus `git status --porcelain=v2` plus `git for-each-ref` plus
   `.git/config` contents).
@@ -158,12 +159,15 @@ separates `rw_binds`, `ro_binds` and `late_ro_binds`):
 
 1. rw: `<root>`.
 2. rw: `<root>/.git`, a mount of its own. A mount point cannot be renamed,
-   removed or replaced (`EBUSY`), so the agent cannot swap `.git` for a directory
-   of its own making.
+   removed or replaced *from inside the sandbox* (`EBUSY`), so the agent cannot
+   swap `.git` for a directory of its own making. It can still be replaced from
+   *outside* the sandbox; §4.2 covers that.
 3. ro, late, in this order: `<root>/.git/config`, `<root>/.git/commondir`,
    `<root>/.git/hooks`, `<root>/.git/info`, `<root>/.git/worktrees`,
-   `<root>/.git/remotes`, `<root>/.git/branches`, and `<root>/.git/modules` (the
-   last only when it is a real directory, not a symlink).
+   `<root>/.git/remotes`, `<root>/.git/branches`, `<root>/.git/modules` (the
+   last only when it is a real directory, not a symlink), and
+   `<root>/.git/config.worktree` (**unconditionally** -- amended during
+   implementation, see below).
    - `commondir`: git reads it from *any* git directory, not only a linked
      worktree's, and takes config, refs and objects from wherever it points.
      Measured: an agent that writes it, pointing at a directory of its own whose
@@ -174,23 +178,29 @@ separates `rw_binds`, `ro_binds` and `late_ro_binds`):
    - `remotes` and `branches`: legacy remote definitions that
      `git fetch <name>` and `git push <name>` read, so an agent could redirect a
      remote name the user types.
-4. ro, late: `<root>/.git/config.worktree`, but only when
-   `extensions.worktreeConfig` is enabled. If the file is missing, the daemon
-   creates it empty first: git reads an empty file as no configuration. A file
-   the user already has is left as it is.
-5. Before every sandbox start the daemon writes `.git/commondir` containing `.`
+   - `config.worktree`: this design originally bound it only when
+     `extensions.worktreeConfig` was already on. That is not enough, because
+     `git sparse-checkout init` turns the extension on by itself and keeps
+     whatever an agent had already left in the file, so the daemon does not
+     wait for the extension to decide whether the file is protected -- it
+     creates and binds it whatever the extension says. If the file is missing,
+     the daemon creates it empty first: git reads an empty file as no
+     configuration. A file the user already has is left as it is.
+4. Before every sandbox start the daemon writes `.git/commondir` containing `.`
    (a newline-terminated dot). That points the common directory at the git
    directory itself, which it is anyway. Measured with git 2.43 and Git for
    Windows 2.52: status, commit, switch, stash, `worktree add` and `remove`, gc
    and fsck all behave as without it. A repository that already has a
    `commondir` with any other content is refused (`InvalidParams`).
-6. If `.git/hooks` or `.git/info` is missing, the daemon creates the empty
+5. If `.git/hooks` or `.git/info` is missing, the daemon creates the empty
    directory; git's own `init` makes both, and they stay after Close. If any of
-   `.git/worktrees`, `.git/remotes` or `.git/branches` is missing, the daemon
-   creates it empty and appends its name to a record of its own,
-   `<data>/in-place/<id>.created`, outside every sandbox. Git creates these on
-   demand, and an empty one changes nothing. Close removes exactly the recorded
-   ones, and only while they are empty (§3.3).
+   `.git/worktrees`, `.git/remotes`, `.git/branches` or `.git/config.worktree`
+   is missing, the daemon creates it (empty, or an empty directory) and appends
+   its name to a record of its own, `<data>/in-place/<id>.created`, outside
+   every sandbox. Git creates the first three on demand, and an empty one
+   changes nothing; `config.worktree` is created for the same reason (above).
+   Close removes exactly the recorded ones, and only while they are still
+   empty (§3.3).
 
 There is no private object directory and no `GIT_OBJECT_DIRECTORY` or
 `GIT_ALTERNATE_OBJECT_DIRECTORIES`: the agent's objects go into the repository's
@@ -199,10 +209,11 @@ for a worktree workspace; `cwd` is `<root>`.
 
 Measured with bwrap 0.9 in the distro: a `--ro-bind` onto a missing path creates
 it on the underlying writable repository (an empty directory, or an empty `0444`
-file). That is why steps 4–6 create every read-only target first; bwrap then never
+file). That is why steps 3–5 create every read-only target first; bwrap then never
 has to, and the binds create nothing beyond those documented entries. Renaming or
 removing a mount point (`.git`, the root, any of the files above) fails with
-`EBUSY`.
+`EBUSY` *from inside the sandbox*. §4.2 covers what that guarantee does and does
+not reach.
 
 ### 4.2 What this protects, and what it does not
 
@@ -215,6 +226,49 @@ of the repository's worktree workspaces.
 Inside the sandbox, git commands that write `.git/config` fail: `git push -u`,
 `git remote add`, upstream tracking set up by `git switch -c x origin/x`, and
 `git sparse-checkout`. This is accepted.
+
+**A read-only bind is not proof against something that runs outside the
+sandbox -- amended during implementation.** The `EBUSY` guarantee of §4.1
+holds only inside the agent's own mount namespace. It does not hold against
+anything that runs outside the sandbox, in the same repository, while the
+workspace is open: a `git config` the user types, `git branch -u`, `git push
+-u`, `git remote add`, a `git worktree remove` that empties the last entry
+under `worktrees`, or `git sparse-checkout` all replace or remove the very
+file or directory a bind was made on -- git's lock-and-rename pattern for
+`config` chief among them -- and the kernel detaches that bind inside the
+sandbox exactly as a plain rename or remove of a mounted-over path always
+has. Nothing run inside the sandbox can prevent that: the entry the bind was
+protecting is simply gone from under it, and the path falls through to the
+writable `.git` beneath.
+
+The daemon watches for this rather than relying on the bind alone.
+`InPlaceLayout::snapshot`, taken right after `prepare` and before the sandbox
+starts, records each protected entry's device and inode -- not size or time,
+so the user editing `.git/config` in their own editor is never mistaken for a
+replacement -- together with the contents of `config`, `config.worktree` and
+`commondir`, the files that name programs. Every 250 ms while the sandbox is
+up, the snapshot is rechecked: every entry is re-`lstat`ed and, given the
+sandbox's pid, its `/proc/<pid>/mountinfo` is re-read to confirm each one is
+still actually mounted there -- identity alone is not enough, because two
+config writes in a row can hand a fresh file the same inode number an ext4
+filesystem just freed. The first change either check finds is a breach: the
+sandbox is torn down, the workspace moves to `Error` with a sentence naming
+which entries changed, and the daemon's log carries a unified line diff of
+the ones whose contents were read. Retry (`workspace.restart`) prepares and
+snapshots again, so a repaired repository is protected exactly as it was on
+create.
+
+This closes the gap for everything that happens after the next check runs,
+but not for the poll interval itself: a change the check has not yet seen --
+made in the up-to-250-ms window before it fires -- can still leave
+`.git/config` holding something written from outside the sandbox, and the
+daemon only reports it after the fact; the logged diff is what lets the user
+tell a setting they meant to make from one they did not, before pressing
+Retry. One consequence follows directly and is by design, not a gap to close:
+any git command that writes into a protected entry -- not only one an agent
+runs, but one the user themselves runs in that repository while an in-place
+workspace is open on it -- reads as a breach and stops that workspace's
+sandbox, because the daemon cannot tell the two apart.
 
 Residual risks, documented in the user guide and not mitigated further:
 
@@ -321,14 +375,25 @@ Daemon (in WSL; bwrap tests skip where bwrap is unavailable):
   - `mv .git x`, replacing `.git`, and moving the root;
   - `rm -rf .git` exits non-zero and leaves `.git`, `config` and `hooks` in
     place (the rest of `.git` is lost; §4.2);
-  - `.git/config.worktree` (when that extension is enabled).
+  - `.git/config.worktree` (bound whether or not that extension is enabled --
+    amended during implementation, §4.1).
 
   The binds create nothing in the repository except the documented entries
-  (§4.1 steps 4–6).
+  (§4.1 steps 3–5).
 - **Preparation:** `prepare` creates exactly those entries and records only the
   on-demand directories it made. A foreign `commondir` is refused. Release
   removes only recorded, still-empty directories and ignores anything else in the
   record. The pinned git ignores a planted `commondir`.
+- **Protection (amended during implementation, §4.2):** a snapshot taken after
+  `prepare` catches a protected entry replaced, removed or unmounted from
+  *outside* the sandbox -- exercised host-side rather than from inside it,
+  since that is the side the guarantee does not reach -- and answers with the
+  changed entries' names; an entry edited in place (same device and inode) is
+  not a breach. The daemon stops the sandbox, sets the workspace `Error` with
+  the breach sentence, and logs a diff of the protected files' contents.
+  Retry (`workspace.restart`) prepares and snapshots again and the workspace
+  comes back `Ready`. A `mountinfo` that cannot be read reads as a breach
+  rather than as nothing changed (fails closed).
 - **Destroy:** the repository is byte-identical afterwards, whatever `force` says.
 - **Changes and diff:** they are measured against `HEAD`, and against the empty
   tree when there are no commits. Merge and PR refuse with

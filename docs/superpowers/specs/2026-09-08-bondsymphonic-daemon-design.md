@@ -357,6 +357,64 @@ Any failure leaves the workspace in `Error(<a sentence saying what is wrong and
 what to do>)`, never a bare `SandboxDown`, and nothing is deleted, so the user
 can decide. `SandboxDown` is reserved for a sandbox that dies while running.
 
+### 4.x Workspace kinds
+
+Two paths through `workspace.create` and, from there, the rest of the
+lifecycle, share one `Workspace` record and one `WorkspaceState`. `kind`
+(`WorkspaceKind::Worktree` or `::InPlace`) decides which:
+
+| Field | `worktree` | `in_place` |
+|---|---|---|
+| `worktree_path` | `~/.bondsymphonic/worktrees/<id>`, a linked worktree of the repository | the repository root itself — the folder the agent edits |
+| `branch` | `bs/<name>/work`, created for the workspace | the branch checked out at creation, or `""` when `HEAD` is detached; display only — never switched, created or deleted |
+| `base_branch` | the branch it was created from | the same string as `branch`; nothing ever merges into it |
+
+A registry written by a daemon that predates `kind` has none, and reads as
+`worktree`.
+
+**Create** (`in_place: true`). The daemon requires a repository root with a
+real `.git` directory: a linked worktree, a root whose `.git` is a file (a
+separate git directory, or a submodule checkout), a bare repository, and a
+path inside another repository are all refused with `InvalidParams` naming
+why. The daemon also refuses `/`, its own `$HOME`, a root inside its data
+directory, and — the one rule `init_if_missing` did not already cover — a root
+that *contains* the data directory, because the read-write bind of such a root
+would bring every other workspace's home and exec socket back over the tmpfs
+that masks them (§6.2). A second in-place create on a checkout that already
+has one is `Conflict`, `"this checkout already has an in-place workspace:
+<name>"`, compared by canonical path so a different route to the same checkout
+is still caught; a worktree workspace on the same repository is unaffected.
+There is no branch, no `git worktree add`, no lock and no private object
+directory: `branch` is simply read with `git symbolic-ref --short -q HEAD`.
+
+**Restore and `workspace.restart`.** `ensure_registered` — the worktree
+repair and lock a `worktree` workspace goes through — does not apply to an
+in-place one; there is no worktree to repair. What is checked instead is that
+`worktree_path` still exists and still has a `.git` directory; if not, the
+workspace goes to `Error("The repository <path> is missing or is no longer a
+git repository. Close the workspace, or restore the folder and press
+Retry.")`. The per-workspace gate and the rest of restart and restore are
+shared with the worktree kind. (A running in-place sandbox can also land in
+`Error` on its own, with a different sentence, if its protected git entries
+are replaced from outside it — see §6.2.)
+
+**Destroy ("Close").** `force` is ignored and there is no dirty or unmerged
+check: nothing of the user's is ever a reason to refuse, because nothing of
+the user's is deleted. Agents, runs, PTYs, the proxy and the sandbox are
+stopped and the daemon's own `homes/<id>`, `caches/<id>` and `run/<id>`
+removed, exactly as for a worktree workspace. The only writes into the
+checkout are `InPlaceLayout::release` taking back what `prepare` put there
+(§6.2): the `commondir` guard, if it still holds exactly what the daemon
+wrote, and each of the on-demand directories the daemon's own record
+(`<data>/in-place/<id>.created`) says it created, if it is still empty.
+`worktree::remove` is never called, and `worktree_path`, its files and its
+branches are never touched.
+
+**`layout_for` refuses an in-place workspace** with `Internal`, before it
+computes anything, so no worktree-only path — `ref_dir`, `worktree_gitdir`, a
+private object directory, `config_worktree` — can be reached for one by a
+caller that forgot to branch on `kind`.
+
 ## 5. Git
 
 All git access goes through the `git` CLI via `tokio::process::Command`, with
@@ -473,6 +531,25 @@ A `--no-git-protect` daemon flag mounts `.git` read-write for troubleshooting;
   constructor, so a command added later cannot be forgotten and a bare
   `Git::new()` carries it too. It applies to the conflict list of 5.4
   (`git diff --name-only --diff-filter=U`) as much as to the lists here.
+- An in-place workspace measures `workspace.status`, `workspace.changes` and
+  `workspace.diff` against `HEAD` — or the empty tree,
+  `4b825dc642cb6eb9a060e54bf8d69288fbee4904`, in a repository with no commits
+  yet — rather than `merge-base(base_branch, HEAD)`, through
+  `InPlaceLayout::git()` (`GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE` all
+  pinned at the checkout). The result types are unchanged.
+- **Every daemon-side `git status` and `git diff` against a tree an agent can
+  write — for both kinds of workspace — passes `--ignore-submodules=all`.** An
+  agent can `git init` a directory in the tree, set `core.fsmonitor` in its own
+  `.git/config` and commit the gitlink as a submodule; without the flag, the
+  daemon's own status or diff looks inside that embedded repository to report
+  its state and runs the command it names. `-c diff.ignoreSubmodules=all` is
+  not enough on its own, because a `.gitmodules` entry with `ignore = none`
+  that the agent writes overrides it; the command-line flag is not overridden
+  by anything in the tree. This closes the hole for both workspace kinds
+  except one known exception: the rebase step of §5.4 runs `git rebase`, which
+  has no `--ignore-submodules` option, so an embedded repository an agent
+  committed can still have its config run there. That is a follow-up, not
+  fixed by this.
 
 ### 5.4 Merge, rebase, squash
 Run in the main repo by the daemon, never inside a sandbox:
@@ -535,6 +612,11 @@ Run in the main repo by the daemon, never inside a sandbox:
   rather than closed: a `.gitattributes` **in the merged tree**, which an agent
   wrote, chooses which of the user's own drivers run and over what content,
   during a merge the daemon performs on the host outside any sandbox.
+- **`workspace.merge` and `workspace.create_pr` refuse an in-place workspace
+  outright**, before any git runs at all: `InvalidParams`, `data.reason =
+  "in_place"`, `"an in-place workspace has nothing to merge; commit and push
+  from the checkout"` (`in_place::nothing_to_merge`, shared by both calls).
+  There is no branch of its own for either to land.
 
 ### 5.5 PR
 `git push -u origin bs/<name>/work` then `gh pr create --title --body [--draft]
@@ -653,6 +735,106 @@ plus its own workspace's paths bound back in. In argv order:
   the sandbox.
 - `--unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup`
   and `--unshare-net` (6.3). `--die-with-parent`, `--new-session`.
+
+**In-place workspaces.** An in-place sandbox's mounts come from
+`InPlaceLayout`, not `Layout`: read-write `<root>` and `<root>/.git` — a mount
+of its own — then, late and read-only, in this order: `.git/config`,
+`.git/commondir`, `.git/hooks`, `.git/info`, `.git/worktrees`,
+`.git/remotes`, `.git/branches`, `.git/modules` (only when it is a real
+directory, never a symlink), and `.git/config.worktree`, which is bound
+unconditionally — unlike a worktree workspace's own `config.worktree`, an
+in-place one is the user's single git directory, and `git sparse-checkout
+init` can turn on `extensions.worktreeConfig` at any moment an agent chooses,
+so the daemon does not wait for that to decide whether the file is protected.
+
+`InPlaceLayout::prepare` runs before every sandbox start — create, restore,
+restart, Retry — and creates every one of those targets that is missing,
+before the sandbox ever starts. This is not tidiness: measured, bubblewrap
+creates a missing `--ro-bind` target itself, an empty directory for a missing
+directory or an empty `0444` file for a missing file, and the filesystem
+underneath a bind here is the user's own writable repository, so a target
+bwrap made on its own would be a target the daemon does not know it owns. Of
+what `prepare` creates, `hooks` and `info` are left as ordinary git output —
+`git init` makes both itself, and they stay after Close — but `worktrees`,
+`remotes`, `branches` and `config.worktree` are recorded in a daemon-owned
+file outside every sandbox, `<data>/in-place/<id>.created`
+(`DataDirs::in_place_record`), so Close (`InPlaceLayout::release`) can take
+back exactly the ones it made, and only while each is still empty: whatever
+git has since put there belongs to the user.
+
+`worktrees`, `remotes` and `branches` are read-only for reasons beyond what
+`.git/config` itself already covers: `worktrees` holds the git directories of
+this same repository's *worktree* workspaces, and their `config.worktree` is
+exactly what the daemon's own status reads for them; `remotes` and `branches`
+hold the legacy remote definitions `git fetch <name>` and `git push <name>`
+read, which an agent could otherwise use to redirect a name the user types.
+
+`prepare` also writes `.git/commondir` as `.` followed by a newline, before
+the first bind, and refuses (`InvalidParams`) a repository whose `commondir`
+already holds something else. Git reads `commondir` from *any* git directory,
+not only a linked worktree's, and takes config, refs and objects from
+wherever it points; an agent that could write it could point the user's next
+`git status` at a config of its own choosing, even with `GIT_DIR` pinned. `.`
+points the common directory at the git directory itself, which is what it
+already is, and was measured to change nothing: status, commit, switch,
+stash, `worktree add`/`remove`, gc and fsck all behave identically with and
+without it, under git 2.43 (the distro) and Git for Windows 2.52.
+
+A mount point — `.git` itself, or any of the entries above — cannot be
+renamed or removed *from inside the sandbox*: the kernel answers `EBUSY`.
+`rm -rf .git` therefore exits non-zero, and `.git`, `config`, `commondir`,
+`hooks`, `info`, `worktrees`, `remotes` and `branches` all survive it — but
+everything under `.git` that is not one of those mount points, `HEAD`, the
+index, `objects/`, `refs/` and `logs/` included, is deleted just the same, so
+the agent can still destroy the repository's history from inside its own
+sandbox. There is no private object directory and no `GIT_OBJECT_DIRECTORY`
+or `GIT_ALTERNATE_OBJECT_DIRECTORIES` for an in-place workspace: the agent's
+objects go straight into the repository's own store, which is the point of
+working in place.
+
+**A bind can still be defeated — from outside the sandbox.** The `EBUSY`
+guarantee above holds only inside the agent's own mount namespace. It is not a
+guarantee against anything that runs outside the sandbox, in the same
+repository, while the workspace is open: a `git config` the user types, `git
+branch -u`, `git push -u`, `git remote add`, a `git worktree remove` that
+empties the last entry under `worktrees`, or `git sparse-checkout` all replace
+or remove the file or directory a bind was made on — git's lock-and-rename
+pattern for `config` chief among them — and the kernel detaches that bind
+inside the sandbox exactly as a plain rename or remove of a mounted-over path
+always has. Nothing run inside the sandbox can prevent that: the entry the
+bind was protecting is simply gone from under it, and the path falls through
+to the writable `.git` beneath.
+
+The daemon watches for this rather than relying on the bind alone.
+`InPlaceLayout::snapshot`, taken right after `prepare` and before the sandbox
+starts, records each protected entry's device and inode — not size or time,
+so the user editing `.git/config` in their own editor is never mistaken for a
+replacement — together with the contents of `config`, `config.worktree` and
+`commondir`, the files that name programs. Every `PROTECTION_POLL` (250 ms)
+while the sandbox is up, `ProtectedSnapshot::check` re-`lstat`s every entry
+and, given the sandbox's pid, re-reads its `/proc/<pid>/mountinfo` to confirm
+each one is still actually mounted there — identity alone is not enough,
+because two config writes in a row can hand a fresh file the same inode
+number an ext4 filesystem just freed. The first change either check finds is
+a breach: the sandbox is torn down, the workspace moves to
+`Error(ProtectionBreach::sentence())`, and a `daemon.log` warning names which
+entries changed and carries a unified line diff of the ones whose contents
+were read. Retry (`workspace.restart`) calls `prepare` and takes a fresh
+snapshot, so a repaired repository is protected exactly as it was on create.
+
+This closes the gap for everything that happens after the next check runs,
+but not for the poll interval itself: a change the check has not yet seen —
+made in the up-to-250-ms window before it fires — can still leave
+`.git/config` holding something written from outside the sandbox, and the
+daemon only reports it after the fact; the logged diff is what lets the user
+tell a setting they meant to make from one they did not, before pressing
+Retry. One consequence follows directly: any git command that writes into a
+protected entry — not only one an agent runs, but one the user themselves
+runs in that repository while an in-place workspace is open on it — reads as
+a breach and stops that workspace's sandbox. This is by design: the daemon
+cannot tell the user's own `git config` apart from an agent's, and the
+alternative would be trusting a bind that has already been shown to be
+defeatable from outside.
 
 ### 6.3 Sandbox init (one bwrap per workspace)
 bubblewrap cannot join an existing network namespace, so the daemon runs exactly
