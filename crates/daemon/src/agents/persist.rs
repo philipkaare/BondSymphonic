@@ -73,6 +73,10 @@ pub struct AgentRecords {
     /// Held across a whole read-modify-write. Never held across an `await`:
     /// every method here is synchronous.
     lock: Mutex<()>,
+    /// Test hook: how long an [`update`](Self::update) that leaves a record
+    /// closed takes on top of the write itself. See
+    /// [`delay_closing_writes`](Self::delay_closing_writes).
+    closing_delay: Mutex<Option<std::time::Duration>>,
 }
 
 impl AgentRecords {
@@ -80,7 +84,22 @@ impl AgentRecords {
         Self {
             path: path.into(),
             lock: Mutex::new(()),
+            closing_delay: Mutex::new(None),
         }
+    }
+
+    /// Makes every write that leaves a record closed take `by` longer, the way
+    /// an `fsync` on a busy disk does.
+    ///
+    /// For tests only, which is why it is hidden rather than absent: the
+    /// integration tests are another crate and cannot see `cfg(test)` items.
+    /// The race it exists to reproduce is between an agent's exit announcement
+    /// and those writes, and a real disk is slow only when it feels like it.
+    /// Only closing writes, so the session id a turn records on the way does
+    /// not move anything else in the test's timeline.
+    #[doc(hidden)]
+    pub fn delay_closing_writes(&self, by: std::time::Duration) {
+        *self.closing_delay.lock() = Some(by);
     }
 
     pub fn path(&self) -> &Path {
@@ -195,6 +214,10 @@ impl AgentRecords {
         };
         f(record);
         record.options.api_key = None;
+        let closing_delay = *self.closing_delay.lock();
+        if let (Some(by), Some(_)) = (closing_delay, &record.ended_at) {
+            std::thread::sleep(by);
+        }
         self.save_locked(&all);
     }
 

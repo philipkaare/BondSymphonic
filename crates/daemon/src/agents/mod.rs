@@ -545,6 +545,12 @@ impl AgentManager {
         }
     }
 
+    /// Test hook: see [`AgentRecords::delay_closing_writes`].
+    #[doc(hidden)]
+    pub fn delay_record_closing_for_tests(&self, by: std::time::Duration) {
+        self.records.delay_closing_writes(by);
+    }
+
     /// An agent id no agent in the map already holds.
     ///
     /// `new_id` is four random bytes, which was collision-free enough while the
