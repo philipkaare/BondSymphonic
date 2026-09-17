@@ -113,11 +113,20 @@ pub async fn merge(
     // state of a working directory, not a reason to refuse every merge into it.
     // Counting them made the guard fire on repositories where nothing was at
     // risk, and the only way out was to delete files the user had put there.
+    //
+    // `IGNORE_SUBMODULES` because the checkout this asks about is the user's
+    // own, which an in-place workspace of the same repository makes
+    // agent-writable: see the constant.
     if on_base
         && !git
             .run(
                 &ws.repo_path,
-                &["status", "--porcelain", "--untracked-files=no"],
+                &[
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=no",
+                    crate::workspace::in_place::IGNORE_SUBMODULES,
+                ],
             )
             .await?
             .stdout
@@ -400,15 +409,33 @@ async fn conflict_or_error(
 /// Empty when the command failed for a reason other than a conflict — and also
 /// if this read itself fails, which is why the caller treats "no paths" as "not
 /// a conflict" and re-raises the original error rather than inventing one.
+///
+/// `ls-files --unmerged`, not `diff --diff-filter=U`: a `diff` compares the
+/// index with the working tree, so it looks inside every embedded repository on
+/// the way and runs that repository's config — and this runs in a tree an agent
+/// can write, in the user's own checkout on a merge conflict and in the
+/// workspace's worktree on a rebase conflict. `ls-files` reads the index alone.
+/// `-z` because a path git would otherwise quote comes back as it is, and
+/// `--full-name` so the paths are repository-relative whatever the working
+/// directory is, as the `diff` output was. The index holds one row per stage,
+/// so each conflicting path appears up to three times and is reported once.
 async fn unmerged_paths(git: &Git, dir: &Path) -> Vec<String> {
-    git.run(dir, &["diff", "--name-only", "--diff-filter=U"])
+    let Ok(out) = git
+        .run(dir, &["ls-files", "--unmerged", "-z", "--full-name"])
         .await
-        .map(|o| {
-            o.stdout
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+    else {
+        return Vec::new();
+    };
+    let mut paths: Vec<String> = Vec::new();
+    for record in out.stdout.split('\0') {
+        // `<mode> <object> <stage>\t<path>`; anything without the tab is the
+        // empty trailer after the last record.
+        let Some((_, path)) = record.split_once('\t') else {
+            continue;
+        };
+        if !path.is_empty() && !paths.iter().any(|p| p == path) {
+            paths.push(path.to_string());
+        }
+    }
+    paths
 }

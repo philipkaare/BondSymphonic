@@ -65,6 +65,49 @@ pub fn git_ok(dir: &Path, args: &[&str]) {
     git_out(dir, args);
 }
 
+/// [`git_out`] for a command whose failure is an answer rather than a fault:
+/// `git config --get <key>` exits non-zero when the key is not set.
+pub fn git_try(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
+    if out.status.success() {
+        Ok(text(&out.stdout))
+    } else {
+        Err(text(&out.stderr))
+    }
+}
+
+/// Commits an embedded repository at `<root>/sub` whose own config runs
+/// `touch <marker>` as `core.fsmonitor`, and leaves a dirty file in it.
+///
+/// This is how an agent gets a git *outside* its sandbox to run a program of
+/// its choosing: git reads an embedded repository's config whenever it has to
+/// report on that repository's state, and only `--ignore-submodules=all` stops
+/// it looking (see `in_place::IGNORE_SUBMODULES`). `env` is whatever the outer
+/// commit needs -- a workspace worktree's commit wants its layout's object
+/// directories.
+pub fn plant_embedded_repo(root: &Path, marker: &Path, env: &[(String, String)]) {
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    git_ok(&sub, &["init", "-q", "-b", "main"]);
+    git_ok(&sub, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(sub.join("f.txt"), "f\n").unwrap();
+    commit_all(&sub, &[], "sub");
+    commit_all(root, env, "gitlink");
+    let config = sub.join(".git/config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "[core]\n\tfsmonitor = touch {}\n",
+        marker.display()
+    ));
+    std::fs::write(&config, text).unwrap();
+    std::fs::write(sub.join("dirty.txt"), "x\n").unwrap();
+}
+
 /// Asserts that a refusal names the repository a folder sits inside.
 ///
 /// Either spelling counts. The daemon prints what it canonicalised, and on

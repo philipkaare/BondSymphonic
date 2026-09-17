@@ -135,7 +135,7 @@ async fn changes_do_not_run_an_embedded_repositorys_config() {
     let repo = common::init_repo(dir.path());
     let (d, id) = in_place_on(dir.path(), &repo, "main").await;
     let marker = dir.path().join("PWNED-in-place");
-    plant_embedded_repo(&repo, &marker, &[]);
+    common::plant_embedded_repo(&repo, &marker, &[]);
     let _ = std::fs::remove_file(&marker);
     changes::changes(&d, &id).await.unwrap();
     changes::diff(&d, &id, "README.md").await.unwrap();
@@ -156,7 +156,7 @@ async fn changes_do_not_run_an_embedded_repositorys_config() {
         .unwrap()
         .sandbox_git_env();
     let marker = other.path().join("PWNED-worktree");
-    plant_embedded_repo(&w.worktree_path, &marker, &env);
+    common::plant_embedded_repo(&w.worktree_path, &marker, &env);
     let _ = std::fs::remove_file(&marker);
     changes::changes(&daemon, &ws.id).await.unwrap();
     assert!(
@@ -164,25 +164,6 @@ async fn changes_do_not_run_an_embedded_repositorys_config() {
         "worktree: changes ran the embedded repository's config"
     );
     cancel.cancel();
-}
-
-/// The same helper as in `in_place_lifecycle.rs`; each test crate has its own.
-fn plant_embedded_repo(root: &Path, marker: &Path, env: &[(String, String)]) {
-    let sub = root.join("sub");
-    std::fs::create_dir_all(&sub).unwrap();
-    common::git_ok(&sub, &["init", "-q", "-b", "main"]);
-    common::git_ok(&sub, &["config", "commit.gpgsign", "false"]);
-    std::fs::write(sub.join("f.txt"), "f\n").unwrap();
-    common::commit_all(&sub, &[], "sub");
-    common::commit_all(root, env, "gitlink");
-    let config = sub.join(".git/config");
-    let mut text = std::fs::read_to_string(&config).unwrap();
-    text.push_str(&format!(
-        "[core]\n\tfsmonitor = touch {}\n",
-        marker.display()
-    ));
-    std::fs::write(&config, text).unwrap();
-    std::fs::write(sub.join("dirty.txt"), "x\n").unwrap();
 }
 
 #[tokio::test]
@@ -249,4 +230,78 @@ async fn inspect_reports_a_hooks_path_inside_the_working_tree() {
     }
     assert_eq!(repo::hooks_path_in_tree(&repo, "."), Some(".".into()));
     assert_eq!(repo::hooks_path_in_tree(&repo, ""), None);
+}
+
+/// Plan R3 again, for the New Agent dialog: `repo.inspect` asks the user's own
+/// checkout whether it is dirty, and with an in-place workspace in that
+/// checkout the tree it asks about is one an agent writes. Opening the dialog
+/// must not be enough to run a program the agent committed.
+#[cfg(unix)]
+#[tokio::test]
+async fn inspect_does_not_run_an_embedded_repositorys_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let marker = dir.path().join("PWNED-inspect");
+    common::plant_embedded_repo(&repo, &marker, &[]);
+    let _ = std::fs::remove_file(&marker);
+
+    let info = repo::inspect(&Git::new(), &repo).await.unwrap();
+    assert!(info.is_repo);
+    assert!(
+        !marker.exists(),
+        "repo.inspect ran the embedded repository's config"
+    );
+    // And the answer is still right: the dirty file is inside `sub`, which a
+    // status that ignores submodules does not count.
+    assert!(!info.is_dirty);
+    std::fs::write(repo.join("README.md"), "changed\n").unwrap();
+    assert!(repo::inspect(&Git::new(), &repo).await.unwrap().is_dirty);
+    assert!(!marker.exists());
+}
+
+/// The merge guard that reads the user's checkout, and the conflict listing
+/// that runs in it afterwards. Both used to look inside every embedded
+/// repository on the way.
+#[cfg(unix)]
+#[tokio::test]
+async fn merging_into_a_checkout_does_not_run_an_embedded_repositorys_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = common::start_daemon(&dir.path().join("data")).await;
+    let mut c = common::Client::connect(port, &token).await;
+    let ws = common::create_ws(&mut c, &repo, "wt").await;
+    let w = daemon.registry.get(&ws.id).unwrap();
+
+    // The agent's side of the conflict, in its own worktree.
+    let env = bondsymphonic_daemon::workspace::lifecycle::layout_for(&daemon, &w)
+        .await
+        .unwrap()
+        .sandbox_git_env();
+    std::fs::write(w.worktree_path.join("README.md"), "theirs\n").unwrap();
+    common::commit_all(&w.worktree_path, &env, "theirs");
+
+    // The user's side, in their own checkout, which is on the base branch --
+    // so the base-dirty guard runs there -- and which holds an embedded
+    // repository whose config names a program.
+    let marker = dir.path().join("PWNED-merge");
+    common::plant_embedded_repo(&repo, &marker, &[]);
+    std::fs::write(repo.join("README.md"), "ours\n").unwrap();
+    common::commit_all(&repo, &[], "ours");
+    let _ = std::fs::remove_file(&marker);
+
+    let result = merge::merge(
+        &daemon,
+        &ws.id,
+        bondsymphonic_proto::MergeMode::Merge,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!result.ok, "the merge should have conflicted");
+    assert_eq!(result.conflicts, ["README.md"]);
+    assert!(
+        !marker.exists(),
+        "the merge ran the embedded repository's config"
+    );
+    cancel.cancel();
 }

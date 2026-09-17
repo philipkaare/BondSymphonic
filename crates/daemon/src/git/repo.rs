@@ -332,9 +332,22 @@ async fn configured_head(git: &Git, repo: &Path) -> Result<Option<String>, RpcEr
 /// something to announce as uncommitted work. With the two disagreeing, the New
 /// Agent dialog said "Repository has uncommitted changes" about a repository
 /// the daemon would merge into without a murmur.
+///
+/// `IGNORE_SUBMODULES` because this runs in the user's own checkout, which an
+/// in-place workspace makes agent-writable: see the constant. The New Agent
+/// dialog calls `repo.inspect`, so without the flag simply opening it would run
+/// a program an agent had committed as an embedded repository's config.
 async fn is_dirty(git: &Git, repo: &Path) -> Result<bool, RpcError> {
     Ok(!git
-        .run(repo, &["status", "--porcelain", "--untracked-files=no"])
+        .run(
+            repo,
+            &[
+                "status",
+                "--porcelain",
+                "--untracked-files=no",
+                crate::workspace::in_place::IGNORE_SUBMODULES,
+            ],
+        )
         .await?
         .stdout
         .trim()
