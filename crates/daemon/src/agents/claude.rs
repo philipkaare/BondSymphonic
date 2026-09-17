@@ -68,9 +68,24 @@ const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long `stop` waits after SIGKILL before giving up on an exit code.
 const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How long `stop` lets the reader finish the output already in the pipe before
-/// it is aborted.
+/// How long the reader keeps waiting on stdout once the process has exited and
+/// the pipe has gone quiet. A grandchild can hold the pipe open for ever, and an
+/// exit nobody announces is worse than one that misses a last line.
+///
+/// Measured from the last line rather than from the exit: the reader does disk
+/// work between lines (the transcript, the session id), and a slow disk must not
+/// cut short output that is already in the pipe.
 const READER_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How much longer than the reader's own pipe bounds `stop` waits for the
+/// reader before aborting it.
+///
+/// What the reader does after its pipes is disk work, closing the agent's
+/// record above all, and that write ends in an `fsync`. It used to count against
+/// the pipe budget, so a busy disk decided whether the exit kept its reason. The
+/// reader bounds its pipe waits itself now, and this is only the patience for a
+/// disk that is slow; a disk that is stuck still gets an answer, from `stop`.
+const RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Lines of the agent's stderr kept for the exit detail. Enough to carry a
 /// login prompt or a stack trace, not enough to fill an event.
@@ -526,6 +541,43 @@ fn resumed(state: AgentState, nothing_pending: bool, items: &[Parsed]) -> bool {
     }
 }
 
+/// What an agent's exit is announced with, whichever of the reader and `stop`
+/// announces it.
+///
+/// An error result already said why the turn failed, and that is the more
+/// useful of the two messages -- so it becomes the exit's detail rather than
+/// replacing the exit. An agent left in `Error` is one the IDE shows as a live
+/// tab for ever, and one whose next turn comes back as a broken pipe instead of
+/// "this agent ended".
+///
+/// The code still goes on the end of it, in the same layout the stderr tail
+/// gets: the reason the turn failed is the better half of the story and leads,
+/// but an exit that says only what went wrong and not how the process went
+/// leaves out the one thing the daemon knows and the agent never said.
+///
+/// One function for both paths, because which of them announces is decided by
+/// timing: `stop` announces when it gave up on the reader, and the reason is
+/// just as true then.
+fn exit_detail_for(entry: &super::AgentEntry, code: i32, tail: &Tail) -> String {
+    match entry.state() {
+        (AgentState::Error, Some(why)) => format!("{why} (exit code {code})"),
+        _ => exit_detail(code, tail, Layout::TailFirst),
+    }
+}
+
+/// Closes the agent's record for an exit path, waiting at most `RECORD_GRACE`.
+///
+/// An exit path that ran out of patience goes on to announce the exit with the
+/// close still queued: see [`AgentSink::ended`].
+async fn close_record(sink: &AgentSink) {
+    if tokio::time::timeout(RECORD_GRACE, sink.ended())
+        .await
+        .is_err()
+    {
+        warn!(agent = %sink.agent_id(), "the agent's record is not closed yet; announcing its exit anyway");
+    }
+}
+
 /// The half of the adapter that only exists while the process does.
 struct Running {
     /// Serialises the writers: `send`, `permission_reply` and `interrupt` can
@@ -729,8 +781,37 @@ impl AgentAdapter for ClaudeAdapter {
         let stderr_for_reader = stderr_done.clone();
         let reader_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
+            let mut exited = exit_for_reader;
+            // The exit code, once the exit has won the race below. Kept rather
+            // than awaited again: a `Shared` polled after it completed panics.
+            //
+            // Once the process is gone the pipe only holds what is already in
+            // it -- unless a grandchild kept it open, which is what the bound
+            // on each read from then on is for. The reader bounds its own pipe
+            // waits so that `stop` never has to cut it short over them.
+            let mut gone: Option<i32> = None;
             loop {
-                let line = match lines.next_line().await {
+                let next = if gone.is_some() {
+                    match tokio::time::timeout(READER_DRAIN, lines.next_line()).await {
+                        Ok(next) => next,
+                        Err(_) => {
+                            warn!(agent = %sink.agent_id(), "agent stdout is still open after it exited; not waiting for it");
+                            break;
+                        }
+                    }
+                } else {
+                    // `next_line` is cancel-safe, so losing this race to the
+                    // exit drops no data: the next read picks it up.
+                    tokio::select! {
+                        biased;
+                        next = lines.next_line() => next,
+                        code = &mut exited => {
+                            gone = Some(code);
+                            continue;
+                        }
+                    }
+                };
+                let line = match next {
                     Ok(Some(line)) => line,
                     Ok(None) => break,
                     Err(e) => {
@@ -766,7 +847,10 @@ impl AgentAdapter for ClaudeAdapter {
                 }
             }
             // stdout is closed, so the process is on its way out.
-            let code = exit_for_reader.await;
+            let code = match gone {
+                Some(code) => code,
+                None => exited.await,
+            };
             // Before the detail is built out of it: the stderr tail is read by
             // a task of its own, and the agent's last words are still on their
             // way when the exit code lands -- the CLI hands its stderr to every
@@ -779,22 +863,11 @@ impl AgentAdapter for ClaudeAdapter {
             // The process is gone whichever way the state went, so the record
             // is closed here rather than only on the `Exited` announcement: an
             // agent that died mid-turn stays in `Error` and never announces one.
-            sink.ended().await;
-            // An error result already said why the turn failed, and that is the
-            // more useful of the two messages -- so it becomes the exit's
-            // detail rather than replacing the exit. An agent left in `Error`
-            // is one the IDE shows as a live tab for ever, and one whose next
-            // turn comes back as a broken pipe instead of "this agent ended".
-            //
-            // The code still goes on the end of it, in the same layout the
-            // stderr tail gets: the reason the turn failed is the better half
-            // of the story and leads, but an exit that says only what went
-            // wrong and not how the process went leaves out the one thing the
-            // daemon knows and the agent never said.
-            let detail = match sink.entry().state() {
-                (AgentState::Error, Some(why)) => format!("{why} (exit code {code})"),
-                _ => exit_detail(code, &tail, Layout::TailFirst),
-            };
+            // Here, before the claim below, because it is a disk write: see
+            // the claim. Bounded, so a process that died on its own is still
+            // announced when the disk does not answer.
+            close_record(&sink).await;
+            let detail = exit_detail_for(sink.entry(), code, &tail);
             // `stop` may be ending this same process; the flag makes one of the
             // two announce and the other stay quiet, so a process that exits on
             // its own and is then stopped still produces one `Exited`.
@@ -804,12 +877,12 @@ impl AgentAdapter for ClaudeAdapter {
             // between would leave the flag set and the event unsent, with
             // `stop` then staying quiet because it reads the flag as somebody
             // else's announcement: the tab would never learn the agent ended.
-            // `AgentSink::state` has no await inside it, so this pair runs to
-            // completion once polled -- if that ever stops being true, the
-            // claim has to move after the publish, or be a claim only the
-            // publisher can redeem.
+            // So the publish is `publish_state`, which is not async at all.
+            // `AgentSink::state` would close the record first, and that write
+            // is exactly the await that used to sit here -- the record is
+            // already closed above.
             if !announced.swap(true, Ordering::SeqCst) {
-                sink.state(AgentState::Exited, Some(detail)).await;
+                sink.publish_state(AgentState::Exited, Some(detail));
             }
         });
 
@@ -926,9 +999,11 @@ impl AgentAdapter for ClaudeAdapter {
     async fn stop(&mut self) -> Result<(), RpcError> {
         let Some(mut running) = self.child.take() else {
             // Already stopped, or never started; `stop` has to stay idempotent
-            // for `destroy`, and the flag keeps it from announcing twice.
+            // for `destroy`, and the flag keeps it from announcing twice. The
+            // record is closed before the claim, as everywhere a claim is made.
+            close_record(&self.sink).await;
             if !self.exit_announced.swap(true, Ordering::SeqCst) {
-                self.sink.state(AgentState::Exited, None).await;
+                self.sink.publish_state(AgentState::Exited, None);
             }
             return Ok(());
         };
@@ -947,31 +1022,48 @@ impl AgentAdapter for ClaudeAdapter {
                 .ok();
         }
         // Whatever the process wrote before it went is still worth recording,
-        // so the reader gets a moment to finish; it is aborted only if it does
-        // not, which is what a SIGKILLed grandchild still holding the pipe open
-        // looks like.
+        // and the reader is the one that announces the exit with its reason,
+        // so it is waited for. It bounds its own pipe waits (`READER_DRAIN`,
+        // `STDERR_DRAIN`), so a grandchild holding a pipe open cannot keep it
+        // for long; what is left is its disk work, which `RECORD_GRACE` covers.
         //
-        // Strictly longer than the reader can spend after the exit, which is
-        // its own `STDERR_DRAIN` -- both timers start from the same exit, so a
-        // budget merely *equal* to it is a dead heat, decided by the scheduler,
-        // in exactly the case both constants were written for. Losing it aborts
-        // the reader mid-drain, and the exit is then announced by this path,
-        // which knows only the code: an agent whose turn ended in an error
-        // loses the error message that was the better half of its exit detail.
-        if tokio::time::timeout(READER_DRAIN + STDERR_DRAIN, &mut running.reader_task)
-            .await
-            .is_err()
-        {
+        // The pipe bounds used to be all this waited, with the reader's record
+        // write counted against them. A busy disk then decided the outcome: an
+        // abort before the reader's claim lost the reason the turn failed, and
+        // one between the claim and the publish lost the exit altogether.
+        //
+        // An abort now lands only on a reader stuck on the disk, or on one fed
+        // without pause by something that outlived the process, and never
+        // between its claim and its publish, which cannot yield.
+        // Finished means finished normally: a reader that panicked never made
+        // its stderr wait, so this path still makes it.
+        let reader_finished = matches!(
+            tokio::time::timeout(
+                READER_DRAIN + STDERR_DRAIN + RECORD_GRACE,
+                &mut running.reader_task,
+            )
+            .await,
+            Ok(Ok(()))
+        );
+        if !reader_finished {
+            warn!(agent = %self.sink.agent_id(), "agent output reader did not finish; stopping it");
             running.reader_task.abort();
+            // The same wait the reader makes, for the same reason: this path
+            // builds an exit detail too, and the tail is what makes it worth
+            // reading. Not when the reader finished, which has made it already.
+            let _ = tokio::time::timeout(STDERR_DRAIN, running.stderr_done.clone()).await;
         }
-        // The same wait the reader makes, for the same reason: this path builds
-        // an exit detail too, and the tail is what makes it worth reading.
-        let _ = tokio::time::timeout(STDERR_DRAIN, running.stderr_done.clone()).await;
         running.stderr_task.abort();
         self.pending_request_ids.lock().clear();
+        // Returns at once when the reader already closed the record, even if
+        // that write is still stuck on the disk. When the reader was stopped
+        // before it got there, this is the first close, and it is bounded like
+        // the reader's: `stop` holds the adapter's lock, and a restart or a
+        // destroy of the workspace waits on it.
+        close_record(&self.sink).await;
         if !self.exit_announced.swap(true, Ordering::SeqCst) {
-            let detail = code.map(|c| exit_detail(c, &self.stderr_tail, Layout::TailFirst));
-            self.sink.state(AgentState::Exited, detail).await;
+            let detail = code.map(|c| exit_detail_for(self.sink.entry(), c, &self.stderr_tail));
+            self.sink.publish_state(AgentState::Exited, detail);
         }
         Ok(())
     }

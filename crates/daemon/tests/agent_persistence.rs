@@ -523,3 +523,69 @@ async fn the_repos_claude_settings_reach_the_workspace_home() {
 
     cancel.cancel();
 }
+
+/// Once a client has seen what the agent said after naming its session, the
+/// session id is on disk: a daemon that dies at that moment comes back with a
+/// session to resume. Every record write is made half a second slower here,
+/// which a reader that only queued the write would overtake, and which leaves
+/// the reader's two-second wait room on a loaded machine.
+#[tokio::test]
+async fn the_session_id_is_on_disk_before_the_lines_after_it_are_seen() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let root = dir.path().join("data");
+    use_fake_claude(py, "simple_turn.ndjson");
+
+    let (port, token, d, cancel) = start_daemon(&root).await;
+    d.agents
+        .delay_every_record_write_for_tests(Duration::from_millis(500));
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "durable").await;
+    let ag = start_agent(&mut c, &ws.id, options()).await.unwrap();
+    wait_for_messages(&mut c, &ag, 3).await;
+
+    assert_eq!(
+        records_of(&root)[0].session_id.as_deref(),
+        Some("sess-1"),
+        "the client has seen the turn, and the session id is still not on disk"
+    );
+    cancel.cancel();
+}
+
+/// What a daemon on its way out waits for: every record write still queued,
+/// within a bound. A write slower than the bound is reported as not done.
+#[tokio::test]
+async fn flushing_the_records_waits_for_queued_writes_within_a_bound() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let root = dir.path().join("data");
+    use_fake_claude(py, "simple_turn.ndjson");
+
+    let (port, token, d, cancel) = start_daemon(&root).await;
+    // Longer than the reader waits for the session id, so the write is still
+    // queued when the turn has been seen.
+    d.agents
+        .delay_every_record_write_for_tests(Duration::from_secs(4));
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "flushed").await;
+    let ag = start_agent(&mut c, &ws.id, options()).await.unwrap();
+    wait_for_messages(&mut c, &ag, 3).await;
+
+    assert!(
+        !d.agents.flush_records(Duration::from_millis(100)).await,
+        "a flush shorter than the write cannot report it done"
+    );
+    assert!(d.agents.flush_records(Duration::from_secs(10)).await);
+    assert_eq!(records_of(&root)[0].session_id.as_deref(), Some("sess-1"));
+    cancel.cancel();
+}

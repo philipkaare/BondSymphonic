@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use persist::{AgentRecord, AgentRecords};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
@@ -254,11 +254,48 @@ impl AgentEntry {
 /// were asked for. That ordering is load-bearing: `agent.start` records the
 /// agent before it spawns the process precisely so the first session id the
 /// reader sees has a record to land in, and a write that could overtake another
-/// would give that back.
+/// would give that back. A running agent's own writes keep their order through
+/// the records file's [`persist::WriteQueue`].
 async fn off_the_runtime(what: &'static str, f: impl FnOnce() + Send + 'static) {
     if let Err(e) = tokio::task::spawn_blocking(f).await {
         warn!(error = %e, "{what} panicked");
     }
+}
+
+/// How long an agent's stdout reader waits for the session id it reported to
+/// reach the records file before it reads on.
+///
+/// The id is what a client resumes the conversation with after a daemon
+/// restart, so the reader used to wait for it outright: once a client had seen
+/// anything after the `init` line, the id was on disk. On a disk a parallel
+/// build holds up for seconds, that wait kept the reader from the line saying
+/// why the turn failed until `stop` had given up and announced an exit that
+/// could not say it. Bounded, the guarantee holds on any disk that answers in
+/// this long, and the write stays queued on one that does not.
+pub const SESSION_RECORD_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Queues `write` on the records file's [`persist::WriteQueue`], and answers a
+/// receiver that resolves once it has run -- or has panicked, which is logged.
+fn queue_write(
+    records: &Arc<AgentRecords>,
+    agent: Option<&AgentId>,
+    what: &'static str,
+    write: impl FnOnce(&AgentRecords) + Send + 'static,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let target = records.clone();
+    let agent = agent.cloned();
+    records.queue().push(Box::new(move || {
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write(&target)));
+        if ran.is_err() {
+            match &agent {
+                Some(agent) => warn!(agent = %agent, "{what} panicked"),
+                None => warn!("{what} panicked"),
+            }
+        }
+        let _ = done.send(());
+    }));
+    finished
 }
 
 /// The single path by which an adapter reports what its agent did.
@@ -283,6 +320,10 @@ pub struct AgentSink {
     /// file the next daemon reads. `None` in the unit tests below, which have no
     /// data directory and nothing to restore into.
     records: Option<Arc<AgentRecords>>,
+    /// Set by the first [`ended`](AgentSink::ended), shared by every clone. The
+    /// record is closed once: the moment the process ended is what it wants,
+    /// and a second write would only put an `fsync` in front of whoever asked.
+    closed: Arc<AtomicBool>,
 }
 
 impl AgentSink {
@@ -305,6 +346,7 @@ impl AgentSink {
             entry,
             order: Arc::new(tokio::sync::Mutex::new(())),
             records: None,
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -351,12 +393,23 @@ impl AgentSink {
     /// Moves the agent's state and announces it. The entry is updated before
     /// the event goes out, so a client that reacts by asking for the agent's
     /// status never sees the older value.
+    ///
+    /// `Exited` closes the record first, which is a disk write. A caller that
+    /// has claimed the one exit announcement must not wait on that between the
+    /// claim and the publish; it calls [`ended`](AgentSink::ended) before
+    /// claiming and [`publish_state`](AgentSink::publish_state) after.
     pub async fn state(&self, state: AgentState, detail: Option<String>) {
         // Before the event: a client that reacts to `Exited` by restarting the
         // daemon must not find the record still open.
         if state == AgentState::Exited {
             self.ended().await;
         }
+        self.publish_state(state, detail);
+    }
+
+    /// [`state`](AgentSink::state) without closing the record: updates the
+    /// entry and publishes, and cannot yield, so it completes once it starts.
+    pub fn publish_state(&self, state: AgentState, detail: Option<String>) {
         *self.entry.state.lock() = (state, detail.clone());
         // After the state itself, so anyone who sees a new epoch also sees the
         // state that goes with it.
@@ -375,7 +428,9 @@ impl AgentSink {
     ///
     /// Recorded as well as remembered: it is the one thing a client needs to
     /// carry a conversation across a daemon restart, by starting a new agent
-    /// with `options.resume_session`.
+    /// with `options.resume_session`. The write is queued and waited for up to
+    /// [`SESSION_RECORD_WAIT`]; the entry has the id at once, which is what
+    /// everything in this daemon reads.
     pub async fn session_id(&self, id: String) {
         // The CLI reports the session on every `init` line, which is once per
         // turn on a resumed conversation, and the record is a file: nothing is
@@ -389,14 +444,22 @@ impl AgentSink {
         if !changed {
             return;
         }
-        let Some(records) = self.records.clone() else {
+        let Some(records) = &self.records else {
             return;
         };
         let agent = self.agent_id.clone();
-        off_the_runtime("recording an agent's session id", move || {
-            records.update(&agent, |r| r.session_id = Some(id))
-        })
-        .await;
+        let written = queue_write(
+            records,
+            Some(&self.agent_id),
+            "recording an agent's session id",
+            move |records| records.update(&agent, |r| r.session_id = Some(id)),
+        );
+        if tokio::time::timeout(SESSION_RECORD_WAIT, written)
+            .await
+            .is_err()
+        {
+            warn!(agent = %self.agent_id, "the session id is not on disk yet; reading on");
+        }
     }
 
     /// The agent's process is gone: closes its transcript file and its record,
@@ -404,21 +467,44 @@ impl AgentSink {
     /// lost.
     ///
     /// Idempotent, and it keeps the first answer: the moment the process ended
-    /// is what the record wants, not the moment somebody noticed again.
+    /// is what the record wants, not the moment somebody noticed again. Only
+    /// the first call writes; the others return at once, even while that write
+    /// is still going, so the exit paths can each call it without queueing
+    /// behind a disk that is slow or stuck.
+    ///
+    /// The first call waits for the write with no bound of its own. The exit
+    /// paths bound it, and publish `Exited` when the bound runs out with the
+    /// close still queued: on a disk that stuck, a restart can find the record
+    /// open, and restores the agent as one that ended when the daemon
+    /// restarted -- the alternative being an exit nobody ever announces.
     pub async fn ended(&self) {
-        // Ahead of the record, and ahead of the early return below: an agent
+        // Ahead of the record, and ahead of the early returns below: an agent
         // with no record on disk still holds a file descriptor, and a daemon
         // that runs for a week must not keep one per agent it has ever run.
         self.store.ended(&self.agent_id);
-        let Some(records) = self.records.clone() else {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some(records) = &self.records else {
             return;
         };
         let agent = self.agent_id.clone();
-        off_the_runtime("closing an agent's record", move || {
-            records.update(&agent, |r| {
-                r.ended_at.get_or_insert_with(now_rfc3339);
-            })
-        })
+        // Taken now, not when the queue gets to it: the moment the process
+        // ended is what the record wants.
+        let now = now_rfc3339();
+        // Waited for, behind whatever was queued before it: a client that
+        // reacts to `Exited` by restarting the daemon must find the record
+        // closed.
+        let _ = queue_write(
+            records,
+            Some(&self.agent_id),
+            "closing an agent's record",
+            move |records| {
+                records.update(&agent, |r| {
+                    r.ended_at.get_or_insert(now);
+                })
+            },
+        )
         .await;
     }
 
@@ -543,6 +629,29 @@ impl AgentManager {
             records: Arc::new(AgentRecords::new(records)),
             probed: claude::Probed::default(),
         }
+    }
+
+    /// Test hook: see [`AgentRecords::delay_closing_writes`].
+    #[doc(hidden)]
+    pub fn delay_record_closing_for_tests(&self, by: std::time::Duration) {
+        self.records.delay_closing_writes(by);
+    }
+
+    /// Waits, for at most `within`, until every record write queued so far has
+    /// happened. Answers whether they all did.
+    ///
+    /// For a daemon on its way out: the runtime does not outlive `main`, and a
+    /// session id still queued at that point is a conversation the next daemon
+    /// cannot offer to resume.
+    pub async fn flush_records(&self, within: std::time::Duration) -> bool {
+        let flushed = queue_write(&self.records, None, "flushing the agent records", |_| {});
+        tokio::time::timeout(within, flushed).await.is_ok()
+    }
+
+    /// Test hook: see [`AgentRecords::delay_every_write`].
+    #[doc(hidden)]
+    pub fn delay_every_record_write_for_tests(&self, by: std::time::Duration) {
+        self.records.delay_every_write(by);
     }
 
     /// An agent id no agent in the map already holds.
