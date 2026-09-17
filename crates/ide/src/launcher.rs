@@ -90,14 +90,16 @@ pub fn local_daemon_binary() -> Option<PathBuf> {
 ///    quietly running some other daemon instead is how a test ends up proving
 ///    nothing. `install_daemon` skips a missing binary anyway, so the outcome
 ///    is "nothing installed", not a crash.
-/// 2. `<exe dir>\bondsymphonic-daemon` — the packaged layout `package.ps1`
-///    builds, where the daemon sits beside the exe in `dist\BondSymphonic\`.
-/// 3. `<exe dir>\..\daemon\bondsymphonic-daemon` — the development tree, where
-///    the exe is in `target\<profile>\` and `build-daemon.ps1` leaves the
-///    daemon in `target\daemon\`.
-///
-/// Packaged before development, so a package unzipped inside a checkout runs
-/// the daemon it shipped with rather than whatever the checkout last built.
+/// 2. `<exe dir>\bondsymphonic-daemon` (the packaged layout `package.ps1`
+///    builds, where the daemon sits beside the exe in `dist\BondSymphonic\`)
+///    and `<exe dir>\..\daemon\bondsymphonic-daemon` (the development tree,
+///    where the exe is in `target\<profile>\` and `build-daemon.ps1` leaves
+///    the daemon in `target\daemon\`) — whichever of the two exists. When
+///    both exist, whichever has the newer `mtime` wins, since a stray binary
+///    left over from an old build in either layout must never beat a fresh
+///    one in the other; a tie goes to the packaged copy, so a package
+///    unzipped inside a checkout still runs the daemon it shipped with
+///    rather than whatever the checkout last built at the very same instant.
 fn resolve_daemon_binary(exe: &Path, override_path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     if let Some(raw) = override_path {
         // An empty variable is how a shell spells "unset"; `PathBuf::from("")`
@@ -115,13 +117,55 @@ fn resolve_daemon_binary(exe: &Path, override_path: Option<&std::ffi::OsStr>) ->
     }
     let dir = exe.parent()?;
     let packaged = dir.join(DAEMON_FILE_NAME);
-    if packaged.exists() {
-        return Some(packaged);
+    // `?` on the grandparent only after the packaged path is built, so an exe
+    // sitting at the root of a volume can still find a packaged daemon beside
+    // it even though it has no `..\daemon` to look in.
+    let dev = dir
+        .parent()
+        .map(|p| p.join("daemon").join(DAEMON_FILE_NAME));
+
+    let packaged_exists = packaged.exists();
+    let dev_exists = dev.as_deref().is_some_and(Path::exists);
+
+    match (packaged_exists, dev_exists) {
+        (false, false) => None,
+        (true, false) => Some(packaged),
+        (false, true) => dev,
+        (true, true) => {
+            let dev = dev.expect("dev_exists is true only when dev is Some");
+            // Both candidates exist: this is exactly the situation that once
+            // let a stray, months-old binary in one layout silently outrank a
+            // freshly built one in the other. Recency decides, and the choice
+            // is always logged so a stale pick is never silent again.
+            if mtime(&dev) > mtime(&packaged) {
+                tracing::warn!(
+                    "using the dev-tree daemon at {} (newer than the packaged \
+                     copy at {}, which is being ignored)",
+                    dev.display(),
+                    packaged.display()
+                );
+                Some(dev)
+            } else {
+                tracing::warn!(
+                    "using the packaged daemon at {} (as new as or newer than \
+                     the dev-tree copy at {}, which is being ignored)",
+                    packaged.display(),
+                    dev.display()
+                );
+                Some(packaged)
+            }
+        }
     }
-    // `?` on the grandparent only after the packaged candidate has been tried,
-    // so an exe sitting at the root of a volume still finds its own daemon.
-    let dev = dir.parent()?.join("daemon").join(DAEMON_FILE_NAME);
-    dev.exists().then_some(dev)
+}
+
+/// The file's modification time, or the Unix epoch when it cannot be read.
+/// Falling back to the oldest possible instant means a path whose metadata
+/// is unreadable simply loses the comparison in [`resolve_daemon_binary`]
+/// rather than panicking or making the unreadable path win by default.
+fn mtime(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH)
 }
 
 /// Test hook: a loopback `host:port` to connect to instead of starting a daemon.
@@ -833,6 +877,84 @@ mod tests {
         // an override naming the current directory.
         assert_eq!(
             resolve_daemon_binary(&packaged_exe, Some(std::ffi::OsStr::new(""))),
+            Some(packaged_daemon)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolves_the_newer_of_two_daemon_binaries() {
+        // A stray old daemon left in the dev tree must never beat a freshly
+        // built packaged copy, or vice versa: whichever `mtime` is newer wins,
+        // regardless of which layout it happens to sit in. This is the exact
+        // shape of the bug that motivated this fix: `build-daemon.ps1` refreshed
+        // the dev-tree daemon, but a stray older packaged-layout binary from a
+        // previous unzip still won the old "packaged before dev" ordering.
+        let root = scratch("resolve-newer");
+        let packaged_exe = root.join("BondSymphonic").join("bondsymphonic-ide.exe");
+        let packaged_daemon = root.join("BondSymphonic").join(DAEMON_FILE_NAME);
+        let dev_daemon = root.join("daemon").join(DAEMON_FILE_NAME);
+        touch(&packaged_exe);
+        touch(&packaged_daemon);
+        touch(&dev_daemon);
+
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let new = std::time::SystemTime::now();
+
+        // The dev-tree copy is newer: it wins even though the packaged copy
+        // would otherwise be tried first.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&packaged_daemon)
+            .expect("packaged daemon")
+            .set_modified(old)
+            .expect("set packaged mtime");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dev_daemon)
+            .expect("dev daemon")
+            .set_modified(new)
+            .expect("set dev mtime");
+        assert_eq!(
+            resolve_daemon_binary(&packaged_exe, None),
+            Some(dev_daemon.clone())
+        );
+
+        // The packaged copy is newer: it wins, matching the documented order
+        // for anything not decided by recency.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&packaged_daemon)
+            .expect("packaged daemon")
+            .set_modified(new)
+            .expect("set packaged mtime");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dev_daemon)
+            .expect("dev daemon")
+            .set_modified(old)
+            .expect("set dev mtime");
+        assert_eq!(
+            resolve_daemon_binary(&packaged_exe, None),
+            Some(packaged_daemon.clone())
+        );
+
+        // A tie goes to the packaged copy, per the documented resolution order.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&packaged_daemon)
+            .expect("packaged daemon")
+            .set_modified(new)
+            .expect("set packaged mtime");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dev_daemon)
+            .expect("dev daemon")
+            .set_modified(new)
+            .expect("set dev mtime");
+        assert_eq!(
+            resolve_daemon_binary(&packaged_exe, None),
             Some(packaged_daemon)
         );
 
