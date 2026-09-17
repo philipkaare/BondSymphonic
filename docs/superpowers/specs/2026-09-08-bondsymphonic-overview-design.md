@@ -186,9 +186,10 @@ crate.
   different question); `in_place_refusal` is why the path cannot be worked on
   in place (a linked worktree, a `.git` that is a file), the same sentence
   `workspace.create` would refuse with, or `None`; `hooks_path_in_tree` is the
-  repository's effective `core.hooksPath`, relative to the root, when it
-  resolves inside the working tree rather than inside `.git` (husky does
-  this), or `None`.
+  repository's effective `core.hooksPath`, relative to the root, when it names
+  a path an in-place agent could write — inside the working tree (husky does
+  this), or inside `.git` but outside the entries the sandbox binds read-only
+  — or `None`.
 - `repo.detect_run_configs {path}` → `RunConfig[]` (from `bondsymphonic.toml` or
   auto-detection, with `source` field), plus `network_allow[]` and `warnings[]`.
   `warnings` is one line per part of the repository's `bondsymphonic.toml` that

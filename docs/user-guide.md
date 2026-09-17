@@ -433,6 +433,13 @@ sandbox cannot fully close off:
   repository: that push runs `pre-push` deliberately, because that is how
   git-lfs uploads what a push points at. The dialog warns about both paths and
   about both ways they run (see "Creating an agent workspace" above).
+- **Create PR is exposed a second way, unrelated to hooks.** `gh pr create`
+  checks the checkout for uncommitted changes with a plain `git status
+  --porcelain` of its own, which is not protected the way BondSymphonic's own
+  calls are. So pressing **Create PR…** on a *worktree* workspace of a
+  repository that also has an in-place workspace can run an embedded
+  repository's config (see below) too — even though the in-place workspace
+  itself was never touched. Neither of these two is fixed yet.
 - **Programs your own git configuration names, if they live in the tree.** A
   `filter.*.clean`, a `diff.*.textconv` or a `core.fsmonitor` pointing at a
   script inside the working tree is a script the agent can rewrite, and the
@@ -454,13 +461,6 @@ sandbox cannot fully close off:
   `--ignore-submodules=all` and so do not run it — the one exception is the
   rebase a Rebase merge runs in a *worktree* workspace, which git offers no
   such option for. Your own git is not covered at all.
-- **Create PR, on a different workspace, is another exception.** `gh pr
-  create` checks the checkout for uncommitted changes with a plain `git
-  status --porcelain` of its own, which is not protected the way
-  BondSymphonic's calls are. So if this repository also has a *worktree*
-  workspace, pressing **Create PR…** there can run an embedded repository's
-  config the same way — even though the in-place workspace itself was never
-  touched. Not fixed yet; treat it the same as the bullet above.
 - **History can be destroyed.** `rm -rf .git` cannot remove the files
   BondSymphonic protects, but it deletes everything else — `HEAD`, the index,
   every object and every ref — just as the agent can delete any other file in
@@ -970,7 +970,8 @@ workspace's own bookkeeping and stops offering it, without expecting anything
 back from the folder.
 
 **"Git files this workspace protects changed while the agent was running (…),
-so its sandbox was stopped."** An in-place workspace's sandbox stopped itself
+so its sandbox was stopped. See what changed, check .git/config for settings
+you did not make, then press Retry."** An in-place workspace's sandbox stopped itself
 because one of the git files it protects changed: `.git/config`, `commondir`,
 `hooks`, `info`, `worktrees`, `remotes`, `branches`, `config.worktree`. Two
 quite different things produce it, and the diff is how you tell them apart.

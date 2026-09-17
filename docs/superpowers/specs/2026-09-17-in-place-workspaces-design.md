@@ -51,8 +51,9 @@ A registry written by an older daemon has no `kind`, so it reads as `worktree`.
 Option<String>` fields:
 
 - `hooks_path_in_tree`: the repository's effective `core.hooksPath`, relative to
-  the root, when it resolves to a directory inside the working tree (husky does
-  this) and not inside `.git`, otherwise `None`. See §4.3.
+  the root, when it names a path an in-place agent could write — inside the
+  working tree (husky does this), or inside `.git` but outside the entries
+  §4.1 binds read-only — otherwise `None`. See §4.3.
 - `head_branch`: the branch checked out, or `None` when `HEAD` is detached.
   `default_branch` is the remote's default and is not this.
 - `in_place_refusal`: why the path cannot be worked in place (a linked worktree, a
