@@ -69,7 +69,7 @@ All commands are run from the PowerShell tool unless stated. The Bash tool is Gi
 ## Spec resolutions (decided while planning; the lead should confirm R1 and R3)
 
 - **R1 — `.git/commondir` is a sandbox escape the spec misses.** Measured in the distro (git 2.43, bwrap 0.9): an agent with a writable `.git` can write `.git/commondir` pointing at a directory of its own with a `config` holding `core.fsmonitor`, and the next `git status` **on the host** runs it — even with `GIT_DIR` pinned. `GIT_COMMON_DIR` pinned stops it for the daemon, but not for the user's own git. Resolution: before every sandbox start the daemon writes `.git/commondir` containing `.\n` (a no-op: the common dir is the git dir itself — verified with git 2.43 and Git for Windows 2.52: status, commit, switch, stash, `worktree add/remove`, gc, fsck all work) and binds it read-only; Close removes it again if it still holds exactly `.\n`. `prepare` refuses a repository that already has a `commondir` with other content.
-- **R2 — `.git/worktrees` must be read-only too.** Otherwise an in-place agent can write `config.worktree` of a *worktree* workspace of the same repository, whose daemon-side `status` then runs it. The daemon creates `.git/worktrees` if missing (git would create it on demand; an empty one changes nothing), binds it read-only, and Close removes it again if it is empty.
+- **R2 — `.git/worktrees` must be read-only too.** Otherwise an in-place agent can write `config.worktree` of a *worktree* workspace of the same repository, whose daemon-side `status` then runs it. The same goes for `.git/remotes` and `.git/branches`, the legacy remote definitions `git fetch <name>` / `git push <name>` read (an agent could redirect a name the user types). The daemon creates each of the three if missing (git creates them on demand; an empty one changes nothing), records which ones it created in a daemon-owned file `<data>/in-place/<id>.created` (outside every sandbox), binds all three read-only, and Close removes each one again only if the daemon created it and it is still empty. (`hooks` and `info` are also created when missing, but stay: git's own `init` makes them.)
 - **R3 — embedded repositories run their own config.** Measured: an agent that `git init`s `sub/` in the tree, sets `core.fsmonitor` in `sub/.git/config` and commits the gitlink makes every `git status`/`git diff` in the parent run it — the user's, and the **daemon's** (for both workspace kinds; this is a pre-existing hole in the worktree kind as well). `-c diff.ignoreSubmodules=all` is not enough (a `.gitmodules` `ignore = none` overrides it); the explicit `--ignore-submodules=all` flag is. Resolution: every daemon-side status/diff passes the flag (Tasks 3 and 4). The user-side risk is documented as a residual risk. Not covered here and reported as follow-up: the rebase step in `git/merge.rs` (`worktree_git().run(.., ["rebase", ..])`) has no such flag.
 - **R4 — `rm -rf .git` does not "fail" cleanly.** Measured: it exits non-zero and `.git`, `config`, `hooks`, `info` (the mount points) survive, but `HEAD`, `index`, `objects/`, `refs/`, `logs/` are deleted. The tests assert only what holds (non-zero exit, `.git` still a directory, `config` unchanged, `hooks` still there); the user guide says an agent can destroy the repository's history just as it can delete files.
 - **R5 — bwrap creates missing bind targets on the writable repository.** Measured: a `--ro-bind` onto a missing directory creates an empty directory, and onto a missing file creates an empty `0444` file, in the user's repository. So every read-only target is created by the daemon first (`prepare`), `.git/modules` is bound only when it is a real directory, and `config.worktree` only when `extensions.worktreeConfig` is on. A mount point cannot be renamed or removed (`EBUSY`), confirmed for `.git` and for the root.
@@ -391,7 +391,7 @@ Depends on Task 1. May run beside Task 5.
 
 **Files:**
 - Create: `crates/daemon/src/workspace/in_place.rs`
-- Modify: `crates/daemon/src/workspace/mod.rs` (`pub mod in_place;`)
+- Modify: `crates/daemon/src/workspace/mod.rs` (`pub mod in_place;`, `DataDirs::in_place_record`)
 - Test: `crates/daemon/tests/in_place_sandbox.rs` (new)
 
 **Interfaces:**
@@ -407,12 +407,13 @@ Depends on Task 1. May run beside Task 5.
       pub fn config(&self) -> PathBuf; pub fn commondir(&self) -> PathBuf;
       pub fn hooks(&self) -> PathBuf; pub fn info(&self) -> PathBuf;
       pub fn modules(&self) -> PathBuf; pub fn worktrees(&self) -> PathBuf;
+      pub fn remotes(&self) -> PathBuf; pub fn branches(&self) -> PathBuf;
       pub fn config_worktree(&self) -> PathBuf;
       pub fn git(&self) -> Git;
       pub fn check_repository(&self) -> Result<(), RpcError>;
       pub async fn worktree_config_enabled(&self) -> Result<bool, RpcError>;
-      pub fn prepare(&self, worktree_config: bool) -> Result<(), RpcError>;
-      pub fn release(&self);
+      pub fn prepare(&self, worktree_config: bool, record: &Path) -> Result<(), RpcError>;
+      pub fn release(&self, record: &Path);
       pub fn rw_binds(&self) -> Vec<PathBuf>;
       pub fn late_ro_binds(&self, worktree_config: bool) -> Vec<PathBuf>;
   }
@@ -421,6 +422,9 @@ Depends on Task 1. May run beside Task 5.
   pub fn in_place_refusal(kind: &RepoKind, root: &Path) -> Option<String>;
   pub fn target_refusal(root: &Path, data_root: &Path) -> Option<String>;
   pub fn nothing_to_merge() -> RpcError;   // InvalidParams, data.reason = "in_place"
+  pub const ON_DEMAND_DIRS: [&str; 3] = ["worktrees", "remotes", "branches"];
+  // bondsymphonic_daemon::workspace
+  impl DataDirs { pub fn in_place_record(&self, id: &WorkspaceId) -> PathBuf }  // <root>/in-place/<id>.created
   ```
 
 - [ ] **Step 1: Write the failing tests.** Create `crates/daemon/tests/in_place_sandbox.rs`:
@@ -445,6 +449,12 @@ fn layout(dir: &Path, repo: &Path) -> InPlaceLayout {
     InPlaceLayout::new(repo, &no_hooks)
 }
 
+/// Where the daemon would record what it created for this test's workspace:
+/// under the data directory, never in the repository.
+fn record(dir: &Path) -> PathBuf {
+    dir.join("data/in-place/ws_test.created")
+}
+
 /// The top-level names in `.git`, sorted.
 fn git_dir_entries(repo: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(repo.join(".git"))
@@ -459,22 +469,35 @@ fn git_dir_entries(repo: &Path) -> Vec<String> {
 fn prepare_makes_only_the_documented_entries() {
     let dir = tempfile::tempdir().unwrap();
     let repo = common::init_repo(dir.path());
-    std::fs::remove_dir_all(repo.join(".git/hooks")).unwrap();
-    let _ = std::fs::remove_dir_all(repo.join(".git/info"));
+    // Whether `git init` makes `branches` depends on its template; take the
+    // question away so the expected list does not.
+    for name in ["hooks", "info", "branches"] {
+        let _ = std::fs::remove_dir_all(repo.join(".git").join(name));
+    }
     let before = git_dir_entries(&repo);
     let l = layout(dir.path(), &repo);
 
-    l.prepare(false).unwrap();
+    l.prepare(false, &record(dir.path())).unwrap();
 
     let mut added: Vec<String> = git_dir_entries(&repo)
         .into_iter()
         .filter(|n| !before.contains(n))
         .collect();
     added.sort();
-    assert_eq!(added, ["commondir", "hooks", "info", "worktrees"]);
+    assert_eq!(
+        added,
+        ["branches", "commondir", "hooks", "info", "remotes", "worktrees"]
+    );
     assert_eq!(std::fs::read(l.commondir()).unwrap(), b".\n");
-    // Idempotent: a restart prepares the same repository again.
-    l.prepare(false).unwrap();
+    // Only the on-demand directories are recorded, and only once each.
+    let recorded = std::fs::read_to_string(record(dir.path())).unwrap();
+    let mut lines: Vec<&str> = recorded.lines().collect();
+    lines.sort();
+    assert_eq!(lines, ["branches", "remotes", "worktrees"]);
+    // Idempotent: a restart prepares the same repository again, and what the
+    // first start created is still remembered as the daemon's.
+    l.prepare(false, &record(dir.path())).unwrap();
+    assert_eq!(std::fs::read_to_string(record(dir.path())).unwrap(), recorded);
     // git still reads the repository as its own common dir.
     assert_eq!(
         common::git_out(&repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"]),
@@ -488,13 +511,13 @@ fn prepare_creates_config_worktree_only_with_the_extension_and_keeps_its_content
     let dir = tempfile::tempdir().unwrap();
     let repo = common::init_repo(dir.path());
     let l = layout(dir.path(), &repo);
-    l.prepare(false).unwrap();
+    l.prepare(false, &record(dir.path())).unwrap();
     assert!(!l.config_worktree().exists());
-    l.prepare(true).unwrap();
+    l.prepare(true, &record(dir.path())).unwrap();
     assert_eq!(std::fs::read(l.config_worktree()).unwrap(), b"");
     // The user's own file is theirs: never truncated.
     std::fs::write(l.config_worktree(), "[core]\n\tsparseCheckout = false\n").unwrap();
-    l.prepare(true).unwrap();
+    l.prepare(true, &record(dir.path())).unwrap();
     assert!(std::fs::read_to_string(l.config_worktree())
         .unwrap()
         .contains("sparseCheckout"));
@@ -505,7 +528,7 @@ fn prepare_refuses_a_commondir_it_did_not_write() {
     let dir = tempfile::tempdir().unwrap();
     let repo = common::init_repo(dir.path());
     std::fs::write(repo.join(".git/commondir"), "/somewhere/else\n").unwrap();
-    let err = layout(dir.path(), &repo).prepare(false).unwrap_err();
+    let err = layout(dir.path(), &repo).prepare(false, &record(dir.path())).unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidParams);
     assert!(err.message.contains("commondir"), "{}", err.message);
     assert_eq!(
@@ -516,21 +539,41 @@ fn prepare_refuses_a_commondir_it_did_not_write() {
 }
 
 #[test]
-fn release_takes_back_the_guard_and_an_empty_worktrees_dir_only() {
+fn release_takes_back_only_what_the_daemon_made_and_left_empty() {
     let dir = tempfile::tempdir().unwrap();
     let repo = common::init_repo(dir.path());
     let before = git_dir_entries(&repo);
     let l = layout(dir.path(), &repo);
-    l.prepare(false).unwrap();
-    l.release();
+    l.prepare(false, &record(dir.path())).unwrap();
+    l.release(&record(dir.path()));
     assert_eq!(git_dir_entries(&repo), before);
+    assert!(!record(dir.path()).exists(), "the record goes with the release");
 
-    // A worktrees dir with a registration in it is git's, and stays.
-    l.prepare(false).unwrap();
-    common::git_ok(&repo, &["worktree", "add", "-q", "-b", "side", &dir.path().join("side").to_string_lossy()]);
-    l.release();
+    // A worktrees dir with a registration in it is git's now, and stays.
+    l.prepare(false, &record(dir.path())).unwrap();
+    common::git_ok(
+        &repo,
+        &["worktree", "add", "-q", "-b", "side", &dir.path().join("side").to_string_lossy()],
+    );
+    l.release(&record(dir.path()));
     assert!(l.worktrees().is_dir());
     assert!(!l.commondir().exists());
+
+    // An empty `remotes` the user already had is theirs: not recorded, not
+    // removed.
+    let other = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(other.path());
+    std::fs::create_dir_all(repo.join(".git/remotes")).unwrap();
+    let l = layout(other.path(), &repo);
+    l.prepare(false, &record(other.path())).unwrap();
+    l.release(&record(other.path()));
+    assert!(l.remotes().is_dir());
+
+    // A record naming anything but the three on-demand directories is ignored.
+    std::fs::create_dir_all(record(other.path()).parent().unwrap()).unwrap();
+    std::fs::write(record(other.path()), "hooks\n../..\nobjects\n").unwrap();
+    l.release(&record(other.path()));
+    assert!(l.hooks().is_dir() && repo.join(".git/objects").is_dir());
 }
 
 #[test]
@@ -546,7 +589,15 @@ fn late_binds_follow_what_the_repository_has() {
     assert_eq!(names(l.rw_binds()), ["", ".git"]);
     assert_eq!(
         names(l.late_ro_binds(false)),
-        [".git/config", ".git/commondir", ".git/hooks", ".git/info", ".git/worktrees"]
+        [
+            ".git/config",
+            ".git/commondir",
+            ".git/hooks",
+            ".git/info",
+            ".git/worktrees",
+            ".git/remotes",
+            ".git/branches"
+        ]
     );
     std::fs::create_dir_all(l.modules()).unwrap();
     assert_eq!(
@@ -557,6 +608,8 @@ fn late_binds_follow_what_the_repository_has() {
             ".git/hooks",
             ".git/info",
             ".git/worktrees",
+            ".git/remotes",
+            ".git/branches",
             ".git/modules",
             ".git/config.worktree"
         ]
@@ -717,7 +770,7 @@ mod bwrap {
     /// levels under a data dir, as the backend expects.
     async fn sandbox_over(dir: &Path, l: &InPlaceLayout) -> Arc<dyn SandboxHandle> {
         let wc = l.worktree_config_enabled().await.unwrap();
-        l.prepare(wc).unwrap();
+        l.prepare(wc, &record(dir)).unwrap();
         let data = dir.join("data");
         let home = data.join("homes/ws_inplace");
         let run = data.join("run/ws_inplace");
@@ -754,6 +807,8 @@ try info "printf x > .git/info/exclude"
 try commondir "printf /tmp/evil > .git/commondir"
 try commondir-unlink "rm -f .git/commondir"
 try worktrees "mkdir .git/worktrees/planted"
+try remotes "printf 'URL: /tmp/evil\n' > .git/remotes/origin"
+try branches "printf '/tmp/evil\n' > .git/branches/origin"
 try move-git "mv .git moved-git"
 try replace-git "mkdir -p newgit && mv -T newgit .git"
 try move-root "mv '$root' '$root-moved'"
@@ -771,6 +826,8 @@ try config-worktree "printf x > .git/config.worktree"
         let repo = common::init_repo(dir.path());
         common::git_ok(&repo, &["config", "extensions.worktreeConfig", "true"]);
         let config_before = std::fs::read(repo.join(".git/config")).unwrap();
+        // Template-dependent; see `prepare_makes_only_the_documented_entries`.
+        let _ = std::fs::remove_dir_all(repo.join(".git/branches"));
         let l = layout(dir.path(), &repo);
         let before = git_dir_entries(&repo);
         let handle = sandbox_over(dir.path(), &l).await;
@@ -780,7 +837,10 @@ try config-worktree "printf x > .git/config.worktree"
             .into_iter()
             .filter(|n| !before.contains(n))
             .collect();
-        assert_eq!(added, ["commondir", "config.worktree", "worktrees"]);
+        assert_eq!(
+            added,
+            ["branches", "commondir", "config.worktree", "remotes", "worktrees"]
+        );
 
         let (_, out) = run_in(&handle, &PROBE.replace("@ROOT@", &repo.to_string_lossy())).await;
         for expected in [
@@ -793,6 +853,8 @@ try config-worktree "printf x > .git/config.worktree"
             "commondir: refused",
             "commondir-unlink: refused",
             "worktrees: refused",
+            "remotes: refused",
+            "branches: refused",
             "move-git: refused",
             "replace-git: refused",
             "move-root: refused",
@@ -836,7 +898,18 @@ try config-worktree "printf x > .git/config.worktree"
 Run (WSL command from "How to run") with `--test in_place_sandbox`.
 Expected: FAIL, `could not find in_place in workspace`.
 
-- [ ] **Step 3: Write the module.** Add `pub mod in_place;` to `crates/daemon/src/workspace/mod.rs` (after `pub mod changes;`) and create `crates/daemon/src/workspace/in_place.rs`:
+- [ ] **Step 3: Write the module.** In `crates/daemon/src/workspace/mod.rs` add `pub mod in_place;` (after `pub mod changes;`) and, in `impl DataDirs` after `run()`:
+
+```rust
+    /// Which of `.git`'s on-demand directories the daemon created in an
+    /// in-place workspace's checkout, so Close takes back exactly those. Under
+    /// the data root, which no sandbox can write.
+    pub fn in_place_record(&self, id: &WorkspaceId) -> PathBuf {
+        self.root.join("in-place").join(format!("{id}.created"))
+    }
+```
+
+Then create `crates/daemon/src/workspace/in_place.rs`:
 
 ```rust
 //! In-place workspaces: an agent working directly in a repository's own
@@ -876,6 +949,11 @@ pub const COMMONDIR_GUARD: &str = ".\n";
 /// The empty tree, which git knows without it being in any object store. What
 /// changes are measured against in a repository with no commits yet.
 pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// The directories under `.git` that git makes only when it needs them, which
+/// the daemon makes (and binds read-only) when they are missing, and which
+/// Close takes back when the daemon made them and they are still empty.
+pub const ON_DEMAND_DIRS: [&str; 3] = ["worktrees", "remotes", "branches"];
 
 /// The paths of one in-place workspace.
 #[derive(Debug, Clone)]
@@ -932,6 +1010,12 @@ impl InPlaceLayout {
     }
     pub fn worktrees(&self) -> PathBuf {
         self.git_dir.join("worktrees")
+    }
+    pub fn remotes(&self) -> PathBuf {
+        self.git_dir.join("remotes")
+    }
+    pub fn branches(&self) -> PathBuf {
+        self.git_dir.join("branches")
     }
     pub fn config_worktree(&self) -> PathBuf {
         self.git_dir.join("config.worktree")
@@ -992,12 +1076,17 @@ impl InPlaceLayout {
     /// bwrap creates a missing bind target itself -- an empty directory, or an
     /// empty read-only file -- and here the underlying mount is the user's
     /// writable repository, so the daemon makes each one first and knows
-    /// exactly what it made: the `commondir` guard, and `hooks`, `info` and
-    /// `worktrees` when they are missing, which git would create itself and
-    /// which change nothing empty. `config.worktree` only matters with the
+    /// exactly what it made: the `commondir` guard, and `hooks`, `info` and the
+    /// [`ON_DEMAND_DIRS`] when they are missing, which git would create itself
+    /// and which change nothing empty. `config.worktree` only matters with the
     /// extension on, and a file the user already has is theirs and is left as
     /// it is.
-    pub fn prepare(&self, worktree_config: bool) -> Result<(), RpcError> {
+    ///
+    /// Which on-demand directories this call created is appended to `record`,
+    /// a daemon-owned file outside every sandbox
+    /// ([`crate::workspace::DataDirs::in_place_record`]), so Close can take
+    /// back exactly those and never one the user had.
+    pub fn prepare(&self, worktree_config: bool, record: &Path) -> Result<(), RpcError> {
         let guard = self.commondir();
         match std::fs::read(&guard) {
             Ok(bytes) if bytes == COMMONDIR_GUARD.as_bytes() => {}
@@ -1013,8 +1102,31 @@ impl InPlaceLayout {
             }
             Err(e) => return Err(io_error(&guard, e)),
         }
-        for dir in [self.hooks(), self.info(), self.worktrees()] {
+        for dir in [self.hooks(), self.info()] {
             std::fs::create_dir_all(&dir).map_err(|e| io_error(&dir, e))?;
+        }
+        let mut created = String::new();
+        for name in ON_DEMAND_DIRS {
+            let dir = self.git_dir.join(name);
+            if std::fs::symlink_metadata(&dir).is_err() {
+                std::fs::create_dir(&dir).map_err(|e| io_error(&dir, e))?;
+                created.push_str(name);
+                created.push('\n');
+            }
+        }
+        if !created.is_empty() {
+            // Written before the sandbox exists, so a failure here stops the
+            // start rather than leaving a directory nobody remembers making.
+            use std::io::Write;
+            if let Some(parent) = record.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(record)
+                .and_then(|mut f| f.write_all(created.as_bytes()))
+                .map_err(|e| io_error(record, e))?;
         }
         let wt = self.config_worktree();
         if worktree_config && !wt.exists() {
@@ -1025,15 +1137,25 @@ impl InPlaceLayout {
     }
 
     /// Takes back what [`prepare`](Self::prepare) left that git would not have:
-    /// the guard, if it is still exactly the guard, and `worktrees`, if it is
-    /// empty. Best effort: Close must not fail over either.
-    pub fn release(&self) {
+    /// the guard, if it is still exactly the guard, and each on-demand
+    /// directory `record` says the daemon created, if it is still empty. Then
+    /// the record itself. Best effort: Close must not fail over any of it.
+    pub fn release(&self, record: &Path) {
         let guard = self.commondir();
         if std::fs::read(&guard).is_ok_and(|b| b == COMMONDIR_GUARD.as_bytes()) {
             let _ = std::fs::remove_file(&guard);
         }
-        // `remove_dir` only removes an empty directory, which is the point.
-        let _ = std::fs::remove_dir(self.worktrees());
+        let recorded = std::fs::read_to_string(record).unwrap_or_default();
+        for name in ON_DEMAND_DIRS {
+            // Only names from the fixed list: the record is the daemon's, but
+            // nothing read back from disk gets to name a path by itself.
+            if recorded.lines().any(|line| line == name) {
+                // `remove_dir` only removes an empty directory, which is the
+                // point: whatever git has put there since is the user's.
+                let _ = std::fs::remove_dir(self.git_dir.join(name));
+            }
+        }
+        let _ = std::fs::remove_file(record);
     }
 
     /// Bound read-write, in this order. `.git` is a mount of its own so it
@@ -1044,8 +1166,9 @@ impl InPlaceLayout {
 
     /// Bound read-only after the read-write binds. `worktrees` is here because
     /// it holds the git directories of this repository's *worktree*
-    /// workspaces, whose `config.worktree` the daemon's own status reads.
-    /// `modules` only when it is a real directory: bwrap would otherwise create
+    /// workspaces, whose `config.worktree` the daemon's own status reads;
+    /// `remotes` and `branches` because `git fetch <name>` and `git push
+    /// <name>` read remote definitions from them. `modules` only when it is a real directory: bwrap would otherwise create
     /// it, and an agent that makes one gains nothing an embedded repository in
     /// the tree would not give it (plan R3).
     pub fn late_ro_binds(&self, worktree_config: bool) -> Vec<PathBuf> {
@@ -1055,6 +1178,8 @@ impl InPlaceLayout {
             self.hooks(),
             self.info(),
             self.worktrees(),
+            self.remotes(),
+            self.branches(),
         ];
         if is_real_dir(&self.modules()) {
             paths.push(self.modules());
@@ -1552,7 +1677,10 @@ mod bwrap {
         }
         let dir = tempfile::tempdir().unwrap();
         let repo = common::init_repo(dir.path());
-        std::fs::remove_dir_all(repo.join(".git/hooks")).unwrap();
+        // `branches` depends on git's template; take the question away.
+        for gone in [".git/hooks", ".git/branches"] {
+            let _ = std::fs::remove_dir_all(repo.join(gone));
+        }
         let before = names(&repo);
         let server = Server::bind(ServerConfig::default()).await.unwrap();
         let daemon = Daemon::new(
@@ -1565,7 +1693,16 @@ mod bwrap {
         assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
 
         let added: Vec<String> = names(&repo).into_iter().filter(|n| !before.contains(n)).collect();
-        assert_eq!(added, [".git/commondir", ".git/hooks/", ".git/worktrees/"]);
+        assert_eq!(
+            added,
+            [
+                ".git/branches/",
+                ".git/commondir",
+                ".git/hooks/",
+                ".git/remotes/",
+                ".git/worktrees/"
+            ]
+        );
 
         let handle = daemon.sandbox(&ws.id).unwrap();
         let script = format!(
@@ -1593,8 +1730,14 @@ mod bwrap {
         lifecycle::destroy(&daemon, &ws.id, false).await.unwrap();
         let after: Vec<String> = names(&repo).into_iter().filter(|n| !before.contains(n)).collect();
         // The hooks directory stays (git would have made it); the guard and the
-        // empty worktrees directory are taken back.
-        assert!(!after.iter().any(|n| n == ".git/commondir" || n == ".git/worktrees/"), "{after:?}");
+        // empty on-demand directories the daemon made are taken back, and so
+        // is its record of them.
+        for gone in [".git/commondir", ".git/worktrees/", ".git/remotes/", ".git/branches/"] {
+            assert!(!after.iter().any(|n| n == gone), "{gone} survived Close: {after:?}");
+        }
+        assert!(before.iter().all(|n| n != ".git/hooks/"));
+        assert!(names(&repo).iter().any(|n| n == ".git/hooks/"));
+        assert!(!DataDirs::new(dir.path().join("data")).in_place_record(&ws.id).exists());
     }
 }
 ```
@@ -1710,7 +1853,7 @@ In `start_sandbox`, replace the `let layout = layout_for(..)` line, the `config.
             // while the sandbox was down.
             let layout = InPlaceLayout::new(&ws.worktree_path, &d.dirs.no_hooks());
             let worktree_config = layout.worktree_config_enabled().await?;
-            layout.prepare(worktree_config)?;
+            layout.prepare(worktree_config, &d.dirs.in_place_record(&ws.id))?;
             in_place_spec_for(d, ws, &layout, worktree_config)
         }
     };
@@ -1859,7 +2002,8 @@ async fn close_in_place(d: &Daemon, ws: &Workspace) -> Result<(), RpcError> {
         // The same lock every other write to this repository takes.
         let repo_lock = crate::git::repo_lock(&ws.repo_path);
         let _repo_guard = repo_lock.lock().await;
-        InPlaceLayout::new(&ws.worktree_path, &d.dirs.no_hooks()).release();
+        InPlaceLayout::new(&ws.worktree_path, &d.dirs.no_hooks())
+            .release(&d.dirs.in_place_record(id));
     }
     d.agents.forget_workspace(id);
     // `remove_workspace` removes `<data>/worktrees/<id>`, never `worktree_path`.
@@ -3364,20 +3508,20 @@ Depends on Tasks 3, 4 and 6 (the docs describe what landed; read the diffs first
 - Modify: `docs/superpowers/specs/2026-09-08-bondsymphonic-overview-design.md` (§6.1, §6.3)
 - Modify: `docs/user-guide.md` (install line, Creating an agent workspace, new section, Finishing a workspace, Troubleshooting)
 
-No tests; the check is a read-through against the code.
+No tests; the check is a read-through against the code. The in-place spec (`docs/superpowers/specs/2026-09-17-in-place-workspaces-design.md`) was already brought in line with R1–R10 while planning; if an implementation step had to deviate from it, update that spec here too.
 
 - [ ] **Step 1: Daemon design.**
-  - §4 Workspaces: a subsection **4.x Workspace kinds** with the table from spec §2 (`kind`, `worktree_path`, `branch`, `base_branch`) and one paragraph each for create (spec §3.1 plus R7: `/`, `$HOME`, inside or containing the data directory, `.git` a file, linked worktree, bare, one in-place workspace per checkout by canonical path, `Conflict` sentence), restore/restart (no `ensure_registered`; the `Error` sentence verbatim), destroy ("Close": `force` ignored, no dirty/unmerged check, teardown, `release()` of the guard and an empty `worktrees`, never `worktree::remove`), and `layout_for` refusing an in-place workspace.
+  - §4 Workspaces: a subsection **4.x Workspace kinds** with the table from spec §2 (`kind`, `worktree_path`, `branch`, `base_branch`) and one paragraph each for create (spec §3.1 plus R7: `/`, `$HOME`, inside or containing the data directory, `.git` a file, linked worktree, bare, one in-place workspace per checkout by canonical path, `Conflict` sentence), restore/restart (no `ensure_registered`; the `Error` sentence verbatim), destroy ("Close": `force` ignored, no dirty/unmerged check, teardown, `release()` of the guard and of the empty on-demand directories the daemon recorded creating, never `worktree::remove`), and `layout_for` refusing an in-place workspace.
   - §5.3 Changes and diff: in place measures against `HEAD` (empty tree when unborn) with `InPlaceLayout::git()`; every daemon-side status/diff carries `--ignore-submodules=all`, and why (R3; the config key is not enough because `.gitmodules` overrides it). Note the rebase step as the known exception.
   - §5.4/§5.5: merge and PR refuse an in-place workspace with `data.reason = "in_place"`.
-  - §6.2 Linux/bwrap filesystem rules: an **In-place workspaces** paragraph listing the binds in order (rw root, rw `.git`, late ro `config`, `commondir`, `hooks`, `info`, `worktrees`, `modules` if a real directory, `config.worktree` if the extension is on), what `prepare` creates and why (bwrap creates missing targets on the writable repository — measured, R5), the `commondir` guard and why (R1, with the git versions measured), why `worktrees` is read-only (R2), that mount points cannot be renamed or removed, and that `rm -rf .git` still deletes everything that is not a mount point (R4). No private object directory, no `GIT_OBJECT_DIRECTORY`.
+  - §6.2 Linux/bwrap filesystem rules: an **In-place workspaces** paragraph listing the binds in order (rw root, rw `.git`, late ro `config`, `commondir`, `hooks`, `info`, `worktrees`, `remotes`, `branches`, `modules` if a real directory, `config.worktree` if the extension is on), what `prepare` creates and why (bwrap creates missing targets on the writable repository — measured, R5), the `commondir` guard and why (R1, with the git versions measured), why `worktrees`, `remotes` and `branches` are read-only and how the daemon records which of them it created (`<data>/in-place/<id>.created`) so Close removes only those, and only when empty (R2), that mount points cannot be renamed or removed, and that `rm -rf .git` still deletes everything that is not a mount point (R4). No private object directory, no `GIT_OBJECT_DIRECTORY`.
 
 - [ ] **Step 2: Overview.** §6.1/§6.3: `PROTOCOL_VERSION` is `2` (version 2 added in-place workspaces; a peer that sends no version is version 1 and is refused); `workspace.create` gains `in_place`; `repo.inspect` returns `head_branch`, `in_place_refusal`, `hooks_path_in_tree`; `WorkspaceInfo` carries `kind`; merge/PR `InvalidParams` with `reason: "in_place"`. Update the "which is `1`" sentence at line 152 and the `repo.inspect` result line at 175.
 
 - [ ] **Step 3: User guide.**
   - Install: `# bondsymphonic-ide 0.1.0 (protocol 2)`.
   - "Creating an agent workspace": the **Work in** choice, both labels verbatim, the help sentence, the hooks warning, and when the choice is greyed out (linked worktree, `.git` a file) and that the dialog remembers the last choice.
-  - New section **Working directly in a checkout**, after "Creating an agent workspace": what it is (the agent edits your folder on its current branch, inside the same sandbox, allowlist, runs and tabs; no branch, no merge), when to use it (a quick change you will review and commit yourself; a repository whose tooling cannot live in a second worktree), what the agent may do with git (stage, commit, switch, stash) and cannot (write `.git/config`, hooks, `.git/info`, `.git/commondir`, `.git/worktrees`, submodule git dirs; commands that write config such as `git push -u`, `git remote add`, tracking setup — R10), what BondSymphonic writes into `.git` (`commondir` containing `.`, and `hooks`, `info`, `worktrees` when missing; `config.worktree` when that extension is on) and that Close removes the `commondir` and an empty `worktrees` again, the Changes tab (against `HEAD`, no Merge/Rebase/Squash/Create PR/Discard), **Close workspace…** and its exact question, one in-place workspace per checkout (worktree workspaces beside it are fine), and **Residual risks**: `core.hooksPath` inside the tree; `.gitattributes` choosing your own filter/diff drivers; a rebase left in progress with `exec` lines; scripts in the tree; an embedded repository the agent commits as a submodule runs its own config the next time *your* git looks at it (R3); the agent can delete the repository's history (`rm -rf .git` removes everything but the protected entries, R4) just as it can delete files — keep a remote or a backup.
+  - New section **Working directly in a checkout**, after "Creating an agent workspace": what it is (the agent edits your folder on its current branch, inside the same sandbox, allowlist, runs and tabs; no branch, no merge), when to use it (a quick change you will review and commit yourself; a repository whose tooling cannot live in a second worktree), what the agent may do with git (stage, commit, switch, stash) and cannot (write `.git/config`, hooks, `.git/info`, `.git/commondir`, `.git/worktrees`, `.git/remotes`, `.git/branches`, submodule git dirs; commands that write config such as `git push -u`, `git remote add`, tracking setup — R10), what BondSymphonic writes into `.git` (`commondir` containing `.`, and `hooks`, `info`, `worktrees`, `remotes`, `branches` when missing; `config.worktree` when that extension is on) and that Close removes the `commondir` and, of the last three, those it created that are still empty, the Changes tab (against `HEAD`, no Merge/Rebase/Squash/Create PR/Discard), **Close workspace…** and its exact question, one in-place workspace per checkout (worktree workspaces beside it are fine), and **Residual risks**: `core.hooksPath` inside the tree; `.gitattributes` choosing your own filter/diff drivers; a rebase left in progress with `exec` lines; scripts in the tree; an embedded repository the agent commits as a submodule runs its own config the next time *your* git looks at it (R3); the agent can delete the repository's history (`rm -rf .git` removes everything but the protected entries, R4) just as it can delete files — keep a remote or a backup.
   - "Finishing a workspace": one paragraph pointing in-place users to their own `git commit`/`git push`, and to Close.
   - "Troubleshooting": the `Error` sentence for a moved or deleted checkout and what Retry/Close do; the protocol-mismatch line now names version 2.
 
@@ -3430,4 +3574,8 @@ Expected: clean.
 
 - **Spec coverage.** §2 model/protocol → Task 1. §3.1 create → Task 3 Step 5 (+R7). §3.2 restore/restart → Task 3 Step 6 and test `a_checkout_that_went_away...`. §3.3 destroy → Task 3 Step 6, byte-identity test for both `force` values. §3.4 changes/diff/status/merge/PR/pinned git/`Layout` guard → Tasks 3 (status, `layout_for`) and 4. §4.1 mounts → Task 2 (`late_ro_binds`, `prepare`, bwrap probe) and Task 3 (`in_place_spec_for`, "binds create only what is documented" test). §4.2 residual risks → Task 7. §4.3 hooks warning → Task 4 (`hooks_path_in_tree`) and Task 6 (dialog). §4.4 noop → unchanged. §5.1 dialog → Task 6 Step 4. §5.2 presentation → Task 6 Step 5 (labels, toolbar, Close wording in menu, tab menu and banner). §5.3 restore → Task 5 (`kind` from `WorkspaceInfo`, not stored). §6 testing → each item has a named test above; "kind survives a reconnect and restore" is `a_tab_takes_its_kind_from_the_daemon_and_keeps_it` (the reconnect path is the same `from_persisted`/`apply_workspace_info` pair). §7 docs → Task 7.
 - **Placeholders.** None; the only prose-described edits are mechanical fixture additions (Task 1 Steps 6–7) and docs (Task 7), each with exact content.
-- **Type consistency.** `InPlaceLayout::{new, git, prepare, release, rw_binds, late_ro_binds, check_repository, worktree_config_enabled}`, `in_place::{head_branch, diff_base, in_place_refusal, target_refusal, nothing_to_merge, EMPTY_TREE, COMMONDIR_GUARD, IN_PLACE_REASON}`, `lifecycle::in_place_spec_for`, `repo::hooks_path_in_tree`, `app_state::workspace_problem_for`, `Workspaces::is_in_place`, `app_controller::create_params`, `GroupModel::workspaceInPlace`, `AppController::{newAgentInPlace,setNewAgentInPlace}`, `ChangesToolbar::setInPlace`, `WorkspaceBanner::setInPlace`, `workspacelabel::{inPlace,inPlaceSuffix}` are spelled the same in every task that uses them.
+- **Type consistency.** `InPlaceLayout::{new, git, prepare, release, rw_binds, late_ro_binds, check_repository, worktree_config_enabled}`, `in_place::{head_branch, diff_base, in_place_refusal, target_refusal, nothing_to_merge, EMPTY_TREE, COMMONDIR_GUARD, IN_PLACE_REASON, ON_DEMAND_DIRS}`, `DataDirs::in_place_record`, `lifecycle::in_place_spec_for`, `repo::hooks_path_in_tree`, `app_state::workspace_problem_for`, `Workspaces::is_in_place`, `app_controller::create_params`, `GroupModel::workspaceInPlace`, `AppController::{newAgentInPlace,setNewAgentInPlace}`, `ChangesToolbar::setInPlace`, `WorkspaceBanner::setInPlace`, `workspacelabel::{inPlace,inPlaceSuffix}` are spelled the same in every task that uses them.
+
+## Known follow-ups (out of scope for this plan)
+
+- **The rebase in `crates/daemon/src/git/merge.rs` can run an embedded repository's config (R3).** `workspace.merge` with mode `rebase` runs `git rebase` through `Layout::worktree_git()` in a worktree workspace's worktree, and git's own clean-tree check inside `rebase` looks into submodules; there is no `--ignore-submodules` option for `rebase`. An agent that commits an embedded repository with a `core.fsmonitor` in its `.git/config` can therefore have that command run by the daemon when the user presses Rebase. Worktree workspaces only (an in-place workspace refuses merges). Needs its own measurement and fix — for example refusing to rebase a branch that adds a gitlink, or running the rebase with `GIT_CONFIG_*` overrides measured to stop the child git.

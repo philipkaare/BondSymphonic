@@ -1,6 +1,6 @@
 # In-place workspaces — design
 
-Date: 2026-09-17. Status: approved in chat by the user.
+Date: 2026-09-17. Status: approved in chat by the user; amended the same day while planning (`.git/commondir`, `worktrees`, `remotes` and `branches` read-only, `--ignore-submodules=all`, the extra `repo.inspect` fields and refusals, measured bwrap and git behaviour). The plan is `docs/superpowers/plans/2026-09-17-in-place-workspaces.md`.
 
 ## 1. Goal
 
@@ -47,10 +47,19 @@ A registry written by an older daemon has no `kind`, so it reads as `worktree`.
 `WorkspaceCreateParams` gains `#[serde(default)] in_place: bool`. With it set,
 `base_branch` is ignored and may be empty.
 
-`RepoInfo` (the `repo.inspect` result) gains
-`#[serde(default)] hooks_path_in_tree: Option<String>`: the repository's effective
-`core.hooksPath` when it resolves to a directory inside the working tree (husky
-does this), otherwise `None`. See §4.3.
+`RepoInfo` (the `repo.inspect` result) gains three `#[serde(default)]
+Option<String>` fields:
+
+- `hooks_path_in_tree`: the repository's effective `core.hooksPath`, relative to
+  the root, when it resolves to a directory inside the working tree (husky does
+  this) and not inside `.git`, otherwise `None`. See §4.3.
+- `head_branch`: the branch checked out, or `None` when `HEAD` is detached.
+  `default_branch` is the remote's default and is not this.
+- `in_place_refusal`: why the path cannot be worked in place (a linked worktree, a
+  `.git` that is a file), as the sentence `workspace.create` refuses with, or
+  `None`. The dialog uses it to disable the choice (§5.1).
+
+`WorkspaceInfo` carries `kind` as well.
 
 `PROTOCOL_VERSION` goes from 1 to 2. An older daemon would ignore `in_place` and
 quietly make a worktree, and the hello gate is what stops that. The IDE already
@@ -63,10 +72,16 @@ installs its own daemon before every launch (M7).
 1. Validate the name as today. Classify the path with `repo::classify`.
    `init_if_missing` works as today, so a folder can be initialised and then used
    in place.
-2. Require a **repository root with a `.git` directory**. A linked worktree (where
-   `.git` is a file), a bare repository and a path inside another repository are
-   refused with `InvalidParams` and a sentence saying why. The existing refusals
-   (`/`, `$HOME`, the data directory, a workspace worktree) apply unchanged.
+2. Require a **repository root with a `.git` directory**. A linked worktree, a
+   root whose `.git` is a file (a separate git directory, a submodule checkout), a
+   bare repository and a path inside another repository are refused with
+   `InvalidParams` and a sentence saying why. The daemon also refuses `/`, the
+   daemon user's `$HOME`, a root inside the daemon's data directory, and a root
+   that **contains** the data directory: the read-write bind of such a root would
+   bring every other workspace's home and exec socket back over the tmpfs that
+   masks them. (Before this design those refusals applied only to
+   `init_if_missing`.) Workspace worktrees live under the data directory and are
+   linked worktrees, so both rules cover them.
 3. Refuse with `Conflict` ("this checkout already has an in-place workspace:
    <name>") if a registered in-place workspace has the same canonical
    `worktree_path`. Worktree workspaces on the same repository are allowed
@@ -96,28 +111,43 @@ For `in_place`:
 - Stop agents, runs, PTYs, the proxy and the sandbox; delete the daemon's own
   `homes/<id>`, `caches/<id>`, `run/<id>` and the agent records and transcripts,
   as today.
-- **Never** run `worktree::remove` and never touch `worktree_path`, its `.git`,
-  or any branch. A test asserts that the repository is byte-identical afterwards
-  (tree listing plus `git status --porcelain=v2` plus `git for-each-ref` plus
+- **Never** run `worktree::remove` and never touch `worktree_path`, its files, or
+  any branch. The only writes to `.git` are taking back what §4.1 step 6 put
+  there: the `commondir` guard if it still holds exactly `.`, and each of
+  `worktrees`, `remotes` and `branches` that the daemon's record says it created
+  and that is still empty. The record is then deleted. A test asserts that the
+  repository is byte-identical afterwards (tree listing with contents, `.git`
+  included, plus `git status --porcelain=v2` plus `git for-each-ref` plus
   `.git/config` contents).
 
 ### 3.4 Changes, diff, status, merge, PR
 
 - `workspace.status`, `workspace.changes` and `workspace.diff` compare against
   `HEAD` instead of `merge-base(base_branch, HEAD)`: staged, unstaged and
-  untracked changes, the same as `git status`. The result types are unchanged.
+  untracked changes, the same as `git status`. In a repository with no commits
+  they compare against the empty tree. The result types are unchanged.
+- Every daemon-side `git status` and `git diff` against an agent-writable tree,
+  in either kind of workspace, passes `--ignore-submodules=all`. An agent can
+  commit an embedded repository whose own `.git/config` sets `core.fsmonitor`,
+  and a status that looks into it runs that command (measured with git 2.43).
+  `-c diff.ignoreSubmodules=all` is not enough, because a `.gitmodules` entry with
+  `ignore = none` overrides it; the command-line flag is not overridden. This
+  also closes the same hole in worktree workspaces, except in the rebase step
+  (§4.2).
 - `workspace.merge` and `workspace.create_pr` answer `InvalidParams` with
   `data.reason = "in_place"` ("an in-place workspace has nothing to merge; commit
   and push from the checkout").
 - Daemon-side git for an in-place workspace pins `GIT_DIR=<root>/.git`,
-  `GIT_WORK_TREE=<root>` and `core.hooksPath=<no_hooks>`, like `daemon_git`. The
+  `GIT_COMMON_DIR=<root>/.git`, `GIT_WORK_TREE=<root>` and
+  `core.hooksPath=<no_hooks>`, like `daemon_git`. `GIT_COMMON_DIR` is what keeps
+  a planted `commondir` (§4.1) away from the daemon even if the guard were gone. The
   repository config is the user's own and is read-only to the agent, so the
   `NEUTRALISED_CONFIG` list is not applied, for the same reason as `daemon_git`.
 
-`Layout` gets a kind-aware constructor, or an `InPlaceLayout` beside it. The
-implementer decides which, as long as no worktree-only path (`ref_dir`,
-`worktree_gitdir`, `objects_dir`, `config_worktree`) can be reached for an
-in-place workspace by accident. A test covers destroy and restore.
+An `InPlaceLayout` lives beside `Layout`, in `workspace/in_place.rs`, and
+`layout_for` refuses an in-place workspace with `Internal`, so no worktree-only
+path (`ref_dir`, `worktree_gitdir`, `objects_dir`, `config_worktree`) can be
+reached for one by accident. Tests cover destroy and restore.
 
 ## 4. Daemon: sandbox (`linux_bwrap`)
 
@@ -130,29 +160,61 @@ separates `rw_binds`, `ro_binds` and `late_ro_binds`):
 2. rw: `<root>/.git`, a mount of its own. A mount point cannot be renamed,
    removed or replaced (`EBUSY`), so the agent cannot swap `.git` for a directory
    of its own making.
-3. ro, late: `<root>/.git/config`, `<root>/.git/hooks`, `<root>/.git/info` and
-   `<root>/.git/modules` (the last only when it exists).
+3. ro, late, in this order: `<root>/.git/config`, `<root>/.git/commondir`,
+   `<root>/.git/hooks`, `<root>/.git/info`, `<root>/.git/worktrees`,
+   `<root>/.git/remotes`, `<root>/.git/branches`, and `<root>/.git/modules` (the
+   last only when it is a real directory, not a symlink).
+   - `commondir`: git reads it from *any* git directory, not only a linked
+     worktree's, and takes config, refs and objects from wherever it points.
+     Measured: an agent that writes it, pointing at a directory of its own whose
+     `config` sets `core.fsmonitor`, gets that command run by the user's next
+     `git status`, even with `GIT_DIR` pinned.
+   - `worktrees`: it holds the git directories of this repository's *worktree*
+     workspaces, whose `config.worktree` the daemon's own status reads.
+   - `remotes` and `branches`: legacy remote definitions that
+     `git fetch <name>` and `git push <name>` read, so an agent could redirect a
+     remote name the user types.
 4. ro, late: `<root>/.git/config.worktree`, but only when
    `extensions.worktreeConfig` is enabled. If the file is missing, the daemon
-   creates it empty first: git reads an empty file as no configuration.
-5. If `.git/hooks` or `.git/info` is missing, the daemon creates the empty
-   directory before binding it read-only. Git itself would create both, and an
-   empty directory changes nothing.
+   creates it empty first: git reads an empty file as no configuration. A file
+   the user already has is left as it is.
+5. Before every sandbox start the daemon writes `.git/commondir` containing `.`
+   (a newline-terminated dot). That points the common directory at the git
+   directory itself, which it is anyway. Measured with git 2.43 and Git for
+   Windows 2.52: status, commit, switch, stash, `worktree add` and `remove`, gc
+   and fsck all behave as without it. A repository that already has a
+   `commondir` with any other content is refused (`InvalidParams`).
+6. If `.git/hooks` or `.git/info` is missing, the daemon creates the empty
+   directory; git's own `init` makes both, and they stay after Close. If any of
+   `.git/worktrees`, `.git/remotes` or `.git/branches` is missing, the daemon
+   creates it empty and appends its name to a record of its own,
+   `<data>/in-place/<id>.created`, outside every sandbox. Git creates these on
+   demand, and an empty one changes nothing. Close removes exactly the recorded
+   ones, and only while they are empty (§3.3).
 
 There is no private object directory and no `GIT_OBJECT_DIRECTORY` or
 `GIT_ALTERNATE_OBJECT_DIRECTORIES`: the agent's objects go into the repository's
 own store. The proxy, home, cache, run dir, Claude binary and environment are as
 for a worktree workspace; `cwd` is `<root>`.
 
-The implementer must check, with bwrap 0.9 in the distro, that none of these
-binds creates a file or directory in the user's repository beyond the two
-creations in steps 4 and 5. The daemon makes those itself, so bwrap never has to.
+Measured with bwrap 0.9 in the distro: a `--ro-bind` onto a missing path creates
+it on the underlying writable repository (an empty directory, or an empty `0444`
+file). That is why steps 4–6 create every read-only target first; bwrap then never
+has to, and the binds create nothing beyond those documented entries. Renaming or
+removing a mount point (`.git`, the root, any of the files above) fails with
+`EBUSY`.
 
 ### 4.2 What this protects, and what it does not
 
 This keeps the sandbox boundary for any git the user runs later, on either side of
 WSL: the agent cannot plant a hook, a `core.fsmonitor`, a `core.sshCommand` or a
-filter driver, and cannot redirect `.git`.
+filter driver in the repository's config, cannot redirect `.git` or its common
+directory, cannot redefine a legacy remote, and cannot reach the git directories
+of the repository's worktree workspaces.
+
+Inside the sandbox, git commands that write `.git/config` fail: `git push -u`,
+`git remote add`, upstream tracking set up by `git switch -c x origin/x`, and
+`git sparse-checkout`. This is accepted.
 
 Residual risks, documented in the user guide and not mitigated further:
 
@@ -165,12 +227,29 @@ Residual risks, documented in the user guide and not mitigated further:
   lines that run when the user types `git rebase --continue`.
 - **Scripts in the tree** (`package.json` scripts, `Makefile`, …) run when the
   user runs them. That is inherent in letting an agent edit your checkout.
-- The agent cannot init or commit in submodules (`.git/modules` is read-only).
+- **Embedded repositories.** An agent can `git init` a directory in the tree, set
+  `core.fsmonitor` (or any other command) in *its* `.git/config`, and commit it
+  as a gitlink. The user's next `git status` or `git diff` in the checkout looks
+  into it and runs that command. The daemon's own git is protected
+  (`--ignore-submodules=all`, §3.4); the user's is not.
+- **History can be destroyed.** `rm -rf .git` fails, and the mount points
+  (`.git`, `config`, `commondir`, `hooks`, `info`, `worktrees`, `remotes`,
+  `branches`) survive. But `HEAD`, the index, `objects/`, `refs/` and `logs/` are
+  deleted, just as the agent can delete any file in the checkout. Keep a remote
+  or a backup.
+- The agent cannot init or commit in existing submodules (`.git/modules` is
+  read-only).
+- **Known gap, worktree workspaces only:** `workspace.merge` in rebase mode runs
+  `git rebase` in the workspace worktree, and `rebase` has no
+  `--ignore-submodules` option. An embedded repository an agent committed there
+  can therefore have its config run by the daemon when the user presses Rebase.
+  This is a follow-up and is not fixed by this design.
 
 ### 4.3 `core.hooksPath` warning
 
-`repo.inspect` resolves `git config --get core.hooksPath`, relative to the root, and
-reports it in `hooks_path_in_tree` when it lies inside the working tree. The New
+`repo.inspect` resolves `git config --get core.hooksPath` (relative to the root, `~/`
+expanded, `..` taken out) and reports it, relative to the root, in
+`hooks_path_in_tree` when it lies inside the working tree but not inside `.git`. The New
 Agent dialog shows a warning under the in-place choice when it is set (§5.1). The
 daemon does not refuse such a create.
 
@@ -187,22 +266,31 @@ isolates nothing.
   default) or **Work directly in this checkout**.
 - With the second choice selected:
   - The base-branch field is disabled and shows the checked-out branch from
-    `repo.inspect`, or "detached HEAD".
+    `repo.inspect` (`head_branch`), or "detached HEAD". No base branch is sent.
   - The help text reads: "The agent edits this folder on its current branch. Its
     changes are not isolated on a branch of their own."
   - When `hooks_path_in_tree` is set, a warning says: "This repository runs git
     hooks from `<path>` inside the working tree. The agent can change them, and
     they run outside the sandbox the next time you use git here."
-  - When the path is a linked worktree or bare repository, the choice is disabled
-    with the reason. The daemon refuses these as well (§3.1).
-- The chosen mode is remembered with the other dialog defaults.
+  - When `in_place_refusal` is set (a linked worktree, a `.git` that is a file),
+    the choice is disabled with that sentence as its tooltip, and the dialog
+    falls back to a worktree. A bare repository is already an `inspect` error.
+    The daemon refuses all of these as well (§3.1).
+- The chosen mode is remembered in `state.json` (`new_agent_in_place`), beside the
+  recent repositories. It is written only when a dialog is accepted while the
+  choice was available, so a forced fallback does not overwrite the preference.
 
 ### 5.2 Workspace presentation
 
 - The tab, explorer header or current-worktree display marks an in-place workspace
   as "in place", showing the repository path and branch.
-- The Changes toolbar hides Merge and Create PR. The Changes list shows the
-  changes against `HEAD`.
+- The Changes toolbar hides Merge, Rebase, Squash, Create PR and Discard. All five
+  act on a branch of the workspace's own, and there is none. The Workspace menu
+  shows the same actions and hides them too. The Changes list shows the changes
+  against `HEAD`.
+- The Close group dialog offers an in-place workspace only **Keep (move to
+  Unsorted)** and **Close (files are kept)**, and leaves it out of the discard
+  confirmation.
 - Destroy becomes **Close workspace…** in the Workspace menu, the tab menu and the
   down-workspace banner. It asks: *Close workspace "<name>"? The agent and its
   sandbox stop. Your files, branches and git history are not touched.* There is no
@@ -227,25 +315,42 @@ Daemon (in WSL; bwrap tests skip where bwrap is unavailable):
     and `git switch -c`.
 
   From inside, these fail:
-  - writes to `.git/config`, `.git/hooks/*` and `.git/info/*`;
-  - `mv .git x`, `rm -rf .git`, and replacing `.git`;
+  - writes to `.git/config`, `.git/hooks/*`, `.git/info/*`, `.git/commondir`,
+    `.git/worktrees/*`, `.git/remotes/*` and `.git/branches/*`, and
+    `git config`;
+  - `mv .git x`, replacing `.git`, and moving the root;
+  - `rm -rf .git` exits non-zero and leaves `.git`, `config` and `hooks` in
+    place (the rest of `.git` is lost; §4.2);
   - `.git/config.worktree` (when that extension is enabled).
 
-  The binds create nothing in the repository except the documented directories.
+  The binds create nothing in the repository except the documented entries
+  (§4.1 steps 4–6).
+- **Preparation:** `prepare` creates exactly those entries and records only the
+  on-demand directories it made. A foreign `commondir` is refused. Release
+  removes only recorded, still-empty directories and ignores anything else in the
+  record. The pinned git ignores a planted `commondir`.
 - **Destroy:** the repository is byte-identical afterwards, whatever `force` says.
-- **Changes and diff:** they are measured against `HEAD`. Merge and PR refuse with
+- **Changes and diff:** they are measured against `HEAD`, and against the empty
+  tree when there are no commits. Merge and PR refuse with
   `reason = "in_place"`.
+- **Embedded repositories:** status and changes, in both kinds of workspace, do
+  not run an embedded repository's config.
+- **Refusals:** a root that contains the data directory is refused.
 - **Restore and restart:** there is no worktree repair; a missing repository gives
   the `Error` sentence; restart works.
 - **`repo.inspect`:** `hooks_path_in_tree` is set for an in-tree `core.hooksPath`
-  (relative and absolute forms) and `None` otherwise.
-- **Protocol:** a version-1 hello is refused; `kind` defaults to `worktree` for an
-  old registry.
+  (relative and absolute forms) and `None` otherwise (outside, inside `.git`,
+  unset). `head_branch` names the branch and is `None` when detached;
+  `in_place_refusal` is set for a linked worktree.
+- **Protocol:** a version-1 hello, and one with no version at all, is refused;
+  `kind` defaults to `worktree` for an old registry.
 
-IDE, with fake-daemon smoke tests and model tests:
+IDE, with fake-daemon smoke tests, widget tests and model tests:
 
-- The dialog sends `in_place` and shows the hooks warning.
-- The in-place tab hides Merge and PR.
+- The dialog sends `in_place` (and no base branch), shows the hooks warning, shows
+  the checked-out branch or "detached HEAD", and disables the choice with the
+  reason for a linked worktree.
+- The in-place tab hides Merge, Rebase, Squash, Create PR and Discard.
 - The Close wording is used, with no Force box, and a single non-forced destroy is
   sent.
 - `kind` survives a reconnect and restore.
@@ -254,7 +359,7 @@ IDE, with fake-daemon smoke tests and model tests:
 
 - **Daemon design §4:** workspace kinds, the in-place create, restore, destroy
   and changes; §6.2 the in-place mount rules.
-- **Overview:** the protocol list, `in_place` and `hooks_path_in_tree`, and
-  protocol version 2.
+- **Overview:** the protocol list, `in_place`, `kind`, `head_branch`,
+  `in_place_refusal` and `hooks_path_in_tree`, and protocol version 2.
 - **User guide:** a section "Working directly in a checkout", covering what it
   is, when to use it, the Close wording and the residual risks from §4.2.
