@@ -729,7 +729,9 @@ const IN_PLACE_HOLD_REASON: &str =
 /// repository -- which cannot happen today, but costs nothing to allow -- each
 /// take back their own.
 fn in_place_hold(git_common: &Path, id: &WorkspaceId) -> PathBuf {
-    git_common.join("worktrees").join(format!(".bs-inplace-{id}"))
+    git_common
+        .join("worktrees")
+        .join(format!(".bs-inplace-{id}"))
 }
 
 /// Keeps `<git common dir>/worktrees` in place for as long as an in-place

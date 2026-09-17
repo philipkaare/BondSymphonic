@@ -289,14 +289,9 @@ async fn merging_into_a_checkout_does_not_run_an_embedded_repositorys_config() {
     common::commit_all(&repo, &[], "ours");
     let _ = std::fs::remove_file(&marker);
 
-    let result = merge::merge(
-        &daemon,
-        &ws.id,
-        bondsymphonic_proto::MergeMode::Merge,
-        None,
-    )
-    .await
-    .unwrap();
+    let result = merge::merge(&daemon, &ws.id, bondsymphonic_proto::MergeMode::Merge, None)
+        .await
+        .unwrap();
     assert!(!result.ok, "the merge should have conflicted");
     assert_eq!(result.conflicts, ["README.md"]);
     assert!(

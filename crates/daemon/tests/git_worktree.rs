@@ -769,8 +769,7 @@ async fn the_stale_hold_sweep_leaves_everything_but_a_hold_alone() {
     let layout = layout_for(dir.path(), &repo, "sweep").await;
     worktree::create(&layout, "main").await.unwrap();
     let worktrees = layout.git_common.join("worktrees");
-    const HOLD_REASON: &str = "BondSymphonic keeps this directory while it removes a worktree
-";
+    const HOLD_REASON: &str = "BondSymphonic keeps this directory while it removes a worktree\n";
 
     // A leftover of a daemon that stopped mid-removal, which is what the sweep
     // is for.
@@ -780,14 +779,12 @@ async fn the_stale_hold_sweep_leaves_everything_but_a_hold_alone() {
     // A registration wearing the same name. Its lock is git's to honour.
     let registration = worktrees.join(".bs-hold-registration");
     std::fs::create_dir(&registration).unwrap();
-    std::fs::write(registration.join("gitdir"), "/somewhere/.git
-").unwrap();
+    std::fs::write(registration.join("gitdir"), "/somewhere/.git\n").unwrap();
     std::fs::write(registration.join("locked"), HOLD_REASON).unwrap();
     // A directory with a lock that says something else.
     let theirs = worktrees.join(".bs-hold-theirs");
     std::fs::create_dir(&theirs).unwrap();
-    std::fs::write(theirs.join("locked"), "on a removable disk
-").unwrap();
+    std::fs::write(theirs.join("locked"), "on a removable disk\n").unwrap();
     // And the persistent hold of an in-place workspace, which the sweep must
     // never touch whatever a worktree removal is doing.
     worktree::hold_worktrees_for_in_place(&layout.git_common, &"ws_here".into());
@@ -841,7 +838,11 @@ async fn removing_a_workspace_leaves_a_branch_somebody_else_checked_out() {
         e.message
     );
     assert_eq!(
-        common::git_out(&repo, &["rev-parse", "--verify", "refs/heads/bs/taken/work"]).len(),
+        common::git_out(
+            &repo,
+            &["rev-parse", "--verify", "refs/heads/bs/taken/work"]
+        )
+        .len(),
         40,
         "the branch somebody is standing on was deleted"
     );
