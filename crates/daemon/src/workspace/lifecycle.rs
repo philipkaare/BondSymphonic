@@ -9,6 +9,7 @@ use crate::git::{
 use crate::ids::new_id;
 use crate::net::allowlist::{Allowlist, HostPattern};
 use crate::sandbox::{SandboxCommand, SandboxHandle, SandboxSpec};
+use crate::workspace::in_place::{self, InPlaceLayout, IGNORE_SUBMODULES};
 use crate::workspace::{now_rfc3339, Workspace};
 use bondsymphonic_proto::*;
 use std::path::{Path, PathBuf};
@@ -24,6 +25,15 @@ fn sandbox_user() -> String {
 }
 
 pub async fn layout_for(d: &Daemon, ws: &Workspace) -> Result<Layout, RpcError> {
+    // The one door to the worktree-only paths. An in-place workspace has none
+    // of them, and a caller that forgot to branch on the kind must fail here
+    // rather than compute a `worktrees/<id>` gitdir inside the user's `.git`.
+    if ws.kind == WorkspaceKind::InPlace {
+        return Err(RpcError::internal(format!(
+            "workspace {} works in place and has no worktree layout",
+            ws.id
+        )));
+    }
     let git_common = repo::common_dir(&d.git, &ws.repo_path).await?;
     Ok(Layout {
         repo: ws.repo_path.clone(),
@@ -112,10 +122,57 @@ pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
     let same = |p: &Path| (p.to_path_buf(), p.to_path_buf());
     let mut rw_binds = vec![same(&ws.worktree_path), same(&layout.objects_dir)];
     rw_binds.extend(layout.rw_git_paths().iter().map(|p| same(p)));
+    // Read-only *after* the read-write bind of its parent gitdir, or the parent
+    // would put the writable original straight back on top of it.
+    let late_ro_binds = vec![same(&layout.config_worktree())];
+    finish_spec(
+        d,
+        ws,
+        rw_binds,
+        vec![same(&layout.git_common)],
+        late_ro_binds,
+        layout.sandbox_git_env(),
+    )
+}
+
+/// The sandbox of an in-place workspace: the checkout and its `.git`
+/// read-write, and what a git outside the sandbox would execute read-only on
+/// top (see [`InPlaceLayout::late_ro_binds`]). No private object directory:
+/// the agent's objects go into the repository's own store.
+pub fn in_place_spec_for(
+    d: &Daemon,
+    ws: &Workspace,
+    layout: &InPlaceLayout,
+    worktree_config: bool,
+) -> SandboxSpec {
+    let same = |p: &PathBuf| (p.clone(), p.clone());
+    finish_spec(
+        d,
+        ws,
+        layout.rw_binds().iter().map(same).collect(),
+        Vec::new(),
+        layout
+            .late_ro_binds(worktree_config)
+            .iter()
+            .map(same)
+            .collect(),
+        Vec::new(),
+    )
+}
+
+/// What both kinds share: the cache, the Claude binary, the proxy and the
+/// workspace id.
+fn finish_spec(
+    d: &Daemon,
+    ws: &Workspace,
+    mut rw_binds: Vec<(PathBuf, PathBuf)>,
+    mut ro_binds: Vec<(PathBuf, PathBuf)>,
+    late_ro_binds: Vec<(PathBuf, PathBuf)>,
+    mut env: Vec<(String, String)>,
+) -> SandboxSpec {
     let cache = d.dirs.cache(&ws.id);
     let home_in_sandbox = PathBuf::from(format!("/home/{}", sandbox_user()));
     rw_binds.push((cache, home_in_sandbox.join(".cache")));
-    let mut ro_binds = vec![same(&layout.git_common)];
     // The Claude Code CLI, bound in at a fixed path. A bwrap sandbox has its
     // own `/home`, so the daemon user's install is not reachable from inside it
     // and `claude_argv` names the bound path instead. Only where the backend
@@ -126,10 +183,6 @@ pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
     if d.backend.name() == BWRAP_BACKEND {
         ro_binds.extend(crate::agents::claude::claude_ro_bind());
     }
-    // Read-only *after* the read-write bind of its parent gitdir, or the parent
-    // would put the writable original straight back on top of it.
-    let late_ro_binds = vec![same(&layout.config_worktree())];
-    let mut env = layout.sandbox_git_env();
     env.push(("BS_WORKSPACE".into(), ws.id.to_string()));
     // Only where the sandbox actually has a network namespace of its own. The
     // no-sandbox backend runs processes as plain children of the daemon, which
@@ -151,7 +204,6 @@ pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
 }
 
 pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcError> {
-    let layout = layout_for(d, ws).await?;
     for p in [
         d.dirs.cache(&ws.id),
         d.dirs.home(&ws.id),
@@ -159,13 +211,29 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
     ] {
         std::fs::create_dir_all(p).map_err(|e| RpcError::io(&e))?;
     }
-    // The daemon owns `config.worktree`, empty, and the sandbox gets it
-    // read-only. Written on every start rather than only at creation, so that a
-    // workspace made before this existed — or one whose file an agent managed to
-    // write — starts from a file the daemon put there. Nothing legitimate is
-    // lost: git only writes this file for features (sparse-checkout) the
-    // read-only bind rules out inside the sandbox anyway.
-    std::fs::write(layout.config_worktree(), b"").map_err(|e| RpcError::io(&e))?;
+    let spec = match ws.kind {
+        WorkspaceKind::Worktree => {
+            let layout = layout_for(d, ws).await?;
+            // The daemon owns `config.worktree`, empty, and the sandbox gets it
+            // read-only. Written on every start rather than only at creation, so
+            // that a workspace made before this existed — or one whose file an
+            // agent managed to write — starts from a file the daemon put there.
+            // Nothing legitimate is lost: git only writes this file for features
+            // (sparse-checkout) the read-only bind rules out inside the sandbox
+            // anyway.
+            std::fs::write(layout.config_worktree(), b"").map_err(|e| RpcError::io(&e))?;
+            spec_for(d, ws, &layout)
+        }
+        WorkspaceKind::InPlace => {
+            // Every start, like the worktree kind's `config.worktree`: what the
+            // read-only binds need is put back even if something removed it
+            // while the sandbox was down.
+            let layout = InPlaceLayout::new(&ws.worktree_path, &d.dirs.no_hooks());
+            let worktree_config = layout.worktree_config_enabled().await?;
+            layout.prepare(worktree_config, &d.dirs.in_place_record(&ws.id))?;
+            in_place_spec_for(d, ws, &layout, worktree_config)
+        }
+    };
     // Before the sandbox, not after: the shim inside it connects to this socket
     // as its first act, and a sandbox that came up first would race it.
     let proxy = d
@@ -177,7 +245,7 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
             d.events.clone(),
         )
         .await?;
-    let handle = match d.backend.start(&spec_for(d, ws, &layout)).await {
+    let handle = match d.backend.start(&spec).await {
         Ok(h) => h,
         // Nothing will ever connect to that listener now.
         Err(e) => {
@@ -521,7 +589,11 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
     let ws = {
         let repo_lock = crate::git::repo_lock(&repo_path);
         let _repo_guard = repo_lock.lock().await;
-        create_the_workspace(d, &p, &repo_path).await?
+        if p.in_place {
+            create_in_place(d, &p, &repo_path).await?
+        } else {
+            create_the_workspace(d, &p, &repo_path).await?
+        }
     };
 
     seed_home(d, &ws).await;
@@ -550,6 +622,172 @@ async fn create_the_workspace(
     p: &WorkspaceCreateParams,
     repo_path: &Path,
 ) -> Result<Workspace, RpcError> {
+    let git_common = resolve_repository(d, p, repo_path).await?;
+    if d.registry.find_by_name(repo_path, &p.name).is_some() {
+        return Err(RpcError::new(
+            ErrorCode::Conflict,
+            format!("workspace {} already exists for this repo", p.name),
+        ));
+    }
+    let id = WorkspaceId(new_id("ws_"));
+    d.dirs.ensure_workspace(&id).map_err(|e| RpcError::io(&e))?;
+    let ws = Workspace {
+        id: id.clone(),
+        name: p.name.clone(),
+        repo_path: repo_path.to_path_buf(),
+        base_branch: p.base_branch.clone(),
+        branch: Workspace::branch_for(&p.name),
+        worktree_path: d.dirs.worktree(&id),
+        created_at: now_rfc3339(),
+        allowlist: effective_allowlist(repo_path),
+        kind: WorkspaceKind::Worktree,
+        state: WorkspaceState::Creating,
+        agents: vec![],
+        runs: vec![],
+    };
+    d.registry
+        .insert(ws.clone())
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?;
+    d.emit_state(&ws);
+
+    let layout = Layout {
+        repo: repo_path.to_path_buf(),
+        git_common,
+        name: ws.name.clone(),
+        branch: ws.branch.clone(),
+        worktree_path: ws.worktree_path.clone(),
+        objects_dir: d.dirs.objects(&id),
+        no_hooks_dir: d.dirs.no_hooks(),
+    };
+    if let Err(failed) = worktree::create(&layout, &p.base_branch).await {
+        // `worktree::create` unwinds whatever it managed to make, the branch
+        // included when the branch was its own. This is the safety net for the
+        // rest: the worktree directory and its registration, and never the
+        // branch — `RemoveBranch::Never`, because a cleanup that cannot show the
+        // branch is its own is a cleanup that must not run `git branch -D` on
+        // somebody else's.
+        //
+        // Only when there is something to clean up, which `create` reports
+        // rather than leaving to be guessed at. Half of its refusals happen
+        // before it writes anything — a name already taken, a base branch that
+        // does not exist, a `branch_exists` that failed outright — and the
+        // other half unwind themselves. Running this anyway meant a
+        // `git worktree prune` **on the user's repository**, and prune forgets
+        // every registration whose directory is not there at that moment: a
+        // worktree on an unmounted disk, or one the user had moved aside. Those
+        // are not this call's to lose over a typo in a branch name.
+        if failed.left == worktree::Leftovers::Something {
+            let _ = worktree::remove_with(&layout, worktree::RemoveBranch::Never).await;
+        }
+        let e = failed.error;
+        // The client has already seen `Creating`. Tell it why the workspace failed, then
+        // send the terminal `Destroying` event a real destroy ends on, so the workspace
+        // disappears from the client's list instead of hanging there forever.
+        let _ = d
+            .set_state(&id, WorkspaceState::Error(e.message.clone()))
+            .await;
+        let _ = d.set_state(&id, WorkspaceState::Destroying).await;
+        let _ = d.registry.remove(&id).await;
+        d.dirs.remove_workspace(&id);
+        return Err(e);
+    }
+    Ok(ws)
+}
+
+/// [`create_the_workspace`] for `in_place: true`: the checkout is used as it
+/// is. No branch, no `git worktree add`, no lock, no private objects -- so,
+/// unlike a worktree create, nothing is made in the repository here and there
+/// is nothing to unwind on a refusal.
+async fn create_in_place(
+    d: &Arc<Daemon>,
+    p: &WorkspaceCreateParams,
+    repo_path: &Path,
+) -> Result<Workspace, RpcError> {
+    // Before `resolve_repository`, which may `git init` the folder: a target
+    // that is refused anyway must not be made a repository first.
+    if let Some(why) = in_place::target_refusal(repo_path, &d.dirs.root) {
+        return Err(RpcError::invalid_params(format!(
+            "refusing to work in place in {}: {why}",
+            repo_path.display()
+        )));
+    }
+    resolve_repository(d, p, repo_path).await?;
+    // Asked again after `resolve_repository`, which may just have made the
+    // folder a repository of its own.
+    let kind = repo::classify(&d.git, repo_path).await?;
+    if let Some(why) = in_place::in_place_refusal(&kind, repo_path) {
+        return Err(RpcError::invalid_params(why));
+    }
+    // One agent per checkout. By canonical path, so two spellings of one
+    // folder are one folder, as they are for the repository lock held here.
+    let target = repo::canonical_ish(repo_path);
+    if let Some(other) = d.registry.list().into_iter().find(|w| {
+        w.kind == WorkspaceKind::InPlace && repo::canonical_ish(&w.worktree_path) == target
+    }) {
+        return Err(RpcError::new(
+            ErrorCode::Conflict,
+            format!(
+                "this checkout already has an in-place workspace: {}",
+                other.name
+            ),
+        ));
+    }
+    if d.registry.find_by_name(repo_path, &p.name).is_some() {
+        return Err(RpcError::new(
+            ErrorCode::Conflict,
+            format!("workspace {} already exists for this repo", p.name),
+        ));
+    }
+    let layout = InPlaceLayout::new(repo_path, &d.dirs.no_hooks());
+    // Display only: never switched, created or deleted, and nothing merges
+    // into it, so the base branch says the same.
+    let branch = in_place::head_branch(&layout.git(), repo_path).await?;
+    let ws = Workspace {
+        id: WorkspaceId(new_id("ws_")),
+        name: p.name.clone(),
+        repo_path: repo_path.to_path_buf(),
+        base_branch: branch.clone(),
+        branch,
+        worktree_path: repo_path.to_path_buf(),
+        created_at: now_rfc3339(),
+        allowlist: effective_allowlist(repo_path),
+        kind: WorkspaceKind::InPlace,
+        state: WorkspaceState::Creating,
+        agents: vec![],
+        runs: vec![],
+    };
+    d.registry
+        .insert(ws.clone())
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?;
+    d.emit_state(&ws);
+    Ok(ws)
+}
+
+/// The repository's own `[network] allow` on top of the defaults. A
+/// `bondsymphonic.toml` that will not parse is worth a warning and nothing
+/// more: refusing to create the workspace over it would leave the user unable
+/// to open the very repo they need a workspace in to fix the file.
+fn effective_allowlist(repo_path: &Path) -> Vec<String> {
+    let repo_config = match crate::runs::config::load_repo_config(repo_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!(repo = %repo_path.display(), error = %e, "using the default allowlist");
+            None
+        }
+    };
+    crate::net::allowlist::effective(repo_config.as_ref())
+}
+
+/// Identifies the repository at `repo_path`, initialising it first when the
+/// client asked for that, and answers its common git directory. Shared by both
+/// kinds of create, so both refuse and initialise the same folders the same way.
+async fn resolve_repository(
+    d: &Arc<Daemon>,
+    p: &WorkspaceCreateParams,
+    repo_path: &Path,
+) -> Result<PathBuf, RpcError> {
     // Is this path a repository of its own? [`repo::classify`] is the one place
     // that answers, so `repo.inspect`, `init_repo` and this all say the same
     // thing about the same folder. Only the first two answers lead to a write:
@@ -632,88 +870,7 @@ async fn create_the_workspace(
             }))
         }
     };
-    if d.registry.find_by_name(repo_path, &p.name).is_some() {
-        return Err(RpcError::new(
-            ErrorCode::Conflict,
-            format!("workspace {} already exists for this repo", p.name),
-        ));
-    }
-    let id = WorkspaceId(new_id("ws_"));
-    d.dirs.ensure_workspace(&id).map_err(|e| RpcError::io(&e))?;
-    // The repo's own `[network] allow` extends the defaults for this workspace.
-    // A `bondsymphonic.toml` that will not parse is worth a warning and nothing
-    // more: refusing to create the workspace over it would leave the user
-    // unable to open the very repo they need a workspace in to fix the file.
-    let repo_config = match crate::runs::config::load_repo_config(repo_path) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            tracing::warn!(repo = %repo_path.display(), error = %e, "using the default allowlist");
-            None
-        }
-    };
-    let allowlist = crate::net::allowlist::effective(repo_config.as_ref());
-    let ws = Workspace {
-        id: id.clone(),
-        name: p.name.clone(),
-        repo_path: repo_path.to_path_buf(),
-        base_branch: p.base_branch.clone(),
-        branch: Workspace::branch_for(&p.name),
-        worktree_path: d.dirs.worktree(&id),
-        created_at: now_rfc3339(),
-        allowlist,
-        kind: WorkspaceKind::Worktree,
-        state: WorkspaceState::Creating,
-        agents: vec![],
-        runs: vec![],
-    };
-    d.registry
-        .insert(ws.clone())
-        .await
-        .map_err(|e| RpcError::internal(e.to_string()))?;
-    d.emit_state(&ws);
-
-    let layout = Layout {
-        repo: repo_path.to_path_buf(),
-        git_common,
-        name: ws.name.clone(),
-        branch: ws.branch.clone(),
-        worktree_path: ws.worktree_path.clone(),
-        objects_dir: d.dirs.objects(&id),
-        no_hooks_dir: d.dirs.no_hooks(),
-    };
-    if let Err(failed) = worktree::create(&layout, &p.base_branch).await {
-        // `worktree::create` unwinds whatever it managed to make, the branch
-        // included when the branch was its own. This is the safety net for the
-        // rest: the worktree directory and its registration, and never the
-        // branch — `RemoveBranch::Never`, because a cleanup that cannot show the
-        // branch is its own is a cleanup that must not run `git branch -D` on
-        // somebody else's.
-        //
-        // Only when there is something to clean up, which `create` reports
-        // rather than leaving to be guessed at. Half of its refusals happen
-        // before it writes anything — a name already taken, a base branch that
-        // does not exist, a `branch_exists` that failed outright — and the
-        // other half unwind themselves. Running this anyway meant a
-        // `git worktree prune` **on the user's repository**, and prune forgets
-        // every registration whose directory is not there at that moment: a
-        // worktree on an unmounted disk, or one the user had moved aside. Those
-        // are not this call's to lose over a typo in a branch name.
-        if failed.left == worktree::Leftovers::Something {
-            let _ = worktree::remove_with(&layout, worktree::RemoveBranch::Never).await;
-        }
-        let e = failed.error;
-        // The client has already seen `Creating`. Tell it why the workspace failed, then
-        // send the terminal `Destroying` event a real destroy ends on, so the workspace
-        // disappears from the client's list instead of hanging there forever.
-        let _ = d
-            .set_state(&id, WorkspaceState::Error(e.message.clone()))
-            .await;
-        let _ = d.set_state(&id, WorkspaceState::Destroying).await;
-        let _ = d.registry.remove(&id).await;
-        d.dirs.remove_workspace(&id);
-        return Err(e);
-    }
-    Ok(ws)
+    Ok(git_common)
 }
 
 pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty, RpcError> {
@@ -725,6 +882,13 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
     let mut count = gate.lock().await;
     *count += 1;
     let ws = d.workspace(id)?;
+    if ws.kind == WorkspaceKind::InPlace {
+        // `force` means nothing here, and there is no dirty or unmerged check:
+        // the work is in the user's own checkout and none of it is deleted.
+        close_in_place(d, &ws).await?;
+        gates().lock().remove(id);
+        return Ok(Empty {});
+    }
     // `layout_for` asks the source repository where its git directory is, so a
     // repository the user has since deleted or moved fails here. Without the
     // `force` escape that failure is permanent: the registry entry can never be
@@ -765,9 +929,13 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
                 if !layout.worktree_gitdir().join("HEAD").is_file() {
                     return Ok(true);
                 }
+                // `IGNORE_SUBMODULES`: see there.
                 Ok(!layout
                     .worktree_git()
-                    .run(&ws.worktree_path, &["status", "--porcelain"])
+                    .run(
+                        &ws.worktree_path,
+                        &["status", "--porcelain", IGNORE_SUBMODULES],
+                    )
                     .await?
                     .stdout
                     .trim()
@@ -868,6 +1036,33 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
     Ok(Empty {})
 }
 
+/// `workspace.destroy` for an in-place workspace: everything that runs in its
+/// sandbox stops, the daemon's own directories and records for it go, and the
+/// checkout is left exactly as it was. Never `worktree::remove`, never a
+/// branch, never a write to the repository beyond taking back what
+/// [`InPlaceLayout::prepare`] put there.
+async fn close_in_place(d: &Daemon, ws: &Workspace) -> Result<(), RpcError> {
+    let id = &ws.id;
+    d.set_state(id, WorkspaceState::Destroying).await?;
+    d.watchers.disable(id);
+    tear_down_sandbox(d, id).await;
+    {
+        // The same lock every other write to this repository takes.
+        let repo_lock = crate::git::repo_lock(&ws.repo_path);
+        let _repo_guard = repo_lock.lock().await;
+        InPlaceLayout::new(&ws.worktree_path, &d.dirs.no_hooks())
+            .release(&d.dirs.in_place_record(id));
+    }
+    d.agents.forget_workspace(id);
+    // `remove_workspace` removes `<data>/worktrees/<id>`, never `worktree_path`.
+    d.dirs.remove_workspace(id);
+    d.registry
+        .remove(id)
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?;
+    Ok(())
+}
+
 /// Says that a workspace's worktree had to be re-registered.
 ///
 /// Worth more than a log line: the repair worked, but whatever pruned the
@@ -902,6 +1097,25 @@ fn report_repaired(d: &Daemon, ws: &Workspace) {
 /// a bare `No such file or directory` from deep inside `start_sandbox` is what
 /// this replaced. The code stays that of the underlying failure.
 async fn bring_up(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcError> {
+    match ws.kind {
+        // No worktree to repair and no registration to put back: only the
+        // checkout itself has to still be there.
+        WorkspaceKind::InPlace => {
+            InPlaceLayout::new(&ws.worktree_path, &d.dirs.no_hooks()).check_repository()?
+        }
+        WorkspaceKind::Worktree => worktree_bring_up(d, ws).await?,
+    }
+    start_sandbox(d, ws).await.map_err(|e| {
+        RpcError::new(
+            e.code,
+            format!("The sandbox could not be started: {}", e.message),
+        )
+    })
+}
+
+/// [`bring_up`]'s checks for a worktree workspace: the directory is there and
+/// the repository lists it, re-registered when it can be.
+async fn worktree_bring_up(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcError> {
     if !ws.worktree_path.is_dir() {
         return Err(RpcError::new(
             ErrorCode::IoError,
@@ -924,12 +1138,7 @@ async fn bring_up(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcError> {
     if worktree::ensure_registered(&layout).await? == worktree::Registration::Repaired {
         report_repaired(d, ws);
     }
-    start_sandbox(d, ws).await.map_err(|e| {
-        RpcError::new(
-            e.code,
-            format!("The sandbox could not be started: {}", e.message),
-        )
-    })
+    Ok(())
 }
 
 /// One workspace's gate: held by whichever of restore, restart and destroy is
@@ -1006,17 +1215,22 @@ pub async fn restore(d: &Arc<Daemon>, entry: RestoreEntry) {
         tracing::debug!(ws = %id, "restore skipped: the workspace was restarted or destroyed meanwhile");
         return;
     }
+    // What the IDE calls taking a workspace away, which for an in-place one
+    // deletes nothing.
+    let verb = if ws.kind == WorkspaceKind::InPlace {
+        "Close"
+    } else {
+        "Remove"
+    };
     let state = match ws.state {
-        WorkspaceState::Creating => WorkspaceState::Error(
-            "Creating this workspace was interrupted when the daemon stopped. Remove the \
+        WorkspaceState::Creating => WorkspaceState::Error(format!(
+            "Creating this workspace was interrupted when the daemon stopped. {verb} the \
              workspace to clean up."
-                .into(),
-        ),
-        WorkspaceState::Destroying => WorkspaceState::Error(
-            "Removing this workspace was interrupted when the daemon stopped. Remove the \
+        )),
+        WorkspaceState::Destroying => WorkspaceState::Error(format!(
+            "Removing this workspace was interrupted when the daemon stopped. {verb} the \
              workspace again to finish."
-                .into(),
-        ),
+        )),
         WorkspaceState::Ready | WorkspaceState::SandboxDown | WorkspaceState::Error(_) => {
             // A sandbox already registered is not this restore's to leak.
             tear_down_sandbox(d, &id).await;
@@ -1111,14 +1325,23 @@ pub async fn restart(d: &Arc<Daemon>, id: &WorkspaceId) -> Result<WorkspaceInfo,
 
 pub async fn status(d: &Daemon, id: &WorkspaceId) -> Result<WorkspaceStatusResult, RpcError> {
     let ws = d.workspace(id)?;
-    let layout = layout_for(d, &ws).await?;
-    // `worktree_git`, not `daemon_git`: the worktree is agent-writable, so git
-    // must not be allowed to discover its repository (and its config) from it.
-    let out = layout
-        .worktree_git()
+    // Both pin git's discovery (`worktree_git`, not `daemon_git`): the tree is
+    // agent-writable either way, so git must not be allowed to find its
+    // repository (and its config) from it.
+    let git = match ws.kind {
+        WorkspaceKind::InPlace => InPlaceLayout::new(&ws.worktree_path, &d.dirs.no_hooks()).git(),
+        WorkspaceKind::Worktree => layout_for(d, &ws).await?.worktree_git(),
+    };
+    // `IGNORE_SUBMODULES`: see there.
+    let out = git
         .run(
             &ws.worktree_path,
-            &["status", "--porcelain=v2", "--untracked-files=all"],
+            &[
+                "status",
+                "--porcelain=v2",
+                "--untracked-files=all",
+                IGNORE_SUBMODULES,
+            ],
         )
         .await?;
     Ok(WorkspaceStatusResult {
