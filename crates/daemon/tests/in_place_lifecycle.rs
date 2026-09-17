@@ -454,6 +454,148 @@ async fn removing_a_worktree_workspace_keeps_the_worktrees_directory() {
     cancel.cancel();
 }
 
+/// A sandbox that calls itself `linux_bwrap`, so the protection watcher runs,
+/// over the no-sandbox backend. The first time the watcher asks for its pid it
+/// dies, and answers only once `watch_sandbox` has taken it out of the
+/// registry: the watcher then checks a sandbox that is already gone, every
+/// time, rather than once in a scheduler's while.
+mod dying {
+    use super::*;
+    use async_trait::async_trait;
+    use bondsymphonic_daemon::sandbox::{
+        SandboxBackend, SandboxChild, SandboxCommand, SandboxSpec,
+    };
+    use bondsymphonic_daemon::workspace::in_place;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{OnceLock, Weak};
+
+    type DaemonCell = Arc<OnceLock<Weak<Daemon>>>;
+
+    /// Set once the dying sandbox was out of the registry before its pid was
+    /// answered, which is the order the test is about.
+    static GONE_BEFORE_ANSWER: AtomicBool = AtomicBool::new(false);
+
+    struct DyingBackend {
+        daemon: DaemonCell,
+    }
+
+    struct DyingHandle {
+        inner: Arc<dyn SandboxHandle>,
+        id: WorkspaceId,
+        died: tokio::sync::watch::Sender<bool>,
+        dead: AtomicBool,
+        daemon: DaemonCell,
+    }
+
+    #[async_trait]
+    impl SandboxBackend for DyingBackend {
+        fn name(&self) -> &'static str {
+            "linux_bwrap"
+        }
+        async fn check(&self) -> Vec<PrereqStatus> {
+            Vec::new()
+        }
+        async fn start(&self, spec: &SandboxSpec) -> Result<Arc<dyn SandboxHandle>, RpcError> {
+            Ok(Arc::new(DyingHandle {
+                inner: backend_for("noop").start(spec).await?,
+                id: spec.id.clone(),
+                died: tokio::sync::watch::channel(false).0,
+                dead: AtomicBool::new(false),
+                daemon: self.daemon.clone(),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl SandboxHandle for DyingHandle {
+        async fn spawn(&self, cmd: SandboxCommand) -> Result<SandboxChild, RpcError> {
+            self.inner.spawn(cmd).await
+        }
+        async fn shutdown(&self) -> Result<(), RpcError> {
+            self.inner.shutdown().await
+        }
+        fn helper_exe(&self) -> PathBuf {
+            self.inner.helper_exe()
+        }
+        fn died(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+            Some(self.died.subscribe())
+        }
+        fn host_pid(&self) -> Option<u32> {
+            if !self.dead.swap(true, Ordering::SeqCst) {
+                let _ = self.died.send(true);
+                // `block_in_place` hands this worker's queued tasks -- the
+                // woken `watch_sandbox` among them -- to another worker while
+                // this one waits.
+                let daemon = self.daemon.get().and_then(Weak::upgrade).unwrap();
+                tokio::task::block_in_place(|| {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while daemon.sandboxes.lock().contains_key(&self.id) {
+                        if std::time::Instant::now() > deadline {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    GONE_BEFORE_ANSWER.store(true, Ordering::SeqCst);
+                });
+            }
+            None
+        }
+    }
+
+    /// A sandbox that dies on its own is `SandboxDown`, and the watcher that
+    /// finds its mount table gone says nothing about replaced files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sandbox_that_dies_is_down_not_breached() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = common::init_repo(dir.path());
+        let cell: DaemonCell = Arc::default();
+        let bus = EventBus::new(256);
+        let mut events = bus.subscribe();
+        let daemon = Daemon::new(
+            DataDirs::new(dir.path().join("data")),
+            Arc::new(DyingBackend {
+                daemon: cell.clone(),
+            }),
+            bus,
+        )
+        .unwrap();
+        cell.set(Arc::downgrade(&daemon)).unwrap();
+        let ws = lifecycle::create(&daemon, params(&repo, "dying"))
+            .await
+            .unwrap();
+        assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while daemon.registry.get(&ws.id).unwrap().state != WorkspaceState::SandboxDown {
+            assert!(std::time::Instant::now() < deadline, "never SandboxDown");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Long enough for the watcher to finish its check and its look under
+        // the gate.
+        tokio::time::sleep(in_place::PROTECTION_POLL * 3).await;
+        assert!(
+            GONE_BEFORE_ANSWER.load(Ordering::SeqCst),
+            "the watcher never asked a dead sandbox for its pid"
+        );
+        assert_eq!(
+            daemon.registry.get(&ws.id).unwrap().state,
+            WorkspaceState::SandboxDown
+        );
+        while let Ok(msg) = events.try_recv() {
+            if let ServerMessage::Event {
+                event: Event::DaemonLog { message, .. },
+                ..
+            } = msg
+            {
+                assert!(
+                    !message.contains("Git files") && !message.contains("worktree was removed"),
+                    "a breach was reported for a sandbox that died: {message}"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod bwrap {
     use super::*;
