@@ -194,6 +194,11 @@ crate.
   `{ok, conflicts[]}`
 - `workspace.create_pr {workspace_id, title, body, draft}` → `{url}`
 - `workspace.set_allowlist {workspace_id, hosts[]}`
+- `workspace.restart {workspace_id}` → `WorkspaceInfo`. Restarts the sandbox of
+  a `Ready`, `SandboxDown` or `Error` workspace, re-registering a pruned
+  worktree when it safely can. Refused while the workspace is `Creating` or
+  `Destroying`. On failure the workspace is left `Error(reason)` and the error
+  carries the same reason.
 
 **fs** (paths are always relative to the worktree root; `..` is rejected)
 - `fs.list_dir {workspace_id, path}` → entries with type, size, git status

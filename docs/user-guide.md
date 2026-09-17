@@ -372,6 +372,44 @@ them.
 
 ---
 
+## When a workspace cannot run
+
+A tab reading ⏸ or ✕, with the reason in its tooltip, is a workspace whose
+sandbox is not running. Its pane has a red banner at the top saying what
+happened:
+
+- *The sandbox for this workspace is not running* — it stopped unexpectedly
+  while the IDE was open. The worktree and the conversation are kept.
+- *This workspace could not be started* — the daemon could not bring it back,
+  for example after a restart; the line under it names the reason, such as a
+  worktree whose git registration had gone missing (see Troubleshooting).
+
+The banner offers two buttons:
+
+- **Retry** starts the workspace's sandbox again. It reads *Retrying…* while
+  it works, and both buttons are disabled until the daemon answers. If it
+  succeeds the banner goes away and, if the workspace's agent needs one, a new
+  agent is started resuming the same conversation. If it fails, the banner
+  shows the new reason and you can retry once the cause is fixed.
+- **Remove workspace…** asks the same question as **Destroy workspace…** on
+  the Workspace menu and the tab's own menu — *Destroy workspace "\<name\>"? Its
+  sandbox and worktree are removed.*, with a **Force (discard changes)** box
+  you can tick up front. Left unticked, and the daemon cannot tell the
+  workspace is clean — which happens exactly when its worktree's git
+  registration is the thing that went missing — you are asked once more:
+  *Workspace "\<name\>" may have uncommitted changes[, and has commits that are
+  not merged into its base branch]. Remove it anyway?* **Remove anyway**
+  discards them and deletes the workspace's branch, with any commits only it
+  has.
+
+While a workspace cannot run, its prompt box says so instead of offering to
+send a message, and the model and permission-mode dropdowns are unavailable,
+since choosing one would restart an agent with no sandbox to restart it in.
+Your worktree and branch are untouched either way — Retry is what brings them
+back.
+
+---
+
 ## Terminal tabs
 
 A Terminal workspace's pane runs a shell inside that workspace's sandbox. So
@@ -674,6 +712,19 @@ wsl -d bondsymphonic -- pgrep -a -f bondsymphonic-daemon
 
 A leftover `daemon.lock` file means nothing on its own — the lock is released by
 the operating system whenever the process ends, however it ends.
+
+**A workspace's worktree disappeared on its own.** Every workspace worktree is
+git-locked (`git worktree lock`) the moment it is created, specifically so that
+a git tool on the Windows side — which cannot see a worktree living under the
+WSL home, and so treats every one of them as stale — does not delete its
+registration with `git worktree prune`. Never run `git worktree prune` or
+`git worktree remove` on a BondSymphonic worktree by hand; the directory and
+the branch are not what "prune" removes anyway, only the bookkeeping that
+makes git recognise the directory as a worktree at all. If one is pruned
+despite the lock — or the daemon is stopped mid-write and leaves the
+registration half built — its tab shows the reason and a **Retry** button that
+puts the registration back, keeping uncommitted work as unstaged changes. See
+"When a workspace cannot run" above.
 
 **Sandbox failures.** The sandbox is bubblewrap. If the `bwrap` or `userns`
 check fails, unprivileged user namespaces are usually restricted:

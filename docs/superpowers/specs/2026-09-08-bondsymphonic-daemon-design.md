@@ -187,7 +187,13 @@ workspace was being created.
    instead of failing (see below).
 2. Compute branch `bs/<name>/work`; fail with `Conflict` if it exists.
 3. Pre-create the writable ref directories (5.2).
-4. `git worktree add -b bs/<name>/work <worktree_path> <base_branch>`.
+4. `git worktree add -b bs/<name>/work <worktree_path> <base_branch>`, then
+   `git worktree lock --reason "BondSymphonic manages this worktree from WSL;
+   do not prune or remove it by hand"`. A git running on Windows cannot see a
+   worktree under the WSL home, so its `git worktree prune` would delete every
+   unlocked workspace registration; git skips a locked one when it prunes,
+   whichever side runs the prune. A failed lock unwinds the create like any
+   other post-add failure.
 5. Create `homes/<id>` seeded with Claude credentials (8.3) and `caches/<id>`.
 6. Build the `SandboxSpec` and start the sandbox supervisor (6).
 7. Persist to registry, emit `workspace.state`.
@@ -271,11 +277,40 @@ nothing to the index, so those files stay untracked.
 **Destroy**: stop agents, runs, PTYs; tear down sandbox; `git worktree remove
 --force`; `git branch -D bs/<name>/work`; delete `homes/`, `caches/`, transcripts;
 remove from registry. With `force=false`, refuse if the worktree has uncommitted
-changes or unmerged commits and return `Conflict` with details.
+changes or unmerged commits and return `Conflict` with details. A worktree whose
+registration the repository has lost track of counts as dirty too: nothing can
+be read from it to say otherwise, so the refusal errs toward asking rather than
+toward destroying something that might have held work.
+
+**Restart** (`workspace.restart`) is refused while the workspace is `Creating`
+or `Destroying`, naming which. Otherwise it stops runs, agents (each announced
+`Exited`; records and transcripts kept) and PTYs, removes the sandbox handle
+from the live map *before* shutting it down (so its death watcher, which only
+acts on a handle that is still its own, stays quiet), stops the proxy, and then
+brings the workspace up exactly like a restore, repairing a pruned worktree the
+same way `restore` does. It answers `WorkspaceInfo` (`Ready`) on success, or
+leaves the workspace `Error(reason)` and returns an `RpcError` carrying the same
+sentence. It is allowed from `Ready` (a plain sandbox restart), `SandboxDown`
+and `Error`. Restart repairs a sandbox at runtime; the client restarts or
+resumes the workspace's agents itself once it answers, since `workspace.restart`
+stops them like any other teardown.
+
+**Restore, restart and destroy of one workspace are serialised by a
+per-workspace gate** — a mutex holding a count of the restarts and destroys
+that have run, taken before the per-repository lock everywhere. Without it the
+three interleave: a destroy landing while a restart is starting the sandbox
+would tear down before the new handle exists and the restart would then
+register a live sandbox for a workspace that is gone; a restart landing while
+the startup restore is bringing the same workspace up would start a second
+sandbox and drop the first one's handle with its processes still running. The
+startup restore works from a list of workspaces and gate counts taken before
+the server accepts its first connection, and skips a workspace whose count has
+since changed — a restart or a destroy already reached it.
 
 **Removing a worktree is a fixed sequence, not a reading of git's prose.**
-`worktree::remove` runs `worktree unlock` (whose failure is not news — most
-worktrees were never locked, and a locked one makes `worktree remove --force`
+`worktree::remove` runs `worktree unlock` (whose failure is not news — every
+workspace worktree is locked by `create`, above, and a user may lock one too,
+and a locked worktree makes `worktree remove --force`
 refuse outright *and* makes `prune` skip the registration), then `worktree
 remove --force`, then a `remove_dir_all` of whatever is left with a retry for
 Windows sharing violations, then `worktree prune`, then the branch step. Each
@@ -297,9 +332,30 @@ afterwards on Unix. The unique name matters as much as the rename: one fixed
 `<file>.tmp` is shared by every writer and by every earlier run of the daemon, so
 two saves at once can rename each other's half-written file into place, and one
 leftover at that name wedges the writer for good.
-On startup, each registered workspace is validated: if the worktree directory or
-the branch is gone, the workspace is marked `Error` rather than deleted, so the
-user can decide.
+On startup, each registered workspace is brought up by `lifecycle::restore`,
+from a snapshot of the registry and the per-workspace gates (see the Restart
+paragraph above) taken before the server accepts its first connection, so no
+client request can race it:
+- A workspace persisted as `Creating` or `Destroying` is not brought up; it
+  becomes `Error` saying that operation was interrupted when the daemon
+  stopped and to remove the workspace (again, if it was being removed) to
+  clean up.
+- Otherwise the worktree directory must exist, and the repository must still
+  list the worktree. An intact registration is locked if it is not already. A
+  registration that has `HEAD`, `commondir` and `gitdir` but no `index` — a
+  rebuild cut short — gets its index rebuilt from `HEAD` alone. A registration
+  with some but not all of those three files — an even earlier cut-short — is
+  removed and rebuilt from scratch, which happens only when the directory's
+  `.git` still points at exactly that registration and the branch exists and
+  is checked out nowhere else. Uncommitted work survives as unstaged changes;
+  anything staged does not. A repair either way is announced with a
+  `daemon.log` Warn on the workspace, starting "Re-registered this workspace's
+  worktree".
+- The sandbox is then started.
+
+Any failure leaves the workspace in `Error(<a sentence saying what is wrong and
+what to do>)`, never a bare `SandboxDown`, and nothing is deleted, so the user
+can decide. `SandboxDown` is reserved for a sandbox that dies while running.
 
 ## 5. Git
 
