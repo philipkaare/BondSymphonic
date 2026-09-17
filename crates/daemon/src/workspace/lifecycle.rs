@@ -489,6 +489,30 @@ fn watch_sandbox(
 /// restart's teardown would be, under the workspace's gate: the agents are
 /// announced as exited and the workspace goes to `Error` until Retry, which
 /// prepares and snapshots again.
+/// The workspace whose next protection check should panic. **A test hook, and
+/// nothing outside a test ever writes it.**
+///
+/// It exists because the fail-closed arm below cannot be reached any other way:
+/// nothing a repository can contain makes [`in_place::ProtectedSnapshot::check`]
+/// panic, and an untested fail-closed path in a security control is how
+/// fail-open gets put back by the next person to touch it. Keyed by workspace
+/// so that two tests in one binary cannot take each other's. Writing it needs
+/// code running in the daemon's own process, and what it does there is stop an
+/// agent rather than free one.
+#[doc(hidden)]
+pub static PANIC_IN_PROTECTION_CHECK_FOR: parking_lot::Mutex<Option<WorkspaceId>> =
+    parking_lot::Mutex::new(None);
+
+/// Whether [`PANIC_IN_PROTECTION_CHECK_FOR`] names `id`, taking it if it does.
+fn panic_hook_takes(id: &WorkspaceId) -> bool {
+    let mut asked = PANIC_IN_PROTECTION_CHECK_FOR.lock();
+    if asked.as_ref() == Some(id) {
+        *asked = None;
+        return true;
+    }
+    false
+}
+
 fn watch_protection(
     d: &Arc<Daemon>,
     id: &WorkspaceId,
@@ -526,7 +550,11 @@ fn watch_protection(
             // Windows.
             let check = {
                 let snapshot = snapshot.clone();
-                tokio::task::spawn_blocking(move || snapshot.check(Some(pid)))
+                let asked_to_fail = panic_hook_takes(&id);
+                tokio::task::spawn_blocking(move || {
+                    assert!(!asked_to_fail, "a test asked this check to fail");
+                    snapshot.check(Some(pid))
+                })
             };
             match check.await {
                 Ok(Some(breach)) => break Some(breach),

@@ -86,9 +86,15 @@ pub struct RepoInfo {
     #[serde(default)]
     pub in_place_refusal: Option<String>,
     /// The repository's effective `core.hooksPath`, relative to the root, when
-    /// it resolves to a directory inside the working tree (husky does this):
-    /// hooks there are files an in-place agent can edit and the user's own git
-    /// runs. `None` otherwise.
+    /// the programs it names are ones an in-place agent could write: hooks the
+    /// agent can edit and the user's own git then runs. `None` otherwise.
+    ///
+    /// That is the whole working tree (`.husky/_`, which husky does), and also
+    /// anything under `.git` except the six directories the sandbox binds
+    /// read-only — `hooks`, `info`, `modules`, `worktrees`, `remotes`,
+    /// `branches` — so `.git/my-hooks` is reported and `.git/hooks` is not.
+    /// A path outside the repository root is the user's own and is never
+    /// reported.
     #[serde(default)]
     pub hooks_path_in_tree: Option<String>,
 }

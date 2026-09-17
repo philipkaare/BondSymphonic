@@ -629,6 +629,184 @@ mod dying {
     }
 }
 
+/// The ordering the test above deliberately avoids, and the one that used to
+/// report an ordinary crash as tampering.
+///
+/// The sandbox is dead -- no pid, so the check finds nothing of its mount table
+/// and reads every protected entry as unbound -- and `watch_sandbox` has *not*
+/// got there yet, so the handle is still the registered one and the watcher's
+/// look under the gate still sees itself as current. The only thing left that
+/// can tell an OOM kill from tampering is asking the handle whether it died.
+///
+/// `watch_sandbox` is kept out of the way by answering its one `died()` call
+/// with `None`, which is what a backend with no independent life answers and
+/// which makes that watcher return without ever removing the handle.
+mod dying_unnoticed {
+    use super::*;
+    use async_trait::async_trait;
+    use bondsymphonic_daemon::sandbox::{
+        SandboxBackend, SandboxChild, SandboxCommand, SandboxSpec,
+    };
+    use bondsymphonic_daemon::workspace::in_place;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A backend calling itself `linux_bwrap`, so the protection watcher runs
+    /// at all, over the no-sandbox backend. `dead` decides whether its
+    /// sandboxes are already gone.
+    struct Backend {
+        dead: bool,
+    }
+
+    struct Handle {
+        inner: Arc<dyn SandboxHandle>,
+        died: tokio::sync::watch::Sender<bool>,
+        dead: bool,
+        asked: AtomicBool,
+    }
+
+    #[async_trait]
+    impl SandboxBackend for Backend {
+        fn name(&self) -> &'static str {
+            "linux_bwrap"
+        }
+        async fn check(&self) -> Vec<PrereqStatus> {
+            Vec::new()
+        }
+        async fn start(&self, spec: &SandboxSpec) -> Result<Arc<dyn SandboxHandle>, RpcError> {
+            Ok(Arc::new(Handle {
+                inner: backend_for("noop").start(spec).await?,
+                died: tokio::sync::watch::channel(self.dead).0,
+                dead: self.dead,
+                asked: AtomicBool::new(false),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl SandboxHandle for Handle {
+        async fn spawn(&self, cmd: SandboxCommand) -> Result<SandboxChild, RpcError> {
+            self.inner.spawn(cmd).await
+        }
+        async fn shutdown(&self) -> Result<(), RpcError> {
+            self.inner.shutdown().await
+        }
+        fn helper_exe(&self) -> PathBuf {
+            self.inner.helper_exe()
+        }
+        fn died(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+            if !self.dead || self.asked.swap(true, Ordering::SeqCst) {
+                Some(self.died.subscribe())
+            } else {
+                // `watch_sandbox`'s one call, which it takes as "this backend's
+                // sandboxes cannot die on their own" and returns on -- leaving
+                // the handle registered, which is the ordering under test.
+                None
+            }
+        }
+        fn host_pid(&self) -> Option<u32> {
+            // A live sandbox answers with this process, whose `mountinfo` is
+            // readable; a dead one has no pid, which is what makes the check
+            // read every protected entry as unbound.
+            (!self.dead).then(std::process::id)
+        }
+    }
+
+    /// The state polling this test's helpers do, with a deadline loose enough
+    /// for a machine running the rest of the suite beside them.
+    async fn wait_for_state(daemon: &Daemon, ws: &WorkspaceId, state: &WorkspaceState) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while daemon.registry.get(ws).unwrap().state != *state {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "still {:?}",
+                daemon.registry.get(ws).unwrap().state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_sandbox_the_watcher_still_owns_is_not_a_breach() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = common::init_repo(dir.path());
+        let bus = EventBus::new(256);
+        let mut events = bus.subscribe();
+        let daemon = Daemon::new(
+            DataDirs::new(dir.path().join("data")),
+            Arc::new(Backend { dead: true }),
+            bus,
+        )
+        .unwrap();
+        let ws = lifecycle::create(&daemon, params(&repo, "quiet"))
+            .await
+            .unwrap();
+        assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+        // The handle nobody removed is still the registered one, so every poll
+        // reaches the look under the gate.
+        assert!(daemon.sandbox(&ws.id).is_ok());
+
+        tokio::time::sleep(in_place::PROTECTION_POLL * 6).await;
+
+        assert_eq!(
+            daemon.registry.get(&ws.id).unwrap().state,
+            WorkspaceState::Ready,
+            "a dead sandbox was reported as tampering"
+        );
+        while let Ok(msg) = events.try_recv() {
+            if let ServerMessage::Event {
+                event: Event::DaemonLog { message, .. },
+                ..
+            } = msg
+            {
+                assert!(
+                    !message.contains("Git files") && !message.contains("could not be made"),
+                    "a breach was reported for a sandbox that died: {message}"
+                );
+            }
+        }
+    }
+
+    /// A check that panics must take the sandbox down with it. Returning
+    /// instead left an agent running with nothing watching the git files it
+    /// could reach, for as long as the workspace lived.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_check_that_panics_stops_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = common::init_repo(dir.path());
+        let daemon = Daemon::new(
+            DataDirs::new(dir.path().join("data")),
+            Arc::new(Backend { dead: false }),
+            EventBus::new(256),
+        )
+        .unwrap();
+        let ws = lifecycle::create(&daemon, params(&repo, "panicky"))
+            .await
+            .unwrap();
+        assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+
+        *lifecycle::PANIC_IN_PROTECTION_CHECK_FOR.lock() = Some(ws.id.clone());
+
+        let expected = WorkspaceState::Error(
+            "The check that keeps this workspace's git files safe from the agent could not be \
+             made, so its sandbox was stopped. Press Retry."
+                .into(),
+        );
+        wait_for_state(&daemon, &ws.id, &expected).await;
+        assert!(
+            daemon.sandbox(&ws.id).is_err(),
+            "the sandbox was left running with nothing watching it"
+        );
+        // Taken rather than left standing, so the Retry below gets a working
+        // check.
+        assert!(lifecycle::PANIC_IN_PROTECTION_CHECK_FOR.lock().is_none());
+        assert_eq!(
+            lifecycle::restart(&daemon, &ws.id).await.unwrap().state,
+            WorkspaceState::Ready
+        );
+        lifecycle::destroy(&daemon, &ws.id, false).await.unwrap();
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod bwrap {
     use super::*;

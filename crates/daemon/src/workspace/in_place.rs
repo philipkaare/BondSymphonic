@@ -971,7 +971,7 @@ impl ProtectedSnapshot {
     /// A few dozen `lstat` calls and the reads of the covered set, which is a
     /// few dozen kilobytes of small files. Measured on the largest `/mnt/c`
     /// repository to hand (BondSymphonic itself, fourteen hooks and two
-    /// worktree registrations): about 56 ms a poll, against a
+    /// worktree registrations): 71 to 117 ms a poll, against a
     /// [`PROTECTION_POLL`] of 250 ms, and the caps
     /// ([`COVERED_CAP`]) keep a pathological repository from making it
     /// unbounded. Looking from the host side also makes a DrvFs mount
@@ -1063,6 +1063,11 @@ fn mount_points(mountinfo: &str) -> std::collections::HashSet<PathBuf> {
 
 /// The kernel writes space, tab, newline and backslash in a mount point as
 /// `\ooo` octal escapes.
+///
+/// Three octal digits reach 511, which is not a byte. The kernel never writes
+/// such a sequence, but this runs inside the protection poll, and a poll that
+/// panics now stops the user's agent -- so a sequence that is not a byte is
+/// left as the text it is rather than arithmetic that overflows.
 fn unescape_mount_field(field: &str) -> String {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -1070,10 +1075,16 @@ fn unescape_mount_field(field: &str) -> String {
     while i < bytes.len() {
         let octal = bytes
             .get(i + 1..i + 4)
-            .filter(|d| bytes[i] == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)));
+            .filter(|d| bytes[i] == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)))
+            .and_then(|d| {
+                let value = u32::from(d[0] - b'0') * 64
+                    + u32::from(d[1] - b'0') * 8
+                    + u32::from(d[2] - b'0');
+                u8::try_from(value).ok()
+            });
         match octal {
-            Some(d) => {
-                out.push((d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0'));
+            Some(byte) => {
+                out.push(byte);
                 i += 4;
             }
             None => {

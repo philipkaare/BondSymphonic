@@ -7,7 +7,7 @@
 mod common;
 
 use bondsymphonic_daemon::git::repo::RepoKind;
-use bondsymphonic_daemon::workspace::in_place::{self, InPlaceLayout, ProtectedSnapshot};
+use bondsymphonic_daemon::workspace::in_place::{self, InPlaceLayout};
 use bondsymphonic_proto::ErrorCode;
 use std::path::{Path, PathBuf};
 
@@ -58,6 +58,9 @@ fn drvfs_tempdir() -> Option<tempfile::TempDir> {
 
 /// Rewrites a file without replacing it: the same inode, the same mount,
 /// which is how a Windows drive's aliases and a user's editor both write.
+///
+/// Only the bubblewrap tests write this way, and those are Linux-only.
+#[cfg(target_os = "linux")]
 fn write_in_place(path: &Path, bytes: &[u8]) {
     use std::io::Write;
     std::fs::OpenOptions::new()
@@ -961,7 +964,7 @@ mod bwrap {
     async fn sandbox_over(
         dir: &Path,
         l: &InPlaceLayout,
-    ) -> (Arc<dyn SandboxHandle>, ProtectedSnapshot) {
+    ) -> (Arc<dyn SandboxHandle>, in_place::ProtectedSnapshot) {
         l.prepare(&ws_id(), &record(dir)).unwrap();
         let snapshot = l.snapshot().unwrap();
         let data = dir.join("data");
