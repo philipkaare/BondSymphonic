@@ -1213,6 +1213,15 @@ void MainWindow::onAgentExited(const QString& agentId, const QString& state,
     // reporting itself as a working agent, and the difference between "it came
     // back" and "it has died eleven times" is the thing the user most needs to
     // see.
+    // A stop the user's own Retry asked for. `onWorkspaceRestarted` starts the
+    // agent again; a failed Retry leaves the workspace's banner, whose Retry is
+    // the way back for the agent too.
+    if (m_restarting.contains(workspaceId)) {
+        return;
+    }
+    if (menuTest().contains(QLatin1String("sandbox-banner"))) {
+        announceMenuTest("agent-stopped", workspaceId, detail);
+    }
     m_agentArea->showBanner(workspaceId, QStringLiteral("The agent stopped."), detail, QString());
     // Said separately from the banner, because they are different facts. The
     // banner reports the latest failure; this reports that the agent is down,
@@ -1357,6 +1366,7 @@ void MainWindow::onRetryWorkspace(const QString& workspaceId) {
     if (menuTest().contains(QLatin1String("sandbox-retry"))) {
         announceMenuTest("sandbox-retry", workspaceId, QString());
     }
+    m_restarting.insert(workspaceId);
     m_agentArea->setRetrying(workspaceId, true);
     m_controller->restartWorkspace(workspaceId);
 }
@@ -1364,6 +1374,7 @@ void MainWindow::onRetryWorkspace(const QString& workspaceId) {
 void MainWindow::onWorkspaceRestarted(const QString& workspaceId, const QString& infoJson) {
     // Applying the answer is what takes the banner down: the model change it
     // provokes finds the workspace without a problem.
+    m_restarting.remove(workspaceId);
     m_groupModel->applyWorkspaceInfo(infoJson);
     m_agentArea->setRetrying(workspaceId, false);
     // Unlike the automatic start this includes an agent that had ended -- the
@@ -1730,6 +1741,7 @@ void MainWindow::onWorkspaceOpFailed(const QString& workspaceId, const QString& 
         // workspace failed with this very sentence as its reason, and the
         // banner that asked is the one that shows it, with Retry pressable
         // again.
+        m_restarting.remove(workspaceId);
         m_groupModel->noteRestartFailed(workspaceId, message);
         m_agentArea->setRetrying(workspaceId, false);
         qWarning("workspace restart failed for %s: %s", qUtf8Printable(workspaceId),
@@ -1931,6 +1943,7 @@ void MainWindow::updateCostLabel() {
 }
 
 void MainWindow::onWorkspaceDestroyed(const QString& workspaceId) {
+    m_restarting.remove(workspaceId);
     // Panes first: the model change that follows re-selects a surviving tab,
     // and the areas must no longer hold the dead one when it does. The editor
     // tabs go with them: there is nothing left to save the file to.

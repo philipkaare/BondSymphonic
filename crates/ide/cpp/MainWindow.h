@@ -324,6 +324,12 @@ private:
     /// What each workspace's banner is showing as its problem, title and
     /// detail joined, so a sync only touches the ones that changed.
     QHash<QString, QString> m_workspaceProblems;
+    /// Workspaces with a `workspace.restart` in flight. The daemon stops every
+    /// agent in the workspace before it restarts the sandbox, and the `exited`
+    /// those stops report is the Retry at work rather than a crash: it must not
+    /// raise "The agent stopped." over a workspace that is coming back, whose
+    /// agent the answer starts again anyway.
+    QSet<QString> m_restarting;
     /// The banner buttons the seam has already pressed, by step and workspace.
     QSet<QString> m_bannerTestPressed;
     /// Adds one Edit menu item forwarding to the current editor's view, and

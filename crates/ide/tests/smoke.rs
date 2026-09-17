@@ -2326,6 +2326,13 @@ mod sandbox_retry {
             "one start, not one per pass\n{}",
             run.context
         );
+        // The agents the restart stopped are the Retry at work, not a crash:
+        // no "The agent stopped." banner over a workspace that is coming back.
+        assert!(
+            run.line_index("BS_MENU_TEST agent-stopped").is_none(),
+            "the restart's own agent stop was reported as a failure\n{}",
+            run.context
+        );
     }
 
     #[test]
@@ -2583,6 +2590,28 @@ mod sandbox_retry {
                         Request::WorkspaceRestart(_) => match restart {
                             Restart::Works => {
                                 current = WorkspaceState::Ready;
+                                // What the daemon does on the way: every agent
+                                // in the workspace is stopped, and says so,
+                                // before the sandbox comes back and the answer
+                                // goes out.
+                                let ws = WorkspaceId(WORKSPACE.to_owned());
+                                let exited = ServerMessage::event(
+                                    Some(ws.clone()),
+                                    Event::AgentStateChanged {
+                                        agent_id: AgentId(OLD_AGENT.to_owned()),
+                                        state: AgentState::Exited,
+                                        detail: Some("stopped for a restart".to_owned()),
+                                    },
+                                );
+                                let ready = ServerMessage::event(
+                                    Some(ws),
+                                    Event::WorkspaceStateChanged {
+                                        info: Box::new(workspace(current.clone())),
+                                    },
+                                );
+                                for event in [exited, ready] {
+                                    let _ = w.write_all(codec::encode(&event).as_bytes()).await;
+                                }
                                 ServerMessage::ok(id, &workspace(current.clone()))
                             }
                             Restart::Refused => {
