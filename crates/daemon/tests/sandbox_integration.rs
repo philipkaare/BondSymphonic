@@ -1961,3 +1961,52 @@ async fn a_workspace_cannot_see_its_siblings_under_the_data_dir() {
         lifecycle::destroy(&daemon, id, true).await.unwrap();
     }
 }
+
+/// `workspace.restart` of a live bwrap workspace swaps the sandbox, and the
+/// death of the old one is not mistaken for the new one dying.
+///
+/// The old sandbox's `watch_sandbox` task sees its handle die a moment after
+/// the restart shut it down; if it still thought that handle was the
+/// workspace's, it would flip the restarted workspace to `SandboxDown` and
+/// stop the new proxy. So the state is checked again after that moment, and
+/// the new sandbox has to still run commands and still have its proxy socket.
+#[tokio::test]
+async fn a_restarted_bwrap_workspace_stays_ready_when_its_old_sandbox_dies() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (daemon, ws, _layout) = bwrap_workspace(dir.path(), &repo, "restarts").await;
+    let run_dir = daemon.dirs.run(&ws.id).to_string_lossy().into_owned();
+    let old_pids = pgrep_pids(&run_dir);
+    assert!(!old_pids.is_empty(), "no bwrap process for {run_dir}");
+
+    let info = lifecycle::restart(&daemon, &ws.id).await.unwrap();
+    assert_eq!(info.state, WorkspaceState::Ready);
+
+    wait_until(std::time::Duration::from_secs(5), || {
+        let now = pgrep_pids(&run_dir);
+        old_pids.iter().all(|p| !now.contains(p))
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        daemon.registry.get(&ws.id).unwrap().state,
+        WorkspaceState::Ready
+    );
+    let handle = daemon.sandbox(&ws.id).unwrap();
+    let (code, out) = run_in(&handle, "echo alive").await;
+    assert_eq!((code, out.trim()), (0, "alive"));
+    assert!(
+        daemon
+            .dirs
+            .run(&ws.id)
+            .join(lifecycle::PROXY_SOCKET_FILE)
+            .exists(),
+        "the restart lost the proxy socket"
+    );
+
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+}
