@@ -79,6 +79,28 @@ QString menuTest() {
     return qEnvironmentVariable("BS_MENU_TEST");
 }
 
+/// The workspace a targeted seam step names, as `step=<workspace id>`, or empty
+/// when the step is not armed. **Test-only**, and the only way the banner
+/// steps and `destroy-yes` choose what to act on: they act on the workspace a
+/// fixture named and on nothing else, so a stray variable can never reach a
+/// workspace the run did not make.
+///
+/// `destroy-yes` sends real destroys, so it is additionally refused unless the
+/// run is pointed at a daemon of its own with `BS_DAEMON_ADDR`.
+QString menuTestTarget(const char* step) {
+    const QString name = QString::fromLatin1(step) + QLatin1Char('=');
+    if (qstrcmp(step, "destroy-yes") == 0 && qEnvironmentVariableIsEmpty("BS_DAEMON_ADDR")) {
+        return QString();
+    }
+    for (const QString& item : menuTest().split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+        const QString trimmed = item.trimmed();
+        if (trimmed.startsWith(name)) {
+            return trimmed.mid(name.size());
+        }
+    }
+    return QString();
+}
+
 /// How Qt's text formats are spelled in a test line. `QLabel`'s default is
 /// `AutoText`, which is what makes an unset format worth reporting at all.
 const char* textFormatWord(Qt::TextFormat format) {
@@ -727,6 +749,8 @@ void MainWindow::showWorkspaceError(const QString& workspaceId, const QString& t
     // The banner is on the workspace's own pane, and the tab's red glyph is
     // what says so from a group the user is not looking at. Both are needed:
     // one of them is only visible when that workspace is in front.
+    // A new failure replaces whatever the banner said, an agent stop included.
+    m_agentStopped.remove(workspaceId);
     m_agentArea->showBanner(workspaceId, title, detail, stderrText);
     m_groupModel->setWorkspaceError(workspaceId, detail.isEmpty() ? title : title + "\n" + detail);
 }
@@ -735,8 +759,15 @@ void MainWindow::clearWorkspaceError(const QString& workspaceId) {
     if (workspaceId.isEmpty()) {
         return;
     }
+    m_agentStopped.remove(workspaceId);
     m_agentArea->clearBanner(workspaceId);
     m_groupModel->clearWorkspaceError(workspaceId);
+}
+
+void MainWindow::clearAgentStopped(const QString& workspaceId) {
+    if (m_agentStopped.contains(workspaceId)) {
+        clearWorkspaceError(workspaceId);
+    }
 }
 
 void MainWindow::connectController() {
@@ -763,6 +794,7 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::workspacesListed, this,
                      [this](const QString& json) {
                          m_groupModel->reconcile(json);
+                         resumeUnansweredRestarts(true);
                          // After the reconcile, not the restore: the restore
                          // places the tabs the session file remembered, and it
                          // is this list -- the daemon's own answer -- that says
@@ -831,6 +863,7 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::workspaceChanged, this,
                      [this](const QString& info) {
                          m_groupModel->applyWorkspaceInfo(info);
+                         resumeUnansweredRestarts(false);
                          // A workspace whose sandbox has just come up is a
                          // workspace that can now take an agent. On a restore
                          // every one of them is still starting when the list
@@ -848,6 +881,8 @@ void MainWindow::connectController() {
                      &MainWindow::onWorkspaceRestarted);
     QObject::connect(m_controller, &AppController::workspaceDestroyRefused, this,
                      &MainWindow::onDestroyRefused);
+    QObject::connect(m_controller, &AppController::workspaceRestartFailed, this,
+                     &MainWindow::onWorkspaceRestartFailed);
     // A host the workspace's proxy refused. The queue is per workspace and
     // lives in the model, so one blocked while another tab is in front waits
     // there rather than being shown over the wrong workspace.
@@ -894,7 +929,11 @@ void MainWindow::connectController() {
                          // would kill the conversation it just resumed.
                          m_agentArea->setRestartOffered(workspaceId, false);
                          m_autoStarting.remove(workspaceId);
+                         // The banner that said it had stopped is out of date
+                         // the moment it is running again.
+                         clearAgentStopped(workspaceId);
                          rebindCost();
+                         reportAgentStartedForTest(workspaceId);
                      });
     // A transcript pane with no agent -- a restored session, or one whose agent
     // exited -- offers to start one. The options are the tab's own, so a
@@ -940,6 +979,7 @@ void MainWindow::connectController() {
     // what takes the red glyph off the tab.
     QObject::connect(m_agentArea, &AgentArea::bannerDismissed, this,
                      [this](const QString& workspaceId) {
+                         m_agentStopped.remove(workspaceId);
                          m_groupModel->clearWorkspaceError(workspaceId);
                      });
     QObject::connect(m_controller, &AppController::agentStateChanged, this,
@@ -1131,7 +1171,7 @@ void MainWindow::onDestroyRequested(const QString& workspaceId, const QString& w
     if (announceMenuTest("destroy", workspaceId, question)) {
         // `destroy-yes` answers Yes with Force unticked, which is what a user
         // who just presses Enter on the banner's Remove sends.
-        if (menuTest().contains(QLatin1String("destroy-yes"))) {
+        if (menuTestTarget("destroy-yes") == workspaceId) {
             m_controller->destroyWorkspace(workspaceId, false);
         }
         return;
@@ -1177,21 +1217,21 @@ void MainWindow::onDestroyRefused(const QString& workspaceId, bool dirty, bool u
         what.append(QStringLiteral("has commits that are not merged into its base branch"));
     }
     const QString question =
-        QStringLiteral("%1 %2. Remove it anyway? Its uncommitted changes are discarded and its "
+        QStringLiteral("%1 %2. Destroy it anyway? Its uncommitted changes are discarded and its "
                        "branch is deleted, with any commits only it has.")
             .arg(subject, what.join(QStringLiteral(" and ")));
     if (announceMenuTest("destroy-refused", workspaceId, question)) {
-        if (menuTest().contains(QLatin1String("destroy-yes"))) {
+        if (menuTestTarget("destroy-yes") == workspaceId) {
             m_controller->destroyWorkspace(workspaceId, true);
         }
         return;
     }
     QMessageBox box(this);
     box.setIcon(QMessageBox::Warning);
-    box.setWindowTitle(QStringLiteral("Remove workspace"));
+    box.setWindowTitle(QStringLiteral("Destroy workspace"));
     box.setText(question);
     QPushButton* remove =
-        box.addButton(QStringLiteral("Remove anyway"), QMessageBox::DestructiveRole);
+        box.addButton(QStringLiteral("Destroy anyway"), QMessageBox::DestructiveRole);
     box.addButton(QMessageBox::Cancel);
     box.setDefaultButton(QMessageBox::Cancel);
     box.exec();
@@ -1274,7 +1314,18 @@ void MainWindow::onAgentExited(const QString& agentId, const QString& state,
     // A stop the user's own Retry asked for. `onWorkspaceRestarted` starts the
     // agent again; a failed Retry leaves the workspace's banner, whose Retry is
     // the way back for the agent too.
-    if (m_restarting.contains(workspaceId)) {
+    //
+    // The same for a workspace whose sandbox is down or failed: the agent went
+    // with the sandbox, the workspace's banner already says so, and its Retry
+    // brings the agent back too. Either way the offer is recorded, so a
+    // workspace that comes back without its agent still has a Restart.
+    //
+    // And for one whose agent is being started again: the start was sent
+    // before this exit arrived -- events and answers travel apart -- so the
+    // agent that exited is the one being replaced.
+    if (m_restarting.contains(workspaceId) || m_workspaceProblems.contains(workspaceId) ||
+        m_autoStarting.contains(workspaceId)) {
+        m_agentArea->setRestartOffered(workspaceId, true);
         return;
     }
     if (menuTest().contains(QLatin1String("sandbox-banner"))) {
@@ -1287,6 +1338,7 @@ void MainWindow::onAgentExited(const QString& agentId, const QString& state,
     // together, a merge that failed over a still-dead agent would take the
     // user's only way back away with it.
     m_agentArea->setRestartOffered(workspaceId, true);
+    m_agentStopped.insert(workspaceId);
     m_groupModel->setWorkspaceError(workspaceId, detail.isEmpty()
                                                      ? QStringLiteral("The agent stopped.")
                                                      : QStringLiteral("The agent stopped.\n") + detail);
@@ -1374,6 +1426,11 @@ void MainWindow::syncWorkspaceProblems() {
             }
             m_workspaceProblems.insert(workspaceId, shown);
             m_agentArea->setWorkspaceProblem(workspaceId, title, detail);
+            // An agent that stopped just before its sandbox was reported down
+            // stopped because of it. The problem says so and its Retry brings
+            // the agent back, so "The agent stopped." and the red tab it
+            // brought are the same news told wrongly.
+            clearAgentStopped(workspaceId);
             if (report) {
                 announceMenuTest("sandbox-banner", workspaceId,
                                  title + QStringLiteral(" | ") + detail);
@@ -1394,15 +1451,16 @@ void MainWindow::syncWorkspaceProblems() {
 
 void MainWindow::pressBannerForTest(const QString& workspaceId, const char* step,
                                     const char* button) {
-    const QString name = QString::fromLatin1(step);
-    const QString key = name + QLatin1Char(' ') + workspaceId;
-    if (!menuTest().contains(name) || m_bannerTestPressed.contains(key)) {
+    const QString key = QString::fromLatin1(step) + QLatin1Char(' ') + workspaceId;
+    // Only the workspace the step names: see `menuTestTarget`.
+    if (workspaceId.isEmpty() || menuTestTarget(step) != workspaceId ||
+        m_bannerTestPressed.contains(key)) {
         return;
     }
     // After this turn, so the pane the model change is about to build is there.
-    // The banner's own button and nothing else: this is the workspace the
-    // fixture put in trouble, and a click anywhere wider could land on
-    // something the run never asked about.
+    // The banner is that workspace's own page's, and only its named button is
+    // pressed: a click anywhere wider could land on something the run never
+    // asked about.
     const QString objectName = QString::fromLatin1(button);
     QTimer::singleShot(0, this, [this, workspaceId, key, objectName] {
         WorkspaceBanner* banner = m_agentArea->banner(workspaceId);
@@ -1425,6 +1483,7 @@ void MainWindow::onRetryWorkspace(const QString& workspaceId) {
         announceMenuTest("sandbox-retry", workspaceId, QString());
     }
     m_restarting.insert(workspaceId);
+    m_restartUnanswered.remove(workspaceId);
     m_agentArea->setRetrying(workspaceId, true);
     m_controller->restartWorkspace(workspaceId);
 }
@@ -1433,12 +1492,77 @@ void MainWindow::onWorkspaceRestarted(const QString& workspaceId, const QString&
     // Applying the answer is what takes the banner down: the model change it
     // provokes finds the workspace without a problem.
     m_restarting.remove(workspaceId);
+    m_restartUnanswered.remove(workspaceId);
     m_groupModel->applyWorkspaceInfo(infoJson);
     m_agentArea->setRetrying(workspaceId, false);
+    resumeAgentAfterRestart(workspaceId);
+    startAgentsThatHaveNone();
+}
+
+void MainWindow::onWorkspaceRestartFailed(const QString& workspaceId, const QString& message,
+                                          int kind) {
+    // The `operationFailed` behind this is answered here, in the banner.
+    noteFailureRouted(message);
+    m_restarting.remove(workspaceId);
+    m_agentArea->setRetrying(workspaceId, false);
+    qWarning("workspace restart failed for %s: %s", qUtf8Printable(workspaceId),
+             qUtf8Printable(message));
+    // `RestartFailure` in the controller: 0 is the daemon's own reason.
+    if (kind == 0) {
+        m_groupModel->noteRestartFailed(workspaceId, message);
+        return;
+    }
+    // Anything else is about the request, not the workspace, whose banner
+    // keeps what it said. A refusal changed nothing; a timeout or a lost
+    // connection may have been a restart that worked, so the agent comes back
+    // when the workspace is next seen running.
+    const QString name = m_groupModel->workspaceName(workspaceId);
+    if (kind == 1) {
+        showOperationMessage(QStringLiteral("Could not retry \"%1\" yet: %2").arg(name, message),
+                             QString());
+        return;
+    }
+    const bool connectionLost = kind != 2;
+    m_restartUnanswered.insert(workspaceId, connectionLost);
+    showOperationMessage(
+        QStringLiteral("The daemon did not answer the retry of \"%1\" (%2). If the workspace "
+                       "stays down, press Retry again.")
+            .arg(name, message),
+        QString());
+    // A timeout on a live connection: the workspace may already read as
+    // running, and nothing else would notice.
+    if (!connectionLost) {
+        resumeUnansweredRestarts(false);
+    }
+}
+
+void MainWindow::resumeUnansweredRestarts(bool listed) {
+    const QList<QString> pending = m_restartUnanswered.keys();
+    for (const QString& workspaceId : pending) {
+        if (m_restartUnanswered.value(workspaceId) && !listed) {
+            continue;
+        }
+        const QJsonObject tab = tabFor(workspaceId);
+        if (tab.isEmpty()) {
+            m_restartUnanswered.remove(workspaceId);
+            continue;
+        }
+        if (!tab.value("workspace_problem").toObject().isEmpty() ||
+            tab.value("status").toString() == QLatin1String("Creating") ||
+            m_restarting.contains(workspaceId)) {
+            continue;
+        }
+        m_restartUnanswered.remove(workspaceId);
+        resumeAgentAfterRestart(workspaceId);
+    }
+}
+
+void MainWindow::resumeAgentAfterRestart(const QString& workspaceId) {
     // Unlike the automatic start this includes an agent that had ended -- the
-    // one a daemon restart leaves behind in every workspace -- because the user
-    // just asked for this workspace back and an agent is what it is for. Booked
-    // in the same set, so the pass below cannot ask for a second one.
+    // one a daemon restart leaves behind in every workspace, and the one the
+    // restart itself stops -- because the user asked for this workspace back
+    // and an agent is what it is for. Booked in the same set as the automatic
+    // start, so neither can ask for a second one.
     if (m_groupModel->agentNeedsStart(workspaceId) && !m_autoStarting.contains(workspaceId)) {
         m_autoStarting.insert(workspaceId);
         m_agentArea->setStarting(workspaceId, true);
@@ -1450,7 +1574,26 @@ void MainWindow::onWorkspaceRestarted(const QString& workspaceId, const QString&
                                     : model->restartOptionsJson();
         m_controller->startAgent(workspaceId, options);
     }
-    startAgentsThatHaveNone();
+}
+
+void MainWindow::reportAgentStartedForTest(const QString& workspaceId) {
+    if (!menuTest().contains(QLatin1String("sandbox-banner"))) {
+        return;
+    }
+    int status = -1;
+    for (int group = 0; group < m_groupModel->groupCount(); ++group) {
+        for (int tab = 0; tab < m_groupModel->tabCount(group); ++tab) {
+            if (m_groupModel->tabWorkspaceId(group, tab) == workspaceId) {
+                status = m_groupModel->tabStatus(group, tab);
+            }
+        }
+    }
+    const WorkspaceBanner* banner = m_agentArea->banner(workspaceId);
+    const bool shown = banner != nullptr && !banner->isHidden();
+    announceMenuTest("agent-started", workspaceId,
+                     QStringLiteral("status=%1 banner=%2")
+                         .arg(status)
+                         .arg(shown ? QStringLiteral("shown") : QStringLiteral("hidden")));
 }
 
 QJsonObject MainWindow::tabFor(const QString& workspaceId) const {
@@ -1794,18 +1937,6 @@ void MainWindow::onRepoInspectFailed(const QString& path, const QString& message
 void MainWindow::onWorkspaceOpFailed(const QString& workspaceId, const QString& op,
                                      const QString& message) {
     noteFailureRouted(message);
-    if (op == QLatin1String("workspace.restart")) {
-        // The banner is where this belongs, not a box: the daemon has left the
-        // workspace failed with this very sentence as its reason, and the
-        // banner that asked is the one that shows it, with Retry pressable
-        // again.
-        m_restarting.remove(workspaceId);
-        m_groupModel->noteRestartFailed(workspaceId, message);
-        m_agentArea->setRetrying(workspaceId, false);
-        qWarning("workspace restart failed for %s: %s", qUtf8Printable(workspaceId),
-                 qUtf8Printable(message));
-        return;
-    }
     if (op == QLatin1String("agent.start")) {
         // The pane must stop saying it is starting something. The signal names
         // the workspace, so only the pane that asked comes out of it.
@@ -2002,6 +2133,8 @@ void MainWindow::updateCostLabel() {
 
 void MainWindow::onWorkspaceDestroyed(const QString& workspaceId) {
     m_restarting.remove(workspaceId);
+    m_restartUnanswered.remove(workspaceId);
+    m_agentStopped.remove(workspaceId);
     // Panes first: the model change that follows re-selects a surviving tab,
     // and the areas must no longer hold the dead one when it does. The editor
     // tabs go with them: there is nothing left to save the file to.

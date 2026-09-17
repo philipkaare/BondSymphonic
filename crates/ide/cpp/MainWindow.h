@@ -321,6 +321,10 @@ private:
     /// workspace back, so its agent comes back too -- including one that had
     /// ended, which the automatic start leaves alone.
     void onWorkspaceRestarted(const QString& workspaceId, const QString& infoJson);
+    /// Test seam: says what `workspaceId`'s tab and banner look like once its
+    /// agent has started -- the status code the tab paints and whether the
+    /// banner is up. See [`announceMenuTest`].
+    void reportAgentStartedForTest(const QString& workspaceId);
     /// The tab JSON for `workspaceId`, or an empty object.
     QJsonObject tabFor(const QString& workspaceId) const;
     /// Test seam: presses the named button on `workspaceId`'s banner once, if
@@ -335,6 +339,29 @@ private:
     /// raise "The agent stopped." over a workspace that is coming back, whose
     /// agent the answer starts again anyway.
     QSet<QString> m_restarting;
+    /// A Retry that failed without the daemon saying why, for workspaces the
+    /// daemon may well have restarted anyway, with whether the connection
+    /// went with it. Resumed once the workspace is next seen running by
+    /// [`resumeUnansweredRestarts`] -- after a lost connection, only once a
+    /// new one has listed the workspaces, since a start sent before that
+    /// fails for want of a connection.
+    QHash<QString, bool> m_restartUnanswered;
+    /// Workspaces whose banner is showing "The agent stopped." from
+    /// `onAgentExited`, so the agent coming back -- or its sandbox turning
+    /// out to be what stopped it -- can take exactly that down.
+    QSet<QString> m_agentStopped;
+    /// A Retry that failed. See `AppController::workspaceRestartFailed`.
+    void onWorkspaceRestartFailed(const QString& workspaceId, const QString& message, int kind);
+    /// Starts `workspaceId`'s agent again after its sandbox came back, if it
+    /// needs one. Booked in `m_autoStarting`.
+    void resumeAgentAfterRestart(const QString& workspaceId);
+    /// Resumes the agents of the workspaces in `m_restartUnanswered` that are
+    /// running now. `listed` is true when a fresh `workspace.list` is what
+    /// says so, which is the one proof a lost connection is back.
+    void resumeUnansweredRestarts(bool listed);
+    /// Takes down the "The agent stopped." layer on `workspaceId`, and only
+    /// that one.
+    void clearAgentStopped(const QString& workspaceId);
     /// The banner buttons the seam has already pressed, by step and workspace.
     QSet<QString> m_bannerTestPressed;
     /// Adds one Edit menu item forwarding to the current editor's view, and

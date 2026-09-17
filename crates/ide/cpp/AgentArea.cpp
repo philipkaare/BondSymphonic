@@ -123,6 +123,9 @@ void AgentArea::clearWorkspaceProblem(const QString& workspaceId) {
     if (WorkspaceBanner* banner = m_banners.value(workspaceId)) {
         banner->clearWorkspaceProblem();
     }
+    // Whatever was said about the agent while the problem was up -- a
+    // `clearBanner` meanwhile takes the banner's own copy down with it.
+    applyRestartOffer(workspaceId);
     if (TranscriptView* view = m_transcripts.value(workspaceId)) {
         view->setWorkspaceDown(false);
     }

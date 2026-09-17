@@ -94,14 +94,17 @@ WorkspaceBanner::WorkspaceBanner(QWidget* parent) : QFrame(parent) {
     m_retry = new QPushButton(QStringLiteral("Retry"), this);
     m_retry->setObjectName(QStringLiteral("WorkspaceBannerRetryButton"));
     m_retry->setToolTip(QStringLiteral(
-        "Start this workspace's sandbox again, then its agent. The worktree and the "
-        "conversation are kept."));
+        "Start this workspace's sandbox again. The worktree is kept, and a Claude agent "
+        "resumes its conversation."));
     m_retry->hide();
     head->addWidget(m_retry, 0, Qt::AlignTop);
 
-    m_remove = new QPushButton(QStringLiteral("Remove workspace") + QChar(0x2026), this);
+    // The tab menu's verb, so the button and the confirmation behind it name
+    // the same act.
+    m_remove = new QPushButton(QStringLiteral("Destroy workspace") + QChar(0x2026), this);
     m_remove->setObjectName(QStringLiteral("WorkspaceBannerRemoveButton"));
-    m_remove->setToolTip(QStringLiteral("Destroy this workspace, after asking"));
+    m_remove->setToolTip(QStringLiteral(
+        "Remove this workspace's sandbox, worktree and branch, after asking"));
     m_remove->hide();
     head->addWidget(m_remove, 0, Qt::AlignTop);
 

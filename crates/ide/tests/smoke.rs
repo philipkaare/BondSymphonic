@@ -2284,7 +2284,7 @@ mod sandbox_retry {
         let run = run_ide(
             WorkspaceState::Error(RESTORE_REASON.to_owned()),
             Restart::Works,
-            "sandbox-banner,sandbox-retry",
+            "sandbox-banner,sandbox-retry=ws_retry1",
         );
         let reason = run
             .banner_line(RESTORE_REASON)
@@ -2343,7 +2343,7 @@ mod sandbox_retry {
         let run = run_ide(
             WorkspaceState::Error(RESTORE_REASON.to_owned()),
             Restart::Refused,
-            "sandbox-banner,sandbox-retry",
+            "sandbox-banner,sandbox-retry=ws_retry1",
         );
         let first = run
             .banner_line(RESTORE_REASON)
@@ -2379,7 +2379,7 @@ mod sandbox_retry {
         let run = run_ide(
             WorkspaceState::SandboxDown,
             Restart::Works,
-            "sandbox-banner,sandbox-remove",
+            "sandbox-banner,sandbox-remove=ws_retry1",
         );
         assert!(
             run.banner_line("stopped unexpectedly").is_some(),
@@ -2718,7 +2718,7 @@ mod sandbox_remove_dirty {
 
     const TOKEN: &str = "remove-dirty-token";
     const SCRIPT: &str = "wait,quit";
-    const MENU_TEST: &str = "sandbox-banner,sandbox-remove,destroy-yes";
+    const MENU_TEST: &str = "sandbox-banner,sandbox-remove=ws_dirty1,destroy-yes=ws_dirty1";
     const WORKSPACE: &str = "ws_dirty1";
     const NAME: &str = "dirty-one";
     const REASON: &str = "Git no longer lists this workspace's worktree. Remove the workspace.";
@@ -2947,5 +2947,628 @@ mod sandbox_remove_dirty {
             WorkspaceState::Error(REASON.to_owned()),
             &[],
         )
+    }
+}
+
+/// Review follow-ups to `sandbox_retry`: a Retry after the sandbox died under a
+/// running agent, and a Retry whose answer never arrived.
+///
+/// * A sandbox that dies takes its agent with it, and the agent's `exited` can
+///   arrive before the workspace's `SandboxDown`. That exit is the sandbox's
+///   news, not a crash: once Retry has the workspace and its agent back, the
+///   pane must not still say "The agent stopped." over a tab painted red.
+/// * A Retry that the daemon carried out but whose answer was lost to a
+///   dropped connection is not the workspace failing. The banner must not show
+///   the connection's error as the workspace's reason, and the agent must come
+///   back once the workspace is seen running.
+///
+/// The seam steps name the one workspace they may press on.
+mod sandbox_retry_followups {
+    use super::{drain, wait_for};
+    use bondsymphonic_ide::model::persistence::{PersistedGroup, StateFile, STATE_VERSION};
+    use bondsymphonic_proto::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    const TOKEN: &str = "followup-token";
+    /// Long enough for a dropped connection to be rebuilt and re-listed.
+    const SCRIPT: &str = "wait,wait,wait,quit";
+    const WORKSPACE: &str = "ws_follow1";
+    const NAME: &str = "follow-one";
+    const AGENT: &str = "ag_follow_old";
+    const NEW_AGENT: &str = "ag_follow_new";
+    const SESSION: &str = "sess-follow-1";
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+    /// `TabStatus::Error` as `GroupModel::tabStatus` codes it.
+    const ERROR_CODE: &str = "status=3";
+
+    type Journal = Arc<Mutex<Vec<String>>>;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Scenario {
+        /// Listed running; the agent exits and then the sandbox goes down.
+        /// Retry works.
+        DiedAtRuntime,
+        /// Listed down. Retry is carried out -- the agent's stop and the
+        /// `Ready` go out -- and then the connection drops before the answer.
+        AnswerLost,
+    }
+
+    #[test]
+    fn a_retry_after_the_sandbox_died_leaves_no_agent_stopped_banner() {
+        if bondsymphonic_ide::testing::skip_without_qt("retry after runtime death") {
+            return;
+        }
+        let run = run_ide(Scenario::DiedAtRuntime);
+        let problem = run
+            .line_index("BS_MENU_TEST sandbox-banner target=ws_follow1 ")
+            .unwrap_or_else(|| panic!("the sandbox going down was never shown\n{}", run.context));
+        assert!(
+            run.out
+                .lines()
+                .nth(problem)
+                .unwrap_or("")
+                .contains("stopped unexpectedly"),
+            "{}",
+            run.context
+        );
+        let started = run
+            .out
+            .lines()
+            .find(|l| l.starts_with("BS_MENU_TEST agent-started target=ws_follow1 "))
+            .unwrap_or_else(|| panic!("the agent was not started again\n{}", run.context));
+        assert!(
+            started.contains("banner=hidden"),
+            "the pane still shows a banner over a running agent: {started}\n{}",
+            run.context
+        );
+        assert!(
+            !started.contains(ERROR_CODE),
+            "the tab is still red over a running agent: {started}\n{}",
+            run.context
+        );
+        assert_eq!(
+            run.journal
+                .iter()
+                .filter(|m| m.starts_with("agent.start"))
+                .collect::<Vec<_>>(),
+            [&format!("agent.start:{WORKSPACE}:{SESSION}")],
+            "{}",
+            run.context
+        );
+    }
+
+    #[test]
+    fn a_retry_whose_answer_was_lost_still_brings_the_agent_back() {
+        if bondsymphonic_ide::testing::skip_without_qt("retry answer lost") {
+            return;
+        }
+        let run = run_ide(Scenario::AnswerLost);
+        // The connection's failure is not the workspace's reason.
+        for line in run
+            .out
+            .lines()
+            .filter(|l| l.starts_with("BS_MENU_TEST sandbox-banner target=ws_follow1 "))
+        {
+            assert!(
+                line.contains("stopped unexpectedly") || line.ends_with("question=cleared"),
+                "a banner line that is not the workspace's own news: {line}\n{}",
+                run.context
+            );
+        }
+        assert_eq!(
+            run.journal
+                .iter()
+                .filter(|m| m.starts_with("workspace.restart"))
+                .count(),
+            1,
+            "{}",
+            run.context
+        );
+        // The daemon did restart it, so the agent comes back: once.
+        assert_eq!(
+            run.journal
+                .iter()
+                .filter(|m| m.starts_with("agent.start"))
+                .collect::<Vec<_>>(),
+            [&format!("agent.start:{WORKSPACE}:{SESSION}")],
+            "{}",
+            run.context
+        );
+        let started = run
+            .out
+            .lines()
+            .find(|l| l.starts_with("BS_MENU_TEST agent-started target=ws_follow1 "))
+            .unwrap_or_else(|| panic!("the agent never reported started\n{}", run.context));
+        assert!(
+            started.contains("banner=hidden"),
+            "{started}\n{}",
+            run.context
+        );
+        assert!(!started.contains(ERROR_CODE), "{started}\n{}", run.context);
+    }
+
+    struct Run {
+        out: String,
+        journal: Vec<String>,
+        context: String,
+    }
+
+    impl Run {
+        fn line_index(&self, needle: &str) -> Option<usize> {
+            self.out.lines().position(|l| l.contains(needle))
+        }
+    }
+
+    fn run_ide(scenario: Scenario) -> Run {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (addr, journal) = rt.block_on(fake_daemon(scenario));
+
+        let tag = match scenario {
+            Scenario::DiedAtRuntime => "died",
+            Scenario::AnswerLost => "lost",
+        };
+        let config =
+            std::env::temp_dir().join(format!("bs-retry-follow-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("config dir");
+        let state_path = config.join("state.json");
+        let saved = StateFile {
+            version: STATE_VERSION,
+            groups: vec![PersistedGroup {
+                name: "follow".to_owned(),
+                workspace_ids: vec![WORKSPACE.to_owned()],
+                ..PersistedGroup::default()
+            }],
+            active_workspace: Some(WORKSPACE.to_owned()),
+            ..StateFile::default()
+        };
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&saved).expect("state json"),
+        )
+        .expect("seed state.json");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", SCRIPT)
+            .env(
+                "BS_MENU_TEST",
+                format!("sandbox-banner,sandbox-retry={WORKSPACE}"),
+            )
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", &state_path)
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let journal = journal.lock().expect("journal mutex").clone();
+        let context =
+            format!("requests: {journal:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(
+            status.success(),
+            "the IDE exited with {status}, expected 0\n{context}"
+        );
+        assert!(
+            !format!("{out}{err}").contains("panicked at"),
+            "the IDE logged a panic\n{context}"
+        );
+        let _ = std::fs::remove_dir_all(&config);
+        Run {
+            out,
+            journal,
+            context,
+        }
+    }
+
+    fn event(body: Event) -> ServerMessage {
+        ServerMessage::event(Some(WorkspaceId(WORKSPACE.to_owned())), body)
+    }
+
+    fn exited() -> ServerMessage {
+        event(Event::AgentStateChanged {
+            agent_id: AgentId(AGENT.to_owned()),
+            state: AgentState::Exited,
+            detail: Some("the sandbox went away".to_owned()),
+        })
+    }
+
+    fn state_event(state: WorkspaceState, agent: AgentState) -> ServerMessage {
+        event(Event::WorkspaceStateChanged {
+            info: Box::new(workspace(state, agent)),
+        })
+    }
+
+    async fn fake_daemon(scenario: Scenario) -> (std::net::SocketAddr, Journal) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let recorded = journal.clone();
+
+        tokio::spawn(async move {
+            let (mut current, mut agent) = match scenario {
+                Scenario::DiedAtRuntime => (WorkspaceState::Ready, AgentState::Idle),
+                Scenario::AnswerLost => (WorkspaceState::SandboxDown, AgentState::Exited),
+            };
+            let mut died = false;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (r, mut w) = stream.into_split();
+                let mut r = BufReader::new(r);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let ClientMessage::Request { id, request } =
+                        codec::decode(line.trim_end()).expect("decode");
+                    let method = match &request {
+                        Request::WorkspaceRestart(p) => {
+                            format!("workspace.restart:{}", p.workspace_id.0)
+                        }
+                        Request::AgentStart(p) => format!(
+                            "agent.start:{}:{}",
+                            p.workspace_id.0,
+                            p.options.resume_session.clone().unwrap_or_default()
+                        ),
+                        other => other.method_name().to_owned(),
+                    };
+                    recorded.lock().expect("journal mutex").push(method);
+                    let mut after: Vec<ServerMessage> = Vec::new();
+                    let reply = match request {
+                        Request::Hello(p) if p.token == TOKEN => Some(ServerMessage::ok(
+                            id,
+                            &HelloResult {
+                                daemon_version: "0.0.0-fake".into(),
+                                capabilities: Capabilities {
+                                    sandbox_backend: "noop".into(),
+                                    git_protect: false,
+                                    adapters: vec![AgentAdapterKind::Claude],
+                                },
+                                protocol_version: Some(PROTOCOL_VERSION),
+                            },
+                        )),
+                        Request::Hello(_) => Some(ServerMessage::err(id, RpcError::unauthorized())),
+                        Request::SystemCheckPrereqs {} => Some(ServerMessage::ok(
+                            id,
+                            &CheckPrereqsResult {
+                                items: vec![PrereqStatus {
+                                    name: "claude_auth".into(),
+                                    ok: true,
+                                    detail: "logged in".into(),
+                                    fix_hint: None,
+                                }],
+                            },
+                        )),
+                        Request::WorkspaceList {} => {
+                            // The death, once the tab exists to hear of it:
+                            // the agent first, as the adapter notices its
+                            // process gone before the daemon marks the sandbox.
+                            if scenario == Scenario::DiedAtRuntime && !died {
+                                died = true;
+                                after.push(exited());
+                                after.push(state_event(
+                                    WorkspaceState::SandboxDown,
+                                    AgentState::Exited,
+                                ));
+                            }
+                            let listed = workspace(current.clone(), agent);
+                            if died {
+                                current = WorkspaceState::SandboxDown;
+                                agent = AgentState::Exited;
+                            }
+                            Some(ServerMessage::ok(
+                                id,
+                                &WorkspaceListResult {
+                                    workspaces: vec![listed],
+                                },
+                            ))
+                        }
+                        Request::WorkspaceGet(_) => {
+                            Some(ServerMessage::ok(id, &workspace(current.clone(), agent)))
+                        }
+                        Request::WorkspaceRestart(_) => {
+                            current = WorkspaceState::Ready;
+                            agent = AgentState::Exited;
+                            let stop = exited();
+                            let ready = state_event(WorkspaceState::Ready, AgentState::Exited);
+                            for message in [stop, ready] {
+                                let _ = w.write_all(codec::encode(&message).as_bytes()).await;
+                            }
+                            match scenario {
+                                Scenario::DiedAtRuntime => {
+                                    Some(ServerMessage::ok(id, &workspace(current.clone(), agent)))
+                                }
+                                // Carried out, never answered.
+                                Scenario::AnswerLost => None,
+                            }
+                        }
+                        Request::AgentStart(_) => Some(ServerMessage::ok(
+                            id,
+                            &AgentStartResult {
+                                agent_id: AgentId(NEW_AGENT.to_owned()),
+                            },
+                        )),
+                        Request::AgentHistory(_) => Some(ServerMessage::ok(
+                            id,
+                            &HistoryResult {
+                                messages: vec![],
+                                state: AgentState::Exited,
+                                detail: None,
+                            },
+                        )),
+                        Request::FsListDir(_) => {
+                            Some(ServerMessage::ok(id, &ListDirResult { entries: vec![] }))
+                        }
+                        Request::FsWatch(_) => Some(ServerMessage::ok(id, &Empty {})),
+                        Request::WorkspaceChanges(_) => {
+                            Some(ServerMessage::ok(id, &ChangesResult { files: vec![] }))
+                        }
+                        Request::WorkspaceStatus(_) => Some(ServerMessage::ok(
+                            id,
+                            &WorkspaceStatusResult { entries: vec![] },
+                        )),
+                        Request::RepoDetectRunConfigs(_) => Some(ServerMessage::ok(
+                            id,
+                            &DetectRunConfigsResult {
+                                configs: vec![],
+                                network_allow: vec![],
+                                warnings: vec![],
+                            },
+                        )),
+                        Request::RunList(_) => {
+                            Some(ServerMessage::ok(id, &RunListResult { runs: vec![] }))
+                        }
+                        other => Some(ServerMessage::err(
+                            id,
+                            RpcError::internal(format!("not implemented: {}", other.method_name())),
+                        )),
+                    };
+                    let Some(reply) = reply else {
+                        // Drop the connection with the request unanswered.
+                        break;
+                    };
+                    if w.write_all(codec::encode(&reply).as_bytes()).await.is_err() {
+                        break;
+                    }
+                    if !after.is_empty() {
+                        // After the list has been applied: events travel on
+                        // their own channel and would otherwise reach a model
+                        // that has no tab for them yet.
+                        tokio::time::sleep(Duration::from_millis(1_500)).await;
+                    }
+                    for message in after {
+                        let _ = w.write_all(codec::encode(&message).as_bytes()).await;
+                    }
+                }
+            }
+        });
+
+        (addr, journal)
+    }
+
+    fn workspace(state: WorkspaceState, agent: AgentState) -> WorkspaceInfo {
+        let mut info = super::workspace(WORKSPACE, NAME, state, &[]);
+        let record = AgentSummary {
+            id: AgentId(AGENT.to_owned()),
+            adapter: AgentAdapterKind::Claude,
+            state: agent,
+            session_id: Some(SESSION.to_owned()),
+            command: None,
+            model: None,
+            permission_mode: None,
+        };
+        info.agents = vec![record.id.clone()];
+        info.agent_records = vec![record];
+        info
+    }
+}
+
+/// The banner seam acts on the workspace its steps name and on nothing else.
+///
+/// `sandbox-retry`, `sandbox-remove` and `destroy-yes` send real requests --
+/// a restart stops agents, a forced destroy deletes a branch -- so a step that
+/// named no workspace, or another one, must leave every workspace alone even
+/// when its banner is up and its buttons are pressable. The workspace here has
+/// a problem and its pane is on screen; the steps name a different id.
+mod seam_targets {
+    use super::{drain, wait_for};
+    use bondsymphonic_ide::model::persistence::{PersistedGroup, StateFile, STATE_VERSION};
+    use bondsymphonic_proto::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    const TOKEN: &str = "seam-target-token";
+    const WORKSPACE: &str = "ws_bystander1";
+    const MENU_TEST: &str = "sandbox-banner,sandbox-retry=ws_nobody,sandbox-remove=ws_nobody,\
+                             destroy-yes=ws_nobody,sandbox-retry,sandbox-remove,destroy-yes";
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+    #[test]
+    fn a_banner_step_never_acts_on_a_workspace_it_does_not_name() {
+        if bondsymphonic_ide::testing::skip_without_qt("seam targets") {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let journal: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let addr = rt.block_on(fake_daemon(journal.clone()));
+
+        let config = std::env::temp_dir().join(format!("bs-seam-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("config dir");
+        let state_path = config.join("state.json");
+        let saved = StateFile {
+            version: STATE_VERSION,
+            groups: vec![PersistedGroup {
+                name: "bystander".to_owned(),
+                workspace_ids: vec![WORKSPACE.to_owned()],
+                ..PersistedGroup::default()
+            }],
+            active_workspace: Some(WORKSPACE.to_owned()),
+            ..StateFile::default()
+        };
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&saved).expect("state json"),
+        )
+        .expect("seed state.json");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", "wait,quit")
+            .env("BS_MENU_TEST", MENU_TEST)
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", &state_path)
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let seen = journal.lock().expect("journal mutex").clone();
+        let context = format!("requests: {seen:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(status.success(), "{context}");
+        let _ = std::fs::remove_dir_all(&config);
+
+        // The control: the banner is up, so the seam had something to press.
+        assert!(
+            out.lines().any(|l| l
+                .starts_with(&format!("BS_MENU_TEST sandbox-banner target={WORKSPACE} "))),
+            "the banner never came up, so this run proves nothing\n{context}"
+        );
+        assert!(
+            !out.contains("BS_MENU_TEST sandbox-retry ") && !out.contains("BS_MENU_TEST destroy "),
+            "a button was pressed on a workspace no step named\n{context}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|m| m.starts_with("workspace.restart") || m.starts_with("workspace.destroy")),
+            "a request went out for a workspace no step named\n{context}"
+        );
+    }
+
+    async fn fake_daemon(recorded: Arc<Mutex<Vec<String>>>) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (r, mut w) = stream.into_split();
+                let mut r = BufReader::new(r);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let ClientMessage::Request { id, request } =
+                        codec::decode(line.trim_end()).expect("decode");
+                    recorded
+                        .lock()
+                        .expect("journal mutex")
+                        .push(request.method_name().to_owned());
+                    let reply = match request {
+                        Request::Hello(p) if p.token == TOKEN => ServerMessage::ok(
+                            id,
+                            &HelloResult {
+                                daemon_version: "0.0.0-fake".into(),
+                                capabilities: Capabilities {
+                                    sandbox_backend: "noop".into(),
+                                    git_protect: false,
+                                    adapters: vec![AgentAdapterKind::Claude],
+                                },
+                                protocol_version: Some(PROTOCOL_VERSION),
+                            },
+                        ),
+                        Request::Hello(_) => ServerMessage::err(id, RpcError::unauthorized()),
+                        Request::SystemCheckPrereqs {} => {
+                            ServerMessage::ok(id, &CheckPrereqsResult { items: vec![] })
+                        }
+                        Request::WorkspaceList {} => ServerMessage::ok(
+                            id,
+                            &WorkspaceListResult {
+                                workspaces: vec![super::workspace(
+                                    WORKSPACE,
+                                    "bystander",
+                                    WorkspaceState::Error("left alone".to_owned()),
+                                    &[],
+                                )],
+                            },
+                        ),
+                        Request::FsWatch(_) => ServerMessage::ok(id, &Empty {}),
+                        Request::FsListDir(_) => {
+                            ServerMessage::ok(id, &ListDirResult { entries: vec![] })
+                        }
+                        Request::WorkspaceChanges(_) => {
+                            ServerMessage::ok(id, &ChangesResult { files: vec![] })
+                        }
+                        Request::WorkspaceStatus(_) => {
+                            ServerMessage::ok(id, &WorkspaceStatusResult { entries: vec![] })
+                        }
+                        Request::RunList(_) => {
+                            ServerMessage::ok(id, &RunListResult { runs: vec![] })
+                        }
+                        // Answered as a daemon would, so a run that did send
+                        // one would not stall before the assertions catch it.
+                        Request::WorkspaceRestart(_) | Request::WorkspaceDestroy(_) => {
+                            ServerMessage::err(id, RpcError::internal("must not be asked"))
+                        }
+                        other => ServerMessage::err(
+                            id,
+                            RpcError::internal(format!("not implemented: {}", other.method_name())),
+                        ),
+                    };
+                    if w.write_all(codec::encode(&reply).as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        addr
     }
 }
