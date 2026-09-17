@@ -384,6 +384,10 @@ pub async fn create(layout: &Layout, base_branch: &str) -> Result<(), CreateFail
         let unwound = remove_with(layout, RemoveBranch::Always).await;
         return Err(CreateFailed::after(unwound, e));
     }
+    if let Err(e) = lock(layout).await {
+        let unwound = remove_with(layout, RemoveBranch::Always).await;
+        return Err(CreateFailed::after(unwound, e));
+    }
     if !layout.ref_dir().join("work").is_file() {
         let unwound = remove_with(layout, RemoveBranch::Always).await;
         return Err(CreateFailed::after(
@@ -395,6 +399,42 @@ pub async fn create(layout: &Layout, base_branch: &str) -> Result<(), CreateFail
         ));
     }
     Ok(())
+}
+
+/// The reason every workspace worktree is locked with, as `git worktree list`
+/// shows it to whoever wonders why.
+pub const LOCK_REASON: &str =
+    "BondSymphonic manages this worktree from WSL; do not prune or remove it by hand";
+
+/// Locks the workspace's worktree registration.
+///
+/// **This is what keeps a Windows git from deleting the workspace.** The
+/// worktree lives under the WSL user's home, a path a git running on Windows
+/// cannot see, so to that git every workspace registration looks stale — and a
+/// `git worktree prune` there, which Windows git tools run on their own, deletes
+/// `<git_common>/worktrees/<id>`. The directory and the branch survive; the
+/// registration does not, and without it the worktree is not a repository any
+/// more. Git skips locked registrations in `prune`, on every platform, and
+/// [`remove_with`] unlocks before it removes, so the lock costs the daemon
+/// nothing.
+///
+/// The short-lived scratch worktrees `git/merge.rs` checks out are not locked:
+/// they exist for the length of one call.
+async fn lock(layout: &Layout) -> Result<(), RpcError> {
+    layout
+        .daemon_git()
+        .run(
+            &layout.repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                LOCK_REASON,
+                &path_arg(&layout.worktree_path),
+            ],
+        )
+        .await
+        .map(|_| ())
 }
 
 /// Removes the worktree, its registration and its branch.

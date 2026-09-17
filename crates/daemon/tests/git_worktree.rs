@@ -53,6 +53,37 @@ async fn create_makes_branch_worktree_and_writable_dirs() {
     );
 }
 
+/// A new workspace worktree is locked, so a `git worktree prune` that cannot see
+/// the directory keeps its registration.
+///
+/// That is exactly what a Windows git does to every workspace: the worktree
+/// lives under the WSL user's home, which Windows git cannot see, so to it every
+/// registration looks stale. Hiding the directory stands in for that here.
+#[tokio::test]
+async fn create_locks_the_worktree_so_a_prune_that_cannot_see_it_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_path = common::init_repo(dir.path());
+    let git = Git::new();
+    let layout = layout_for(dir.path(), &repo_path, "locked-on-create").await;
+    worktree::create(&layout, "main").await.unwrap();
+
+    let reason = std::fs::read_to_string(layout.worktree_gitdir().join("locked"))
+        .expect("create must lock the worktree");
+    assert_eq!(reason.trim_end(), worktree::LOCK_REASON);
+
+    let hidden = dir.path().join("hidden");
+    std::fs::rename(dir.path().join("worktrees"), &hidden).unwrap();
+    git.run(&repo_path, &["worktree", "prune"]).await.unwrap();
+    std::fs::rename(&hidden, dir.path().join("worktrees")).unwrap();
+    assert!(
+        layout.worktree_gitdir().join("HEAD").is_file(),
+        "prune removed a locked registration"
+    );
+
+    worktree::remove(&layout).await.unwrap();
+    assert!(!layout.worktree_gitdir().exists());
+}
+
 #[tokio::test]
 async fn commits_in_worktree_go_to_private_objects_and_daemon_can_read_them() {
     let dir = tempfile::tempdir().unwrap();
@@ -233,6 +264,14 @@ async fn remove_takes_a_locked_worktree_with_it() {
     let layout = layout_for(dir.path(), &repo_path, "locked").await;
     worktree::create(&layout, "main").await.unwrap();
 
+    // `create` locks every worktree with a reason of its own; this one is
+    // locked the way a user would, which git only allows once it is unlocked.
+    let _ = git
+        .run(
+            &repo_path,
+            &["worktree", "unlock", &layout.worktree_path.to_string_lossy()],
+        )
+        .await;
     git.run(
         &repo_path,
         &[
