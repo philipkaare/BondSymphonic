@@ -291,6 +291,47 @@ pub struct AgentTab {
     /// forgotten it, and `agent.state` says what is true now.
     #[serde(default)]
     pub attention: String,
+    /// Why the workspace itself cannot run -- its sandbox died, or it could not
+    /// be started at all -- or `None` while it can. What the pane's banner
+    /// shows, with a Retry beside it.
+    ///
+    /// Kept apart from `status` because `TabStatus::Error` is also what an
+    /// agent that failed reads as, and the two call for different buttons:
+    /// a failed agent is restarted, a failed workspace has its sandbox
+    /// brought back first. Set and cleared only by the workspace's own state,
+    /// in [`Workspaces::apply_workspace_info`].
+    #[serde(default)]
+    pub workspace_problem: Option<WorkspaceProblem>,
+}
+
+/// What a workspace that cannot run says about itself: the banner's two lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceProblem {
+    pub title: String,
+    pub detail: String,
+}
+
+/// The problem `state` describes, or `None` for a workspace that is running,
+/// being created or going away.
+///
+/// A sandbox that died at runtime reaches the IDE as a bare `SandboxDown`, with
+/// no reason attached, so the sentence says what is known: it stopped by
+/// itself. A workspace that failed to start carries the daemon's own reason,
+/// which is a readable sentence and is shown as it came.
+pub fn workspace_problem(state: &WorkspaceState) -> Option<WorkspaceProblem> {
+    match state {
+        WorkspaceState::SandboxDown => Some(WorkspaceProblem {
+            title: "The sandbox for this workspace is not running".to_owned(),
+            detail: "It stopped unexpectedly. Retry starts it again; the worktree and the \
+                     conversation are kept."
+                .to_owned(),
+        }),
+        WorkspaceState::Error(reason) => Some(WorkspaceProblem {
+            title: "This workspace could not be started".to_owned(),
+            detail: reason.clone(),
+        }),
+        WorkspaceState::Ready | WorkspaceState::Creating | WorkspaceState::Destroying => None,
+    }
 }
 
 /// The sentence a tab carries while its agent is waiting to be allowed a tool.
@@ -327,10 +368,12 @@ pub fn adapter_from_name(name: &str) -> AgentAdapterKind {
 }
 
 pub fn state_detail(state: &WorkspaceState) -> String {
-    match state {
-        WorkspaceState::Error(detail) => detail.clone(),
-        _ => String::new(),
-    }
+    // The problem's detail rather than the `Error` text alone: a sandbox that
+    // is down has something to say too, and a tooltip reading only "sandbox
+    // down" was the unexplained state the banner exists to replace.
+    workspace_problem(state)
+        .map(|problem| problem.detail)
+        .unwrap_or_default()
 }
 
 impl AgentTab {
@@ -349,6 +392,23 @@ impl AgentTab {
             Some(detail) => detail.as_str(),
             None => self.detail.as_str(),
         }
+    }
+
+    /// Whether a workspace that has just come back should have its agent
+    /// started: a Claude tab whose agent is missing or has ended.
+    ///
+    /// "Ended" includes an agent nobody has heard from. A tab restored from
+    /// `workspace.list` is bound to the daemon's last record for the
+    /// workspace, and after a daemon restart that record is an agent that is
+    /// not running; waiting for it to report in would wait forever.
+    pub fn agent_needs_start(&self) -> bool {
+        if self.adapter != AgentAdapterKind::Claude {
+            return false;
+        }
+        !matches!(
+            self.agent_status,
+            Some(TabStatus::Idle | TabStatus::Working | TabStatus::WaitingPermission)
+        ) || self.agent_id.is_none()
     }
 
     /// A tab for a workspace the daemon described but the IDE was not tracking:
@@ -398,6 +458,7 @@ impl AgentTab {
             options_json: agent.map(restart_options_json).unwrap_or_default(),
             op_error: None,
             attention: String::new(),
+            workspace_problem: workspace_problem(&info.state),
         }
     }
 }
@@ -863,11 +924,9 @@ impl Workspaces {
             tab.detail = tab.agent_detail.clone();
         } else {
             tab.status = TabStatus::from_workspace_state(&info.state);
-            tab.detail = match &info.state {
-                WorkspaceState::Error(detail) => detail.clone(),
-                _ => String::new(),
-            };
+            tab.detail = state_detail(&info.state);
         }
+        tab.workspace_problem = workspace_problem(&info.state);
         tab.branch = info.branch.clone();
         // Refreshed rather than set once: a tab restored from a session file
         // written before this field existed has none, and the Run panel cannot
@@ -890,6 +949,27 @@ impl Workspaces {
             return false;
         };
         self.groups[g].tabs[t].op_error = Some(detail.to_owned());
+        true
+    }
+
+    /// Records that a `workspace.restart` failed with `reason`, exactly as the
+    /// daemon leaves it: `Error(reason)`. False when the workspace is not
+    /// tracked.
+    ///
+    /// Applied here rather than waited for, because not every failure has an
+    /// event behind it -- a request that timed out never heard from the
+    /// daemon at all -- and a banner that went on showing the old reason
+    /// after a failed Retry would look like the Retry did nothing. The next
+    /// `workspace.state` overwrites it with whatever is true.
+    pub fn note_restart_failed(&mut self, id: &WorkspaceId, reason: &str) -> bool {
+        let Some((g, t)) = self.find(id) else {
+            return false;
+        };
+        let tab = &mut self.groups[g].tabs[t];
+        let state = WorkspaceState::Error(reason.to_owned());
+        tab.status = TabStatus::from_workspace_state(&state);
+        tab.detail = state_detail(&state);
+        tab.workspace_problem = workspace_problem(&state);
         true
     }
 
@@ -1067,7 +1147,12 @@ impl Workspaces {
         // it -- so testing for it needs no second copy of the workspace state.
         // `apply_workspace_info` hands the badge back on recovery, carrying
         // exactly what was recorded above.
-        if tab.status != TabStatus::SandboxDown {
+        //
+        // A workspace that failed to start is the same news with a reason
+        // attached, and the reason is what the tooltip would otherwise lose, so
+        // the test is on the problem the workspace reported rather than on the
+        // badge.
+        if tab.workspace_problem.is_none() {
             tab.status = status;
             tab.detail = detail.to_owned();
         }
@@ -1305,6 +1390,7 @@ mod tests {
             options_json: String::new(),
             op_error: None,
             attention: String::new(),
+            workspace_problem: None,
         }
     }
 

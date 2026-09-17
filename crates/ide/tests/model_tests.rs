@@ -38,6 +38,7 @@ fn tab(id: &str, name: &str) -> AgentTab {
         agent_detail: String::new(),
         op_error: None,
         attention: String::new(),
+        workspace_problem: None,
     }
 }
 
@@ -1198,4 +1199,147 @@ fn a_tab_carries_the_options_the_composer_chose() {
 
     // A workspace that is not tracked is not silently created.
     assert!(!w.set_tab_options(&"ws_missing".into(), chosen));
+}
+
+/// What a workspace that cannot run says about itself, which is what its pane's
+/// banner shows. A sandbox that died has no reason of its own to give, so the
+/// sentence says what happened; a workspace that failed to start carries the
+/// daemon's reason verbatim. Every other state has nothing to report.
+#[test]
+fn a_workspace_that_cannot_run_describes_its_problem() {
+    let down = workspace_problem(&WorkspaceState::SandboxDown).expect("a down sandbox");
+    assert_eq!(down.title, "The sandbox for this workspace is not running");
+    assert!(
+        down.detail.contains("stopped unexpectedly"),
+        "{:?}",
+        down.detail
+    );
+
+    let failed = workspace_problem(&WorkspaceState::Error(
+        "The worktree's git registration is missing.".into(),
+    ))
+    .expect("a failed workspace");
+    assert_eq!(failed.title, "This workspace could not be started");
+    assert_eq!(failed.detail, "The worktree's git registration is missing.");
+
+    for fine in [
+        WorkspaceState::Ready,
+        WorkspaceState::Creating,
+        WorkspaceState::Destroying,
+    ] {
+        assert_eq!(workspace_problem(&fine), None, "{fine:?}");
+    }
+}
+
+/// The problem rides on the tab from the first `WorkspaceInfo` to the one that
+/// says the workspace is `Ready` again, whether or not an agent is bound to
+/// the tab -- the restored tabs a daemon restart leaves behind all have one.
+#[test]
+fn a_tab_carries_its_workspace_problem_until_the_workspace_is_ready() {
+    let restored = AgentTab::from_workspace_info(&info(
+        "ws_1",
+        "alpha",
+        WorkspaceState::Error("sandbox would not start".into()),
+    ));
+    assert_eq!(
+        restored.workspace_problem.as_ref().map(|p| p.detail.as_str()),
+        Some("sandbox would not start")
+    );
+
+    let mut w = Workspaces::new_default();
+    w.add_tab(0, tab("ws_1", "alpha"));
+    let ws = WorkspaceId::from("ws_1");
+    assert!(w.set_agent(&ws, AgentId("ag_1".into())));
+
+    w.apply_workspace_info(&info("ws_1", "alpha", WorkspaceState::SandboxDown));
+    let showing = w.active().expect("a tab");
+    assert!(showing.workspace_problem.is_some());
+    // The tooltip reads `detail`, and a bare "sandbox down" there is the
+    // unexplained state this exists to replace.
+    assert!(
+        showing.detail.contains("stopped unexpectedly"),
+        "{:?}",
+        showing.detail
+    );
+
+    w.apply_workspace_info(&info("ws_1", "alpha", WorkspaceState::Error("gone".into())));
+    assert_eq!(
+        w.active().and_then(|t| t.workspace_problem.clone()),
+        workspace_problem(&WorkspaceState::Error("gone".into()))
+    );
+
+    w.apply_workspace_info(&info("ws_1", "alpha", WorkspaceState::Ready));
+    assert_eq!(w.active().and_then(|t| t.workspace_problem.clone()), None);
+}
+
+/// An agent reporting in while its workspace has failed must not paint over
+/// the failure. The badge would read "error" either way, but the reason would
+/// be the agent's and the workspace's would be lost from the tooltip.
+#[test]
+fn an_agent_state_does_not_hide_a_failed_workspace() {
+    let mut w = Workspaces::new_default();
+    w.add_tab(0, tab("ws_1", "alpha"));
+    let ws = WorkspaceId::from("ws_1");
+    let agent = AgentId("ag_1".into());
+    assert!(w.set_agent(&ws, agent.clone()));
+    w.apply_workspace_info(&info(
+        "ws_1",
+        "alpha",
+        WorkspaceState::Error("worktree is gone".into()),
+    ));
+
+    assert!(w
+        .set_agent_status(&agent, TabStatus::Done, "the agent ended")
+        .is_some());
+    let showing = w.active().expect("a tab");
+    assert_eq!(showing.status, TabStatus::Error);
+    assert_eq!(showing.detail, "worktree is gone");
+    assert_eq!(showing.agent_status, Some(TabStatus::Done));
+}
+
+/// A Retry that the daemon refused leaves the workspace in `Error` with the
+/// refusal as its reason. The tab says so at once rather than waiting for an
+/// event that may never come -- a timed-out request has no event behind it.
+#[test]
+fn a_failed_restart_is_the_workspace_s_new_problem() {
+    let mut w = Workspaces::new_default();
+    w.add_tab(0, tab("ws_1", "alpha"));
+    let ws = WorkspaceId::from("ws_1");
+    w.apply_workspace_info(&info("ws_1", "alpha", WorkspaceState::SandboxDown));
+
+    assert!(w.note_restart_failed(&ws, "bwrap: permission denied"));
+    let showing = w.active().expect("a tab");
+    assert_eq!(showing.status, TabStatus::Error);
+    assert_eq!(showing.detail, "bwrap: permission denied");
+    assert_eq!(
+        showing.workspace_problem,
+        workspace_problem(&WorkspaceState::Error("bwrap: permission denied".into()))
+    );
+    assert!(!w.note_restart_failed(&"ws_missing".into(), "x"));
+}
+
+/// Whether a workspace that has just come back needs its agent started: a
+/// Claude tab with no agent, or with one that has ended. A terminal tab never
+/// does, and an agent the daemon says is alive is left alone.
+#[test]
+fn a_recovered_claude_tab_needs_an_agent_unless_one_is_alive() {
+    let mut claude = tab("ws_1", "alpha");
+    claude.adapter = AgentAdapterKind::Claude;
+    assert!(claude.agent_needs_start(), "no agent at all");
+
+    claude.agent_id = Some(AgentId("ag_1".into()));
+    assert!(claude.agent_needs_start(), "an agent nobody has heard from");
+    for (status, needs) in [
+        (TabStatus::Done, true),
+        (TabStatus::Error, true),
+        (TabStatus::Idle, false),
+        (TabStatus::Working, false),
+        (TabStatus::WaitingPermission, false),
+    ] {
+        claude.agent_status = Some(status);
+        assert_eq!(claude.agent_needs_start(), needs, "{status:?}");
+    }
+
+    let terminal = tab("ws_2", "beta");
+    assert!(!terminal.agent_needs_start());
 }

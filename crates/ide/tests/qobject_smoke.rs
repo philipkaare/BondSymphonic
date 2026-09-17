@@ -57,6 +57,7 @@ fn tab(info: &WorkspaceInfo) -> AgentTab {
         agent_detail: String::new(),
         op_error: None,
         attention: String::new(),
+        workspace_problem: None,
     }
 }
 

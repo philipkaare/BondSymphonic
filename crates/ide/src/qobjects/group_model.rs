@@ -207,6 +207,23 @@ pub mod qobject {
         #[qinvokable]
         fn permission_attention(self: &GroupModel, name: QString) -> QString;
 
+        /// Records that `workspace.restart` failed for `workspace_id` with
+        /// `reason`: the tab reads as the failed workspace the daemon leaves
+        /// behind, and its banner shows the new reason. False when the
+        /// workspace is not tracked.
+        #[qinvokable]
+        fn note_restart_failed(
+            self: Pin<&mut GroupModel>,
+            workspace_id: QString,
+            reason: QString,
+        ) -> bool;
+
+        /// Whether `workspace_id` is a Claude tab whose agent is missing or has
+        /// ended, which is what a successful Retry starts again. False for an
+        /// unknown workspace.
+        #[qinvokable]
+        fn agent_needs_start(self: &GroupModel, workspace_id: QString) -> bool;
+
         /// The workspace whose tab is running `agent_id`, or empty. The window
         /// gets agent state events keyed by agent, and the attention calls
         /// above are keyed by workspace.
@@ -860,6 +877,31 @@ impl qobject::GroupModel {
         ))
     }
 
+    pub fn note_restart_failed(
+        mut self: Pin<&mut Self>,
+        workspace_id: QString,
+        reason: QString,
+    ) -> bool {
+        let id = WorkspaceId(workspace_id.to_string());
+        let noted = self
+            .as_mut()
+            .rust_mut()
+            .workspaces
+            .note_restart_failed(&id, &reason.to_string());
+        if noted {
+            self.publish();
+        }
+        noted
+    }
+
+    pub fn agent_needs_start(&self, workspace_id: QString) -> bool {
+        let id = WorkspaceId(workspace_id.to_string());
+        let workspaces = &self.rust().workspaces;
+        workspaces
+            .find(&id)
+            .is_some_and(|(g, t)| workspaces.groups[g].tabs[t].agent_needs_start())
+    }
+
     pub fn agent_workspace_id(&self, agent_id: QString) -> QString {
         let id = AgentId(agent_id.to_string());
         match self
@@ -1090,6 +1132,7 @@ mod tests {
             options_json: String::new(),
             op_error: Some("Merge stopped: conflicts in README.md".to_owned()),
             attention: String::new(),
+            workspace_problem: None,
         }
     }
 
