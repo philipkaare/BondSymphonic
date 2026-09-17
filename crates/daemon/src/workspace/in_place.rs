@@ -500,7 +500,7 @@ impl InPlaceLayout {
             bytes: 0,
         };
         for path in self.hard_link_checked() {
-            scan.file(&path);
+            scan.file(&path, Read::Contents);
         }
         scan.tree(&self.hooks(), &[]);
         scan.tree(&self.info(), &[INFO_REFS]);
@@ -514,7 +514,7 @@ impl InPlaceLayout {
             // empty on every start of the worktree workspace it belongs to,
             // over a file git itself never made.
             scan.empty_or_missing(&entry.join("config.worktree"));
-            scan.file(&entry.join("commondir"));
+            scan.file(&entry.join("commondir"), Read::Contents);
         }
         scan.modules(&self.modules(), 0);
         scan.out
@@ -553,8 +553,11 @@ enum Content {
     /// is kept as well as the bytes so that appending past the cap is a change
     /// too.
     File(u64, Vec<u8>),
-    /// There, but neither a regular file nor a directory.
+    /// A symlink, which is neither.
     Other,
+    /// There, and deliberately not read: its name and its type are all that
+    /// matters about it. See [`Read`].
+    Listed,
     /// Nothing is there.
     Absent,
     /// There, and the daemon could not read it.
@@ -581,31 +584,78 @@ impl Scan<'_> {
     }
 
     /// Records one path, reading it when it is a regular file.
-    fn file(&mut self, path: &Path) {
+    ///
+    /// Opened before it is looked at, rather than `lstat` and then open: on a
+    /// Windows drive every one of those crosses into Windows, the poll has 250
+    /// ms for the whole covered set, and this is the call the set is made of.
+    /// `O_NOFOLLOW` so a symlink is seen as one rather than followed, and
+    /// `O_NONBLOCK` so a FIFO nobody will ever write cannot hold the poll.
+    fn file(&mut self, path: &Path, read: Read) {
         if self.full() {
             return;
         }
-        let content = match std::fs::symlink_metadata(path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Content::Absent,
-            Err(e) => Content::Unreadable(e.to_string()),
-            Ok(m) if m.is_dir() => Content::Dir,
-            Ok(m) if !m.is_file() => Content::Other,
-            Ok(m) => match read_bytes(path) {
-                Ok(bytes) => {
-                    self.bytes += bytes.len() as u64;
-                    Content::File(m.len(), bytes)
-                }
-                Err(e) => Content::Unreadable(e),
-            },
-        };
+        let content = self.contents_of(path, read);
         self.out.push((self.name_of(path), content));
+    }
+
+    fn contents_of(&mut self, path: &Path, read: Read) -> Content {
+        use std::io::Read as _;
+        // Nothing to open, and nothing to `lstat` either: a listed entry is
+        // recorded by its name and its type, and on a Windows drive every
+        // syscall that is not made is a crossing into Windows that is not made.
+        if read == Read::Listed {
+            return match std::fs::symlink_metadata(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Content::Absent,
+                Err(e) => Content::Unreadable(e.to_string()),
+                Ok(m) if m.is_dir() => Content::Dir,
+                Ok(m) if m.is_symlink() => Content::Other,
+                Ok(_) => Content::Listed,
+            };
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = match options.open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Content::Absent,
+            // What `O_NOFOLLOW` answers for a symlink.
+            #[cfg(unix)]
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Content::Other,
+            Err(e) => return Content::Unreadable(e.to_string()),
+        };
+        let meta = match file.metadata() {
+            Ok(m) => m,
+            Err(e) => return Content::Unreadable(e.to_string()),
+        };
+        if meta.is_dir() {
+            return Content::Dir;
+        }
+        if !meta.is_file() || read == Read::Listed {
+            // A `*.sample` hook is listed, not read: git runs a hook by name and
+            // never one with that suffix, so what is *in* one changes nothing.
+            // Renaming it to a name git does run is a new name in the listing,
+            // which is a change like any other.
+            return Content::Listed;
+        }
+        let mut bytes = Vec::new();
+        match file.take(READ_CAP).read_to_end(&mut bytes) {
+            Ok(_) => {
+                self.bytes += bytes.len() as u64;
+                Content::File(meta.len(), bytes)
+            }
+            Err(e) => Content::Unreadable(e.to_string()),
+        }
     }
 
     /// [`Self::file`], with an empty regular file recorded as nothing being
     /// there: for a file whose emptiness is how git is told to ignore it, the
     /// two say the same thing.
     fn empty_or_missing(&mut self, path: &Path) {
-        self.file(path);
+        self.file(path, Read::Contents);
         if let Some((_, content)) = self.out.last_mut() {
             if *content == Content::File(0, Vec::new()) {
                 *content = Content::Absent;
@@ -619,21 +669,36 @@ impl Scan<'_> {
         if self.full() {
             return;
         }
-        self.file(dir);
+        self.file(dir, Read::Contents);
         let Ok(read) = std::fs::read_dir(dir) else {
             return;
         };
-        let mut names: Vec<std::ffi::OsString> = read.flatten().map(|e| e.file_name()).collect();
-        names.sort();
-        for name in names {
+        // The type from the directory entry, so nothing here needs an `lstat`
+        // of its own. A filesystem that does not carry one -- a Windows drive
+        // among them -- answers `None`, and then the open in `file` settles it.
+        let mut entries: Vec<(std::ffi::OsString, Option<std::fs::FileType>)> = read
+            .flatten()
+            .map(|e| (e.file_name(), e.file_type().ok()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, file_type) in entries {
             if skip.iter().any(|s| std::ffi::OsStr::new(s) == name) {
                 continue;
             }
             let path = dir.join(&name);
-            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
-                self.tree(&path, &[]);
-            } else {
-                self.file(&path);
+            let read = Read::of(&name);
+            match file_type {
+                Some(t) if t.is_dir() => self.tree(&path, &[]),
+                // Nothing more to ask: a listed entry is its name and its
+                // type, and the directory listing carried both.
+                Some(t) if read == Read::Listed && t.is_file() => {
+                    self.out.push((self.name_of(&path), Content::Listed))
+                }
+                Some(_) => self.file(&path, read),
+                // A filesystem whose directory entries carry no type. The
+                // `lstat` or the open in `file` settles it instead.
+                None if path.is_dir() => self.tree(&path, &[]),
+                None => self.file(&path, read),
             }
         }
     }
@@ -661,7 +726,7 @@ impl Scan<'_> {
                 continue;
             }
             for file in ["config", "config.worktree", "commondir"] {
-                self.file(&module.join(file));
+                self.file(&module.join(file), Read::Contents);
             }
             self.tree(&module.join("hooks"), &[]);
             self.modules(&module.join("modules"), depth + 1);
@@ -669,27 +734,27 @@ impl Scan<'_> {
     }
 }
 
-/// The first [`READ_CAP`] bytes of a regular file, or why they could not be
-/// read.
-///
-/// The same care as [`read_protected`]: by the time this runs the entry may be
-/// a FIFO nobody will ever write, so the open neither follows a symlink nor
-/// waits.
-fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+/// Whether a covered file's contents are worth reading, or whether its name,
+/// type and length say everything there is to say about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Read {
+    Contents,
+    Listed,
+}
+
+impl Read {
+    /// Git runs a hook by name, and never one named `<hook>.sample` -- those
+    /// are the samples `git init` copies out of its template. Reading a
+    /// kilobyte out of each of the fourteen of them on every poll, on a
+    /// filesystem where every open crosses into Windows, is most of what a
+    /// poll would cost, and it buys nothing: to make one run, an agent has to
+    /// give it a name git knows, which is a new name in the listing.
+    fn of(name: &std::ffi::OsStr) -> Self {
+        match Path::new(name).extension() {
+            Some(ext) if ext == "sample" => Self::Listed,
+            _ => Self::Contents,
+        }
     }
-    let file = options.open(path).map_err(|e| e.to_string())?;
-    let mut bytes = Vec::new();
-    file.take(READ_CAP)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    Ok(bytes)
 }
 
 /// What a protected entry must be.

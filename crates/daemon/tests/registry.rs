@@ -304,3 +304,51 @@ async fn a_registry_write_leaves_the_worker_it_ran_on_running() {
         "the registry write moved the task off its worker, leaving a thread to retire: {seen:?}"
     );
 }
+
+/// Plan C3, the half that was left as a question: does a daemon that meets a
+/// registry version it does not know refuse to load it?
+///
+/// It does not. `load` only ever migrates *upwards*; a version above its own
+/// is taken as "nothing to do", and the next write puts the file back at the
+/// version that daemon writes. So bumping the version when an in-place
+/// workspace is present would not make an older build fail closed on the file
+/// — it would only make the file's version flap — and the defence against an
+/// older build has to be the one `workspace.destroy` makes on the path it is
+/// about to remove.
+///
+/// Pinned here so a later change that *does* make an unknown version a refusal
+/// is a deliberate one, with the version bump that then becomes worth making.
+#[test]
+fn a_registry_from_a_newer_daemon_is_loaded_rather_than_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workspaces.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "version": 99,
+            "workspaces": [{
+                "id": "ws_future",
+                "name": "future",
+                "repo_path": "/repo",
+                "base_branch": "main",
+                "branch": "bs/future/work",
+                "worktree_path": "/repo",
+                "created_at": "2026-09-17T10:00:00Z",
+                "allowlist": [],
+                "state": { "state": "ready" },
+                "agents": [],
+                "runs": [],
+                "kind": "in_place",
+                "something_this_build_has_never_heard_of": true
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let registry = Registry::load(&path).unwrap();
+    assert_eq!(registry.list().len(), 1);
+    // And an unknown field is dropped rather than refused, which is what turns
+    // an in-place workspace into a worktree workspace on an older build.
+    assert_eq!(registry.list()[0].name, "future");
+}

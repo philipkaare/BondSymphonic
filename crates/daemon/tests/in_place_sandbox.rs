@@ -29,6 +29,111 @@ fn ws_id() -> bondsymphonic_proto::WorkspaceId {
     "ws_test".into()
 }
 
+/// A temporary directory on a Windows drive, or `None` when this host has
+/// none to offer.
+///
+/// DrvFs is where the alias hole lives, and it is also where this IDE's
+/// users keep their repositories: they pick a `C:\...` folder in a Windows
+/// dialog and the daemon is handed `/mnt/c/...`. `$BS_DRVFS_TEST_DIR`
+/// first, so a host that keeps its scratch space elsewhere can say where;
+/// otherwise a Windows user's own temp directory, which is the one place
+/// under `/mnt/c` a Linux process can be sure it may write.
+fn drvfs_tempdir() -> Option<tempfile::TempDir> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(named) = std::env::var("BS_DRVFS_TEST_DIR") {
+        candidates.push(PathBuf::from(named));
+    }
+    if let Ok(users) = std::fs::read_dir("/mnt/c/Users") {
+        for user in users.flatten() {
+            candidates.push(user.path().join("AppData/Local/Temp"));
+        }
+    }
+    candidates.into_iter().find_map(|base| {
+        tempfile::Builder::new()
+            .prefix("bs-inplace-")
+            .tempdir_in(base)
+            .ok()
+    })
+}
+
+/// Rewrites a file without replacing it: the same inode, the same mount,
+/// which is how a Windows drive's aliases and a user's editor both write.
+fn write_in_place(path: &Path, bytes: &[u8]) {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(bytes))
+        .unwrap();
+}
+
+/// What the content check costs on a real repository on a Windows drive, where
+/// an `lstat` crosses into Windows and the poll has 250 ms to finish in.
+///
+/// The `.git` of the largest repository to hand is copied onto the drive --
+/// only the parts the check covers, and only for reading -- so the number is
+/// one from a real repository's hooks and worktree registrations rather than
+/// from a `git init`. Printed as well as bounded: the bound is loose enough
+/// not to flake on a busy machine, and the number is what a person reading the
+/// output learns from.
+#[test]
+fn the_content_check_costs_far_less_than_the_poll_it_runs_in() {
+    let Some(drive) = drvfs_tempdir() else {
+        eprintln!("SKIP: no Windows drive to test on");
+        return;
+    };
+    let repo = common::init_repo(drive.path());
+    let real = Path::new("/mnt/c/git/BondSymphonic/.git");
+    if real.is_dir() {
+        for name in ["hooks", "info", "worktrees"] {
+            let _ = std::fs::remove_dir_all(repo.join(".git").join(name));
+            copy_tree(&real.join(name), &repo.join(".git").join(name));
+        }
+        if let Ok(config) = std::fs::read(real.join("config")) {
+            std::fs::write(repo.join(".git/config"), config).unwrap();
+        }
+    }
+    let l = layout(drive.path(), &repo);
+    l.prepare(&ws_id(), &record(drive.path())).unwrap();
+    let snapshot = l.snapshot().unwrap();
+    assert_eq!(snapshot.check(None), None);
+
+    let runs = 10;
+    let started = std::time::Instant::now();
+    for _ in 0..runs {
+        assert_eq!(snapshot.check(None), None);
+    }
+    let each = started.elapsed() / runs;
+    eprintln!("one protection check on a Windows drive: {each:?}");
+    assert!(
+        each < in_place::PROTECTION_POLL,
+        "a check takes {each:?}, which is not far enough inside the {:?} poll",
+        in_place::PROTECTION_POLL
+    );
+}
+
+/// `from` and everything under it copied to `to`, for the timing test. Silent
+/// about what it cannot read: this reads a repository it does not own.
+fn copy_tree(from: &Path, to: &Path) {
+    if std::fs::create_dir_all(to).is_err() {
+        return;
+    }
+    let Ok(read) = std::fs::read_dir(from) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => copy_tree(&src, &dst),
+            Ok(t) if t.is_file() => {
+                let _ = std::fs::copy(&src, &dst);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The top-level names in `.git`, sorted.
 fn git_dir_entries(repo: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(repo.join(".git"))
@@ -143,7 +248,9 @@ fn prepare_refuses_protected_entries_that_are_not_what_git_makes() {
         // Dangling: `outside` does not exist.
         std::os::unix::fs::symlink(&outside, &entry).unwrap();
         let before = git_dir_entries(&repo);
-        let err = layout(&sub, &repo).prepare(&ws_id(), &record(&sub)).unwrap_err();
+        let err = layout(&sub, &repo)
+            .prepare(&ws_id(), &record(&sub))
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams, "{name}");
         let expected = if make_dir {
             format!(".git/{name} that is not a directory")
@@ -536,18 +643,25 @@ fn a_hook_appearing_or_going_is_a_breach() {
     );
     std::fs::remove_file(&remote).unwrap();
 
-    // A sample hook is covered too: it is only its name that keeps git from
-    // running it, and the name is the agent's to change.
+    // A `*.sample` hook is listed but not read: git runs a hook by name and
+    // never one with that suffix, so what is in one is nobody's business --
+    // and reading fourteen of them on every poll is most of what a poll on a
+    // Windows drive would cost. Giving one a name git does run is a new name
+    // in the listing, which is what is actually caught.
     let sample = l.hooks().join("pre-commit.sample");
-    if sample.is_file() {
-        let mut text = std::fs::read_to_string(&sample).unwrap();
-        text.push_str("touch /nonexistent\n");
-        std::fs::write(&sample, text).unwrap();
-        assert_eq!(
-            snapshot.check(None).map(|b| b.entries),
-            Some(vec![".git/hooks/pre-commit.sample".to_string()])
-        );
-    }
+    assert!(sample.is_file(), "git's template made no samples");
+    let mut text = std::fs::read_to_string(&sample).unwrap();
+    text.push_str("touch /nonexistent\n");
+    std::fs::write(&sample, &text).unwrap();
+    assert_eq!(snapshot.check(None), None, "a sample's contents");
+    std::fs::rename(&sample, l.hooks().join("pre-commit")).unwrap();
+    assert_eq!(
+        snapshot.check(None).map(|b| b.entries),
+        Some(vec![
+            ".git/hooks/pre-commit.sample".to_string(),
+            ".git/hooks/pre-commit".to_string(),
+        ])
+    );
 }
 
 /// Plan I3: a second name for a protected file is a way past every bind, so
@@ -626,7 +740,10 @@ fn the_hold_keeps_the_worktrees_directory_for_as_long_as_the_workspace() {
 
     l.release(&ws_id(), &record(dir.path()));
     assert!(!hold.exists(), "release left the hold behind");
-    assert!(!l.worktrees().exists(), "release left .git/worktrees behind");
+    assert!(
+        !l.worktrees().exists(),
+        "release left .git/worktrees behind"
+    );
 }
 
 #[test]
@@ -1155,45 +1272,6 @@ try config-worktree "printf x > .git/config.worktree"
         );
         (sleeper.killer)();
         handle.shutdown().await.unwrap();
-    }
-
-    /// A temporary directory on a Windows drive, or `None` when this host has
-    /// none to offer.
-    ///
-    /// DrvFs is where the alias hole lives, and it is also where this IDE's
-    /// users keep their repositories: they pick a `C:\...` folder in a Windows
-    /// dialog and the daemon is handed `/mnt/c/...`. `$BS_DRVFS_TEST_DIR`
-    /// first, so a host that keeps its scratch space elsewhere can say where;
-    /// otherwise a Windows user's own temp directory, which is the one place
-    /// under `/mnt/c` a Linux process can be sure it may write.
-    fn drvfs_tempdir() -> Option<tempfile::TempDir> {
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Ok(named) = std::env::var("BS_DRVFS_TEST_DIR") {
-            candidates.push(PathBuf::from(named));
-        }
-        if let Ok(users) = std::fs::read_dir("/mnt/c/Users") {
-            for user in users.flatten() {
-                candidates.push(user.path().join("AppData/Local/Temp"));
-            }
-        }
-        candidates.into_iter().find_map(|base| {
-            tempfile::Builder::new()
-                .prefix("bs-inplace-")
-                .tempdir_in(base)
-                .ok()
-        })
-    }
-
-    /// Rewrites a file without replacing it: the same inode, the same mount,
-    /// which is how a Windows drive's aliases and a user's editor both write.
-    fn write_in_place(path: &Path, bytes: &[u8]) {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(path)
-            .and_then(|mut f| f.write_all(bytes))
-            .unwrap();
     }
 
     /// Plan C1, the DrvFs hole: a read-only bind protects one Linux dentry,

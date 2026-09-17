@@ -326,6 +326,12 @@ fn plant_fsmonitor(config_file: &std::path::Path, marker: &std::path::Path) {
             "core.fsmonitor",
             &cmd,
         ])
+        // `--file` needs no repository, but git still sets one up from the
+        // working directory, and the test process inherits whatever the suite
+        // was run from -- a linked worktree whose gitfile names a path this
+        // host cannot resolve, for instance. Somewhere with no repository in it
+        // takes the question away.
+        .current_dir(std::env::temp_dir())
         .status()
         .unwrap();
     assert!(st.success(), "planting core.fsmonitor");
