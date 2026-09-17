@@ -1683,14 +1683,23 @@ struct SlowStop {
     took: Duration,
 }
 
+/// Which record writes a [`stop_with_slow_records`] slows down.
+#[derive(Debug, Clone, Copy)]
+enum SlowWrites {
+    /// Only the writes that close a record: the exit path's own.
+    Closing(Duration),
+    /// Every update, the session id the turn reports on its way included.
+    Every(Duration),
+}
+
 /// Starts an agent whose turn fails and whose stderr arrives 1.5 s after it
-/// exits, makes every write that closes a record take `delay` longer, and stops
-/// it at once.
+/// exits, makes the record writes `slow` names take longer, and stops it at
+/// once.
 ///
 /// The reader always spends its full stderr budget (one second) here, so the
-/// record writes are the only thing that moves: `delay` decides where in the
+/// record writes are the only thing that moves: the delay decides where in the
 /// reader's exit path `stop`'s deadline falls.
-async fn stop_with_slow_record_closing(py: &str, delay: Duration) -> SlowStop {
+async fn stop_with_slow_records(py: &str, slow: SlowWrites) -> SlowStop {
     let dir = tempfile::tempdir().unwrap();
     let repo = init_repo(dir.path());
     use_dying_claude(py, Some("error_result_turn.ndjson"));
@@ -1701,10 +1710,14 @@ async fn stop_with_slow_record_closing(py: &str, delay: Duration) -> SlowStop {
     let mut c = Client::connect(port, &token).await;
     let ws = create_ws(&mut c, &repo, "slowdisk").await;
 
+    // Before the start, because the reader runs from the spawn on and records
+    // the session id as soon as the CLI reports it. The start's own record is
+    // an insert, which the hook leaves alone.
+    match slow {
+        SlowWrites::Closing(by) => d.agents.delay_record_closing_for_tests(by),
+        SlowWrites::Every(by) => d.agents.delay_every_record_write_for_tests(by),
+    }
     let ag = start_agent(&mut c, &ws.id).await;
-    // After the start: the start writes a record too, and it is not the write
-    // under test.
-    d.agents.delay_record_closing_for_tests(delay);
     let started = Instant::now();
     c.call(Request::AgentStop(AgentIdParams {
         agent_id: ag.clone(),
@@ -1737,7 +1750,7 @@ async fn a_slow_record_write_does_not_lose_the_reason_an_agent_ended() {
         eprintln!("SKIP: no python interpreter");
         return;
     };
-    let stop = stop_with_slow_record_closing(py, Duration::from_millis(1500)).await;
+    let stop = stop_with_slow_records(py, SlowWrites::Closing(Duration::from_millis(1500))).await;
     assert_eq!(stop.exits.len(), 1, "{:?}", stop.exits);
     assert!(
         stop.exits[0].contains("Not logged in"),
@@ -1762,7 +1775,7 @@ async fn a_slow_record_write_does_not_swallow_the_exit_announcement() {
         return;
     };
     for delay in [Duration::from_millis(750), Duration::from_secs(3)] {
-        let stop = stop_with_slow_record_closing(py, delay).await;
+        let stop = stop_with_slow_records(py, SlowWrites::Closing(delay)).await;
         assert_eq!(
             stop.exits.len(),
             1,
@@ -1826,7 +1839,8 @@ async fn a_grandchild_holding_stdout_does_not_cost_the_exit_its_reason() {
 
 /// A disk that does not come back within `stop`'s own patience still gets an
 /// answer and exactly one exit: `stop` gives up on the reader, and does not
-/// queue a write of its own behind the stuck one.
+/// queue a write of its own behind the stuck one. The reader had already read
+/// why the turn failed, so the exit `stop` announces says so too.
 #[tokio::test]
 async fn a_stuck_record_write_still_ends_the_stop_with_one_exit() {
     let _guard = ENV.lock().await;
@@ -1834,11 +1848,41 @@ async fn a_stuck_record_write_still_ends_the_stop_with_one_exit() {
         eprintln!("SKIP: no python interpreter");
         return;
     };
-    let stop = stop_with_slow_record_closing(py, Duration::from_secs(8)).await;
+    let stop = stop_with_slow_records(py, SlowWrites::Closing(Duration::from_secs(8))).await;
     assert_eq!(stop.exits.len(), 1, "{:?}", stop.exits);
     assert!(
         stop.took < Duration::from_millis(7500),
         "stop waited on the stuck write: {:?}",
+        stop.took
+    );
+    assert!(
+        stop.exits[0].contains("Not logged in"),
+        "the exit stop announced lost the reason: {:?}",
+        stop.exits
+    );
+}
+
+/// A disk slow for every write -- the session id the turn reports on the way
+/// included -- must not keep the reader from the lines after that report. The
+/// reason the turn failed is on one of them, and an exit announced before the
+/// reader got there cannot say it. What a parallel build does to a disk.
+#[tokio::test]
+async fn a_slow_session_id_write_does_not_cost_the_exit_its_reason() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let stop = stop_with_slow_records(py, SlowWrites::Every(Duration::from_secs(6))).await;
+    assert_eq!(stop.exits.len(), 1, "{:?}", stop.exits);
+    assert!(
+        stop.exits[0].contains("Not logged in"),
+        "the exit lost the reason the turn failed: {:?}",
+        stop.exits
+    );
+    assert!(
+        stop.took < Duration::from_millis(7500),
+        "stop waited on the slow writes: {:?}",
         stop.took
     );
 }

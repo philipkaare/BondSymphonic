@@ -254,10 +254,85 @@ impl AgentEntry {
 /// were asked for. That ordering is load-bearing: `agent.start` records the
 /// agent before it spawns the process precisely so the first session id the
 /// reader sees has a record to land in, and a write that could overtake another
-/// would give that back.
+/// would give that back. A running agent's own writes keep their order through
+/// [`RecordWriter`], which awaits this for each in turn.
 async fn off_the_runtime(what: &'static str, f: impl FnOnce() + Send + 'static) {
     if let Err(e) = tokio::task::spawn_blocking(f).await {
         warn!(error = %e, "{what} panicked");
+    }
+}
+
+/// One record write, and whether somebody is waiting for it.
+struct RecordJob {
+    what: &'static str,
+    write: Box<dyn FnOnce(&AgentRecords) + Send>,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// One agent's record writes, done in the order they were asked for by a task
+/// of their own.
+///
+/// The agent's stdout reader asks for them -- the session id on the way, the
+/// record's close at the end -- and every one ends in an `fsync`. Waiting on
+/// them in the reader put the disk between the protocol lines: a session id
+/// write that a parallel build held up for seconds kept the reader from the
+/// line saying why the turn failed, and an exit announced in the meantime could
+/// not say it. So a write that nobody needs to see finished is only queued,
+/// and the reader goes on reading. A queue rather than a task per write,
+/// because the order still matters: the last session id asked for is the one
+/// the file must end up with.
+#[derive(Clone)]
+struct RecordWriter {
+    jobs: tokio::sync::mpsc::UnboundedSender<RecordJob>,
+}
+
+impl RecordWriter {
+    /// Starts the writer. It ends once every sink holding it is gone, after the
+    /// writes already queued.
+    fn spawn(records: Arc<AgentRecords>) -> Self {
+        let (jobs, mut queue) = tokio::sync::mpsc::unbounded_channel::<RecordJob>();
+        tokio::spawn(async move {
+            while let Some(job) = queue.recv().await {
+                let records = records.clone();
+                let write = job.write;
+                off_the_runtime(job.what, move || write(&records)).await;
+                if let Some(done) = job.done {
+                    let _ = done.send(());
+                }
+            }
+        });
+        Self { jobs }
+    }
+
+    /// Queues `write` without waiting for it.
+    fn ask(&self, what: &'static str, write: impl FnOnce(&AgentRecords) + Send + 'static) {
+        let _ = self.jobs.send(RecordJob {
+            what,
+            write: Box::new(write),
+            done: None,
+        });
+    }
+
+    /// Queues `write` and waits until it, and everything before it, is done.
+    async fn wait(&self, what: &'static str, write: impl FnOnce(&AgentRecords) + Send + 'static) {
+        let (done, finished) = tokio::sync::oneshot::channel();
+        if self
+            .jobs
+            .send(RecordJob {
+                what,
+                write: Box::new(write),
+                done: Some(done),
+            })
+            .is_ok()
+        {
+            let _ = finished.await;
+        }
+    }
+
+    /// Waits for everything queued so far.
+    async fn written(&self) {
+        self.wait("waiting for the agent's record writes", |_| {})
+            .await;
     }
 }
 
@@ -282,7 +357,7 @@ pub struct AgentSink {
     /// Where this agent's record is kept, so a session id and an exit reach the
     /// file the next daemon reads. `None` in the unit tests below, which have no
     /// data directory and nothing to restore into.
-    records: Option<Arc<AgentRecords>>,
+    records: Option<RecordWriter>,
     /// Set by the first [`ended`](AgentSink::ended), shared by every clone. The
     /// record is closed once: the moment the process ended is what it wants,
     /// and a second write would only put an `fsync` in front of whoever asked.
@@ -318,8 +393,18 @@ impl AgentSink {
     /// Separate from [`new`](AgentSink::new) so the sink stays constructible
     /// without a data directory: only [`AgentManager`] has one.
     pub fn with_records(mut self, records: Arc<AgentRecords>) -> Self {
-        self.records = Some(records);
+        self.records = Some(RecordWriter::spawn(records));
         self
+    }
+
+    /// Waits until every record write asked for so far has happened.
+    ///
+    /// [`session_id`](AgentSink::session_id) only asks; this is for whoever
+    /// needs the file to show it, which is the tests.
+    pub async fn records_written(&self) {
+        if let Some(writer) = &self.records {
+            writer.written().await;
+        }
     }
 
     /// Records one transcript entry and publishes it.
@@ -391,8 +476,10 @@ impl AgentSink {
     ///
     /// Recorded as well as remembered: it is the one thing a client needs to
     /// carry a conversation across a daemon restart, by starting a new agent
-    /// with `options.resume_session`.
-    pub async fn session_id(&self, id: String) {
+    /// with `options.resume_session`. The write is queued, not waited for: see
+    /// [`RecordWriter`]. The entry has the id at once, which is what everything
+    /// in this daemon reads.
+    pub fn session_id(&self, id: String) {
         // The CLI reports the session on every `init` line, which is once per
         // turn on a resumed conversation, and the record is a file: nothing is
         // written unless the id actually moved.
@@ -405,14 +492,13 @@ impl AgentSink {
         if !changed {
             return;
         }
-        let Some(records) = self.records.clone() else {
+        let Some(records) = &self.records else {
             return;
         };
         let agent = self.agent_id.clone();
-        off_the_runtime("recording an agent's session id", move || {
+        records.ask("recording an agent's session id", move |records| {
             records.update(&agent, |r| r.session_id = Some(id))
-        })
-        .await;
+        });
     }
 
     /// The agent's process is gone: closes its transcript file and its record,
@@ -432,16 +518,23 @@ impl AgentSink {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
-        let Some(records) = self.records.clone() else {
+        let Some(records) = &self.records else {
             return;
         };
         let agent = self.agent_id.clone();
-        off_the_runtime("closing an agent's record", move || {
-            records.update(&agent, |r| {
-                r.ended_at.get_or_insert_with(now_rfc3339);
+        // Taken now, not when the queue gets to it: the moment the process
+        // ended is what the record wants.
+        let now = now_rfc3339();
+        // Waited for, behind whatever this agent queued before it: a client
+        // that reacts to `Exited` by restarting the daemon must find the
+        // record closed.
+        records
+            .wait("closing an agent's record", move |records| {
+                records.update(&agent, |r| {
+                    r.ended_at.get_or_insert(now);
+                })
             })
-        })
-        .await;
+            .await;
     }
 
     pub fn agent_id(&self) -> &AgentId {
@@ -571,6 +664,12 @@ impl AgentManager {
     #[doc(hidden)]
     pub fn delay_record_closing_for_tests(&self, by: std::time::Duration) {
         self.records.delay_closing_writes(by);
+    }
+
+    /// Test hook: see [`AgentRecords::delay_every_write`].
+    #[doc(hidden)]
+    pub fn delay_every_record_write_for_tests(&self, by: std::time::Duration) {
+        self.records.delay_every_write(by);
     }
 
     /// An agent id no agent in the map already holds.
@@ -1165,9 +1264,11 @@ mod tests {
         // The wrong order: the agent speaks, and only then is it recorded.
         let entry = Arc::new(AgentEntry::new(ws.clone(), AgentAdapterKind::Claude));
         let s = sink(&entry);
-        s.session_id("sess-1".into()).await;
+        s.session_id("sess-1".into());
+        s.records_written().await;
         records.upsert(blank());
-        s.session_id("sess-1".into()).await;
+        s.session_id("sess-1".into());
+        s.records_written().await;
         assert_eq!(
             records.load()[0].session_id,
             None,
@@ -1180,12 +1281,15 @@ mod tests {
         let entry = Arc::new(AgentEntry::new(ws.clone(), AgentAdapterKind::Claude));
         let s = sink(&entry);
         records.upsert(blank());
-        s.session_id("sess-1".into()).await;
+        s.session_id("sess-1".into());
+        s.records_written().await;
         assert_eq!(records.load()[0].session_id.as_deref(), Some("sess-1"));
-        s.session_id("sess-1".into()).await;
+        s.session_id("sess-1".into());
+        s.records_written().await;
         assert_eq!(records.load()[0].session_id.as_deref(), Some("sess-1"));
         // And a session that really does move is followed.
-        s.session_id("sess-2".into()).await;
+        s.session_id("sess-2".into());
+        s.records_written().await;
         assert_eq!(records.load()[0].session_id.as_deref(), Some("sess-2"));
     }
 

@@ -541,6 +541,30 @@ fn resumed(state: AgentState, nothing_pending: bool, items: &[Parsed]) -> bool {
     }
 }
 
+/// What an agent's exit is announced with, whichever of the reader and `stop`
+/// announces it.
+///
+/// An error result already said why the turn failed, and that is the more
+/// useful of the two messages -- so it becomes the exit's detail rather than
+/// replacing the exit. An agent left in `Error` is one the IDE shows as a live
+/// tab for ever, and one whose next turn comes back as a broken pipe instead of
+/// "this agent ended".
+///
+/// The code still goes on the end of it, in the same layout the stderr tail
+/// gets: the reason the turn failed is the better half of the story and leads,
+/// but an exit that says only what went wrong and not how the process went
+/// leaves out the one thing the daemon knows and the agent never said.
+///
+/// One function for both paths, because which of them announces is decided by
+/// timing: `stop` announces when it gave up on the reader, and the reason is
+/// just as true then.
+fn exit_detail_for(entry: &super::AgentEntry, code: i32, tail: &Tail) -> String {
+    match entry.state() {
+        (AgentState::Error, Some(why)) => format!("{why} (exit code {code})"),
+        _ => exit_detail(code, tail, Layout::TailFirst),
+    }
+}
+
 /// The half of the adapter that only exists while the process does.
 struct Running {
     /// Serialises the writers: `send`, `permission_reply` and `interrupt` can
@@ -803,7 +827,7 @@ impl AgentAdapter for ClaudeAdapter {
                             sink.message(body).await;
                         }
                         Parsed::State(state, detail) => sink.state(state, detail).await,
-                        Parsed::SessionId(id) => sink.session_id(id).await,
+                        Parsed::SessionId(id) => sink.session_id(id),
                         Parsed::Nothing => {}
                     }
                 }
@@ -828,21 +852,7 @@ impl AgentAdapter for ClaudeAdapter {
             // Here, before the claim below, because it is a disk write: see
             // the claim.
             sink.ended().await;
-            // An error result already said why the turn failed, and that is the
-            // more useful of the two messages -- so it becomes the exit's
-            // detail rather than replacing the exit. An agent left in `Error`
-            // is one the IDE shows as a live tab for ever, and one whose next
-            // turn comes back as a broken pipe instead of "this agent ended".
-            //
-            // The code still goes on the end of it, in the same layout the
-            // stderr tail gets: the reason the turn failed is the better half
-            // of the story and leads, but an exit that says only what went
-            // wrong and not how the process went leaves out the one thing the
-            // daemon knows and the agent never said.
-            let detail = match sink.entry().state() {
-                (AgentState::Error, Some(why)) => format!("{why} (exit code {code})"),
-                _ => exit_detail(code, &tail, Layout::TailFirst),
-            };
+            let detail = exit_detail_for(sink.entry(), code, &tail);
             // `stop` may be ending this same process; the flag makes one of the
             // two announce and the other stay quiet, so a process that exits on
             // its own and is then stopped still produces one `Exited`.
@@ -1030,7 +1040,7 @@ impl AgentAdapter for ClaudeAdapter {
         // leave this path queued behind it.
         self.sink.ended().await;
         if !self.exit_announced.swap(true, Ordering::SeqCst) {
-            let detail = code.map(|c| exit_detail(c, &self.stderr_tail, Layout::TailFirst));
+            let detail = code.map(|c| exit_detail_for(self.sink.entry(), c, &self.stderr_tail));
             self.sink.publish_state(AgentState::Exited, detail);
         }
         Ok(())

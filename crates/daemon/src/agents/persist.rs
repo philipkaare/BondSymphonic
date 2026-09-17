@@ -77,6 +77,9 @@ pub struct AgentRecords {
     /// closed takes on top of the write itself. See
     /// [`delay_closing_writes`](Self::delay_closing_writes).
     closing_delay: Mutex<Option<std::time::Duration>>,
+    /// Test hook: the same for every update. See
+    /// [`delay_every_write`](Self::delay_every_write).
+    every_delay: Mutex<Option<std::time::Duration>>,
 }
 
 impl AgentRecords {
@@ -85,6 +88,7 @@ impl AgentRecords {
             path: path.into(),
             lock: Mutex::new(()),
             closing_delay: Mutex::new(None),
+            every_delay: Mutex::new(None),
         }
     }
 
@@ -100,6 +104,14 @@ impl AgentRecords {
     #[doc(hidden)]
     pub fn delay_closing_writes(&self, by: std::time::Duration) {
         *self.closing_delay.lock() = Some(by);
+    }
+
+    /// [`delay_closing_writes`](Self::delay_closing_writes) for every update,
+    /// the session id a turn records included: a disk that is slow for
+    /// everyone, which is what a parallel build makes of it.
+    #[doc(hidden)]
+    pub fn delay_every_write(&self, by: std::time::Duration) {
+        *self.every_delay.lock() = Some(by);
     }
 
     pub fn path(&self) -> &Path {
@@ -215,8 +227,10 @@ impl AgentRecords {
         f(record);
         record.options.api_key = None;
         let closing_delay = *self.closing_delay.lock();
-        if let (Some(by), Some(_)) = (closing_delay, &record.ended_at) {
-            std::thread::sleep(by);
+        let every_delay = *self.every_delay.lock();
+        match (every_delay, closing_delay, &record.ended_at) {
+            (Some(by), _, _) | (None, Some(by), Some(_)) => std::thread::sleep(by),
+            _ => {}
         }
         self.save_locked(&all);
     }
