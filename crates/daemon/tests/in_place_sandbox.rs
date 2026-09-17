@@ -7,7 +7,7 @@
 mod common;
 
 use bondsymphonic_daemon::git::repo::RepoKind;
-use bondsymphonic_daemon::workspace::in_place::{self, InPlaceLayout};
+use bondsymphonic_daemon::workspace::in_place::{self, InPlaceLayout, ProtectedSnapshot};
 use bondsymphonic_proto::ErrorCode;
 use std::path::{Path, PathBuf};
 
@@ -57,6 +57,7 @@ fn prepare_makes_only_the_documented_entries() {
         [
             "branches",
             "commondir",
+            "config.worktree",
             "hooks",
             "info",
             "remotes",
@@ -64,11 +65,14 @@ fn prepare_makes_only_the_documented_entries() {
         ]
     );
     assert_eq!(std::fs::read(l.commondir()).unwrap(), b".\n");
-    // Only the on-demand directories are recorded, and only once each.
+    // Only the on-demand entries are recorded, and only once each.
     let recorded = std::fs::read_to_string(record(dir.path())).unwrap();
     let mut lines: Vec<&str> = recorded.lines().collect();
     lines.sort();
-    assert_eq!(lines, ["branches", "remotes", "worktrees"]);
+    assert_eq!(
+        lines,
+        ["branches", "config.worktree", "remotes", "worktrees"]
+    );
     // Idempotent: a restart prepares the same repository again, and what the
     // first start created is still remembered as the daemon's.
     l.prepare(false, &record(dir.path())).unwrap();
@@ -88,12 +92,14 @@ fn prepare_makes_only_the_documented_entries() {
 }
 
 #[test]
-fn prepare_creates_config_worktree_only_with_the_extension_and_keeps_its_content() {
+fn prepare_always_creates_config_worktree_and_keeps_its_content() {
     let dir = tempfile::tempdir().unwrap();
     let repo = common::init_repo(dir.path());
     let l = layout(dir.path(), &repo);
+    // With the extension off too: `git sparse-checkout init` turns it on
+    // later and keeps whatever the file holds by then.
     l.prepare(false, &record(dir.path())).unwrap();
-    assert!(!l.config_worktree().exists());
+    assert_eq!(std::fs::read(l.config_worktree()).unwrap(), b"");
     l.prepare(true, &record(dir.path())).unwrap();
     assert_eq!(std::fs::read(l.config_worktree()).unwrap(), b"");
     // The user's own file is theirs: never truncated.
@@ -102,6 +108,62 @@ fn prepare_creates_config_worktree_only_with_the_extension_and_keeps_its_content
     assert!(std::fs::read_to_string(l.config_worktree())
         .unwrap()
         .contains("sparseCheckout"));
+    // ... and not taken back at Close, though the daemon made the file.
+    l.release(&record(dir.path()));
+    assert!(l.config_worktree().is_file());
+}
+
+/// A bind follows a symlink, and writing a missing file through a dangling
+/// one creates its target: every protected entry must be what git makes, and
+/// a refusal writes nothing.
+#[cfg(unix)]
+#[test]
+fn prepare_refuses_protected_entries_that_are_not_what_git_makes() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    for (name, make_dir) in [
+        ("config.worktree", false),
+        ("commondir", false),
+        ("hooks", true),
+        ("worktrees", true),
+        ("config", false),
+    ] {
+        let sub = dir.path().join(name);
+        std::fs::create_dir_all(&sub).unwrap();
+        let repo = common::init_repo(&sub);
+        let entry = repo.join(".git").join(name);
+        let _ = std::fs::remove_dir_all(&entry);
+        let _ = std::fs::remove_file(&entry);
+        // Dangling: `outside` does not exist.
+        std::os::unix::fs::symlink(&outside, &entry).unwrap();
+        let before = git_dir_entries(&repo);
+        let err = layout(&sub, &repo)
+            .prepare(false, &record(&sub))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams, "{name}");
+        let expected = if make_dir {
+            format!(".git/{name} that is not a directory")
+        } else {
+            format!(".git/{name} that is not a regular file")
+        };
+        assert!(err.message.contains(&expected), "{name}: {}", err.message);
+        assert!(!outside.exists(), "{name}: wrote through the symlink");
+        assert_eq!(git_dir_entries(&repo), before, "{name}");
+        assert!(!record(&sub).exists(), "{name}");
+    }
+
+    // A directory where git keeps a file is refused the same way.
+    let repo = common::init_repo(&dir.path().join("dir"));
+    std::fs::create_dir(repo.join(".git/config.worktree")).unwrap();
+    let err = layout(dir.path(), &repo)
+        .prepare(false, &record(dir.path()))
+        .unwrap_err();
+    assert!(
+        err.message
+            .contains("config.worktree that is not a regular file"),
+        "{}",
+        err.message
+    );
 }
 
 #[test]
@@ -194,7 +256,8 @@ fn late_binds_follow_what_the_repository_has() {
             ".git/info",
             ".git/worktrees",
             ".git/remotes",
-            ".git/branches"
+            ".git/branches",
+            ".git/config.worktree"
         ]
     );
     std::fs::create_dir_all(l.modules()).unwrap();
@@ -319,6 +382,78 @@ fn a_merge_refusal_carries_the_in_place_reason() {
     );
 }
 
+/// Only a replaced or removed entry has lost its bind; an edit in place has
+/// not, and must not stop the agent.
+#[test]
+fn a_snapshot_notices_replaced_and_removed_entries_but_not_edits_in_place() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let l = layout(dir.path(), &repo);
+    l.prepare(false, &record(dir.path())).unwrap();
+    let snapshot = l.snapshot().unwrap();
+    assert_eq!(snapshot.check(None), None);
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(l.config())
+        .unwrap()
+        .write_all(b"[bs]\n\tnote = edited in place\n")
+        .unwrap();
+    assert_eq!(snapshot.check(None), None);
+
+    // `git config` writes `config.lock` and renames it over `config`.
+    common::git_ok(&repo, &["config", "core.fsmonitor", "touch /nonexistent"]);
+    let breach = snapshot.check(None).unwrap();
+    assert_eq!(breach.entries, [".git/config"]);
+    assert!(
+        breach
+            .config_diff
+            .starts_with("--- a/.git/config\n+++ b/.git/config\n"),
+        "{}",
+        breach.config_diff
+    );
+    for line in [
+        "+[bs]",
+        "+\tnote = edited in place",
+        "+\tfsmonitor = touch /nonexistent",
+        " [core]",
+    ] {
+        assert!(
+            breach.config_diff.lines().any(|l| l == line),
+            "{line:?} in:\n{}",
+            breach.config_diff
+        );
+    }
+    assert!(!breach
+        .config_diff
+        .lines()
+        .any(|l| l.starts_with('-') && !l.starts_with("---")));
+
+    std::fs::remove_dir(l.worktrees()).unwrap();
+    let breach = snapshot.check(None).unwrap();
+    assert_eq!(breach.entries, [".git/config", ".git/worktrees"]);
+    assert_eq!(
+        breach.sentence(),
+        "Git files this workspace protects were replaced while the agent was running \
+         (.git/config, .git/worktrees), so its sandbox was stopped. Check .git/config for \
+         settings you did not make — the daemon log shows what changed — then press Retry."
+    );
+}
+
+#[test]
+fn a_breach_with_unchanged_files_has_no_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let l = layout(dir.path(), &repo);
+    l.prepare(false, &record(dir.path())).unwrap();
+    let snapshot = l.snapshot().unwrap();
+    std::fs::remove_dir(l.remotes()).unwrap();
+    let breach = snapshot.check(None).unwrap();
+    assert_eq!(breach.entries, [".git/remotes"]);
+    assert_eq!(breach.config_diff, "");
+}
+
 /// The escape R1 in the plan closes, from the daemon's side: a planted
 /// `commondir` with a config of its own must not reach the pinned git.
 #[cfg(unix)]
@@ -365,7 +500,9 @@ async fn the_pinned_git_ignores_a_planted_commondir() {
 #[cfg(target_os = "linux")]
 mod bwrap {
     use super::*;
-    use bondsymphonic_daemon::sandbox::{backend_for, SandboxCommand, SandboxHandle, SandboxSpec};
+    use bondsymphonic_daemon::sandbox::{
+        backend_for, SandboxChild, SandboxCommand, SandboxHandle, SandboxSpec,
+    };
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
 
@@ -408,9 +545,13 @@ mod bwrap {
     /// The spec an in-place workspace gets, minus the parts (proxy, Claude,
     /// cache) that have nothing to do with `.git`. Home and run dir sit two
     /// levels under a data dir, as the backend expects.
-    async fn sandbox_over(dir: &Path, l: &InPlaceLayout) -> Arc<dyn SandboxHandle> {
+    async fn sandbox_over(
+        dir: &Path,
+        l: &InPlaceLayout,
+    ) -> (Arc<dyn SandboxHandle>, ProtectedSnapshot) {
         let wc = l.worktree_config_enabled().await.unwrap();
         l.prepare(wc, &record(dir)).unwrap();
+        let snapshot = l.snapshot().unwrap();
         let data = dir.join("data");
         let home = data.join("homes/ws_inplace");
         let run = data.join("run/ws_inplace");
@@ -430,7 +571,8 @@ mod bwrap {
             env: vec![],
             cwd: l.root.clone(),
         };
-        backend_for("linux_bwrap").start(&spec).await.unwrap()
+        let handle = backend_for("linux_bwrap").start(&spec).await.unwrap();
+        (handle, snapshot)
     }
 
     const PROBE: &str = r#"
@@ -470,7 +612,7 @@ try config-worktree "printf x > .git/config.worktree"
         let _ = std::fs::remove_dir_all(repo.join(".git/branches"));
         let l = layout(dir.path(), &repo);
         let before = git_dir_entries(&repo);
-        let handle = sandbox_over(dir.path(), &l).await;
+        let (handle, snapshot) = sandbox_over(dir.path(), &l).await;
 
         // Nothing but the documented entries appeared, bwrap included.
         let added: Vec<String> = git_dir_entries(&repo)
@@ -526,6 +668,10 @@ try config-worktree "printf x > .git/config.worktree"
             config_before
         );
         assert_eq!(std::fs::read(l.commondir()).unwrap(), b".\n");
+        // Nothing the agent did, allowed or refused, reads as a breach.
+        let (pid, sleeper) = sandbox_host_pid(&handle).await;
+        assert_eq!(snapshot.check(Some(pid)), None);
+        (sleeper.killer)();
         handle.shutdown().await.unwrap();
     }
 
@@ -541,7 +687,7 @@ try config-worktree "printf x > .git/config.worktree"
         let repo = common::init_repo(dir.path());
         let config_before = std::fs::read(repo.join(".git/config")).unwrap();
         let l = layout(dir.path(), &repo);
-        let handle = sandbox_over(dir.path(), &l).await;
+        let (handle, _) = sandbox_over(dir.path(), &l).await;
         let (code, _) = run_in(&handle, &format!("rm -rf '{}/.git'", repo.display())).await;
         assert_ne!(code, 0, "rm -rf .git must fail");
         assert!(repo.join(".git").is_dir());
@@ -550,6 +696,126 @@ try config-worktree "printf x > .git/config.worktree"
             std::fs::read(repo.join(".git/config")).unwrap(),
             config_before
         );
+        handle.shutdown().await.unwrap();
+    }
+
+    /// The host pid of a process inside the sandbox, whose `mountinfo` is the
+    /// sandbox's. The spawn answers with the pid inside the sandbox's own pid
+    /// namespace, so the sleeper is found by a command line no other process
+    /// has.
+    async fn sandbox_host_pid(handle: &Arc<dyn SandboxHandle>) -> (u32, SandboxChild) {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let arg = format!(
+            "3600.{}{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let child = handle
+            .spawn(SandboxCommand {
+                argv: vec!["sleep".into(), arg.clone()],
+                env: vec![],
+                cwd: None,
+                pty: None,
+            })
+            .await
+            .unwrap();
+        let wanted = format!("sleep\0{arg}\0");
+        for _ in 0..100 {
+            for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+                let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                    continue;
+                };
+                if std::fs::read(entry.path().join("cmdline")).is_ok_and(|c| c == wanted.as_bytes())
+                {
+                    return (pid, child);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the sleeper never showed up in /proc");
+    }
+
+    /// Plan C1: a git outside the sandbox that replaces a bound entry
+    /// detaches its bind, and the only defence is noticing. The repository
+    /// path has a space in it, which `mountinfo` spells `\040`.
+    #[tokio::test]
+    async fn a_host_git_replacing_config_mid_session_is_a_breach() {
+        if !bwrap_available() {
+            eprintln!("SKIP: bwrap unavailable");
+            return;
+        }
+        let dir = tempfile::Builder::new()
+            .prefix("in place ")
+            .tempdir()
+            .unwrap();
+        let repo = common::init_repo(dir.path());
+        let l = layout(dir.path(), &repo);
+        let (handle, snapshot) = sandbox_over(dir.path(), &l).await;
+        let (pid, sleeper) = sandbox_host_pid(&handle).await;
+        assert_eq!(snapshot.check(Some(pid)), None, "an untouched session");
+
+        // The user edits the file in place: the bind stands.
+        let mut config = std::fs::read_to_string(l.config()).unwrap();
+        config.push_str("[bs]\n\tnote = edited in place\n");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(l.config())
+            .and_then(|mut f| std::io::Write::write_all(&mut f, config.as_bytes()))
+            .unwrap();
+        assert_eq!(snapshot.check(Some(pid)), None, "an edit in place");
+
+        // What `git config` does: write `config.lock`, rename it over.
+        let lock = repo.join(".git/config.lock");
+        std::fs::write(
+            &lock,
+            format!("{config}[core]\n\tfsmonitor = touch /tmp/pwned\n"),
+        )
+        .unwrap();
+        std::fs::rename(&lock, l.config()).unwrap();
+        let breach = snapshot.check(Some(pid)).unwrap();
+        assert_eq!(breach.entries, [".git/config"]);
+        assert!(
+            breach
+                .config_diff
+                .lines()
+                .any(|line| line == "+\tfsmonitor = touch /tmp/pwned"),
+            "{}",
+            breach.config_diff
+        );
+        (sleeper.killer)();
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_host_removing_worktrees_mid_session_is_a_breach_even_once_it_is_back() {
+        if !bwrap_available() {
+            eprintln!("SKIP: bwrap unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = common::init_repo(dir.path());
+        let l = layout(dir.path(), &repo);
+        let (handle, snapshot) = sandbox_over(dir.path(), &l).await;
+        let (pid, sleeper) = sandbox_host_pid(&handle).await;
+        assert_eq!(snapshot.check(Some(pid)), None);
+
+        // The last `git worktree remove` takes the directory with it.
+        std::fs::remove_dir(l.worktrees()).unwrap();
+        let breach = snapshot.check(Some(pid)).unwrap();
+        assert_eq!(breach.entries, [".git/worktrees"]);
+        assert_eq!(breach.config_diff, "");
+
+        // The next `git worktree add` makes it again, possibly with the old
+        // inode number; the sandbox's mount is gone either way.
+        std::fs::create_dir(l.worktrees()).unwrap();
+        let breach = snapshot.check(Some(pid)).unwrap();
+        assert_eq!(breach.entries, [".git/worktrees"]);
+        let mounts = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")).unwrap();
+        assert!(
+            !mounts.contains(&format!(" {} ", l.worktrees().display())),
+            "the bind should be gone:\n{mounts}"
+        );
+        (sleeper.killer)();
         handle.shutdown().await.unwrap();
     }
 }
