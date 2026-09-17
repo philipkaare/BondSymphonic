@@ -227,11 +227,18 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
             // read-only binds need is put back even if something removed it
             // while the sandbox was down.
             let layout = InPlaceLayout::new(&ws.worktree_path, &d.dirs.no_hooks());
-            layout.prepare(&d.dirs.in_place_record(&ws.id))?;
-            // After `prepare`, so it is of the entries the binds are about to
-            // be made on, and before the sandbox, so nothing can replace one
-            // unseen in between.
-            let snapshot = layout.snapshot().map_err(|e| RpcError::io(&e))?;
+            // Under the repository lock, as Close's `release` is: a worktree
+            // create or removal running beside this makes and deletes
+            // `.git/worktrees` too.
+            let snapshot = {
+                let repo_lock = crate::git::repo_lock(&ws.repo_path);
+                let _repo_guard = repo_lock.lock().await;
+                layout.prepare(&d.dirs.in_place_record(&ws.id))?;
+                // After `prepare`, so it is of the entries the binds are about
+                // to be made on, and before the sandbox, so nothing can replace
+                // one unseen in between.
+                layout.snapshot().map_err(|e| RpcError::io(&e))?
+            };
             (in_place_spec_for(d, ws, &layout, &snapshot), Some(snapshot))
         }
     };
@@ -508,7 +515,12 @@ fn watch_protection(
             // counts. A live sandbox whose pid cannot be found has no mount
             // table to vouch for it, so it gets pid 0, which has no `/proc`
             // entry and so reads as a breach.
-            let pid = handle.host_pid().unwrap_or(0);
+            let pid = handle.host_pid().unwrap_or_else(|| {
+                // The breach sentence will say files were replaced; the log
+                // says what actually happened.
+                tracing::error!(ws = %id, "cannot find the sandbox's pid to read its mount table");
+                0
+            });
             // Off the runtime: on a DrvFs mount even an `lstat` can wait on
             // Windows.
             let check = {
@@ -524,6 +536,14 @@ fn watch_protection(
                 }
             }
         };
+        let gate = gate(&id);
+        let mut count = gate.lock().await;
+        // Looked at again under the gate, and before anything is said: a
+        // restart or Close that got there first owns the workspace now, and
+        // the sandbox it took down is no breach.
+        if !is_current(&d) || d.registry.get(&id).is_none() {
+            return;
+        }
         let sentence = breach.sentence();
         tracing::warn!(ws = %id, entries = ?breach.entries, "protected git entries were replaced");
         d.events.publish(
@@ -533,22 +553,11 @@ fn watch_protection(
                 message: if breach.config_diff.is_empty() {
                     sentence.clone()
                 } else {
-                    format!(
-                        "{sentence}
-{}",
-                        breach.config_diff
-                    )
+                    format!("{sentence}\n{}", breach.config_diff)
                 },
                 host: None,
             },
         );
-        let gate = gate(&id);
-        let mut count = gate.lock().await;
-        // Looked at again under the gate: a restart or Close that got there
-        // first owns the workspace now.
-        if !is_current(&d) || d.registry.get(&id).is_none() {
-            return;
-        }
         *count += 1;
         tear_down_sandbox(&d, &id).await;
         if let Err(e) = d.set_state(&id, WorkspaceState::Error(sentence)).await {
@@ -690,6 +699,11 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
     };
 
     seed_home(d, &ws).await;
+    // Under the new workspace's gate, like every other sandbox start: a
+    // protection breach found while the shim is still coming up then waits
+    // for `Ready` to be written, rather than being overwritten by it.
+    let gate = gate(&ws.id);
+    let _count = gate.lock().await;
     match start_sandbox(d, &ws).await {
         Ok(()) => Ok(d.workspace_info(&d.set_state(&ws.id, WorkspaceState::Ready).await?)),
         Err(e) => {
@@ -833,6 +847,9 @@ async fn create_in_place(
         ));
     }
     let layout = InPlaceLayout::new(repo_path, &d.dirs.no_hooks());
+    // What would stop every sandbox start is a refusal now, not a workspace
+    // registered only to sit in `Error`.
+    layout.check_preparable()?;
     // Display only: never switched, created or deleted, and nothing merges
     // into it, so the base branch says the same.
     let branch = in_place::head_branch(&layout.git(), repo_path).await?;

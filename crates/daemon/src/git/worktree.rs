@@ -1,6 +1,6 @@
 use super::{path_arg, repo, Git};
 use bondsymphonic_proto::{ErrorCode, RpcError};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Layout {
@@ -710,6 +710,76 @@ async fn read_tree(layout: &Layout) -> Result<(), RpcError> {
         .map(|_| ())
 }
 
+/// What a hold's `locked` file says, for anyone who finds one.
+const HOLD_REASON: &str = "BondSymphonic keeps this directory while it removes a worktree\n";
+
+/// The name every hold entry starts with.
+const HOLD_PREFIX: &str = ".bs-hold-";
+
+/// Keeps `<git common dir>/worktrees` in place while the daemon removes or
+/// prunes worktrees, for as long as the value lives.
+///
+/// Git deletes that directory when the last linked worktree goes. An in-place
+/// workspace of the same repository has it bound read-only, and the bind does
+/// not survive the directory: the sandbox would be stopped over the daemon's
+/// own cleanup. So a registration-shaped entry holding only a `locked` file
+/// sits in it meanwhile. Git skips a locked entry when it prunes (it asks
+/// before looking for a `gitdir`), `worktree list` skips an entry with no
+/// `gitdir`, and the directory is then never empty when git tries to remove
+/// it. Measured with git 2.43: `list`, `remove`, `prune`, `repair`, `fsck`
+/// and `gc` all leave such an entry and the directory alone.
+///
+/// Only where the directory already exists: without one there is nothing a
+/// bind could be holding. Callers hold the repository lock, so any other hold
+/// found here is one a stopped daemon left behind and is taken away first.
+/// Best effort throughout: a hold that cannot be made costs an in-place
+/// sandbox a restart, not the removal.
+pub struct WorktreesHold {
+    entry: Option<PathBuf>,
+}
+
+impl WorktreesHold {
+    pub fn take(git_common: &Path) -> Self {
+        let worktrees = git_common.join("worktrees");
+        if !std::fs::symlink_metadata(&worktrees).is_ok_and(|m| m.is_dir()) {
+            return Self { entry: None };
+        }
+        if let Ok(read) = std::fs::read_dir(&worktrees) {
+            for stale in read.flatten() {
+                if stale.file_name().to_string_lossy().starts_with(HOLD_PREFIX) {
+                    release_hold(&stale.path());
+                }
+            }
+        }
+        let entry = worktrees.join(format!("{HOLD_PREFIX}{}", crate::ids::new_id("")));
+        let made = std::fs::create_dir(&entry)
+            .and_then(|()| std::fs::write(entry.join("locked"), HOLD_REASON));
+        match made {
+            Ok(()) => Self { entry: Some(entry) },
+            Err(e) => {
+                tracing::warn!(path = %entry.display(), error = %e, "cannot hold the worktrees directory");
+                release_hold(&entry);
+                Self { entry: None }
+            }
+        }
+    }
+}
+
+impl Drop for WorktreesHold {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            release_hold(&entry);
+        }
+    }
+}
+
+/// Takes a hold entry away: its `locked` file and then the entry, and nothing
+/// else -- an entry that holds more is not one the daemon made.
+fn release_hold(entry: &Path) {
+    let _ = std::fs::remove_file(entry.join("locked"));
+    let _ = std::fs::remove_dir(entry);
+}
+
 /// Removes the worktree, its registration and its branch.
 ///
 /// [`remove_with`] with [`RemoveBranch::Always`]: what `workspace.destroy`
@@ -732,6 +802,7 @@ pub async fn remove(layout: &Layout) -> Result<(), RpcError> {
 /// the worktree directory and its registration, which belong to one workspace.
 pub async fn remove_with(layout: &Layout, branch: RemoveBranch) -> Result<(), RpcError> {
     let git = &layout.daemon_git();
+    let _hold = WorktreesHold::take(&layout.git_common);
     // `worktree unlock` first, and its failure is not news: it fails for a
     // worktree that was never locked, which is almost all of them. When one
     // *is* locked — a checkout the user parked on a removable disk, say — git
@@ -847,12 +918,53 @@ fn report(
     Err(first)
 }
 
+/// `text` as a POSIX extended regular expression that matches only itself,
+/// which is what `git config --get-regexp` takes.
+fn regex_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if r"\.^$*+?()[]{}|".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Deletes the workspace's branch, and the two directories named after the
 /// workspace name that go with it.
+///
+/// `update-ref -d` rather than `branch -D`: `branch -D` rewrites
+/// `.git/config` every time, to drop a `branch.<name>` section that is usually
+/// not there, and a replaced config stops any in-place workspace of the same
+/// repository (see [`crate::workspace::in_place::ProtectedSnapshot`]). The
+/// section is removed separately, and only when there is one -- a workspace
+/// whose pull request set an upstream.
 async fn remove_branch(git: &Git, layout: &Layout) -> Result<(), RpcError> {
     if repo::branch_exists(git, &layout.repo, &layout.branch).await? {
-        git.run(&layout.repo, &["branch", "-D", &layout.branch])
+        let full = format!("refs/heads/{}", layout.branch);
+        git.run(&layout.repo, &["update-ref", "-d", &full]).await?;
+        let section = format!("branch.{}", layout.branch);
+        let has_section = git
+            .run(
+                &layout.repo,
+                &[
+                    "config",
+                    "--local",
+                    "--name-only",
+                    "--get-regexp",
+                    &format!("^{}\\.", regex_escape(&section)),
+                ],
+            )
+            .await
+            .is_ok_and(|o| !o.stdout.trim().is_empty());
+        if has_section {
+            git.run(
+                &layout.repo,
+                &["config", "--local", "--remove-section", &section],
+            )
             .await?;
+        }
     }
     let _ = std::fs::remove_dir(layout.ref_dir());
     let _ = std::fs::remove_dir_all(layout.reflog_dir());

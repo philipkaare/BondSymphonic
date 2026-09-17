@@ -413,6 +413,47 @@ async fn a_checkout_that_went_away_says_so_and_comes_back_on_restart() {
     assert!(!repo.join(".git/commondir").exists());
 }
 
+/// Git deletes `.git/worktrees` when the last linked worktree goes, which
+/// would take a running in-place sandbox's read-only bind with it. The
+/// daemon's own removal leaves the directory standing, and nothing of its
+/// hold behind.
+#[tokio::test]
+async fn removing_a_worktree_workspace_keeps_the_worktrees_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "last").await;
+    // What `git push -u` leaves: the branch's section goes with the branch.
+    common::git_ok(&repo, &["config", "branch.bs/last/work.remote", "origin"]);
+    lifecycle::destroy(&daemon, &ws.id, false).await.unwrap();
+    let sections = std::process::Command::new("git")
+        .args(["config", "--local", "--get-regexp", r"^branch\."])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&sections.stdout), "");
+    assert_eq!(
+        common::git_out(&repo, &["branch", "--list", "bs/*"]),
+        "",
+        "the branch survived"
+    );
+    let worktrees = repo.join(".git/worktrees");
+    assert!(worktrees.is_dir(), "git removed .git/worktrees");
+    assert_eq!(
+        std::fs::read_dir(&worktrees).unwrap().count(),
+        0,
+        "the hold was left behind"
+    );
+    assert_eq!(
+        common::git_out(&repo, &["worktree", "list", "--porcelain"])
+            .matches("worktree ")
+            .count(),
+        1
+    );
+    cancel.cancel();
+}
+
 #[cfg(target_os = "linux")]
 mod bwrap {
     use super::*;
@@ -598,6 +639,7 @@ mod bwrap {
         let expected = WorkspaceState::Error(
             ProtectionBreach {
                 entries: vec![".git/config".into()],
+                removed: vec![],
                 config_diff: String::new(),
             }
             .sentence(),
@@ -646,6 +688,118 @@ mod bwrap {
             daemon.registry.get(&ws.id).unwrap().state,
             WorkspaceState::Ready
         );
+        lifecycle::destroy(&daemon, &ws.id, false).await.unwrap();
+    }
+
+    async fn bwrap_daemon(dir: &Path) -> Arc<Daemon> {
+        let server = Server::bind(ServerConfig::default()).await.unwrap();
+        Daemon::new(
+            DataDirs::new(dir.join("data")),
+            backend_for("linux_bwrap"),
+            server.event_bus(),
+        )
+        .unwrap()
+    }
+
+    /// Waits up to 2 s for `ws` to reach `state`.
+    async fn wait_for_state(daemon: &Daemon, ws: &WorkspaceId, state: &WorkspaceState) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while daemon.registry.get(ws).unwrap().state != *state {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "still {:?}",
+                daemon.registry.get(ws).unwrap().state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The daemon removing the repository's last worktree workspace is its own
+    /// cleanup, not a breach: the in-place sandbox beside it keeps running.
+    #[tokio::test]
+    async fn destroying_a_sibling_worktree_workspace_leaves_the_agent_running() {
+        if !bwrap_available() {
+            eprintln!("SKIP: bwrap unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = common::init_repo(dir.path());
+        let daemon = bwrap_daemon(dir.path()).await;
+        let here = lifecycle::create(&daemon, params(&repo, "here"))
+            .await
+            .unwrap();
+        assert_eq!(here.state, WorkspaceState::Ready, "{:?}", here.state);
+        let beside = lifecycle::create(
+            &daemon,
+            WorkspaceCreateParams {
+                base_branch: "main".into(),
+                in_place: false,
+                ..params(&repo, "beside")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(beside.state, WorkspaceState::Ready, "{:?}", beside.state);
+        let sandbox = daemon.sandbox(&here.id).unwrap();
+
+        lifecycle::destroy(&daemon, &beside.id, false)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(in_place::PROTECTION_POLL * 4).await;
+        assert_eq!(
+            daemon.registry.get(&here.id).unwrap().state,
+            WorkspaceState::Ready
+        );
+        assert!(Arc::ptr_eq(&daemon.sandbox(&here.id).unwrap(), &sandbox));
+        lifecycle::destroy(&daemon, &here.id, false).await.unwrap();
+    }
+
+    /// The user removing their own last worktree does take the bind away; the
+    /// sandbox stops, and the sentence says what happened rather than raising
+    /// an alarm about `.git/config`.
+    #[tokio::test]
+    async fn the_users_last_worktree_going_stops_the_sandbox_with_its_own_sentence() {
+        if !bwrap_available() {
+            eprintln!("SKIP: bwrap unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = common::init_repo(dir.path());
+        let daemon = bwrap_daemon(dir.path()).await;
+        let ws = lifecycle::create(&daemon, params(&repo, "mine"))
+            .await
+            .unwrap();
+        assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+
+        let theirs = dir.path().join("theirs");
+        let theirs = theirs.to_string_lossy();
+        common::git_ok(&repo, &["worktree", "add", "-q", "-b", "theirs", &theirs]);
+        common::git_ok(&repo, &["worktree", "remove", &theirs]);
+        assert!(!repo.join(".git/worktrees").exists());
+
+        let sentence = ProtectionBreach {
+            entries: vec![".git/worktrees".into()],
+            removed: vec![".git/worktrees".into()],
+            config_diff: String::new(),
+        }
+        .sentence();
+        assert!(
+            sentence.starts_with("This repository's last worktree was removed"),
+            "{sentence}"
+        );
+        wait_for_state(&daemon, &ws.id, &WorkspaceState::Error(sentence)).await;
+        assert!(
+            daemon.sandbox(&ws.id).is_err(),
+            "a sandbox was left running"
+        );
+
+        // Retry puts the directory back and starts again.
+        assert_eq!(
+            lifecycle::restart(&daemon, &ws.id).await.unwrap().state,
+            WorkspaceState::Ready
+        );
+        assert!(repo.join(".git/worktrees").is_dir());
         lifecycle::destroy(&daemon, &ws.id, false).await.unwrap();
     }
 }

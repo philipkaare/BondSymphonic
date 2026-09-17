@@ -203,6 +203,25 @@ impl InPlaceLayout {
         Ok(())
     }
 
+    /// Every refusal [`prepare`](Self::prepare) can make, without writing
+    /// anything, so `workspace.create` can refuse a checkout rather than
+    /// register a workspace that could never start. `Ok(true)` when the
+    /// `commondir` guard is already in place, `Ok(false)` when it is missing.
+    pub fn check_preparable(&self) -> Result<bool, RpcError> {
+        self.refuse_foreign_entries()?;
+        let guard = self.commondir();
+        match std::fs::read(&guard) {
+            Ok(bytes) if bytes == COMMONDIR_GUARD.as_bytes() => Ok(true),
+            Ok(_) => Err(RpcError::invalid_params(format!(
+                "{} has a .git/commondir that BondSymphonic did not write; an agent cannot \
+                 work in place in it",
+                self.root.display()
+            ))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(io_error(&guard, e)),
+        }
+    }
+
     /// `path` as the root-relative name a person reads, `.git/config`.
     fn name_of(&self, path: &Path) -> String {
         path.strip_prefix(&self.root)
@@ -232,21 +251,8 @@ impl InPlaceLayout {
     /// recorded for an entry that may not exist, which Close skips, rather
     /// than an entry nobody remembers making.
     pub fn prepare(&self, record: &Path) -> Result<(), RpcError> {
-        self.refuse_foreign_entries()?;
-        let guard = self.commondir();
-        match std::fs::read(&guard) {
-            Ok(bytes) if bytes == COMMONDIR_GUARD.as_bytes() => {}
-            Ok(_) => {
-                return Err(RpcError::invalid_params(format!(
-                    "{} has a .git/commondir that BondSymphonic did not write; an agent cannot \
-                     work in place in it",
-                    self.root.display()
-                )))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                create_file(&guard, COMMONDIR_GUARD.as_bytes())?
-            }
-            Err(e) => return Err(io_error(&guard, e)),
+        if !self.check_preparable()? {
+            create_file(&self.commondir(), COMMONDIR_GUARD.as_bytes())?;
         }
         for dir in [self.hooks(), self.info()] {
             if std::fs::symlink_metadata(&dir).is_err() {
@@ -572,19 +578,24 @@ impl ProtectedSnapshot {
                 .map(|text| mount_points(&text))
                 .unwrap_or_default()
         });
-        let entries: Vec<String> = self
-            .entries
-            .iter()
-            .filter(|e| {
-                let same = std::fs::symlink_metadata(&e.path)
-                    .is_ok_and(|m| EntryKind::of(&m) == Some(e.kind) && identity(&m) == e.identity);
-                let still_bound = mounted
-                    .as_ref()
-                    .is_none_or(|points| e.mount_points.iter().any(|p| points.contains(p)));
-                !(same && still_bound)
-            })
-            .map(|e| e.name.clone())
-            .collect();
+        let mut entries = Vec::new();
+        let mut removed = Vec::new();
+        for e in &self.entries {
+            let now = std::fs::symlink_metadata(&e.path);
+            let same = now
+                .as_ref()
+                .is_ok_and(|m| EntryKind::of(m) == Some(e.kind) && identity(m) == e.identity);
+            let still_bound = mounted
+                .as_ref()
+                .is_none_or(|points| e.mount_points.iter().any(|p| points.contains(p)));
+            if same && still_bound {
+                continue;
+            }
+            entries.push(e.name.clone());
+            if now.is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound) {
+                removed.push(e.name.clone());
+            }
+        }
         if entries.is_empty() {
             return None;
         }
@@ -600,6 +611,7 @@ impl ProtectedSnapshot {
         let config_diff = lines.iter().map(|l| format!("{l}\n")).collect();
         Some(ProtectionBreach {
             entries,
+            removed,
             config_diff,
         })
     }
@@ -700,6 +712,9 @@ pub struct ProtectionBreach {
     /// Root-relative names of the entries that were replaced, removed or
     /// unmounted, e.g. `[".git/config"]`.
     pub entries: Vec<String>,
+    /// Those of `entries` that are not there at all any more, rather than
+    /// replaced by something else.
+    pub removed: Vec<String>,
     /// A unified-style line diff of `.git/config` (and the other snapshotted
     /// files) between the snapshot and now; empty when unchanged.
     pub config_diff: String,
@@ -707,7 +722,18 @@ pub struct ProtectionBreach {
 
 impl ProtectionBreach {
     /// The sentence the workspace's `Error` state carries.
+    ///
+    /// Git removes `.git/worktrees` itself when the repository's last linked
+    /// worktree goes, which is the user's own ordinary work and no sign of
+    /// tampering, so that one case is told as what it is.
     pub fn sentence(&self) -> String {
+        let worktrees = [".git/worktrees".to_string()];
+        if self.entries == worktrees && self.removed == worktrees {
+            return "This repository's last worktree was removed, which also removed a \
+                    directory the sandbox keeps read-only, so the sandbox was stopped. Nothing \
+                    needs checking; press Retry."
+                .to_string();
+        }
         format!(
             "Git files this workspace protects were replaced while the agent was running ({}), \
              so its sandbox was stopped. Check .git/config for settings you did not make — \

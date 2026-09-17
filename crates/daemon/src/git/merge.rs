@@ -75,6 +75,9 @@ pub async fn merge(
     // stale" true.
     let lock = crate::git::repo_lock(&ws.repo_path);
     let _guard = lock.lock().await;
+    // The reaper and the scratch checkout both remove and prune worktrees; an
+    // in-place workspace of this repository must keep its `.git/worktrees`.
+    let _hold = crate::git::worktree::WorktreesHold::take(&layout.git_common);
 
     // Scratch worktrees a killed daemon left behind. Each one keeps the base
     // branch checked out, so `git worktree add <new> <base>` fails with
