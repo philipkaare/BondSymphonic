@@ -140,6 +140,11 @@ pub enum Request {
     WorkspaceDestroy(WorkspaceDestroyParams),
     #[serde(rename = "workspace.status")]
     WorkspaceStatus(WorkspaceIdParams),
+    /// Brings a workspace whose sandbox is down, or that is in `Error`, back
+    /// up: re-registers its worktree with the repository if the repository has
+    /// forgotten it, then starts the sandbox again. Answers `WorkspaceInfo`.
+    #[serde(rename = "workspace.restart")]
+    WorkspaceRestart(WorkspaceIdParams),
     #[serde(rename = "workspace.changes")]
     WorkspaceChanges(WorkspaceIdParams),
     #[serde(rename = "workspace.diff")]
@@ -201,6 +206,7 @@ impl Request {
             WorkspaceGet(_) => "workspace.get",
             WorkspaceDestroy(_) => "workspace.destroy",
             WorkspaceStatus(_) => "workspace.status",
+            WorkspaceRestart(_) => "workspace.restart",
             WorkspaceChanges(_) => "workspace.changes",
             WorkspaceDiff(_) => "workspace.diff",
             WorkspaceMerge(_) => "workspace.merge",
