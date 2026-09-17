@@ -348,27 +348,12 @@ impl Daemon {
         self.restore_workspaces().await;
     }
 
-    /// Validates every registered workspace and restarts its sandbox.
+    /// Validates every registered workspace — its worktree directory, and its
+    /// registration in the repository, re-registered when it can be — and
+    /// restarts its sandbox. See [`lifecycle::restore`].
     pub async fn restore_workspaces(self: &Arc<Self>) {
         for ws in self.registry.list() {
-            if !ws.worktree_path.exists() {
-                let _ = self
-                    .set_state(
-                        &ws.id,
-                        WorkspaceState::Error("worktree directory is missing".into()),
-                    )
-                    .await;
-                continue;
-            }
-            match lifecycle::start_sandbox(self, &ws).await {
-                Ok(()) => {
-                    let _ = self.set_state(&ws.id, WorkspaceState::Ready).await;
-                }
-                Err(e) => {
-                    tracing::warn!(ws = %ws.id, "sandbox restore failed: {e}");
-                    let _ = self.set_state(&ws.id, WorkspaceState::SandboxDown).await;
-                }
-            }
+            lifecycle::restore(self, &ws).await;
         }
     }
 }

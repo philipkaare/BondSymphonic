@@ -729,7 +729,7 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
         // Always present here: `layout` is only `None` when `force` is set.
         let layout = layout.as_ref().expect("a layout unless forced");
         // A missing worktree directory rules out the dirty check but not the unmerged
-        // one. `restore` records that state as `Error("worktree directory is missing")`,
+        // one. `restore` records that state as an `Error` naming the missing directory,
         // and the branch still points at commits whose objects live only in this
         // workspace's private object dir, which the `git branch -D` in `worktree::remove`
         // would discard for good.
@@ -839,6 +839,162 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
         .await
         .map_err(|e| RpcError::internal(e.to_string()))?;
     Ok(Empty {})
+}
+
+/// Says that a workspace's worktree had to be re-registered.
+///
+/// Worth more than a log line: the repair worked, but whatever pruned the
+/// registration is still out there, and anything that was staged in the
+/// worktree is unstaged now. Starts with the sentence the IDE matches on.
+fn report_repaired(d: &Daemon, ws: &Workspace) {
+    d.events.publish(
+        Some(ws.id.clone()),
+        Event::DaemonLog {
+            level: LogLevel::Warn,
+            message: format!(
+                "Re-registered this workspace's worktree: the repository {} had forgotten it, \
+                 most likely because a git on Windows ran `git worktree prune`. Uncommitted \
+                 changes are kept, anything that was staged is unstaged, and the worktree is \
+                 now locked against another prune.",
+                ws.repo_path.display()
+            ),
+            host: None,
+        },
+    );
+}
+
+/// Everything between "this workspace is registered" and "its sandbox is up",
+/// for a workspace that already exists: the worktree directory is there, the
+/// repository still lists it (put back if it can be, see
+/// [`worktree::ensure_registered`]), and the sandbox starts.
+///
+/// Every failure comes back as a sentence a user can read, because the caller
+/// puts `message` straight into `WorkspaceState::Error` and in front of them —
+/// a bare `No such file or directory` from deep inside `start_sandbox` is what
+/// this replaced. The code stays that of the underlying failure.
+async fn bring_up(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcError> {
+    if !ws.worktree_path.is_dir() {
+        return Err(RpcError::new(
+            ErrorCode::IoError,
+            format!(
+                "The worktree directory {} is missing. Remove the workspace to clean up.",
+                ws.worktree_path.display()
+            ),
+        ));
+    }
+    let layout = layout_for(d, ws).await.map_err(|e| {
+        RpcError::new(
+            e.code,
+            format!(
+                "The repository {} could not be read: {}",
+                ws.repo_path.display(),
+                e.message
+            ),
+        )
+    })?;
+    if worktree::ensure_registered(&layout).await? == worktree::Registration::Repaired {
+        report_repaired(d, ws);
+    }
+    start_sandbox(d, ws).await.map_err(|e| {
+        RpcError::new(
+            e.code,
+            format!("The sandbox could not be started: {}", e.message),
+        )
+    })
+}
+
+/// Brings a workspace that exists on disk back up when the daemon starts.
+///
+/// A failure leaves the workspace in `Error` with the reason, never a bare
+/// `SandboxDown`: that state means "the sandbox died while it was running" and
+/// says nothing about what to do, which is exactly what a user looking at a
+/// workspace that would not come back needs to know.
+pub async fn restore(d: &Arc<Daemon>, ws: &Workspace) {
+    let state = match bring_up(d, ws).await {
+        Ok(()) => WorkspaceState::Ready,
+        Err(e) => {
+            tracing::warn!(ws = %ws.id, "restore failed: {}", e.message);
+            WorkspaceState::Error(e.message)
+        }
+    };
+    if let Err(e) = d.set_state(&ws.id, state).await {
+        tracing::warn!(ws = %ws.id, "could not record the restored state: {}", e.message);
+    }
+}
+
+/// One restart at a time per workspace.
+///
+/// Two restarts interleaved would each start a sandbox, and the second insert
+/// into `Daemon::sandboxes` would drop the first handle on the floor with its
+/// processes still running.
+fn restart_lock(id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .entry(id.clone())
+        .or_default()
+        .clone()
+}
+
+/// `workspace.restart`: stops whatever is left of the workspace's sandbox and
+/// brings it up again, repairing the worktree registration on the way when it
+/// can.
+///
+/// Allowed from `Ready` (a plain sandbox restart), `SandboxDown` and `Error`;
+/// refused while the workspace is being created or destroyed, when another
+/// call owns its state.
+///
+/// The teardown is the one `destroy` does, minus everything that touches the
+/// worktree: runs and their bridges, agents, terminals, the sandbox and its
+/// proxy. The agents end through their own `stop`, so each one is announced as
+/// `Exited` rather than left claiming to run in a sandbox that is gone; their
+/// records and transcripts stay, and the IDE starts them again (resuming their
+/// sessions) once the workspace is `Ready`. The old handle leaves
+/// `Daemon::sandboxes` *before* it is shut down, which is what tells its
+/// `watch_sandbox` task that the death it is about to see is not news — without
+/// that it would flip the restarted workspace to `SandboxDown`.
+///
+/// A failure leaves the workspace in `Error` with the same sentence the
+/// returned error carries.
+pub async fn restart(d: &Arc<Daemon>, id: &WorkspaceId) -> Result<WorkspaceInfo, RpcError> {
+    let lock = restart_lock(id);
+    let _guard = lock.lock().await;
+    let ws = d.workspace(id)?;
+    match ws.state {
+        WorkspaceState::Creating | WorkspaceState::Destroying => {
+            return Err(RpcError::invalid_params(format!(
+                "workspace {} is being {}; it cannot be restarted now",
+                ws.name,
+                if ws.state == WorkspaceState::Creating {
+                    "created"
+                } else {
+                    "destroyed"
+                }
+            )));
+        }
+        WorkspaceState::Ready | WorkspaceState::SandboxDown | WorkspaceState::Error(_) => {}
+    }
+    d.runs.stop_all_in(id).await;
+    d.agents.stop_all_in(id).await;
+    d.ptys.close_workspace(id).await;
+    // The guard is dropped before the await, as in `destroy`.
+    let old = d.sandboxes.lock().remove(id);
+    if let Some(h) = old {
+        let _ = h.shutdown().await;
+    }
+    d.proxies.stop(id);
+    match bring_up(d, &ws).await {
+        Ok(()) => Ok(d.workspace_info(&d.set_state(id, WorkspaceState::Ready).await?)),
+        Err(e) => {
+            tracing::warn!(ws = %id, "restart failed: {}", e.message);
+            d.set_state(id, WorkspaceState::Error(e.message.clone()))
+                .await?;
+            Err(e)
+        }
+    }
 }
 
 pub async fn status(d: &Daemon, id: &WorkspaceId) -> Result<WorkspaceStatusResult, RpcError> {
