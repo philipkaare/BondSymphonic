@@ -446,6 +446,13 @@ sandbox cannot fully close off:
   `--ignore-submodules=all` and so do not run it — the one exception is the
   rebase a Rebase merge runs in a *worktree* workspace, which git offers no
   such option for. Your own git is not covered at all.
+- **Create PR, on a different workspace, is another exception.** `gh pr
+  create` checks the checkout for uncommitted changes with a plain `git
+  status --porcelain` of its own, which is not protected the way
+  BondSymphonic's calls are. So if this repository also has a *worktree*
+  workspace, pressing **Create PR…** there can run an embedded repository's
+  config the same way — even though the in-place workspace itself was never
+  touched. Not fixed yet; treat it the same as the bullet above.
 - **History can be destroyed.** `rm -rf .git` cannot remove the files
   BondSymphonic protects, but it deletes everything else — `HEAD`, the index,
   every object and every ref — just as the agent can delete any other file in
@@ -959,11 +966,12 @@ so its sandbox was stopped."** An in-place workspace's sandbox stopped itself
 because one of the git files it protects changed: `.git/config`, `commondir`,
 `hooks`, `info`, `worktrees`, `remotes`, `branches`, `config.worktree`. Two
 quite different things produce it, and the diff is how you tell them apart.
-Either something outside the sandbox replaced the file — **any git command that
+Either something outside the sandbox changed the file — **any git command that
 writes one of those, including one you run yourself in that repository**
 (`git config`, `git branch -u`, `git push -u`, `git remote add`, `git
-sparse-checkout`), stops the workspace this way, since the daemon cannot tell
-your own command from an agent's — or, on a Windows drive, the agent itself
+sparse-checkout`), and **opening `.git/config` (or any of the others) in your
+own editor and saving it**, both stop the workspace this way, since the
+daemon cannot tell your own change from an agent's — or, on a Windows drive, the agent itself
 wrote through a name the drive resolves to the same file, which the read-only
 binds do not cover and this check does (see "Working directly in a checkout"
 above). BondSymphonic's own routine work on a *worktree* workspace of the same

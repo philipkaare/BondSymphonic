@@ -277,8 +277,11 @@ compared whole, and, given the sandbox's pid, its `/proc/<pid>/mountinfo` is
 re-read to confirm each entry is still actually mounted there -- identity alone
 is not enough, because two config writes in a row can hand a fresh file the same
 inode number an ext4 filesystem just freed, and on a Windows drive an aliased
-write changes neither identity nor mount. Measured at about 56 ms a poll on a
-real `/mnt/c` repository. The first change any of the three finds is a breach:
+write changes neither identity nor mount. Measured at 71-117 ms a poll against
+BondSymphonic's own `.git` (14 hooks, 2 worktree registrations) copied onto a
+Windows drive -- down from 196 ms before `*.sample` hooks were listed from
+their directory entry rather than opened and read, since git never runs a
+file with that suffix. The first change any of the three finds is a breach:
 the sandbox is torn down, the workspace moves to `Error` with a sentence naming
 which entries changed, and a `daemon.log` warning carries that sentence, the
 entry names and a unified line diff of the files whose contents are read. The
@@ -390,6 +393,15 @@ Residual risks, documented in the user guide and not mitigated further:
   as a gitlink. The user's next `git status` or `git diff` in the checkout looks
   into it and runs that command. The daemon's own git is protected
   (`--ignore-submodules=all`, §3.4); the user's is not.
+- **`gh pr create` is not protected either.** `pr.rs` runs `gh` with its
+  working directory set to the user's checkout, and `gh` itself (2.45.0) runs
+  `git status --porcelain` there to print its "N uncommitted changes"
+  warning — no `--ignore-submodules`, nothing neutralised. So **Create PR** on
+  a *worktree* workspace of a repository that also has an in-place workspace
+  open can run an embedded repository's config the same way. Confirmed by
+  reading the installed `gh` binary's source; not fixed, since the remedy
+  (`--repo owner/name` against a daemon-owned directory) needs a real GitHub
+  repository to test. Follow-up.
 - **History can be destroyed.** `rm -rf .git` fails, and the mount points
   (`.git`, `config`, `commondir`, `hooks`, `info`, `worktrees`, `remotes`,
   `branches`) survive. But `HEAD`, the index, `objects/`, `refs/` and `logs/` are

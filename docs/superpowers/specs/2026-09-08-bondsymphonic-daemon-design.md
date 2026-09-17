@@ -671,6 +671,19 @@ A failure of either command is a `GitError` carrying `{command, exit_code,
 stderr}`. The `command` field is what tells the two apart; the title and the body
 are deliberately not in it, so a client cannot echo them back from the error.
 
+**Residual risk: `gh pr create` runs its own `git status --porcelain`.**
+`pr.rs` sets `gh`'s working directory to `ws.repo_path` — the user's own
+checkout — and `gh` (traced at 2.45.0, `NewCreateContext` in
+`pkg/cmd/pr/create/create.go`) calls `UncommittedChangeCount`, which is
+exactly `git status --porcelain`, with no `--ignore-submodules` and none of
+the neutralisation `daemon_git` applies. So **Create PR** on a *worktree*
+workspace, of a repository that also has an in-place workspace open, can run
+an embedded repository's `core.fsmonitor` (§6.2's residual risks) as the
+daemon user, outside every sandbox, the moment the button is pressed. Not
+fixed: the remedy is running `gh` with `--repo owner/name` against a
+daemon-owned working directory, which changes how it resolves the base and
+head repositories and needs a real GitHub repository to verify. Follow-up.
+
 ## 6. Sandbox
 
 ### 6.1 Trait
@@ -859,11 +872,28 @@ starts, records three things:
 - the contents of everything under `.git` that git runs or reads as
   configuration — `config`, `config.worktree`, `commondir`, the listings and
   contents of `hooks`, `info`, `remotes`, `branches` and `modules`, and the
-  `config.worktree` and `commondir` of each registration under `worktrees`,
-  which is where the same alias trick would otherwise reach a *worktree*
-  workspace's own gitdir — bounded by `COVERED_CAP` paths and
-  `COVERED_BYTES_CAP` bytes, in a fixed sorted order, so that a repository with
-  hundreds of submodules cannot make the check unbounded;
+  `config.worktree` and `commondir` of the registrations under `worktrees`
+  that existed when the sandbox started, which is where the same alias trick
+  would otherwise reach a *worktree* workspace's own gitdir. Not the rest of
+  such a registration (`index`, `HEAD`, `logs`, `refs`), which the daemon's
+  own work in that sibling worktree rewrites constantly, and not a
+  registration that appears later: `workspace.create` on a sibling worktree
+  workspace adds one while an in-place sandbox runs, and the daemon must not
+  stop an agent over its own ordinary work. `info/refs` is excluded too:
+  every `git gc` rewrites it through `update-server-info`, and `gc --auto`
+  runs behind an ordinary commit, so covering it would stop an in-place agent
+  at random — it is a dumb-HTTP ref listing, not anything git executes. A
+  `*.sample` hook is listed but not read, since git never runs a file with
+  that suffix; making one run means giving it a name git knows, which is a
+  new listing entry and is caught that way. The set is bounded by
+  `COVERED_CAP` (512 paths), `COVERED_BYTES_CAP` (4 MiB total) and `READ_CAP`
+  (256 KiB per file) — the recorded length is part of the comparison too, so
+  a file that grows past its own cap still reads as changed — walked in a
+  fixed sorted order, so a snapshot and a later check that both hit a cap
+  stop at the same place and anything ahead of it is itself a change.
+  `modules/**` descends only through path components named `modules` (how
+  git nests them), eight deep, so nothing reaches into a submodule's object
+  store;
 - the mount points each entry was bound at.
 
 Every `PROTECTION_POLL` (250 ms) while the sandbox is up,
@@ -872,8 +902,11 @@ compares it whole, and, given the sandbox's pid, re-reads its
 `/proc/<pid>/mountinfo` to confirm each entry is still actually mounted there —
 identity alone is not enough, because two config writes in a row can hand a
 fresh file the same inode number an ext4 filesystem just freed, and an aliased
-write on DrvFs changes neither identity nor mount. Measured at about 56 ms a
-poll on a real `/mnt/c` repository, against the 250 ms period. The first change
+write on DrvFs changes neither identity nor mount. Measured at 71–117 ms a
+poll against BondSymphonic's own `.git` (14 hooks, 2 worktree registrations)
+copied onto a Windows drive, against the 250 ms period — down from 196 ms
+before two optimisations: one syscall fewer per path, and listing a
+`*.sample` hook from its directory entry rather than reading it. The first change
 any of the three finds is a breach: the sandbox is torn down, the workspace
 moves to `Error(ProtectionBreach::sentence())`, and a `daemon.log` **warning**
 carries that sentence, the entries that changed and a unified line diff of the
