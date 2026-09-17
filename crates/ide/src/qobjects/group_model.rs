@@ -497,8 +497,24 @@ pub fn agent_record_status(info: &WorkspaceInfo, agent_id: Option<&AgentId>) -> 
 /// because this runs after `Workspaces::apply_workspace_info` has already
 /// decided it; every later one derives it from `agent_status` itself.
 pub fn adopt_agent_record(tab: &mut AgentTab, info: &WorkspaceInfo) -> bool {
-    if !matches!(info.state, WorkspaceState::Ready) || tab.agent_status.is_some() {
+    if !matches!(info.state, WorkspaceState::Ready) {
         return false;
+    }
+    // An agent the daemon says has ended has ended, whatever the tab last
+    // heard: `Exited` is final for an agent id. What a `workspace.restart`
+    // answers with is exactly this, and deciding whether to start the agent
+    // again must not hang on its `agent.state` having arrived first.
+    if tab.agent_status.is_some() {
+        if agent_record_status(info, tab.agent_id.as_ref()) != Some(TabStatus::Done)
+            || tab.agent_status == Some(TabStatus::Done)
+        {
+            return false;
+        }
+        tab.agent_status = Some(TabStatus::Done);
+        tab.agent_detail.clear();
+        tab.status = TabStatus::Done;
+        tab.detail.clear();
+        return true;
     }
     let Some(status) = agent_record_status(info, tab.agent_id.as_ref()) else {
         return false;
@@ -1346,5 +1362,52 @@ mod tests {
             "and the status bar names it: {:?}",
             model.attention()
         );
+    }
+
+    /// A `workspace.restart` answers with the stopped agent's record saying
+    /// `Exited`. That decides whether Retry starts the agent again, so it must
+    /// win over whatever the tab last heard -- an `agent.state` for the stop
+    /// may not have arrived yet, or may have been dropped.
+    #[test]
+    fn an_exited_record_overrides_what_the_tab_last_heard() {
+        let mut ready = info("ws_1", "alpha");
+        let agent = AgentId("ag_1".to_owned());
+        ready.agent_records = vec![AgentSummary {
+            id: agent.clone(),
+            adapter: AgentAdapterKind::Claude,
+            state: AgentState::Exited,
+            session_id: None,
+            command: None,
+            model: None,
+            permission_mode: None,
+        }];
+        let mut model = Workspaces::new_default();
+        let mut tab = AgentTab::from_workspace_info(&ready);
+        tab.adapter = AgentAdapterKind::Claude;
+        model.add_tab(0, tab);
+        assert!(model.set_agent(&ready.id, agent.clone()));
+        assert!(model
+            .set_agent_status(&agent, TabStatus::Working, "thinking")
+            .is_some());
+
+        let (g, t) = model.apply_workspace_info(&ready).expect("tracked");
+        let tab = &mut model.groups[g].tabs[t];
+        assert!(
+            !tab.agent_needs_start(),
+            "the premise: the tab thinks it is working"
+        );
+        assert!(adopt_agent_record(tab, &ready));
+        assert_eq!(tab.agent_status, Some(TabStatus::Done));
+        assert_eq!(tab.status, TabStatus::Done);
+        assert!(tab.agent_needs_start());
+        // Said once: a second pass has nothing to change.
+        assert!(!adopt_agent_record(tab, &ready));
+
+        // A live record does not override a live tab.
+        let mut working = ready.clone();
+        working.agent_records[0].state = AgentState::Idle;
+        tab.agent_status = Some(TabStatus::Working);
+        assert!(!adopt_agent_record(tab, &working));
+        assert_eq!(tab.agent_status, Some(TabStatus::Working));
     }
 }

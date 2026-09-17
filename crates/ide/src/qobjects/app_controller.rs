@@ -436,6 +436,22 @@ pub mod qobject {
             unmerged: bool,
         );
 
+        /// A `restart_workspace` call failed. `kind` is a
+        /// [`RestartFailure`](super::RestartFailure) code: the daemon's own
+        /// reason (the workspace is now `Error` with `message`), a refusal
+        /// that left the workspace as it was, a request that timed out with
+        /// the connection still up, or no connection at all. Only the first is
+        /// news about the workspace; the others are about the request, and the
+        /// daemon may well have done the restart. Emitted alongside
+        /// `operation_failed`, in one step.
+        #[qsignal]
+        fn workspace_restart_failed(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            message: QString,
+            kind: i32,
+        );
+
         /// A `restart_workspace` call succeeded: `info_json` is the
         /// `WorkspaceInfo` the daemon answered with, its sandbox running again.
         /// Separate from `workspace_changed` because the window does one thing
@@ -631,9 +647,8 @@ pub mod qobject {
 
         /// Bring a workspace whose sandbox is down, or which failed to start,
         /// back up (`workspace.restart`). Answers with `workspace_restarted`,
-        /// or with `workspace_op_failed("workspace.restart", ...)` carrying the
-        /// daemon's reason -- the workspace is then in `Error` with that same
-        /// reason.
+        /// or with `workspace_restart_failed` saying what kind of failure it
+        /// was.
         #[qinvokable]
         fn restart_workspace(self: Pin<&mut AppController>, workspace_id: QString);
 
@@ -1522,6 +1537,47 @@ fn end_workspace_op_with_failure(
             QString::from(&message),
             QString::from(&data),
         )
+    });
+}
+
+/// What kind of failure a `workspace.restart` ended in, which decides what the
+/// window may conclude about the workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartFailure {
+    /// The daemon tried and failed; the workspace is `Error(message)`.
+    Reason = 0,
+    /// The daemon would not try -- the workspace is being created or
+    /// destroyed -- and left it as it was.
+    Refused = 1,
+    /// No answer in time, on a connection that is still up. The restart may
+    /// have happened.
+    Timeout = 2,
+    /// No connection, or it went while waiting. The restart may have happened.
+    NoConnection = 3,
+}
+
+impl RestartFailure {
+    pub fn of(e: &ClientError) -> RestartFailure {
+        match e {
+            ClientError::Rpc(rpc) if rpc.code == ErrorCode::InvalidParams => Self::Refused,
+            ClientError::Rpc(_) => Self::Reason,
+            ClientError::Timeout => Self::Timeout,
+            _ => Self::NoConnection,
+        }
+    }
+}
+
+/// Queues `workspace_restart_failed` and the `operation_failed` behind it, in
+/// one closure: see the note on `operation_failed`.
+fn report_restart_failure(qt: &QtHandle, workspace: String, message: String, kind: RestartFailure) {
+    tracing::warn!("workspace.restart failed for {workspace} ({kind:?}): {message}");
+    let _ = qt.queue(move |mut q| {
+        q.as_mut().workspace_restart_failed(
+            QString::from(&workspace),
+            QString::from(&message),
+            kind as i32,
+        );
+        q.operation_failed(QString::from("workspace.restart"), QString::from(&message))
     });
 }
 
@@ -2474,7 +2530,7 @@ impl qobject::AppController {
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(message) => {
-                report_workspace_op_failure(&qt, id, "workspace.restart", message.to_owned());
+                report_restart_failure(&qt, id, message.to_owned(), RestartFailure::NoConnection);
                 return;
             }
         };
@@ -2496,15 +2552,16 @@ impl qobject::AppController {
                         q.workspace_restarted(QString::from(&id), QString::from(&json))
                     });
                 }
-                // The message alone, not `failure_parts`: the daemon's refusal
+                // The message alone, not `failure_parts`: the daemon's reason
                 // is a sentence written for the user, and it is what the banner
                 // shows as the workspace's new reason.
                 Err(e) => {
+                    let kind = RestartFailure::of(&e);
                     let message = match e {
                         ClientError::Rpc(rpc) => rpc.message,
                         other => other.to_string(),
                     };
-                    report_workspace_op_failure(&qt, id, "workspace.restart", message);
+                    report_restart_failure(&qt, id, message, kind);
                 }
             }
         });

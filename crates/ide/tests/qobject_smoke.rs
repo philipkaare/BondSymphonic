@@ -2042,3 +2042,38 @@ mod destroy_refusal {
         assert_eq!(destroy_refusal(&ClientError::Timeout), None);
     }
 }
+
+/// What a failed `workspace.restart` lets the window conclude. Only the
+/// daemon's own reason is news about the workspace; a refusal left it alone,
+/// and a timeout or a lost connection may hide a restart that worked.
+mod restart_failure {
+    use bondsymphonic_ide::client::ClientError;
+    use bondsymphonic_ide::qobjects::app_controller::RestartFailure;
+    use bondsymphonic_proto::{ErrorCode, RpcError};
+
+    #[test]
+    fn only_the_daemons_own_failure_is_the_workspaces_reason() {
+        let sandbox = ClientError::Rpc(RpcError::new(
+            ErrorCode::SandboxError,
+            "The sandbox could not be started: bwrap failed.",
+        ));
+        assert_eq!(RestartFailure::of(&sandbox), RestartFailure::Reason);
+        let git = ClientError::Rpc(RpcError::new(ErrorCode::GitError, "worktree unregistered"));
+        assert_eq!(RestartFailure::of(&git), RestartFailure::Reason);
+        let creating = ClientError::Rpc(RpcError::invalid_params("workspace is being created"));
+        assert_eq!(RestartFailure::of(&creating), RestartFailure::Refused);
+        assert_eq!(
+            RestartFailure::of(&ClientError::Timeout),
+            RestartFailure::Timeout
+        );
+        assert_eq!(
+            RestartFailure::of(&ClientError::Disconnected),
+            RestartFailure::NoConnection
+        );
+        // The codes the window switches on.
+        assert_eq!(RestartFailure::Reason as i32, 0);
+        assert_eq!(RestartFailure::Refused as i32, 1);
+        assert_eq!(RestartFailure::Timeout as i32, 2);
+        assert_eq!(RestartFailure::NoConnection as i32, 3);
+    }
+}

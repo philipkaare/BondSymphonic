@@ -227,7 +227,9 @@ pub struct AgentTab {
     #[serde(default)]
     pub base_branch: String,
     pub status: TabStatus,
-    /// `Error(detail)` text from the daemon, or empty for any other status.
+    /// What the badge's status has to say: the agent's detail while it owns
+    /// the badge, otherwise the workspace problem's detail (see
+    /// [`state_detail`]), or empty.
     pub detail: String,
     /// The workspace's worktree, from `WorkspaceInfo`. The Run panel detects
     /// configurations against this path, since `repo.detect_run_configs` takes
@@ -298,8 +300,9 @@ pub struct AgentTab {
     /// Kept apart from `status` because `TabStatus::Error` is also what an
     /// agent that failed reads as, and the two call for different buttons:
     /// a failed agent is restarted, a failed workspace has its sandbox
-    /// brought back first. Set and cleared only by the workspace's own state,
-    /// in [`Workspaces::apply_workspace_info`].
+    /// brought back first. Derived from the workspace's own state wherever a
+    /// tab is built or refreshed from a `WorkspaceInfo`, and set by
+    /// [`Workspaces::note_restart_failed`] for a Retry the daemon refused.
     #[serde(default)]
     pub workspace_problem: Option<WorkspaceProblem>,
 }
@@ -322,8 +325,7 @@ pub fn workspace_problem(state: &WorkspaceState) -> Option<WorkspaceProblem> {
     match state {
         WorkspaceState::SandboxDown => Some(WorkspaceProblem {
             title: "The sandbox for this workspace is not running".to_owned(),
-            detail: "It stopped unexpectedly. Retry starts it again; the worktree and the \
-                     conversation are kept."
+            detail: "It stopped unexpectedly. Retry starts it again; the worktree is kept."
                 .to_owned(),
         }),
         WorkspaceState::Error(reason) => Some(WorkspaceProblem {
@@ -952,15 +954,15 @@ impl Workspaces {
         true
     }
 
-    /// Records that a `workspace.restart` failed with `reason`, exactly as the
-    /// daemon leaves it: `Error(reason)`. False when the workspace is not
-    /// tracked.
+    /// Records that the daemon tried a `workspace.restart` and failed with
+    /// `reason`, which leaves the workspace `Error(reason)`. False when the
+    /// workspace is not tracked.
     ///
-    /// Applied here rather than waited for, because not every failure has an
-    /// event behind it -- a request that timed out never heard from the
-    /// daemon at all -- and a banner that went on showing the old reason
-    /// after a failed Retry would look like the Retry did nothing. The next
-    /// `workspace.state` overwrites it with whatever is true.
+    /// Only for the daemon's own reason: a request that timed out or lost its
+    /// connection says nothing about the workspace, and the window does not
+    /// call this for it. Applied here rather than waited for so the banner
+    /// shows the new reason at once; the next `workspace.state` overwrites it
+    /// with whatever is true.
     pub fn note_restart_failed(&mut self, id: &WorkspaceId, reason: &str) -> bool {
         let Some((g, t)) = self.find(id) else {
             return false;
