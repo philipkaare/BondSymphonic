@@ -1605,3 +1605,59 @@ async fn a_version_probe_that_hangs_fails_the_start_and_is_not_remembered() {
         .unwrap();
     cancel.cancel();
 }
+
+/// `workspace.restart` ends the workspace's agents the way a destroy does, so
+/// none of them is left claiming to run in the sandbox that was replaced, and
+/// keeps their records and transcripts for the IDE to resume from.
+#[tokio::test]
+async fn restarting_a_workspace_stops_its_agents_and_keeps_their_records() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    use_fake_claude(py, "simple_turn.ndjson");
+    let (port, token, _d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "restarted").await;
+
+    let ag = start_agent(&mut c, &ws.id).await;
+    next_agent_events(&mut c, &ag, 5, Duration::from_secs(20)).await;
+
+    let info: WorkspaceInfo = serde_json::from_value(
+        c.call(Request::WorkspaceRestart(WorkspaceIdParams {
+            workspace_id: ws.id.clone(),
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(info.state, WorkspaceState::Ready);
+    let seen: Vec<Event> = c
+        .drain_events()
+        .into_iter()
+        .map(|(_, e)| e)
+        .filter(|e| agent_of(e) == Some(&ag))
+        .collect();
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            Event::AgentStateChanged {
+                state: AgentState::Exited,
+                ..
+            }
+        )),
+        "the agent must be stopped by the restart: {seen:?}"
+    );
+    let record = info
+        .agent_records
+        .iter()
+        .find(|a| a.id == ag)
+        .expect("the agent's record survives the restart");
+    assert_eq!(record.state, AgentState::Exited);
+    assert!(!history_of(&mut c, &ag).await.messages.is_empty());
+    cancel.cancel();
+}
