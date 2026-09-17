@@ -321,3 +321,285 @@ async fn a_sandbox_that_will_not_start_is_an_error_that_says_so() {
     assert_eq!(err.code, ErrorCode::SandboxError);
     assert_eq!(err.message, reason);
 }
+
+// ---------------------------------------------------------------------------
+// Restart, restore and destroy of one workspace, interleaved.
+//
+// A fake backend makes the interleavings deterministic: its `start` can be
+// slow, and its handle's `shutdown` announces the death first and returns
+// only after a pause, which is the window in which a death watcher runs.
+// ---------------------------------------------------------------------------
+
+struct FakeHandle {
+    inner: Arc<dyn SandboxHandle>,
+    died: tokio::sync::watch::Sender<bool>,
+    shut: std::sync::atomic::AtomicBool,
+    shutdown_pause: std::time::Duration,
+}
+
+#[async_trait]
+impl SandboxHandle for FakeHandle {
+    async fn spawn(
+        &self,
+        cmd: bondsymphonic_daemon::sandbox::SandboxCommand,
+    ) -> Result<bondsymphonic_daemon::sandbox::SandboxChild, RpcError> {
+        self.inner.spawn(cmd).await
+    }
+    async fn shutdown(&self) -> Result<(), RpcError> {
+        self.shut.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.died.send(true);
+        tokio::time::sleep(self.shutdown_pause).await;
+        self.inner.shutdown().await
+    }
+    fn helper_exe(&self) -> PathBuf {
+        self.inner.helper_exe()
+    }
+    fn died(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        Some(self.died.subscribe())
+    }
+}
+
+struct FakeBackend {
+    start_delay: std::time::Duration,
+    shutdown_pause: std::time::Duration,
+    handles: parking_lot::Mutex<Vec<Arc<FakeHandle>>>,
+}
+
+impl FakeBackend {
+    fn new(start_delay_ms: u64, shutdown_pause_ms: u64) -> Arc<Self> {
+        Arc::new(Self {
+            start_delay: std::time::Duration::from_millis(start_delay_ms),
+            shutdown_pause: std::time::Duration::from_millis(shutdown_pause_ms),
+            handles: parking_lot::Mutex::new(Vec::new()),
+        })
+    }
+    fn started(&self) -> usize {
+        self.handles.lock().len()
+    }
+    /// Handles that were started and never shut down.
+    fn alive(&self) -> usize {
+        self.handles
+            .lock()
+            .iter()
+            .filter(|h| !h.shut.load(std::sync::atomic::Ordering::SeqCst))
+            .count()
+    }
+    fn last(&self) -> Arc<FakeHandle> {
+        self.handles.lock().last().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl SandboxBackend for FakeBackend {
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+    async fn check(&self) -> Vec<PrereqStatus> {
+        Vec::new()
+    }
+    async fn start(&self, spec: &SandboxSpec) -> Result<Arc<dyn SandboxHandle>, RpcError> {
+        tokio::time::sleep(self.start_delay).await;
+        let inner = backend_for("noop").start(spec).await?;
+        let handle = Arc::new(FakeHandle {
+            inner,
+            died: tokio::sync::watch::channel(false).0,
+            shut: std::sync::atomic::AtomicBool::new(false),
+            shutdown_pause: self.shutdown_pause,
+        });
+        self.handles.lock().push(handle.clone());
+        Ok(handle)
+    }
+}
+
+async fn create_on(d: &Arc<Daemon>, repo: &Path, name: &str) -> WorkspaceInfo {
+    let ws = lifecycle::create(
+        d,
+        WorkspaceCreateParams {
+            repo_path: repo.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: name.into(),
+            init_if_missing: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ws.state, WorkspaceState::Ready);
+    ws
+}
+
+fn saw_sandbox_down(
+    rx: &mut tokio::sync::broadcast::Receiver<ServerMessage>,
+    id: &WorkspaceId,
+) -> bool {
+    let mut seen = false;
+    while let Ok(msg) = rx.try_recv() {
+        if let ServerMessage::Event {
+            event: Event::WorkspaceStateChanged { info },
+            ..
+        } = msg
+        {
+            seen |= &info.id == id && info.state == WorkspaceState::SandboxDown;
+        }
+    }
+    seen
+}
+
+/// The old sandbox's death watcher must not report the death a restart causes
+/// on purpose. The fake announces the death at the start of `shutdown` and
+/// returns 200 ms later, so a restart that shut the handle down while it was
+/// still the registered one would have its watcher publish `SandboxDown`.
+#[tokio::test]
+async fn a_restart_does_not_report_its_own_sandbox_dying() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let backend = FakeBackend::new(0, 200);
+    let (daemon, events) = daemon_over(&dir.path().join("data"), backend.clone());
+    let ws = create_on(&daemon, &repo, "quiet").await;
+    let mut rx = events.subscribe();
+
+    lifecycle::restart(&daemon, &ws.id).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    assert!(!saw_sandbox_down(&mut rx, &ws.id));
+    assert_eq!(
+        daemon.registry.get(&ws.id).unwrap().state,
+        WorkspaceState::Ready
+    );
+    let current: Arc<dyn SandboxHandle> = backend.last();
+    assert!(Arc::ptr_eq(&daemon.sandbox(&ws.id).unwrap(), &current));
+    assert_eq!((backend.started(), backend.alive()), (2, 1));
+    shut_down_sandboxes(&daemon).await;
+}
+
+/// A destroy that arrives while a restart is starting the sandbox waits for
+/// it and takes the new sandbox down with the workspace.
+#[tokio::test]
+async fn a_destroy_during_a_restart_leaves_no_sandbox_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let backend = FakeBackend::new(300, 0);
+    let (daemon, _events) = daemon_over(&dir.path().join("data"), backend.clone());
+    let ws = create_on(&daemon, &repo, "raced").await;
+
+    let restarting = {
+        let d = daemon.clone();
+        let id = ws.id.clone();
+        tokio::spawn(async move { lifecycle::restart(&d, &id).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+    let _ = restarting.await.unwrap();
+
+    assert!(daemon.registry.get(&ws.id).is_none());
+    assert!(
+        daemon.sandboxes.lock().is_empty(),
+        "a sandbox outlived its workspace"
+    );
+    assert_eq!(backend.alive(), 0, "a started sandbox was never shut down");
+}
+
+/// A second daemon over the data directory of a first one that made the
+/// workspace and whose sandboxes are down: what a daemon start looks like.
+async fn restarted_daemon(
+    dir: &Path,
+    name: &str,
+    backend: Arc<FakeBackend>,
+) -> (Arc<Daemon>, WorkspaceId) {
+    let repo = common::init_repo(dir);
+    let data = dir.join("data");
+    let (first, _) = daemon_over(&data, backend_for("noop"));
+    let ws = create_on(&first, &repo, name).await;
+    shut_down_sandboxes(&first).await;
+    let (daemon, _events) = daemon_over(&data, backend);
+    (daemon, ws.id)
+}
+
+/// A Retry that reaches the daemon while its startup restore is still going
+/// must not end with two sandboxes for one workspace.
+#[tokio::test]
+async fn a_restart_during_the_startup_restore_starts_one_sandbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = FakeBackend::new(300, 0);
+    let (daemon, id) = restarted_daemon(dir.path(), "retried", backend.clone()).await;
+    let snapshot = lifecycle::restore_snapshot(&daemon);
+
+    let restarting = {
+        let d = daemon.clone();
+        let id = id.clone();
+        tokio::spawn(async move { lifecycle::restart(&d, &id).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    daemon.restore_workspaces_from(snapshot).await;
+    restarting.await.unwrap().unwrap();
+
+    assert_eq!(backend.started(), 1, "the restore started a second sandbox");
+    assert_eq!(backend.alive(), 1);
+    assert_eq!(
+        daemon.registry.get(&id).unwrap().state,
+        WorkspaceState::Ready
+    );
+    shut_down_sandboxes(&daemon).await;
+}
+
+/// A workspace removed while the startup restore had not reached it yet is
+/// not brought back up.
+#[tokio::test]
+async fn the_startup_restore_skips_a_workspace_destroyed_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = FakeBackend::new(0, 0);
+    let (daemon, id) = restarted_daemon(dir.path(), "removed", backend.clone()).await;
+    let snapshot = lifecycle::restore_snapshot(&daemon);
+
+    lifecycle::destroy(&daemon, &id, true).await.unwrap();
+    daemon.restore_workspaces_from(snapshot).await;
+
+    assert_eq!(backend.started(), 0);
+    assert!(daemon.registry.get(&id).is_none());
+    assert!(daemon.sandboxes.lock().is_empty());
+}
+
+/// A non-forced destroy of a workspace whose registration is gone cannot ask
+/// git whether the worktree is dirty. It answers the way a dirty one does, a
+/// `Conflict` the IDE turns into "discard anyway?", rather than a raw
+/// "not a git repository".
+#[tokio::test]
+async fn a_destroy_without_force_of_an_unregistered_worktree_is_a_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, ws, layout) = pruned_workspace(dir.path(), "unlisted").await;
+    common::git_ok(&layout.repo, &["branch", "-D", &layout.branch]);
+    let (daemon, _events) = daemon_over(&data, backend_for("noop"));
+
+    let err = lifecycle::destroy(&daemon, &ws.id, false)
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+    assert_eq!(err.data.unwrap()["dirty"], serde_json::json!(true));
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+}
+
+/// A workspace the last daemon left `Creating` or `Destroying` was in the
+/// middle of something nobody is going to finish. It is not brought up (a
+/// half-removed worktree must not come back `Ready`) but put in `Error` with
+/// what to do.
+#[tokio::test]
+async fn the_startup_restore_reports_an_interrupted_create_or_removal() {
+    for state in [WorkspaceState::Creating, WorkspaceState::Destroying] {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FakeBackend::new(0, 0);
+        let (daemon, id) = restarted_daemon(dir.path(), "interrupted", backend.clone()).await;
+        daemon.set_state(&id, state.clone()).await.unwrap();
+        let snapshot = lifecycle::restore_snapshot(&daemon);
+
+        daemon.restore_workspaces_from(snapshot).await;
+
+        assert_eq!(backend.started(), 0, "{state:?}");
+        match daemon.registry.get(&id).unwrap().state {
+            WorkspaceState::Error(m) => {
+                assert!(m.contains("interrupted"), "{state:?}: {m}");
+                assert!(m.contains("Remove the workspace"), "{state:?}: {m}");
+            }
+            other => panic!("{state:?}: expected Error, got {other:?}"),
+        }
+    }
+}

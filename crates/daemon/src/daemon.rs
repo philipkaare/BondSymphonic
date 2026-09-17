@@ -352,8 +352,17 @@ impl Daemon {
     /// registration in the repository, re-registered when it can be — and
     /// restarts its sandbox. See [`lifecycle::restore`].
     pub async fn restore_workspaces(self: &Arc<Self>) {
-        for ws in self.registry.list() {
-            lifecycle::restore(self, &ws).await;
+        self.restore_workspaces_from(lifecycle::restore_snapshot(self))
+            .await;
+    }
+
+    /// [`restore_workspaces`](Self::restore_workspaces) over a list taken
+    /// earlier. `main` takes it before the server accepts a request and runs
+    /// this alongside the accept loop, so each workspace is checked again when
+    /// its turn comes (see [`lifecycle::restore`]).
+    pub async fn restore_workspaces_from(self: &Arc<Self>, snapshot: Vec<lifecycle::RestoreEntry>) {
+        for entry in snapshot {
+            lifecycle::restore(self, entry).await;
         }
     }
 }

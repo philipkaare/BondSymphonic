@@ -264,13 +264,19 @@ async fn start_shim(d: &Arc<Daemon>, ws: &Workspace, handle: &Arc<dyn SandboxHan
     }
     let d = d.clone();
     let id = ws.id.clone();
+    let sandbox = handle.clone();
     tokio::spawn(async move {
         helper.drain().await;
         let code = (&mut child.exit).await.ok();
         // A sandbox on its way down takes the shim with it, which is ordinary; a
         // shim that dies under a live sandbox has cost that workspace its
-        // network and is worth saying so.
-        let alive = d.sandboxes.lock().contains_key(&id);
+        // network and is worth saying so. Compared by handle, not by id: after
+        // a restart the id has a new sandbox, and the old shim dying is not news.
+        let alive = d
+            .sandboxes
+            .lock()
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(current, &sandbox));
         if alive {
             report_no_network(
                 &d,
@@ -358,15 +364,18 @@ fn watch_sandbox(
         let _ = died.wait_for(|dead| *dead).await;
         // A handle that is no longer the registered one belongs to a `destroy`
         // or a restart that has already taken over this workspace's state.
-        let still_ours = d
-            .sandboxes
-            .lock()
-            .get(&id)
-            .is_some_and(|current| Arc::ptr_eq(current, &handle));
-        if !still_ours {
-            return;
+        // Checked and removed under one guard: a restart registering its new
+        // handle between the two would otherwise have that handle removed here.
+        {
+            let mut live = d.sandboxes.lock();
+            let still_ours = live
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle));
+            if !still_ours {
+                return;
+            }
+            live.remove(&id);
         }
-        d.sandboxes.lock().remove(&id);
         // The processes went with the sandbox, but their bridges did not: a
         // host port still accepting connections for a run that no longer exists
         // would hang a browser rather than refuse it.
@@ -707,6 +716,13 @@ async fn create_the_workspace(
 }
 
 pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty, RpcError> {
+    // For the whole destroy: a restart or startup restore of this workspace
+    // that is starting a sandbox finishes first, and its sandbox is then torn
+    // down below like any other, rather than registered after the teardown for
+    // a workspace that no longer exists. The workspace is read under it.
+    let gate = gate(id);
+    let mut count = gate.lock().await;
+    *count += 1;
     let ws = d.workspace(id)?;
     // `layout_for` asks the source repository where its git directory is, so a
     // repository the user has since deleted or moved fails here. Without the
@@ -741,6 +757,12 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
             async {
                 if !ws.worktree_path.exists() {
                     return Ok(false);
+                }
+                // A registration a prune took leaves git nothing to answer
+                // with. Not knowing is treated as dirty: the user is asked to
+                // discard, which is what a forced destroy is for.
+                if !layout.worktree_gitdir().join("HEAD").is_file() {
+                    return Ok(true);
                 }
                 Ok(!layout
                     .worktree_git()
@@ -838,6 +860,10 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
         .remove(id)
         .await
         .map_err(|e| RpcError::internal(e.to_string()))?;
+    // Ids are never reused, so the gate is one entry nobody will ask for
+    // again. Anyone already waiting on it holds a clone and finds the
+    // workspace gone.
+    gates().lock().remove(id);
     Ok(Empty {})
 }
 
@@ -852,11 +878,13 @@ fn report_repaired(d: &Daemon, ws: &Workspace) {
         Event::DaemonLog {
             level: LogLevel::Warn,
             message: format!(
-                "Re-registered this workspace's worktree: the repository {} had forgotten it, \
-                 most likely because a git on Windows ran `git worktree prune`. Uncommitted \
-                 changes are kept, anything that was staged is unstaged, and the worktree is \
-                 now locked against another prune.",
-                ws.repo_path.display()
+                "Re-registered this workspace's worktree: the repository {} had forgotten it \
+                 or its registration was incomplete, most likely because a git on Windows ran \
+                 `git worktree prune`. Uncommitted changes are kept, anything that was staged \
+                 is unstaged, a detached HEAD is back on {}, and the worktree is now locked \
+                 against another prune.",
+                ws.repo_path.display(),
+                ws.branch
             ),
             host: None,
         },
@@ -903,40 +931,127 @@ async fn bring_up(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcError> {
     })
 }
 
+/// One workspace's gate: held by whichever of restore, restart and destroy is
+/// working on its sandbox, around a count of the restarts and destroys that
+/// have run.
+///
+/// Without it the three interleave. A destroy that lands while a restart is
+/// starting the sandbox tears down before the new handle exists, and the
+/// restart then registers a live sandbox for a workspace that is gone; a Retry
+/// that lands while the startup restore is bringing the same workspace up
+/// starts a second sandbox and drops the first one's handle with its processes
+/// still running.
+///
+/// The count is how the startup restore, which works from a list taken before
+/// the first request was accepted, tells that somebody got to a workspace
+/// before it did. Lock order is gate, then repository lock, everywhere.
+type Gate = Arc<tokio::sync::Mutex<u64>>;
+
+fn gates() -> &'static parking_lot::Mutex<std::collections::HashMap<WorkspaceId, Gate>> {
+    static GATES: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<WorkspaceId, Gate>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(Default::default)
+}
+
+fn gate(id: &WorkspaceId) -> Gate {
+    gates().lock().entry(id.clone()).or_default().clone()
+}
+
+/// A workspace as the startup restore found it, with its gate's count at that
+/// moment.
+pub struct RestoreEntry {
+    ws: Workspace,
+    /// `None` when the gate was held at the time, which only a restart or a
+    /// destroy already under way can do: the restore then leaves the workspace
+    /// to it.
+    ops: Option<u64>,
+}
+
+/// The workspaces the startup restore will bring up. `main` takes this before
+/// the server accepts its first request, so nothing a client does can be in it.
+pub fn restore_snapshot(d: &Daemon) -> Vec<RestoreEntry> {
+    d.registry
+        .list()
+        .into_iter()
+        .map(|ws| {
+            let ops = gate(&ws.id).try_lock().ok().map(|count| *count);
+            RestoreEntry { ws, ops }
+        })
+        .collect()
+}
+
 /// Brings a workspace that exists on disk back up when the daemon starts.
 ///
 /// A failure leaves the workspace in `Error` with the reason, never a bare
 /// `SandboxDown`: that state means "the sandbox died while it was running" and
 /// says nothing about what to do, which is exactly what a user looking at a
 /// workspace that would not come back needs to know.
-pub async fn restore(d: &Arc<Daemon>, ws: &Workspace) {
-    let state = match bring_up(d, ws).await {
-        Ok(()) => WorkspaceState::Ready,
-        Err(e) => {
-            tracing::warn!(ws = %ws.id, "restore failed: {}", e.message);
-            WorkspaceState::Error(e.message)
+///
+/// Runs alongside the accept loop, so it takes the workspace's gate and looks
+/// again under it. A workspace that is gone, or that a restart or destroy has
+/// touched since the snapshot, is left alone: whoever touched it owns its
+/// state now. A workspace the last daemon left `Creating` or `Destroying` is
+/// not brought up either — nobody is going to finish that, and a half-removed
+/// worktree must not come back `Ready` — but put in `Error` with what to do.
+pub async fn restore(d: &Arc<Daemon>, entry: RestoreEntry) {
+    let id = entry.ws.id.clone();
+    let gate = gate(&id);
+    let count = gate.lock().await;
+    let Some(ws) = d.registry.get(&id) else {
+        return;
+    };
+    if entry.ops != Some(*count) {
+        tracing::debug!(ws = %id, "restore skipped: the workspace was restarted or destroyed meanwhile");
+        return;
+    }
+    let state = match ws.state {
+        WorkspaceState::Creating => WorkspaceState::Error(
+            "Creating this workspace was interrupted when the daemon stopped. Remove the \
+             workspace to clean up."
+                .into(),
+        ),
+        WorkspaceState::Destroying => WorkspaceState::Error(
+            "Removing this workspace was interrupted when the daemon stopped. Remove the \
+             workspace again to finish."
+                .into(),
+        ),
+        WorkspaceState::Ready | WorkspaceState::SandboxDown | WorkspaceState::Error(_) => {
+            // A sandbox already registered is not this restore's to leak.
+            tear_down_sandbox(d, &id).await;
+            match bring_up(d, &ws).await {
+                Ok(()) => WorkspaceState::Ready,
+                Err(e) => {
+                    tracing::warn!(ws = %id, "restore failed: {}", e.message);
+                    WorkspaceState::Error(e.message)
+                }
+            }
         }
     };
-    if let Err(e) = d.set_state(&ws.id, state).await {
-        tracing::warn!(ws = %ws.id, "could not record the restored state: {}", e.message);
+    if let Err(e) = d.set_state(&id, state).await {
+        tracing::warn!(ws = %id, "could not record the restored state: {}", e.message);
     }
 }
 
-/// One restart at a time per workspace.
+/// Stops everything that runs in a workspace's sandbox, and the sandbox.
 ///
-/// Two restarts interleaved would each start a sandbox, and the second insert
-/// into `Daemon::sandboxes` would drop the first handle on the floor with its
-/// processes still running.
-fn restart_lock(id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
-    > = std::sync::OnceLock::new();
-    LOCKS
-        .get_or_init(Default::default)
-        .lock()
-        .entry(id.clone())
-        .or_default()
-        .clone()
+/// The teardown `destroy` does, minus everything that touches the worktree:
+/// runs and their bridges, agents, terminals, the sandbox and its proxy. The
+/// agents end through their own `stop`, so each one is announced as `Exited`
+/// rather than left claiming to run in a sandbox that is gone; their records
+/// and transcripts stay. The handle leaves `Daemon::sandboxes` *before* it is
+/// shut down, which is what tells its `watch_sandbox` task that the death it is
+/// about to see is not news.
+async fn tear_down_sandbox(d: &Daemon, id: &WorkspaceId) {
+    d.runs.stop_all_in(id).await;
+    d.agents.stop_all_in(id).await;
+    d.ptys.close_workspace(id).await;
+    // The guard is dropped before the await, as in `destroy`.
+    let old = d.sandboxes.lock().remove(id);
+    if let Some(h) = old {
+        let _ = h.shutdown().await;
+    }
+    d.proxies.stop(id);
 }
 
 /// `workspace.restart`: stops whatever is left of the workspace's sandbox and
@@ -947,21 +1062,18 @@ fn restart_lock(id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
 /// refused while the workspace is being created or destroyed, when another
 /// call owns its state.
 ///
-/// The teardown is the one `destroy` does, minus everything that touches the
-/// worktree: runs and their bridges, agents, terminals, the sandbox and its
-/// proxy. The agents end through their own `stop`, so each one is announced as
-/// `Exited` rather than left claiming to run in a sandbox that is gone; their
-/// records and transcripts stay, and the IDE starts them again (resuming their
-/// sessions) once the workspace is `Ready`. The old handle leaves
-/// `Daemon::sandboxes` *before* it is shut down, which is what tells its
-/// `watch_sandbox` task that the death it is about to see is not news — without
-/// that it would flip the restarted workspace to `SandboxDown`.
+/// The teardown is [`tear_down_sandbox`]; the IDE starts the agents again
+/// (resuming their sessions) once the workspace is `Ready`. Under the
+/// workspace's [`Gate`], so it waits for — and is waited for by — a destroy or
+/// the startup restore of the same workspace.
 ///
 /// A failure leaves the workspace in `Error` with the same sentence the
 /// returned error carries.
 pub async fn restart(d: &Arc<Daemon>, id: &WorkspaceId) -> Result<WorkspaceInfo, RpcError> {
-    let lock = restart_lock(id);
-    let _guard = lock.lock().await;
+    let gate = gate(id);
+    let mut count = gate.lock().await;
+    // Read under the gate: a destroy that held it may have removed the
+    // workspace, or left it in `Error`.
     let ws = d.workspace(id)?;
     match ws.state {
         WorkspaceState::Creating | WorkspaceState::Destroying => {
@@ -977,21 +1089,20 @@ pub async fn restart(d: &Arc<Daemon>, id: &WorkspaceId) -> Result<WorkspaceInfo,
         }
         WorkspaceState::Ready | WorkspaceState::SandboxDown | WorkspaceState::Error(_) => {}
     }
-    d.runs.stop_all_in(id).await;
-    d.agents.stop_all_in(id).await;
-    d.ptys.close_workspace(id).await;
-    // The guard is dropped before the await, as in `destroy`.
-    let old = d.sandboxes.lock().remove(id);
-    if let Some(h) = old {
-        let _ = h.shutdown().await;
-    }
-    d.proxies.stop(id);
+    *count += 1;
+    tear_down_sandbox(d, id).await;
     match bring_up(d, &ws).await {
         Ok(()) => Ok(d.workspace_info(&d.set_state(id, WorkspaceState::Ready).await?)),
         Err(e) => {
             tracing::warn!(ws = %id, "restart failed: {}", e.message);
-            d.set_state(id, WorkspaceState::Error(e.message.clone()))
-                .await?;
+            // The reason is what the caller needs; a registry that would not
+            // take the write is the daemon's own problem and goes to the log.
+            if let Err(s) = d
+                .set_state(id, WorkspaceState::Error(e.message.clone()))
+                .await
+            {
+                tracing::warn!(ws = %id, "could not record the failed restart: {}", s.message);
+            }
             Err(e)
         }
     }

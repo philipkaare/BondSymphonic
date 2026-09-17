@@ -169,10 +169,13 @@ async fn serve(args: Args) -> Result<()> {
     // ids restore puts in the map are what a new agent's id is minted against.
     daemon.restore_agents();
     // The workspaces run alongside the accept loop rather than ahead of it, so
-    // `hello` is answered at once and each workspace flips to Ready or SandboxDown
+    // `hello` is answered at once and each workspace flips to Ready or Error
     // through the `workspace.state` events it publishes as its sandboxes come up.
+    // The list is taken here, before the first request is accepted, so a
+    // workspace a client restarts or removes meanwhile is recognised as such.
+    let snapshot = bondsymphonic_daemon::workspace::lifecycle::restore_snapshot(&daemon);
     let restoring = daemon.clone();
-    tokio::spawn(async move { restoring.restore_workspaces().await });
+    tokio::spawn(async move { restoring.restore_workspaces_from(snapshot).await });
 
     let shutdown = CancellationToken::new();
     // Exit when stdin closes (IDE died) or on ctrl-c.
