@@ -71,6 +71,7 @@ const FIXTURE_KNOBS: &[&str] = &[
     "DYING_CLAUDE_STDERR_FROM_CHILD",
     "DYING_CLAUDE_EXIT",
     "DYING_CLAUDE_STDOUT_HELD",
+    "DYING_CLAUDE_STDOUT_SPEW",
 ];
 
 fn clear_knobs() {
@@ -1830,9 +1831,65 @@ async fn a_grandchild_holding_stdout_does_not_cost_the_exit_its_reason() {
         .collect();
     assert_eq!(exits.len(), 1, "{exits:?}");
     assert!(exits[0].contains("Not logged in"), "{exits:?}");
+    // The reader's second of silence and its stderr drain (the holder holds
+    // stderr too), on top of the fixture's own start. Waiting the held pipe out
+    // is `stop`'s five seconds and its own stderr drain on top of that start.
     assert!(
-        took < Duration::from_secs(4),
+        took < Duration::from_millis(5500),
         "stop waited out the held pipe: {took:?}"
+    );
+    cancel.cancel();
+}
+
+/// A reader kept busy past `stop`'s patience -- here by something the CLI left
+/// writing to stdout -- never got to close the record, so `stop` is the first
+/// to close it. A disk that does not answer must not keep `stop` waiting, and
+/// with it the adapter's lock and any restart or destroy of the workspace.
+#[tokio::test]
+async fn a_stop_that_closes_the_record_itself_does_not_wait_out_a_stuck_disk() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    use_dying_claude(py, Some("error_result_turn.ndjson"));
+    std::env::set_var("DYING_CLAUDE_STDOUT_SPEW", "20");
+    let (port, token, d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "stuckstop").await;
+
+    d.agents
+        .delay_record_closing_for_tests(Duration::from_secs(15));
+    let ag = start_agent(&mut c, &ws.id).await;
+    let started = Instant::now();
+    c.call(Request::AgentStop(AgentIdParams {
+        agent_id: ag.clone(),
+    }))
+    .await
+    .unwrap();
+    let took = started.elapsed();
+    let events = next_agent_events(&mut c, &ag, usize::MAX, Duration::from_millis(500)).await;
+    let exits: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::AgentStateChanged {
+                state: AgentState::Exited,
+                detail,
+                ..
+            } => Some(detail.clone().unwrap_or_default()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(exits.len(), 1, "{exits:?}");
+    assert!(exits[0].contains("Not logged in"), "{exits:?}");
+    // `stop`'s five seconds for the reader, a second for stderr (the writer
+    // holds it) and its bounded wait for the close: about nine. Waiting the
+    // close out would be twenty-one.
+    assert!(
+        took < Duration::from_secs(12),
+        "stop waited on the stuck close: {took:?}"
     );
     cancel.cancel();
 }

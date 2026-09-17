@@ -80,6 +80,52 @@ pub struct AgentRecords {
     /// Test hook: the same for every update. See
     /// [`delay_every_write`](Self::delay_every_write).
     every_delay: Mutex<Option<std::time::Duration>>,
+    /// The writes callers queue rather than do: see [`queue`](Self::queue).
+    queue: WriteQueue,
+}
+
+/// A queued piece of work for the records file.
+pub type Job = Box<dyn FnOnce() + Send>;
+
+/// Record writes done one at a time, in the order they were queued, on a
+/// thread of their own.
+///
+/// The agents' stdout readers queue their writes here rather than doing them:
+/// every write ends in an `fsync`, and a reader waiting on the disk is a reader
+/// not reading the protocol. One queue for the file rather than one per agent,
+/// because the file's lock already serialises every agent's writes, and one
+/// place to wait for is what a daemon on its way out needs.
+///
+/// A thread rather than a tokio task: a job is blocking work anyway, and the
+/// queue then does not depend on a runtime existing when the records are made.
+/// The thread is started by the first job and ends when the records are dropped.
+#[derive(Default)]
+pub struct WriteQueue {
+    jobs: std::sync::OnceLock<std::sync::mpsc::Sender<Job>>,
+}
+
+impl WriteQueue {
+    /// Queues `job`. If the thread cannot be started, the job runs here instead:
+    /// late is better than lost.
+    pub fn push(&self, job: Job) {
+        let sender = self.jobs.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            let started = std::thread::Builder::new()
+                .name("agent-records".into())
+                .spawn(move || {
+                    for job in rx {
+                        job();
+                    }
+                });
+            if let Err(e) = started {
+                warn!(error = %e, "could not start the agent records writer; writing in place");
+            }
+            tx
+        });
+        if let Err(std::sync::mpsc::SendError(job)) = sender.send(job) {
+            job();
+        }
+    }
 }
 
 impl AgentRecords {
@@ -89,7 +135,13 @@ impl AgentRecords {
             lock: Mutex::new(()),
             closing_delay: Mutex::new(None),
             every_delay: Mutex::new(None),
+            queue: WriteQueue::default(),
         }
+    }
+
+    /// Where writes go that their caller does not do itself. See [`WriteQueue`].
+    pub fn queue(&self) -> &WriteQueue {
+        &self.queue
     }
 
     /// Makes every write that leaves a record closed take `by` longer, the way

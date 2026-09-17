@@ -255,85 +255,42 @@ impl AgentEntry {
 /// agent before it spawns the process precisely so the first session id the
 /// reader sees has a record to land in, and a write that could overtake another
 /// would give that back. A running agent's own writes keep their order through
-/// [`RecordWriter`], which awaits this for each in turn.
+/// the records file's [`persist::WriteQueue`].
 async fn off_the_runtime(what: &'static str, f: impl FnOnce() + Send + 'static) {
     if let Err(e) = tokio::task::spawn_blocking(f).await {
         warn!(error = %e, "{what} panicked");
     }
 }
 
-/// One record write, and whether somebody is waiting for it.
-struct RecordJob {
-    what: &'static str,
-    write: Box<dyn FnOnce(&AgentRecords) + Send>,
-    done: Option<tokio::sync::oneshot::Sender<()>>,
-}
-
-/// One agent's record writes, done in the order they were asked for by a task
-/// of their own.
+/// How long an agent's stdout reader waits for the session id it reported to
+/// reach the records file before it reads on.
 ///
-/// The agent's stdout reader asks for them -- the session id on the way, the
-/// record's close at the end -- and every one ends in an `fsync`. Waiting on
-/// them in the reader put the disk between the protocol lines: a session id
-/// write that a parallel build held up for seconds kept the reader from the
-/// line saying why the turn failed, and an exit announced in the meantime could
-/// not say it. So a write that nobody needs to see finished is only queued,
-/// and the reader goes on reading. A queue rather than a task per write,
-/// because the order still matters: the last session id asked for is the one
-/// the file must end up with.
-#[derive(Clone)]
-struct RecordWriter {
-    jobs: tokio::sync::mpsc::UnboundedSender<RecordJob>,
-}
+/// The id is what a client resumes the conversation with after a daemon
+/// restart, so the reader used to wait for it outright: once a client had seen
+/// anything after the `init` line, the id was on disk. On a disk a parallel
+/// build holds up for seconds, that wait kept the reader from the line saying
+/// why the turn failed until `stop` had given up and announced an exit that
+/// could not say it. Bounded, the guarantee holds on any disk that answers in
+/// this long, and the write stays queued on one that does not.
+pub const SESSION_RECORD_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-impl RecordWriter {
-    /// Starts the writer. It ends once every sink holding it is gone, after the
-    /// writes already queued.
-    fn spawn(records: Arc<AgentRecords>) -> Self {
-        let (jobs, mut queue) = tokio::sync::mpsc::unbounded_channel::<RecordJob>();
-        tokio::spawn(async move {
-            while let Some(job) = queue.recv().await {
-                let records = records.clone();
-                let write = job.write;
-                off_the_runtime(job.what, move || write(&records)).await;
-                if let Some(done) = job.done {
-                    let _ = done.send(());
-                }
-            }
-        });
-        Self { jobs }
-    }
-
-    /// Queues `write` without waiting for it.
-    fn ask(&self, what: &'static str, write: impl FnOnce(&AgentRecords) + Send + 'static) {
-        let _ = self.jobs.send(RecordJob {
-            what,
-            write: Box::new(write),
-            done: None,
-        });
-    }
-
-    /// Queues `write` and waits until it, and everything before it, is done.
-    async fn wait(&self, what: &'static str, write: impl FnOnce(&AgentRecords) + Send + 'static) {
-        let (done, finished) = tokio::sync::oneshot::channel();
-        if self
-            .jobs
-            .send(RecordJob {
-                what,
-                write: Box::new(write),
-                done: Some(done),
-            })
-            .is_ok()
-        {
-            let _ = finished.await;
+/// Queues `write` on the records file's [`persist::WriteQueue`], and answers a
+/// receiver that resolves once it has run -- or has panicked, which is logged.
+fn queue_write(
+    records: &Arc<AgentRecords>,
+    what: &'static str,
+    write: impl FnOnce(&AgentRecords) + Send + 'static,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let target = records.clone();
+    records.queue().push(Box::new(move || {
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write(&target)));
+        if ran.is_err() {
+            warn!("{what} panicked");
         }
-    }
-
-    /// Waits for everything queued so far.
-    async fn written(&self) {
-        self.wait("waiting for the agent's record writes", |_| {})
-            .await;
-    }
+        let _ = done.send(());
+    }));
+    finished
 }
 
 /// The single path by which an adapter reports what its agent did.
@@ -357,7 +314,7 @@ pub struct AgentSink {
     /// Where this agent's record is kept, so a session id and an exit reach the
     /// file the next daemon reads. `None` in the unit tests below, which have no
     /// data directory and nothing to restore into.
-    records: Option<RecordWriter>,
+    records: Option<Arc<AgentRecords>>,
     /// Set by the first [`ended`](AgentSink::ended), shared by every clone. The
     /// record is closed once: the moment the process ended is what it wants,
     /// and a second write would only put an `fsync` in front of whoever asked.
@@ -393,18 +350,8 @@ impl AgentSink {
     /// Separate from [`new`](AgentSink::new) so the sink stays constructible
     /// without a data directory: only [`AgentManager`] has one.
     pub fn with_records(mut self, records: Arc<AgentRecords>) -> Self {
-        self.records = Some(RecordWriter::spawn(records));
+        self.records = Some(records);
         self
-    }
-
-    /// Waits until every record write asked for so far has happened.
-    ///
-    /// [`session_id`](AgentSink::session_id) only asks; this is for whoever
-    /// needs the file to show it, which is the tests.
-    pub async fn records_written(&self) {
-        if let Some(writer) = &self.records {
-            writer.written().await;
-        }
     }
 
     /// Records one transcript entry and publishes it.
@@ -476,10 +423,10 @@ impl AgentSink {
     ///
     /// Recorded as well as remembered: it is the one thing a client needs to
     /// carry a conversation across a daemon restart, by starting a new agent
-    /// with `options.resume_session`. The write is queued, not waited for: see
-    /// [`RecordWriter`]. The entry has the id at once, which is what everything
-    /// in this daemon reads.
-    pub fn session_id(&self, id: String) {
+    /// with `options.resume_session`. The write is queued and waited for up to
+    /// [`SESSION_RECORD_WAIT`]; the entry has the id at once, which is what
+    /// everything in this daemon reads.
+    pub async fn session_id(&self, id: String) {
         // The CLI reports the session on every `init` line, which is once per
         // turn on a resumed conversation, and the record is a file: nothing is
         // written unless the id actually moved.
@@ -496,9 +443,15 @@ impl AgentSink {
             return;
         };
         let agent = self.agent_id.clone();
-        records.ask("recording an agent's session id", move |records| {
+        let written = queue_write(records, "recording an agent's session id", move |records| {
             records.update(&agent, |r| r.session_id = Some(id))
         });
+        if tokio::time::timeout(SESSION_RECORD_WAIT, written)
+            .await
+            .is_err()
+        {
+            warn!(agent = %self.agent_id, "the session id is not on disk yet; reading on");
+        }
     }
 
     /// The agent's process is gone: closes its transcript file and its record,
@@ -510,6 +463,12 @@ impl AgentSink {
     /// the first call writes; the others return at once, even while that write
     /// is still going, so the exit paths can each call it without queueing
     /// behind a disk that is slow or stuck.
+    ///
+    /// The first call waits for the write with no bound of its own. The exit
+    /// paths bound it, and publish `Exited` when the bound runs out with the
+    /// close still queued: on a disk that stuck, a restart can find the record
+    /// open, and restores the agent as one that ended when the daemon
+    /// restarted -- the alternative being an exit nobody ever announces.
     pub async fn ended(&self) {
         // Ahead of the record, and ahead of the early returns below: an agent
         // with no record on disk still holds a file descriptor, and a daemon
@@ -525,16 +484,15 @@ impl AgentSink {
         // Taken now, not when the queue gets to it: the moment the process
         // ended is what the record wants.
         let now = now_rfc3339();
-        // Waited for, behind whatever this agent queued before it: a client
-        // that reacts to `Exited` by restarting the daemon must find the
-        // record closed.
-        records
-            .wait("closing an agent's record", move |records| {
-                records.update(&agent, |r| {
-                    r.ended_at.get_or_insert(now);
-                })
+        // Waited for, behind whatever was queued before it: a client that
+        // reacts to `Exited` by restarting the daemon must find the record
+        // closed.
+        let _ = queue_write(records, "closing an agent's record", move |records| {
+            records.update(&agent, |r| {
+                r.ended_at.get_or_insert(now);
             })
-            .await;
+        })
+        .await;
     }
 
     pub fn agent_id(&self) -> &AgentId {
@@ -664,6 +622,17 @@ impl AgentManager {
     #[doc(hidden)]
     pub fn delay_record_closing_for_tests(&self, by: std::time::Duration) {
         self.records.delay_closing_writes(by);
+    }
+
+    /// Waits, for at most `within`, until every record write queued so far has
+    /// happened. Answers whether they all did.
+    ///
+    /// For a daemon on its way out: the runtime does not outlive `main`, and a
+    /// session id still queued at that point is a conversation the next daemon
+    /// cannot offer to resume.
+    pub async fn flush_records(&self, within: std::time::Duration) -> bool {
+        let flushed = queue_write(&self.records, "flushing the agent records", |_| {});
+        tokio::time::timeout(within, flushed).await.is_ok()
     }
 
     /// Test hook: see [`AgentRecords::delay_every_write`].
@@ -1264,11 +1233,9 @@ mod tests {
         // The wrong order: the agent speaks, and only then is it recorded.
         let entry = Arc::new(AgentEntry::new(ws.clone(), AgentAdapterKind::Claude));
         let s = sink(&entry);
-        s.session_id("sess-1".into());
-        s.records_written().await;
+        s.session_id("sess-1".into()).await;
         records.upsert(blank());
-        s.session_id("sess-1".into());
-        s.records_written().await;
+        s.session_id("sess-1".into()).await;
         assert_eq!(
             records.load()[0].session_id,
             None,
@@ -1281,15 +1248,12 @@ mod tests {
         let entry = Arc::new(AgentEntry::new(ws.clone(), AgentAdapterKind::Claude));
         let s = sink(&entry);
         records.upsert(blank());
-        s.session_id("sess-1".into());
-        s.records_written().await;
+        s.session_id("sess-1".into()).await;
         assert_eq!(records.load()[0].session_id.as_deref(), Some("sess-1"));
-        s.session_id("sess-1".into());
-        s.records_written().await;
+        s.session_id("sess-1".into()).await;
         assert_eq!(records.load()[0].session_id.as_deref(), Some("sess-1"));
         // And a session that really does move is followed.
-        s.session_id("sess-2".into());
-        s.records_written().await;
+        s.session_id("sess-2".into()).await;
         assert_eq!(records.load()[0].session_id.as_deref(), Some("sess-2"));
     }
 

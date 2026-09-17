@@ -208,6 +208,17 @@ async fn serve(args: Args) -> Result<()> {
     for h in sandboxes {
         let _ = h.shutdown().await;
     }
+    // The agents' record writes still queued -- a session id reported a moment
+    // ago above all -- are what the next daemon restores the agents from, and
+    // the queue does not outlive this function. Bounded, because a daemon that
+    // cannot exit is worse than one that loses a write.
+    if !daemon
+        .agents
+        .flush_records(std::time::Duration::from_secs(5))
+        .await
+    {
+        tracing::warn!("some agent record writes were still queued at exit");
+    }
     tracing::info!("daemon exited");
     Ok(())
 }

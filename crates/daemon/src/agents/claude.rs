@@ -565,6 +565,19 @@ fn exit_detail_for(entry: &super::AgentEntry, code: i32, tail: &Tail) -> String 
     }
 }
 
+/// Closes the agent's record for an exit path, waiting at most `RECORD_GRACE`.
+///
+/// An exit path that ran out of patience goes on to announce the exit with the
+/// close still queued: see [`AgentSink::ended`].
+async fn close_record(sink: &AgentSink) {
+    if tokio::time::timeout(RECORD_GRACE, sink.ended())
+        .await
+        .is_err()
+    {
+        warn!(agent = %sink.agent_id(), "the agent's record is not closed yet; announcing its exit anyway");
+    }
+}
+
 /// The half of the adapter that only exists while the process does.
 struct Running {
     /// Serialises the writers: `send`, `permission_reply` and `interrupt` can
@@ -769,12 +782,13 @@ impl AgentAdapter for ClaudeAdapter {
         let reader_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             let mut exited = exit_for_reader;
+            // The exit code, once the exit has won the race below. Kept rather
+            // than awaited again: a `Shared` polled after it completed panics.
+            //
             // Once the process is gone the pipe only holds what is already in
             // it -- unless a grandchild kept it open, which is what the bound
             // on each read from then on is for. The reader bounds its own pipe
             // waits so that `stop` never has to cut it short over them.
-            // The exit code, once the exit has won the race below. Kept rather
-            // than awaited again: a `Shared` polled after it completed panics.
             let mut gone: Option<i32> = None;
             loop {
                 let next = if gone.is_some() {
@@ -827,7 +841,7 @@ impl AgentAdapter for ClaudeAdapter {
                             sink.message(body).await;
                         }
                         Parsed::State(state, detail) => sink.state(state, detail).await,
-                        Parsed::SessionId(id) => sink.session_id(id),
+                        Parsed::SessionId(id) => sink.session_id(id).await,
                         Parsed::Nothing => {}
                     }
                 }
@@ -850,8 +864,9 @@ impl AgentAdapter for ClaudeAdapter {
             // is closed here rather than only on the `Exited` announcement: an
             // agent that died mid-turn stays in `Error` and never announces one.
             // Here, before the claim below, because it is a disk write: see
-            // the claim.
-            sink.ended().await;
+            // the claim. Bounded, so a process that died on its own is still
+            // announced when the disk does not answer.
+            close_record(&sink).await;
             let detail = exit_detail_for(sink.entry(), code, &tail);
             // `stop` may be ending this same process; the flag makes one of the
             // two announce and the other stay quiet, so a process that exits on
@@ -986,7 +1001,7 @@ impl AgentAdapter for ClaudeAdapter {
             // Already stopped, or never started; `stop` has to stay idempotent
             // for `destroy`, and the flag keeps it from announcing twice. The
             // record is closed before the claim, as everywhere a claim is made.
-            self.sink.ended().await;
+            close_record(&self.sink).await;
             if !self.exit_announced.swap(true, Ordering::SeqCst) {
                 self.sink.publish_state(AgentState::Exited, None);
             }
@@ -1020,25 +1035,28 @@ impl AgentAdapter for ClaudeAdapter {
         // An abort now lands only on a reader stuck on the disk, or on one fed
         // without pause by something that outlived the process, and never
         // between its claim and its publish, which cannot yield.
-        if tokio::time::timeout(
+        let reader_finished = tokio::time::timeout(
             READER_DRAIN + STDERR_DRAIN + RECORD_GRACE,
             &mut running.reader_task,
         )
         .await
-        .is_err()
-        {
+        .is_ok();
+        if !reader_finished {
             warn!(agent = %self.sink.agent_id(), "agent output reader did not finish; stopping it");
             running.reader_task.abort();
+            // The same wait the reader makes, for the same reason: this path
+            // builds an exit detail too, and the tail is what makes it worth
+            // reading. Not when the reader finished, which has made it already.
+            let _ = tokio::time::timeout(STDERR_DRAIN, running.stderr_done.clone()).await;
         }
-        // The same wait the reader makes, for the same reason: this path builds
-        // an exit detail too, and the tail is what makes it worth reading.
-        let _ = tokio::time::timeout(STDERR_DRAIN, running.stderr_done.clone()).await;
         running.stderr_task.abort();
         self.pending_request_ids.lock().clear();
         // Returns at once when the reader already closed the record, even if
-        // that write is still stuck on the disk, so an aborted reader does not
-        // leave this path queued behind it.
-        self.sink.ended().await;
+        // that write is still stuck on the disk. When the reader was stopped
+        // before it got there, this is the first close, and it is bounded like
+        // the reader's: `stop` holds the adapter's lock, and a restart or a
+        // destroy of the workspace waits on it.
+        close_record(&self.sink).await;
         if !self.exit_announced.swap(true, Ordering::SeqCst) {
             let detail = code.map(|c| exit_detail_for(self.sink.entry(), c, &self.stderr_tail));
             self.sink.publish_state(AgentState::Exited, detail);
