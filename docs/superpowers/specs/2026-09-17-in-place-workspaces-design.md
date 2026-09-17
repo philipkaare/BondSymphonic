@@ -1,6 +1,6 @@
 # In-place workspaces — design
 
-Date: 2026-09-17. Status: approved in chat by the user; amended the same day while planning (`.git/commondir`, `worktrees`, `remotes` and `branches` read-only, `--ignore-submodules=all`, the extra `repo.inspect` fields and refusals, measured bwrap and git behaviour), and amended twice more during implementation (§4.1: `config.worktree` is bound unconditionally, not only when `extensions.worktreeConfig` is on; §4.2: a read-only bind can be detached from outside the sandbox, so the daemon detects and stops the sandbox instead of relying on the bind alone; §4.2 again: the daemon's own worktree and branch cleanup no longer trips that detection, a removed last worktree gets its own sentence, and Create PR's `git push -u` is a known gap that still can). The plan is `docs/superpowers/plans/2026-09-17-in-place-workspaces.md`.
+Date: 2026-09-17. Status: approved in chat by the user; amended the same day while planning (`.git/commondir`, `worktrees`, `remotes` and `branches` read-only, `--ignore-submodules=all`, the extra `repo.inspect` fields and refusals, measured bwrap and git behaviour), and amended twice more during implementation (§4.1: `config.worktree` is bound unconditionally, not only when `extensions.worktreeConfig` is on; §4.2: a read-only bind can be detached from outside the sandbox, so the daemon detects and stops the sandbox instead of relying on the bind alone; §4.2 again: the daemon's own worktree and branch cleanup no longer trips that detection and a removed last worktree gets its own sentence), and amended once more in the final fix wave (§4.2: on a Windows drive the read-only binds are not the control -- name aliases get past them -- so the watcher compares the contents of everything under `.git` that git runs as configuration; the hold in `.git/worktrees` is persistent; Create PR pushes without `-u`; and the honest account of what an in-place agent can still reach, refs and objects included). The plan is `docs/superpowers/plans/2026-09-17-in-place-workspaces.md`.
 
 ## 1. Goal
 
@@ -217,15 +217,37 @@ not reach.
 
 ### 4.2 What this protects, and what it does not
 
-This keeps the sandbox boundary for any git the user runs later, on either side of
-WSL: the agent cannot plant a hook, a `core.fsmonitor`, a `core.sshCommand` or a
-filter driver in the repository's config, cannot redirect `.git` or its common
-directory, cannot redefine a legacy remote, and cannot reach the git directories
-of the repository's worktree workspaces.
+On a checkout inside the distro, this keeps the sandbox boundary for any git the
+user runs later, on either side of WSL: the agent cannot plant a hook, a
+`core.fsmonitor`, a `core.sshCommand` or a filter driver in the repository's
+config, cannot redirect `.git` or its common directory, cannot redefine a legacy
+remote, and cannot reach the git directories of the repository's worktree
+workspaces. Git commands that write `.git/config` therefore fail inside the
+sandbox: `git push -u`, `git remote add`, upstream tracking set up by `git switch
+-c x origin/x`, and `git sparse-checkout`. This is accepted.
 
-Inside the sandbox, git commands that write `.git/config` fail: `git push -u`,
-`git remote add`, upstream tracking set up by `git switch -c x origin/x`, and
-`git sparse-checkout`. This is accepted.
+**On a Windows drive the binds are not the control -- amended during
+implementation.** A bind protects one dentry. On DrvFs (9p, `aname=drvfs`)
+Windows resolves names that differ only in case, and 8.3 short names, to the
+same file, and each alias is a dentry no mount covers: measured in the distro,
+`printf … >> .git/CONFIG`, `>> .GIT/config` and `>> GIT~1/config` all reach the
+user's `.git/config` through the read-only bind, with the mount, the device and
+the inode unchanged, and `echo x > .git/HOOKS/pre-commit` plants a hook. A
+Windows `git status` then ran the planted `core.fsmonitor`. The IDE is a Windows
+application and the repositories the user browses to are Windows folders, so
+this is the ordinary case rather than an edge one. It is answered by content
+detection (below), which is the only check that tells the difference: on such a
+drive the protection is detect-and-stop, not blocked, and the docs and the New
+Agent dialog say so.
+
+**What an in-place agent can reach that no bind covers.** `.git` itself is
+writable. An in-place agent can therefore write the repository's refs and
+objects: it can move a sibling *worktree* workspace's `refs/heads/bs/<name>/work`
+between the user reading its Changes and pressing Merge, rewrite `packed-refs`,
+write loose objects, and add `refs/replace` entries, which change what the
+daemon's diff and the user's `git log -p` display (the daemon does not set
+`GIT_NO_REPLACE_OBJECTS`). This is a residual risk of the design, listed below
+and in the user guide.
 
 **A read-only bind is not proof against something that runs outside the
 sandbox -- amended during implementation.** The `EBUSY` guarantee of §4.1
@@ -243,20 +265,29 @@ writable `.git` beneath.
 
 The daemon watches for this rather than relying on the bind alone.
 `InPlaceLayout::snapshot`, taken right after `prepare` and before the sandbox
-starts, records each protected entry's device and inode -- not size or time,
-so the user editing `.git/config` in their own editor is never mistaken for a
-replacement -- together with the contents of `config`, `config.worktree` and
-`commondir`, the files that name programs. Every 250 ms while the sandbox is
-up, the snapshot is rechecked: every entry is re-`lstat`ed and, given the
-sandbox's pid, its `/proc/<pid>/mountinfo` is re-read to confirm each one is
-still actually mounted there -- identity alone is not enough, because two
-config writes in a row can hand a fresh file the same inode number an ext4
-filesystem just freed. The first change either check finds is a breach: the
-sandbox is torn down, the workspace moves to `Error` with a sentence naming
-which entries changed, and the daemon's log carries a unified line diff of
-the ones whose contents were read. Retry (`workspace.restart`) prepares and
-snapshots again, so a repaired repository is protected exactly as it was on
-create.
+starts, records three things: each protected entry's device, inode, type and
+link count (a second hard link to `config` is refused at snapshot time and is a
+breach when it appears, because a write through the other name reaches the same
+file with identity and mount intact); the contents of everything under `.git`
+that git runs or reads as configuration, bounded by a path and a byte cap so a
+pathological repository cannot make the check unbounded; and the mount points
+the entries were bound at. Every 250 ms while the sandbox is up, all three are
+rechecked: every entry is re-`lstat`ed, the covered contents are re-read and
+compared whole, and, given the sandbox's pid, its `/proc/<pid>/mountinfo` is
+re-read to confirm each entry is still actually mounted there -- identity alone
+is not enough, because two config writes in a row can hand a fresh file the same
+inode number an ext4 filesystem just freed, and on a Windows drive an aliased
+write changes neither identity nor mount. Measured at about 56 ms a poll on a
+real `/mnt/c` repository. The first change any of the three finds is a breach:
+the sandbox is torn down, the workspace moves to `Error` with a sentence naming
+which entries changed, and a `daemon.log` warning carries that sentence, the
+entry names and a unified line diff of the files whose contents are read. The
+same sentence and diff go out as a workspace-tagged warn-level `daemon.log`
+event, which is what the IDE shows behind the banner's **What changed** (§5.2).
+A sandbox that died on its own is not a breach, and a check that could not be
+made stops the sandbox with a sentence of its own rather than leaving it
+unwatched. Retry (`workspace.restart`) prepares and snapshots again, so a
+repaired repository is protected exactly as it was on create.
 
 This closes the gap for everything that happens after the next check runs,
 but not for the poll interval itself: a change the check has not yet seen --
@@ -278,12 +309,23 @@ hardened:
 
 - Removing a worktree deletes `.git/worktrees` itself once the last linked
   worktree is gone. `worktree::remove` (a plain destroy) and the merge/rebase
-  scratch-worktree reaper now hold the directory open first
-  (`WorktreesHold::take`, a `.bs-hold-<id>/locked` entry a locked-entry-aware
-  git prune skips and `worktree list` skips too), under the same
-  per-repository lock `prepare`/`release` take, and drop the hold once the
-  operation is done. A stale hold a killed daemon left behind is taken away
-  by the next one that reaches the repository.
+  scratch-worktree reaper hold the directory open first (`WorktreesHold::take`,
+  a `.bs-hold-<id>/locked` entry a locked-entry-aware git prune skips and
+  `worktree list` skips too), under the same per-repository lock
+  `prepare`/`release` take, and drop the hold once the operation is done. A
+  stale hold a killed daemon left behind is taken away by the next one that
+  reaches the repository -- only when its `locked` file says what the daemon
+  writes there and the entry holds nothing else, so a worktree of the user's
+  own that happens to be named that way keeps its lock.
+- **Made persistent in the final wave.** The hold above covers only the
+  daemon's own removals, and `git worktree prune` or a `git gc` -- which git's
+  `--auto` maintenance runs behind an ordinary `git commit` -- removes an empty
+  `.git/worktrees` just as well, stopping an agent for no reason the user could
+  see. So `prepare` now also creates a hold of its own, named for the workspace
+  -- `.bs-inplace-<workspace id>/locked` -- and `release` removes exactly that
+  entry at Close, and only while its `locked` file still holds what the daemon
+  wrote there. Its name deliberately does not start with `.bs-hold-`, which the
+  stale sweep above takes away.
 - Deleting a workspace's branch used to run `git branch -D`, which rewrites
   `.git/config` every time to drop a `branch.<name>` section that is usually
   not there. `remove_branch` now runs `git update-ref -d
@@ -292,10 +334,10 @@ hardened:
   upstream -- see the gap below). A plain destroy therefore no longer writes
   `.git/config` at all.
 
-**A removed *last* worktree still stops the sandbox, but says so plainly.**
-The hold above covers only the daemon's own removals; a user deleting the
-repository's last remaining worktree by hand still detaches the bind. The
-watcher tells this apart from a replaced or foreign entry: `ProtectionBreach`
+**A `.git/worktrees` that is gone anyway says so plainly.** With the persistent
+hold, the user's own `git worktree remove`, `prune` and `gc` no longer empty
+that directory, so what is left is deleting it by hand. The watcher tells that
+apart from a replaced or foreign entry: `ProtectionBreach`
 carries `removed`, the subset of `entries` that are gone rather than
 replaced, and its `sentence()` answers differently when the breach is exactly
 `.git/worktrees`, removed: *"This repository's last worktree was removed,
@@ -303,17 +345,37 @@ which also removed a directory the sandbox keeps read-only, so the sandbox
 was stopped. Nothing needs checking; press Retry."* -- no diff to review,
 because `.git/worktrees` names no program.
 
-**Known gap, to be closed in the final wave.** `workspace.create_pr` still
-runs `git push -u origin <branch>`, which sets that branch's upstream in
-`.git/config`. A Create PR on a *worktree* workspace therefore still stops an
-in-place sibling of the same repository today, the same as any other
-host-side `.git/config` write. Scheduled to be removed once Create PR's push
-is hardened the same way `remove_branch` was above.
+**Create PR pushes without `-u` -- changed in the final wave.**
+`workspace.create_pr` used to run `git push -u origin <branch>`, which sets
+that branch's upstream in `.git/config` and so stopped an in-place sibling of
+the same repository. It now runs `git push origin <branch>`: `gh pr create` is
+given `--head` explicitly, the object absorption that follows reads
+`refs/remotes/origin/<branch>`, which a push updates with or without `-u`, and
+an upstream the user wants is theirs to set. The `branch.<name>` section that
+`remove_branch` still knows how to remove is now only one a user set by hand.
 
 Residual risks, documented in the user guide and not mitigated further:
 
+- **On a Windows drive the protection catches rather than prevents.** The
+  read-only binds do not cover the names DrvFs aliases, so a write through one
+  of them lands and is answered up to 250 ms later by the sandbox being stopped
+  and the change shown. What that window allows is the user's to review and
+  undo.
+- **The repository's refs and objects.** `.git` is read-write, so an in-place
+  agent can move any branch -- a sibling worktree workspace's included -- rewrite
+  `packed-refs`, write loose objects, and add `refs/replace` entries, which
+  change what the daemon's diff and the user's `git log -p` show. The daemon does
+  not set `GIT_NO_REPLACE_OBJECTS`, and Merge does not pin the commit its Changes
+  view was computed from; both are follow-ups.
 - **`core.hooksPath` inside the working tree** (§4.3). Hooks there are ordinary
   files the agent can edit, and the user's git runs them.
+- **Programs the user's own config names that live in the tree.** A
+  `filter.*.clean`, a `diff.*.textconv` or a `core.fsmonitor` pointing at a
+  script inside the working tree is a script the agent can rewrite, and
+  `InPlaceLayout::git()` deliberately applies no neutralisation, so the daemon's
+  own status and diff run it on the next Changes refresh. The worktree kind has
+  the same exposure inside its own worktree; this predates the design. A
+  follow-up would run the read-only queries with the drivers neutralised.
 - **`.gitattributes` in the working tree** can select filter or diff drivers, but
   only drivers already defined in the user's own read-only config. This risk
   exists today for merged worktree content too.
@@ -337,7 +399,10 @@ Residual risks, documented in the user guide and not mitigated further:
   `git rebase` in the workspace worktree, and `rebase` has no
   `--ignore-submodules` option. An embedded repository an agent committed there
   can therefore have its config run by the daemon when the user presses Rebase.
-  This is a follow-up and is not fixed by this design.
+  This is a follow-up and is not fixed by this design. It is the only exception
+  left: the conflict listing that follows a failed merge or rebase used to be a
+  second one (`git diff --diff-filter=U` is worktree-versus-index and looks into
+  a submodule), and now reads the index alone with `git ls-files --unmerged -z`.
 
 ### 4.3 `core.hooksPath` warning
 
@@ -366,6 +431,12 @@ isolates nothing.
   - When `hooks_path_in_tree` is set, a warning says: "This repository runs git
     hooks from `<path>` inside the working tree. The agent can change them, and
     they run outside the sandbox the next time you use git here."
+  - For a repository on a Windows drive -- `C:\…` as the dialog holds it, or
+    `/mnt/<letter>/…` as the daemon knows it -- a note says how the protection
+    works there: "This folder is on a Windows drive. There the sandbox cannot
+    make .git read-only, so a change to it is caught within a moment instead:
+    the sandbox stops and shows you what changed." (§4.2.) The check is on the
+    path's spelling and asks the daemon nothing.
   - When `in_place_refusal` is set (a linked worktree, a `.git` that is a file),
     the choice is disabled with that sentence as its tooltip, and the dialog
     falls back to a worktree. A bare repository is already an `inspect` error.
@@ -384,7 +455,14 @@ isolates nothing.
   against `HEAD`.
 - The Close group dialog offers an in-place workspace only **Keep (move to
   Unsorted)** and **Close (files are kept)**, and leaves it out of the discard
-  confirmation.
+  confirmation. That row sends the same non-forced `workspace.destroy` the tab
+  menu's **Close workspace…** does, not the forced one a discard is; the run
+  behind the dialog completes on either answer to it.
+- The banner of a workspace stopped because its protected git files changed
+  offers **What changed**, which opens the line diff the daemon sent with the
+  reason (§4.2). The IDE keeps that text against the workspace id, so it
+  survives the tab being built later and a reconnect; an IDE started after the
+  event has only `daemon.log`, which carries the same diff.
 - Destroy becomes **Close workspace…** in the Workspace menu, the tab menu and the
   down-workspace banner. It asks: *Close workspace "<name>"? The agent and its
   sandbox stop. Your files, branches and git history are not touched.* There is no

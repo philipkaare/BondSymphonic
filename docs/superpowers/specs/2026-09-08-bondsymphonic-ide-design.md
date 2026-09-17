@@ -529,6 +529,19 @@ terminal tab bound to no agent. There is deliberately no field in
   red glyph on the agent tab and a dismissible banner at the top of that
   workspace's agent area, with the error message and, for `GitError`, the stderr
   in an expandable section.
+- A workspace that cannot run at all takes that banner over (Retry and Close or
+  Destroy instead of Dismiss and Restart), and the same expandable section
+  carries what the daemon said to explain the reason, under **What changed**.
+  Only the daemon ever fills it: a workspace-tagged warn-level `daemon.log`
+  event whose first line is the sentence the workspace's `Error` state then
+  carries, and whose remaining lines are the detail — today, the line diff of
+  the git files an in-place workspace protects (daemon design §6.2). The IDE
+  recognises the pair by that shape and not by any wording of its own, keeps the
+  detail against the workspace id in `Workspaces`, and pairs it with the problem
+  whichever of the two events arrives first. That store outlives a tab that does
+  not exist yet and a reconnect, and not the process: an IDE started after the
+  event shows the reason without the detail, which is why the daemon logs the
+  same diff to `daemon.log`.
 - Daemon-level problems (disconnect, prereqs) show in the status bar and, when
   blocking, by opening the Settings dialog on its Setup section — **once per run
   of blocking failures**, which is `should_auto_open_setup(blocked,

@@ -489,7 +489,7 @@ For a merge, `<after>` is the base branch after the operation and `<before>`
 the same ref before it, so the range is exactly the commits the merge added. A
 push absorbs a different range: `<ws.branch> ^<ws.base_branch>`, everything the
 workspace's branch adds to its base. The reason is `refs/remotes/origin/<branch>`,
-which `git push -u` leaves behind — unlike the local workspace branch, that
+which a push leaves behind with or without `-u` — unlike the local workspace branch, that
 remote-tracking ref is *not* deleted when the workspace is destroyed, so it would
 be left pointing into an object directory that no longer exists. An empty range is
 a no-op. The pack is written straight into `objects/pack`, which is where `git
@@ -540,7 +540,7 @@ A `--no-git-protect` daemon flag mounts `.git` read-write for troubleshooting;
   recognise. It is in the *default* `Git` rather than at any call site or
   constructor, so a command added later cannot be forgotten and a bare
   `Git::new()` carries it too. It applies to the conflict list of 5.4
-  (`git diff --name-only --diff-filter=U`) as much as to the lists here.
+  (`git ls-files --unmerged -z --full-name`) as much as to the lists here.
 - An in-place workspace measures `workspace.status`, `workspace.changes` and
   `workspace.diff` against `HEAD` — or the empty tree,
   `4b825dc642cb6eb9a060e54bf8d69288fbee4904`, in a repository with no commits
@@ -555,11 +555,17 @@ A `--no-git-protect` daemon flag mounts `.git` read-write for troubleshooting;
   its state and runs the command it names. `-c diff.ignoreSubmodules=all` is
   not enough on its own, because a `.gitmodules` entry with `ignore = none`
   that the agent writes overrides it; the command-line flag is not overridden
-  by anything in the tree. This closes the hole for both workspace kinds
-  except one known exception: the rebase step of §5.4 runs `git rebase`, which
-  has no `--ignore-submodules` option, so an embedded repository an agent
-  committed can still have its config run there. That is a follow-up, not
-  fixed by this.
+  by anything in the tree. It covers `repo::is_dirty` (which `repo.inspect`
+  calls, so opening the New Agent dialog on a repository is enough to run an
+  embedded config without it) and the base-dirty guard of §5.4 as well as the
+  workspace queries. This closes the hole for both workspace kinds except one
+  known exception: the rebase step of §5.4 runs `git rebase`, which has no
+  `--ignore-submodules` option, so an embedded repository an agent committed
+  can still have its config run there. That is a follow-up, not fixed by this.
+  The conflict list that follows a failed merge or rebase used to be a second
+  exception — `git diff --diff-filter=U` compares the worktree with the index
+  and looks into a submodule to do it — and now reads the index alone with `git
+  ls-files --unmerged`.
 
 ### 5.4 Merge, rebase, squash
 Run in the main repo by the daemon, never inside a sandbox:
@@ -629,7 +635,9 @@ Run in the main repo by the daemon, never inside a sandbox:
   There is no branch of its own for either to land.
 
 ### 5.5 PR
-`git push -u origin bs/<name>/work` then `gh pr create --title --body [--draft]
+`git push origin bs/<name>/work` — deliberately without `-u`, which would write
+`.git/config` and stop an in-place workspace of the same repository (§6.2) —
+then `gh pr create --title --body [--draft]
 --head bs/<name>/work --base <base>`; parse the URL from stdout. `gh` runs on the
 host with the daemon user's own configuration, never in a sandbox, and must be
 authenticated in the distro (reported by `check_prereqs` as `gh_auth`).
@@ -806,8 +814,7 @@ working in place.
 guarantee above holds only inside the agent's own mount namespace. It is not a
 guarantee against anything that runs outside the sandbox, in the same
 repository, while the workspace is open: a `git config` the user types, `git
-branch -u`, `git push -u`, `git remote add`, a `git worktree remove` that
-empties the last entry under `worktrees`, or `git sparse-checkout` all replace
+branch -u`, `git push -u`, `git remote add`, or `git sparse-checkout` all replace
 or remove the file or directory a bind was made on — git's lock-and-rename
 pattern for `config` chief among them — and the kernel detaches that bind
 inside the sandbox exactly as a plain rename or remove of a mounted-over path
@@ -815,22 +822,57 @@ always has. Nothing run inside the sandbox can prevent that: the entry the
 bind was protecting is simply gone from under it, and the path falls through
 to the writable `.git` beneath.
 
-The daemon watches for this rather than relying on the bind alone.
+**And on a Windows drive the bind is not the control at all.** A bind protects
+one dentry. On DrvFs (9p, `aname=drvfs`) Windows resolves names that differ
+only in case, and 8.3 short names, to the same file, and each alias is a dentry
+no mount covers. Measured in the distro with the daemon's own bind shape:
+`>> .git/config` fails as intended, while `>> .git/CONFIG`, `>> .GIT/config`
+and `>> GIT~1/config` all reach the user's config, and `echo x >
+.git/HOOKS/pre-commit` plants a hook — with the mount, the device and the inode
+unchanged in every case. A Windows `git status` in that repository then ran the
+planted `core.fsmonitor`. The IDE is a Windows application and the repositories
+the user picks are Windows folders, so this is the ordinary case rather than an
+edge one, and it is why the watcher below compares contents rather than
+identity alone. On such a drive the protection is detect-and-stop rather than
+blocked, which the New Agent dialog and the user guide say in as many words.
+
+The daemon watches for all of this rather than relying on the bind.
 `InPlaceLayout::snapshot`, taken right after `prepare` and before the sandbox
-starts, records each protected entry's device and inode — not size or time,
-so the user editing `.git/config` in their own editor is never mistaken for a
-replacement — together with the contents of `config`, `config.worktree` and
-`commondir`, the files that name programs. Every `PROTECTION_POLL` (250 ms)
-while the sandbox is up, `ProtectedSnapshot::check` re-`lstat`s every entry
-and, given the sandbox's pid, re-reads its `/proc/<pid>/mountinfo` to confirm
-each one is still actually mounted there — identity alone is not enough,
-because two config writes in a row can hand a fresh file the same inode
-number an ext4 filesystem just freed. The first change either check finds is
-a breach: the sandbox is torn down, the workspace moves to
-`Error(ProtectionBreach::sentence())`, and a `daemon.log` warning names which
-entries changed and carries a unified line diff of the ones whose contents
-were read. Retry (`workspace.restart`) calls `prepare` and takes a fresh
-snapshot, so a repaired repository is protected exactly as it was on create.
+starts, records three things:
+
+- each protected entry's device, inode, type and link count — not size or
+  time, so the user editing `.git/config` in their own editor is never mistaken
+  for a replacement. A protected file that already has a second hard link is
+  refused by `prepare`, and one that gains a second is a breach: a write through
+  the other name reaches the same file with identity and mount intact;
+- the contents of everything under `.git` that git runs or reads as
+  configuration — `config`, `config.worktree`, `commondir`, and the listings and
+  contents of `hooks`, `info`, `remotes`, `branches` and `modules` — bounded by
+  `COVERED_CAP` paths and `COVERED_BYTES_CAP` bytes, in a fixed sorted order, so
+  that a repository with hundreds of submodules cannot make the check unbounded;
+- the mount points each entry was bound at.
+
+Every `PROTECTION_POLL` (250 ms) while the sandbox is up,
+`ProtectedSnapshot::check` re-`lstat`s every entry, re-reads the covered set and
+compares it whole, and, given the sandbox's pid, re-reads its
+`/proc/<pid>/mountinfo` to confirm each entry is still actually mounted there —
+identity alone is not enough, because two config writes in a row can hand a
+fresh file the same inode number an ext4 filesystem just freed, and an aliased
+write on DrvFs changes neither identity nor mount. Measured at about 56 ms a
+poll on a real `/mnt/c` repository, against the 250 ms period. The first change
+any of the three finds is a breach: the sandbox is torn down, the workspace
+moves to `Error(ProtectionBreach::sentence())`, and a `daemon.log` **warning**
+carries that sentence, the entries that changed and a unified line diff of the
+files whose contents are read. The same sentence and diff go out as a
+workspace-tagged warn-level `daemon.log` *event*, which is what the IDE keeps
+against the workspace and offers behind its banner's **What changed** (IDE
+design §12); the IDE pairs the two by their first line, so the wording stays
+the daemon's alone. A sandbox that has died on its own is not reported as a
+breach — its pid is gone, so nothing would read as mounted — and a check that
+could not be made at all stops the sandbox with a sentence of its own rather
+than leaving it unwatched. Retry (`workspace.restart`) calls `prepare` and takes
+a fresh snapshot, so a repaired repository is protected exactly as it was on
+create.
 
 This closes the gap for everything that happens after the next check runs,
 but not for the poll interval itself: a change the check has not yet seen —
@@ -855,7 +897,7 @@ repository, not the worktree workspace being acted on:
 - **Removing a worktree deletes `.git/worktrees` itself once the last linked
   worktree is gone**, which detaches the bind under any in-place sandbox of
   the same repository. `worktree::remove` (a plain destroy) and the merge/
-  rebase scratch-worktree reaper (§5.4) now hold the directory open first:
+  rebase scratch-worktree reaper (§5.4) hold the directory open first:
   `WorktreesHold::take` creates a `.bs-hold-<id>/locked` entry in
   `.git/worktrees` before either operation runs, under the same
   per-repository lock `InPlaceLayout::prepare`/`release` take, and drops it
@@ -864,8 +906,20 @@ repository, not the worktree workspace being acted on:
   directory is never empty while a hold is live and is never deleted out from
   under a bind the daemon itself still needs. A stale hold a killed daemon
   left behind is taken away by the next one that reaches that repository,
-  before it takes its own. Best effort: a hold that cannot be made costs the
-  in-place sandbox a Retry, not the removal it was protecting against.
+  before it takes its own — but only when its `locked` file says exactly what
+  the daemon writes there and the entry holds nothing else, so a worktree of
+  the user's own that happens to carry the name keeps its lock. Best effort: a
+  hold that cannot be made costs the in-place sandbox a Retry, not the removal
+  it was protecting against.
+- **The user's own `git worktree prune` and `git gc` do the same, and are not
+  the daemon's to bracket.** Git's `--auto` maintenance runs behind an ordinary
+  `git commit`, and an empty `.git/worktrees` is removed by it. So while an
+  in-place workspace exists the directory carries a hold of that workspace's
+  own: `InPlaceLayout::prepare` writes `.bs-inplace-<workspace id>/locked` and
+  `release` removes exactly that entry at Close, and only while it still holds
+  what the daemon wrote. Its name deliberately does not start with `.bs-hold-`,
+  which the stale sweep above takes away. It registers no worktree, so `git
+  worktree list` does not show it.
 - **Deleting a workspace's branch used to run `git branch -D`, which rewrites
   `.git/config` every time** to drop a `branch.<name>` section that is
   usually not there at all — and a rewritten `.git/config` is exactly what the
@@ -877,11 +931,11 @@ repository, not the worktree workspace being acted on:
   longer touches `.git/config` at all, and no longer stops an in-place
   sibling.
 
-**A removed *last* worktree still stops the sandbox, but says so plainly.**
-The hold above only covers the daemon's own removals; a user deleting the
-repository's last remaining worktree by hand — outside anything BondSymphonic
-did — still deletes `.git/worktrees` and still detaches the bind. The watcher
-tells this case apart from a replaced or foreign entry: `ProtectionBreach` now
+**A `.git/worktrees` that is gone anyway says so plainly.** With the persistent
+hold the user's own `git worktree remove`, `prune` and `gc` no longer empty
+that directory, so what is left is deleting it by hand, which still detaches
+the bind. The watcher tells that apart from a replaced or foreign entry:
+`ProtectionBreach` now
 carries `removed`, the subset of `entries` that are gone rather than
 replaced, and `ProtectionBreach::sentence()` answers with a different
 sentence when the breach is exactly `.git/worktrees`, removed: *"This
@@ -890,13 +944,14 @@ sandbox keeps read-only, so the sandbox was stopped. Nothing needs checking;
 press Retry."* — no diff to review, because there is nothing to have planted:
 `.git/worktrees` names no program.
 
-**Known gap, to be closed in the final wave.** `workspace.create_pr` still
-runs `git push -u origin <branch>` (§5.5), which sets that branch's upstream
-in `.git/config` — the one config write Create PR cannot avoid. A Create PR
-on a *worktree* workspace therefore still stops an in-place sibling of the
-same repository today, the same way any other host-side `.git/config` write
-does (above). This is scheduled to be removed once Create PR's push is
-hardened the same way `remove_branch` was above.
+**Create PR pushes without `-u`.** `workspace.create_pr` used to run `git push
+-u origin <branch>` (§5.5), which sets that branch's upstream in `.git/config`
+and so stopped an in-place sibling of the same repository, the same way any
+other host-side `.git/config` write does (above). It now runs `git push origin
+<branch>`: nothing in the flow needs the tracking, because `gh pr create` is
+given `--head` explicitly and the object absorption that follows reads
+`refs/remotes/origin/<branch>`, which a push updates either way. An upstream
+the user wants is theirs to set, when no in-place workspace is open.
 
 ### 6.3 Sandbox init (one bwrap per workspace)
 bubblewrap cannot join an existing network namespace, so the daemon runs exactly
