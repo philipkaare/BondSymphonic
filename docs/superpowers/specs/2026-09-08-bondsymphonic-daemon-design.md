@@ -282,7 +282,14 @@ registry. Removing the branch this way, rather than with `git branch -D`
 (which rewrites `.git/config` every time to drop a section that is usually not
 there), is what keeps a plain destroy from touching `.git/config` at all when
 there is nothing to remove from it — see §6.2 for why that matters next to an
-in-place workspace of the same repository. With `force=false`, refuse if the worktree has uncommitted
+in-place workspace of the same repository. The ref deletion refuses a branch
+that is checked out in any worktree of the repository, as `git branch -D` did
+and `git update-ref -d` does not: an in-place agent can `git switch` the user's
+checkout onto a workspace's branch. The removal itself refuses any
+`worktree_path` that is not `<data>/worktrees/<id>`, `force` included; the
+daemon creates worktrees nowhere else, and an entry that names somewhere else
+is a registry an older build rewrote without its `kind` — an in-place
+workspace's own checkout, which a forced destroy would otherwise delete. With `force=false`, refuse if the worktree has uncommitted
 changes or unmerged commits and return `Conflict` with details. A worktree whose
 registration the repository has lost track of counts as dirty too: nothing can
 be read from it to say otherwise, so the refusal errs toward asking rather than
