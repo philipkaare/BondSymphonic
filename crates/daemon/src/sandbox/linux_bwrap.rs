@@ -346,6 +346,10 @@ struct BwrapHandle {
     /// The daemon binary as this sandbox sees it, from the same
     /// [`exe_in_sandbox`] the argv was built with.
     helper_exe: PathBuf,
+    /// The pid of the `bwrap` the daemon started. It stays the daemon's
+    /// unreaped child until `shutdown` waits on it, so the number cannot be
+    /// reused before then.
+    bwrap_pid: Option<u32>,
     bwrap: tokio::sync::Mutex<tokio::process::Child>,
 }
 
@@ -469,6 +473,7 @@ impl SandboxBackend for BwrapBackend {
             client,
             base_env: base_env(spec, &self.user),
             helper_exe: exe_in_sandbox(spec, &self.self_exe),
+            bwrap_pid: child.id(),
             bwrap: tokio::sync::Mutex::new(child),
         }))
     }
@@ -490,6 +495,21 @@ impl SandboxHandle for BwrapHandle {
         // The exec socket closes when init exits, whatever killed it: an OOM, a
         // crash, bwrap being killed, or the whole sandbox being torn down.
         Some(self.client.died())
+    }
+
+    fn host_pid(&self) -> Option<u32> {
+        // The `bwrap` the daemon started stays in the host's mount namespace;
+        // with `--unshare-user` it forks a second `bwrap` into the new
+        // namespaces, which becomes the sandbox's pid 1 and is its only child.
+        // Read fresh each time: that child is not ours to keep from being
+        // reaped, and its pid could belong to anything once it is gone.
+        let pid = self.bwrap_pid?;
+        std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+            .ok()?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
     }
 
     async fn shutdown(&self) -> Result<(), RpcError> {

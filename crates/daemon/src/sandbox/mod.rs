@@ -128,6 +128,17 @@ pub trait SandboxHandle: Send + Sync {
     fn died(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
         None
     }
+
+    /// The host pid of a process inside this sandbox's mount namespace, whose
+    /// `/proc/<pid>/mountinfo` shows the sandbox's mounts as the sandbox sees
+    /// them. Asked for on every look rather than kept, because that process
+    /// may be gone and its pid reused.
+    ///
+    /// `None` from a backend with no mounts of its own, and whenever the
+    /// process cannot be found.
+    fn host_pid(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Picks a backend by name. Unknown or unsupported names fall back to `noop`

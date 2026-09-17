@@ -137,16 +137,23 @@ pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
 
 /// The sandbox of an in-place workspace: the checkout and its `.git`
 /// read-write, and what a git outside the sandbox would execute read-only on
-/// top (see [`InPlaceLayout::late_ro_binds`]). No private object directory:
-/// the agent's objects go into the repository's own store.
-pub fn in_place_spec_for(d: &Daemon, ws: &Workspace, layout: &InPlaceLayout) -> SandboxSpec {
+/// top. The read-only list is the snapshot's own
+/// ([`in_place::ProtectedSnapshot::late_ro_binds`]), so every entry bound is
+/// an entry watched. No private object directory: the agent's objects go into
+/// the repository's own store.
+pub fn in_place_spec_for(
+    d: &Daemon,
+    ws: &Workspace,
+    layout: &InPlaceLayout,
+    snapshot: &in_place::ProtectedSnapshot,
+) -> SandboxSpec {
     let same = |p: &PathBuf| (p.clone(), p.clone());
     finish_spec(
         d,
         ws,
         layout.rw_binds().iter().map(same).collect(),
         Vec::new(),
-        layout.late_ro_binds().iter().map(same).collect(),
+        snapshot.late_ro_binds().iter().map(same).collect(),
         Vec::new(),
     )
 }
@@ -202,7 +209,7 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
     ] {
         std::fs::create_dir_all(p).map_err(|e| RpcError::io(&e))?;
     }
-    let spec = match ws.kind {
+    let (spec, protection) = match ws.kind {
         WorkspaceKind::Worktree => {
             let layout = layout_for(d, ws).await?;
             // The daemon owns `config.worktree`, empty, and the sandbox gets it
@@ -213,7 +220,7 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
             // (sparse-checkout) the read-only bind rules out inside the sandbox
             // anyway.
             std::fs::write(layout.config_worktree(), b"").map_err(|e| RpcError::io(&e))?;
-            spec_for(d, ws, &layout)
+            (spec_for(d, ws, &layout), None)
         }
         WorkspaceKind::InPlace => {
             // Every start, like the worktree kind's `config.worktree`: what the
@@ -221,7 +228,11 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
             // while the sandbox was down.
             let layout = InPlaceLayout::new(&ws.worktree_path, &d.dirs.no_hooks());
             layout.prepare(&d.dirs.in_place_record(&ws.id))?;
-            in_place_spec_for(d, ws, &layout)
+            // After `prepare`, so it is of the entries the binds are about to
+            // be made on, and before the sandbox, so nothing can replace one
+            // unseen in between.
+            let snapshot = layout.snapshot().map_err(|e| RpcError::io(&e))?;
+            (in_place_spec_for(d, ws, &layout, &snapshot), Some(snapshot))
         }
     };
     // Before the sandbox, not after: the shim inside it connects to this socket
@@ -245,6 +256,11 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
     };
     d.sandboxes.lock().insert(ws.id.clone(), handle.clone());
     watch_sandbox(d, &ws.id, handle.clone(), proxy);
+    // Only where there are binds to lose: the no-sandbox backend protects
+    // nothing, and a `git config` the user runs beside it breaches nothing.
+    if let Some(snapshot) = protection.filter(|_| d.backend.name() == BWRAP_BACKEND) {
+        watch_protection(d, &ws.id, handle.clone(), snapshot);
+    }
     if d.backend.name() == BWRAP_BACKEND {
         start_shim(d, ws, &handle).await;
     }
@@ -450,6 +466,104 @@ fn watch_sandbox(
         // `workspace.list` with no sandbox behind it and nothing said about why.
         if let Err(e) = d.set_state(&id, WorkspaceState::SandboxDown).await {
             tracing::warn!(ws = %id, error = %e.message, "could not record the sandbox as down");
+        }
+    });
+}
+
+/// Stops an in-place sandbox whose protected git entries were replaced from
+/// outside it (see [`InPlaceLayout::snapshot`]).
+///
+/// Polled rather than watched: inotify never hears about a rename Windows
+/// makes on a DrvFs mount, and the check is a few `lstat` calls. Tied to one
+/// sandbox handle, as [`watch_sandbox`] is, and quiet once that handle is no
+/// longer the registered one -- a restart has a watcher of its own.
+///
+/// A breach is said out loud with what changed, and then handled as a
+/// restart's teardown would be, under the workspace's gate: the agents are
+/// announced as exited and the workspace goes to `Error` until Retry, which
+/// prepares and snapshots again.
+fn watch_protection(
+    d: &Arc<Daemon>,
+    id: &WorkspaceId,
+    handle: Arc<dyn SandboxHandle>,
+    snapshot: in_place::ProtectedSnapshot,
+) {
+    let d = d.clone();
+    let id = id.clone();
+    let snapshot = Arc::new(snapshot);
+    tokio::spawn(async move {
+        let is_current = |d: &Daemon| {
+            d.sandboxes
+                .lock()
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+        };
+        let mut pid_missing = false;
+        let breach = loop {
+            tokio::time::sleep(in_place::PROTECTION_POLL).await;
+            if !is_current(&d) {
+                return;
+            }
+            // Always with a pid: a replaced file can come back with the same
+            // inode, so the sandbox's own mount table is the check that
+            // counts. A sandbox whose pid cannot be found is usually one on
+            // its way down, which `watch_sandbox` is about to report, so it
+            // gets one poll's grace. After that, pid 0 -- which has no
+            // `/proc` entry, and an unreadable mount table is no evidence
+            // that anything is still bound.
+            let pid = match handle.host_pid() {
+                Some(pid) => pid,
+                None if !pid_missing => {
+                    pid_missing = true;
+                    continue;
+                }
+                None => 0,
+            };
+            pid_missing = false;
+            // Off the runtime: on a DrvFs mount even an `lstat` can wait on
+            // Windows.
+            let check = {
+                let snapshot = snapshot.clone();
+                tokio::task::spawn_blocking(move || snapshot.check(Some(pid)))
+            };
+            match check.await {
+                Ok(Some(breach)) => break breach,
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(ws = %id, error = %e, "the protection check panicked; this sandbox is no longer watched");
+                    return;
+                }
+            }
+        };
+        let sentence = breach.sentence();
+        tracing::warn!(ws = %id, entries = ?breach.entries, "protected git entries were replaced");
+        d.events.publish(
+            Some(id.clone()),
+            Event::DaemonLog {
+                level: LogLevel::Warn,
+                message: if breach.config_diff.is_empty() {
+                    sentence.clone()
+                } else {
+                    format!(
+                        "{sentence}
+{}",
+                        breach.config_diff
+                    )
+                },
+                host: None,
+            },
+        );
+        let gate = gate(&id);
+        let mut count = gate.lock().await;
+        // Looked at again under the gate: a restart or Close that got there
+        // first owns the workspace now.
+        if !is_current(&d) || d.registry.get(&id).is_none() {
+            return;
+        }
+        *count += 1;
+        tear_down_sandbox(&d, &id).await;
+        if let Err(e) = d.set_state(&id, WorkspaceState::Error(sentence)).await {
+            tracing::warn!(ws = %id, "could not record the stopped sandbox: {}", e.message);
         }
     });
 }

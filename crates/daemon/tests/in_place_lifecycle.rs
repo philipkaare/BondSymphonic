@@ -418,6 +418,7 @@ mod bwrap {
     use super::*;
     use bondsymphonic_daemon::sandbox::SandboxCommand;
     use bondsymphonic_daemon::server::{Server, ServerConfig};
+    use bondsymphonic_daemon::workspace::in_place::{self, ProtectionBreach};
     use tokio::io::AsyncReadExt;
 
     fn bwrap_available() -> bool {
@@ -473,6 +474,7 @@ mod bwrap {
             [
                 ".git/branches/",
                 ".git/commondir",
+                ".git/config.worktree",
                 ".git/hooks/",
                 ".git/remotes/",
                 ".git/worktrees/"
@@ -520,10 +522,11 @@ mod bwrap {
             .filter(|n| !before.contains(n))
             .collect();
         // The hooks directory stays (git would have made it); the guard and the
-        // empty on-demand directories the daemon made are taken back, and so
-        // is its record of them.
+        // empty entries the daemon made are taken back, and so is its record
+        // of them.
         for gone in [
             ".git/commondir",
+            ".git/config.worktree",
             ".git/worktrees/",
             ".git/remotes/",
             ".git/branches/",
@@ -538,5 +541,111 @@ mod bwrap {
         assert!(!DataDirs::new(dir.path().join("data"))
             .in_place_record(&ws.id)
             .exists());
+    }
+
+    /// A git on the host that replaces `.git/config` -- as every `git config`
+    /// does, by renaming `config.lock` over it -- takes the read-only bind
+    /// away from the running sandbox. The daemon notices, says what changed,
+    /// stops the sandbox and leaves the workspace in `Error` until Retry,
+    /// which protects the new file.
+    #[tokio::test]
+    async fn a_config_replaced_from_the_host_stops_the_sandbox() {
+        if !bwrap_available() {
+            eprintln!("SKIP: bwrap unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = common::init_repo(dir.path());
+        let server = Server::bind(ServerConfig::default()).await.unwrap();
+        let bus = server.event_bus();
+        let mut events = bus.subscribe();
+        let daemon = Daemon::new(
+            DataDirs::new(dir.path().join("data")),
+            backend_for("linux_bwrap"),
+            bus,
+        )
+        .unwrap();
+        let ws = lifecycle::create(&daemon, params(&repo, "swapped"))
+            .await
+            .unwrap();
+        assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+
+        let config = repo.join(".git/config");
+        // The pid the mount check reads is in the sandbox's mount namespace:
+        // its mount table has the read-only bind on the config.
+        let pid = daemon
+            .sandbox(&ws.id)
+            .unwrap()
+            .host_pid()
+            .expect("a host pid");
+        let mountinfo = std::fs::read_to_string(format!("/proc/{pid}/mountinfo")).unwrap();
+        let canonical = std::fs::canonicalize(&config).unwrap();
+        assert!(
+            mountinfo.contains(&format!(" {} ", canonical.display())),
+            "{mountinfo}"
+        );
+        let lock = repo.join(".git/config.lock");
+        // Twice, as two `git config` writes in a row do: the second rename
+        // usually hands the file its old inode back on ext4 (measured), so only
+        // the sandbox's mount table can tell it was replaced.
+        for line in ["[core]\n\tfsmonitor = echo planted\n", "[x]\n\ty = z\n"] {
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(line);
+            std::fs::write(&lock, text).unwrap();
+            std::fs::rename(&lock, &config).unwrap();
+        }
+
+        let expected = WorkspaceState::Error(
+            ProtectionBreach {
+                entries: vec![".git/config".into()],
+                config_diff: String::new(),
+            }
+            .sentence(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while daemon.registry.get(&ws.id).unwrap().state != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "still {:?}",
+                daemon.registry.get(&ws.id).unwrap().state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            daemon.sandbox(&ws.id).is_err(),
+            "a sandbox was left running"
+        );
+
+        // The warning names the change, on this workspace.
+        let mut warned = false;
+        while let Ok(msg) = events.try_recv() {
+            if let ServerMessage::Event {
+                workspace_id: Some(id),
+                event: Event::DaemonLog { level, message, .. },
+            } = msg
+            {
+                if id == ws.id
+                    && level == LogLevel::Warn
+                    && message.contains("+\tfsmonitor = echo planted")
+                {
+                    assert!(
+                        message.starts_with("Git files this workspace protects"),
+                        "{message}"
+                    );
+                    warned = true;
+                }
+            }
+        }
+        assert!(warned, "no daemon.log warning with the config diff");
+
+        // Retry protects the file that is there now.
+        let info = lifecycle::restart(&daemon, &ws.id).await.unwrap();
+        assert_eq!(info.state, WorkspaceState::Ready);
+        tokio::time::sleep(in_place::PROTECTION_POLL * 3).await;
+        assert_eq!(
+            daemon.registry.get(&ws.id).unwrap().state,
+            WorkspaceState::Ready
+        );
+        lifecycle::destroy(&daemon, &ws.id, false).await.unwrap();
     }
 }
