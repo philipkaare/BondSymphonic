@@ -698,12 +698,16 @@ void NewAgentDialog::updateModeState() {
     const bool inPlace = m_inPlaceMode->isChecked();
     m_form->setRowVisible(m_inPlaceHelp, inPlace);
     m_form->setRowVisible(m_driveNote, inPlace && onAWindowsDrive(repoPath()));
+    // Not "inside the working tree" any more: the daemon reports every hooks
+    // path in this repository the agent can write, and a `core.hooksPath`
+    // pointing at a directory it makes inside the read-write part of `.git` is
+    // one of them. The path itself says where it is.
     m_hooksWarning->setText(
         m_hooksPath.isEmpty()
             ? QString()
-            : QStringLiteral("This repository runs git hooks from %1 inside the working tree. "
-                             "The agent can change them, and they run outside the sandbox the "
-                             "next time you use git here.")
+            : QStringLiteral("This repository runs git hooks from %1, which the agent can "
+                             "change. They run outside the sandbox the next time you use git "
+                             "here.")
                   .arg(m_hooksPath));
     m_form->setRowVisible(m_hooksWarning, inPlace && !m_hooksPath.isEmpty());
     if (m_inspectPending || m_inspectFailed) {
@@ -1052,6 +1056,20 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_offers_the_checkout_itse
     if (inPlace->isEnabled() || dialog.inPlace() || dialog.inPlaceAvailable() ||
         !inPlace->toolTip().contains(QLatin1String("linked worktree"))) {
         return 9;
+    }
+
+    // A hooks path the agent can write inside the read-write part of `.git` is
+    // warned about in the same words. Only the daemon decides which paths those
+    // are; the dialog names whichever it is told about, so the sentence no
+    // longer claims the working tree.
+    controller.repoInspected(
+        QString::fromUtf8(kDialogRepo),
+        QStringLiteral(R"({"is_repo":true,"branches":["main"],"default_branch":"main",)"
+                       R"("head_branch":"main","hooks_path_in_tree":".git/my-hooks"})"));
+    inPlace->setChecked(true);
+    if (warning->isHidden() || !warning->text().contains(QLatin1String(".git/my-hooks")) ||
+        warning->text().contains(QLatin1String("inside the working tree"))) {
+        return 10;
     }
     return 0;
 }

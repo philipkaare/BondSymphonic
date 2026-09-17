@@ -235,9 +235,9 @@ which then simply shows the branch already checked out (or "detached HEAD")
 rather than something you pick, since nothing is switched or created. The help
 text under the choice says why: "The agent edits this folder on its current
 branch. Its changes are not isolated on a branch of their own." If the
-repository runs its git hooks from inside the working tree itself — the way
-husky does — a warning names the path: "This repository runs git hooks from
-\<path\> inside the working tree. The agent can change them, and they run
+repository runs its git hooks from a directory the agent can write — from
+inside the working tree, the way husky does — a warning names the path: "This
+repository runs git hooks from \<path\>, which the agent can change. They run
 outside the sandbox the next time you use git here." For a folder on a Windows
 drive (`C:\…`, which the distro sees as `/mnt/c/…`), a second note says how the
 protection works there: "This folder is on a Windows drive. There the sandbox
@@ -395,6 +395,17 @@ checkout** on a folder that already has one is refused: "this checkout already
 has an in-place workspace: \<name\>". A worktree workspace on the same
 repository is unaffected and can run alongside it.
 
+**Do not point an older BondSymphonic at the same distro while one of these
+exists.** A build from before this feature does not know what kind of workspace
+this is. It reads the daemon's `workspaces.json`, drops the field it does not
+understand, and writes the entry back as an ordinary worktree workspace whose
+"worktree" is your own checkout — and destroying *that*, in that older build,
+would delete the folder. This build refuses to remove any worktree path it did
+not create itself, so it cannot make that mistake, and every IDE installs its
+own daemon into the distro before it connects, so an ordinary upgrade is safe.
+What to avoid is launching an older IDE afterwards. Close your in-place
+workspaces before you go back to one.
+
 **Residual risks.** Working in the checkout itself means a few things the
 sandbox cannot fully close off:
 
@@ -411,7 +422,9 @@ sandbox cannot fully close off:
   somewhere inside the tree (husky does this) has ordinary files there the
   agent can edit like any other, and your own git runs them the next time you
   use it. The dialog warns about this when it is set (see "Creating an agent
-  workspace" above).
+  workspace" above). The same exposure exists for a hooks directory inside
+  `.git` that is not `.git/hooks` — `.git` itself is writable, and only the
+  entries BondSymphonic binds are not.
 - **Programs your own git configuration names, if they live in the tree.** A
   `filter.*.clean`, a `diff.*.textconv` or a `core.fsmonitor` pointing at a
   script inside the working tree is a script the agent can rewrite, and the

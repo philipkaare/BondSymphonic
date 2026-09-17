@@ -367,8 +367,10 @@ Residual risks, documented in the user guide and not mitigated further:
   change what the daemon's diff and the user's `git log -p` show. The daemon does
   not set `GIT_NO_REPLACE_OBJECTS`, and Merge does not pin the commit its Changes
   view was computed from; both are follow-ups.
-- **`core.hooksPath` inside the working tree** (§4.3). Hooks there are ordinary
-  files the agent can edit, and the user's git runs them.
+- **`core.hooksPath` the agent can write** (§4.3). Hooks inside the working tree
+  are ordinary files the agent can edit, and the user's git runs them. So is a
+  hooks directory inside the read-write part of `.git`, which the dialog does
+  not warn about today (§4.3, "Open").
 - **Programs the user's own config names that live in the tree.** A
   `filter.*.clean`, a `diff.*.textconv` or a `core.fsmonitor` pointing at a
   script inside the working tree is a script the agent can rewrite, and
@@ -409,8 +411,17 @@ Residual risks, documented in the user guide and not mitigated further:
 `repo.inspect` resolves `git config --get core.hooksPath` (relative to the root, `~/`
 expanded, `..` taken out) and reports it, relative to the root, in
 `hooks_path_in_tree` when it lies inside the working tree but not inside `.git`. The New
-Agent dialog shows a warning under the in-place choice when it is set (§5.1). The
-daemon does not refuse such a create.
+Agent dialog shows a warning under the in-place choice when it is set (§5.1), and
+the sentence names the path rather than saying where it is. The daemon does not
+refuse such a create.
+
+**Open:** a `core.hooksPath` pointing inside the *read-write* part of `.git`
+(`.git/my-hooks`, or `.git/hooks/../my-hooks`, which normalises to it) is a
+directory the agent can fill just as well, and is not reported today, because
+the resolution treats all of `.git` as unwritable. Only the entries §4.1 binds
+are. The residual-risk list and the user guide say so; the dialog needs no
+change when the field is corrected, which is why its sentence no longer claims
+the working tree.
 
 ### 4.4 Noop backend
 
@@ -429,8 +440,10 @@ isolates nothing.
   - The help text reads: "The agent edits this folder on its current branch. Its
     changes are not isolated on a branch of their own."
   - When `hooks_path_in_tree` is set, a warning says: "This repository runs git
-    hooks from `<path>` inside the working tree. The agent can change them, and
-    they run outside the sandbox the next time you use git here."
+    hooks from `<path>`, which the agent can change. They run outside the
+    sandbox the next time you use git here." The sentence names the path rather
+    than saying where it is, so that it holds for every path the field can
+    report (§4.3).
   - For a repository on a Windows drive -- `C:\…` as the dialog holds it, or
     `/mnt/<letter>/…` as the daemon knows it -- a note says how the protection
     works there: "This folder is on a Windows drive. There the sandbox cannot

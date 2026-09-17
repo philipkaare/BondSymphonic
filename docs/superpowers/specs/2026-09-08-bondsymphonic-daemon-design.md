@@ -289,7 +289,11 @@ checkout onto a workspace's branch. The removal itself refuses any
 `worktree_path` that is not `<data>/worktrees/<id>`, `force` included; the
 daemon creates worktrees nowhere else, and an entry that names somewhere else
 is a registry an older build rewrote without its `kind` — an in-place
-workspace's own checkout, which a forced destroy would otherwise delete. With `force=false`, refuse if the worktree has uncommitted
+workspace's own checkout, which a forced destroy would otherwise delete. The
+registry's own `version` cannot carry that defence: `migrate` loads a file whose
+version it does not know rather than refusing it, so raising it would not make
+an older build fail closed, and the path check is what protects this one. An
+older build still has neither, which the user guide says in as many words. With `force=false`, refuse if the worktree has uncommitted
 changes or unmerged commits and return `Conflict` with details. A worktree whose
 registration the repository has lost track of counts as dirty too: nothing can
 be read from it to say otherwise, so the refusal errs toward asking rather than
