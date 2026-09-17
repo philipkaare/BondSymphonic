@@ -2694,3 +2694,258 @@ mod sandbox_retry {
         info
     }
 }
+
+/// Remove on the banner of a workspace git has lost track of.
+///
+/// The daemon cannot tell whether such a worktree is clean, so a destroy
+/// without force is refused with `Conflict` and `data.dirty`. The banner's
+/// advice for that workspace is to remove it, and the destroy dialog's Force
+/// box starts unticked, so the first answer is always that refusal. The
+/// window turns it into one plain question -- remove it anyway, discarding
+/// its changes and its branch -- and a yes is the forced destroy.
+///
+/// `destroy-yes` answers both questions yes: the seam prints each one instead
+/// of raising a modal box and carries on as a user who pressed Yes would.
+mod sandbox_remove_dirty {
+    use super::{drain, wait_for};
+    use bondsymphonic_ide::model::persistence::{PersistedGroup, StateFile, STATE_VERSION};
+    use bondsymphonic_proto::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    const TOKEN: &str = "remove-dirty-token";
+    const SCRIPT: &str = "wait,quit";
+    const MENU_TEST: &str = "sandbox-banner,sandbox-remove,destroy-yes";
+    const WORKSPACE: &str = "ws_dirty1";
+    const NAME: &str = "dirty-one";
+    const REASON: &str = "Git no longer lists this workspace's worktree. Remove the workspace.";
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+    type Journal = Arc<Mutex<Vec<String>>>;
+
+    #[test]
+    fn remove_asks_again_when_the_daemon_cannot_tell_the_worktree_is_clean() {
+        if bondsymphonic_ide::testing::skip_without_qt("sandbox remove dirty") {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (addr, journal) = rt.block_on(fake_daemon());
+
+        let config = std::env::temp_dir().join(format!("bs-remove-dirty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("config dir");
+        let state_path = config.join("state.json");
+        let saved = StateFile {
+            version: STATE_VERSION,
+            groups: vec![PersistedGroup {
+                name: "dirty".to_owned(),
+                workspace_ids: vec![WORKSPACE.to_owned()],
+                ..PersistedGroup::default()
+            }],
+            active_workspace: Some(WORKSPACE.to_owned()),
+            ..StateFile::default()
+        };
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&saved).expect("state json"),
+        )
+        .expect("seed state.json");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", SCRIPT)
+            .env("BS_MENU_TEST", MENU_TEST)
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", &state_path)
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let seen = journal.lock().expect("journal mutex").clone();
+        let context = format!("requests: {seen:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(
+            status.success(),
+            "the IDE exited with {status}, expected 0\n{context}"
+        );
+        let _ = std::fs::remove_dir_all(&config);
+
+        let line = |needle: &str| out.lines().position(|l| l.contains(needle));
+
+        // The first question is the tab menu's, unticked.
+        let asked = line(&format!("BS_MENU_TEST destroy target={WORKSPACE} "))
+            .unwrap_or_else(|| panic!("Remove did not ask to destroy\n{context}"));
+        // The refusal is asked about, in words that say what a yes costs.
+        let refused = out
+            .lines()
+            .find(|l| l.starts_with(&format!("BS_MENU_TEST destroy-refused target={WORKSPACE} ")))
+            .unwrap_or_else(|| panic!("the refusal was not turned into a question\n{context}"));
+        assert!(refused.contains(NAME), "{refused}");
+        assert!(refused.contains("uncommitted changes"), "{refused}");
+        assert!(refused.contains("branch"), "{refused}");
+        assert!(
+            asked < line("BS_MENU_TEST destroy-refused").unwrap_or(0),
+            "{context}"
+        );
+
+        // Unforced first, forced on the yes, and nothing else.
+        let destroys: Vec<&String> = seen
+            .iter()
+            .filter(|m| m.starts_with("workspace.destroy"))
+            .collect();
+        assert_eq!(
+            destroys,
+            [
+                &format!("workspace.destroy:{WORKSPACE}:false"),
+                &format!("workspace.destroy:{WORKSPACE}:true"),
+            ],
+            "{context}"
+        );
+        // A refusal that was asked about is not also a box.
+        assert!(
+            !err.contains("workspace.destroy failed"),
+            "the refusal was reported as a failure too\n{context}"
+        );
+    }
+
+    /// One workspace git has lost track of: an unforced destroy is refused as
+    /// the daemon refuses it, a forced one works.
+    async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let recorded = journal.clone();
+
+        tokio::spawn(async move {
+            let mut destroyed = false;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (r, mut w) = stream.into_split();
+                let mut r = BufReader::new(r);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let ClientMessage::Request { id, request } =
+                        codec::decode(line.trim_end()).expect("decode");
+                    let method = match &request {
+                        Request::WorkspaceDestroy(p) => {
+                            format!("workspace.destroy:{}:{}", p.workspace_id.0, p.force)
+                        }
+                        other => other.method_name().to_owned(),
+                    };
+                    recorded.lock().expect("journal mutex").push(method);
+                    let listed = if destroyed { vec![] } else { vec![workspace()] };
+                    let reply = match request {
+                        Request::Hello(p) if p.token == TOKEN => ServerMessage::ok(
+                            id,
+                            &HelloResult {
+                                daemon_version: "0.0.0-fake".into(),
+                                capabilities: Capabilities {
+                                    sandbox_backend: "noop".into(),
+                                    git_protect: false,
+                                    adapters: vec![AgentAdapterKind::Claude],
+                                },
+                                protocol_version: Some(PROTOCOL_VERSION),
+                            },
+                        ),
+                        Request::Hello(_) => ServerMessage::err(id, RpcError::unauthorized()),
+                        Request::SystemCheckPrereqs {} => ServerMessage::ok(
+                            id,
+                            &CheckPrereqsResult {
+                                items: vec![PrereqStatus {
+                                    name: "claude_auth".into(),
+                                    ok: true,
+                                    detail: "logged in".into(),
+                                    fix_hint: None,
+                                }],
+                            },
+                        ),
+                        Request::WorkspaceList {} => {
+                            ServerMessage::ok(id, &WorkspaceListResult { workspaces: listed })
+                        }
+                        Request::WorkspaceGet(_) => ServerMessage::ok(id, &workspace()),
+                        Request::WorkspaceDestroy(p) if !p.force => ServerMessage::err(
+                            id,
+                            RpcError::new(
+                                ErrorCode::Conflict,
+                                "workspace has uncommitted changes or unmerged commits; use \
+                                 force to discard",
+                            )
+                            .with_data(serde_json::json!({ "dirty": true, "unmerged": false })),
+                        ),
+                        Request::WorkspaceDestroy(_) => {
+                            destroyed = true;
+                            ServerMessage::ok(id, &Empty {})
+                        }
+                        Request::FsListDir(_) => {
+                            ServerMessage::ok(id, &ListDirResult { entries: vec![] })
+                        }
+                        Request::FsWatch(_) => ServerMessage::ok(id, &Empty {}),
+                        Request::WorkspaceChanges(_) => {
+                            ServerMessage::ok(id, &ChangesResult { files: vec![] })
+                        }
+                        Request::WorkspaceStatus(_) => {
+                            ServerMessage::ok(id, &WorkspaceStatusResult { entries: vec![] })
+                        }
+                        Request::RepoDetectRunConfigs(_) => ServerMessage::ok(
+                            id,
+                            &DetectRunConfigsResult {
+                                configs: vec![],
+                                network_allow: vec![],
+                                warnings: vec![],
+                            },
+                        ),
+                        Request::RunList(_) => {
+                            ServerMessage::ok(id, &RunListResult { runs: vec![] })
+                        }
+                        other => ServerMessage::err(
+                            id,
+                            RpcError::internal(format!("not implemented: {}", other.method_name())),
+                        ),
+                    };
+                    if w.write_all(codec::encode(&reply).as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        (addr, journal)
+    }
+
+    /// No agent: the question is about the worktree, and an agent record
+    /// would only add requests this fixture has nothing to say about.
+    fn workspace() -> WorkspaceInfo {
+        super::workspace(
+            WORKSPACE,
+            NAME,
+            WorkspaceState::Error(REASON.to_owned()),
+            &[],
+        )
+    }
+}

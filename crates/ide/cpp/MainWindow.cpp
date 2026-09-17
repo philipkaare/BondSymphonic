@@ -846,6 +846,8 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::workspaceDestroyed, this, &MainWindow::onWorkspaceDestroyed);
     QObject::connect(m_controller, &AppController::workspaceRestarted, this,
                      &MainWindow::onWorkspaceRestarted);
+    QObject::connect(m_controller, &AppController::workspaceDestroyRefused, this,
+                     &MainWindow::onDestroyRefused);
     // A host the workspace's proxy refused. The queue is per workspace and
     // lives in the model, so one blocked while another tab is in front waits
     // there rather than being shown over the wrong workspace.
@@ -1127,6 +1129,11 @@ void MainWindow::onDestroyRequested(const QString& workspaceId, const QString& w
             : QStringLiteral("Destroy workspace \"%1\"? Its sandbox and worktree are removed.")
                   .arg(workspaceName);
     if (announceMenuTest("destroy", workspaceId, question)) {
+        // `destroy-yes` answers Yes with Force unticked, which is what a user
+        // who just presses Enter on the banner's Remove sends.
+        if (menuTest().contains(QLatin1String("destroy-yes"))) {
+            m_controller->destroyWorkspace(workspaceId, false);
+        }
         return;
     }
     QMessageBox box(this);
@@ -1149,6 +1156,57 @@ void MainWindow::onDestroyRequested(const QString& workspaceId, const QString& w
         return;
     }
     m_controller->destroyWorkspace(workspaceId, force->isChecked());
+}
+
+void MainWindow::onDestroyRefused(const QString& workspaceId, bool dirty, bool unmerged) {
+    if (workspaceId.isEmpty() || !workspaceIsOpen(workspaceId)) {
+        return;
+    }
+    const QString name = m_groupModel->workspaceName(workspaceId);
+    const QString subject = name.isEmpty() ? QStringLiteral("This workspace")
+                                           : QStringLiteral("Workspace \"%1\"").arg(name);
+    // Said the way the daemon knows it. A worktree git has lost track of is
+    // reported dirty because nothing can be read from it, so "may have" is the
+    // honest wording for dirty work; unmerged commits are read off the branch
+    // and are certain.
+    QStringList what;
+    if (dirty) {
+        what.append(QStringLiteral("may have uncommitted changes"));
+    }
+    if (unmerged) {
+        what.append(QStringLiteral("has commits that are not merged into its base branch"));
+    }
+    const QString question =
+        QStringLiteral("%1 %2. Remove it anyway? Its uncommitted changes are discarded and its "
+                       "branch is deleted, with any commits only it has.")
+            .arg(subject, what.join(QStringLiteral(" and ")));
+    if (announceMenuTest("destroy-refused", workspaceId, question)) {
+        if (menuTest().contains(QLatin1String("destroy-yes"))) {
+            m_controller->destroyWorkspace(workspaceId, true);
+        }
+        return;
+    }
+    QMessageBox box(this);
+    box.setIcon(QMessageBox::Warning);
+    box.setWindowTitle(QStringLiteral("Remove workspace"));
+    box.setText(question);
+    QPushButton* remove =
+        box.addButton(QStringLiteral("Remove anyway"), QMessageBox::DestructiveRole);
+    box.addButton(QMessageBox::Cancel);
+    box.setDefaultButton(QMessageBox::Cancel);
+    box.exec();
+    if (box.clickedButton() != remove) {
+        return;
+    }
+    // Asked again after the modal, for the reason `onDestroyRequested` asks.
+    if (!workspaceIsOpen(workspaceId)) {
+        return;
+    }
+    if (isWorkspaceBusy(workspaceId)) {
+        sayWorkspaceIsBusy();
+        return;
+    }
+    m_controller->destroyWorkspace(workspaceId, true);
 }
 
 bool MainWindow::workspaceIsOpen(const QString& workspaceId) const {

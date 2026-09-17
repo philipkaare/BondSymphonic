@@ -422,6 +422,20 @@ pub mod qobject {
         #[qsignal]
         fn workspace_destroyed(self: Pin<&mut AppController>, id: QString);
 
+        /// An unforced `destroy_workspace` was refused because the workspace
+        /// has uncommitted changes (`dirty`) or commits its base branch does
+        /// not have (`unmerged`) -- or, for a worktree git no longer lists,
+        /// because the daemon cannot tell and says dirty. Emitted instead of
+        /// a failure: this is a question for the user, and a forced destroy
+        /// is the answer that goes ahead.
+        #[qsignal]
+        fn workspace_destroy_refused(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            dirty: bool,
+            unmerged: bool,
+        );
+
         /// A `restart_workspace` call succeeded: `info_json` is the
         /// `WorkspaceInfo` the daemon answered with, its sandbox running again.
         /// Separate from `workspace_changed` because the window does one thing
@@ -1511,6 +1525,22 @@ fn end_workspace_op_with_failure(
     });
 }
 
+/// Whether `e` is the daemon refusing an unforced destroy for what it would
+/// discard, as `(dirty, unmerged)`. `None` for every other failure, including
+/// a `Conflict` that names neither.
+pub fn destroy_refusal(e: &ClientError) -> Option<(bool, bool)> {
+    let ClientError::Rpc(rpc) = e else {
+        return None;
+    };
+    if rpc.code != ErrorCode::Conflict {
+        return None;
+    }
+    let data = rpc.data.as_ref()?;
+    let flag = |key: &str| data.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    let (dirty, unmerged) = (flag("dirty"), flag("unmerged"));
+    (dirty || unmerged).then_some((dirty, unmerged))
+}
+
 /// A `destroy_workspace` that failed: the booking goes back and the failure is
 /// reported on `operationFailed`, which is where a plain destroy's errors have
 /// always gone (a discard's go to the workspace's own banner instead).
@@ -2422,7 +2452,18 @@ impl qobject::AppController {
                         q.workspace_destroyed(QString::from(&id))
                     });
                 }
-                Err(e) => end_destroy(&qt, id, e.to_string()),
+                Err(e) => match destroy_refusal(&e) {
+                    Some((dirty, unmerged)) if !force => {
+                        tracing::info!(
+                            "workspace.destroy refused for {id}: dirty={dirty} unmerged={unmerged}"
+                        );
+                        let _ = qt.queue(move |mut q| {
+                            q.as_mut().end_workspace_op(&id);
+                            q.workspace_destroy_refused(QString::from(&id), dirty, unmerged)
+                        });
+                    }
+                    _ => end_destroy(&qt, id, e.to_string()),
+                },
             }
         });
     }

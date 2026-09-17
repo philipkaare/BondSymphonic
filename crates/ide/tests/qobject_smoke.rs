@@ -2000,3 +2000,45 @@ mod task_15_add_tab {
         assert_eq!(AgentTab::from_workspace_info(&ok).detail, "");
     }
 }
+
+/// An unforced destroy the daemon refused for what it would discard is a
+/// question for the user, not a failure. Only a `Conflict` that names dirty
+/// or unmerged work is one; everything else stays a failure.
+mod destroy_refusal {
+    use bondsymphonic_ide::client::ClientError;
+    use bondsymphonic_ide::qobjects::app_controller::destroy_refusal;
+    use bondsymphonic_proto::{ErrorCode, RpcError};
+
+    fn conflict(data: Option<serde_json::Value>) -> ClientError {
+        let mut rpc = RpcError::new(ErrorCode::Conflict, "use force to discard");
+        rpc.data = data;
+        ClientError::Rpc(rpc)
+    }
+
+    #[test]
+    fn a_conflict_naming_dirty_or_unmerged_work_is_a_refusal() {
+        let dirty = conflict(Some(
+            serde_json::json!({ "dirty": true, "unmerged": false }),
+        ));
+        assert_eq!(destroy_refusal(&dirty), Some((true, false)));
+        let unmerged = conflict(Some(
+            serde_json::json!({ "dirty": false, "unmerged": true }),
+        ));
+        assert_eq!(destroy_refusal(&unmerged), Some((false, true)));
+    }
+
+    #[test]
+    fn every_other_failure_is_not() {
+        assert_eq!(destroy_refusal(&conflict(None)), None);
+        let neither = conflict(Some(
+            serde_json::json!({ "dirty": false, "unmerged": false }),
+        ));
+        assert_eq!(destroy_refusal(&neither), None);
+        let git = ClientError::Rpc(
+            RpcError::new(ErrorCode::GitError, "worktree remove failed")
+                .with_data(serde_json::json!({ "dirty": true })),
+        );
+        assert_eq!(destroy_refusal(&git), None);
+        assert_eq!(destroy_refusal(&ClientError::Timeout), None);
+    }
+}

@@ -139,6 +139,11 @@ private:
     /// asks about, so the question and the act cannot name different
     /// workspaces however much the model has moved since.
     void onDestroyRequested(const QString& workspaceId, const QString& workspaceName);
+    /// An unforced destroy the daemon refused for what it would discard. Asks
+    /// once more, saying what a yes costs, and a yes is the forced destroy --
+    /// which is the only way to remove a workspace whose worktree git has lost
+    /// track of, since the daemon cannot tell whether it is clean.
+    void onDestroyRefused(const QString& workspaceId, bool dirty, bool unmerged);
     /// Whether the model still has a tab for `workspaceId`. By id, because a
     /// workspace may legitimately have no name.
     bool workspaceIsOpen(const QString& workspaceId) const;
