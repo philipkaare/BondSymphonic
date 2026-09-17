@@ -55,7 +55,15 @@ CloseGroupDialog::CloseGroupDialog(const QString& groupName,
         auto* combo = new QComboBox(this);
         combo->setObjectName(QStringLiteral("CloseGroupChoice_") + choice.workspaceId);
         for (const CloseGroupAction action : kActions) {
-            combo->addItem(actionLabel(action), static_cast<int>(action));
+            // An in-place workspace has nothing to merge, and its "discard"
+            // closes it without touching the checkout, so it is worded as that.
+            if (choice.inPlace && action == CloseGroupAction::Merge) {
+                continue;
+            }
+            combo->addItem(choice.inPlace && action == CloseGroupAction::Discard
+                               ? QStringLiteral("Close (files are kept)")
+                               : actionLabel(action),
+                           static_cast<int>(action));
         }
         combo->setCurrentIndex(0);
         if (choice.busy) {

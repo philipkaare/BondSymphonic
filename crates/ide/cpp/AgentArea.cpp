@@ -102,17 +102,18 @@ QWidget* AgentArea::makePage(const QString& workspaceId, QWidget* body) {
 }
 
 void AgentArea::setWorkspaceProblem(const QString& workspaceId, const QString& title,
-                                    const QString& detail) {
+                                    const QString& detail, bool inPlace) {
     if (workspaceId.isEmpty()) {
         return;
     }
     const auto found = m_problems.constFind(workspaceId);
-    if (found != m_problems.constEnd() && found->title == title && found->detail == detail) {
+    if (found != m_problems.constEnd() && found->title == title && found->detail == detail &&
+        found->inPlace == inPlace) {
         return;
     }
     // A new reason is the answer to whatever Retry was in flight, so the
     // button is pressable again.
-    m_problems.insert(workspaceId, { title, detail, false });
+    m_problems.insert(workspaceId, { title, detail, false, inPlace });
     applyWorkspaceProblem(workspaceId);
 }
 
@@ -146,6 +147,7 @@ void AgentArea::applyWorkspaceProblem(const QString& workspaceId) {
         return;
     }
     if (WorkspaceBanner* banner = m_banners.value(workspaceId)) {
+        banner->setInPlace(found->inPlace);
         banner->showWorkspaceProblem(found->title, found->detail);
         banner->setRetrying(found->retrying);
     }

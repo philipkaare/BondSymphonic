@@ -1,6 +1,7 @@
 #pragma once
 #include <QDialog>
 #include <QString>
+#include <QStringList>
 
 class AppController;
 class GroupModel;
@@ -11,6 +12,7 @@ class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
 class QProgressBar;
+class QRadioButton;
 class QToolButton;
 
 /// Collects everything a new workspace needs: which repository and base branch
@@ -76,6 +78,14 @@ public:
     /// the consent, and pressing Create is the agreement to it.
     bool initIfMissing() const;
 
+    /// Whether the agent is to work directly in the checkout rather than in a
+    /// new worktree. Only ever true when the choice was available.
+    bool inPlace() const;
+    /// Whether the last inspection allowed working in place at all. The window
+    /// remembers the choice only then, so a linked worktree that forced a
+    /// worktree does not overwrite what the user prefers.
+    bool inPlaceAvailable() const;
+
 private:
     void browse();
     /// Rebuilds the Recent menu from the controller's list, most recent first,
@@ -112,6 +122,9 @@ private:
     /// moves, because a control that is empty and enabled is indistinguishable
     /// from a repository that genuinely has no branches.
     void updateBranchState();
+    /// Puts the base-branch row, the help and the hooks warning into the state
+    /// the chosen mode and the last inspection describe.
+    void updateModeState();
     void onGroupChanged(int index);
     /// Shows the fields the selected adapter has and hides the rest.
     void onAdapterChanged();
@@ -137,6 +150,21 @@ private:
     /// off the combo when the answer arrives, because by then the combo has
     /// been through the loading state and holds that state's own words.
     QString m_branchChoice;
+    QRadioButton* m_worktreeMode = nullptr;
+    QRadioButton* m_inPlaceMode = nullptr;
+    /// What working in place means, under the choice while it is selected.
+    QLabel* m_inPlaceHelp = nullptr;
+    /// The repository runs hooks from inside its working tree, which an agent
+    /// working in place can rewrite. Plain text: the path is the repository's.
+    QLabel* m_hooksWarning = nullptr;
+    /// From the last inspection: the branches, the default, the checked-out
+    /// branch (empty for a detached HEAD), why in place is refused (empty when
+    /// it is not) and the in-tree hooks path (empty when there is none).
+    QStringList m_branches;
+    QString m_defaultBranch;
+    QString m_headBranch;
+    QString m_inPlaceRefusal;
+    QString m_hooksPath;
     QLineEdit* m_name = nullptr;
     QComboBox* m_adapter = nullptr;
     QLineEdit* m_command = nullptr;

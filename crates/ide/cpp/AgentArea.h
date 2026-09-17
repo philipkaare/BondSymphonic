@@ -147,8 +147,9 @@ public:
     /// A fact about the workspace, held like the restart offer for a pane
     /// that has not been built yet. Re-stating the same problem changes
     /// nothing, so the window may call this on every model change.
+    /// `inPlace` words the banner's Remove button as Close.
     void setWorkspaceProblem(const QString& workspaceId, const QString& title,
-                             const QString& detail);
+                             const QString& detail, bool inPlace = false);
 
     /// The workspace can run again: the banner goes back to what it was
     /// showing before, and any Retry in flight is over.
@@ -212,6 +213,7 @@ private:
         QString title;
         QString detail;
         bool retrying = false;
+        bool inPlace = false;
     };
 
     /// Wraps `body` in the page this area actually stacks: a banner above the

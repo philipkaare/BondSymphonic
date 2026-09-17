@@ -224,7 +224,8 @@ void ExplorerDock::changeEvent(QEvent* event) {
 
 void ExplorerDock::setWorkspaceHeader(const QString& name, const QString& branch,
                                       const QString& repoPath, const QString& baseBranch,
-                                      const QString& worktreePath) {
+                                      const QString& worktreePath, bool inPlace) {
+    m_changesToolbar->setInPlace(inPlace);
     m_worktreePath = worktreePath;
     m_name = name;
     m_branch = branch;
@@ -245,8 +246,11 @@ void ExplorerDock::setWorkspaceHeader(const QString& name, const QString& branch
     }
     m_headerName->setText(name);
     m_headerName->setToolTip(name);
-    m_headerDetail->setText(workspacelabel::origin(repoPath, baseBranch));
-    m_headerDetail->setToolTip(workspacelabel::detail(repoPath, baseBranch, branch, worktreePath));
+    m_headerDetail->setText(workspacelabel::origin(repoPath, baseBranch) +
+                            (inPlace ? workspacelabel::inPlaceSuffix() : QString()));
+    m_headerDetail->setToolTip(
+        inPlace ? workspacelabel::inPlaceDetail(repoPath, baseBranch, worktreePath)
+                : workspacelabel::detail(repoPath, baseBranch, branch, worktreePath));
     updatePathElide();
     m_refreshButton->setEnabled(true);
 }

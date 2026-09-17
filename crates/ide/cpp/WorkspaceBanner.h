@@ -45,6 +45,10 @@ public:
     /// the same dead agent still offers it.
     void setRestartOffered(bool offered);
 
+    /// Words the Remove button for an in-place workspace, whose Close touches
+    /// none of the user's files. Sticky, like the restart offer.
+    void setInPlace(bool inPlace);
+
     /// Puts the banner into the state that outranks every failure: the
     /// workspace itself cannot run. `title` and `detail` say why, and the
     /// buttons are Retry and Remove workspace instead of Dismiss and Restart --

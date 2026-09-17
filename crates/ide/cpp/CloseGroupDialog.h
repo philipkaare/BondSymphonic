@@ -30,6 +30,9 @@ struct CloseGroupChoice {
     /// or discarding a workspace whose merge is still absorbing objects out of
     /// it is what leaves the base branch pointing at commits that are gone.
     bool busy = false;
+    /// The workspace works in its checkout: it cannot be merged, and
+    /// discarding it only closes it.
+    bool inPlace = false;
 };
 
 /// Asks what to do with each workspace in a group before the group is closed.

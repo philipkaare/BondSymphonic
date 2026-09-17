@@ -47,6 +47,12 @@ public:
     void setWorkspace(const QString& workspaceId, const QString& name, const QString& branch,
                       const QString& baseBranch);
 
+    /// Whether the workspace works directly in its checkout. Such a workspace
+    /// has no branch of its own, so Merge, Rebase, Squash, Create PR and
+    /// Discard are hidden, here and in the Workspace menu that shows these same
+    /// actions. The dock sets this with the workspace.
+    void setInPlace(bool inPlace);
+
     /// Asks the daemon again what would be lost with the current workspace, so
     /// the Discard confirmation counts the right number of files. Called by the
     /// dock whenever the changed-file list moves.

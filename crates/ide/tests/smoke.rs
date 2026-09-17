@@ -3820,3 +3820,236 @@ mod sandbox_retry_destroying {
         addr
     }
 }
+
+/// In-place workspaces: the banner of an in-place workspace that cannot run
+/// asks to *close* it, in words that promise the checkout is untouched, and a
+/// yes sends exactly one destroy, unforced. The fake daemon reports the
+/// workspace with `kind: in_place`, which is the only way the IDE learns it.
+///
+/// The seam steps name the one workspace they may press on.
+mod in_place_close {
+    use super::{drain, wait_for};
+    use bondsymphonic_ide::model::persistence::{PersistedGroup, StateFile, STATE_VERSION};
+    use bondsymphonic_proto::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    const TOKEN: &str = "in-place-close-token";
+    const SCRIPT: &str = "wait,quit";
+    const MENU_TEST: &str = "sandbox-banner,sandbox-remove=ws_inplace1,destroy-yes=ws_inplace1";
+    const WORKSPACE: &str = "ws_inplace1";
+    const NAME: &str = "checkout-one";
+    const REASON: &str = "The repository /smoke/repo is missing or is no longer a git \
+                          repository. Close the workspace, or restore the folder and press Retry.";
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+    type Journal = Arc<Mutex<Vec<String>>>;
+
+    #[test]
+    fn an_in_place_workspace_is_closed_with_one_plain_destroy() {
+        if bondsymphonic_ide::testing::skip_without_qt("in-place close") {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (addr, journal) = rt.block_on(fake_daemon());
+
+        // Never the developer's real `%APPDATA%\BondSymphonic`.
+        let config = std::env::temp_dir().join(format!("bs-in-place-close-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("config dir");
+        let state_path = config.join("state.json");
+        let saved = StateFile {
+            version: STATE_VERSION,
+            groups: vec![PersistedGroup {
+                name: "here".to_owned(),
+                workspace_ids: vec![WORKSPACE.to_owned()],
+                ..PersistedGroup::default()
+            }],
+            active_workspace: Some(WORKSPACE.to_owned()),
+            ..StateFile::default()
+        };
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&saved).expect("state json"),
+        )
+        .expect("seed state.json");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", SCRIPT)
+            .env("BS_MENU_TEST", MENU_TEST)
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", &state_path)
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let seen = journal.lock().expect("journal mutex").clone();
+        let context = format!("requests: {seen:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(
+            status.success(),
+            "the IDE exited with {status}, expected 0\n{context}"
+        );
+        let _ = std::fs::remove_dir_all(&config);
+
+        let question = out
+            .lines()
+            .find(|l| l.starts_with(&format!("BS_MENU_TEST destroy target={WORKSPACE} ")))
+            .unwrap_or_else(|| panic!("Close did not ask\n{context}"));
+        assert!(
+            question.ends_with(&format!(
+                "question=Close workspace \"{NAME}\"? The agent and its sandbox stop. Your \
+                 files, branches and git history are not touched."
+            )),
+            "{question}"
+        );
+        assert!(!out.contains("BS_MENU_TEST destroy-refused"), "{context}");
+        let destroys: Vec<&String> = seen
+            .iter()
+            .filter(|m| m.starts_with("workspace.destroy"))
+            .collect();
+        assert_eq!(
+            destroys,
+            [&format!("workspace.destroy:{WORKSPACE}:false")],
+            "{context}"
+        );
+    }
+
+    /// One in-place workspace that cannot run. Any destroy succeeds: the daemon
+    /// ignores `force` for this kind, and a second, forced one would be the bug.
+    async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let recorded = journal.clone();
+
+        tokio::spawn(async move {
+            let mut destroyed = false;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (r, mut w) = stream.into_split();
+                let mut r = BufReader::new(r);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let ClientMessage::Request { id, request } =
+                        codec::decode(line.trim_end()).expect("decode");
+                    let method = match &request {
+                        Request::WorkspaceDestroy(p) => {
+                            format!("workspace.destroy:{}:{}", p.workspace_id.0, p.force)
+                        }
+                        other => other.method_name().to_owned(),
+                    };
+                    recorded.lock().expect("journal mutex").push(method);
+                    let listed = if destroyed { vec![] } else { vec![workspace()] };
+                    let reply = match request {
+                        Request::Hello(p) if p.token == TOKEN => ServerMessage::ok(
+                            id,
+                            &HelloResult {
+                                daemon_version: "0.0.0-fake".into(),
+                                capabilities: Capabilities {
+                                    sandbox_backend: "noop".into(),
+                                    git_protect: false,
+                                    adapters: vec![AgentAdapterKind::Claude],
+                                },
+                                protocol_version: Some(PROTOCOL_VERSION),
+                            },
+                        ),
+                        Request::Hello(_) => ServerMessage::err(id, RpcError::unauthorized()),
+                        Request::SystemCheckPrereqs {} => ServerMessage::ok(
+                            id,
+                            &CheckPrereqsResult {
+                                items: vec![PrereqStatus {
+                                    name: "claude_auth".into(),
+                                    ok: true,
+                                    detail: "logged in".into(),
+                                    fix_hint: None,
+                                }],
+                            },
+                        ),
+                        Request::WorkspaceList {} => {
+                            ServerMessage::ok(id, &WorkspaceListResult { workspaces: listed })
+                        }
+                        Request::WorkspaceGet(_) => ServerMessage::ok(id, &workspace()),
+                        Request::WorkspaceDestroy(_) => {
+                            destroyed = true;
+                            ServerMessage::ok(id, &Empty {})
+                        }
+                        Request::FsListDir(_) => {
+                            ServerMessage::ok(id, &ListDirResult { entries: vec![] })
+                        }
+                        Request::FsWatch(_) => ServerMessage::ok(id, &Empty {}),
+                        Request::WorkspaceChanges(_) => {
+                            ServerMessage::ok(id, &ChangesResult { files: vec![] })
+                        }
+                        Request::WorkspaceStatus(_) => {
+                            ServerMessage::ok(id, &WorkspaceStatusResult { entries: vec![] })
+                        }
+                        Request::RepoDetectRunConfigs(_) => ServerMessage::ok(
+                            id,
+                            &DetectRunConfigsResult {
+                                configs: vec![],
+                                network_allow: vec![],
+                                warnings: vec![],
+                            },
+                        ),
+                        Request::RunList(_) => {
+                            ServerMessage::ok(id, &RunListResult { runs: vec![] })
+                        }
+                        other => ServerMessage::err(
+                            id,
+                            RpcError::internal(format!("not implemented: {}", other.method_name())),
+                        ),
+                    };
+                    if w.write_all(codec::encode(&reply).as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        (addr, journal)
+    }
+
+    /// No agent, for the reason `sandbox_remove_dirty` gives: the question is
+    /// about the workspace.
+    fn workspace() -> WorkspaceInfo {
+        WorkspaceInfo {
+            kind: WorkspaceKind::InPlace,
+            worktree_path: "/smoke/repo".to_owned(),
+            branch: "main".to_owned(),
+            ..super::workspace(
+                WORKSPACE,
+                NAME,
+                WorkspaceState::Error(REASON.to_owned()),
+                &[],
+            )
+        }
+    }
+}

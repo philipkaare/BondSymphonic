@@ -166,6 +166,12 @@ void ChangesToolbar::noteBranches(const QString& workspaceId, const QString& bra
     }
 }
 
+void ChangesToolbar::setInPlace(bool inPlace) {
+    for (QAction* action : { m_merge, m_rebase, m_squash, m_pr, m_discard }) {
+        action->setVisible(!inPlace);
+    }
+}
+
 bool ChangesToolbar::busy(const QString& workspaceId) const {
     return !m_controller.isNull() && !workspaceId.isEmpty() &&
            m_controller->isWorkspaceBusy(workspaceId);
@@ -582,6 +588,37 @@ extern "C" std::int32_t bs_widget_test_changes_toolbar_acts_on_the_confirmed_wor
             return code;
         }
         ++index;
+    }
+    return 0;
+}
+
+/// An in-place workspace has no branch of its own to merge, squash, push or
+/// discard, so all five actions leave the toolbar -- and with it the Workspace
+/// menu, which shows these same actions -- and come back for a worktree.
+extern "C" std::int32_t bs_widget_test_changes_toolbar_hides_git_actions_in_place() {
+    AppController controller;
+    ChangesToolbar toolbar(&controller);
+    toolbar.setWorkspace(QStringLiteral("ws_ip"), QStringLiteral("here"), QStringLiteral("main"),
+                         QStringLiteral("main"));
+    const QList<QAction*> actions{ toolbar.mergeAction(), toolbar.rebaseAction(),
+                                   toolbar.squashAction(), toolbar.prAction(),
+                                   toolbar.discardAction() };
+    for (QAction* action : actions) {
+        if (!action->isVisible()) {
+            return 1;
+        }
+    }
+    toolbar.setInPlace(true);
+    for (QAction* action : actions) {
+        if (action->isVisible()) {
+            return 2;
+        }
+    }
+    toolbar.setInPlace(false);
+    for (QAction* action : actions) {
+        if (!action->isVisible()) {
+            return 3;
+        }
     }
     return 0;
 }

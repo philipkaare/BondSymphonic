@@ -1136,6 +1136,9 @@ void MainWindow::onNewAgent() {
     if (result != QDialog::Accepted) {
         return;
     }
+    if (dialog.inPlaceAvailable()) {
+        m_controller->setNewAgentInPlace(dialog.inPlace());
+    }
     if (dialog.adapter() == "claude") {
         // One call: the workspace, the agent in it and its opening prompt. The
         // controller emits `workspaceCreated` as soon as the workspace exists,
@@ -1143,12 +1146,13 @@ void MainWindow::onNewAgent() {
         m_controller->createWorkspaceWithAgentAndRun(
             dialog.repoPath(), dialog.baseBranch(), dialog.name(), dialog.group(),
             dialog.optionsJson(), dialog.initialPrompt(), dialog.runConfig(),
-            dialog.initIfMissing(), false);
+            dialog.initIfMissing(), dialog.inPlace());
         return;
     }
     m_controller->createWorkspaceWithRun(dialog.repoPath(), dialog.baseBranch(), dialog.name(),
                                          dialog.group(), dialog.adapter(), dialog.command(),
-                                         dialog.runConfig(), dialog.initIfMissing(), false);
+                                         dialog.runConfig(), dialog.initIfMissing(),
+                                         dialog.inPlace());
 }
 
 void MainWindow::onDestroyRequested(const QString& workspaceId, const QString& workspaceName) {
@@ -1160,6 +1164,33 @@ void MainWindow::onDestroyRequested(const QString& workspaceId, const QString& w
     }
     if (isWorkspaceBusy(workspaceId)) {
         sayWorkspaceIsBusy();
+        return;
+    }
+    if (m_groupModel->workspaceInPlace(workspaceId)) {
+        // Nothing of the user's is removed, so there is nothing to force and
+        // nothing to ask twice about: one plain question, one plain destroy.
+        const QString question =
+            (workspaceName.isEmpty()
+                 ? QStringLiteral("Close this workspace?")
+                 : QStringLiteral("Close workspace \"%1\"?").arg(workspaceName)) +
+            QStringLiteral(" The agent and its sandbox stop. Your files, branches and git "
+                           "history are not touched.");
+        if (announceMenuTest("destroy", workspaceId, question)) {
+            if (menuTestTarget("destroy-yes") == workspaceId) {
+                m_controller->destroyWorkspace(workspaceId, false);
+            }
+            return;
+        }
+        if (QMessageBox::question(this, QStringLiteral("Close workspace"), question,
+                                  QMessageBox::Yes | QMessageBox::Cancel,
+                                  QMessageBox::Cancel) != QMessageBox::Yes) {
+            return;
+        }
+        if (isWorkspaceBusy(workspaceId)) {
+            sayWorkspaceIsBusy();
+            return;
+        }
+        m_controller->destroyWorkspace(workspaceId, false);
         return;
     }
     // Named, not "this workspace": the menu that led here has been closed for
@@ -1421,13 +1452,15 @@ void MainWindow::syncWorkspaceProblems() {
             }
             const QString title = problem.value("title").toString();
             const QString detail = problem.value("detail").toString();
-            const QString shown = title + QLatin1Char('\n') + detail;
+            const bool inPlace = workspacelabel::inPlace(tab);
+            const QString shown = title + QLatin1Char('\n') + detail +
+                                  (inPlace ? QStringLiteral("\nin place") : QString());
             const auto known = m_workspaceProblems.constFind(workspaceId);
             if (known != m_workspaceProblems.constEnd() && *known == shown) {
                 continue;
             }
             m_workspaceProblems.insert(workspaceId, shown);
-            m_agentArea->setWorkspaceProblem(workspaceId, title, detail);
+            m_agentArea->setWorkspaceProblem(workspaceId, title, detail, inPlace);
             // An agent that stopped just before its sandbox was reported down
             // stopped because of it. The problem says so and its Retry brings
             // the agent back, so "The agent stopped." and the red tab it
@@ -1702,6 +1735,7 @@ void MainWindow::onCloseGroup(const QString& groupName) {
                               tab.value("base_branch").toString());
         toolbar->requestSummary(choice.workspaceId);
         choice.busy = m_controller->isWorkspaceBusy(choice.workspaceId);
+        choice.inPlace = workspacelabel::inPlace(tab);
         workspaces.append(choice);
     }
 
@@ -1734,7 +1768,9 @@ bool MainWindow::confirmDiscards(const QList<CloseGroupChoice>& choices) {
     ChangesToolbar* toolbar = m_explorer->changesToolbar();
     QStringList doomed;
     for (const CloseGroupChoice& choice : choices) {
-        if (choice.action != CloseGroupAction::Discard) {
+        // Closing an in-place workspace loses nothing, so it is not in the
+        // question.
+        if (choice.action != CloseGroupAction::Discard || choice.inPlace) {
             continue;
         }
         const int files = toolbar->changedFilesFor(choice.workspaceId);
@@ -2083,7 +2119,8 @@ void MainWindow::onActiveTabChanged() {
                                    active.value("branch").toString(),
                                    active.value("repo_path").toString(),
                                    active.value("base_branch").toString(),
-                                   active.value("worktree_path").toString());
+                                   active.value("worktree_path").toString(),
+                                   workspacelabel::inPlace(active));
     // The tab's choice first, because `setWorkspace` publishes the list it
     // already has synchronously and the `configsChanged` slot above applies
     // this to it; the worktree path is the daemon's, from `WorkspaceInfo`.
@@ -2193,6 +2230,11 @@ void MainWindow::updateWorkspaceStatus() {
     const bool live = !active.isEmpty();
     m_restartAgentAction->setEnabled(live);
     m_destroyAction->setEnabled(live);
+    // The verb follows the workspace: an in-place one is closed, and nothing
+    // of the user's goes with it.
+    m_destroyAction->setText(workspacelabel::inPlace(active)
+                                 ? QStringLiteral("&Close workspace…")
+                                 : QStringLiteral("&Destroy workspace…"));
     m_closeGroupAction->setEnabled(live);
     const bool several = m_groupModel->tabCount(group) > 1;
     m_nextAgentAction->setEnabled(several);

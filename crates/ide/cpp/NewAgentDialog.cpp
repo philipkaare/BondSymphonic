@@ -21,6 +21,8 @@
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QRadioButton>
+#include <QSignalBlocker>
 #include <QStringList>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -111,6 +113,39 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     m_repoState->setTextFormat(Qt::PlainText);
     m_repoState->hide();
     form->addRow(QString(), m_repoState);
+
+    // Where the agent works. A worktree is the default: it is the choice that
+    // keeps the agent's work off the user's own branch.
+    auto* modes = new QWidget(this);
+    auto* modesLayout = new QVBoxLayout(modes);
+    modesLayout->setContentsMargins(0, 0, 0, 0);
+    m_worktreeMode = new QRadioButton(QStringLiteral("Work in a new worktree"), modes);
+    m_worktreeMode->setObjectName(QStringLiteral("NewAgentWorktreeMode"));
+    m_inPlaceMode = new QRadioButton(QStringLiteral("Work directly in this checkout"), modes);
+    m_inPlaceMode->setObjectName(QStringLiteral("NewAgentInPlaceMode"));
+    modesLayout->addWidget(m_worktreeMode);
+    modesLayout->addWidget(m_inPlaceMode);
+    (m_controller->newAgentInPlace() ? m_inPlaceMode : m_worktreeMode)->setChecked(true);
+    form->addRow("Work in:", modes);
+
+    m_inPlaceHelp = new QLabel(QStringLiteral("The agent edits this folder on its current branch. "
+                                              "Its changes are not isolated on a branch of their "
+                                              "own."),
+                               this);
+    m_inPlaceHelp->setObjectName(QStringLiteral("NewAgentInPlaceHelp"));
+    m_inPlaceHelp->setWordWrap(true);
+    m_inPlaceHelp->setTextFormat(Qt::PlainText);
+    form->addRow(QString(), m_inPlaceHelp);
+
+    m_hooksWarning = new QLabel(this);
+    m_hooksWarning->setObjectName(QStringLiteral("NewAgentHooksWarning"));
+    m_hooksWarning->setWordWrap(true);
+    m_hooksWarning->setTextFormat(Qt::PlainText);
+    // The same red as the name hint: this is a thing that can go wrong.
+    m_hooksWarning->setStyleSheet(
+        QStringLiteral("color:%1")
+            .arg(theme::ink(theme::removed(), theme::isDark(palette())).name()));
+    form->addRow(QString(), m_hooksWarning);
 
     m_baseBranch = new QComboBox(this);
     m_baseBranch->setObjectName(QStringLiteral("NewAgentBaseBranch"));
@@ -258,6 +293,15 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     // its own. Everything else on it belongs to the window.
     QObject::connect(m_controller, &AppController::operationFailed, this,
                      &NewAgentDialog::onRunConfigsFailed);
+    QObject::connect(m_inPlaceMode, &QRadioButton::toggled, this, [this](bool checked) {
+        // The branch picked for a worktree is kept for the way back, since the
+        // row is about to show the checkout's branch instead.
+        if (checked && m_baseBranch->isEnabled()) {
+            m_branchChoice = m_baseBranch->currentText();
+        }
+        updateModeState();
+        updateOkEnabled();
+    });
 
     onAdapterChanged();
     updateNameHint();
@@ -272,6 +316,7 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
         // and Create stays dead until the branches are in.
         inspectRepo();
     }
+    updateModeState();
     updateOkEnabled();
 }
 
@@ -289,7 +334,9 @@ QString NewAgentDialog::repoPath() const {
     return m_controller->wslPath(m_repoPath->text().trimmed());
 }
 
-QString NewAgentDialog::baseBranch() const { return m_baseBranch->currentText().trimmed(); }
+QString NewAgentDialog::baseBranch() const {
+    return inPlace() ? QString() : m_baseBranch->currentText().trimmed();
+}
 
 QString NewAgentDialog::name() const { return m_name->text().trimmed(); }
 
@@ -345,6 +392,14 @@ QString NewAgentDialog::runConfig() const {
 
 bool NewAgentDialog::initIfMissing() const { return m_initIfMissing; }
 
+bool NewAgentDialog::inPlace() const {
+    return m_inPlaceMode->isChecked() && inPlaceAvailable();
+}
+
+bool NewAgentDialog::inPlaceAvailable() const {
+    return m_inPlaceRefusal.isEmpty() && !m_inspectPending && !m_inspectFailed;
+}
+
 QString NewAgentDialog::group() const {
     // Reading the combo text rather than the line edit's visibility keeps this
     // correct after `exec()` returns, when every child widget is hidden again.
@@ -398,11 +453,16 @@ void NewAgentDialog::inspectRepo() {
     // replace whatever is in the combo, and only from a combo that is actually
     // offering branches: "Loading branches…" and "Could not read branches" are
     // the row's own words and were never a choice the user made.
-    if (m_baseBranch->isEnabled()) {
+    if (m_baseBranch->isEnabled() && !m_inPlaceMode->isChecked()) {
         m_branchChoice = m_baseBranch->currentText();
     }
     m_inspectPending = true;
     m_inspectFailed = false;
+    // What the last inspection said about working in place was about the last
+    // repository, like the notes below.
+    m_inPlaceRefusal.clear();
+    m_hooksPath.clear();
+    m_headBranch.clear();
     // Both notes belong to the repository that was inspected, so they go down
     // with it rather than surviving into the answer for another one -- or into
     // no answer at all, if the inspection fails.
@@ -413,6 +473,7 @@ void NewAgentDialog::inspectRepo() {
     m_initIfMissing = false;
     m_status->setText(QStringLiteral("Reading repository %1…").arg(path));
     updateBranchState();
+    updateModeState();
     updateOkEnabled();
     m_controller->inspectRepo(path);
     // Alongside, not after: the two answers are independent and the run
@@ -454,18 +515,18 @@ void NewAgentDialog::onRepoInspected(const QString& path, const QString& infoJso
     // A daemon too old to send these answered nothing but repositories, so an
     // absent `is_repo` is a repository. `exists` only matters when it is not.
     showRepoState(info.value("is_repo").toBool(true), info.value("exists").toBool(false));
-    m_baseBranch->clear();
-    for (const QJsonValue& branch : info.value("branches").toArray()) {
-        m_baseBranch->addItem(branch.toString());
+    m_branches.clear();
+    for (const QJsonValue& value : info.value("branches").toArray()) {
+        m_branches.append(value.toString());
     }
-    const QString preferred =
-        m_branchChoice.isEmpty() ? info.value("default_branch").toString() : m_branchChoice;
-    const int index = m_baseBranch->findText(preferred);
-    if (index >= 0) {
-        m_baseBranch->setCurrentIndex(index);
-    } else {
-        m_baseBranch->setEditText(preferred);
-    }
+    m_defaultBranch = info.value("default_branch").toString();
+    // A folder about to be initialised will be on `main`, which is also what
+    // `default_branch` says for one.
+    m_headBranch = info.value("is_repo").toBool(true) ? info.value("head_branch").toString()
+                                                     : m_defaultBranch;
+    m_inPlaceRefusal = info.value("in_place_refusal").toString();
+    m_hooksPath = info.value("hooks_path_in_tree").toString();
+    updateModeState();
     // Tracked files only: the daemon asks `git status --untracked-files=no`, the
     // same question the merge guard asks, so the sentence has to say which
     // changes it counted. A build output or a scratch note lying in a working
@@ -571,6 +632,7 @@ void NewAgentDialog::onRepoInspectFailed(const QString& path, const QString& mes
     m_inspectFailed = true;
     m_status->setText(message);
     updateBranchState();
+    updateModeState();
     updateOkEnabled();
 }
 
@@ -593,6 +655,48 @@ void NewAgentDialog::onAdapterChanged() {
     m_form->setRowVisible(m_initialPrompt, claude);
 }
 
+void NewAgentDialog::updateModeState() {
+    m_inPlaceMode->setEnabled(m_inPlaceRefusal.isEmpty());
+    m_inPlaceMode->setToolTip(m_inPlaceRefusal);
+    if (!m_inPlaceRefusal.isEmpty() && m_inPlaceMode->isChecked()) {
+        // Said by the tooltip on the disabled choice; the daemon would refuse
+        // the create with the same sentence.
+        m_worktreeMode->setChecked(true);
+    }
+    const bool inPlace = m_inPlaceMode->isChecked();
+    m_form->setRowVisible(m_inPlaceHelp, inPlace);
+    m_hooksWarning->setText(
+        m_hooksPath.isEmpty()
+            ? QString()
+            : QStringLiteral("This repository runs git hooks from %1 inside the working tree. "
+                             "The agent can change them, and they run outside the sandbox the "
+                             "next time you use git here.")
+                  .arg(m_hooksPath));
+    m_form->setRowVisible(m_hooksWarning, inPlace && !m_hooksPath.isEmpty());
+    if (m_inspectPending || m_inspectFailed) {
+        // `updateBranchState` owns the row while an answer is out or missing.
+        return;
+    }
+    const QSignalBlocker quiet(m_baseBranch);
+    m_baseBranch->clear();
+    if (inPlace) {
+        // Shown, not chosen: nothing is switched and nothing is sent.
+        m_baseBranch->addItem(m_headBranch.isEmpty() ? QStringLiteral("detached HEAD")
+                                                     : m_headBranch);
+        m_baseBranch->setEnabled(false);
+        return;
+    }
+    m_baseBranch->setEnabled(true);
+    m_baseBranch->addItems(m_branches);
+    const QString preferred = m_branchChoice.isEmpty() ? m_defaultBranch : m_branchChoice;
+    const int index = m_baseBranch->findText(preferred);
+    if (index >= 0) {
+        m_baseBranch->setCurrentIndex(index);
+    } else {
+        m_baseBranch->setEditText(preferred);
+    }
+}
+
 void NewAgentDialog::onGroupChanged(int index) {
     const bool isNew = m_group->itemText(index) == QString::fromUtf8(kNewGroupEntry);
     m_newGroupLabel->setVisible(isNew);
@@ -609,7 +713,7 @@ void NewAgentDialog::updateOkEnabled() {
     // the user did not choose.
     const QString path = repoPath();
     const bool ok = !path.isEmpty() && path == m_pendingPath && !m_inspectPending &&
-                    !m_inspectFailed && !baseBranch().isEmpty() && !group().isEmpty() &&
+                    !m_inspectFailed && (inPlace() || !baseBranch().isEmpty()) && !group().isEmpty() &&
                     m_controller->validateWorkspaceName(name()).isEmpty();
     m_buttons->button(QDialogButtonBox::Ok)->setEnabled(ok);
 }
@@ -844,6 +948,77 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_always_sends_a_permissio
     if (yolo.value(QStringLiteral("permission_mode")).toString() !=
         QLatin1String("bypassPermissions")) {
         return 6;
+    }
+    return 0;
+}
+
+/// The dialog offers the checkout itself, says what that means, warns about
+/// hooks the agent could edit, and will not offer it where the daemon would
+/// refuse.
+extern "C" std::int32_t bs_widget_test_new_agent_dialog_offers_the_checkout_itself() {
+    AppController controller;
+    GroupModel model;
+    NewAgentDialog dialog(&controller, &model, QString::fromUtf8(kDialogRepo));
+    auto* worktree = dialog.findChild<QRadioButton*>(QStringLiteral("NewAgentWorktreeMode"));
+    auto* inPlace = dialog.findChild<QRadioButton*>(QStringLiteral("NewAgentInPlaceMode"));
+    auto* help = dialog.findChild<QLabel*>(QStringLiteral("NewAgentInPlaceHelp"));
+    auto* warning = dialog.findChild<QLabel*>(QStringLiteral("NewAgentHooksWarning"));
+    auto* branch = dialog.findChild<QComboBox*>(QStringLiteral("NewAgentBaseBranch"));
+    if (worktree == nullptr || inPlace == nullptr || help == nullptr || warning == nullptr ||
+        branch == nullptr) {
+        return 1;
+    }
+    controller.repoInspected(
+        QString::fromUtf8(kDialogRepo),
+        QStringLiteral(R"({"is_repo":true,"branches":["main","feature"],"default_branch":"main",)"
+                       R"("head_branch":"feature","hooks_path_in_tree":".husky/_"})"));
+    // A worktree is the default, with the branches offered.
+    if (!worktree->isChecked() || dialog.inPlace() || !help->isHidden() || !warning->isHidden() ||
+        !branch->isEnabled() || branch->currentText() != QLatin1String("main")) {
+        return 2;
+    }
+
+    inPlace->setChecked(true);
+    if (!dialog.inPlace() || help->isHidden() || warning->isHidden()) {
+        return 3;
+    }
+    if (help->text() != QLatin1String("The agent edits this folder on its current branch. Its "
+                                      "changes are not isolated on a branch of their own.")) {
+        return 4;
+    }
+    if (!warning->text().contains(QLatin1String(".husky/_")) ||
+        !warning->text().contains(QLatin1String("outside the sandbox"))) {
+        return 5;
+    }
+    // The branch is the checked-out one, shown and not chosen, and not sent.
+    if (branch->isEnabled() || branch->currentText() != QLatin1String("feature") ||
+        !dialog.baseBranch().isEmpty()) {
+        return 6;
+    }
+    // Back to a worktree: the list comes back, with the user's choice.
+    worktree->setChecked(true);
+    if (!branch->isEnabled() || branch->count() != 2) {
+        return 7;
+    }
+
+    // A detached HEAD says so.
+    inPlace->setChecked(true);
+    controller.repoInspected(QString::fromUtf8(kDialogRepo),
+                             QStringLiteral(R"({"is_repo":true,"branches":["main"],)"
+                                            R"("default_branch":"main"})"));
+    if (branch->currentText() != QLatin1String("detached HEAD") || !warning->isHidden()) {
+        return 8;
+    }
+
+    // A linked worktree cannot be worked in place: the choice is off, says
+    // why, and the dialog falls back to a worktree.
+    controller.repoInspected(
+        QString::fromUtf8(kDialogRepo),
+        QStringLiteral(R"({"is_repo":true,"branches":["main"],"default_branch":"main",)"
+                       R"("head_branch":"main","in_place_refusal":"it is a linked worktree"})"));
+    if (inPlace->isEnabled() || dialog.inPlace() || dialog.inPlaceAvailable() ||
+        !inPlace->toolTip().contains(QLatin1String("linked worktree"))) {
+        return 9;
     }
     return 0;
 }

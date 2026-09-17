@@ -67,6 +67,22 @@ inline QString detail(const QString& repoPath, const QString& baseBranch, const 
     return out;
 }
 
+/// What an in-place workspace's tooltip adds instead: it has no branch of its
+/// own, and the folder it works in is the user's checkout, not a worktree.
+inline QString inPlaceDetail(const QString& repoPath, const QString& baseBranch,
+                             const QString& worktreePath) {
+    return originFull(repoPath, baseBranch) +
+           QStringLiteral("\nworks in place: no branch or merge of its own\ncheckout: ") +
+           worktreePath;
+}
+
+/// What `origin` adds for such a workspace. It has no branch of its own, so
+/// the one named is the checkout's, and saying so is what keeps a user from
+/// thinking there is something to merge.
+inline QString inPlaceSuffix() {
+    return QStringLiteral(" (in place)");
+}
+
 /// The field names are the daemon's own, as the group model publishes them in
 /// its state JSON; a tab that is missing one of them falls through to the
 /// empty-half handling above rather than to a placeholder invented here.
@@ -74,15 +90,28 @@ inline QString repoPathOf(const QJsonObject& tab) {
     return tab.value(QStringLiteral("repo_path")).toString();
 }
 
+/// Whether a tab's workspace works directly in its checkout.
+inline bool inPlace(const QJsonObject& tab) {
+    return tab.value(QStringLiteral("kind")).toString() == QLatin1String("in_place");
+}
+
 inline QString origin(const QJsonObject& tab) {
-    return origin(repoPathOf(tab), tab.value(QStringLiteral("base_branch")).toString());
+    const QString out =
+        origin(repoPathOf(tab), tab.value(QStringLiteral("base_branch")).toString());
+    return inPlace(tab) && !out.isEmpty() ? out + inPlaceSuffix() : out;
 }
 
 inline QString originFull(const QJsonObject& tab) {
-    return originFull(repoPathOf(tab), tab.value(QStringLiteral("base_branch")).toString());
+    const QString out =
+        originFull(repoPathOf(tab), tab.value(QStringLiteral("base_branch")).toString());
+    return inPlace(tab) && !out.isEmpty() ? out + inPlaceSuffix() : out;
 }
 
 inline QString detail(const QJsonObject& tab) {
+    if (inPlace(tab)) {
+        return inPlaceDetail(repoPathOf(tab), tab.value(QStringLiteral("base_branch")).toString(),
+                             tab.value(QStringLiteral("worktree_path")).toString());
+    }
     return detail(repoPathOf(tab), tab.value(QStringLiteral("base_branch")).toString(),
                   tab.value(QStringLiteral("branch")).toString(),
                   tab.value(QStringLiteral("worktree_path")).toString());

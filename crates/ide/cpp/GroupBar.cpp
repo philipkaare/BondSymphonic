@@ -433,7 +433,14 @@ void GroupBar::openAgentMenu(int index, const QPoint& globalPos) {
     QMenu menu(this);
     QAction* newAction = menu.addAction("New agent…");
     QAction* destroyAction =
-        workspaceId.isEmpty() ? nullptr : menu.addAction("Destroy workspace…");
+        workspaceId.isEmpty()
+            ? nullptr
+            : menu.addAction(m_model->workspaceInPlace(workspaceId) ? "Close workspace…"
+                                                                   : "Destroy workspace…");
+    if (destroyAction != nullptr) {
+        // The seam finds the item by this name, whichever verb it carries.
+        destroyAction->setObjectName(QStringLiteral("GroupBarDestroyAction"));
+    }
 
     QAction* chosen = execMenu(menu, globalPos);
     if (chosen == nullptr) {
@@ -471,7 +478,9 @@ QAction* GroupBar::execMenu(QMenu& menu, const QPoint& globalPos) {
         m_model->loadState(m_menuTestState);
     }
     for (QAction* action : menu.actions()) {
-        if (action->text() == m_menuTestChoice) {
+        if (action->text() == m_menuTestChoice ||
+            (m_menuTestChoice == QStringLiteral("Destroy workspace…") &&
+             action->objectName() == QLatin1String("GroupBarDestroyAction"))) {
             return action;
         }
     }

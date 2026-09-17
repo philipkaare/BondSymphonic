@@ -74,8 +74,12 @@ public:
     /// says nothing the line above does not -- it belongs to the tooltip, and
     /// to the Changes toolbar, which names both branches in the confirmation
     /// before it moves anything.
+    ///
+    /// `inPlace` is a workspace that works directly in its checkout: the
+    /// header says so, and the toolbar drops the actions it has no branch for.
     void setWorkspaceHeader(const QString& name, const QString& branch, const QString& repoPath,
-                            const QString& baseBranch, const QString& worktreePath);
+                            const QString& baseBranch, const QString& worktreePath,
+                            bool inPlace = false);
 
     /// The Changes tab's toolbar, so the window can connect its results to the
     /// status bar and to the workspace banners. Never null.

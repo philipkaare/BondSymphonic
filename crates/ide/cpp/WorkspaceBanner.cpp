@@ -170,6 +170,19 @@ void WorkspaceBanner::setRestartOffered(bool offered) {
     render();
 }
 
+void WorkspaceBanner::setInPlace(bool inPlace) {
+    // The window's verb for the same act, so the button and the question
+    // behind it agree.
+    m_remove->setText((inPlace ? QStringLiteral("Close workspace")
+                               : QStringLiteral("Destroy workspace")) +
+                      QChar(0x2026));
+    m_remove->setToolTip(
+        inPlace ? QStringLiteral("Stop this workspace's agent and sandbox, after asking. Your "
+                                 "files, branches and git history are not touched.")
+                : QStringLiteral("Remove this workspace's sandbox, worktree and branch, after "
+                                 "asking"));
+}
+
 void WorkspaceBanner::showWorkspaceProblem(const QString& title, const QString& detail) {
     m_problemTitle = title;
     m_problemDetail = detail;
@@ -440,6 +453,33 @@ extern "C" std::int32_t bs_widget_test_banner_remixes_its_red_for_a_new_palette(
     QCoreApplication::processEvents();
     if (banner->palette().color(QPalette::Window) != onDark) {
         return 3;
+    }
+    return 0;
+}
+
+/// The banner's second button names what it does to an in-place workspace:
+/// Close, which touches none of the user's files, rather than Destroy.
+extern "C" std::int32_t bs_widget_test_banner_says_close_for_an_in_place_workspace() {
+    QWidget host;
+    auto* banner = new WorkspaceBanner(&host);
+    auto* remove = banner->findChild<QPushButton*>(QStringLiteral("WorkspaceBannerRemoveButton"));
+    if (remove == nullptr) {
+        return 1;
+    }
+    const QString ellipsis(QChar(0x2026));
+    if (remove->text() != QStringLiteral("Destroy workspace") + ellipsis) {
+        return 2;
+    }
+    banner->setInPlace(true);
+    banner->showWorkspaceProblem(QStringLiteral("This workspace could not be started"),
+                                 QStringLiteral("The repository /r is missing"));
+    if (remove->isHidden() || remove->text() != QStringLiteral("Close workspace") + ellipsis ||
+        !remove->toolTip().contains(QLatin1String("not touched"))) {
+        return 3;
+    }
+    banner->setInPlace(false);
+    if (remove->text() != QStringLiteral("Destroy workspace") + ellipsis) {
+        return 4;
     }
     return 0;
 }
