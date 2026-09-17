@@ -329,7 +329,7 @@ async fn status_does_not_run_an_embedded_repositorys_config() {
     ] {
         let root = PathBuf::from(&ws.worktree_path);
         let marker = dir.path().join(format!("PWNED-{}", ws.name));
-        plant_embedded_repo(&root, &marker, &env);
+        common::plant_embedded_repo(&root, &marker, &env);
         // Anything the test's own git set off while planting is not the
         // daemon's doing.
         let _ = std::fs::remove_file(&marker);
@@ -341,28 +341,6 @@ async fn status_does_not_run_an_embedded_repositorys_config() {
         );
     }
     cancel.cancel();
-}
-
-/// `sub/` as a repository of its own, committed as a gitlink, then given a
-/// `core.fsmonitor` and touched, which is what makes a parent's status look in
-/// and run it. The config comes after the parent's commit, whose own status
-/// would otherwise set the marker off before the daemon is asked anything.
-pub fn plant_embedded_repo(root: &Path, marker: &Path, env: &[(String, String)]) {
-    let sub = root.join("sub");
-    std::fs::create_dir_all(&sub).unwrap();
-    common::git_ok(&sub, &["init", "-q", "-b", "main"]);
-    common::git_ok(&sub, &["config", "commit.gpgsign", "false"]);
-    std::fs::write(sub.join("f.txt"), "f\n").unwrap();
-    common::commit_all(&sub, &[], "sub");
-    common::commit_all(root, env, "gitlink");
-    let config = sub.join(".git/config");
-    let mut text = std::fs::read_to_string(&config).unwrap();
-    text.push_str(&format!(
-        "[core]\n\tfsmonitor = touch {}\n",
-        marker.display()
-    ));
-    std::fs::write(&config, text).unwrap();
-    std::fs::write(sub.join("dirty.txt"), "x\n").unwrap();
 }
 
 #[tokio::test]
@@ -655,12 +633,16 @@ mod bwrap {
         assert_eq!(
             added,
             [
-                ".git/branches/",
-                ".git/commondir",
-                ".git/config.worktree",
-                ".git/hooks/",
-                ".git/remotes/",
-                ".git/worktrees/"
+                ".git/branches/".to_string(),
+                ".git/commondir".into(),
+                ".git/config.worktree".into(),
+                ".git/hooks/".into(),
+                ".git/remotes/".into(),
+                ".git/worktrees/".into(),
+                // The persistent hold, which is what keeps `.git/worktrees`
+                // from being deleted as empty while the agent works.
+                format!(".git/worktrees/.bs-inplace-{}/", ws.id),
+                format!(".git/worktrees/.bs-inplace-{}/locked", ws.id),
             ]
         );
 
@@ -897,11 +879,12 @@ mod bwrap {
         lifecycle::destroy(&daemon, &here.id, false).await.unwrap();
     }
 
-    /// The user removing their own last worktree does take the bind away; the
-    /// sandbox stops, and the sentence says what happened rather than raising
-    /// an alarm about `.git/config`.
+    /// The user's own last worktree going is ordinary work, and the persistent
+    /// hold is what keeps it from stopping the agent. Only something that takes
+    /// `.git/worktrees` away outright still does -- and then the sentence says
+    /// what happened rather than raising an alarm about `.git/config`.
     #[tokio::test]
-    async fn the_users_last_worktree_going_stops_the_sandbox_with_its_own_sentence() {
+    async fn the_users_last_worktree_going_no_longer_stops_the_sandbox() {
         if !bwrap_available() {
             eprintln!("SKIP: bwrap unavailable");
             return;
@@ -918,7 +901,20 @@ mod bwrap {
         let theirs = theirs.to_string_lossy();
         common::git_ok(&repo, &["worktree", "add", "-q", "-b", "theirs", &theirs]);
         common::git_ok(&repo, &["worktree", "remove", &theirs]);
-        assert!(!repo.join(".git/worktrees").exists());
+        // Git leaves the directory because the hold is still in it, and the
+        // prune and the `gc` git runs behind the user's own commits leave it
+        // too.
+        common::git_ok(&repo, &["worktree", "prune"]);
+        common::git_ok(&repo, &["gc"]);
+        assert!(repo.join(".git/worktrees").is_dir());
+        tokio::time::sleep(in_place::PROTECTION_POLL * 4).await;
+        assert_eq!(
+            daemon.registry.get(&ws.id).unwrap().state,
+            WorkspaceState::Ready
+        );
+
+        // What is left: a person removing the directory by hand.
+        std::fs::remove_dir_all(repo.join(".git/worktrees")).unwrap();
 
         let sentence = ProtectionBreach {
             entries: vec![".git/worktrees".into()],

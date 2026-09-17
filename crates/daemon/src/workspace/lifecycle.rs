@@ -233,7 +233,7 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
             let snapshot = {
                 let repo_lock = crate::git::repo_lock(&ws.repo_path);
                 let _repo_guard = repo_lock.lock().await;
-                layout.prepare(&d.dirs.in_place_record(&ws.id))?;
+                layout.prepare(&ws.id, &d.dirs.in_place_record(&ws.id))?;
                 // After `prepare`, so it is of the entries the binds are about
                 // to be made on, and before the sandbox, so nothing can replace
                 // one unseen in between.
@@ -505,7 +505,11 @@ fn watch_protection(
                 .get(&id)
                 .is_some_and(|current| Arc::ptr_eq(current, &handle))
         };
-        let breach = loop {
+        // The pid the check was made with, kept so the "no pid" line is said
+        // only once the breach is going to be acted on: a sandbox that has
+        // already died has no pid either, and that is not worth an error.
+        let mut had_pid;
+        let outcome = loop {
             tokio::time::sleep(in_place::PROTECTION_POLL).await;
             if !is_current(&d) {
                 return;
@@ -515,12 +519,9 @@ fn watch_protection(
             // counts. A live sandbox whose pid cannot be found has no mount
             // table to vouch for it, so it gets pid 0, which has no `/proc`
             // entry and so reads as a breach.
-            let pid = handle.host_pid().unwrap_or_else(|| {
-                // The breach sentence will say files were replaced; the log
-                // says what actually happened.
-                tracing::error!(ws = %id, "cannot find the sandbox's pid to read its mount table");
-                0
-            });
+            let pid = handle.host_pid();
+            had_pid = pid.is_some();
+            let pid = pid.unwrap_or(0);
             // Off the runtime: on a DrvFs mount even an `lstat` can wait on
             // Windows.
             let check = {
@@ -528,11 +529,15 @@ fn watch_protection(
                 tokio::task::spawn_blocking(move || snapshot.check(Some(pid)))
             };
             match check.await {
-                Ok(Some(breach)) => break breach,
+                Ok(Some(breach)) => break Some(breach),
                 Ok(None) => {}
+                // Fails closed. A check that cannot answer is not an answer of
+                // "nothing changed", and returning here would leave a sandbox
+                // with an agent in it running unwatched for as long as the
+                // workspace lives.
                 Err(e) => {
-                    tracing::error!(ws = %id, error = %e, "the protection check panicked; this sandbox is no longer watched");
-                    return;
+                    tracing::error!(ws = %id, error = %e, "the protection check panicked");
+                    break None;
                 }
             }
         };
@@ -544,16 +549,39 @@ fn watch_protection(
         if !is_current(&d) || d.registry.get(&id).is_none() {
             return;
         }
-        let sentence = breach.sentence();
-        tracing::warn!(ws = %id, entries = ?breach.entries, "protected git entries were replaced");
+        // Nor is a sandbox that died underneath the check. Its pid 1 is gone,
+        // so `host_pid` answers `None` and the mount table of pid 0 says
+        // nothing is mounted, which every entry then reads as unbound. An OOM
+        // kill is not tampering, nothing is running in that sandbox to be
+        // protected from, and `watch_sandbox` is already on its way to
+        // reporting it as down.
+        if handle.died().is_some_and(|rx| *rx.borrow()) {
+            return;
+        }
+        if !had_pid {
+            tracing::error!(ws = %id, "cannot find the sandbox's pid to read its mount table");
+        }
+        let sentence = match &outcome {
+            Some(breach) => breach.sentence(),
+            None => "The check that keeps this workspace's git files safe from the agent could \
+                     not be made, so its sandbox was stopped. Press Retry."
+                .to_string(),
+        };
+        match &outcome {
+            Some(breach) => {
+                tracing::warn!(ws = %id, entries = ?breach.entries, diff = %breach.config_diff, "protected git entries changed")
+            }
+            None => tracing::warn!(ws = %id, "stopping a sandbox whose protection check failed"),
+        }
+        let diff = outcome.map(|b| b.config_diff).unwrap_or_default();
         d.events.publish(
             Some(id.clone()),
             Event::DaemonLog {
                 level: LogLevel::Warn,
-                message: if breach.config_diff.is_empty() {
+                message: if diff.is_empty() {
                     sentence.clone()
                 } else {
-                    format!("{sentence}\n{}", breach.config_diff)
+                    format!("{sentence}\n{diff}")
                 },
                 host: None,
             },
@@ -999,6 +1027,30 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
         gates().lock().remove(id);
         return Ok(Empty {});
     }
+    // From here on the destroy deletes a directory tree, and the only tree it
+    // may ever delete is the one the daemon made for this workspace. A registry
+    // entry is a file on disk: a daemon build from before in-place workspaces
+    // existed drops the `kind` field when it rewrites `workspaces.json`, and the
+    // entry then reads back as a worktree workspace whose `worktree_path` is the
+    // user's own checkout. Everything below -- `worktree remove --force`, and
+    // `remove_dir_all` after it -- would take that checkout, `.git` and all.
+    // There is no legitimate case to weigh against: `workspace.create` puts
+    // every worktree it makes under `worktrees/<id>`, so a path that is not
+    // there is a corrupted entry, whatever `force` says.
+    let expected = d.dirs.worktree(id);
+    if ws.worktree_path != expected {
+        return Err(RpcError::new(
+            ErrorCode::InvalidParams,
+            format!(
+                "workspace {id} records a worktree at {}, which is not the {} BondSymphonic \
+                 would have made; refusing to remove it. Its registry entry is damaged: edit \
+                 {} by hand to remove the entry.",
+                ws.worktree_path.display(),
+                expected.display(),
+                d.dirs.registry_file().display()
+            ),
+        ));
+    }
     // `layout_for` asks the source repository where its git directory is, so a
     // repository the user has since deleted or moved fails here. Without the
     // `force` escape that failure is permanent: the registry entry can never be
@@ -1161,7 +1213,7 @@ async fn close_in_place(d: &Daemon, ws: &Workspace) -> Result<(), RpcError> {
         let repo_lock = crate::git::repo_lock(&ws.repo_path);
         let _repo_guard = repo_lock.lock().await;
         InPlaceLayout::new(&ws.worktree_path, &d.dirs.no_hooks())
-            .release(&d.dirs.in_place_record(id));
+            .release(id, &d.dirs.in_place_record(id));
     }
     d.agents.forget_workspace(id);
     // `remove_workspace` removes `<data>/worktrees/<id>`, never `worktree_path`.

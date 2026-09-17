@@ -13,7 +13,7 @@
 
 use crate::git::repo::{self, RepoKind};
 use crate::git::{path_arg, Git};
-use bondsymphonic_proto::{ErrorCode, RpcError};
+use bondsymphonic_proto::{ErrorCode, RpcError, WorkspaceId};
 use std::path::{Path, PathBuf};
 
 /// The `data.reason` a merge or pull request on an in-place workspace is
@@ -203,12 +203,43 @@ impl InPlaceLayout {
         Ok(())
     }
 
+    /// Refuses a checkout where one of the files whose contents are protected
+    /// has another name of its own.
+    ///
+    /// A read-only bind protects a path, not a file. A second hard link to
+    /// `.git/config` is a second path to the same bytes on the same writable
+    /// mount, so an agent that plants one -- during the window a Retry opens,
+    /// or before the workspace was ever started -- writes the user's config
+    /// through it with the bind standing and every identity check satisfied.
+    /// Git never makes one, so a link count above one is refused rather than
+    /// reasoned about.
+    fn refuse_extra_links(&self) -> Result<(), RpcError> {
+        for path in self.hard_link_checked() {
+            if links(&path)? > 1 {
+                return Err(RpcError::invalid_params(format!(
+                    "{} has more than one name; an agent cannot work in place in it",
+                    self.name_of(&path)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The protected files a second hard link would defeat: the three git
+    /// reads as configuration. The protected *directories* are not here --
+    /// a directory has a link per subdirectory, and `.git/worktrees` gains one
+    /// whenever the user adds a worktree.
+    fn hard_link_checked(&self) -> [PathBuf; 3] {
+        [self.config(), self.config_worktree(), self.commondir()]
+    }
+
     /// Every refusal [`prepare`](Self::prepare) can make, without writing
     /// anything, so `workspace.create` can refuse a checkout rather than
     /// register a workspace that could never start. `Ok(true)` when the
     /// `commondir` guard is already in place, `Ok(false)` when it is missing.
     pub fn check_preparable(&self) -> Result<bool, RpcError> {
         self.refuse_foreign_entries()?;
+        self.refuse_extra_links()?;
         let guard = self.commondir();
         match std::fs::read(&guard) {
             Ok(bytes) if bytes == COMMONDIR_GUARD.as_bytes() => Ok(true),
@@ -250,7 +281,10 @@ impl InPlaceLayout {
     /// before the entries are made, so a failure in between leaves a name
     /// recorded for an entry that may not exist, which Close skips, rather
     /// than an entry nobody remembers making.
-    pub fn prepare(&self, record: &Path) -> Result<(), RpcError> {
+    ///
+    /// Last, once `.git/worktrees` is certain to exist, the persistent hold
+    /// goes in: see [`crate::git::worktree::hold_worktrees_for_in_place`].
+    pub fn prepare(&self, id: &WorkspaceId, record: &Path) -> Result<(), RpcError> {
         if !self.check_preparable()? {
             create_file(&self.commondir(), COMMONDIR_GUARD.as_bytes())?;
         }
@@ -264,6 +298,7 @@ impl InPlaceLayout {
             .filter(|name| std::fs::symlink_metadata(self.git_dir.join(name)).is_err())
             .collect();
         if missing.is_empty() {
+            crate::git::worktree::hold_worktrees_for_in_place(&self.git_dir, id);
             return Ok(());
         }
         {
@@ -288,14 +323,19 @@ impl InPlaceLayout {
                 std::fs::create_dir(&path).map_err(|e| io_error(&path, e))?;
             }
         }
+        crate::git::worktree::hold_worktrees_for_in_place(&self.git_dir, id);
         Ok(())
     }
 
     /// Takes back what [`prepare`](Self::prepare) left that git would not have:
-    /// the guard, if it is still exactly the guard, and each entry `record`
-    /// says the daemon created, if it is still empty. Then the record itself.
-    /// Best effort: Close must not fail over any of it.
-    pub fn release(&self, record: &Path) {
+    /// the persistent hold, the guard, if it is still exactly the guard, and
+    /// each entry `record` says the daemon created, if it is still empty. Then
+    /// the record itself. Best effort: Close must not fail over any of it.
+    ///
+    /// The hold goes first, since it is what keeps `.git/worktrees` from being
+    /// empty.
+    pub fn release(&self, id: &WorkspaceId, record: &Path) {
+        crate::git::worktree::release_in_place_hold(&self.git_dir, id);
         let guard = self.commondir();
         if std::fs::read(&guard).is_ok_and(|b| b == COMMONDIR_GUARD.as_bytes()) {
             let _ = std::fs::remove_file(&guard);
@@ -359,6 +399,7 @@ impl InPlaceLayout {
     pub fn snapshot(&self) -> std::io::Result<ProtectedSnapshot> {
         let root = std::fs::canonicalize(&self.root)?;
         let mut entries = Vec::new();
+        let single_link = self.hard_link_checked();
         let all =
             std::iter::once((self.git_dir.clone(), EntryKind::Dir)).chain(self.late_entries());
         for (path, kind) in all {
@@ -367,6 +408,16 @@ impl InPlaceLayout {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("{} is not {}", path.display(), kind.described()),
+                ));
+            }
+            // A hard link planted before this start would otherwise be a name
+            // for the user's config that no bind covers; see
+            // `refuse_extra_links`.
+            let single_link = single_link.contains(&path);
+            if single_link && link_count(&meta) > 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{} has more than one name", path.display()),
                 ));
             }
             // bwrap makes the path of a bind target inside the sandbox from
@@ -386,17 +437,259 @@ impl InPlaceLayout {
                 path,
                 mount_points,
                 kind,
+                single_link,
             });
         }
-        let contents = [self.config(), self.config_worktree(), self.commondir()]
+        let diff_files = [self.config(), self.config_worktree(), self.commondir()]
             .into_iter()
             .map(|path| {
                 let text = read_protected(&path);
                 (self.name_of(&path), path, text)
             })
             .collect();
-        Ok(ProtectedSnapshot { entries, contents })
+        let registrations = registrations(&self.worktrees());
+        let covered = self.scan_covered(&registrations);
+        Ok(ProtectedSnapshot {
+            layout: self.clone(),
+            entries,
+            diff_files,
+            registrations,
+            covered,
+        })
     }
+
+    /// Everything under `.git` that git reads as configuration or runs as a
+    /// program, with its contents, in one deterministic order.
+    ///
+    /// This is the check that holds where a bind does not. A bind protects one
+    /// Linux dentry; on the Windows drives this IDE's users work from
+    /// (`/mnt/c/...`, 9p `drvfs`), Windows resolves `.git/CONFIG`, `.GIT/config`
+    /// and the 8.3 short name `GIT~1/config` to the same file through dentries
+    /// the mount does not cover, and a write through any of them reaches the
+    /// user's config with the mount, the device and the inode all unchanged.
+    /// Measured in the distro: each of those four spellings gets past every
+    /// read-only bind. Contents are the only thing left that tells the
+    /// difference, so they are read on every poll and compared whole.
+    ///
+    /// What is covered, and what deliberately is not:
+    /// - `config`, `config.worktree` and `commondir`: every one names programs.
+    /// - Everything under `hooks`, `info`, `remotes` and `branches`: hooks are
+    ///   programs, `info/attributes` and `info/grafts` change what git does with
+    ///   the tree and the history, and a legacy remote definition can hold an
+    ///   `ext::` URL, which is a command. All four are small and git does not
+    ///   write them by itself -- except `info/refs`, which every `git gc`
+    ///   rewrites through `update-server-info` (measured) and which is a ref
+    ///   listing for dumb HTTP clients rather than anything git executes.
+    /// - Of `worktrees` and `modules`, the files a sibling worktree's or a
+    ///   submodule's git reads as configuration. Not the rest: a registration
+    ///   holds an index, a `HEAD` and reflogs that the daemon's own work in a
+    ///   sibling worktree rewrites constantly, and a submodule's git directory
+    ///   holds an object store.
+    /// - Of `worktrees`, only the registrations `registrations` names, which is
+    ///   the set that existed when the sandbox started. The daemon adds
+    ///   registrations itself while an in-place sandbox runs -- that is what
+    ///   `workspace.create` on a sibling worktree workspace does -- and an
+    ///   in-place workspace must not be stopped by the daemon's own ordinary
+    ///   work. A registration an agent invents instead gains it nothing: git
+    ///   only reads a registration's `config.worktree` under that worktree's own
+    ///   `GIT_DIR`, and `worktree list` skips an entry with no `gitdir`.
+    fn scan_covered(&self, registrations: &[std::ffi::OsString]) -> Vec<(String, Content)> {
+        let mut scan = Scan {
+            root: &self.root,
+            out: Vec::new(),
+            bytes: 0,
+        };
+        for path in self.hard_link_checked() {
+            scan.file(&path);
+        }
+        scan.tree(&self.hooks(), &[]);
+        scan.tree(&self.info(), &[INFO_REFS]);
+        scan.tree(&self.remotes(), &[]);
+        scan.tree(&self.branches(), &[]);
+        let worktrees = self.worktrees();
+        for name in registrations {
+            let entry = worktrees.join(name);
+            // `config.worktree` as "empty or not there at all": git reads an
+            // empty file as no configuration, and the daemon writes this one
+            // empty on every start of the worktree workspace it belongs to,
+            // over a file git itself never made.
+            scan.empty_or_missing(&entry.join("config.worktree"));
+            scan.file(&entry.join("commondir"));
+        }
+        scan.modules(&self.modules(), 0);
+        scan.out
+    }
+}
+
+/// The names in `.git/worktrees`, sorted, or nothing when it cannot be read.
+fn registrations(worktrees: &Path) -> Vec<std::ffi::OsString> {
+    let Ok(read) = std::fs::read_dir(worktrees) else {
+        return Vec::new();
+    };
+    let mut names: Vec<std::ffi::OsString> = read.flatten().map(|e| e.file_name()).collect();
+    names.sort();
+    names
+}
+
+/// The most paths one [`InPlaceLayout::scan_covered`] looks at, and the most
+/// bytes it keeps across all of them.
+///
+/// Neither is reached by anything git makes: a fresh `.git/hooks` holds
+/// fourteen samples of a few kilobytes each, and every other covered file is
+/// one git wrote by hand. They are here so that a repository with hundreds of
+/// submodules cannot make a poll that must finish inside
+/// [`PROTECTION_POLL`] walk an unbounded tree. The order is fixed and sorted,
+/// so a snapshot and a later check that both stop at the cap stop at the same
+/// place -- and anything added ahead of the cap is a change in its own right,
+/// which is what stops the sandbox.
+const COVERED_CAP: usize = 512;
+const COVERED_BYTES_CAP: u64 = 4 * 1024 * 1024;
+
+/// What a covered path was when it was looked at. Compared whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Content {
+    Dir,
+    /// A regular file: its length, and its first [`READ_CAP`] bytes. The length
+    /// is kept as well as the bytes so that appending past the cap is a change
+    /// too.
+    File(u64, Vec<u8>),
+    /// There, but neither a regular file nor a directory.
+    Other,
+    /// Nothing is there.
+    Absent,
+    /// There, and the daemon could not read it.
+    Unreadable(String),
+}
+
+/// One walk of the covered set. See [`InPlaceLayout::scan_covered`].
+struct Scan<'a> {
+    root: &'a Path,
+    out: Vec<(String, Content)>,
+    bytes: u64,
+}
+
+impl Scan<'_> {
+    fn full(&self) -> bool {
+        self.out.len() >= COVERED_CAP || self.bytes >= COVERED_BYTES_CAP
+    }
+
+    fn name_of(&self, path: &Path) -> String {
+        path.strip_prefix(self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// Records one path, reading it when it is a regular file.
+    fn file(&mut self, path: &Path) {
+        if self.full() {
+            return;
+        }
+        let content = match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Content::Absent,
+            Err(e) => Content::Unreadable(e.to_string()),
+            Ok(m) if m.is_dir() => Content::Dir,
+            Ok(m) if !m.is_file() => Content::Other,
+            Ok(m) => match read_bytes(path) {
+                Ok(bytes) => {
+                    self.bytes += bytes.len() as u64;
+                    Content::File(m.len(), bytes)
+                }
+                Err(e) => Content::Unreadable(e),
+            },
+        };
+        self.out.push((self.name_of(path), content));
+    }
+
+    /// [`Self::file`], with an empty regular file recorded as nothing being
+    /// there: for a file whose emptiness is how git is told to ignore it, the
+    /// two say the same thing.
+    fn empty_or_missing(&mut self, path: &Path) {
+        self.file(path);
+        if let Some((_, content)) = self.out.last_mut() {
+            if *content == Content::File(0, Vec::new()) {
+                *content = Content::Absent;
+            }
+        }
+    }
+
+    /// Records `dir` and everything under it, names sorted so two walks of the
+    /// same tree agree. `skip` names entries of `dir` itself that are left out.
+    fn tree(&mut self, dir: &Path, skip: &[&str]) {
+        if self.full() {
+            return;
+        }
+        self.file(dir);
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut names: Vec<std::ffi::OsString> = read.flatten().map(|e| e.file_name()).collect();
+        names.sort();
+        for name in names {
+            if skip.iter().any(|s| std::ffi::OsStr::new(s) == name) {
+                continue;
+            }
+            let path = dir.join(&name);
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+                self.tree(&path, &[]);
+            } else {
+                self.file(&path);
+            }
+        }
+    }
+
+    /// The configuration and hooks of every submodule git directory under
+    /// `modules`, and of every module nested in one of those.
+    ///
+    /// Only through path components named `modules`, which is how git nests
+    /// them, so nothing here descends into an object store. The depth is
+    /// bounded as well as the walk: a `modules/a/modules/a/...` chain an agent
+    /// makes is not something to follow to the end.
+    fn modules(&mut self, modules: &Path, depth: usize) {
+        const MAX_DEPTH: usize = 8;
+        if depth >= MAX_DEPTH || self.full() || !modules.is_dir() {
+            return;
+        }
+        let Ok(read) = std::fs::read_dir(modules) else {
+            return;
+        };
+        let mut names: Vec<std::ffi::OsString> = read.flatten().map(|e| e.file_name()).collect();
+        names.sort();
+        for name in names {
+            let module = modules.join(&name);
+            if !std::fs::symlink_metadata(&module).is_ok_and(|m| m.is_dir()) {
+                continue;
+            }
+            for file in ["config", "config.worktree", "commondir"] {
+                self.file(&module.join(file));
+            }
+            self.tree(&module.join("hooks"), &[]);
+            self.modules(&module.join("modules"), depth + 1);
+        }
+    }
+}
+
+/// The first [`READ_CAP`] bytes of a regular file, or why they could not be
+/// read.
+///
+/// The same care as [`read_protected`]: by the time this runs the entry may be
+/// a FIFO nobody will ever write, so the open neither follows a symlink nor
+/// waits.
+fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(READ_CAP)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    Ok(bytes)
 }
 
 /// What a protected entry must be.
@@ -521,6 +814,36 @@ fn identity(_meta: &std::fs::Metadata) -> (u64, u64) {
     (0, 0)
 }
 
+/// How many names this file has. Git makes one of each, so anything above one
+/// is a name the read-only binds do not cover; see
+/// [`InPlaceLayout::refuse_extra_links`].
+#[cfg(unix)]
+fn link_count(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink()
+}
+
+#[cfg(not(unix))]
+fn link_count(_meta: &std::fs::Metadata) -> u64 {
+    1
+}
+
+/// The link count of `path`, counting a path that is not there as one: a file
+/// that does not exist has no second name either, and whether it may be missing
+/// is [`InPlaceLayout::refuse_foreign_entries`]'s question, not this one.
+fn links(path: &Path) -> Result<u64, RpcError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => Ok(link_count(&m)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(1),
+        Err(e) => Err(io_error(path, e)),
+    }
+}
+
+/// The one name under `.git/info` the content check leaves out. Every `git gc`
+/// rewrites it through `update-server-info` (measured with git 2.43), and it is
+/// a ref listing for dumb HTTP clients, not anything git executes.
+const INFO_REFS: &str = "refs";
+
 /// How often the lifecycle re-checks an in-place sandbox's protected entries.
 pub const PROTECTION_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -534,16 +857,26 @@ struct Protected {
     mount_points: Vec<PathBuf>,
     kind: EntryKind,
     identity: (u64, u64),
+    /// Whether a second hard link to this entry is a breach in itself.
+    single_link: bool,
 }
 
-/// The entries an in-place sandbox was started with, and the contents of the
-/// files among them that name programs. See [`InPlaceLayout::snapshot`].
+/// The entries an in-place sandbox was started with, and the contents of
+/// everything under `.git` that git reads as configuration or runs as a
+/// program. See [`InPlaceLayout::snapshot`].
 #[derive(Debug)]
 pub struct ProtectedSnapshot {
+    /// What the covered set is scanned from again on every poll.
+    layout: InPlaceLayout,
     /// `.git` first, then the late read-only binds in bind order.
     entries: Vec<Protected>,
-    /// `(name, path, contents)` of `config`, `config.worktree` and `commondir`.
-    contents: Vec<(String, PathBuf, Result<String, String>)>,
+    /// `(name, path, contents)` of `config`, `config.worktree` and `commondir`,
+    /// as the text the breach diff is made of.
+    diff_files: Vec<(String, PathBuf, Result<String, String>)>,
+    /// The names in `.git/worktrees` the covered set was taken over.
+    registrations: Vec<std::ffi::OsString>,
+    /// `(name, contents)` of every covered path, in scan order.
+    covered: Vec<(String, Content)>,
 }
 
 impl ProtectedSnapshot {
@@ -554,9 +887,12 @@ impl ProtectedSnapshot {
     }
 
     /// `None` while every protected entry is still the one that was bound
-    /// (same device, inode and type, still present) and -- when `sandbox_pid`
-    /// is given -- still a mount point in `/proc/<pid>/mountinfo`. Otherwise
-    /// the breach, with what changed in the files that name programs.
+    /// (same device, inode, type and number of names, still present),
+    /// everything under `.git` that git runs or reads as configuration still
+    /// holds exactly what it did ([`InPlaceLayout::scan_covered`]) and -- when
+    /// `sandbox_pid` is given -- every entry is still a mount point in
+    /// `/proc/<pid>/mountinfo`. Otherwise the breach, with what changed in the
+    /// files that name programs.
     ///
     /// A running sandbox must be checked with a pid. Identity alone misses an
     /// entry replaced by one with the same inode number, and git's
@@ -566,12 +902,16 @@ impl ProtectedSnapshot {
     /// pid, a `mountinfo` that cannot be read counts as nothing mounted, so
     /// the answer is a breach rather than a guess.
     ///
-    /// It is a handful of `lstat` calls and one small read, cheap enough for
-    /// [`PROTECTION_POLL`]. Looking from the host side also makes a DrvFs
-    /// mount revalidate a name Windows renamed, which inotify never reports.
-    /// The entries are settled before any protected file is read, and those
-    /// reads never block and are bounded ([`read_protected`]), so a breach is
-    /// always answered promptly.
+    /// A few dozen `lstat` calls and the reads of the covered set, which is a
+    /// few dozen kilobytes of small files. Measured on the largest `/mnt/c`
+    /// repository to hand (BondSymphonic itself, fourteen hooks and two
+    /// worktree registrations): about 56 ms a poll, against a
+    /// [`PROTECTION_POLL`] of 250 ms, and the caps
+    /// ([`COVERED_CAP`]) keep a pathological repository from making it
+    /// unbounded. Looking from the host side also makes a DrvFs mount
+    /// revalidate a name Windows renamed, which inotify never reports. The
+    /// entries are settled before any protected file is read, and those reads
+    /// never block and are bounded, so a breach is always answered promptly.
     pub fn check(&self, sandbox_pid: Option<u32>) -> Option<ProtectionBreach> {
         let mounted = sandbox_pid.map(|pid| {
             std::fs::read_to_string(format!("/proc/{pid}/mountinfo"))
@@ -582,9 +922,11 @@ impl ProtectedSnapshot {
         let mut removed = Vec::new();
         for e in &self.entries {
             let now = std::fs::symlink_metadata(&e.path);
-            let same = now
-                .as_ref()
-                .is_ok_and(|m| EntryKind::of(m) == Some(e.kind) && identity(m) == e.identity);
+            let same = now.as_ref().is_ok_and(|m| {
+                EntryKind::of(m) == Some(e.kind)
+                    && identity(m) == e.identity
+                    && (!e.single_link || link_count(m) == 1)
+            });
             let still_bound = mounted
                 .as_ref()
                 .is_none_or(|points| e.mount_points.iter().any(|p| points.contains(p)));
@@ -596,11 +938,20 @@ impl ProtectedSnapshot {
                 removed.push(e.name.clone());
             }
         }
+        // The check the read-only binds cannot make for themselves. Every
+        // difference is named, whether the entry moved or only its contents
+        // did, so the sentence and the log say which file to look at.
+        let now = self.layout.scan_covered(&self.registrations);
+        for name in changed(&self.covered, &now) {
+            if !entries.contains(&name) {
+                entries.push(name);
+            }
+        }
         if entries.is_empty() {
             return None;
         }
         let mut lines = Vec::new();
-        for (name, path, before) in &self.contents {
+        for (name, path, before) in &self.diff_files {
             line_diff(name, before, &read_protected(path), &mut lines);
         }
         if lines.len() > DIFF_LINES {
@@ -615,6 +966,24 @@ impl ProtectedSnapshot {
             config_diff,
         })
     }
+}
+
+/// The covered names that are not what they were: one that has appeared or
+/// gone, and one whose contents differ. Both lists are scanned the same way
+/// from the same roots, so a name that is in both is the same path.
+fn changed(before: &[(String, Content)], now: &[(String, Content)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, was) in before {
+        if now.iter().find(|(n, _)| n == name).map(|(_, c)| c) != Some(was) {
+            out.push(name.clone());
+        }
+    }
+    for (name, _) in now {
+        if !before.iter().any(|(n, _)| n == name) && !out.contains(name) {
+            out.push(name.clone());
+        }
+    }
+    out
 }
 
 /// The mount points in a `/proc/<pid>/mountinfo`, unescaped.
@@ -705,12 +1074,12 @@ fn line_diff(
     }
 }
 
-/// Protected entries of a running in-place sandbox were replaced, removed or
-/// unmounted from outside it.
+/// Protected entries of a running in-place sandbox were replaced, removed,
+/// unmounted or written from outside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtectionBreach {
-    /// Root-relative names of the entries that were replaced, removed or
-    /// unmounted, e.g. `[".git/config"]`.
+    /// Root-relative names of the entries that were replaced, removed,
+    /// unmounted or written, e.g. `[".git/config"]`.
     pub entries: Vec<String>,
     /// Those of `entries` that are not there at all any more, rather than
     /// replaced by something else.
@@ -735,11 +1104,23 @@ impl ProtectionBreach {
                 .to_string();
         }
         format!(
-            "Git files this workspace protects were replaced while the agent was running ({}), \
-             so its sandbox was stopped. Check .git/config for settings you did not make — \
-             the daemon log shows what changed — then press Retry.",
-            self.entries.join(", ")
+            "Git files this workspace protects changed while the agent was running ({}), so its \
+             sandbox was stopped. Check .git/config for settings you did not make — the daemon \
+             log shows what changed — then press Retry.",
+            self.named()
         )
+    }
+
+    /// The changed entries for the sentence. A write through a name a Windows
+    /// drive resolves to the same file can change a whole directory at once, so
+    /// the list is one a person can read rather than all of it.
+    fn named(&self) -> String {
+        const SHOWN: usize = 6;
+        let shown = self.entries.iter().take(SHOWN).cloned().collect::<Vec<_>>();
+        match self.entries.len().checked_sub(SHOWN) {
+            Some(more) if more > 0 => format!("{}, and {more} more", shown.join(", ")),
+            _ => shown.join(", "),
+        }
     }
 }
 
