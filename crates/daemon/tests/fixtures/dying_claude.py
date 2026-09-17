@@ -27,6 +27,10 @@ daemon is still reading its pipes:
   that before writing the stderr, so the daemon is reliably already waiting on
   the exit.
 * `DYING_CLAUDE_EXIT` (default 0): the exit status.
+* `DYING_CLAUDE_STDOUT_HELD` (seconds, optional): when set, a child that
+  inherits this process's stdout is left behind, silent, for that long. That is
+  a grandchild holding the protocol pipe open after the CLI has gone, which the
+  daemon's reader must not wait out.
 
 `--version` is answered and nothing else happens, because the daemon probes the
 program it is about to run before it runs it.
@@ -45,6 +49,9 @@ LINE_DELAY = 0.02
 
 #: argv marker for the child half of `DYING_CLAUDE_STDERR_FROM_CHILD`.
 WRITER = "--stderr-writer"
+
+#: argv marker for the child half of `DYING_CLAUDE_STDOUT_HELD`.
+HOLDER = "--stdout-holder"
 
 
 def replay(path):
@@ -91,12 +98,22 @@ def write_stderr_after_the_delay():
 def main():
     if WRITER in sys.argv[1:]:
         return write_stderr_after_the_delay()
+    if HOLDER in sys.argv[1:]:
+        time.sleep(float_env("DYING_CLAUDE_STDOUT_HELD", "0"))
+        return 0
     if "--version" in sys.argv[1:]:
         print("0.0.0-dying (dying_claude.py)")
         return 0
     fixture = os.environ.get("FAKE_CLAUDE_FIXTURE")
     if fixture:
         replay(fixture)
+    if os.environ.get("DYING_CLAUDE_STDOUT_HELD"):
+        # Inherits fd 1 at the fork, so the pipe stays open whether or not the
+        # interpreter has started by the time this process is gone.
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), HOLDER],
+            stdin=subprocess.DEVNULL,
+        )
     text = stderr_text()
     if text and os.environ.get("DYING_CLAUDE_STDERR_FROM_CHILD"):
         # Started and abandoned: stderr is fd 2, which the child inherits, and

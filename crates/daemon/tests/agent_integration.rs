@@ -70,6 +70,7 @@ const FIXTURE_KNOBS: &[&str] = &[
     "DYING_CLAUDE_STDERR_DELAY",
     "DYING_CLAUDE_STDERR_FROM_CHILD",
     "DYING_CLAUDE_EXIT",
+    "DYING_CLAUDE_STDOUT_HELD",
 ];
 
 fn clear_knobs() {
@@ -1660,4 +1661,184 @@ async fn restarting_a_workspace_stops_its_agents_and_keeps_their_records() {
     assert_eq!(record.state, AgentState::Exited);
     assert!(!history_of(&mut c, &ag).await.messages.is_empty());
     cancel.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// An agent stopped while the disk is slow.
+//
+// The exit announcement closes the agent's record first, and that write ends
+// in an fsync. `stop` used to count it against the two seconds it gives the
+// reader for the pipes, and abort the reader when it ran out. Where the abort
+// landed decided what the client heard: before the reader claimed the
+// announcement, an exit without the reason the turn failed; between the claim
+// and the publish, no exit at all. A disk that is slow only when another test
+// suite runs made that a coin toss; the records hook makes it a certainty.
+// ---------------------------------------------------------------------------
+
+/// What a stop did, seen from the client.
+struct SlowStop {
+    /// The detail of every `Exited` announced for the agent.
+    exits: Vec<String>,
+    /// How long `agent.stop` took to answer.
+    took: Duration,
+}
+
+/// Starts an agent whose turn fails and whose stderr arrives 1.5 s after it
+/// exits, makes every write that closes a record take `delay` longer, and stops
+/// it at once.
+///
+/// The reader always spends its full stderr budget (one second) here, so the
+/// record writes are the only thing that moves: `delay` decides where in the
+/// reader's exit path `stop`'s deadline falls.
+async fn stop_with_slow_record_closing(py: &str, delay: Duration) -> SlowStop {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    use_dying_claude(py, Some("error_result_turn.ndjson"));
+    std::env::set_var("DYING_CLAUDE_STDERR", "far too late to matter");
+    std::env::set_var("DYING_CLAUDE_STDERR_FROM_CHILD", "1");
+    std::env::set_var("DYING_CLAUDE_STDERR_DELAY", "1.5");
+    let (port, token, d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "slowdisk").await;
+
+    let ag = start_agent(&mut c, &ws.id).await;
+    // After the start: the start writes a record too, and it is not the write
+    // under test.
+    d.agents.delay_record_closing_for_tests(delay);
+    let started = Instant::now();
+    c.call(Request::AgentStop(AgentIdParams {
+        agent_id: ag.clone(),
+    }))
+    .await
+    .unwrap();
+    let took = started.elapsed();
+    let events = next_agent_events(&mut c, &ag, usize::MAX, Duration::from_millis(500)).await;
+    let exits = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::AgentStateChanged {
+                state: AgentState::Exited,
+                detail,
+                ..
+            } => Some(detail.clone().unwrap_or_default()),
+            _ => None,
+        })
+        .collect();
+    cancel.cancel();
+    SlowStop { exits, took }
+}
+
+/// A record write that outlasts `stop`'s pipe budget must not cost the exit
+/// its reason. The first closing write alone takes the reader past two seconds.
+#[tokio::test]
+async fn a_slow_record_write_does_not_lose_the_reason_an_agent_ended() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let stop = stop_with_slow_record_closing(py, Duration::from_millis(1500)).await;
+    assert_eq!(stop.exits.len(), 1, "{:?}", stop.exits);
+    assert!(
+        stop.exits[0].contains("Not logged in"),
+        "the exit lost the reason the turn failed: {:?}",
+        stop.exits
+    );
+}
+
+/// The reader claims the announcement and then publishes it, and nothing may
+/// sit between the two: a second closing write there is a window in which
+/// `stop`'s deadline leaves the flag claimed and the event unsent.
+///
+/// Two delays, one per deadline. At 750 ms the reader claims at about 1.75 s
+/// and the old two-second deadline fell inside that window. At 3 s it claims at
+/// about 4 s, and `stop`'s present deadline -- the reader's two pipe bounds and
+/// `RECORD_GRACE`, five seconds -- falls where the window would be.
+#[tokio::test]
+async fn a_slow_record_write_does_not_swallow_the_exit_announcement() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    for delay in [Duration::from_millis(750), Duration::from_secs(3)] {
+        let stop = stop_with_slow_record_closing(py, delay).await;
+        assert_eq!(
+            stop.exits.len(),
+            1,
+            "{delay:?}: the agent must announce exactly one exit: {:?}",
+            stop.exits
+        );
+        assert!(
+            stop.exits[0].contains("Not logged in"),
+            "{delay:?}: {:?}",
+            stop.exits
+        );
+    }
+}
+
+/// Something the CLI started that keeps stdout open after the CLI has gone is
+/// waited out by the reader for a moment of silence, not by `stop` for its whole
+/// patience: the reader then announces the exit itself, with its reason.
+#[tokio::test]
+async fn a_grandchild_holding_stdout_does_not_cost_the_exit_its_reason() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    use_dying_claude(py, Some("error_result_turn.ndjson"));
+    std::env::set_var("DYING_CLAUDE_STDOUT_HELD", "10");
+    let (port, token, _d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "heldstdout").await;
+
+    let ag = start_agent(&mut c, &ws.id).await;
+    let started = Instant::now();
+    c.call(Request::AgentStop(AgentIdParams {
+        agent_id: ag.clone(),
+    }))
+    .await
+    .unwrap();
+    let took = started.elapsed();
+    let events = next_agent_events(&mut c, &ag, usize::MAX, Duration::from_millis(500)).await;
+    let exits: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::AgentStateChanged {
+                state: AgentState::Exited,
+                detail,
+                ..
+            } => Some(detail.clone().unwrap_or_default()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(exits.len(), 1, "{exits:?}");
+    assert!(exits[0].contains("Not logged in"), "{exits:?}");
+    assert!(
+        took < Duration::from_secs(4),
+        "stop waited out the held pipe: {took:?}"
+    );
+    cancel.cancel();
+}
+
+/// A disk that does not come back within `stop`'s own patience still gets an
+/// answer and exactly one exit: `stop` gives up on the reader, and does not
+/// queue a write of its own behind the stuck one.
+#[tokio::test]
+async fn a_stuck_record_write_still_ends_the_stop_with_one_exit() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let stop = stop_with_slow_record_closing(py, Duration::from_secs(8)).await;
+    assert_eq!(stop.exits.len(), 1, "{:?}", stop.exits);
+    assert!(
+        stop.took < Duration::from_millis(7500),
+        "stop waited on the stuck write: {:?}",
+        stop.took
+    );
 }

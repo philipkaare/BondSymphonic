@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use persist::{AgentRecord, AgentRecords};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
@@ -283,6 +283,10 @@ pub struct AgentSink {
     /// file the next daemon reads. `None` in the unit tests below, which have no
     /// data directory and nothing to restore into.
     records: Option<Arc<AgentRecords>>,
+    /// Set by the first [`ended`](AgentSink::ended), shared by every clone. The
+    /// record is closed once: the moment the process ended is what it wants,
+    /// and a second write would only put an `fsync` in front of whoever asked.
+    closed: Arc<AtomicBool>,
 }
 
 impl AgentSink {
@@ -305,6 +309,7 @@ impl AgentSink {
             entry,
             order: Arc::new(tokio::sync::Mutex::new(())),
             records: None,
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -351,12 +356,23 @@ impl AgentSink {
     /// Moves the agent's state and announces it. The entry is updated before
     /// the event goes out, so a client that reacts by asking for the agent's
     /// status never sees the older value.
+    ///
+    /// `Exited` closes the record first, which is a disk write. A caller that
+    /// has claimed the one exit announcement must not wait on that between the
+    /// claim and the publish; it calls [`ended`](AgentSink::ended) before
+    /// claiming and [`publish_state`](AgentSink::publish_state) after.
     pub async fn state(&self, state: AgentState, detail: Option<String>) {
         // Before the event: a client that reacts to `Exited` by restarting the
         // daemon must not find the record still open.
         if state == AgentState::Exited {
             self.ended().await;
         }
+        self.publish_state(state, detail);
+    }
+
+    /// [`state`](AgentSink::state) without closing the record: updates the
+    /// entry and publishes, and cannot yield, so it completes once it starts.
+    pub fn publish_state(&self, state: AgentState, detail: Option<String>) {
         *self.entry.state.lock() = (state, detail.clone());
         // After the state itself, so anyone who sees a new epoch also sees the
         // state that goes with it.
@@ -404,12 +420,18 @@ impl AgentSink {
     /// lost.
     ///
     /// Idempotent, and it keeps the first answer: the moment the process ended
-    /// is what the record wants, not the moment somebody noticed again.
+    /// is what the record wants, not the moment somebody noticed again. Only
+    /// the first call writes; the others return at once, even while that write
+    /// is still going, so the exit paths can each call it without queueing
+    /// behind a disk that is slow or stuck.
     pub async fn ended(&self) {
-        // Ahead of the record, and ahead of the early return below: an agent
+        // Ahead of the record, and ahead of the early returns below: an agent
         // with no record on disk still holds a file descriptor, and a daemon
         // that runs for a week must not keep one per agent it has ever run.
         self.store.ended(&self.agent_id);
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let Some(records) = self.records.clone() else {
             return;
         };
