@@ -3572,3 +3572,250 @@ mod seam_targets {
         addr
     }
 }
+
+/// A Retry whose answer was lost resumes the agent only into a workspace that
+/// is actually running. One the daemon reports `Destroying` is on its way out:
+/// no agent is started in it, and the pending resume is dropped, so a later
+/// `Ready` for it does not start one either.
+mod sandbox_retry_destroying {
+    use super::{drain, wait_for};
+    use bondsymphonic_ide::model::persistence::{PersistedGroup, StateFile, STATE_VERSION};
+    use bondsymphonic_proto::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    const TOKEN: &str = "retry-destroying-token";
+    const WORKSPACE: &str = "ws_going1";
+    const AGENT: &str = "ag_going_old";
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+    type Journal = Arc<Mutex<Vec<String>>>;
+
+    #[test]
+    fn a_lost_retry_starts_no_agent_in_a_workspace_being_destroyed() {
+        if bondsymphonic_ide::testing::skip_without_qt("retry into destroying") {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let addr = rt.block_on(fake_daemon(journal.clone()));
+
+        let config = std::env::temp_dir().join(format!("bs-retry-going-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("config dir");
+        let state_path = config.join("state.json");
+        let saved = StateFile {
+            version: STATE_VERSION,
+            groups: vec![PersistedGroup {
+                name: "going".to_owned(),
+                workspace_ids: vec![WORKSPACE.to_owned()],
+                ..PersistedGroup::default()
+            }],
+            active_workspace: Some(WORKSPACE.to_owned()),
+            ..StateFile::default()
+        };
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&saved).expect("state json"),
+        )
+        .expect("seed state.json");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", "wait,wait,wait,quit")
+            .env(
+                "BS_MENU_TEST",
+                format!("sandbox-banner,sandbox-retry={WORKSPACE}"),
+            )
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", &state_path)
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let seen = journal.lock().expect("journal mutex").clone();
+        let context = format!("requests: {seen:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(status.success(), "{context}");
+        let _ = std::fs::remove_dir_all(&config);
+
+        // The controls: the Retry went out, its connection was rebuilt and
+        // the workspaces listed again, and the `Ready` behind that was sent.
+        assert_eq!(
+            seen.iter()
+                .filter(|m| m.starts_with("workspace.restart"))
+                .count(),
+            1,
+            "{context}"
+        );
+        assert!(
+            seen.iter().filter(|m| *m == "workspace.list").count() >= 2,
+            "the connection was never rebuilt, so this run proves nothing\n{context}"
+        );
+        assert!(
+            seen.iter().any(|m| m == "sent:ready"),
+            "the late Ready was never sent\n{context}"
+        );
+        assert!(
+            !seen.iter().any(|m| m.starts_with("agent.start")),
+            "an agent was started in a workspace being destroyed\n{context}"
+        );
+    }
+
+    fn workspace(state: WorkspaceState) -> WorkspaceInfo {
+        let mut info = super::workspace(WORKSPACE, "going", state, &[]);
+        let record = AgentSummary {
+            id: AgentId(AGENT.to_owned()),
+            adapter: AgentAdapterKind::Claude,
+            state: AgentState::Exited,
+            session_id: Some("sess-going".to_owned()),
+            command: None,
+            model: None,
+            permission_mode: None,
+        };
+        info.agents = vec![record.id.clone()];
+        info.agent_records = vec![record];
+        info
+    }
+
+    /// Listed down; the Retry is dropped unanswered; the reconnect lists the
+    /// workspace `Destroying`, and a moment later a `Ready` event arrives for
+    /// it -- which is what would start the agent if the pending resume had
+    /// been kept.
+    async fn fake_daemon(recorded: Journal) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let mut current = WorkspaceState::SandboxDown;
+            let mut retried = false;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (r, mut w) = stream.into_split();
+                let mut r = BufReader::new(r);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let ClientMessage::Request { id, request } =
+                        codec::decode(line.trim_end()).expect("decode");
+                    recorded
+                        .lock()
+                        .expect("journal mutex")
+                        .push(request.method_name().to_owned());
+                    let mut late_ready = false;
+                    let reply = match request {
+                        Request::Hello(p) if p.token == TOKEN => Some(ServerMessage::ok(
+                            id,
+                            &HelloResult {
+                                daemon_version: "0.0.0-fake".into(),
+                                capabilities: Capabilities {
+                                    sandbox_backend: "noop".into(),
+                                    git_protect: false,
+                                    adapters: vec![AgentAdapterKind::Claude],
+                                },
+                                protocol_version: Some(PROTOCOL_VERSION),
+                            },
+                        )),
+                        Request::Hello(_) => Some(ServerMessage::err(id, RpcError::unauthorized())),
+                        Request::SystemCheckPrereqs {} => {
+                            Some(ServerMessage::ok(id, &CheckPrereqsResult { items: vec![] }))
+                        }
+                        Request::WorkspaceList {} => {
+                            late_ready = retried;
+                            Some(ServerMessage::ok(
+                                id,
+                                &WorkspaceListResult {
+                                    workspaces: vec![workspace(current.clone())],
+                                },
+                            ))
+                        }
+                        Request::WorkspaceRestart(_) => {
+                            retried = true;
+                            current = WorkspaceState::Destroying;
+                            None
+                        }
+                        Request::AgentStart(_) => Some(ServerMessage::ok(
+                            id,
+                            &AgentStartResult {
+                                agent_id: AgentId("ag_going_new".to_owned()),
+                            },
+                        )),
+                        Request::AgentHistory(_) => Some(ServerMessage::ok(
+                            id,
+                            &HistoryResult {
+                                messages: vec![],
+                                state: AgentState::Exited,
+                                detail: None,
+                            },
+                        )),
+                        Request::FsWatch(_) => Some(ServerMessage::ok(id, &Empty {})),
+                        Request::FsListDir(_) => {
+                            Some(ServerMessage::ok(id, &ListDirResult { entries: vec![] }))
+                        }
+                        Request::WorkspaceChanges(_) => {
+                            Some(ServerMessage::ok(id, &ChangesResult { files: vec![] }))
+                        }
+                        Request::WorkspaceStatus(_) => Some(ServerMessage::ok(
+                            id,
+                            &WorkspaceStatusResult { entries: vec![] },
+                        )),
+                        Request::RunList(_) => {
+                            Some(ServerMessage::ok(id, &RunListResult { runs: vec![] }))
+                        }
+                        other => Some(ServerMessage::err(
+                            id,
+                            RpcError::internal(format!("not implemented: {}", other.method_name())),
+                        )),
+                    };
+                    let Some(reply) = reply else {
+                        break;
+                    };
+                    if w.write_all(codec::encode(&reply).as_bytes()).await.is_err() {
+                        break;
+                    }
+                    if late_ready {
+                        // After the list has been applied; events travel on
+                        // their own channel.
+                        tokio::time::sleep(Duration::from_millis(1_500)).await;
+                        let ready = ServerMessage::event(
+                            Some(WorkspaceId(WORKSPACE.to_owned())),
+                            Event::WorkspaceStateChanged {
+                                info: Box::new(workspace(WorkspaceState::Ready)),
+                            },
+                        );
+                        if w.write_all(codec::encode(&ready).as_bytes()).await.is_ok() {
+                            recorded
+                                .lock()
+                                .expect("journal mutex")
+                                .push("sent:ready".to_owned());
+                        }
+                    }
+                }
+            }
+        });
+        addr
+    }
+}

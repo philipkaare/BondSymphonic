@@ -794,6 +794,7 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::workspacesListed, this,
                      [this](const QString& json) {
                          m_groupModel->reconcile(json);
+                         noteWorkspaceStates(json);
                          resumeUnansweredRestarts(true);
                          // After the reconcile, not the restore: the restore
                          // places the tabs the session file remembered, and it
@@ -863,6 +864,7 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::workspaceChanged, this,
                      [this](const QString& info) {
                          m_groupModel->applyWorkspaceInfo(info);
+                         noteWorkspaceStates(info);
                          resumeUnansweredRestarts(false);
                          // A workspace whose sandbox has just come up is a
                          // workspace that can now take an agent. On a restore
@@ -1494,6 +1496,7 @@ void MainWindow::onWorkspaceRestarted(const QString& workspaceId, const QString&
     m_restarting.remove(workspaceId);
     m_restartUnanswered.remove(workspaceId);
     m_groupModel->applyWorkspaceInfo(infoJson);
+    noteWorkspaceStates(infoJson);
     m_agentArea->setRetrying(workspaceId, false);
     resumeAgentAfterRestart(workspaceId);
     startAgentsThatHaveNone();
@@ -1536,20 +1539,37 @@ void MainWindow::onWorkspaceRestartFailed(const QString& workspaceId, const QStr
     }
 }
 
+void MainWindow::noteWorkspaceStates(const QString& json) {
+    const QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
+    const QJsonArray infos = doc.isArray() ? doc.array() : QJsonArray{ doc.object() };
+    for (const QJsonValue& value : infos) {
+        const QJsonObject info = value.toObject();
+        const QString id = info.value("id").toString();
+        if (!id.isEmpty()) {
+            m_workspaceStates.insert(id, info.value("state").toString());
+        }
+    }
+}
+
 void MainWindow::resumeUnansweredRestarts(bool listed) {
     const QList<QString> pending = m_restartUnanswered.keys();
     for (const QString& workspaceId : pending) {
         if (m_restartUnanswered.value(workspaceId) && !listed) {
             continue;
         }
-        const QJsonObject tab = tabFor(workspaceId);
-        if (tab.isEmpty()) {
+        const QString state = m_workspaceStates.value(workspaceId);
+        // Gone, or on its way: there is no agent to bring back, now or later.
+        if (tabFor(workspaceId).isEmpty() || state == QLatin1String("destroying")) {
             m_restartUnanswered.remove(workspaceId);
             continue;
         }
-        if (!tab.value("workspace_problem").toObject().isEmpty() ||
-            tab.value("status").toString() == QLatin1String("Creating") ||
-            m_restarting.contains(workspaceId)) {
+        // Running is the one state an agent can be started in. Anything else
+        // waits for the next report; after a fresh list that report no longer
+        // has to be another list, because the connection is back.
+        if (state != QLatin1String("ready") || m_restarting.contains(workspaceId)) {
+            if (listed) {
+                m_restartUnanswered.insert(workspaceId, false);
+            }
             continue;
         }
         m_restartUnanswered.remove(workspaceId);
@@ -2135,6 +2155,7 @@ void MainWindow::onWorkspaceDestroyed(const QString& workspaceId) {
     m_restarting.remove(workspaceId);
     m_restartUnanswered.remove(workspaceId);
     m_agentStopped.remove(workspaceId);
+    m_workspaceStates.remove(workspaceId);
     // Panes first: the model change that follows re-selects a surviving tab,
     // and the areas must no longer hold the dead one when it does. The editor
     // tabs go with them: there is nothing left to save the file to.

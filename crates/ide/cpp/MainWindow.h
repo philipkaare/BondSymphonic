@@ -346,6 +346,14 @@ private:
     /// new one has listed the workspaces, since a start sent before that
     /// fails for want of a connection.
     QHash<QString, bool> m_restartUnanswered;
+    /// The daemon's own word for each workspace's state ("ready",
+    /// "destroying", ...), from the last `WorkspaceInfo` the window was handed.
+    /// The tab cannot say it: a workspace being destroyed and a running one
+    /// whose agent ended both read as done there.
+    QHash<QString, QString> m_workspaceStates;
+    /// Records the state of every `WorkspaceInfo` in `json`, which is one info
+    /// object or an array of them.
+    void noteWorkspaceStates(const QString& json);
     /// Workspaces whose banner is showing "The agent stopped." from
     /// `onAgentExited`, so the agent coming back -- or its sandbox turning
     /// out to be what stopped it -- can take exactly that down.
