@@ -638,13 +638,18 @@ fn checked_out_at(listed: &str, branch: &str) -> Option<String> {
 async fn rebuild(layout: &Layout) -> Result<(), RpcError> {
     let gitdir = layout.worktree_gitdir();
     std::fs::create_dir_all(&gitdir).map_err(|e| RpcError::io(&e))?;
+    // Git finds a registration by comparing this path with the one it is given,
+    // and git for Windows writes it, and compares it, with forward slashes
+    // (checked against 2.52). A backslash here makes `worktree lock` answer
+    // "is not a working tree".
+    let mut back_link = path_arg(&layout.worktree_path.join(".git"));
+    if cfg!(windows) {
+        back_link = back_link.replace('\\', "/");
+    }
     for (name, contents) in [
         ("HEAD", format!("ref: refs/heads/{}\n", layout.branch)),
         ("commondir", "../..\n".to_string()),
-        (
-            "gitdir",
-            format!("{}\n", path_arg(&layout.worktree_path.join(".git"))),
-        ),
+        ("gitdir", format!("{back_link}\n")),
     ] {
         std::fs::write(gitdir.join(name), contents).map_err(|e| RpcError::io(&e))?;
     }
