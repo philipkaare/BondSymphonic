@@ -54,19 +54,24 @@ pub async fn create_pr(
         // repository's merges behind it for two minutes would be its own bug.
         let lock = crate::git::repo_lock(&ws.repo_path);
         let _guard = lock.lock().await;
-        // `-u` so the branch tracks, and a later push from the user's own shell
-        // needs no arguments. The objects being pushed live in the workspace's
-        // private object directory; `daemon_git` is what lets git read them.
-        git.run(&ws.repo_path, &["push", "-u", "origin", &ws.branch])
+        // Without `-u`: setting an upstream writes `branch.<name>.remote` and
+        // `branch.<name>.merge` into `.git/config`, and every write of that file
+        // replaces it, which stops any in-place workspace of the same repository
+        // (see [`crate::workspace::in_place::ProtectedSnapshot`]). Nothing here
+        // needs the tracking: `gh pr create` is given `--head` explicitly, and a
+        // later push from the user's own shell is theirs to set up. The objects
+        // being pushed live in the workspace's private object directory;
+        // `daemon_git` is what lets git read them.
+        git.run(&ws.repo_path, &["push", "origin", &ws.branch])
             .await?;
         // Daemon design §5.2: the borrowed objects are copied into the shared
-        // store after the push. `-u` leaves `refs/remotes/origin/<branch>`
-        // behind, and unlike the local branch that ref is *not* deleted when the
-        // workspace is destroyed — it would be left pointing into a directory
-        // that no longer exists. Everything the branch adds to the base is what
-        // has to be copied, and a failure here is reported rather than logged:
-        // the push has happened, so the caller has to know the workspace is now
-        // holding objects the repository needs.
+        // store after the push. A push updates `refs/remotes/origin/<branch>`
+        // with or without `-u`, and unlike the local branch that ref is *not*
+        // deleted when the workspace is destroyed — it would be left pointing
+        // into a directory that no longer exists. Everything the branch adds to
+        // the base is what has to be copied, and a failure here is reported
+        // rather than logged: the push has happened, so the caller has to know
+        // the workspace is now holding objects the repository needs.
         crate::git::absorb_objects(
             &git,
             &ws.repo_path,

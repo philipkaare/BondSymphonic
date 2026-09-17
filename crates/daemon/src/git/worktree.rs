@@ -1,5 +1,5 @@
 use super::{path_arg, repo, Git};
-use bondsymphonic_proto::{ErrorCode, RpcError};
+use bondsymphonic_proto::{ErrorCode, RpcError, WorkspaceId};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -179,7 +179,7 @@ const NEUTRALISED_CONFIG: &[&str] = &[
 /// object directory are named after the workspace id and belong to one
 /// workspace alone. So a cleanup that deletes the branch unconditionally is a
 /// cleanup that can delete somebody else's work: two creates of one name, one
-/// of them failing, and `git branch -D` lands on the branch the other one is
+/// of them failing, and the branch deletion lands on the branch the other one is
 /// checking out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoveBranch {
@@ -319,7 +319,7 @@ fn branch_conflict(branch: &str) -> RpcError {
 /// The inference holds for every wording of "already there" git has, because
 /// those take the `Never` path — but a future git that refuses a create for
 /// that reason in words none of the three match would send the unwind down this
-/// branch instead, and `git branch -D` would land on somebody else's work. The
+/// branch instead, and the branch deletion would land on somebody else's work. The
 /// repository lock `workspace.create` holds is what keeps a second create of
 /// the same name out of the window in practice; [`branch_is_already_there`] is
 /// the part that has to stay current with git.
@@ -716,6 +716,52 @@ const HOLD_REASON: &str = "BondSymphonic keeps this directory while it removes a
 /// The name every hold entry starts with.
 const HOLD_PREFIX: &str = ".bs-hold-";
 
+/// What the persistent hold of an in-place workspace says.
+const IN_PLACE_HOLD_REASON: &str =
+    "BondSymphonic keeps this directory while an agent works in this checkout\n";
+
+/// The name of the persistent hold of the in-place workspace `id`.
+///
+/// Deliberately not [`HOLD_PREFIX`]: `WorktreesHold::take` sweeps away every
+/// entry with that prefix as the leftover of a daemon that stopped mid-removal,
+/// and this one is meant to outlive every worktree removal there is. It carries
+/// the workspace id so that two in-place workspaces of two checkouts of the same
+/// repository -- which cannot happen today, but costs nothing to allow -- each
+/// take back their own.
+fn in_place_hold(git_common: &Path, id: &WorkspaceId) -> PathBuf {
+    git_common.join("worktrees").join(format!(".bs-inplace-{id}"))
+}
+
+/// Keeps `<git common dir>/worktrees` in place for as long as an in-place
+/// workspace exists, rather than only across one removal.
+///
+/// The directory is bound read-only into that workspace's sandbox, and a bind
+/// does not survive the directory it was made on. Git deletes `worktrees` when
+/// it finds it empty -- the last `git worktree remove`, but also a plain `git
+/// worktree prune` or a `git gc`, which git's own `--auto` maintenance runs
+/// behind the user's ordinary `git commit`. Without this, an agent would be
+/// stopped at random by the user's git doing nothing of any consequence.
+///
+/// Made by [`crate::workspace::in_place::InPlaceLayout::prepare`], after that
+/// call has made sure `worktrees` exists, and taken back by its `release`. Best
+/// effort: a hold that cannot be made costs a restart, not the workspace.
+pub fn hold_worktrees_for_in_place(git_common: &Path, id: &WorkspaceId) {
+    let entry = in_place_hold(git_common, id);
+    if entry.join("locked").is_file() {
+        return;
+    }
+    let made = std::fs::create_dir_all(&entry)
+        .and_then(|()| std::fs::write(entry.join("locked"), IN_PLACE_HOLD_REASON));
+    if let Err(e) = made {
+        tracing::warn!(path = %entry.display(), error = %e, "cannot hold the worktrees directory for an in-place workspace");
+    }
+}
+
+/// Takes the persistent hold away again, at Close.
+pub fn release_in_place_hold(git_common: &Path, id: &WorkspaceId) {
+    release_hold(&in_place_hold(git_common, id), IN_PLACE_HOLD_REASON);
+}
+
 /// Keeps `<git common dir>/worktrees` in place while the daemon removes or
 /// prunes worktrees, for as long as the value lives.
 ///
@@ -747,7 +793,7 @@ impl WorktreesHold {
         if let Ok(read) = std::fs::read_dir(&worktrees) {
             for stale in read.flatten() {
                 if stale.file_name().to_string_lossy().starts_with(HOLD_PREFIX) {
-                    release_hold(&stale.path());
+                    release_hold(&stale.path(), HOLD_REASON);
                 }
             }
         }
@@ -758,7 +804,7 @@ impl WorktreesHold {
             Ok(()) => Self { entry: Some(entry) },
             Err(e) => {
                 tracing::warn!(path = %entry.display(), error = %e, "cannot hold the worktrees directory");
-                release_hold(&entry);
+                release_hold(&entry, HOLD_REASON);
                 Self { entry: None }
             }
         }
@@ -768,15 +814,35 @@ impl WorktreesHold {
 impl Drop for WorktreesHold {
     fn drop(&mut self) {
         if let Some(entry) = self.entry.take() {
-            release_hold(&entry);
+            release_hold(&entry, HOLD_REASON);
         }
     }
 }
 
 /// Takes a hold entry away: its `locked` file and then the entry, and nothing
-/// else -- an entry that holds more is not one the daemon made.
-fn release_hold(entry: &Path) {
-    let _ = std::fs::remove_file(entry.join("locked"));
+/// else.
+///
+/// Both steps are read before they are taken. A registration has a `gitdir`,
+/// and a user is free to name a worktree whatever they like -- including
+/// something that begins the way a hold does -- so an entry with one is theirs
+/// and is left alone, lock and all. The `locked` file has to say exactly what
+/// the daemon wrote there, because a `locked` a user wrote is a worktree they
+/// asked git to protect. The directory then goes only if it is empty, which is
+/// what leaves anything else in it standing.
+fn release_hold(entry: &Path, reason: &str) {
+    if entry.join("gitdir").exists() {
+        return;
+    }
+    let locked = entry.join("locked");
+    match std::fs::read(&locked) {
+        Ok(bytes) if bytes == reason.as_bytes() => {
+            let _ = std::fs::remove_file(&locked);
+        }
+        // A hold whose `locked` was never written: the directory is still the
+        // daemon's to take back.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return,
+    }
     let _ = std::fs::remove_dir(entry);
 }
 
@@ -792,7 +858,7 @@ pub async fn remove(layout: &Layout) -> Result<(), RpcError> {
 /// so.
 ///
 /// Through [`Layout::daemon_git`] for the same reason as [`create`]: the
-/// `branch -D` at the end fires `reference-transaction`, and a destroy is the
+/// branch deletion at the end fires `reference-transaction`, and a destroy is the
 /// last moment at which running the repository's code would be welcome.
 ///
 /// With [`RemoveBranch::Never`] the branch stays, and so do
@@ -940,8 +1006,27 @@ fn regex_escape(text: &str) -> String {
 /// repository (see [`crate::workspace::in_place::ProtectedSnapshot`]). The
 /// section is removed separately, and only when there is one -- a workspace
 /// whose pull request set an upstream.
+///
+/// What `branch -D` also did, and `update-ref -d` does not, is refuse a branch
+/// that is checked out somewhere. By here the workspace's own worktree is gone
+/// and pruned, so the only way to find the branch checked out is that somebody
+/// else took it -- an in-place agent that ran `git switch bs/<name>/work` in
+/// the user's own checkout, say. Deleting it under them would leave that
+/// checkout on a branch that does not exist, so it is refused as it used to be.
 async fn remove_branch(git: &Git, layout: &Layout) -> Result<(), RpcError> {
     if repo::branch_exists(git, &layout.repo, &layout.branch).await? {
+        let listed = git
+            .run(&layout.repo, &["worktree", "list", "--porcelain"])
+            .await?;
+        if let Some(other) = checked_out_at(&listed.stdout, &layout.branch) {
+            return Err(RpcError::new(
+                ErrorCode::Conflict,
+                format!(
+                    "branch {} is checked out at {other}, so it was left alone",
+                    layout.branch
+                ),
+            ));
+        }
         let full = format!("refs/heads/{}", layout.branch);
         git.run(&layout.repo, &["update-ref", "-d", &full]).await?;
         let section = format!("branch.{}", layout.branch);

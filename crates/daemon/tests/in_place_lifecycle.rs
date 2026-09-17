@@ -432,6 +432,61 @@ async fn removing_a_worktree_workspace_keeps_the_worktrees_directory() {
     cancel.cancel();
 }
 
+/// Plan C3: a registry entry that says a worktree lives somewhere the daemon
+/// would never have put one is a damaged entry, not an instruction to delete
+/// that directory.
+///
+/// The way it happens is a daemon build from before in-place workspaces: it
+/// drops the `kind` field it does not know when it rewrites `workspaces.json`,
+/// and the entry then reads back as a worktree workspace whose `worktree_path`
+/// is the user's own checkout. `worktree remove --force` fails on it and the
+/// removal that follows would take the checkout, `.git` and all.
+#[tokio::test]
+async fn destroy_refuses_a_worktree_path_the_daemon_would_never_have_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let d = Daemon::new(
+        DataDirs::new(dir.path().join("data")),
+        backend_for("noop"),
+        EventBus::new(16),
+    )
+    .unwrap();
+    let id = WorkspaceId("ws_lost_kind".into());
+    d.registry
+        .insert(bondsymphonic_daemon::workspace::Workspace {
+            id: id.clone(),
+            name: "here".into(),
+            repo_path: repo.clone(),
+            base_branch: "main".into(),
+            branch: "main".into(),
+            // What the entry looks like once `kind` has been dropped.
+            worktree_path: repo.clone(),
+            created_at: bondsymphonic_daemon::workspace::now_rfc3339(),
+            allowlist: vec![],
+            state: WorkspaceState::Ready,
+            agents: vec![],
+            runs: vec![],
+            kind: WorkspaceKind::Worktree,
+        })
+        .await
+        .unwrap();
+
+    for force in [false, true] {
+        let e = lifecycle::destroy(&d, &id, force).await.unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidParams, "force = {force}");
+        assert!(
+            e.message.contains(&repo.display().to_string())
+                && e.message.contains("refusing to remove it"),
+            "force = {force}: {}",
+            e.message
+        );
+        assert!(repo.join(".git").is_dir(), "force = {force}");
+        assert!(repo.join("README.md").is_file(), "force = {force}");
+    }
+    // The entry is still there to be repaired, and the refusal says where.
+    assert!(d.registry.get(&id).is_some());
+}
+
 /// A sandbox that calls itself `linux_bwrap`, so the protection watcher runs,
 /// over the no-sandbox backend. The first time the watcher asks for its pid it
 /// dies, and answers only once `watch_sandbox` has taken it out of the

@@ -753,3 +753,96 @@ async fn worktree_status(layout: &Layout) -> String {
         .unwrap()
         .stdout
 }
+
+/// A worktree removal sweeps away holds a stopped daemon left behind. The
+/// sweep goes by name, so it must be able to tell a hold from anything else
+/// wearing that name: a registration has a `gitdir`, and a `locked` file that
+/// does not say what the daemon writes is a lock somebody else is relying on.
+///
+/// Git itself spells a leading dot as `-` when it names a registration, so
+/// nothing shaped like this is git's doing; it is a directory somebody made by
+/// hand, and it is theirs.
+#[tokio::test]
+async fn the_stale_hold_sweep_leaves_everything_but_a_hold_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let layout = layout_for(dir.path(), &repo, "sweep").await;
+    worktree::create(&layout, "main").await.unwrap();
+    let worktrees = layout.git_common.join("worktrees");
+    const HOLD_REASON: &str = "BondSymphonic keeps this directory while it removes a worktree
+";
+
+    // A leftover of a daemon that stopped mid-removal, which is what the sweep
+    // is for.
+    let stale = worktrees.join(".bs-hold-00000000");
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("locked"), HOLD_REASON).unwrap();
+    // A registration wearing the same name. Its lock is git's to honour.
+    let registration = worktrees.join(".bs-hold-registration");
+    std::fs::create_dir(&registration).unwrap();
+    std::fs::write(registration.join("gitdir"), "/somewhere/.git
+").unwrap();
+    std::fs::write(registration.join("locked"), HOLD_REASON).unwrap();
+    // A directory with a lock that says something else.
+    let theirs = worktrees.join(".bs-hold-theirs");
+    std::fs::create_dir(&theirs).unwrap();
+    std::fs::write(theirs.join("locked"), "on a removable disk
+").unwrap();
+    // And the persistent hold of an in-place workspace, which the sweep must
+    // never touch whatever a worktree removal is doing.
+    worktree::hold_worktrees_for_in_place(&layout.git_common, &"ws_here".into());
+    let persistent = worktrees.join(".bs-inplace-ws_here");
+
+    worktree::remove(&layout).await.unwrap();
+
+    assert!(!stale.exists(), "the leftover hold should have gone");
+    for kept in [&registration, &theirs, &persistent] {
+        assert!(kept.is_dir(), "{} was swept away", kept.display());
+        assert!(
+            kept.join("locked").is_file(),
+            "{}'s lock was taken",
+            kept.display()
+        );
+    }
+
+    worktree::release_in_place_hold(&layout.git_common, &"ws_here".into());
+    assert!(!persistent.exists());
+}
+
+/// `branch -D` refused to delete a branch that was checked out somewhere;
+/// `update-ref -d` will do it without a murmur. An in-place agent switching the
+/// user's own checkout onto the workspace's branch is how that happens.
+#[tokio::test]
+async fn removing_a_workspace_leaves_a_branch_somebody_else_checked_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let layout = layout_for(dir.path(), &repo, "taken").await;
+    worktree::create(&layout, "main").await.unwrap();
+    // The worktree the branch belongs to goes first, as `remove_with` does --
+    // `-f -f` because the daemon locks its own worktrees -- and then somebody
+    // else is standing on the branch.
+    common::git_ok(
+        &repo,
+        &[
+            "worktree",
+            "remove",
+            "-f",
+            "-f",
+            &layout.worktree_path.to_string_lossy(),
+        ],
+    );
+    common::git_ok(&repo, &["switch", "-q", "bs/taken/work"]);
+
+    let e = worktree::remove(&layout).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict);
+    assert!(
+        e.message.contains("bs/taken/work") && e.message.contains("is checked out at"),
+        "{}",
+        e.message
+    );
+    assert_eq!(
+        common::git_out(&repo, &["rev-parse", "--verify", "refs/heads/bs/taken/work"]).len(),
+        40,
+        "the branch somebody is standing on was deleted"
+    );
+}

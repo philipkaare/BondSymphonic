@@ -706,7 +706,7 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
     //
     // Two creates of one name could otherwise pass the registry check together,
     // both reach `git worktree add -b bs/<name>/work`, and have the loser's
-    // cleanup run `git branch -D` on the branch the winner was checking out.
+    // cleanup delete the branch the winner was checking out.
     // The branch, its loose-ref directory and its reflog are named after the
     // workspace *name*, so none of them is private to one workspace; making the
     // sequence serial is what keeps "the branch is not there yet" true from the
@@ -800,7 +800,7 @@ async fn create_the_workspace(
         // included when the branch was its own. This is the safety net for the
         // rest: the worktree directory and its registration, and never the
         // branch — `RemoveBranch::Never`, because a cleanup that cannot show the
-        // branch is its own is a cleanup that must not run `git branch -D` on
+        // branch is its own is a cleanup that must not delete
         // somebody else's.
         //
         // Only when there is something to clean up, which `create` reports
@@ -1074,7 +1074,7 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
         // A missing worktree directory rules out the dirty check but not the unmerged
         // one. `restore` records that state as an `Error` naming the missing directory,
         // and the branch still points at commits whose objects live only in this
-        // workspace's private object dir, which the `git branch -D` in `worktree::remove`
+        // workspace's private object dir, which the branch deletion in `worktree::remove`
         // would discard for good.
         //
         // Asked at once: one reads the worktree and the other the repository's

@@ -115,11 +115,14 @@ async fn create_pr_pushes_the_branch_and_returns_the_url_gh_printed() {
         ),
         "alpha work"
     );
-    // `-u`, so the branch is tracking and a later `git push` from the repo needs
-    // no arguments.
+    // Without `-u`: setting an upstream would write `.git/config`, and every
+    // write of that file stops an in-place workspace of the same repository.
+    // Nothing needs the tracking — `gh pr create` is given `--head` — and the
+    // remote-tracking ref `absorb_objects` reasons about is updated either way.
+    assert!(common::git_try(&repo, &["config", "--get", "branch.bs/alpha/work.remote"]).is_err());
     assert_eq!(
-        common::git_out(&repo, &["config", "--get", "branch.bs/alpha/work.remote"]),
-        "origin"
+        common::git_out(&repo, &["rev-parse", "refs/remotes/origin/bs/alpha/work"]),
+        common::git_out(&repo, &["rev-parse", "refs/heads/bs/alpha/work"])
     );
 
     let logged = std::fs::read_to_string(&log).unwrap();
