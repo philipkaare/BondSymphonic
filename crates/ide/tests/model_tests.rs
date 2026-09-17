@@ -1422,3 +1422,132 @@ mod in_place_model {
         assert!(p.detail.contains("the worktree is kept"), "{}", p.detail);
     }
 }
+
+/// The breach detail, 2026-09-17 (final wave, I1): the daemon says why it
+/// stopped a workspace in two events -- a warning carrying the sentence and a
+/// diff, and then the workspace's own `Error` state carrying the sentence
+/// alone -- and the model has to put them back together whichever way round
+/// they arrive, and for a workspace whose tab does not exist yet.
+mod workspace_warnings {
+    use bondsymphonic_ide::model::app_state::Workspaces;
+    use bondsymphonic_proto::*;
+
+    const SENTENCE: &str = "Git files this workspace protects were replaced while the agent was \
+                            running (.git/config), so its sandbox was stopped.";
+    const DIFF: &str = "--- .git/config\n+++ .git/config\n+\tfsmonitor = ./planted.sh\n";
+
+    fn info(id: &str, state: WorkspaceState) -> WorkspaceInfo {
+        WorkspaceInfo {
+            id: id.into(),
+            name: id.into(),
+            repo_path: "/r".into(),
+            base_branch: "main".into(),
+            branch: "main".into(),
+            worktree_path: "/r".into(),
+            created_at: "t".into(),
+            allowlist: vec![],
+            state,
+            agents: vec![],
+            agent_records: vec![],
+            runs: vec![],
+            kind: WorkspaceKind::InPlace,
+        }
+    }
+
+    fn what_changed(model: &Workspaces, id: &WorkspaceId) -> String {
+        let (g, t) = model.find(id).expect("the workspace has a tab");
+        model.groups[g].tabs[t]
+            .workspace_problem
+            .as_ref()
+            .map(|p| p.what_changed.clone())
+            .unwrap_or_default()
+    }
+
+    /// The daemon's own order: the warning, then the state it explains.
+    #[test]
+    fn the_diff_the_daemon_sent_is_shown_under_the_reason_it_explains() {
+        let id = WorkspaceId("ws_ip".into());
+        let mut model =
+            Workspaces::from_persisted(&[], &[info("ws_ip", WorkspaceState::Ready)], None);
+        assert!(model.note_workspace_warning(&id, &format!("{SENTENCE}\n{DIFF}")));
+        // Nothing yet: a running workspace has no problem to explain.
+        assert_eq!(what_changed(&model, &id), "");
+
+        model.apply_workspace_info(&info("ws_ip", WorkspaceState::Error(SENTENCE.to_owned())));
+        assert_eq!(what_changed(&model, &id), DIFF);
+
+        // A different failure afterwards is not explained by the diff of the
+        // one before it.
+        model.apply_workspace_info(&info(
+            "ws_ip",
+            WorkspaceState::Error("bwrap: permission denied".to_owned()),
+        ));
+        assert_eq!(what_changed(&model, &id), "");
+    }
+
+    /// And the other order, which nothing in the protocol forbids.
+    #[test]
+    fn a_warning_that_arrives_after_the_state_still_explains_it() {
+        let id = WorkspaceId("ws_ip".into());
+        let mut model =
+            Workspaces::from_persisted(&[], &[info("ws_ip", WorkspaceState::Ready)], None);
+        model.apply_workspace_info(&info("ws_ip", WorkspaceState::Error(SENTENCE.to_owned())));
+        assert_eq!(what_changed(&model, &id), "");
+        assert!(model.note_workspace_warning(&id, &format!("{SENTENCE}\n{DIFF}")));
+        assert_eq!(what_changed(&model, &id), DIFF);
+    }
+
+    /// A warning for a workspace with no tab is kept, not dropped: the pane it
+    /// belongs to may be built minutes later, and a reconnect rebuilds every
+    /// tab from the daemon's list.
+    #[test]
+    fn a_warning_survives_the_tab_it_belongs_to_being_built_or_rebuilt() {
+        let id = WorkspaceId("ws_ip".into());
+        let mut model = Workspaces::new_default();
+        assert!(model.note_workspace_warning(&id, &format!("{SENTENCE}\n{DIFF}")));
+        assert!(model.find(&id).is_none());
+
+        model.reconcile(&[info("ws_ip", WorkspaceState::Error(SENTENCE.to_owned()))]);
+        assert_eq!(what_changed(&model, &id), DIFF);
+        // A second list, as a reconnect sends: the tabs are refreshed and the
+        // detail is still there.
+        model.reconcile(&[info("ws_ip", WorkspaceState::Error(SENTENCE.to_owned()))]);
+        assert_eq!(what_changed(&model, &id), DIFF);
+
+        // The workspace going takes its warning with it: a workspace that came
+        // back under the same id would be a different one.
+        assert!(model.remove_workspace(&id));
+        model.reconcile(&[info("ws_ip", WorkspaceState::Error(SENTENCE.to_owned()))]);
+        assert_eq!(what_changed(&model, &id), "");
+    }
+
+    /// A warning with nothing under its first line explains nothing and is
+    /// kept nowhere.
+    #[test]
+    fn a_one_line_warning_is_not_kept() {
+        let id = WorkspaceId("ws_ip".into());
+        let mut model =
+            Workspaces::from_persisted(&[], &[info("ws_ip", WorkspaceState::Ready)], None);
+        assert!(!model.note_workspace_warning(&id, "this workspace has no network: proxy is down"));
+        assert!(!model.note_workspace_warning(&id, &format!("{SENTENCE}\n   \n")));
+        model.apply_workspace_info(&info("ws_ip", WorkspaceState::Error(SENTENCE.to_owned())));
+        assert_eq!(what_changed(&model, &id), "");
+    }
+
+    /// `state_json` is the only way any of this reaches the banner.
+    #[test]
+    fn the_detail_travels_in_state_json() {
+        let id = WorkspaceId("ws_ip".into());
+        let mut model =
+            Workspaces::from_persisted(&[], &[info("ws_ip", WorkspaceState::Ready)], None);
+        model.note_workspace_warning(&id, &format!("{SENTENCE}\n{DIFF}"));
+        model.apply_workspace_info(&info("ws_ip", WorkspaceState::Error(SENTENCE.to_owned())));
+        let json: serde_json::Value = serde_json::from_str(&model.to_json()).expect("state json");
+        assert_eq!(
+            json["groups"][0]["tabs"][0]["workspace_problem"]["what_changed"],
+            DIFF
+        );
+        let back = Workspaces::from_json(&model.to_json()).expect("state json parses");
+        assert_eq!(back, model);
+    }
+}

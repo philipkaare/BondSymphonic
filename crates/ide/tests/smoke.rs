@@ -4053,3 +4053,267 @@ mod in_place_close {
         }
     }
 }
+
+/// The breach detail (final wave, I1): the daemon stops an in-place sandbox
+/// whose protected git files were replaced, and says so in two events -- a
+/// warning carrying the sentence and a diff of what changed, then the
+/// workspace's own `Error` state carrying the sentence alone. The sentence
+/// tells the user to check `.git/config`; this is the run that proves the diff
+/// is one click away in the banner rather than only in a log they cannot see.
+mod in_place_breach_detail {
+    use super::{drain, wait_for};
+    use bondsymphonic_ide::model::persistence::{PersistedGroup, StateFile, STATE_VERSION};
+    use bondsymphonic_proto::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    const TOKEN: &str = "in-place-breach-token";
+    const SCRIPT: &str = "wait,wait,quit";
+    const MENU_TEST: &str = "sandbox-banner,sandbox-what-changed=ws_breach1";
+    const WORKSPACE: &str = "ws_breach1";
+    const NAME: &str = "checkout-one";
+    const SENTENCE: &str = "Git files this workspace protects were replaced while the agent was \
+                            running (.git/config), so its sandbox was stopped. Check .git/config \
+                            for settings you did not make.";
+    const DIFF: &str = "--- .git/config\n+++ .git/config\n+\tfsmonitor = ./planted.sh\n";
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+    type Journal = Arc<Mutex<Vec<String>>>;
+
+    #[test]
+    fn the_diff_behind_a_stopped_sandbox_is_one_click_from_the_banner() {
+        if bondsymphonic_ide::testing::skip_without_qt("in-place breach detail") {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (addr, journal) = rt.block_on(fake_daemon());
+
+        // Never the developer's real `%APPDATA%\BondSymphonic`.
+        let config =
+            std::env::temp_dir().join(format!("bs-in-place-breach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("config dir");
+        let state_path = config.join("state.json");
+        let saved = StateFile {
+            version: STATE_VERSION,
+            groups: vec![PersistedGroup {
+                name: "here".to_owned(),
+                workspace_ids: vec![WORKSPACE.to_owned()],
+                ..PersistedGroup::default()
+            }],
+            active_workspace: Some(WORKSPACE.to_owned()),
+            ..StateFile::default()
+        };
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&saved).expect("state json"),
+        )
+        .expect("seed state.json");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", SCRIPT)
+            .env("BS_MENU_TEST", MENU_TEST)
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", &state_path)
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let seen = journal.lock().expect("journal mutex").clone();
+        let context = format!("requests: {seen:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(
+            status.success(),
+            "the IDE exited with {status}, expected 0\n{context}"
+        );
+        let _ = std::fs::remove_dir_all(&config);
+
+        // The IDE's stdout is a Windows text stream, so every line it wrote
+        // arrives with a carriage return in front of the newline. The diff
+        // below is matched whole, across lines, which is the one assertion
+        // here that cares.
+        let out = out.replace("\r\n", "\n");
+        // The sentence is in the strip, as any workspace problem's is.
+        assert!(
+            out.contains(&format!(
+                "BS_MENU_TEST sandbox-banner target={WORKSPACE} question=This workspace could \
+                 not be started | {SENTENCE}"
+            )),
+            "the banner did not say why the workspace stopped\n{context}"
+        );
+        // And the diff the sentence sends the user to check is behind the
+        // banner's own disclosure, verbatim.
+        assert!(
+            out.contains(&format!(
+                "BS_MENU_TEST sandbox-what-changed target={WORKSPACE} question={DIFF}"
+            )),
+            "the diff never reached the banner\n{context}"
+        );
+    }
+
+    /// One in-place workspace that is running, until the list is answered: then
+    /// the daemon says what it found and what it did about it, in that order.
+    async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let recorded = journal.clone();
+
+        tokio::spawn(async move {
+            let mut stopped = false;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (r, mut w) = stream.into_split();
+                let mut r = BufReader::new(r);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let ClientMessage::Request { id, request } =
+                        codec::decode(line.trim_end()).expect("decode");
+                    recorded
+                        .lock()
+                        .expect("journal mutex")
+                        .push(request.method_name().to_owned());
+                    let mut after: Vec<ServerMessage> = Vec::new();
+                    let reply = match request {
+                        Request::Hello(p) if p.token == TOKEN => ServerMessage::ok(
+                            id,
+                            &HelloResult {
+                                daemon_version: "0.0.0-fake".into(),
+                                capabilities: Capabilities {
+                                    sandbox_backend: "noop".into(),
+                                    git_protect: false,
+                                    adapters: vec![AgentAdapterKind::Claude],
+                                },
+                                protocol_version: Some(PROTOCOL_VERSION),
+                            },
+                        ),
+                        Request::Hello(_) => ServerMessage::err(id, RpcError::unauthorized()),
+                        Request::SystemCheckPrereqs {} => ServerMessage::ok(
+                            id,
+                            &CheckPrereqsResult {
+                                items: vec![PrereqStatus {
+                                    name: "claude_auth".into(),
+                                    ok: true,
+                                    detail: "logged in".into(),
+                                    fix_hint: None,
+                                }],
+                            },
+                        ),
+                        Request::WorkspaceList {} => {
+                            let listed = workspace(if stopped {
+                                WorkspaceState::Error(SENTENCE.to_owned())
+                            } else {
+                                WorkspaceState::Ready
+                            });
+                            if !stopped {
+                                stopped = true;
+                                after.push(ServerMessage::event(
+                                    Some(WorkspaceId(WORKSPACE.to_owned())),
+                                    Event::DaemonLog {
+                                        level: LogLevel::Warn,
+                                        message: format!("{SENTENCE}\n{DIFF}"),
+                                        host: None,
+                                    },
+                                ));
+                                after.push(ServerMessage::event(
+                                    Some(WorkspaceId(WORKSPACE.to_owned())),
+                                    Event::WorkspaceStateChanged {
+                                        info: Box::new(workspace(WorkspaceState::Error(
+                                            SENTENCE.to_owned(),
+                                        ))),
+                                    },
+                                ));
+                            }
+                            ServerMessage::ok(
+                                id,
+                                &WorkspaceListResult {
+                                    workspaces: vec![listed],
+                                },
+                            )
+                        }
+                        Request::WorkspaceGet(_) => {
+                            ServerMessage::ok(id, &workspace(WorkspaceState::Ready))
+                        }
+                        Request::FsListDir(_) => {
+                            ServerMessage::ok(id, &ListDirResult { entries: vec![] })
+                        }
+                        Request::FsWatch(_) => ServerMessage::ok(id, &Empty {}),
+                        Request::WorkspaceChanges(_) => {
+                            ServerMessage::ok(id, &ChangesResult { files: vec![] })
+                        }
+                        Request::WorkspaceStatus(_) => {
+                            ServerMessage::ok(id, &WorkspaceStatusResult { entries: vec![] })
+                        }
+                        Request::RepoDetectRunConfigs(_) => ServerMessage::ok(
+                            id,
+                            &DetectRunConfigsResult {
+                                configs: vec![],
+                                network_allow: vec![],
+                                warnings: vec![],
+                            },
+                        ),
+                        Request::RunList(_) => {
+                            ServerMessage::ok(id, &RunListResult { runs: vec![] })
+                        }
+                        other => ServerMessage::err(
+                            id,
+                            RpcError::internal(format!("not implemented: {}", other.method_name())),
+                        ),
+                    };
+                    if w.write_all(codec::encode(&reply).as_bytes()).await.is_err() {
+                        break;
+                    }
+                    if !after.is_empty() {
+                        // After the list has been applied: the events would
+                        // otherwise reach a model that has no tab for them yet,
+                        // which is a case the model tests cover and this run is
+                        // not about.
+                        tokio::time::sleep(Duration::from_millis(1_500)).await;
+                    }
+                    for message in after {
+                        let _ = w.write_all(codec::encode(&message).as_bytes()).await;
+                    }
+                }
+            }
+        });
+
+        (addr, journal)
+    }
+
+    /// No agent: the banner this run is about belongs to the workspace.
+    fn workspace(state: WorkspaceState) -> WorkspaceInfo {
+        WorkspaceInfo {
+            kind: WorkspaceKind::InPlace,
+            worktree_path: "/smoke/repo".to_owned(),
+            branch: "main".to_owned(),
+            ..super::workspace(WORKSPACE, NAME, state, &[])
+        }
+    }
+}

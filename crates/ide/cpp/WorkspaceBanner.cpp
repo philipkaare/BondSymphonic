@@ -183,16 +183,27 @@ void WorkspaceBanner::setInPlace(bool inPlace) {
                                  "asking"));
 }
 
-void WorkspaceBanner::showWorkspaceProblem(const QString& title, const QString& detail) {
+void WorkspaceBanner::showWorkspaceProblem(const QString& title, const QString& detail,
+                                           const QString& whatChanged) {
+    const bool same = m_problem && m_problemTitle == title && m_problemDetail == detail &&
+                      m_problemChanged == whatChanged;
     m_problemTitle = title;
     m_problemDetail = detail;
+    m_problemChanged = whatChanged;
     m_problem = true;
     render();
+    if (!same) {
+        // News comes folded, as a failure does. The same problem said again --
+        // which the window does on every model change, and on every Retry --
+        // leaves a disclosure the user opened where they put it.
+        setExpanded(false);
+    }
 }
 
 void WorkspaceBanner::clearWorkspaceProblem() {
     m_problemTitle.clear();
     m_problemDetail.clear();
+    m_problemChanged.clear();
     m_problem = false;
     m_retrying = false;
     render();
@@ -212,11 +223,21 @@ void WorkspaceBanner::render() {
     m_title->setToolTip(title);
     m_detail->setText(detail);
     m_detail->setVisible(!detail.isEmpty());
-    m_stderr->setPlainText(m_problem ? QString() : m_errorStderr);
-    m_disclose->setVisible(!m_problem && !m_errorStderr.isEmpty());
-    if (m_problem) {
+    // Whichever layer is on top owns the disclosure: a git error's stderr, or
+    // the explanation the daemon sent with a workspace problem. A workspace
+    // stopped because its protected git files changed is told in one sentence
+    // in the strip, and the diff that says what changed is a wall the user
+    // opens when they have decided to read it.
+    const QString folded = m_problem ? m_problemChanged : m_errorStderr;
+    m_stderr->setPlainText(folded);
+    m_disclose->setVisible(!folded.isEmpty());
+    m_disclose->setToolTip(m_problem
+                               ? QStringLiteral("Show what changed in this repository's git files")
+                               : QStringLiteral("Show what git printed"));
+    if (folded.isEmpty()) {
         m_stderr->hide();
     }
+    m_disclose->setText(discloseLabel(m_stderr->isVisible()));
     // The agent's Restart needs a sandbox to restart it in, so a workspace that
     // cannot run offers the sandbox's Retry instead. The offer itself is kept
     // and comes back with the sandbox.
@@ -274,7 +295,14 @@ void WorkspaceBanner::setExpanded(bool expanded) {
         m_stderr->setFixedHeight(kStderrRows * metrics.lineSpacing() +
                                  2 * static_cast<int>(m_stderr->frameWidth()));
     }
-    m_disclose->setText(arrow(open) + QStringLiteral(" Details"));
+    m_disclose->setText(discloseLabel(open));
+}
+
+QString WorkspaceBanner::discloseLabel(bool open) const {
+    // Named for what is behind it: "Details" is a git command's output, and a
+    // workspace problem's is the repository's own git files as they were and as
+    // they are now.
+    return arrow(open) + (m_problem ? QStringLiteral(" What changed") : QStringLiteral(" Details"));
 }
 
 // The offscreen widget checks. See the note in `EditorArea.cpp`; `build.rs`
@@ -480,6 +508,68 @@ extern "C" std::int32_t bs_widget_test_banner_says_close_for_an_in_place_workspa
     banner->setInPlace(false);
     if (remove->text() != QStringLiteral("Destroy workspace") + ellipsis) {
         return 4;
+    }
+    return 0;
+}
+
+/// A workspace problem the daemon explained: the sentence is in the strip, and
+/// the lines under it -- the diff of the repository's git files that the error
+/// tells the user to check -- are one click away and nowhere else.
+extern "C" std::int32_t bs_widget_test_banner_shows_what_the_daemon_said_changed() {
+    QWidget host;
+    auto* banner = new WorkspaceBanner(&host);
+    auto* disclose =
+        banner->findChild<QToolButton*>(QStringLiteral("WorkspaceBannerDetailsButton"));
+    auto* box = banner->findChild<QPlainTextEdit*>(QStringLiteral("WorkspaceBannerStderr"));
+    auto* detail = banner->findChild<QLabel*>(QStringLiteral("WorkspaceBannerDetail"));
+    if (disclose == nullptr || box == nullptr || detail == nullptr) {
+        return 1;
+    }
+    const QString reason =
+        QStringLiteral("Git files this workspace protects were replaced while the agent was "
+                       "running (.git/config), so its sandbox was stopped.");
+    const QString diff = QStringLiteral("--- .git/config\n+++ .git/config\n+\tfsmonitor = ./x.sh\n");
+
+    // A problem with nothing behind it offers nothing to open.
+    banner->showWorkspaceProblem(QStringLiteral("This workspace could not be started"), reason);
+    if (!disclose->isHidden() || !box->isHidden()) {
+        return 2;
+    }
+
+    banner->showWorkspaceProblem(QStringLiteral("This workspace could not be started"), reason,
+                                 diff);
+    if (disclose->isHidden() || detail->text() != reason) {
+        return 3;
+    }
+    // Folded, and named for what is behind it rather than for a git command's
+    // output.
+    if (!box->isHidden() || !disclose->text().contains(QLatin1String("What changed"))) {
+        return 4;
+    }
+    disclose->click();
+    if (box->isHidden() || box->toPlainText() != diff) {
+        return 5;
+    }
+    // The same problem again -- which the window says on every model change --
+    // leaves it open.
+    banner->showWorkspaceProblem(QStringLiteral("This workspace could not be started"), reason,
+                                 diff);
+    if (box->isHidden()) {
+        return 6;
+    }
+    // A different reason is news and comes folded.
+    banner->showWorkspaceProblem(QStringLiteral("This workspace could not be started"),
+                                 QStringLiteral("bwrap: permission denied"));
+    if (!box->isHidden() || !disclose->isHidden()) {
+        return 7;
+    }
+
+    // And the layer underneath keeps its own word for its own text.
+    banner->showError(QStringLiteral("Merge failed"), QStringLiteral("conflict"),
+                      QStringLiteral("fatal: not possible"));
+    banner->clearWorkspaceProblem();
+    if (disclose->isHidden() || !disclose->text().contains(QLatin1String("Details"))) {
+        return 8;
     }
     return 0;
 }

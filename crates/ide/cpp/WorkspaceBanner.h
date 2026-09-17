@@ -55,10 +55,19 @@ public:
     /// dismissing would leave a pane that can do nothing, and restarting an
     /// agent needs a sandbox to restart it in.
     ///
+    /// `whatChanged` is the longer explanation the daemon sent with the reason,
+    /// or empty. It goes behind the same disclosure a git error's stderr uses,
+    /// because it is a diff of the repository's git files and the strip is one
+    /// sentence wide; the button then reads "What changed" instead of
+    /// "Details". A problem whose three strings are the ones already showing
+    /// changes nothing, so a disclosure the user has opened stays open across
+    /// a Retry.
+    ///
     /// A failure raised while this is up is kept and shown again once
     /// [`clearWorkspaceProblem`] runs, so a merge that failed just before the
     /// sandbox died is not lost to it.
-    void showWorkspaceProblem(const QString& title, const QString& detail);
+    void showWorkspaceProblem(const QString& title, const QString& detail,
+                              const QString& whatChanged = QString());
 
     /// Leaves that state: the banner goes back to the failure it was showing
     /// before, or hides when there was none.
@@ -97,6 +106,10 @@ private:
     /// Shows or hides the stderr box and puts the right arrow on the button.
     void setExpanded(bool expanded);
 
+    /// The disclosure button's text for the layer that is on top, with the
+    /// arrow for `open` in front of it.
+    QString discloseLabel(bool open) const;
+
     /// Fills the labels and buttons in from whichever of the two layers is on
     /// top -- the workspace problem, or the latest failure -- and shows or
     /// hides the banner to match.
@@ -125,9 +138,11 @@ private:
     QString m_errorStderr;
     bool m_error = false;
     bool m_restartOffered = false;
-    /// The workspace problem, when there is one.
+    /// The workspace problem, when there is one, and what the daemon sent to
+    /// explain it -- the problem layer's answer to `m_errorStderr`.
     QString m_problemTitle;
     QString m_problemDetail;
+    QString m_problemChanged;
     bool m_problem = false;
     bool m_retrying = false;
     /// Whether [`applyWash`] is already running. Installing a palette raises

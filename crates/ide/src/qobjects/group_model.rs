@@ -218,6 +218,20 @@ pub mod qobject {
             reason: QString,
         ) -> bool;
 
+        /// Records a warning the daemon sent about `workspace_id`, whose first
+        /// line is a sentence and whose remaining lines explain it. False for a
+        /// message with nothing under its first line, which is kept nowhere.
+        ///
+        /// The workspace need not have a tab: a warning is remembered by id and
+        /// put on the banner when the state it explains arrives, whichever of
+        /// the two the daemon sends first.
+        #[qinvokable]
+        fn note_workspace_warning(
+            self: Pin<&mut GroupModel>,
+            workspace_id: QString,
+            message: QString,
+        ) -> bool;
+
         /// Whether `workspace_id` is a Claude tab whose agent is missing or has
         /// ended, which is what a successful Retry starts again. False for an
         /// unknown workspace.
@@ -910,6 +924,23 @@ impl qobject::GroupModel {
             .rust_mut()
             .workspaces
             .note_restart_failed(&id, &reason.to_string());
+        if noted {
+            self.publish();
+        }
+        noted
+    }
+
+    pub fn note_workspace_warning(
+        mut self: Pin<&mut Self>,
+        workspace_id: QString,
+        message: QString,
+    ) -> bool {
+        let id = WorkspaceId(workspace_id.to_string());
+        let noted = self
+            .as_mut()
+            .rust_mut()
+            .workspaces
+            .note_workspace_warning(&id, &message.to_string());
         if noted {
             self.publish();
         }

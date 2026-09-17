@@ -314,10 +314,34 @@ pub struct AgentTab {
     pub workspace_problem: Option<WorkspaceProblem>,
 }
 
-/// What a workspace that cannot run says about itself: the banner's two lines.
+/// What a workspace that cannot run says about itself: the banner's two lines,
+/// and the longer explanation behind them when the daemon sent one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceProblem {
     pub title: String,
+    pub detail: String,
+    /// The lines the daemon sent under `detail`, or empty. The banner puts
+    /// them behind a "What changed" disclosure rather than in the strip: this
+    /// is a diff of the repository's git files, and it is a wall.
+    ///
+    /// Filled in by [`Workspaces::apply_note`] from what the daemon said about
+    /// the workspace, not by [`workspace_problem_for`], which derives the two
+    /// lines from the state alone.
+    #[serde(default)]
+    pub what_changed: String,
+}
+
+/// A warning the daemon sent about one workspace: its first line, and the
+/// lines under it.
+///
+/// The daemon announces a stopped in-place sandbox twice -- as a `daemon.log`
+/// warning carrying the sentence and a diff of what changed in the
+/// repository's git files, and then as the workspace's own `Error` state,
+/// which carries the sentence alone. This is the first half, kept until the
+/// second arrives so the banner can show both.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceNote {
+    pub sentence: String,
     pub detail: String,
 }
 
@@ -342,6 +366,7 @@ pub fn workspace_problem_for(
     match state {
         WorkspaceState::SandboxDown => Some(WorkspaceProblem {
             title: "The sandbox for this workspace is not running".to_owned(),
+            what_changed: String::new(),
             detail: match kind {
                 WorkspaceKind::Worktree => {
                     "It stopped unexpectedly. Retry starts it again; the worktree is kept."
@@ -355,6 +380,7 @@ pub fn workspace_problem_for(
         WorkspaceState::Error(reason) => Some(WorkspaceProblem {
             title: "This workspace could not be started".to_owned(),
             detail: reason.clone(),
+            what_changed: String::new(),
         }),
         WorkspaceState::Ready | WorkspaceState::Creating | WorkspaceState::Destroying => None,
     }
@@ -556,6 +582,16 @@ pub struct Workspaces {
     /// number already in use, which is what makes a defaulted 0 safe.
     #[serde(default)]
     next_group_id: usize,
+    /// The last multi-line warning the daemon sent about each workspace, by
+    /// workspace id. See [`WorkspaceNote`] and [`Workspaces::note_workspace_warning`].
+    ///
+    /// Kept here rather than on the tab because the warning arrives before the
+    /// state it explains, and can arrive for a workspace that has no tab yet:
+    /// a workspace whose sandbox was stopped while the user was looking at
+    /// another group still has to be able to say why when they open it.
+    /// Ordered, so `state_json` is the same string for the same state.
+    #[serde(default)]
+    workspace_notes: std::collections::BTreeMap<WorkspaceId, WorkspaceNote>,
 }
 
 impl Workspaces {
@@ -593,6 +629,7 @@ impl Workspaces {
             active_group: 0,
             active_tab: 0,
             next_group_id: 0,
+            ..Workspaces::default()
         };
         for persisted in groups {
             let mut tabs = Vec::new();
@@ -712,6 +749,7 @@ impl Workspaces {
             active_group: 0,
             active_tab: 0,
             next_group_id: 1,
+            ..Workspaces::default()
         }
     }
 
@@ -802,6 +840,9 @@ impl Workspaces {
         let Some((g, t)) = self.find(id) else {
             return false;
         };
+        // Whatever the daemon last said about it goes with the tab: the
+        // workspace is gone, and an id the daemon reuses is a different one.
+        self.workspace_notes.remove(id);
         let was_active = self.active_group == g && self.active_tab == t;
         self.groups[g].tabs.remove(t);
         if was_active {
@@ -975,6 +1016,9 @@ impl Workspaces {
         // Same reason, and the Changes toolbar has to name it in every
         // confirmation it puts up.
         tab.base_branch = info.base_branch.clone();
+        // The problem above was derived from the state alone; this is where a
+        // warning the daemon sent about it is put back on.
+        self.apply_note(&info.id);
         Some((g, t))
     }
 
@@ -1010,7 +1054,69 @@ impl Workspaces {
         tab.status = TabStatus::from_workspace_state(&state);
         tab.detail = state_detail(&state);
         tab.workspace_problem = workspace_problem(&state);
+        self.apply_note(id);
         true
+    }
+
+    /// Remembers a warning the daemon sent about one workspace, so that the
+    /// sentence the banner ends up showing can be explained by the lines that
+    /// came with it. False when `message` is a single line, which is every
+    /// warning that explains nothing and is not worth keeping.
+    ///
+    /// Recognised by shape and not by wording: a warning whose first line is
+    /// the sentence the workspace's `Error` state carries is a warning about
+    /// that state, whatever the daemon calls it, and [`Workspaces::apply_note`]
+    /// pairs the two by comparing them. Nothing else here knows what a
+    /// protection breach is.
+    pub fn note_workspace_warning(&mut self, id: &WorkspaceId, message: &str) -> bool {
+        let Some((sentence, detail)) = message.split_once('\n') else {
+            return false;
+        };
+        if detail.trim().is_empty() {
+            return false;
+        }
+        self.workspace_notes.insert(
+            id.clone(),
+            WorkspaceNote {
+                sentence: sentence.trim_end().to_owned(),
+                detail: detail.to_owned(),
+            },
+        );
+        // The state it explains may already be here: the two arrive as separate
+        // events, and only the daemon's order decides which is first.
+        self.apply_note(id);
+        true
+    }
+
+    /// Puts the workspace's remembered warning on its problem, or takes it off
+    /// again when the two no longer describe the same thing.
+    ///
+    /// The detail only shows under the sentence it came with. A workspace that
+    /// failed to start for some other reason afterwards must not be explained
+    /// by the diff of the breach before it.
+    fn apply_note(&mut self, id: &WorkspaceId) {
+        let detail = self
+            .workspace_notes
+            .get(id)
+            .map(|note| (note.sentence.clone(), note.detail.clone()));
+        let Some((g, t)) = self.find(id) else {
+            return;
+        };
+        let Some(problem) = self.groups[g].tabs[t].workspace_problem.as_mut() else {
+            return;
+        };
+        problem.what_changed = match detail {
+            Some((sentence, detail)) if sentence == problem.detail => detail,
+            _ => String::new(),
+        };
+    }
+
+    /// [`Workspaces::apply_note`] for every workspace a warning is remembered
+    /// for, after a rebuild that replaced the tabs those notes belong to.
+    fn apply_notes(&mut self) {
+        for id in self.workspace_notes.keys().cloned().collect::<Vec<_>>() {
+            self.apply_note(&id);
+        }
     }
 
     /// Takes that mark off again, handing the badge back to whatever the
@@ -1270,6 +1376,10 @@ impl Workspaces {
         // Last, so it sees the tabs this call created and none of the ones it
         // dropped.
         self.resync_agents(daemon_list);
+        // Same reason: a tab this call built from the daemon's list has the
+        // problem its state describes and nothing of what the daemon said
+        // about it earlier in this session. A reconnect goes through here.
+        self.apply_notes();
     }
 
     /// Re-derives what every tab says about its agent from the daemon's own
@@ -1506,6 +1616,7 @@ mod tests {
             active_group: 0,
             active_tab: 0,
             next_group_id: 1,
+            ..Workspaces::default()
         };
         assert!(model.remove_group("Only"));
         assert_eq!(model.groups.len(), 1);

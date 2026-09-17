@@ -152,7 +152,7 @@ private:
     /// because a merge can start while the question is on screen.
     bool isWorkspaceBusy(const QString& workspaceId) const;
     /// Says so, which is what a destroy does when it finds one.
-    void sayWorkspaceIsBusy();
+    void sayWorkspaceIsBusy(const QString& workspaceId);
     /// A `system.check_prereqs` that did not answer. Logged, never shown.
     void onPrereqsCheckFailed(const QString& message);
     /// A `repo.inspect` that did not answer, naming the path. Logged: the New
@@ -330,6 +330,9 @@ private:
     /// Test seam: presses the named button on `workspaceId`'s banner once, if
     /// `BS_MENU_TEST` asked for `step`. See [`announceMenuTest`].
     void pressBannerForTest(const QString& workspaceId, const char* step, const char* button);
+    /// Test seam: opens `workspaceId`'s banner disclosure once, if
+    /// `BS_MENU_TEST` asked for `sandbox-what-changed`, and says what it reveals.
+    void revealBannerDetailForTest(const QString& workspaceId);
     /// What each workspace's banner is showing as its problem, title and
     /// detail joined, so a sync only touches the ones that changed.
     QHash<QString, QString> m_workspaceProblems;

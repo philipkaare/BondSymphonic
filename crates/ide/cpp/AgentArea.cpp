@@ -102,18 +102,23 @@ QWidget* AgentArea::makePage(const QString& workspaceId, QWidget* body) {
 }
 
 void AgentArea::setWorkspaceProblem(const QString& workspaceId, const QString& title,
-                                    const QString& detail, bool inPlace) {
+                                    const QString& detail, bool inPlace,
+                                    const QString& whatChanged) {
     if (workspaceId.isEmpty()) {
         return;
     }
     const auto found = m_problems.constFind(workspaceId);
-    if (found != m_problems.constEnd() && found->title == title && found->detail == detail &&
-        found->inPlace == inPlace) {
+    const bool sameReason = found != m_problems.constEnd() && found->title == title &&
+                            found->detail == detail && found->inPlace == inPlace;
+    if (sameReason && found->whatChanged == whatChanged) {
         return;
     }
     // A new reason is the answer to whatever Retry was in flight, so the
-    // button is pressable again.
-    m_problems.insert(workspaceId, { title, detail, false, inPlace });
+    // button is pressable again. The same reason with the daemon's explanation
+    // now attached -- the two arrive as separate events -- is not an answer to
+    // anything, and must not re-enable a Retry that is still out.
+    m_problems.insert(workspaceId,
+                      { title, detail, sameReason && found->retrying, inPlace, whatChanged });
     applyWorkspaceProblem(workspaceId);
 }
 
@@ -148,7 +153,7 @@ void AgentArea::applyWorkspaceProblem(const QString& workspaceId) {
     }
     if (WorkspaceBanner* banner = m_banners.value(workspaceId)) {
         banner->setInPlace(found->inPlace);
-        banner->showWorkspaceProblem(found->title, found->detail);
+        banner->showWorkspaceProblem(found->title, found->detail, found->whatChanged);
         banner->setRetrying(found->retrying);
     }
     if (TranscriptView* view = m_transcripts.value(workspaceId)) {

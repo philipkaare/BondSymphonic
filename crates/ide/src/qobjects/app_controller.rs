@@ -523,6 +523,19 @@ pub mod qobject {
         #[qsignal]
         fn output_dropped(self: Pin<&mut AppController>, count: i64);
 
+        /// The daemon warned about one workspace and said more than one line
+        /// about it: `message` is the sentence and, under it, the detail.
+        ///
+        /// Emitted for the shape rather than for any particular warning. The
+        /// daemon stops an in-place sandbox whose protected git files were
+        /// replaced with exactly this pair -- the sentence the workspace's
+        /// `Error` state will carry, and a diff of what changed -- and the
+        /// model keeps the detail against the workspace so its banner can
+        /// offer it. A one-line warning carries nothing to keep and is only
+        /// logged.
+        #[qsignal]
+        fn workspace_warned(self: Pin<&mut AppController>, workspace_id: QString, message: QString);
+
         /// An asynchronous operation failed. `op` is the daemon method name.
         ///
         /// The catch-all, and the one a consumer should reach for last. A
@@ -1699,7 +1712,28 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
                     )
                 });
             }
-            Event::DaemonLog { level, message, .. } => tracing::info!(?level, "{message}"),
+            Event::DaemonLog { level, message, .. } => {
+                // At the daemon's own level, not always at `info`: a warning
+                // the daemon thought worth raising is a warning here too, and a
+                // console filtered to warnings used to show none of them.
+                match level {
+                    LogLevel::Error => tracing::error!("{message}"),
+                    LogLevel::Warn => tracing::warn!("{message}"),
+                    LogLevel::Info => tracing::info!("{message}"),
+                    LogLevel::Debug => tracing::debug!("{message}"),
+                }
+                // A warning about one workspace with more than one line in it
+                // is kept by the model against that workspace; see
+                // `workspace_warned`. Recognised by its shape, so nothing here
+                // has to know which warning it is.
+                if level == LogLevel::Warn && message.contains('\n') {
+                    if let Some(id) = ws.map(|id| id.to_string()) {
+                        let _ = qt.queue(move |q| {
+                            q.workspace_warned(QString::from(&id), QString::from(&message))
+                        });
+                    }
+                }
+            }
             _ => {}
         }
     }

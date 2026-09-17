@@ -47,6 +47,7 @@
 #include <QStatusBar>
 #include <QTabWidget>
 #include <QTimer>
+#include <QToolButton>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -873,6 +874,17 @@ void MainWindow::connectController() {
                          // agents actually start.
                          startAgentsThatHaveNone();
                      });
+    // What the daemon said about a workspace, kept against it by the model so
+    // the banner can show it under the reason. Before the state it explains, as
+    // the daemon sends it -- and after it, if the daemon ever sends them the
+    // other way round: the model pairs the two rather than assuming an order.
+    QObject::connect(m_controller, &AppController::workspaceWarned, this,
+                     [this](const QString& workspaceId, const QString& message) {
+                         // The model republishes when it keeps one, and
+                         // `syncWorkspaceProblems` runs on that like any other
+                         // model change.
+                         m_groupModel->noteWorkspaceWarning(workspaceId, message);
+                     });
     // Before `onWorkspaceDestroyed`, which takes the tab out and so provokes
     // the active-tab change that points the Run panel at whatever survived: the
     // dead workspace's runs, logs and blocked hosts have to be gone by then.
@@ -1163,7 +1175,7 @@ void MainWindow::onDestroyRequested(const QString& workspaceId, const QString& w
         return;
     }
     if (isWorkspaceBusy(workspaceId)) {
-        sayWorkspaceIsBusy();
+        sayWorkspaceIsBusy(workspaceId);
         return;
     }
     if (m_groupModel->workspaceInPlace(workspaceId)) {
@@ -1187,7 +1199,7 @@ void MainWindow::onDestroyRequested(const QString& workspaceId, const QString& w
             return;
         }
         if (isWorkspaceBusy(workspaceId)) {
-            sayWorkspaceIsBusy();
+            sayWorkspaceIsBusy(workspaceId);
             return;
         }
         m_controller->destroyWorkspace(workspaceId, false);
@@ -1225,7 +1237,7 @@ void MainWindow::onDestroyRequested(const QString& workspaceId, const QString& w
     // defect one layer up that the Changes toolbar was fixed for: the check
     // before a modal says nothing about the moment after it.
     if (isWorkspaceBusy(workspaceId)) {
-        sayWorkspaceIsBusy();
+        sayWorkspaceIsBusy(workspaceId);
         return;
     }
     m_controller->destroyWorkspace(workspaceId, force->isChecked());
@@ -1276,7 +1288,7 @@ void MainWindow::onDestroyRefused(const QString& workspaceId, bool dirty, bool u
         return;
     }
     if (isWorkspaceBusy(workspaceId)) {
-        sayWorkspaceIsBusy();
+        sayWorkspaceIsBusy(workspaceId);
         return;
     }
     m_controller->destroyWorkspace(workspaceId, true);
@@ -1306,7 +1318,18 @@ bool MainWindow::isWorkspaceBusy(const QString& workspaceId) const {
     return m_controller->isWorkspaceBusy(workspaceId);
 }
 
-void MainWindow::sayWorkspaceIsBusy() {
+void MainWindow::sayWorkspaceIsBusy(const QString& workspaceId) {
+    // An in-place workspace is offered none of the git actions, so the only
+    // thing that can be running on it is the Close the user is asking for a
+    // second time -- and neither the title nor the list belongs over a
+    // workspace whose files are never touched.
+    if (m_groupModel->workspaceInPlace(workspaceId)) {
+        QMessageBox::information(
+            this, QStringLiteral("Close workspace"),
+            QStringLiteral("This workspace is already closing. Wait for it to finish, then try "
+                           "again."));
+        return;
+    }
     QMessageBox::information(
         this, QStringLiteral("Destroy workspace"),
         QStringLiteral("This workspace has a merge, pull request or discard running. "
@@ -1452,15 +1475,21 @@ void MainWindow::syncWorkspaceProblems() {
             }
             const QString title = problem.value("title").toString();
             const QString detail = problem.value("detail").toString();
+            // What the daemon said to explain the reason, when it said
+            // anything: the banner offers it behind "What changed". It can
+            // arrive after the problem itself, so it is part of what makes this
+            // news rather than a repeat.
+            const QString whatChanged = problem.value("what_changed").toString();
             const bool inPlace = workspacelabel::inPlace(tab);
-            const QString shown = title + QLatin1Char('\n') + detail +
+            const QString shown = title + QLatin1Char('\n') + detail + QLatin1Char('\n') +
+                                  whatChanged +
                                   (inPlace ? QStringLiteral("\nin place") : QString());
             const auto known = m_workspaceProblems.constFind(workspaceId);
             if (known != m_workspaceProblems.constEnd() && *known == shown) {
                 continue;
             }
             m_workspaceProblems.insert(workspaceId, shown);
-            m_agentArea->setWorkspaceProblem(workspaceId, title, detail, inPlace);
+            m_agentArea->setWorkspaceProblem(workspaceId, title, detail, inPlace, whatChanged);
             // An agent that stopped just before its sandbox was reported down
             // stopped because of it. The problem says so and its Retry brings
             // the agent back, so "The agent stopped." and the red tab it
@@ -1472,6 +1501,7 @@ void MainWindow::syncWorkspaceProblems() {
             }
             pressBannerForTest(workspaceId, "sandbox-retry", "WorkspaceBannerRetryButton");
             pressBannerForTest(workspaceId, "sandbox-remove", "WorkspaceBannerRemoveButton");
+            revealBannerDetailForTest(workspaceId);
         }
     }
     // A workspace that went away took its pane, and its banner, with it.
@@ -1507,6 +1537,40 @@ void MainWindow::pressBannerForTest(const QString& workspaceId, const char* step
         }
         m_bannerTestPressed.insert(key);
         target->click();
+    });
+}
+
+void MainWindow::revealBannerDetailForTest(const QString& workspaceId) {
+    const char* const step = "sandbox-what-changed";
+    const QString key = QString::fromLatin1(step) + QLatin1Char(' ') + workspaceId;
+    // Only the workspace the step names, and only once: see `menuTestTarget`
+    // and `pressBannerForTest`, whose shape this follows. The disclosure is a
+    // tool button rather than a push button, which is the only reason this is
+    // not that function.
+    if (workspaceId.isEmpty() || menuTestTarget(step) != workspaceId ||
+        m_bannerTestPressed.contains(key)) {
+        return;
+    }
+    QTimer::singleShot(0, this, [this, workspaceId, key, step] {
+        WorkspaceBanner* banner = m_agentArea->banner(workspaceId);
+        auto* disclose = banner == nullptr
+                             ? nullptr
+                             : banner->findChild<QToolButton*>(
+                                   QStringLiteral("WorkspaceBannerDetailsButton"));
+        auto* box = banner == nullptr ? nullptr
+                                      : banner->findChild<QPlainTextEdit*>(
+                                            QStringLiteral("WorkspaceBannerStderr"));
+        if (disclose == nullptr || box == nullptr || disclose->isHidden() ||
+            m_bannerTestPressed.contains(key)) {
+            return;
+        }
+        m_bannerTestPressed.insert(key);
+        disclose->click();
+        // What the user would now be reading, so the run can assert on the
+        // whole path from the daemon's event to the text on screen rather than
+        // on the model alone.
+        announceMenuTest(step, workspaceId,
+                         box->isHidden() ? QStringLiteral("hidden") : box->toPlainText());
     });
 }
 
