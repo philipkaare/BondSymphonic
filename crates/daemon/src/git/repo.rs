@@ -420,7 +420,7 @@ pub async fn inspect(git: &Git, repo: &Path) -> Result<RepoInfo, RpcError> {
 /// The same lookup [`crate::agents::credentials`] seeds from; it is two lines
 /// rather than a shared import so that the git layer does not depend on the
 /// agent layer for a question about paths.
-fn daemon_home() -> Option<PathBuf> {
+pub(crate) fn daemon_home() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf())
 }
 

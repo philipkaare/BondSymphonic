@@ -1,4 +1,5 @@
 pub mod changes;
+pub mod in_place;
 pub mod lifecycle;
 pub mod registry;
 
@@ -102,6 +103,12 @@ impl DataDirs {
     }
     pub fn run(&self, id: &WorkspaceId) -> PathBuf {
         self.run.join(id.as_str())
+    }
+    /// Which of `.git`'s on-demand directories the daemon created in an
+    /// in-place workspace's checkout, so Close takes back exactly those. Under
+    /// the data root, which no sandbox can write.
+    pub fn in_place_record(&self, id: &WorkspaceId) -> PathBuf {
+        self.root.join("in-place").join(format!("{id}.created"))
     }
     /// Where a merge puts its scratch checkout of the base branch when the
     /// user's own checkout is on some other branch.
