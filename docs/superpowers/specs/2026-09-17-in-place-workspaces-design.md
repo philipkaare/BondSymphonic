@@ -245,9 +245,9 @@ writable. An in-place agent can therefore write the repository's refs and
 objects: it can move a sibling *worktree* workspace's `refs/heads/bs/<name>/work`
 between the user reading its Changes and pressing Merge, rewrite `packed-refs`,
 write loose objects, and add `refs/replace` entries, which change what the
-daemon's diff and the user's `git log -p` display (the daemon does not set
-`GIT_NO_REPLACE_OBJECTS`). This is a residual risk of the design, listed below
-and in the user guide.
+user's own `git log -p` displays -- though no longer what the daemon reads,
+since `Git::command` sets `GIT_NO_REPLACE_OBJECTS=1`. This is a residual risk of
+the design, listed below and in the user guide.
 
 **A read-only bind is not proof against something that runs outside the
 sandbox -- amended during implementation.** The `EBUSY` guarantee of §4.1
@@ -365,15 +365,22 @@ Residual risks, documented in the user guide and not mitigated further:
   and the change shown. What that window allows is the user's to review and
   undo.
 - **The repository's refs and objects.** `.git` is read-write, so an in-place
-  agent can move any branch -- a sibling worktree workspace's included -- rewrite
-  `packed-refs`, write loose objects, and add `refs/replace` entries, which
-  change what the daemon's diff and the user's `git log -p` show. The daemon does
-  not set `GIT_NO_REPLACE_OBJECTS`, and Merge does not pin the commit its Changes
-  view was computed from; both are follow-ups.
-- **`core.hooksPath` the agent can write** (§4.3). Hooks inside the working tree
-  are ordinary files the agent can edit, and the user's git runs them. So is a
-  hooks directory inside the read-write part of `.git`, which the dialog does
-  not warn about today (§4.3, "Open").
+  agent can move any branch -- a sibling worktree workspace's included, between
+  the user reading its Changes and pressing Merge -- rewrite `packed-refs`,
+  write loose objects, and add `refs/replace` entries. The replace entries no
+  longer reach the daemon: `Git::command` sets `GIT_NO_REPLACE_OBJECTS=1`, so
+  every daemon-side git reports what is actually recorded. They still reach the
+  user's own `git log -p`. That setting has a cost worth knowing: a `git
+  replace` the *user* made is honoured by their git and not by the daemon's, so
+  in a repository that uses replace refs the Changes view and `git log -p` can
+  disagree. Merge does not pin the commit its Changes view was computed from;
+  that is a follow-up and a protocol change.
+- **`core.hooksPath` the agent can write** (§4.3). Hooks inside the working
+  tree, and equally a hooks directory inside the read-write part of `.git`, are
+  ordinary files the agent can edit. The user's next git command runs them, and
+  so does the push behind Create PR on another workspace of the repository,
+  which keeps the repository's hooks on purpose (daemon design §5.5). The
+  dialog warns about both.
 - **Programs the user's own config names that live in the tree.** A
   `filter.*.clean`, a `diff.*.textconv` or a `core.fsmonitor` pointing at a
   script inside the working tree is a script the agent can rewrite, and
@@ -420,20 +427,24 @@ Residual risks, documented in the user guide and not mitigated further:
 
 ### 4.3 `core.hooksPath` warning
 
-`repo.inspect` resolves `git config --get core.hooksPath` (relative to the root, `~/`
-expanded, `..` taken out) and reports it, relative to the root, in
-`hooks_path_in_tree` when it lies inside the working tree but not inside `.git`. The New
-Agent dialog shows a warning under the in-place choice when it is set (§5.1), and
-the sentence names the path rather than saying where it is. The daemon does not
-refuse such a create.
+`repo.inspect` resolves `git config --get core.hooksPath` (relative to the root,
+`~/` expanded, `..` taken out) and reports it, relative to the root with forward
+slashes, in `hooks_path_in_tree` when it names **hooks an in-place agent could
+write**. That is the test, not "inside the working tree": such an agent has the
+whole repository read-write, `.git` included, and the only paths out of its
+reach are the entries §4.1 binds read-only — `.git/hooks`, `.git/info`,
+`.git/modules`, `.git/worktrees`, `.git/remotes`, `.git/branches` — and what is
+inside them. So `.husky/_` is reported, and so is `.git/my-hooks`, and so is
+`.git/hooks/../my-hooks`, which normalises to it before the check. The root
+itself is `"."`, a path outside the root is not reported, and the field's name
+is the one it was born with.
 
-**Open:** a `core.hooksPath` pointing inside the *read-write* part of `.git`
-(`.git/my-hooks`, or `.git/hooks/../my-hooks`, which normalises to it) is a
-directory the agent can fill just as well, and is not reported today, because
-the resolution treats all of `.git` as unwritable. Only the entries §4.1 binds
-are. The residual-risk list and the user guide say so; the dialog needs no
-change when the field is corrected, which is why its sentence no longer claims
-the working tree.
+The New Agent dialog shows a warning under the in-place choice when it is set
+(§5.1). It names the path rather than saying where it is, and it names both ways
+those hooks run outside the sandbox: the user's own next git command here, and
+the push behind **Create PR** on another workspace of the same repository, which
+runs `pre-push` deliberately (daemon design §5.5 — it is how git-lfs uploads
+what a push points at). The daemon does not refuse such a create.
 
 ### 4.4 Noop backend
 
@@ -453,7 +464,8 @@ isolates nothing.
     changes are not isolated on a branch of their own."
   - When `hooks_path_in_tree` is set, a warning says: "This repository runs git
     hooks from `<path>`, which the agent can change. They run outside the
-    sandbox the next time you use git here." The sentence names the path rather
+    sandbox: the next time you use git here, and when Create PR pushes for
+    another workspace of this repository." The sentence names the path rather
     than saying where it is, so that it holds for every path the field can
     report (§4.3).
   - For a repository on a Windows drive -- `C:\…` as the dialog holds it, or

@@ -702,12 +702,18 @@ void NewAgentDialog::updateModeState() {
     // path in this repository the agent can write, and a `core.hooksPath`
     // pointing at a directory it makes inside the read-write part of `.git` is
     // one of them. The path itself says where it is.
+    //
+    // The second sentence names both ways they run. "The next time you use git
+    // here" was not the whole of it: Create PR on another workspace of this
+    // repository pushes from the checkout, and that push runs `pre-push` --
+    // deliberately, because that is how git-lfs uploads what it points at.
     m_hooksWarning->setText(
         m_hooksPath.isEmpty()
             ? QString()
             : QStringLiteral("This repository runs git hooks from %1, which the agent can "
-                             "change. They run outside the sandbox the next time you use git "
-                             "here.")
+                             "change. They run outside the sandbox: the next time you use git "
+                             "here, and when Create PR pushes for another workspace of this "
+                             "repository.")
                   .arg(m_hooksPath));
     m_form->setRowVisible(m_hooksWarning, inPlace && !m_hooksPath.isEmpty());
     if (m_inspectPending || m_inspectFailed) {
@@ -1024,7 +1030,9 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_offers_the_checkout_itse
         return 4;
     }
     if (!warning->text().contains(QLatin1String(".husky/_")) ||
-        !warning->text().contains(QLatin1String("outside the sandbox"))) {
+        !warning->text().contains(QLatin1String("outside the sandbox")) ||
+        // Both ways they run outside it, not only the user's own next git.
+        !warning->text().contains(QLatin1String("Create PR"))) {
         return 5;
     }
     // The branch is the checked-out one, shown and not chosen, and not sent.

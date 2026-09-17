@@ -235,10 +235,12 @@ which then simply shows the branch already checked out (or "detached HEAD")
 rather than something you pick, since nothing is switched or created. The help
 text under the choice says why: "The agent edits this folder on its current
 branch. Its changes are not isolated on a branch of their own." If the
-repository runs its git hooks from a directory the agent can write — from
-inside the working tree, the way husky does — a warning names the path: "This
-repository runs git hooks from \<path\>, which the agent can change. They run
-outside the sandbox the next time you use git here." For a folder on a Windows
+repository runs its git hooks from a directory the agent can write — inside the
+working tree, the way husky does, or inside `.git` but outside the entries
+BondSymphonic protects — a warning names the path: "This repository runs git
+hooks from \<path\>, which the agent can change. They run outside the sandbox:
+the next time you use git here, and when Create PR pushes for another workspace
+of this repository." For a folder on a Windows
 drive (`C:\…`, which the distro sees as `/mnt/c/…`), a second note says how the
 protection works there: "This folder is on a Windows drive. There the sandbox
 cannot make .git read-only, so a change to it is caught within a moment
@@ -319,10 +321,11 @@ effect, and what you are being shown is what to undo.
 **What the agent can reach that no bind covers.** `.git` itself is writable, so
 an agent working in the checkout can write the repository's refs and objects:
 it can move *another* workspace's branch (`refs/heads/bs/<name>/work`), rewrite
-`packed-refs`, write loose objects, and add `refs/replace` entries, which
-change what `git log -p` and BondSymphonic's own Changes view display. If you
-run workspaces of both kinds on one repository, the isolation the worktree kind
-gives you holds against its own agent, not against an in-place sibling's.
+`packed-refs`, write loose objects, and add `refs/replace` entries, which change
+what your own `git log -p` displays — BondSymphonic's own git ignores replace
+refs, so its Changes view shows what is really recorded. If you run workspaces
+of both kinds on one repository, the isolation the worktree kind gives you holds
+against its own agent, not against an in-place sibling's.
 
 **What BondSymphonic writes into `.git`.** Before the sandbox starts, the
 daemon writes `.git/commondir` containing a single `.` (git already treats the
@@ -413,18 +416,23 @@ sandbox cannot fully close off:
   above: a write through an aliased name reaches `.git` and is stopped a
   fraction of a second later. What it did in that fraction of a second is
   yours to review and undo.
-- **The repository's refs and objects.** An in-place agent can move any
-  branch, including another workspace's, rewrite `packed-refs` and add
-  `refs/replace` entries, which change what your `git log -p` and
-  BondSymphonic's own Changes view show. Read a sibling workspace's changes and
-  merge them while no in-place agent is running if that matters to you.
+- **The repository's refs and objects.** An in-place agent can move any branch,
+  including another workspace's — between your reading its Changes and pressing
+  Merge — rewrite `packed-refs` and add `refs/replace` entries. Read a sibling
+  workspace's changes and merge them while no in-place agent is running if that
+  matters to you. The replace entries change only what *your* git shows:
+  BondSymphonic's own git ignores them on purpose, so a `git replace` you made
+  yourself is honoured by `git log -p` and not by the Changes view, and in a
+  repository that uses replace refs the two can disagree.
 - **`core.hooksPath` the agent can write.** A repository that points its hooks
-  somewhere inside the tree (husky does this) has ordinary files there the
-  agent can edit like any other, and your own git runs them the next time you
-  use it. The dialog warns about this when it is set (see "Creating an agent
-  workspace" above). The same exposure exists for a hooks directory inside
-  `.git` that is not `.git/hooks` — `.git` itself is writable, and only the
-  entries BondSymphonic binds are not.
+  somewhere inside the tree (husky does this) has ordinary files there the agent
+  can edit like any other, and so does one that points them at a directory
+  inside `.git` that is not `.git/hooks` — `.git` itself is writable, and only
+  the entries BondSymphonic binds are not. Your own git runs them the next time
+  you use it, and so does **Create PR…** on a *worktree* workspace of this
+  repository: that push runs `pre-push` deliberately, because that is how
+  git-lfs uploads what a push points at. The dialog warns about both paths and
+  about both ways they run (see "Creating an agent workspace" above).
 - **Programs your own git configuration names, if they live in the tree.** A
   `filter.*.clean`, a `diff.*.textconv` or a `core.fsmonitor` pointing at a
   script inside the working tree is a script the agent can rewrite, and the
