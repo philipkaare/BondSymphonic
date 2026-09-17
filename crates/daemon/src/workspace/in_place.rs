@@ -154,29 +154,6 @@ impl InPlaceLayout {
         ))
     }
 
-    /// Whether git reads `config.worktree` in this repository.
-    pub async fn worktree_config_enabled(&self) -> Result<bool, RpcError> {
-        match self
-            .git()
-            .run(
-                &self.root,
-                &[
-                    "config",
-                    "--local",
-                    "--bool",
-                    "--get",
-                    "extensions.worktreeConfig",
-                ],
-            )
-            .await
-        {
-            Ok(o) => Ok(o.stdout.trim() == "true"),
-            // Exit 1 is "not set", which is off.
-            Err(e) if exit_code(&e) == Some(1) => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Every entry the sandbox gets read-only, with what it must be, in bind
     /// order. `modules` only when it is a real directory: bwrap would otherwise
     /// create it, and an agent that makes one gains nothing an embedded
@@ -243,9 +220,9 @@ impl InPlaceLayout {
     /// [`ON_DEMAND_DIRS`] and `config.worktree` when they are missing, which
     /// git would create itself and which change nothing empty.
     /// `config.worktree` is made and bound whatever `extensions.worktreeConfig`
-    /// says, so `worktree_config` no longer changes anything: git ignores the
-    /// file while the extension is off, but `git sparse-checkout init` turns
-    /// the extension on and keeps whatever an agent left in the file.
+    /// says: git ignores the file while the extension is off, but `git
+    /// sparse-checkout init` turns the extension on and keeps whatever an agent
+    /// left in the file.
     ///
     /// Which of the recordable entries this call is about to create is
     /// appended to `record`, a daemon-owned file outside every sandbox
@@ -254,7 +231,7 @@ impl InPlaceLayout {
     /// before the entries are made, so a failure in between leaves a name
     /// recorded for an entry that may not exist, which Close skips, rather
     /// than an entry nobody remembers making.
-    pub fn prepare(&self, _worktree_config: bool, record: &Path) -> Result<(), RpcError> {
+    pub fn prepare(&self, record: &Path) -> Result<(), RpcError> {
         self.refuse_foreign_entries()?;
         let guard = self.commondir();
         match std::fs::read(&guard) {
@@ -352,8 +329,8 @@ impl InPlaceLayout {
     /// workspaces, whose `config.worktree` the daemon's own status reads;
     /// `remotes` and `branches` because `git fetch <name>` and `git push
     /// <name>` read remote definitions from them. `config.worktree` is bound
-    /// whatever `worktree_config` says; see [`prepare`](Self::prepare).
-    pub fn late_ro_binds(&self, _worktree_config: bool) -> Vec<PathBuf> {
+    /// whatever `extensions.worktreeConfig` says; see [`prepare`](Self::prepare).
+    pub fn late_ro_binds(&self) -> Vec<PathBuf> {
         self.late_entries().into_iter().map(|(p, _)| p).collect()
     }
 

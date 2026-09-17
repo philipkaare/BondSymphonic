@@ -139,23 +139,14 @@ pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
 /// read-write, and what a git outside the sandbox would execute read-only on
 /// top (see [`InPlaceLayout::late_ro_binds`]). No private object directory:
 /// the agent's objects go into the repository's own store.
-pub fn in_place_spec_for(
-    d: &Daemon,
-    ws: &Workspace,
-    layout: &InPlaceLayout,
-    worktree_config: bool,
-) -> SandboxSpec {
+pub fn in_place_spec_for(d: &Daemon, ws: &Workspace, layout: &InPlaceLayout) -> SandboxSpec {
     let same = |p: &PathBuf| (p.clone(), p.clone());
     finish_spec(
         d,
         ws,
         layout.rw_binds().iter().map(same).collect(),
         Vec::new(),
-        layout
-            .late_ro_binds(worktree_config)
-            .iter()
-            .map(same)
-            .collect(),
+        layout.late_ro_binds().iter().map(same).collect(),
         Vec::new(),
     )
 }
@@ -229,9 +220,8 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
             // read-only binds need is put back even if something removed it
             // while the sandbox was down.
             let layout = InPlaceLayout::new(&ws.worktree_path, &d.dirs.no_hooks());
-            let worktree_config = layout.worktree_config_enabled().await?;
-            layout.prepare(worktree_config, &d.dirs.in_place_record(&ws.id))?;
-            in_place_spec_for(d, ws, &layout, worktree_config)
+            layout.prepare(&d.dirs.in_place_record(&ws.id))?;
+            in_place_spec_for(d, ws, &layout)
         }
     };
     // Before the sandbox, not after: the shim inside it connects to this socket

@@ -45,7 +45,7 @@ fn prepare_makes_only_the_documented_entries() {
     let before = git_dir_entries(&repo);
     let l = layout(dir.path(), &repo);
 
-    l.prepare(false, &record(dir.path())).unwrap();
+    l.prepare(&record(dir.path())).unwrap();
 
     let mut added: Vec<String> = git_dir_entries(&repo)
         .into_iter()
@@ -75,7 +75,7 @@ fn prepare_makes_only_the_documented_entries() {
     );
     // Idempotent: a restart prepares the same repository again, and what the
     // first start created is still remembered as the daemon's.
-    l.prepare(false, &record(dir.path())).unwrap();
+    l.prepare(&record(dir.path())).unwrap();
     assert_eq!(
         std::fs::read_to_string(record(dir.path())).unwrap(),
         recorded
@@ -98,13 +98,13 @@ fn prepare_always_creates_config_worktree_and_keeps_its_content() {
     let l = layout(dir.path(), &repo);
     // With the extension off too: `git sparse-checkout init` turns it on
     // later and keeps whatever the file holds by then.
-    l.prepare(false, &record(dir.path())).unwrap();
+    l.prepare(&record(dir.path())).unwrap();
     assert_eq!(std::fs::read(l.config_worktree()).unwrap(), b"");
-    l.prepare(true, &record(dir.path())).unwrap();
+    l.prepare(&record(dir.path())).unwrap();
     assert_eq!(std::fs::read(l.config_worktree()).unwrap(), b"");
     // The user's own file is theirs: never truncated.
     std::fs::write(l.config_worktree(), "[core]\n\tsparseCheckout = false\n").unwrap();
-    l.prepare(true, &record(dir.path())).unwrap();
+    l.prepare(&record(dir.path())).unwrap();
     assert!(std::fs::read_to_string(l.config_worktree())
         .unwrap()
         .contains("sparseCheckout"));
@@ -137,9 +137,7 @@ fn prepare_refuses_protected_entries_that_are_not_what_git_makes() {
         // Dangling: `outside` does not exist.
         std::os::unix::fs::symlink(&outside, &entry).unwrap();
         let before = git_dir_entries(&repo);
-        let err = layout(&sub, &repo)
-            .prepare(false, &record(&sub))
-            .unwrap_err();
+        let err = layout(&sub, &repo).prepare(&record(&sub)).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidParams, "{name}");
         let expected = if make_dir {
             format!(".git/{name} that is not a directory")
@@ -156,7 +154,7 @@ fn prepare_refuses_protected_entries_that_are_not_what_git_makes() {
     let repo = common::init_repo(&dir.path().join("dir"));
     std::fs::create_dir(repo.join(".git/config.worktree")).unwrap();
     let err = layout(dir.path(), &repo)
-        .prepare(false, &record(dir.path()))
+        .prepare(&record(dir.path()))
         .unwrap_err();
     assert!(
         err.message
@@ -172,7 +170,7 @@ fn prepare_refuses_a_commondir_it_did_not_write() {
     let repo = common::init_repo(dir.path());
     std::fs::write(repo.join(".git/commondir"), "/somewhere/else\n").unwrap();
     let err = layout(dir.path(), &repo)
-        .prepare(false, &record(dir.path()))
+        .prepare(&record(dir.path()))
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidParams);
     assert!(err.message.contains("commondir"), "{}", err.message);
@@ -189,7 +187,7 @@ fn release_takes_back_only_what_the_daemon_made_and_left_empty() {
     let repo = common::init_repo(dir.path());
     let before = git_dir_entries(&repo);
     let l = layout(dir.path(), &repo);
-    l.prepare(false, &record(dir.path())).unwrap();
+    l.prepare(&record(dir.path())).unwrap();
     l.release(&record(dir.path()));
     assert_eq!(git_dir_entries(&repo), before);
     assert!(
@@ -198,7 +196,7 @@ fn release_takes_back_only_what_the_daemon_made_and_left_empty() {
     );
 
     // A worktrees dir with a registration in it is git's now, and stays.
-    l.prepare(false, &record(dir.path())).unwrap();
+    l.prepare(&record(dir.path())).unwrap();
     common::git_ok(
         &repo,
         &[
@@ -220,7 +218,7 @@ fn release_takes_back_only_what_the_daemon_made_and_left_empty() {
     let repo = common::init_repo(other.path());
     std::fs::create_dir_all(repo.join(".git/remotes")).unwrap();
     let l = layout(other.path(), &repo);
-    l.prepare(false, &record(other.path())).unwrap();
+    l.prepare(&record(other.path())).unwrap();
     l.release(&record(other.path()));
     assert!(l.remotes().is_dir());
 
@@ -248,7 +246,7 @@ fn late_binds_follow_what_the_repository_has() {
     };
     assert_eq!(names(l.rw_binds()), ["", ".git"]);
     assert_eq!(
-        names(l.late_ro_binds(false)),
+        names(l.late_ro_binds()),
         [
             ".git/config",
             ".git/commondir",
@@ -262,7 +260,7 @@ fn late_binds_follow_what_the_repository_has() {
     );
     std::fs::create_dir_all(l.modules()).unwrap();
     assert_eq!(
-        names(l.late_ro_binds(true)),
+        names(l.late_ro_binds()),
         [
             ".git/config",
             ".git/commondir",
@@ -390,7 +388,7 @@ fn a_snapshot_notices_replaced_and_removed_entries_but_not_edits_in_place() {
     let dir = tempfile::tempdir().unwrap();
     let repo = common::init_repo(dir.path());
     let l = layout(dir.path(), &repo);
-    l.prepare(false, &record(dir.path())).unwrap();
+    l.prepare(&record(dir.path())).unwrap();
     let snapshot = l.snapshot().unwrap();
     assert_eq!(snapshot.check(None), None);
 
@@ -446,7 +444,7 @@ fn a_breach_with_unchanged_files_has_no_diff() {
     let dir = tempfile::tempdir().unwrap();
     let repo = common::init_repo(dir.path());
     let l = layout(dir.path(), &repo);
-    l.prepare(false, &record(dir.path())).unwrap();
+    l.prepare(&record(dir.path())).unwrap();
     let snapshot = l.snapshot().unwrap();
     std::fs::remove_dir(l.remotes()).unwrap();
     let breach = snapshot.check(None).unwrap();
@@ -549,8 +547,7 @@ mod bwrap {
         dir: &Path,
         l: &InPlaceLayout,
     ) -> (Arc<dyn SandboxHandle>, ProtectedSnapshot) {
-        let wc = l.worktree_config_enabled().await.unwrap();
-        l.prepare(wc, &record(dir)).unwrap();
+        l.prepare(&record(dir)).unwrap();
         let snapshot = l.snapshot().unwrap();
         let data = dir.join("data");
         let home = data.join("homes/ws_inplace");
@@ -565,7 +562,7 @@ mod bwrap {
             id: "ws_inplace".into(),
             rw_binds: l.rw_binds().iter().map(same).collect(),
             ro_binds: vec![],
-            late_ro_binds: l.late_ro_binds(wc).iter().map(same).collect(),
+            late_ro_binds: l.late_ro_binds().iter().map(same).collect(),
             home,
             run_dir: run,
             env: vec![],
