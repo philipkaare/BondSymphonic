@@ -275,8 +275,14 @@ some code, make it a project" is the ordinary case, and the empty commit adds
 nothing to the index, so those files stay untracked.
 
 **Destroy**: stop agents, runs, PTYs; tear down sandbox; `git worktree remove
---force`; `git branch -D bs/<name>/work`; delete `homes/`, `caches/`, transcripts;
-remove from registry. With `force=false`, refuse if the worktree has uncommitted
+--force`; delete the branch (`git update-ref -d refs/heads/bs/<name>/work`,
+then `git config --local --remove-section branch.bs/<name>/work` only if that
+section exists); delete `homes/`, `caches/`, transcripts; remove from
+registry. Removing the branch this way, rather than with `git branch -D`
+(which rewrites `.git/config` every time to drop a section that is usually not
+there), is what keeps a plain destroy from touching `.git/config` at all when
+there is nothing to remove from it — see §6.2 for why that matters next to an
+in-place workspace of the same repository. With `force=false`, refuse if the worktree has uncommitted
 changes or unmerged commits and return `Conflict` with details. A worktree whose
 registration the repository has lost track of counts as dirty too: nothing can
 be read from it to say otherwise, so the refusal errs toward asking rather than
@@ -384,8 +390,12 @@ that masks them (§6.2). A second in-place create on a checkout that already
 has one is `Conflict`, `"this checkout already has an in-place workspace:
 <name>"`, compared by canonical path so a different route to the same checkout
 is still caught; a worktree workspace on the same repository is unaffected.
-There is no branch, no `git worktree add`, no lock and no private object
-directory: `branch` is simply read with `git symbolic-ref --short -q HEAD`.
+Before anything is registered, `InPlaceLayout::check_preparable` runs the same
+checks `prepare` (§6.2) would make, without writing: a foreign `commondir`
+refuses the create outright, rather than registering a workspace that could
+only ever come up `Error`. There is no branch, no `git worktree add`, no lock
+and no private object directory: `branch` is simply read with `git
+symbolic-ref --short -q HEAD`.
 
 **Restore and `workspace.restart`.** `ensure_registered` — the worktree
 repair and lock a `worktree` workspace goes through — does not apply to an
@@ -507,7 +517,7 @@ would hand the user a base branch that stops being readable when they clean up.
 
 **Creating and removing a worktree runs no repository hooks.** `git worktree add`
 fires `post-checkout` and, for the branch it creates, `reference-transaction`;
-the `git branch -D` on the way out fires `reference-transaction` again. Neither
+the `git update-ref -d` on the way out fires `reference-transaction` again. Neither
 call is the user typing a git command — they happen when the IDE opens or closes
 a workspace — so both go through the same pinned `Git` the rest of the daemon
 side uses, with `core.hooksPath` set to an empty daemon-owned directory (5.4).
@@ -835,6 +845,58 @@ a breach and stops that workspace's sandbox. This is by design: the daemon
 cannot tell the user's own `git config` apart from an agent's, and the
 alternative would be trusting a bind that has already been shown to be
 defeatable from outside.
+
+**The daemon's own worktree cleanup does not trip this.** Two of the
+daemon's own operations remove or rewrite exactly the entries §4.1 (in-place
+paragraph, above) protects, and both were shown by the protection watcher's
+own tests to trip it — against an *in-place* workspace of the same
+repository, not the worktree workspace being acted on:
+
+- **Removing a worktree deletes `.git/worktrees` itself once the last linked
+  worktree is gone**, which detaches the bind under any in-place sandbox of
+  the same repository. `worktree::remove` (a plain destroy) and the merge/
+  rebase scratch-worktree reaper (§5.4) now hold the directory open first:
+  `WorktreesHold::take` creates a `.bs-hold-<id>/locked` entry in
+  `.git/worktrees` before either operation runs, under the same
+  per-repository lock `InPlaceLayout::prepare`/`release` take, and drops it
+  (removing the entry again) once the operation is done. Git skips a locked
+  entry when it prunes, and `worktree list` skips one with no `gitdir`, so the
+  directory is never empty while a hold is live and is never deleted out from
+  under a bind the daemon itself still needs. A stale hold a killed daemon
+  left behind is taken away by the next one that reaches that repository,
+  before it takes its own. Best effort: a hold that cannot be made costs the
+  in-place sandbox a Retry, not the removal it was protecting against.
+- **Deleting a workspace's branch used to run `git branch -D`, which rewrites
+  `.git/config` every time** to drop a `branch.<name>` section that is
+  usually not there at all — and a rewritten `.git/config` is exactly what the
+  protection watcher exists to catch. `remove_branch` now deletes the ref
+  directly (`git update-ref -d refs/heads/bs/<name>/work`) and removes the
+  `branch.<name>` config section separately, and only when `git config
+  --local --get-regexp` finds one — which happens for a workspace whose
+  Create PR set an upstream (see the gap below). A plain destroy therefore no
+  longer touches `.git/config` at all, and no longer stops an in-place
+  sibling.
+
+**A removed *last* worktree still stops the sandbox, but says so plainly.**
+The hold above only covers the daemon's own removals; a user deleting the
+repository's last remaining worktree by hand — outside anything BondSymphonic
+did — still deletes `.git/worktrees` and still detaches the bind. The watcher
+tells this case apart from a replaced or foreign entry: `ProtectionBreach` now
+carries `removed`, the subset of `entries` that are gone rather than
+replaced, and `ProtectionBreach::sentence()` answers with a different
+sentence when the breach is exactly `.git/worktrees`, removed: *"This
+repository's last worktree was removed, which also removed a directory the
+sandbox keeps read-only, so the sandbox was stopped. Nothing needs checking;
+press Retry."* — no diff to review, because there is nothing to have planted:
+`.git/worktrees` names no program.
+
+**Known gap, to be closed in the final wave.** `workspace.create_pr` still
+runs `git push -u origin <branch>` (§5.5), which sets that branch's upstream
+in `.git/config` — the one config write Create PR cannot avoid. A Create PR
+on a *worktree* workspace therefore still stops an in-place sibling of the
+same repository today, the same way any other host-side `.git/config` write
+does (above). This is scheduled to be removed once Create PR's push is
+hardened the same way `remove_branch` was above.
 
 ### 6.3 Sandbox init (one bwrap per workspace)
 bubblewrap cannot join an existing network namespace, so the daemon runs exactly

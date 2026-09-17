@@ -327,10 +327,17 @@ the daemon's log names what changed and shows a line diff of `.git/config`
 **Retry** re-protects the checkout and starts the sandbox again — but review
 that diff first: anything written in the brief window before the check caught
 it is still sitting in `.git/config`, and Retry does not undo it. Because the
-daemon cannot tell your own git command from the agent's, **any command that
-writes into a protected file, run by you in that repository while the
-workspace is open, stops the workspace the same way** — this is by design, not
-something to work around.
+daemon cannot tell your own git command from the agent's, **any `.git/config`
+rewrite you make on this repository from outside BondSymphonic — `git
+config`, `git branch -u`, `git push -u`, `git remote add`, or anything else
+that writes it — or removing your own last worktree of it, stops every
+in-place workspace on that repository the same way**; this is by design, not
+something to work around. BondSymphonic's own routine housekeeping — closing,
+merging, rebasing or squashing a *worktree* workspace of the same repository
+— does not trigger this (Create PR is a known exception today; see below).
+Removing your own last worktree is told apart from everything else: there is
+nothing to review, the tab simply says the last worktree was removed and to
+press Retry.
 
 **The Changes tab shows changes against `HEAD`.** Merge, Rebase, Squash,
 Create PR and Discard are all shaped around a workspace branch this kind does
@@ -348,6 +355,13 @@ discards anything, so there is nothing to force.
 checkout** on a folder that already has one is refused: "this checkout already
 has an in-place workspace: \<name\>". A worktree workspace on the same
 repository is unaffected and can run alongside it.
+
+**Known gap, to be removed:** today, pressing **Create PR** on a *worktree*
+workspace of the same repository stops an in-place workspace open on it —
+Create PR pushes with `-u`, which is itself a `.git/config` write, for the
+reason just above. This is scheduled to go away in a later update; until
+then, expect an in-place workspace to need a Retry after a sibling workspace's
+Create PR.
 
 **Residual risks.** Working in the checkout itself means a few things the
 sandbox cannot fully close off:
@@ -884,14 +898,26 @@ protects: `.git/config`, `commondir`, `hooks`, `info`, `worktrees`, `remotes`,
 `branches`, `config.worktree`. This is not only what an agent might do; **any
 git command that writes into one of those, including one you run yourself in
 that repository** (`git config`, `git branch -u`, `git push -u`, `git remote
-add`, `git sparse-checkout`, or removing the last worktree of the repository),
-stops the workspace this way — the daemon cannot tell your own command from an
-agent's. The daemon's log names what changed and shows a line diff of
-`.git/config` (and the other protected files) between what it last checked and
-now; read that before pressing **Retry** — a setting planted in the brief
-window before the check caught it is still sitting in `.git/config`, and
-Retry does not undo it, only re-protects and restarts. **Close workspace…**
-works regardless, since it never depends on the sandbox being up.
+add`, `git sparse-checkout`), stops the workspace this way — the daemon
+cannot tell your own command from an agent's. BondSymphonic's own routine
+work on a *worktree* workspace of the same repository (Close, Merge, Rebase,
+Squash) is hardened against this and does not trigger it — today the one
+exception is Create PR (see "Working directly in a checkout" above). The
+daemon's log names what changed and shows
+a line diff of `.git/config` (and the other protected files) between what it
+last checked and now; read that before pressing **Retry** — a setting planted
+in the brief window before the check caught it is still sitting in
+`.git/config`, and Retry does not undo it, only re-protects and restarts.
+**Close workspace…** works regardless, since it never depends on the sandbox
+being up.
+
+**"This repository's last worktree was removed, which also removed a
+directory the sandbox keeps read-only, so the sandbox was stopped. Nothing
+needs checking; press Retry."** The same protection as above, but for a
+different reason: removing the repository's very last worktree — by hand,
+outside BondSymphonic — deletes a directory the in-place sandbox depends on,
+which is your own ordinary git use rather than a sign of tampering. There is
+nothing to review here, unlike the sentence above: just press **Retry**.
 
 **Sandbox failures.** The sandbox is bubblewrap. If the `bwrap` or `userns`
 check fails, unprivileged user namespaces are usually restricted:

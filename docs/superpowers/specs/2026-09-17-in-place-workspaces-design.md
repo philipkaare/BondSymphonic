@@ -1,6 +1,6 @@
 # In-place workspaces — design
 
-Date: 2026-09-17. Status: approved in chat by the user; amended the same day while planning (`.git/commondir`, `worktrees`, `remotes` and `branches` read-only, `--ignore-submodules=all`, the extra `repo.inspect` fields and refusals, measured bwrap and git behaviour), and amended again during implementation (§4.1: `config.worktree` is bound unconditionally, not only when `extensions.worktreeConfig` is on; §4.2: a read-only bind can be detached from outside the sandbox, so the daemon detects and stops the sandbox instead of relying on the bind alone). The plan is `docs/superpowers/plans/2026-09-17-in-place-workspaces.md`.
+Date: 2026-09-17. Status: approved in chat by the user; amended the same day while planning (`.git/commondir`, `worktrees`, `remotes` and `branches` read-only, `--ignore-submodules=all`, the extra `repo.inspect` fields and refusals, measured bwrap and git behaviour), and amended twice more during implementation (§4.1: `config.worktree` is bound unconditionally, not only when `extensions.worktreeConfig` is on; §4.2: a read-only bind can be detached from outside the sandbox, so the daemon detects and stops the sandbox instead of relying on the bind alone; §4.2 again: the daemon's own worktree and branch cleanup no longer trips that detection, a removed last worktree gets its own sentence, and Create PR's `git push -u` is a known gap that still can). The plan is `docs/superpowers/plans/2026-09-17-in-place-workspaces.md`.
 
 ## 1. Goal
 
@@ -269,6 +269,46 @@ any git command that writes into a protected entry -- not only one an agent
 runs, but one the user themselves runs in that repository while an in-place
 workspace is open on it -- reads as a breach and stops that workspace's
 sandbox, because the daemon cannot tell the two apart.
+
+**The daemon's own worktree cleanup does not trip this -- amended during
+implementation.** Two of the daemon's own operations remove or rewrite
+exactly what the above protects, against an *in-place* workspace of the same
+repository, not the worktree workspace being acted on. Both are now
+hardened:
+
+- Removing a worktree deletes `.git/worktrees` itself once the last linked
+  worktree is gone. `worktree::remove` (a plain destroy) and the merge/rebase
+  scratch-worktree reaper now hold the directory open first
+  (`WorktreesHold::take`, a `.bs-hold-<id>/locked` entry a locked-entry-aware
+  git prune skips and `worktree list` skips too), under the same
+  per-repository lock `prepare`/`release` take, and drop the hold once the
+  operation is done. A stale hold a killed daemon left behind is taken away
+  by the next one that reaches the repository.
+- Deleting a workspace's branch used to run `git branch -D`, which rewrites
+  `.git/config` every time to drop a `branch.<name>` section that is usually
+  not there. `remove_branch` now runs `git update-ref -d
+  refs/heads/bs/<name>/work` and removes the `branch.<name>` section
+  separately, only when one exists (a workspace whose Create PR set an
+  upstream -- see the gap below). A plain destroy therefore no longer writes
+  `.git/config` at all.
+
+**A removed *last* worktree still stops the sandbox, but says so plainly.**
+The hold above covers only the daemon's own removals; a user deleting the
+repository's last remaining worktree by hand still detaches the bind. The
+watcher tells this apart from a replaced or foreign entry: `ProtectionBreach`
+carries `removed`, the subset of `entries` that are gone rather than
+replaced, and its `sentence()` answers differently when the breach is exactly
+`.git/worktrees`, removed: *"This repository's last worktree was removed,
+which also removed a directory the sandbox keeps read-only, so the sandbox
+was stopped. Nothing needs checking; press Retry."* -- no diff to review,
+because `.git/worktrees` names no program.
+
+**Known gap, to be closed in the final wave.** `workspace.create_pr` still
+runs `git push -u origin <branch>`, which sets that branch's upstream in
+`.git/config`. A Create PR on a *worktree* workspace therefore still stops an
+in-place sibling of the same repository today, the same as any other
+host-side `.git/config` write. Scheduled to be removed once Create PR's push
+is hardened the same way `remove_branch` was above.
 
 Residual risks, documented in the user guide and not mitigated further:
 
