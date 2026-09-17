@@ -467,7 +467,7 @@ impl InPlaceLayout {
     /// and the 8.3 short name `GIT~1/config` to the same file through dentries
     /// the mount does not cover, and a write through any of them reaches the
     /// user's config with the mount, the device and the inode all unchanged.
-    /// Measured in the distro: each of those four spellings gets past every
+    /// Measured in the distro: each of those spellings gets past every
     /// read-only bind. Contents are the only thing left that tells the
     /// difference, so they are read on every poll and compared whole.
     ///
@@ -479,7 +479,8 @@ impl InPlaceLayout {
     ///   `ext::` URL, which is a command. All four are small and git does not
     ///   write them by itself -- except `info/refs`, which every `git gc`
     ///   rewrites through `update-server-info` (measured) and which is a ref
-    ///   listing for dumb HTTP clients rather than anything git executes.
+    ///   listing for dumb HTTP clients rather than anything git executes. A
+    ///   `*.sample` hook is listed rather than read; see [`Read`].
     /// - Of `worktrees` and `modules`, the files a sibling worktree's or a
     ///   submodule's git reads as configuration. Not the rest: a registration
     ///   holds an index, a `HEAD` and reflogs that the daemon's own work in a
