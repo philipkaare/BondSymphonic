@@ -437,6 +437,225 @@ async fn lock(layout: &Layout) -> Result<(), RpcError> {
         .map(|_| ())
 }
 
+/// What [`ensure_registered`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registration {
+    /// The repository still lists the worktree. It is locked now, if it was
+    /// not already.
+    Intact,
+    /// The repository had forgotten the worktree and the registration was
+    /// rebuilt. Worth telling the user: something outside BondSymphonic pruned it.
+    Repaired,
+}
+
+/// Makes sure the repository still lists the workspace's worktree, and puts the
+/// registration back when it safely can.
+///
+/// A registration a Windows git pruned (see [`lock`]) leaves a worktree whose
+/// `.git` file points at nothing, so every git command in it fails and the
+/// sandbox cannot even be started. The directory and the branch are usually
+/// untouched, and then the registration is only three small files and an
+/// index, which is what this writes back — laid out exactly as
+/// `git worktree add` lays them out (git 2.43, checked against a real add):
+/// `HEAD` as a symbolic ref to the branch, `commondir` as `../..`, `gitdir` as
+/// the absolute path of the worktree's `.git`, each ending in a newline.
+/// `git worktree repair` cannot do this: it mends links between a registration
+/// and a directory that both exist, and refuses outright when the registration
+/// is gone.
+///
+/// Only when every one of these holds, because each one that does not means
+/// the worktree is not simply "ours, with the registration missing":
+///
+/// * the worktree directory exists;
+/// * its `.git` is a gitfile naming exactly [`Layout::worktree_gitdir`];
+/// * the branch exists, and no other worktree has it checked out — git allows
+///   one checkout per branch, and a second one would let two worktrees move
+///   the same ref under each other.
+///
+/// The index is rebuilt from the branch with `git read-tree`, which writes the
+/// index and nothing else: the agent's uncommitted edits stay in the directory
+/// and show up as unstaged changes, the way they would after a
+/// `git reset --mixed`. Whatever was staged is unstaged, which is the one thing
+/// the prune took that cannot be had back. The branch's newest commits may live
+/// only in the workspace's private object directory, which
+/// [`Layout::worktree_git`] adds as an alternate.
+///
+/// An intact registration that is not locked — every workspace made before
+/// [`create`] locked them — is locked here, so the next daemon start protects
+/// what is already on disk. A lock that fails is logged and nothing more: the
+/// workspace works, it is only exposed as it always was.
+///
+/// Under the repository lock `workspace.create` and `workspace.destroy` hold,
+/// so a destroy of the same workspace cannot remove the directory while the
+/// registration is being written back into it.
+pub async fn ensure_registered(layout: &Layout) -> Result<Registration, RpcError> {
+    let repo_lock = super::repo_lock(&layout.repo);
+    let _repo_guard = repo_lock.lock().await;
+    let gitdir = layout.worktree_gitdir();
+    if gitdir.is_dir() {
+        if !gitdir.join("locked").exists() {
+            if let Err(e) = lock(layout).await {
+                tracing::warn!(
+                    worktree = %layout.worktree_path.display(),
+                    "could not lock the worktree: {}", e.message
+                );
+            }
+        }
+        return Ok(Registration::Intact);
+    }
+    if let Err(why) = repairable(layout).await {
+        return Err(RpcError::new(
+            ErrorCode::GitError,
+            format!(
+                "The repository {} no longer lists this workspace's worktree, and it could \
+                 not be re-registered because {}. {}",
+                layout.repo.display(),
+                why.reason,
+                why.advice
+            ),
+        )
+        .with_data(serde_json::json!({ "reason": "worktree_unregistered" })));
+    }
+    if let Err(e) = rebuild(layout).await {
+        // Nothing half-built stays behind: a registration without an index or a
+        // lock is worse than none, because the next start would take it as
+        // intact.
+        let _ = std::fs::remove_dir_all(&gitdir);
+        return Err(RpcError::new(
+            e.code,
+            format!(
+                "The repository {} no longer lists this workspace's worktree, and \
+                 re-registering it failed: {}",
+                layout.repo.display(),
+                e.message
+            ),
+        ));
+    }
+    tracing::warn!(
+        repo = %layout.repo.display(),
+        worktree = %layout.worktree_path.display(),
+        "re-registered a worktree the repository had forgotten"
+    );
+    Ok(Registration::Repaired)
+}
+
+/// Why a missing registration is not put back, in words for the user.
+struct NotRepairable {
+    /// Finishes "it could not be re-registered because …".
+    reason: String,
+    /// What the user can do about it, as a sentence of its own.
+    advice: String,
+}
+
+/// Checks the conditions [`ensure_registered`] lists, without writing anything.
+async fn repairable(layout: &Layout) -> Result<(), NotRepairable> {
+    let wt = &layout.worktree_path;
+    let remove_it = || {
+        "Remove the workspace to clean up; if it has work you want to keep, copy it out first."
+            .to_string()
+    };
+    if !wt.is_dir() {
+        return Err(NotRepairable {
+            reason: format!("its directory {} is missing", wt.display()),
+            advice: "Remove the workspace to clean up.".into(),
+        });
+    }
+    let gitfile = wt.join(".git");
+    let expected = layout.worktree_gitdir();
+    let points_at = std::fs::read_to_string(&gitfile)
+        .ok()
+        .and_then(|s| s.strip_prefix("gitdir:").map(|p| p.trim().to_string()));
+    let Some(points_at) = points_at else {
+        return Err(NotRepairable {
+            reason: format!(
+                "{} is not the link to the repository git left there",
+                gitfile.display()
+            ),
+            advice: remove_it(),
+        });
+    };
+    // A relative link, which git writes under `worktree.useRelativePaths`, is
+    // relative to the worktree.
+    let target = wt.join(&points_at);
+    if repo::canonical_ish(&target) != repo::canonical_ish(&expected) {
+        return Err(NotRepairable {
+            reason: format!(
+                "{} points at {points_at} rather than at {}",
+                gitfile.display(),
+                expected.display()
+            ),
+            advice: remove_it(),
+        });
+    }
+    let git = layout.daemon_git();
+    let git_failed = |e: RpcError| NotRepairable {
+        reason: format!("git could not inspect the repository: {}", e.message),
+        advice:
+            "Check that the repository is still there and readable, then restart the workspace."
+                .into(),
+    };
+    if !repo::branch_exists(&git, &layout.repo, &layout.branch)
+        .await
+        .map_err(git_failed)?
+    {
+        return Err(NotRepairable {
+            reason: format!("its branch {} no longer exists", layout.branch),
+            advice: remove_it(),
+        });
+    }
+    let listed = git
+        .run(&layout.repo, &["worktree", "list", "--porcelain"])
+        .await
+        .map_err(git_failed)?
+        .stdout;
+    if let Some(other) = checked_out_at(&listed, &layout.branch) {
+        return Err(NotRepairable {
+            reason: format!(
+                "its branch {} is checked out in another worktree, {other}",
+                layout.branch
+            ),
+            advice: format!("Switch {other} to a different branch, then restart the workspace."),
+        });
+    }
+    Ok(())
+}
+
+/// The worktree `git worktree list --porcelain` shows with `branch` checked out.
+fn checked_out_at(listed: &str, branch: &str) -> Option<String> {
+    let wanted = format!("branch refs/heads/{branch}");
+    let mut current: Option<&str> = None;
+    for line in listed.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(path);
+        } else if line == wanted {
+            return current.map(str::to_string);
+        }
+    }
+    None
+}
+
+/// Writes the registration back and rebuilds its index. See [`ensure_registered`].
+async fn rebuild(layout: &Layout) -> Result<(), RpcError> {
+    let gitdir = layout.worktree_gitdir();
+    std::fs::create_dir_all(&gitdir).map_err(|e| RpcError::io(&e))?;
+    for (name, contents) in [
+        ("HEAD", format!("ref: refs/heads/{}\n", layout.branch)),
+        ("commondir", "../..\n".to_string()),
+        (
+            "gitdir",
+            format!("{}\n", path_arg(&layout.worktree_path.join(".git"))),
+        ),
+    ] {
+        std::fs::write(gitdir.join(name), contents).map_err(|e| RpcError::io(&e))?;
+    }
+    lock(layout).await?;
+    layout
+        .worktree_git()
+        .run(&layout.worktree_path, &["read-tree", "HEAD"])
+        .await
+        .map(|_| ())
+}
+
 /// Removes the worktree, its registration and its branch.
 ///
 /// [`remove_with`] with [`RemoveBranch::Always`]: what `workspace.destroy`

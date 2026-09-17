@@ -269,7 +269,11 @@ async fn remove_takes_a_locked_worktree_with_it() {
     let _ = git
         .run(
             &repo_path,
-            &["worktree", "unlock", &layout.worktree_path.to_string_lossy()],
+            &[
+                "worktree",
+                "unlock",
+                &layout.worktree_path.to_string_lossy(),
+            ],
         )
         .await;
     git.run(
@@ -497,4 +501,211 @@ async fn a_removal_that_fails_twice_names_both_failures() {
         "the second failure has to say which step it was: {}",
         err.message
     );
+}
+
+// ---------------------------------------------------------------------------
+// A registration a Windows git pruned.
+//
+// Windows git cannot see a worktree under the WSL user's home, so its
+// `git worktree prune` deletes `<git_common>/worktrees/<id>` and leaves the
+// directory and the branch where they are. `ensure_registered` puts the
+// registration back when that is all that happened, and says why not
+// otherwise.
+// ---------------------------------------------------------------------------
+
+/// What a Windows `git worktree prune` does to an unlocked registration.
+fn prune_like_windows_git(layout: &Layout) {
+    std::fs::remove_dir_all(layout.worktree_gitdir()).unwrap();
+}
+
+/// A workspace with a commit of the agent's in its private objects, a
+/// modified tracked file and an untracked one: everything a repair must keep.
+async fn workspace_with_work(dir: &std::path::Path, name: &str) -> (std::path::PathBuf, Layout) {
+    let repo_path = common::init_repo(dir);
+    let layout = layout_for(dir, &repo_path, name).await;
+    worktree::create(&layout, "main").await.unwrap();
+    std::fs::write(layout.worktree_path.join("committed.txt"), "c\n").unwrap();
+    common::commit_all(
+        &layout.worktree_path,
+        &layout.sandbox_git_env(),
+        "agent commit",
+    );
+    std::fs::write(layout.worktree_path.join("README.md"), "changed\n").unwrap();
+    std::fs::write(layout.worktree_path.join("wip.txt"), "wip\n").unwrap();
+    (repo_path, layout)
+}
+
+#[tokio::test]
+async fn ensure_registered_locks_an_intact_registration_that_is_not_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_path = common::init_repo(dir.path());
+    let layout = layout_for(dir.path(), &repo_path, "older").await;
+    worktree::create(&layout, "main").await.unwrap();
+    // A workspace made before worktrees were locked.
+    Git::new()
+        .run(
+            &repo_path,
+            &[
+                "worktree",
+                "unlock",
+                &layout.worktree_path.to_string_lossy(),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let got = worktree::ensure_registered(&layout).await.unwrap();
+
+    assert_eq!(got, worktree::Registration::Intact);
+    let reason = std::fs::read_to_string(layout.worktree_gitdir().join("locked")).unwrap();
+    assert_eq!(reason.trim_end(), worktree::LOCK_REASON);
+}
+
+#[tokio::test]
+async fn ensure_registered_leaves_an_existing_lock_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_path = common::init_repo(dir.path());
+    let layout = layout_for(dir.path(), &repo_path, "user-locked").await;
+    worktree::create(&layout, "main").await.unwrap();
+    let locked = layout.worktree_gitdir().join("locked");
+    std::fs::write(&locked, "the user's own reason\n").unwrap();
+
+    let got = worktree::ensure_registered(&layout).await.unwrap();
+
+    assert_eq!(got, worktree::Registration::Intact);
+    assert_eq!(
+        std::fs::read_to_string(&locked).unwrap(),
+        "the user's own reason\n"
+    );
+}
+
+#[tokio::test]
+async fn ensure_registered_rebuilds_a_pruned_registration_and_keeps_the_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let (repo_path, layout) = workspace_with_work(dir.path(), "pruned").await;
+    let head_before = layout
+        .daemon_git()
+        .run(&repo_path, &["rev-parse", "bs/pruned/work"])
+        .await
+        .unwrap()
+        .stdout;
+    prune_like_windows_git(&layout);
+
+    let got = worktree::ensure_registered(&layout).await.unwrap();
+
+    assert_eq!(got, worktree::Registration::Repaired);
+    let gitdir = layout.worktree_gitdir();
+    assert_eq!(
+        std::fs::read_to_string(gitdir.join("HEAD")).unwrap(),
+        "ref: refs/heads/bs/pruned/work\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(gitdir.join("locked"))
+            .unwrap()
+            .trim_end(),
+        worktree::LOCK_REASON
+    );
+    // The branch has not moved, and the worktree still has the agent's work:
+    // the commit, the modified file and the untracked one, none of them staged.
+    let git = layout.worktree_git();
+    let head = git
+        .run(&layout.worktree_path, &["rev-parse", "HEAD"])
+        .await
+        .unwrap()
+        .stdout;
+    assert_eq!(head, head_before);
+    let status = git
+        .run(&layout.worktree_path, &["status", "--porcelain"])
+        .await
+        .unwrap()
+        .stdout;
+    assert_eq!(status, " M README.md\n?? wip.txt\n");
+    assert_eq!(
+        std::fs::read_to_string(layout.worktree_path.join("README.md")).unwrap(),
+        "changed\n"
+    );
+    // Plain git, discovering the repository from the worktree the way a user's
+    // shell would, sees the same thing.
+    let plain = common::git_out(&layout.worktree_path, &["worktree", "list", "--porcelain"]);
+    assert!(
+        plain.contains("branch refs/heads/bs/pruned/work"),
+        "{plain}"
+    );
+    assert!(plain.contains("locked"), "{plain}");
+
+    // And a prune that cannot see the directory no longer takes it.
+    let hidden = dir.path().join("hidden");
+    std::fs::rename(dir.path().join("worktrees"), &hidden).unwrap();
+    common::git_ok(&repo_path, &["worktree", "prune"]);
+    std::fs::rename(&hidden, dir.path().join("worktrees")).unwrap();
+    assert!(gitdir.join("HEAD").is_file());
+}
+
+#[tokio::test]
+async fn ensure_registered_refuses_when_the_branch_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (repo_path, layout) = workspace_with_work(dir.path(), "no-branch").await;
+    prune_like_windows_git(&layout);
+    common::git_ok(&repo_path, &["branch", "-D", "bs/no-branch/work"]);
+
+    let err = worktree::ensure_registered(&layout).await.unwrap_err();
+
+    assert!(err.message.contains("bs/no-branch/work"), "{}", err.message);
+    assert!(err.message.contains("no longer exists"), "{}", err.message);
+    assert!(
+        !layout.worktree_gitdir().exists(),
+        "nothing half-built is left"
+    );
+}
+
+#[tokio::test]
+async fn ensure_registered_refuses_when_the_branch_is_checked_out_elsewhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let (repo_path, layout) = workspace_with_work(dir.path(), "taken").await;
+    prune_like_windows_git(&layout);
+    let other = dir.path().join("other");
+    // Through `daemon_git`: the branch tip is in the private object directory.
+    layout
+        .daemon_git()
+        .run(
+            &repo_path,
+            &["worktree", "add", &other.to_string_lossy(), "bs/taken/work"],
+        )
+        .await
+        .unwrap();
+
+    let err = worktree::ensure_registered(&layout).await.unwrap_err();
+
+    assert!(err.message.contains("checked out"), "{}", err.message);
+    assert!(!layout.worktree_gitdir().exists());
+}
+
+#[tokio::test]
+async fn ensure_registered_refuses_a_gitfile_that_points_somewhere_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_repo_path, layout) = workspace_with_work(dir.path(), "elsewhere").await;
+    prune_like_windows_git(&layout);
+    std::fs::write(
+        layout.worktree_path.join(".git"),
+        "gitdir: /somewhere/else/.git/worktrees/x\n",
+    )
+    .unwrap();
+
+    let err = worktree::ensure_registered(&layout).await.unwrap_err();
+
+    assert!(err.message.contains(".git"), "{}", err.message);
+    assert!(!layout.worktree_gitdir().exists());
+}
+
+#[tokio::test]
+async fn ensure_registered_refuses_when_the_worktree_directory_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_repo_path, layout) = workspace_with_work(dir.path(), "gone").await;
+    prune_like_windows_git(&layout);
+    std::fs::remove_dir_all(&layout.worktree_path).unwrap();
+
+    let err = worktree::ensure_registered(&layout).await.unwrap_err();
+
+    assert!(err.message.contains("directory"), "{}", err.message);
+    assert!(!layout.worktree_gitdir().exists());
 }
