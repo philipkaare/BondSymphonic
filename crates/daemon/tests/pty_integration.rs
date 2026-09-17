@@ -39,6 +39,7 @@ async fn create_workspace(
             base_branch: "main".into(),
             name: name.into(),
             init_if_missing: false,
+            in_place: false,
         }))
         .await
         .unwrap(),
@@ -94,6 +95,7 @@ async fn pty_open_echo_resize_close_over_protocol() {
             base_branch: "main".into(),
             name: "p".into(),
             init_if_missing: false,
+            in_place: false,
         }))
         .await
         .unwrap(),
@@ -205,6 +207,7 @@ async fn pty_open_rejects_an_unbalanced_command() {
             base_branch: "main".into(),
             name: "q".into(),
             init_if_missing: false,
+            in_place: false,
         }))
         .await
         .unwrap(),
@@ -236,6 +239,7 @@ async fn destroying_a_workspace_closes_its_ptys() {
             base_branch: "main".into(),
             name: "r".into(),
             init_if_missing: false,
+            in_place: false,
         }))
         .await
         .unwrap(),

@@ -31,6 +31,7 @@ fn request_envelope_shape() {
             base_branch: "main".into(),
             name: "agent-1".into(),
             init_if_missing: false,
+            in_place: false,
         }),
     };
     let v = serde_json::to_value(&msg).unwrap();
@@ -598,8 +599,73 @@ fn repo_info_from_a_daemon_that_predates_the_non_repo_answer() {
         remotes: vec![],
         is_repo: false,
         exists: true,
+        head_branch: None,
+        in_place_refusal: None,
+        hooks_path_in_tree: None,
     })
     .unwrap();
     assert_eq!(v["is_repo"], false);
     assert_eq!(v["exists"], true);
+}
+
+/// In-place workspaces, 2026-09-17: the second kind of workspace, and the
+/// version bump that keeps an older daemon from quietly making a worktree.
+mod in_place_protocol {
+    use bondsymphonic_proto::*;
+
+    #[test]
+    fn the_protocol_is_version_two_and_a_silent_peer_is_version_one() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(peer_protocol_version(None), 1);
+    }
+
+    #[test]
+    fn a_workspace_kind_is_spelled_in_snake_case_and_defaults_to_worktree() {
+        assert_eq!(
+            serde_json::to_value(WorkspaceKind::InPlace).unwrap(),
+            "in_place"
+        );
+        assert_eq!(
+            serde_json::to_value(WorkspaceKind::Worktree).unwrap(),
+            "worktree"
+        );
+        assert_eq!(WorkspaceKind::default(), WorkspaceKind::Worktree);
+        // A registry or a reply written before the field existed.
+        let old = r#"{
+            "id":"ws_1","name":"alpha","repo_path":"/r","base_branch":"main",
+            "branch":"bs/alpha/work","worktree_path":"/wt","created_at":"t",
+            "allowlist":[],"state":"ready","agents":[],"runs":[]
+        }"#;
+        let info: WorkspaceInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(info.kind, WorkspaceKind::Worktree);
+        let v = serde_json::to_value(WorkspaceInfo {
+            kind: WorkspaceKind::InPlace,
+            ..info
+        })
+        .unwrap();
+        assert_eq!(v["kind"], "in_place");
+    }
+
+    #[test]
+    fn a_create_without_in_place_is_a_worktree_create() {
+        let p: WorkspaceCreateParams =
+            serde_json::from_str(r#"{"repo_path":"/r","base_branch":"main","name":"a"}"#).unwrap();
+        assert!(!p.in_place);
+        let p: WorkspaceCreateParams = serde_json::from_str(
+            r#"{"repo_path":"/r","base_branch":"","name":"a","in_place":true}"#,
+        )
+        .unwrap();
+        assert!(p.in_place);
+    }
+
+    #[test]
+    fn repo_info_without_the_in_place_fields_reads_as_none() {
+        let info: RepoInfo = serde_json::from_str(
+            r#"{"default_branch":"main","branches":["main"],"is_dirty":false,"remotes":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(info.head_branch, None);
+        assert_eq!(info.in_place_refusal, None);
+        assert_eq!(info.hooks_path_in_tree, None);
+    }
 }

@@ -31,6 +31,7 @@ fn info(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
         worktree_path: format!("/wt/{name}"),
         created_at: "2026-09-09T10:00:00Z".to_owned(),
         allowlist: Vec::new(),
+        kind: bondsymphonic_proto::WorkspaceKind::Worktree,
         state,
         agents: Vec::new(),
         agent_records: Vec::new(),

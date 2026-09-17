@@ -651,20 +651,18 @@ enum MismatchAnswer {
 /// which two pieces do not match.
 #[tokio::test]
 async fn a_daemon_on_another_protocol_version_fails_the_handshake() {
-    let addr = fake_daemon_speaking("secret", MismatchAnswer::Answers(Some(2))).await;
+    let addr = fake_daemon_speaking(
+        "secret",
+        MismatchAnswer::Answers(Some(PROTOCOL_VERSION + 1)),
+    )
+    .await;
     let err = DaemonClient::connect(addr, "secret", "0.1.0")
         .await
         .err()
-        .expect("a daemon speaking protocol 2 must not be accepted");
+        .expect("a daemon speaking the next protocol must not be accepted");
     assert!(
-        matches!(
-            err,
-            ClientError::ProtocolMismatch {
-                daemon: 2,
-                client: 1
-            }
-        ),
-        "expected ProtocolMismatch {{ daemon: 2, client: 1 }}, got {err:?}"
+        matches!(err, ClientError::ProtocolMismatch { daemon, client } if daemon == PROTOCOL_VERSION + 1 && client == PROTOCOL_VERSION),
+        "expected a mismatch against {PROTOCOL_VERSION}, got {err:?}"
     );
 }
 
@@ -679,26 +677,24 @@ async fn a_daemon_that_refuses_our_version_is_reported_as_a_mismatch() {
         .err()
         .expect("a refused handshake must not be accepted");
     assert!(
-        matches!(
-            err,
-            ClientError::ProtocolMismatch {
-                daemon: 7,
-                client: 1
-            }
-        ),
-        "expected ProtocolMismatch {{ daemon: 7, client: 1 }}, got {err:?}"
+        matches!(err, ClientError::ProtocolMismatch { daemon: 7, client } if client == PROTOCOL_VERSION),
+        "expected ProtocolMismatch {{ daemon: 7, client: {PROTOCOL_VERSION} }}, got {err:?}"
     );
 }
 
-/// A daemon built before the field existed answers without it. That is a
-/// version 1 daemon, which is what this IDE speaks, so the handshake stands.
+/// A daemon built before the field existed answers without it, which is
+/// version 1. This IDE speaks 2, so the handshake stops there.
 #[tokio::test]
-async fn a_pre_m7_daemon_still_connects() {
+async fn a_pre_m7_daemon_is_a_version_one_daemon_and_is_refused() {
     let addr = fake_daemon_speaking("secret", MismatchAnswer::Answers(None)).await;
-    let (_client, hello, _events) = DaemonClient::connect(addr, "secret", "0.1.0")
+    let err = DaemonClient::connect(addr, "secret", "0.1.0")
         .await
-        .expect("a daemon that sends no protocol version speaks version 1");
-    assert_eq!(hello.protocol_version, None);
+        .err()
+        .expect("a version-1 daemon must not be accepted");
+    assert!(
+        matches!(err, ClientError::ProtocolMismatch { daemon: 1, client } if client == PROTOCOL_VERSION),
+        "got {err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

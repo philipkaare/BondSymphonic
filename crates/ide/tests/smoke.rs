@@ -649,6 +649,7 @@ fn workspace(id: &str, name: &str, state: WorkspaceState, allowlist: &[String]) 
         worktree_path: format!("/wt/{id}"),
         created_at: "2026-09-09T10:00:00Z".to_owned(),
         allowlist: allowlist.to_vec(),
+        kind: bondsymphonic_proto::WorkspaceKind::Worktree,
         state,
         agents: Vec::new(),
         agent_records: Vec::new(),

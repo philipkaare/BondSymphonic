@@ -16,6 +16,7 @@ async fn fs_list_read_write_over_the_protocol() {
             base_branch: "main".into(),
             name: "agent-1".into(),
             init_if_missing: false,
+            in_place: false,
         }))
         .await
         .unwrap(),

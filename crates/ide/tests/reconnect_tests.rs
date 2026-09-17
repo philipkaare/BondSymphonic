@@ -499,6 +499,7 @@ fn workspace(id: &str, name: &str) -> WorkspaceInfo {
         worktree_path: format!("/wt/{id}"),
         created_at: "2026-09-10T10:00:00Z".to_owned(),
         allowlist: Vec::new(),
+        kind: bondsymphonic_proto::WorkspaceKind::Worktree,
         state: WorkspaceState::Ready,
         agents: Vec::new(),
         agent_records: Vec::new(),
@@ -551,7 +552,7 @@ fn wait_for(child: &mut std::process::Child, limit: Duration) -> Option<std::pro
 /// here rather than trying to repair anything, so the sentence has to say what
 /// the user does next.
 const MISMATCH_TEXT: &str =
-    "daemon: protocol mismatch (daemon 2, IDE 1) \u{2014} rebuild the daemon \
+    "daemon: protocol mismatch (daemon 3, IDE 2) \u{2014} rebuild the daemon \
      (scripts\\build-daemon.ps1) or reinstall the package";
 const RECONNECTING_PREFIX: &str = "daemon: reconnecting (attempt";
 /// The mismatch is decided by the handshake, so a cold Qt start is all this
@@ -568,7 +569,7 @@ fn a_protocol_mismatch_stops_the_connection_loop_instead_of_backing_off() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let (addr, journal) = rt.block_on(fake_daemon_speaking_protocol_two());
+    let (addr, journal) = rt.block_on(fake_daemon_speaking_the_next_protocol());
 
     let config = std::env::temp_dir().join(format!("bs-mismatch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&config);
@@ -630,9 +631,9 @@ fn a_protocol_mismatch_stops_the_connection_loop_instead_of_backing_off() {
     let _ = std::fs::remove_dir_all(&config);
 }
 
-/// A daemon that answers the handshake claiming protocol 2. Everything else it
-/// refuses: nothing should get that far.
-async fn fake_daemon_speaking_protocol_two() -> (std::net::SocketAddr, Journal) {
+/// A daemon that answers the handshake claiming the next protocol version.
+/// Everything else it refuses: nothing should get that far.
+async fn fake_daemon_speaking_the_next_protocol() -> (std::net::SocketAddr, Journal) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     let journal: Journal = Arc::new(Mutex::new(Vec::new()));
@@ -669,7 +670,7 @@ async fn fake_daemon_speaking_protocol_two() -> (std::net::SocketAddr, Journal) 
                                     git_protect: false,
                                     adapters: vec![],
                                 },
-                                protocol_version: Some(2),
+                                protocol_version: Some(PROTOCOL_VERSION + 1),
                             },
                         ),
                         other => ServerMessage::err(

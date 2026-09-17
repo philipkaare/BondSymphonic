@@ -419,6 +419,7 @@ async fn create_on(d: &Arc<Daemon>, repo: &Path, name: &str) -> WorkspaceInfo {
             base_branch: "main".into(),
             name: name.into(),
             init_if_missing: false,
+            in_place: false,
         },
     )
     .await

@@ -12,6 +12,7 @@ fn sample(id: &str, name: &str) -> Workspace {
         worktree_path: format!("/data/worktrees/{id}").into(),
         created_at: "2026-09-08T10:00:00Z".into(),
         allowlist: vec![],
+        kind: bondsymphonic_proto::WorkspaceKind::Worktree,
         state: WorkspaceState::Ready,
         agents: vec![],
         runs: vec![],

@@ -13,6 +13,7 @@ fn info(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
         worktree_path: "/w".into(),
         created_at: "t".into(),
         allowlist: vec![],
+        kind: bondsymphonic_proto::WorkspaceKind::Worktree,
         state,
         agents: vec![],
         agent_records: vec![],

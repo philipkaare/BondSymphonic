@@ -18,7 +18,9 @@ pub use types::*;
 /// and the daemon are shipped as a pair, and a pair that does not match is
 /// told so at the handshake rather than failing later on a field one side has
 /// never heard of.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Version 2 added in-place workspaces (`WorkspaceCreateParams::in_place`).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// What a peer that sends no `protocol_version` at all is speaking.
 ///

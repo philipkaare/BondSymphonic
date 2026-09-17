@@ -263,6 +263,7 @@ fn workspace() -> WorkspaceInfo {
         worktree_path: format!("/wt/{WS_ID}"),
         created_at: "2026-09-10T10:00:00Z".to_owned(),
         allowlist: Vec::new(),
+        kind: bondsymphonic_proto::WorkspaceKind::Worktree,
         state: WorkspaceState::Ready,
         // Both lists, the way the daemon sends them: the bare ids an older
         // client would read, and the records this one rebuilds the tab from.
@@ -344,6 +345,7 @@ mod task_9 {
             worktree_path: format!("/wt/{name}"),
             created_at: "2026-09-11T10:00:00Z".to_owned(),
             allowlist: Vec::new(),
+            kind: bondsymphonic_proto::WorkspaceKind::Worktree,
             state: WorkspaceState::Ready,
             agents: Vec::new(),
             agent_records: Vec::new(),
@@ -722,6 +724,7 @@ mod task_10 {
             worktree_path: format!("/wt/{id}"),
             created_at: "2026-09-11T10:00:00Z".to_owned(),
             allowlist: Vec::new(),
+            kind: bondsymphonic_proto::WorkspaceKind::Worktree,
             state: WorkspaceState::Ready,
             agents: Vec::new(),
             agent_records: Vec::new(),
@@ -1005,6 +1008,7 @@ mod task_10_agent_state_race {
             worktree_path: format!("/wt/{id}"),
             created_at: "2026-09-11T10:00:00Z".to_owned(),
             allowlist: Vec::new(),
+            kind: bondsymphonic_proto::WorkspaceKind::Worktree,
             state: WorkspaceState::Ready,
             agents: Vec::new(),
             agent_records: Vec::new(),

@@ -2384,6 +2384,7 @@ impl qobject::AppController {
                 base_branch: base_branch.to_string(),
                 name: name.to_string(),
                 init_if_missing,
+                in_place: false,
             },
             CreateEcho {
                 group: group.to_string(),
@@ -2414,6 +2415,7 @@ impl qobject::AppController {
                 base_branch: base_branch.to_string(),
                 name: name.to_string(),
                 init_if_missing,
+                in_place: false,
             },
             CreateEcho {
                 group: group.to_string(),

@@ -1178,6 +1178,7 @@ mod tests {
             worktree_path: format!("/wt/{id}"),
             created_at: "2026-09-11T10:00:00Z".to_owned(),
             allowlist: Vec::new(),
+            kind: bondsymphonic_proto::WorkspaceKind::Worktree,
             state: WorkspaceState::Ready,
             agents: Vec::new(),
             agent_records: Vec::new(),

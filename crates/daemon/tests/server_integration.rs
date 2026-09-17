@@ -691,10 +691,11 @@ async fn hello_with_another_protocol_version_is_refused_and_the_socket_closes() 
 }
 
 /// A `hello` with no `protocol_version` at all is a client built before the
-/// field existed. It speaks version 1, which is this daemon's version, so it
-/// is accepted -- and the answer tells it which version it just reached.
+/// field existed, which speaks version 1. This daemon speaks 2 -- in-place
+/// workspaces -- so it is refused with both numbers, like any other mismatch,
+/// and the socket closes.
 #[tokio::test]
-async fn hello_without_a_protocol_version_is_accepted_as_version_one() {
+async fn hello_without_a_protocol_version_is_refused_as_version_one() {
     let (port, token, cancel, _h) = start().await;
     let (mut r, mut w) = connect(port).await;
     let line = serde_json::json!({
@@ -704,27 +705,40 @@ async fn hello_without_a_protocol_version_is_accepted_as_version_one() {
         "params": { "token": token, "client_version": "0.1.0" }
     })
     .to_string();
-    assert!(
-        !line.contains("protocol_version"),
-        "the pre-M7 hello must not carry the field: {line}"
-    );
     send_line(&mut w, &line).await;
     match recv(&mut r).await.unwrap() {
         ServerMessage::Response {
             id: 1,
-            result: Some(v),
-            error: None,
-        } => {
-            let hr: HelloResult = codec::parse_result(v).unwrap();
-            assert_eq!(hr.protocol_version, Some(PROTOCOL_VERSION));
-        }
+            error: Some(e),
+            ..
+        } => assert_eq!(protocol_mismatch_versions(&e), Some((PROTOCOL_VERSION, 1))),
         other => panic!("unexpected {other:?}"),
     }
-    // Accepted means authenticated: the next request is answered rather than
-    // rejected, and the socket is still up.
-    send(&mut w, 2, Request::SystemCheckPrereqs {}).await;
+    assert!(recv(&mut r).await.is_none(), "connection should be closed");
+    cancel.cancel();
+}
+
+/// A version-1 client that does say so is refused the same way.
+#[tokio::test]
+async fn hello_with_protocol_version_one_is_refused() {
+    let (port, token, cancel, _h) = start().await;
+    let (mut r, mut w) = connect(port).await;
+    send(
+        &mut w,
+        1,
+        Request::Hello(HelloParams {
+            token,
+            client_version: "0.1.0".into(),
+            protocol_version: Some(1),
+        }),
+    )
+    .await;
     match recv(&mut r).await.unwrap() {
-        ServerMessage::Response { id: 2, error, .. } => assert!(error.is_none(), "{error:?}"),
+        ServerMessage::Response {
+            id: 1,
+            error: Some(e),
+            ..
+        } => assert_eq!(protocol_mismatch_versions(&e), Some((PROTOCOL_VERSION, 1))),
         other => panic!("unexpected {other:?}"),
     }
     cancel.cancel();

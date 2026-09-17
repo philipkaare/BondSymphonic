@@ -55,6 +55,9 @@ fn not_a_repo(exists: bool) -> RepoInfo {
         remotes: Vec::new(),
         is_repo: false,
         exists,
+        head_branch: None,
+        in_place_refusal: None,
+        hooks_path_in_tree: None,
     }
 }
 
@@ -406,6 +409,9 @@ pub async fn inspect(git: &Git, repo: &Path) -> Result<RepoInfo, RpcError> {
         remotes,
         is_repo: true,
         exists: true,
+        head_branch: None,
+        in_place_refusal: None,
+        hooks_path_in_tree: None,
     })
 }
 

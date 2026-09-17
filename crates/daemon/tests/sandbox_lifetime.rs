@@ -122,6 +122,7 @@ async fn an_idle_sandbox_outlives_the_blocking_pool_keep_alive() {
             base_branch: "main".into(),
             name: "idle".into(),
             init_if_missing: false,
+            in_place: false,
         }))
         .await
         .unwrap(),

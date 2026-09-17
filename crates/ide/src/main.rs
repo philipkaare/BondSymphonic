@@ -33,12 +33,12 @@ mod tests {
         assert_eq!(
             version_line(),
             format!(
-                "bondsymphonic-ide {} (protocol 1)",
+                "bondsymphonic-ide {} (protocol 2)",
                 env!("CARGO_PKG_VERSION")
             )
         );
         // The protocol number is read, not typed twice: this is what makes the
         // line change on its own when the wire format does.
-        assert_eq!(bondsymphonic_proto::PROTOCOL_VERSION, 1);
+        assert_eq!(bondsymphonic_proto::PROTOCOL_VERSION, 2);
     }
 }

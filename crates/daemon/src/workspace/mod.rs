@@ -2,7 +2,9 @@ pub mod changes;
 pub mod lifecycle;
 pub mod registry;
 
-use bondsymphonic_proto::{AgentId, RunId, WorkspaceId, WorkspaceInfo, WorkspaceState};
+use bondsymphonic_proto::{
+    AgentId, RunId, WorkspaceId, WorkspaceInfo, WorkspaceKind, WorkspaceState,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -19,6 +21,10 @@ pub struct Workspace {
     pub state: WorkspaceState,
     pub agents: Vec<AgentId>,
     pub runs: Vec<RunId>,
+    /// Which kind of workspace this is. Absent from a registry written before
+    /// in-place workspaces existed, which only ever held worktrees.
+    #[serde(default)]
+    pub kind: WorkspaceKind,
 }
 
 impl Workspace {
@@ -35,6 +41,7 @@ impl Workspace {
             worktree_path: self.worktree_path.to_string_lossy().into_owned(),
             created_at: self.created_at.clone(),
             allowlist: self.allowlist.clone(),
+            kind: self.kind,
             state: self.state.clone(),
             // Both agent lists are left empty here and filled in by
             // `Daemon::workspace_info`, which is the only path a

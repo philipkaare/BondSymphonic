@@ -304,6 +304,7 @@ fn workspace() -> WorkspaceInfo {
         worktree_path: format!("/packaged/worktrees/{WORKSPACE_ID}"),
         created_at: "2026-09-10T10:00:00Z".to_owned(),
         allowlist: Vec::new(),
+        kind: bondsymphonic_proto::WorkspaceKind::Worktree,
         state: WorkspaceState::Ready,
         agents: Vec::new(),
         agent_records: Vec::new(),

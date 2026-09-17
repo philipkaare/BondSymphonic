@@ -924,6 +924,7 @@ async fn a_sandboxed_process_reaches_the_host_only_through_the_allowlisting_prox
             base_branch: "main".into(),
             name: "netbox".into(),
             init_if_missing: false,
+            in_place: false,
         },
     )
     .await

@@ -283,6 +283,7 @@ pub async fn create_ws(c: &mut Client, repo: &std::path::Path, name: &str) -> Wo
             base_branch: "main".into(),
             name: name.into(),
             init_if_missing: false,
+            in_place: false,
         }))
         .await
         .unwrap(),

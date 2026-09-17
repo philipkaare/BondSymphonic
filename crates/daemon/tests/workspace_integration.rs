@@ -30,6 +30,7 @@ async fn create_list_get_status_destroy_roundtrip_with_events() {
             base_branch: "main".into(),
             name: "agent-1".into(),
             init_if_missing: false,
+            in_place: false,
         }))
         .await;
     let mut events = Vec::new();
@@ -78,6 +79,7 @@ async fn create_list_get_status_destroy_roundtrip_with_events() {
             base_branch: "main".into(),
             name: "agent-1".into(),
             init_if_missing: false,
+            in_place: false,
         }))
         .await
         .unwrap_err();
@@ -140,6 +142,7 @@ async fn restore_marks_missing_worktree_as_error() {
             base_branch: "main".into(),
             name: "a".into(),
             init_if_missing: false,
+            in_place: false,
         }))
         .await
         .unwrap(),
@@ -273,6 +276,7 @@ async fn a_failed_create_emits_error_then_destroying() {
             base_branch: "no-such-branch".into(),
             name: "a".into(),
             init_if_missing: false,
+            in_place: false,
         }))
         .await;
     let mut events = Vec::new();
@@ -843,6 +847,7 @@ async fn create_initialises_a_folder_that_is_not_a_repository_yet() {
             base_branch: "main".into(),
             name: "alpha".into(),
             init_if_missing: true,
+            in_place: false,
         }))
         .await
         .unwrap(),
@@ -893,6 +898,7 @@ async fn create_still_refuses_a_folder_that_is_not_a_repository_without_the_flag
             base_branch: "main".into(),
             name: "alpha".into(),
             init_if_missing: false,
+            in_place: false,
         }))
         .await
         .unwrap_err();
@@ -959,6 +965,7 @@ async fn create_does_not_initialise_when_git_fails_for_another_reason() {
             base_branch: "main".into(),
             name: "alpha".into(),
             init_if_missing: true,
+            in_place: false,
         }))
         .await
         .unwrap_err();
@@ -1008,6 +1015,7 @@ async fn create_initialises_a_folder_inside_a_repository_rather_than_adopting_it
             base_branch: "main".into(),
             name: "alpha".into(),
             init_if_missing: true,
+            in_place: false,
         }))
         .await
         .unwrap(),
@@ -1049,6 +1057,7 @@ async fn create_refuses_a_folder_inside_a_repository_without_the_flag() {
             base_branch: "main".into(),
             name: "alpha".into(),
             init_if_missing: false,
+            in_place: false,
         }))
         .await
         .unwrap_err();
@@ -1082,6 +1091,7 @@ async fn create_refuses_to_initialise_inside_the_daemons_data_directory() {
             base_branch: "main".into(),
             name: "alpha".into(),
             init_if_missing: true,
+            in_place: false,
         }))
         .await
         .unwrap_err();
@@ -1115,6 +1125,7 @@ async fn create_refuses_a_bare_repository_by_name() {
             base_branch: "main".into(),
             name: "alpha".into(),
             init_if_missing: true,
+            in_place: false,
         }))
         .await
         .unwrap_err();
@@ -1157,6 +1168,7 @@ mod workspace_create_guards {
                 base_branch: "main".into(),
                 name: name.into(),
                 init_if_missing: false,
+                in_place: false,
             }))
             .await?;
         Ok(serde_json::from_value(v).unwrap())
@@ -1414,6 +1426,7 @@ mod refused_create_touches_nothing {
                 base_branch: "main".into(),
                 name: "alpha".into(),
                 init_if_missing: false,
+                in_place: false,
             }))
             .await
             .unwrap_err();
@@ -1464,6 +1477,7 @@ mod refused_create_touches_nothing {
                 base_branch: "no-such-branch".into(),
                 name: "alpha".into(),
                 init_if_missing: false,
+                in_place: false,
             }))
             .await
             .unwrap_err();

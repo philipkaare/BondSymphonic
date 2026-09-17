@@ -43,7 +43,13 @@ params!(WorkspaceCreateParams {
     /// to become a repository, and the daemon must not make that decision for
     /// them. Where it is set, the IDE has said so in the New Agent dialog.
     #[serde(default)]
-    init_if_missing: bool
+    init_if_missing: bool,
+    /// Work directly in the checkout at `repo_path` instead of a new worktree.
+    /// `base_branch` is then ignored and may be empty. Off by default, and the
+    /// protocol version went to 2 with it: an older daemon would ignore the
+    /// flag and quietly make a worktree.
+    #[serde(default)]
+    in_place: bool
 });
 params!(WorkspaceIdParams {
     workspace_id: WorkspaceId
@@ -259,6 +265,7 @@ impl Request {
                 base_branch: "main".into(),
                 name: "a".into(),
                 init_if_missing: true,
+                in_place: true,
             }),
             WorkspaceList {},
             WorkspaceGet(WorkspaceIdParams {

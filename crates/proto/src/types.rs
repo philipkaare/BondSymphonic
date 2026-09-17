@@ -74,6 +74,23 @@ pub struct RepoInfo {
     /// well as initialised.
     #[serde(default)]
     pub exists: bool,
+    /// The branch checked out in the repository, or `None` when `HEAD` is
+    /// detached or the path is not a repository. `default_branch` is the
+    /// remote's answer and is not this: an in-place workspace works on what is
+    /// checked out, and the New Agent dialog shows that.
+    #[serde(default)]
+    pub head_branch: Option<String>,
+    /// Why an agent cannot work directly in this checkout -- a linked worktree,
+    /// a `.git` that is a file -- as the sentence `workspace.create` would
+    /// refuse with, or `None` when it can.
+    #[serde(default)]
+    pub in_place_refusal: Option<String>,
+    /// The repository's effective `core.hooksPath`, relative to the root, when
+    /// it resolves to a directory inside the working tree (husky does this):
+    /// hooks there are files an in-place agent can edit and the user's own git
+    /// runs. `None` otherwise.
+    #[serde(default)]
+    pub hooks_path_in_tree: Option<String>,
 }
 
 /// The default for [`RepoInfo::is_repo`]. Serde takes a path to a function, not
@@ -90,6 +107,22 @@ pub enum WorkspaceState {
     SandboxDown,
     Error(String),
     Destroying,
+}
+
+/// Which of the two shapes a workspace has.
+///
+/// `Worktree` is the original: a `bs/<name>/work` branch checked out in a
+/// worktree of the daemon's own. `InPlace` is an agent working directly in the
+/// repository's checkout, on whatever branch is checked out there; its
+/// `worktree_path` is the repository root and nothing is ever merged out of it.
+/// Defaults to `Worktree`, which is what every registry and reply written before
+/// the field existed describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceKind {
+    #[default]
+    Worktree,
+    InPlace,
 }
 
 /// One agent a workspace has, as clients see it in
@@ -146,6 +179,9 @@ pub struct WorkspaceInfo {
     pub worktree_path: String,
     pub created_at: String, // RFC 3339
     pub allowlist: Vec<String>,
+    /// Which kind of workspace this is. See [`WorkspaceKind`].
+    #[serde(default)]
+    pub kind: WorkspaceKind,
     #[serde(flatten)]
     pub state: WorkspaceState,
     /// The workspace's agents by id, oldest first, running and ended alike.

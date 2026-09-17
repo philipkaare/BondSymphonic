@@ -312,6 +312,7 @@ async fn create(
             // The script's repository is a repository already; the script is
             // not the place to exercise initialising one.
             init_if_missing: false,
+            in_place: false,
         }))
         .await
         .map_err(|e| e.to_string())?;
