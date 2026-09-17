@@ -815,3 +815,16 @@ mod review_fixes_task_7 {
         );
     }
 }
+
+/// `workspace.restart` starts a sandbox and may repair the worktree's git
+/// registration on the way, which is a git command or two on top of the start:
+/// the same kind of work `workspace.create` does, so the same two minutes. A
+/// Retry abandoned at 30 s would be reported as failed while the sandbox is
+/// still coming up.
+#[test]
+fn a_workspace_restart_waits_as_long_as_a_create() {
+    assert_eq!(
+        default_timeout_for("workspace.restart"),
+        default_timeout_for("workspace.create")
+    );
+}

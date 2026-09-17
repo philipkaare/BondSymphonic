@@ -77,6 +77,9 @@ pub const CREATE_PR_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 /// default, and the New Agent dialog opened with no branches in its list
 /// because of it. A create that has to initialise the folder first does that
 /// work and more.
+///
+/// `workspace.restart` gets it too: it starts a sandbox, which is part of what
+/// a create does, and may re-register the worktree with git on the way.
 pub const REPOSITORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long `method` is given when the client has not been told otherwise.
@@ -90,7 +93,7 @@ pub fn default_timeout_for(method: &str) -> Duration {
     match method {
         "workspace.merge" => MERGE_REQUEST_TIMEOUT,
         "workspace.create_pr" => CREATE_PR_REQUEST_TIMEOUT,
-        "repo.inspect" | "workspace.create" => REPOSITORY_REQUEST_TIMEOUT,
+        "repo.inspect" | "workspace.create" | "workspace.restart" => REPOSITORY_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
 }
