@@ -379,7 +379,8 @@ sandbox is not running. Its pane has a red banner at the top saying what
 happened:
 
 - *The sandbox for this workspace is not running* — it stopped unexpectedly
-  while the IDE was open. The worktree and the conversation are kept.
+  while the IDE was open. Retry starts it again; the worktree and the
+  conversation are kept.
 - *This workspace could not be started* — the daemon could not bring it back,
   for example after a restart; the line under it names the reason, such as a
   worktree whose git registration had gone missing (see Troubleshooting).
@@ -391,14 +392,14 @@ The banner offers two buttons:
   succeeds the banner goes away and, if the workspace's agent needs one, a new
   agent is started resuming the same conversation. If it fails, the banner
   shows the new reason and you can retry once the cause is fixed.
-- **Remove workspace…** asks the same question as **Destroy workspace…** on
+- **Destroy workspace…** asks the same question as the command of that name on
   the Workspace menu and the tab's own menu — *Destroy workspace "\<name\>"? Its
   sandbox and worktree are removed.*, with a **Force (discard changes)** box
   you can tick up front. Left unticked, and the daemon cannot tell the
   workspace is clean — which happens exactly when its worktree's git
   registration is the thing that went missing — you are asked once more:
   *Workspace "\<name\>" may have uncommitted changes[, and has commits that are
-  not merged into its base branch]. Remove it anyway?* **Remove anyway**
+  not merged into its base branch]. Destroy it anyway?* **Destroy anyway**
   discards them and deletes the workspace's branch, with any commits only it
   has.
 
