@@ -492,7 +492,34 @@ pub async fn ensure_registered(layout: &Layout) -> Result<Registration, RpcError
     let repo_lock = super::repo_lock(&layout.repo);
     let _repo_guard = repo_lock.lock().await;
     let gitdir = layout.worktree_gitdir();
-    if gitdir.is_dir() {
+    let has = |name: &str| gitdir.join(name).is_file();
+    let written = has("HEAD") && has("commondir") && has("gitdir");
+    if written {
+        // A registration with no index is one whose rebuild was cut short — the
+        // daemon killed between writing the files and `read-tree`. Git takes a
+        // missing index as every tracked file deleted, so the first plain
+        // `git commit` in the worktree would commit an empty tree onto the
+        // branch. `HEAD` is kept as it is: those three files are all git needs
+        // to find it.
+        let repaired = if has("index") {
+            Registration::Intact
+        } else {
+            // Left by the same interrupted `read-tree`, and it would make the
+            // next one refuse. Nothing else can be holding it: this runs before
+            // the workspace's sandbox starts.
+            let _ = std::fs::remove_file(gitdir.join("index.lock"));
+            read_tree(layout).await.map_err(|e| {
+                RpcError::new(
+                    e.code,
+                    format!(
+                        "This workspace's worktree has lost its index, and rebuilding it \
+                         failed: {}",
+                        e.message
+                    ),
+                )
+            })?;
+            Registration::Repaired
+        };
         if !gitdir.join("locked").exists() {
             if let Err(e) = lock(layout).await {
                 tracing::warn!(
@@ -501,7 +528,16 @@ pub async fn ensure_registered(layout: &Layout) -> Result<Registration, RpcError
                 );
             }
         }
-        return Ok(Registration::Intact);
+        return Ok(repaired);
+    }
+    if gitdir.exists() {
+        // Half written: some of git's files are there and some are not, which is
+        // a daemon killed partway through `rebuild` (or git killed partway
+        // through `worktree add`). The directory is named after this
+        // workspace's id and holds only registration metadata, so it is taken
+        // away and the registration treated as missing.
+        tracing::warn!(gitdir = %gitdir.display(), "removing a half-written worktree registration");
+        std::fs::remove_dir_all(&gitdir).map_err(|e| RpcError::io(&e))?;
     }
     if let Err(why) = repairable(layout).await {
         return Err(RpcError::new(
@@ -641,8 +677,16 @@ async fn rebuild(layout: &Layout) -> Result<(), RpcError> {
     // Git finds a registration by comparing this path with the one it is given,
     // and git for Windows writes it, and compares it, with forward slashes
     // (checked against 2.52). A backslash here makes `worktree lock` answer
-    // "is not a working tree".
-    let mut back_link = path_arg(&layout.worktree_path.join(".git"));
+    // "is not a working tree". On Unix git writes the realpath, symlinks
+    // resolved; Windows is left as given, because `canonicalize` there answers
+    // with a `\\?\` path git does not write.
+    let mut worktree = layout.worktree_path.clone();
+    if cfg!(unix) {
+        if let Ok(real) = std::fs::canonicalize(&worktree) {
+            worktree = real;
+        }
+    }
+    let mut back_link = path_arg(&worktree.join(".git"));
     if cfg!(windows) {
         back_link = back_link.replace('\\', "/");
     }
@@ -654,6 +698,11 @@ async fn rebuild(layout: &Layout) -> Result<(), RpcError> {
         std::fs::write(gitdir.join(name), contents).map_err(|e| RpcError::io(&e))?;
     }
     lock(layout).await?;
+    read_tree(layout).await
+}
+
+/// Rebuilds the worktree's index from its `HEAD`, leaving the files alone.
+async fn read_tree(layout: &Layout) -> Result<(), RpcError> {
     layout
         .worktree_git()
         .run(&layout.worktree_path, &["read-tree", "HEAD"])

@@ -709,3 +709,47 @@ async fn ensure_registered_refuses_when_the_worktree_directory_is_gone() {
     assert!(err.message.contains("directory"), "{}", err.message);
     assert!(!layout.worktree_gitdir().exists());
 }
+
+/// A daemon killed between writing a rebuilt registration and rebuilding its
+/// index leaves a gitdir with no `index`. Git reads that as every tracked file
+/// deleted, so a plain `git commit` in the worktree would commit an empty tree.
+/// The next `ensure_registered` must give the registration its index back.
+#[tokio::test]
+async fn ensure_registered_rebuilds_a_missing_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_repo_path, layout) = workspace_with_work(dir.path(), "no-index").await;
+    std::fs::remove_file(layout.worktree_gitdir().join("index")).unwrap();
+
+    let got = worktree::ensure_registered(&layout).await.unwrap();
+
+    assert_eq!(got, worktree::Registration::Repaired);
+    assert_eq!(worktree_status(&layout).await, " M README.md\n?? wip.txt\n");
+}
+
+/// A registration missing one of the files `git worktree add` writes is not
+/// intact either — the daemon was killed while writing it — and is rebuilt
+/// from scratch.
+#[tokio::test]
+async fn ensure_registered_rebuilds_a_half_written_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_repo_path, layout) = workspace_with_work(dir.path(), "half").await;
+    std::fs::remove_file(layout.worktree_gitdir().join("gitdir")).unwrap();
+    std::fs::remove_file(layout.worktree_gitdir().join("index")).unwrap();
+
+    let got = worktree::ensure_registered(&layout).await.unwrap();
+
+    assert_eq!(got, worktree::Registration::Repaired);
+    assert!(layout.worktree_gitdir().join("gitdir").is_file());
+    assert_eq!(worktree_status(&layout).await, " M README.md\n?? wip.txt\n");
+}
+
+/// `git status --porcelain` in the workspace, through the git that sees its
+/// private objects.
+async fn worktree_status(layout: &Layout) -> String {
+    layout
+        .worktree_git()
+        .run(&layout.worktree_path, &["status", "--porcelain"])
+        .await
+        .unwrap()
+        .stdout
+}
