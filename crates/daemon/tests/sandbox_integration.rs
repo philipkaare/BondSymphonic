@@ -1983,6 +1983,7 @@ async fn a_restarted_bwrap_workspace_stays_ready_when_its_old_sandbox_dies() {
     let old_pids = pgrep_pids(&run_dir);
     assert!(!old_pids.is_empty(), "no bwrap process for {run_dir}");
 
+    let mut events = daemon.events.subscribe();
     let info = lifecycle::restart(&daemon, &ws.id).await.unwrap();
     assert_eq!(info.state, WorkspaceState::Ready);
 
@@ -2007,6 +2008,17 @@ async fn a_restarted_bwrap_workspace_stays_ready_when_its_old_sandbox_dies() {
             .exists(),
         "the restart lost the proxy socket"
     );
+    // The old sandbox's shim died with it; that is not the restarted
+    // workspace losing its network.
+    while let Ok(msg) = events.try_recv() {
+        if let ServerMessage::Event {
+            event: Event::DaemonLog { message, .. },
+            ..
+        } = msg
+        {
+            assert!(!message.contains("no network"), "{message}");
+        }
+    }
 
     lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
 }
