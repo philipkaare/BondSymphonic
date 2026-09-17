@@ -89,6 +89,22 @@ WorkspaceBanner::WorkspaceBanner(QWidget* parent) : QFrame(parent) {
     m_restart->hide();
     head->addWidget(m_restart, 0, Qt::AlignTop);
 
+    // The pair a workspace that cannot run gets instead of the two above.
+    // Retry first, for the same reason Restart is: it is the one that repairs.
+    m_retry = new QPushButton(QStringLiteral("Retry"), this);
+    m_retry->setObjectName(QStringLiteral("WorkspaceBannerRetryButton"));
+    m_retry->setToolTip(QStringLiteral(
+        "Start this workspace's sandbox again, then its agent. The worktree and the "
+        "conversation are kept."));
+    m_retry->hide();
+    head->addWidget(m_retry, 0, Qt::AlignTop);
+
+    m_remove = new QPushButton(QStringLiteral("Remove workspace") + QChar(0x2026), this);
+    m_remove->setObjectName(QStringLiteral("WorkspaceBannerRemoveButton"));
+    m_remove->setToolTip(QStringLiteral("Destroy this workspace, after asking"));
+    m_remove->hide();
+    head->addWidget(m_remove, 0, Qt::AlignTop);
+
     m_dismiss = new QPushButton(QStringLiteral("Dismiss"), this);
     m_dismiss->setObjectName(QStringLiteral("WorkspaceBannerDismissButton"));
     head->addWidget(m_dismiss, 0, Qt::AlignTop);
@@ -116,37 +132,89 @@ WorkspaceBanner::WorkspaceBanner(QWidget* parent) : QFrame(parent) {
     // start is in flight.
     QObject::connect(m_restart, &QPushButton::clicked, this,
                      [this] { emit restartRequested(); });
+    // Neither takes the banner down either: a Retry is answered by the
+    // workspace coming back or failing again, and a removal by the pane going.
+    QObject::connect(m_retry, &QPushButton::clicked, this, [this] { emit retryRequested(); });
+    QObject::connect(m_remove, &QPushButton::clicked, this, [this] { emit removeRequested(); });
 
     QFrame::hide();
 }
 
 void WorkspaceBanner::showError(const QString& title, const QString& detail,
                                 const QString& stderrText) {
+    m_errorTitle = title;
+    m_errorDetail = detail;
+    m_errorStderr = stderrText;
+    m_error = true;
+    render();
+    // Every raise starts folded: the sentence is the news, and a wall of git
+    // output unfolding by itself would push the pane down each time.
+    setExpanded(false);
+}
+
+void WorkspaceBanner::reset() {
+    m_errorTitle.clear();
+    m_errorDetail.clear();
+    m_errorStderr.clear();
+    m_error = false;
+    m_restartOffered = false;
+    render();
+    setExpanded(false);
+}
+
+void WorkspaceBanner::setRestartOffered(bool offered) {
+    m_restartOffered = offered;
+    render();
+}
+
+void WorkspaceBanner::showWorkspaceProblem(const QString& title, const QString& detail) {
+    m_problemTitle = title;
+    m_problemDetail = detail;
+    m_problem = true;
+    render();
+}
+
+void WorkspaceBanner::clearWorkspaceProblem() {
+    m_problemTitle.clear();
+    m_problemDetail.clear();
+    m_problem = false;
+    m_retrying = false;
+    render();
+    // The failure underneath comes back folded, as any raise does.
+    setExpanded(false);
+}
+
+void WorkspaceBanner::setRetrying(bool retrying) {
+    m_retrying = retrying;
+    render();
+}
+
+void WorkspaceBanner::render() {
+    const QString title = m_problem ? m_problemTitle : m_errorTitle;
+    const QString detail = m_problem ? m_problemDetail : m_errorDetail;
     m_title->setText(title);
     m_title->setToolTip(title);
     m_detail->setText(detail);
     m_detail->setVisible(!detail.isEmpty());
-    m_stderr->setPlainText(stderrText);
-    m_disclose->setVisible(!stderrText.isEmpty());
-    // Every raise starts folded: the sentence is the news, and a wall of git
-    // output unfolding by itself would push the pane down each time.
-    setExpanded(false);
-    QFrame::show();
-}
-
-void WorkspaceBanner::reset() {
-    m_title->clear();
-    m_detail->clear();
-    m_detail->hide();
-    m_stderr->clear();
-    m_disclose->hide();
-    m_restart->hide();
-    setExpanded(false);
-    QFrame::hide();
-}
-
-void WorkspaceBanner::setRestartOffered(bool offered) {
-    m_restart->setVisible(offered);
+    m_stderr->setPlainText(m_problem ? QString() : m_errorStderr);
+    m_disclose->setVisible(!m_problem && !m_errorStderr.isEmpty());
+    if (m_problem) {
+        m_stderr->hide();
+    }
+    // The agent's Restart needs a sandbox to restart it in, so a workspace that
+    // cannot run offers the sandbox's Retry instead. The offer itself is kept
+    // and comes back with the sandbox.
+    m_restart->setVisible(m_restartOffered && !m_problem);
+    // Nothing to dismiss: the problem goes when the workspace comes back, and
+    // a banner the user could wave away would leave a pane that does nothing.
+    m_dismiss->setVisible(!m_problem);
+    m_retry->setVisible(m_problem);
+    m_remove->setVisible(m_problem);
+    m_retry->setEnabled(!m_retrying);
+    m_remove->setEnabled(!m_retrying);
+    m_retry->setText(m_retrying ? QStringLiteral("Retrying") + QChar(0x2026)
+                                : QStringLiteral("Retry"));
+    setVisible(m_problem || m_error);
 }
 
 void WorkspaceBanner::applyWash() {
@@ -249,6 +317,92 @@ extern "C" std::int32_t bs_widget_test_banner_offers_restart_only_to_a_dead_agen
     banner->reset();
     if (!restart->isHidden()) {
         return 7;
+    }
+    return 0;
+}
+
+/// A workspace that cannot run takes the banner over with Retry and Remove,
+/// hides the agent's Restart and the Dismiss, and hands the banner back to the
+/// failure underneath when it recovers.
+extern "C" std::int32_t bs_widget_test_banner_offers_retry_for_a_workspace_that_cannot_run() {
+    QWidget host;
+    auto* banner = new WorkspaceBanner(&host);
+    auto button = [banner](const char* name) {
+        return banner->findChild<QPushButton*>(QString::fromLatin1(name));
+    };
+    QPushButton* retry = button("WorkspaceBannerRetryButton");
+    QPushButton* remove = button("WorkspaceBannerRemoveButton");
+    QPushButton* restart = button("WorkspaceBannerRestartButton");
+    QPushButton* dismiss = button("WorkspaceBannerDismissButton");
+    auto* detail = banner->findChild<QLabel*>(QStringLiteral("WorkspaceBannerDetail"));
+    if (retry == nullptr || remove == nullptr || restart == nullptr || dismiss == nullptr ||
+        detail == nullptr) {
+        return 1;
+    }
+    if (!retry->isHidden() || !remove->isHidden()) {
+        // A banner nobody has said anything about offers neither.
+        return 2;
+    }
+
+    // A merge failed over an agent that had died, and then the sandbox went.
+    banner->setRestartOffered(true);
+    banner->showError(QStringLiteral("Merge failed"), QStringLiteral("conflict"), QString());
+    banner->showWorkspaceProblem(QStringLiteral("This workspace could not be started"),
+                                 QStringLiteral("worktree registration is missing"));
+    if (banner->isHidden() || retry->isHidden() || remove->isHidden()) {
+        return 3;
+    }
+    if (!restart->isHidden() || !dismiss->isHidden()) {
+        return 4;
+    }
+    if (detail->text() != QStringLiteral("worktree registration is missing")) {
+        return 5;
+    }
+
+    int retries = 0;
+    int removals = 0;
+    QObject::connect(banner, &WorkspaceBanner::retryRequested, [&retries] { ++retries; });
+    QObject::connect(banner, &WorkspaceBanner::removeRequested, [&removals] { ++removals; });
+    retry->click();
+    remove->click();
+    if (retries != 1 || removals != 1 || banner->isHidden()) {
+        return 6;
+    }
+
+    // In flight: nothing to press twice.
+    banner->setRetrying(true);
+    if (retry->isEnabled() || remove->isEnabled()) {
+        return 7;
+    }
+    // A failed Retry says the new reason and can be pressed again.
+    banner->setRetrying(false);
+    banner->showWorkspaceProblem(QStringLiteral("This workspace could not be started"),
+                                 QStringLiteral("bwrap: permission denied"));
+    if (!retry->isEnabled() || detail->text() != QStringLiteral("bwrap: permission denied")) {
+        return 8;
+    }
+
+    // Recovered: the merge failure comes back, with its Restart and Dismiss.
+    banner->setRetrying(true);
+    banner->clearWorkspaceProblem();
+    if (banner->isHidden() || detail->text() != QStringLiteral("conflict")) {
+        return 9;
+    }
+    if (!retry->isHidden() || restart->isHidden() || dismiss->isHidden()) {
+        return 10;
+    }
+    if (!retry->isEnabled()) {
+        // The next problem must not start out looking busy.
+        return 11;
+    }
+
+    // And with nothing underneath, recovery hides the banner.
+    banner->reset();
+    banner->showWorkspaceProblem(QStringLiteral("The sandbox for this workspace is not running"),
+                                 QString());
+    banner->clearWorkspaceProblem();
+    if (!banner->isHidden()) {
+        return 12;
     }
     return 0;
 }

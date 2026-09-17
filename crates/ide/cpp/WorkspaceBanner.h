@@ -45,6 +45,28 @@ public:
     /// the same dead agent still offers it.
     void setRestartOffered(bool offered);
 
+    /// Puts the banner into the state that outranks every failure: the
+    /// workspace itself cannot run. `title` and `detail` say why, and the
+    /// buttons are Retry and Remove workspace instead of Dismiss and Restart --
+    /// dismissing would leave a pane that can do nothing, and restarting an
+    /// agent needs a sandbox to restart it in.
+    ///
+    /// A failure raised while this is up is kept and shown again once
+    /// [`clearWorkspaceProblem`] runs, so a merge that failed just before the
+    /// sandbox died is not lost to it.
+    void showWorkspaceProblem(const QString& title, const QString& detail);
+
+    /// Leaves that state: the banner goes back to the failure it was showing
+    /// before, or hides when there was none.
+    void clearWorkspaceProblem();
+
+    /// Whether a Retry is in flight. The button is disabled and says so, so a
+    /// sandbox start that takes a while is visibly being waited on.
+    void setRetrying(bool retrying);
+
+    /// Whether the banner is showing a workspace problem.
+    bool hasWorkspaceProblem() const { return m_problem; }
+
 signals:
     /// The user pressed Dismiss. The window answers by clearing the tab's error
     /// mark; this widget does not touch the model.
@@ -53,6 +75,13 @@ signals:
     /// The user pressed Restart. The area turns this into the workspace id the
     /// window needs; this widget knows nothing about agents.
     void restartRequested();
+
+    /// The user pressed Retry on a workspace problem.
+    void retryRequested();
+
+    /// The user pressed Remove workspace on a workspace problem. The window
+    /// asks for confirmation; this widget removes nothing.
+    void removeRequested();
 
 protected:
     /// A palette change is the theme moving under the banner. Its red is mixed
@@ -63,6 +92,11 @@ protected:
 private:
     /// Shows or hides the stderr box and puts the right arrow on the button.
     void setExpanded(bool expanded);
+
+    /// Fills the labels and buttons in from whichever of the two layers is on
+    /// top -- the workspace problem, or the latest failure -- and shows or
+    /// hides the banner to match.
+    void render();
 
     /// Mixes the red into whatever the pane is now and installs it. Called from
     /// the constructor and from every palette change.
@@ -77,6 +111,21 @@ private:
     /// See [`setRestartOffered`]. Hidden unless the failure is an agent that
     /// exited.
     QPushButton* m_restart = nullptr;
+    /// See [`showWorkspaceProblem`]. Hidden unless the workspace cannot run.
+    QPushButton* m_retry = nullptr;
+    QPushButton* m_remove = nullptr;
+    /// The latest failure, kept whole so a workspace problem can sit over it
+    /// and hand the banner back.
+    QString m_errorTitle;
+    QString m_errorDetail;
+    QString m_errorStderr;
+    bool m_error = false;
+    bool m_restartOffered = false;
+    /// The workspace problem, when there is one.
+    QString m_problemTitle;
+    QString m_problemDetail;
+    bool m_problem = false;
+    bool m_retrying = false;
     /// Whether [`applyWash`] is already running. Installing a palette raises
     /// the change event that calls it, so without this it would call itself.
     bool m_mixing = false;

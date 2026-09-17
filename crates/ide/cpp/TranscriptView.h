@@ -56,6 +56,13 @@ public:
     /// last.
     void setStarting(bool starting);
 
+    /// Whether the workspace behind this pane cannot run -- its sandbox is
+    /// down or never started. The prompt box says so instead of offering to
+    /// talk to an agent, and the two dropdowns are shut: choosing a model
+    /// restarts the agent, and there is no sandbox to restart it in. The
+    /// banner above the pane is where the way back is.
+    void setWorkspaceDown(bool down);
+
     /// Opens or closes the composer according to whether Claude Code is logged
     /// in, per the daemon's `claude_auth` prerequisite.
     ///
@@ -260,6 +267,8 @@ private:
     QList<QWidget*> m_notices;
     /// See [`setStarting`].
     bool m_starting = false;
+    /// See [`setWorkspaceDown`].
+    bool m_workspaceDown = false;
     /// See [`setClaudeLoggedIn`]. True until told otherwise, so a view built
     /// without a window around it behaves as it always did.
     bool m_loggedIn = true;

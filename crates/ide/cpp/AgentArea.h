@@ -44,6 +44,13 @@ signals:
     /// clearing the tab's error mark; the area touches no model.
     void bannerDismissed(const QString& workspaceId);
 
+    /// `workspaceId`'s banner asked for its sandbox to be started again.
+    void retryWorkspaceRequested(const QString& workspaceId);
+
+    /// `workspaceId`'s banner asked for the workspace to be removed. The window
+    /// asks for confirmation first, exactly as the tab's own menu does.
+    void removeWorkspaceRequested(const QString& workspaceId);
+
     /// A transcript pane's "Log in to Claude Code…" was pressed. The window
     /// answers by opening Settings on its Setup section.
     void loginRequested();
@@ -133,6 +140,28 @@ public:
     /// died before its tab was ever opened is exactly the one that needs it.
     void setRestartOffered(const QString& workspaceId, bool offered);
 
+    /// Says that `workspaceId` cannot run, and why: its banner offers Retry
+    /// and Remove over whatever it was showing, and its composer stops
+    /// offering to talk to an agent that has no sandbox to run in.
+    ///
+    /// A fact about the workspace, held like the restart offer for a pane
+    /// that has not been built yet. Re-stating the same problem changes
+    /// nothing, so the window may call this on every model change.
+    void setWorkspaceProblem(const QString& workspaceId, const QString& title,
+                             const QString& detail);
+
+    /// The workspace can run again: the banner goes back to what it was
+    /// showing before, and any Retry in flight is over.
+    void clearWorkspaceProblem(const QString& workspaceId);
+
+    /// Whether a Retry for `workspaceId` is in flight.
+    void setRetrying(const QString& workspaceId, bool retrying);
+
+    /// The banner over `workspaceId`'s pane, or null before the pane exists.
+    WorkspaceBanner* banner(const QString& workspaceId) const {
+        return m_banners.value(workspaceId);
+    }
+
     /// Records what `workspaceId`'s pane should say while its transcript is
     /// empty, from the tab JSON the window already holds: the agent's name, the
     /// repository and branch the work forked from, and the worktree it happens
@@ -174,6 +203,17 @@ private:
         QString stderrText;
     };
 
+    /// Puts the remembered workspace problem, and whether a Retry is in
+    /// flight, on the workspace's banner and pane.
+    void applyWorkspaceProblem(const QString& workspaceId);
+
+    /// A workspace that cannot run: see [`setWorkspaceProblem`].
+    struct WorkspaceProblem {
+        QString title;
+        QString detail;
+        bool retrying = false;
+    };
+
     /// Wraps `body` in the page this area actually stacks: a banner above the
     /// pane, hidden until something fails. Records both and returns the page.
     QWidget* makePage(const QString& workspaceId, QWidget* body);
@@ -199,6 +239,8 @@ private:
     /// none, which is what a workspace nobody has said anything about should
     /// do.
     QHash<QString, bool> m_restartOffered;
+    /// The workspaces that cannot run. Absent means the workspace can.
+    QHash<QString, WorkspaceProblem> m_problems;
     /// The agent id each transcript is attached to, so re-showing a tab does
     /// not replay its history again.
     QHash<QString, QString> m_attached;

@@ -81,6 +81,10 @@ QWidget* AgentArea::makePage(const QString& workspaceId, QWidget* body) {
     // the same way.
     QObject::connect(banner, &WorkspaceBanner::restartRequested, this,
                      [this, workspaceId] { emit startAgentRequested(workspaceId); });
+    QObject::connect(banner, &WorkspaceBanner::retryRequested, this,
+                     [this, workspaceId] { emit retryWorkspaceRequested(workspaceId); });
+    QObject::connect(banner, &WorkspaceBanner::removeRequested, this,
+                     [this, workspaceId] { emit removeWorkspaceRequested(workspaceId); });
     // A failure reported before this pane existed: raise it now, which is the
     // first moment the user could have seen it.
     if (m_pendingBanners.contains(workspaceId)) {
@@ -92,7 +96,59 @@ QWidget* AgentArea::makePage(const QString& workspaceId, QWidget* body) {
     // needs the button, and it has nothing to do with whether a failure was
     // held above.
     applyRestartOffer(workspaceId);
+    // And whether the workspace can run at all, which outranks both.
+    applyWorkspaceProblem(workspaceId);
     return page;
+}
+
+void AgentArea::setWorkspaceProblem(const QString& workspaceId, const QString& title,
+                                    const QString& detail) {
+    if (workspaceId.isEmpty()) {
+        return;
+    }
+    const auto found = m_problems.constFind(workspaceId);
+    if (found != m_problems.constEnd() && found->title == title && found->detail == detail) {
+        return;
+    }
+    // A new reason is the answer to whatever Retry was in flight, so the
+    // button is pressable again.
+    m_problems.insert(workspaceId, { title, detail, false });
+    applyWorkspaceProblem(workspaceId);
+}
+
+void AgentArea::clearWorkspaceProblem(const QString& workspaceId) {
+    if (m_problems.remove(workspaceId) == 0) {
+        return;
+    }
+    if (WorkspaceBanner* banner = m_banners.value(workspaceId)) {
+        banner->clearWorkspaceProblem();
+    }
+    if (TranscriptView* view = m_transcripts.value(workspaceId)) {
+        view->setWorkspaceDown(false);
+    }
+}
+
+void AgentArea::setRetrying(const QString& workspaceId, bool retrying) {
+    auto found = m_problems.find(workspaceId);
+    if (found == m_problems.end()) {
+        return;
+    }
+    found->retrying = retrying;
+    applyWorkspaceProblem(workspaceId);
+}
+
+void AgentArea::applyWorkspaceProblem(const QString& workspaceId) {
+    const auto found = m_problems.constFind(workspaceId);
+    if (found == m_problems.constEnd()) {
+        return;
+    }
+    if (WorkspaceBanner* banner = m_banners.value(workspaceId)) {
+        banner->showWorkspaceProblem(found->title, found->detail);
+        banner->setRetrying(found->retrying);
+    }
+    if (TranscriptView* view = m_transcripts.value(workspaceId)) {
+        view->setWorkspaceDown(true);
+    }
 }
 
 void AgentArea::showBanner(const QString& workspaceId, const QString& title,
@@ -253,6 +309,7 @@ void AgentArea::showPlaceholder() {
 void AgentArea::removeWorkspace(const QString& workspaceId) {
     m_welcomes.remove(workspaceId);
     m_restartOffered.remove(workspaceId);
+    m_problems.remove(workspaceId);
     m_attached.remove(workspaceId);
     m_starting.remove(workspaceId);
     m_banners.remove(workspaceId);
@@ -409,6 +466,70 @@ extern "C" std::int32_t bs_widget_test_agent_area_holds_a_restartable_banner() {
         if (restartButton(area)->isHidden()) {
             return 9;
         }
+    }
+    return 0;
+}
+
+/// A workspace that cannot run is said before its pane exists and shown when
+/// it is built; its Retry and Remove reach the window as the workspace's own
+/// requests; and recovery takes the problem down without touching anything
+/// else the banner had to say.
+extern "C" std::int32_t bs_widget_test_agent_area_holds_a_workspace_problem() {
+    const QString workspace = QStringLiteral("ws_problem");
+    AgentArea area;
+    area.setWorkspaceProblem(workspace, QStringLiteral("This workspace could not be started"),
+                             QStringLiteral("worktree registration is missing"));
+    // A Retry for a pane nobody has opened is remembered too.
+    area.setRetrying(workspace, true);
+    if (area.banner(workspace) != nullptr) {
+        return 1;
+    }
+    openPane(area, workspace);
+    WorkspaceBanner* banner = area.banner(workspace);
+    if (banner == nullptr || banner->isHidden() || !banner->hasWorkspaceProblem()) {
+        return 2;
+    }
+    auto* retry = banner->findChild<QPushButton*>(QStringLiteral("WorkspaceBannerRetryButton"));
+    auto* remove = banner->findChild<QPushButton*>(QStringLiteral("WorkspaceBannerRemoveButton"));
+    if (retry == nullptr || remove == nullptr || retry->isEnabled()) {
+        return 3;
+    }
+
+    // The same problem again is no news, and must not end the Retry.
+    area.setWorkspaceProblem(workspace, QStringLiteral("This workspace could not be started"),
+                             QStringLiteral("worktree registration is missing"));
+    if (retry->isEnabled()) {
+        return 4;
+    }
+    // A different reason is the Retry's answer.
+    area.setWorkspaceProblem(workspace, QStringLiteral("This workspace could not be started"),
+                             QStringLiteral("bwrap: permission denied"));
+    if (!retry->isEnabled()) {
+        return 5;
+    }
+
+    QString retried;
+    QString removed;
+    QObject::connect(&area, &AgentArea::retryWorkspaceRequested, &area,
+                     [&retried](const QString& id) { retried = id; });
+    QObject::connect(&area, &AgentArea::removeWorkspaceRequested, &area,
+                     [&removed](const QString& id) { removed = id; });
+    retry->click();
+    remove->click();
+    if (retried != workspace || removed != workspace) {
+        return 6;
+    }
+
+    // A merge failure raised meanwhile waits under the problem and is what is
+    // left when the workspace comes back.
+    area.showBanner(workspace, QStringLiteral("merge failed"), QStringLiteral("conflict"),
+                    QString());
+    if (!banner->hasWorkspaceProblem()) {
+        return 7;
+    }
+    area.clearWorkspaceProblem(workspace);
+    if (banner->hasWorkspaceProblem() || banner->isHidden()) {
+        return 8;
     }
     return 0;
 }

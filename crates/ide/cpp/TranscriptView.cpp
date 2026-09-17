@@ -514,6 +514,14 @@ void TranscriptView::setStarting(bool starting) {
     onStateChanged();
 }
 
+void TranscriptView::setWorkspaceDown(bool down) {
+    if (m_workspaceDown == down) {
+        return;
+    }
+    m_workspaceDown = down;
+    onStateChanged();
+}
+
 void TranscriptView::onStateChanged() {
     if (m_model.isNull()) {
         return;
@@ -546,6 +554,9 @@ void TranscriptView::onStateChanged() {
     const bool noAgent = agentId.isEmpty();
     if (m_starting) {
         m_input->setBusy(true, QStringLiteral("starting the agent") + QChar(kEllipsis));
+    } else if (m_workspaceDown) {
+        // Before "no agent": both are true, and only this one says what to do.
+        m_input->setBusy(true, QStringLiteral("this workspace is not running; see Retry above"));
     } else if (noAgent) {
         m_input->setBusy(true, QStringLiteral("no agent is running in this workspace"));
     } else if (busy) {
@@ -558,7 +569,7 @@ void TranscriptView::onStateChanged() {
     // being replayed. A pane whose agent has exited keeps them open on purpose:
     // choosing the model it should come back on is a reasonable way to ask for
     // it back.
-    const bool choosable = !m_starting && !busy;
+    const bool choosable = !m_starting && !busy && !m_workspaceDown;
     m_modelChoice->setEnabled(choosable);
     m_permissionChoice->setEnabled(choosable);
     refreshBanner();
