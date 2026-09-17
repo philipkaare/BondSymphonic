@@ -1143,12 +1143,12 @@ void MainWindow::onNewAgent() {
         m_controller->createWorkspaceWithAgentAndRun(
             dialog.repoPath(), dialog.baseBranch(), dialog.name(), dialog.group(),
             dialog.optionsJson(), dialog.initialPrompt(), dialog.runConfig(),
-            dialog.initIfMissing());
+            dialog.initIfMissing(), false);
         return;
     }
     m_controller->createWorkspaceWithRun(dialog.repoPath(), dialog.baseBranch(), dialog.name(),
                                          dialog.group(), dialog.adapter(), dialog.command(),
-                                         dialog.runConfig(), dialog.initIfMissing());
+                                         dialog.runConfig(), dialog.initIfMissing(), false);
 }
 
 void MainWindow::onDestroyRequested(const QString& workspaceId, const QString& workspaceName) {

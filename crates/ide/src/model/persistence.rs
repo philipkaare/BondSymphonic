@@ -113,6 +113,10 @@ pub struct StateFile {
     pub swapped: bool,
     /// Repositories the New Agent dialog offers, most recent first.
     pub recent_repos: Vec<String>,
+    /// Whether the New Agent dialog last created an in-place workspace, so it
+    /// opens on the same choice. Written only when a dialog was accepted with
+    /// the choice available.
+    pub new_agent_in_place: bool,
     /// `QMainWindow::saveState()`, base64.
     pub window_state_b64: String,
     /// `QWidget::saveGeometry()`, base64.
@@ -134,6 +138,7 @@ impl Default for StateFile {
             splitter_sizes: Vec::new(),
             swapped: false,
             recent_repos: Vec::new(),
+            new_agent_in_place: false,
             window_state_b64: String::new(),
             geometry_b64: String::new(),
             port_overrides: BTreeMap::new(),

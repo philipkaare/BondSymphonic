@@ -30,6 +30,7 @@ fn tab(id: &str, name: &str) -> AgentTab {
         status: TabStatus::Creating,
         detail: String::new(),
         worktree_path: format!("/wt/{name}"),
+        kind: bondsymphonic_proto::WorkspaceKind::default(),
         adapter: AgentAdapterKind::Terminal,
         command: None,
         run_config: None,
@@ -1346,4 +1347,78 @@ fn a_recovered_claude_tab_needs_an_agent_unless_one_is_alive() {
 
     let terminal = tab("ws_2", "beta");
     assert!(!terminal.agent_needs_start());
+}
+
+/// In-place workspaces, 2026-09-17: the tab carries the kind the daemon
+/// reports, keeps it through events and a restore, and words a stopped
+/// sandbox for a checkout rather than a worktree.
+mod in_place_model {
+    use bondsymphonic_ide::model::app_state::{workspace_problem_for, AgentTab, Workspaces};
+    use bondsymphonic_proto::*;
+
+    fn info(id: &str, kind: WorkspaceKind, state: WorkspaceState) -> WorkspaceInfo {
+        WorkspaceInfo {
+            id: id.into(),
+            name: id.into(),
+            repo_path: "/r".into(),
+            base_branch: "main".into(),
+            branch: "main".into(),
+            worktree_path: "/r".into(),
+            created_at: "t".into(),
+            allowlist: vec![],
+            state,
+            agents: vec![],
+            agent_records: vec![],
+            runs: vec![],
+            kind,
+        }
+    }
+
+    #[test]
+    fn a_tab_takes_its_kind_from_the_daemon_and_keeps_it() {
+        let ip = info("ws_ip", WorkspaceKind::InPlace, WorkspaceState::Ready);
+        let tab = AgentTab::from_workspace_info(&ip);
+        assert!(tab.is_in_place());
+        let json = serde_json::to_value(&tab).unwrap();
+        assert_eq!(json["kind"], "in_place");
+
+        // Restored from the saved arrangement and the daemon's list.
+        let mut model = Workspaces::from_persisted(&[], std::slice::from_ref(&ip), None);
+        assert!(model.is_in_place(&ip.id));
+        // An event refreshes it, as it does the branch.
+        model.apply_workspace_info(&info(
+            "ws_ip",
+            WorkspaceKind::InPlace,
+            WorkspaceState::SandboxDown,
+        ));
+        assert!(model.is_in_place(&ip.id));
+        assert!(!model.is_in_place(&WorkspaceId("ws_other".into())));
+    }
+
+    #[test]
+    fn a_tab_saved_before_the_field_existed_is_a_worktree_tab() {
+        let tab = AgentTab::from_workspace_info(&info(
+            "ws_wt",
+            WorkspaceKind::Worktree,
+            WorkspaceState::Ready,
+        ));
+        let mut json = serde_json::to_value(&tab).unwrap();
+        json.as_object_mut().unwrap().remove("kind");
+        let back: AgentTab = serde_json::from_value(json).unwrap();
+        assert!(!back.is_in_place());
+    }
+
+    #[test]
+    fn a_stopped_sandbox_in_place_says_the_checkout_is_untouched() {
+        let p =
+            workspace_problem_for(&WorkspaceState::SandboxDown, WorkspaceKind::InPlace).unwrap();
+        assert!(
+            p.detail.contains("your checkout is not touched"),
+            "{}",
+            p.detail
+        );
+        let p =
+            workspace_problem_for(&WorkspaceState::SandboxDown, WorkspaceKind::Worktree).unwrap();
+        assert!(p.detail.contains("the worktree is kept"), "{}", p.detail);
+    }
 }

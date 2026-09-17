@@ -317,6 +317,25 @@ fn note_workspace_created(group: &str, workspace: &str, repo_path: &str) {
     });
 }
 
+/// The `workspace.create` the New Agent dialog's answers make. The base branch
+/// of an in-place create is not sent: the daemon ignores it, and a branch name
+/// on the wire would read as though one had been chosen.
+pub fn create_params(
+    repo_path: String,
+    base_branch: String,
+    name: String,
+    init_if_missing: bool,
+    in_place: bool,
+) -> WorkspaceCreateParams {
+    WorkspaceCreateParams {
+        repo_path,
+        base_branch: if in_place { String::new() } else { base_branch },
+        name,
+        init_if_missing,
+        in_place,
+    }
+}
+
 /// What `noteEditors` accepts: the object the window builds,
 /// `{"open": [...], "active": "..."}`, or a bare array of open paths from
 /// anything that does not track which tab is in front. `None` for a string
@@ -600,6 +619,9 @@ pub mod qobject {
         /// answer, never a default: the dialog only sets it once it has told
         /// the user, in the sentence under the path, that the folder is about
         /// to become a repository.
+        ///
+        /// `in_place` works directly in the checkout; `base_branch` is then
+        /// ignored.
         #[qinvokable]
         fn create_workspace_with_run(
             self: Pin<&mut AppController>,
@@ -611,6 +633,7 @@ pub mod qobject {
             command: QString,
             run_config: QString,
             init_if_missing: bool,
+            in_place: bool,
         );
 
         /// Create a workspace and start a Claude agent in it. Answers with
@@ -622,6 +645,9 @@ pub mod qobject {
         ///
         /// `run_config` and `init_if_missing` mean what they do on
         /// `createWorkspaceWithRun`.
+        ///
+        /// `in_place` works directly in the checkout; `base_branch` is then
+        /// ignored.
         #[qinvokable]
         fn create_workspace_with_agent_and_run(
             self: Pin<&mut AppController>,
@@ -633,6 +659,7 @@ pub mod qobject {
             initial_prompt: QString,
             run_config: QString,
             init_if_missing: bool,
+            in_place: bool,
         );
 
         /// Start a Claude agent in an existing workspace. Answers with
@@ -956,6 +983,15 @@ pub mod qobject {
         /// Records a repository as the most recently used one.
         #[qinvokable]
         fn note_recent_repo(self: &AppController, path: QString);
+
+        /// Whether the New Agent dialog should open on "Work directly in this
+        /// checkout".
+        #[qinvokable]
+        fn new_agent_in_place(self: &AppController) -> bool;
+
+        /// Records the dialog's choice for next time.
+        #[qinvokable]
+        fn set_new_agent_in_place(self: &AppController, in_place: bool);
 
         /// The port a run of `config` in `workspace_id` should use instead of
         /// the configured one, or 0 when the user set none.
@@ -2377,15 +2413,16 @@ impl qobject::AppController {
         command: QString,
         run_config: QString,
         init_if_missing: bool,
+        in_place: bool,
     ) {
         self.create_workspace_inner(
-            WorkspaceCreateParams {
-                repo_path: repo_path.to_string(),
-                base_branch: base_branch.to_string(),
-                name: name.to_string(),
+            create_params(
+                repo_path.to_string(),
+                base_branch.to_string(),
+                name.to_string(),
                 init_if_missing,
-                in_place: false,
-            },
+                in_place,
+            ),
             CreateEcho {
                 group: group.to_string(),
                 adapter: adapter.to_string(),
@@ -2407,16 +2444,17 @@ impl qobject::AppController {
         initial_prompt: QString,
         run_config: QString,
         init_if_missing: bool,
+        in_place: bool,
     ) {
         let options_json = options_json.to_string();
         self.create_workspace_inner(
-            WorkspaceCreateParams {
-                repo_path: repo_path.to_string(),
-                base_branch: base_branch.to_string(),
-                name: name.to_string(),
+            create_params(
+                repo_path.to_string(),
+                base_branch.to_string(),
+                name.to_string(),
                 init_if_missing,
-                in_place: false,
-            },
+                in_place,
+            ),
             CreateEcho {
                 group: group.to_string(),
                 adapter: "claude".to_owned(),
@@ -3103,6 +3141,18 @@ impl qobject::AppController {
     pub fn note_recent_repo(&self, path: QString) {
         let path = path.to_string();
         note_state(|s| s.note_recent(&path));
+    }
+
+    pub fn new_agent_in_place(&self) -> bool {
+        state_store().with(|s| s.new_agent_in_place)
+    }
+
+    pub fn set_new_agent_in_place(&self, in_place: bool) {
+        note_state_if_changed(|s| {
+            let changed = s.new_agent_in_place != in_place;
+            s.new_agent_in_place = in_place;
+            changed
+        });
     }
 
     pub fn port_override(&self, workspace_id: QString, config: QString) -> i32 {

@@ -49,6 +49,7 @@ fn tab(info: &WorkspaceInfo) -> AgentTab {
         status: TabStatus::from_workspace_state(&info.state),
         detail: String::new(),
         worktree_path: info.worktree_path.clone(),
+        kind: bondsymphonic_proto::WorkspaceKind::default(),
         adapter: AgentAdapterKind::Terminal,
         command: None,
         run_config: None,
@@ -2076,5 +2077,35 @@ mod restart_failure {
         assert_eq!(RestartFailure::Refused as i32, 1);
         assert_eq!(RestartFailure::Timeout as i32, 2);
         assert_eq!(RestartFailure::NoConnection as i32, 3);
+    }
+}
+
+/// In-place workspaces: what the New Agent dialog's choice turns into on the
+/// wire, and the dialog's remembered mode in `state.json`.
+mod in_place_controller {
+    use bondsymphonic_ide::model::persistence::StateFile;
+    use bondsymphonic_ide::qobjects::app_controller::create_params;
+
+    #[test]
+    fn an_in_place_create_sends_the_flag_and_no_base_branch() {
+        let p = create_params("/r".into(), "main".into(), "a".into(), false, true);
+        assert!(p.in_place);
+        assert_eq!(p.base_branch, "", "ignored by the daemon, so not sent");
+        let p = create_params("/r".into(), "main".into(), "a".into(), true, false);
+        assert!(!p.in_place && p.init_if_missing);
+        assert_eq!(p.base_branch, "main");
+    }
+
+    #[test]
+    fn the_dialog_mode_defaults_to_a_worktree_and_round_trips() {
+        let fresh: StateFile = serde_json::from_str("{}").unwrap();
+        assert!(!fresh.new_agent_in_place);
+        let saved = StateFile {
+            new_agent_in_place: true,
+            ..StateFile::default()
+        };
+        let back: StateFile =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert!(back.new_agent_in_place);
     }
 }

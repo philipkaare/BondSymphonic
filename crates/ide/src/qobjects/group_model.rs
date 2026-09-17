@@ -235,6 +235,12 @@ pub mod qobject {
         #[qinvokable]
         fn workspace_name(self: &GroupModel, workspace_id: QString) -> QString;
 
+        /// Whether `workspace_id` works directly in its repository's checkout.
+        /// The window words Close and the menus from it; false for a workspace
+        /// the model does not track.
+        #[qinvokable]
+        fn workspace_in_place(self: &GroupModel, workspace_id: QString) -> bool;
+
         /// Removes the group named `name`, moving whatever tabs it still holds
         /// into "Unsorted". What "Close group" does once the per-workspace
         /// merges and discards it asked for have all succeeded.
@@ -944,6 +950,12 @@ impl qobject::GroupModel {
         }
     }
 
+    pub fn workspace_in_place(&self, workspace_id: QString) -> bool {
+        self.rust()
+            .workspaces
+            .is_in_place(&WorkspaceId(workspace_id.to_string()))
+    }
+
     pub fn remove_group(mut self: Pin<&mut Self>, name: QString) -> bool {
         let name = name.to_string();
         let removed = self.as_mut().rust_mut().workspaces.remove_group(&name);
@@ -1038,6 +1050,9 @@ impl qobject::GroupModel {
             adapter_name(tab.adapter),
             status_text(tab.display_status()),
         );
+        if tab.is_in_place() {
+            text.push_str("\nworks in place: no branch or merge of its own");
+        }
         let detail = tab.display_detail();
         if !detail.is_empty() {
             text.push('\n');
@@ -1139,6 +1154,7 @@ mod tests {
             status: TabStatus::Working,
             detail: String::new(),
             worktree_path: String::new(),
+            kind: bondsymphonic_proto::WorkspaceKind::default(),
             adapter: AgentAdapterKind::Terminal,
             command: None,
             run_config: None,

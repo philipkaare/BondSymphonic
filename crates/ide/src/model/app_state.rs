@@ -2,7 +2,8 @@
 
 use crate::model::persistence::{PersistedGroup, PersistedTab};
 use bondsymphonic_proto::{
-    AgentAdapterKind, AgentId, AgentState, AgentSummary, WorkspaceId, WorkspaceInfo, WorkspaceState,
+    AgentAdapterKind, AgentId, AgentState, AgentSummary, WorkspaceId, WorkspaceInfo, WorkspaceKind,
+    WorkspaceState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -237,6 +238,12 @@ pub struct AgentTab {
     /// was carried still loads; `apply_workspace_info` fills it in again.
     #[serde(default)]
     pub worktree_path: String,
+    /// Which kind of workspace the tab shows, from `WorkspaceInfo`. Not kept
+    /// anywhere of its own: every restore and every event brings it again.
+    /// Defaulted, so a tab serialised before the field existed reads as the
+    /// worktree it was.
+    #[serde(default)]
+    pub kind: WorkspaceKind,
     pub adapter: AgentAdapterKind,
     pub command: Option<String>,
     /// The run configuration chosen for this workspace, if any, so the Run
@@ -322,11 +329,28 @@ pub struct WorkspaceProblem {
 /// itself. A workspace that failed to start carries the daemon's own reason,
 /// which is a readable sentence and is shown as it came.
 pub fn workspace_problem(state: &WorkspaceState) -> Option<WorkspaceProblem> {
+    workspace_problem_for(state, WorkspaceKind::Worktree)
+}
+
+/// [`workspace_problem`] for a workspace of `kind`. Only the stopped-sandbox
+/// sentence differs: an in-place workspace has no worktree to keep, and what
+/// the user wants to hear is that their checkout was not touched.
+pub fn workspace_problem_for(
+    state: &WorkspaceState,
+    kind: WorkspaceKind,
+) -> Option<WorkspaceProblem> {
     match state {
         WorkspaceState::SandboxDown => Some(WorkspaceProblem {
             title: "The sandbox for this workspace is not running".to_owned(),
-            detail: "It stopped unexpectedly. Retry starts it again; the worktree is kept."
-                .to_owned(),
+            detail: match kind {
+                WorkspaceKind::Worktree => {
+                    "It stopped unexpectedly. Retry starts it again; the worktree is kept."
+                }
+                WorkspaceKind::InPlace => {
+                    "It stopped unexpectedly. Retry starts it again; your checkout is not touched."
+                }
+            }
+            .to_owned(),
         }),
         WorkspaceState::Error(reason) => Some(WorkspaceProblem {
             title: "This workspace could not be started".to_owned(),
@@ -396,6 +420,11 @@ impl AgentTab {
         }
     }
 
+    /// Whether the agent works directly in the repository's checkout.
+    pub fn is_in_place(&self) -> bool {
+        self.kind == WorkspaceKind::InPlace
+    }
+
     /// Whether a workspace that has just come back should have its agent
     /// started: a Claude tab whose agent is missing or has ended.
     ///
@@ -451,6 +480,7 @@ impl AgentTab {
             status: TabStatus::from_workspace_state(&info.state),
             detail: state_detail(&info.state),
             worktree_path: info.worktree_path.clone(),
+            kind: info.kind,
             adapter: agent.map_or(AgentAdapterKind::Claude, |a| a.adapter),
             command: None,
             run_config: None,
@@ -460,7 +490,7 @@ impl AgentTab {
             options_json: agent.map(restart_options_json).unwrap_or_default(),
             op_error: None,
             attention: String::new(),
-            workspace_problem: workspace_problem(&info.state),
+            workspace_problem: workspace_problem_for(&info.state, info.kind),
         }
     }
 }
@@ -873,6 +903,13 @@ impl Workspaces {
         self.active_tab = 0;
     }
 
+    /// Whether `id` is an in-place workspace. False for one the model does not
+    /// track, which is the wording the window falls back on anyway.
+    pub fn is_in_place(&self, id: &WorkspaceId) -> bool {
+        self.find(id)
+            .is_some_and(|(g, t)| self.groups[g].tabs[t].is_in_place())
+    }
+
     pub fn find(&self, id: &WorkspaceId) -> Option<(usize, usize)> {
         for (gi, g) in self.groups.iter().enumerate() {
             if let Some(ti) = g.tabs.iter().position(|t| &t.workspace_id == id) {
@@ -928,8 +965,9 @@ impl Workspaces {
             tab.status = TabStatus::from_workspace_state(&info.state);
             tab.detail = state_detail(&info.state);
         }
-        tab.workspace_problem = workspace_problem(&info.state);
+        tab.workspace_problem = workspace_problem_for(&info.state, info.kind);
         tab.branch = info.branch.clone();
+        tab.kind = info.kind;
         // Refreshed rather than set once: a tab restored from a session file
         // written before this field existed has none, and the Run panel cannot
         // detect anything without it.
@@ -1383,6 +1421,7 @@ mod tests {
             status: TabStatus::Working,
             detail: "busy".to_owned(),
             worktree_path: String::new(),
+            kind: WorkspaceKind::default(),
             adapter: AgentAdapterKind::Terminal,
             command: None,
             run_config: None,
