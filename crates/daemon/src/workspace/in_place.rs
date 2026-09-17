@@ -345,6 +345,11 @@ impl InPlaceLayout {
     /// and the path falls through to the read-write `.git` below it. Nothing
     /// can prevent that from the sandbox's side, so the daemon notices and
     /// stops the sandbox instead.
+    ///
+    /// The sandbox must be given exactly
+    /// [`ProtectedSnapshot::late_ro_binds`], not a list computed again: the
+    /// list depends on whether `.git/modules` exists, and an entry that is
+    /// bound but not watched is not protected.
     pub fn snapshot(&self) -> std::io::Result<ProtectedSnapshot> {
         let root = std::fs::canonicalize(&self.root)?;
         let mut entries = Vec::new();
@@ -358,23 +363,29 @@ impl InPlaceLayout {
                     format!("{} is not {}", path.display(), kind.described()),
                 ));
             }
-            let name = self.name_of(&path);
-            let mount_point = match path.strip_prefix(&self.root) {
-                Ok(rel) => root.join(rel),
-                Err(_) => path.clone(),
-            };
+            // bwrap makes the path of a bind target inside the sandbox from
+            // the spelling it is given, so a symlink in the root's path can
+            // show up in `mountinfo` either resolved or as written. Either
+            // counts; both are fixed here, once.
+            let mut mount_points = vec![path.clone()];
+            if let Ok(rel) = path.strip_prefix(&self.root) {
+                let canonical = root.join(rel);
+                if canonical != path {
+                    mount_points.push(canonical);
+                }
+            }
             entries.push(Protected {
                 identity: identity(&meta),
-                name,
+                name: self.name_of(&path),
                 path,
-                mount_point,
+                mount_points,
                 kind,
             });
         }
         let contents = [self.config(), self.config_worktree(), self.commondir()]
             .into_iter()
             .map(|path| {
-                let text = read_lossy(&path);
+                let text = read_protected(&path);
                 (self.name_of(&path), path, text)
             })
             .collect();
@@ -434,10 +445,59 @@ fn create_file(path: &Path, bytes: &[u8]) -> Result<(), RpcError> {
         .map_err(|e| io_error(path, e))
 }
 
-fn read_lossy(path: &Path) -> String {
-    std::fs::read(path)
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default()
+/// The most of a protected file [`ProtectedSnapshot::check`] reads.
+const READ_CAP: u64 = 256 * 1024;
+
+/// The most lines a breach's diff carries.
+const DIFF_LINES: usize = 200;
+
+/// Reads a protected file for the breach diff, or says why it will not.
+///
+/// By the time this runs after a breach the agent may have had write access
+/// to the entry, so it may be a FIFO that blocks an `open` forever, a symlink
+/// to `/dev/zero`, or a sparse file of any size. The open neither follows a
+/// symlink nor waits, only a regular file is read, and only up to
+/// [`READ_CAP`]. Control characters come back escaped, since the text goes
+/// to the daemon log.
+fn read_protected(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    const NOT_REGULAR: &str = "is no longer a regular file";
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err("is missing".into()),
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(NOT_REGULAR.into()),
+        Err(e) => return Err(format!("cannot be read: {e}")),
+    };
+    match file.metadata() {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err(NOT_REGULAR.into()),
+        Err(e) => return Err(format!("cannot be read: {e}")),
+    }
+    let mut bytes = Vec::new();
+    if let Err(e) = file.take(READ_CAP + 1).read_to_end(&mut bytes) {
+        return Err(format!("cannot be read: {e}"));
+    }
+    if bytes.len() as u64 > READ_CAP {
+        return Err(format!("is larger than {} KiB; not shown", READ_CAP / 1024));
+    }
+    Ok(String::from_utf8_lossy(&bytes)
+        .chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                format!("\\u{{{:x}}}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect())
 }
 
 /// Which file an entry is. Device and inode, never size or time: the user
@@ -464,9 +524,8 @@ struct Protected {
     name: String,
     /// Where the daemon looks at it.
     path: PathBuf,
-    /// Where the sandbox has it mounted, as its `mountinfo` spells it: the
-    /// canonical path, because a bind lands where the path resolves to.
-    mount_point: PathBuf,
+    /// The spellings under which the sandbox's `mountinfo` may list it.
+    mount_points: Vec<PathBuf>,
     kind: EntryKind,
     identity: (u64, u64),
 }
@@ -475,27 +534,44 @@ struct Protected {
 /// files among them that name programs. See [`InPlaceLayout::snapshot`].
 #[derive(Debug)]
 pub struct ProtectedSnapshot {
+    /// `.git` first, then the late read-only binds in bind order.
     entries: Vec<Protected>,
     /// `(name, path, contents)` of `config`, `config.worktree` and `commondir`.
-    contents: Vec<(String, PathBuf, String)>,
+    contents: Vec<(String, PathBuf, Result<String, String>)>,
 }
 
 impl ProtectedSnapshot {
+    /// The read-only binds this snapshot watches, in bind order: what the
+    /// sandbox's spec must carry.
+    pub fn late_ro_binds(&self) -> Vec<PathBuf> {
+        self.entries[1..].iter().map(|e| e.path.clone()).collect()
+    }
+
     /// `None` while every protected entry is still the one that was bound
     /// (same device, inode and type, still present) and -- when `sandbox_pid`
-    /// is given and its `mountinfo` readable -- still a mount point in the
-    /// sandbox. Otherwise the breach, with what changed in the files that name
-    /// programs.
+    /// is given -- still a mount point in `/proc/<pid>/mountinfo`. Otherwise
+    /// the breach, with what changed in the files that name programs.
     ///
-    /// The mount check catches what identity alone cannot: a directory
-    /// removed and made again may get its old inode number back. It is a
-    /// handful of `lstat` calls and one small read, cheap enough for
+    /// A running sandbox must be checked with a pid. Identity alone misses an
+    /// entry replaced by one with the same inode number, and git's
+    /// lock-and-rename gets the freed number back routinely on ext4: two
+    /// config writes in a row (`git branch -u`) leave `.git/config` with its
+    /// old inode and no bind. `None` is for a backend without mounts. With a
+    /// pid, a `mountinfo` that cannot be read counts as nothing mounted, so
+    /// the answer is a breach rather than a guess.
+    ///
+    /// It is a handful of `lstat` calls and one small read, cheap enough for
     /// [`PROTECTION_POLL`]. Looking from the host side also makes a DrvFs
     /// mount revalidate a name Windows renamed, which inotify never reports.
+    /// The entries are settled before any protected file is read, and those
+    /// reads never block and are bounded ([`read_protected`]), so a breach is
+    /// always answered promptly.
     pub fn check(&self, sandbox_pid: Option<u32>) -> Option<ProtectionBreach> {
-        let mounted = sandbox_pid
-            .and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/mountinfo")).ok())
-            .map(|text| mount_points(&text));
+        let mounted = sandbox_pid.map(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/mountinfo"))
+                .map(|text| mount_points(&text))
+                .unwrap_or_default()
+        });
         let entries: Vec<String> = self
             .entries
             .iter()
@@ -504,7 +580,7 @@ impl ProtectedSnapshot {
                     .is_ok_and(|m| EntryKind::of(&m) == Some(e.kind) && identity(&m) == e.identity);
                 let still_bound = mounted
                     .as_ref()
-                    .is_none_or(|points| points.contains(&e.mount_point));
+                    .is_none_or(|points| e.mount_points.iter().any(|p| points.contains(p)));
                 !(same && still_bound)
             })
             .map(|e| e.name.clone())
@@ -512,11 +588,16 @@ impl ProtectedSnapshot {
         if entries.is_empty() {
             return None;
         }
-        let config_diff = self
-            .contents
-            .iter()
-            .map(|(name, path, before)| line_diff(name, before, &read_lossy(path)))
-            .collect();
+        let mut lines = Vec::new();
+        for (name, path, before) in &self.contents {
+            line_diff(name, before, &read_protected(path), &mut lines);
+        }
+        if lines.len() > DIFF_LINES {
+            let more = lines.len() - DIFF_LINES;
+            lines.truncate(DIFF_LINES);
+            lines.push(format!("... {more} more lines not shown"));
+        }
+        let config_diff = lines.iter().map(|l| format!("{l}\n")).collect();
         Some(ProtectionBreach {
             entries,
             config_diff,
@@ -557,21 +638,33 @@ fn unescape_mount_field(field: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// A whole-file line diff of `name` in unified style, or `""` when nothing
-/// changed. These files are a few dozen lines, so every line is shown rather
-/// than hunks; past a size where the comparison would be slow the old and new
-/// contents are listed in full instead.
-fn line_diff(name: &str, before: &str, after: &str) -> String {
-    if before == after {
-        return String::new();
-    }
+/// Appends a whole-file line diff of `name` in unified style to `out`, or
+/// nothing when it did not change. These files are a few dozen lines, so
+/// every line is shown rather than hunks. A file that could not be read is
+/// one line saying why; past a size where the comparison would be slow, the
+/// old and new lines are listed as they are. The caller caps the total.
+fn line_diff(
+    name: &str,
+    before: &Result<String, String>,
+    after: &Result<String, String>,
+    out: &mut Vec<String>,
+) {
+    let (before, after) = match (before, after) {
+        (Ok(a), Ok(b)) if a == b => return,
+        (Ok(a), Ok(b)) => (a, b),
+        (_, Err(why)) => return out.push(format!("{name} {why}")),
+        (Err(why), Ok(_)) => {
+            return out.push(format!("{name} {why} at the start; not compared"));
+        }
+    };
     let a: Vec<&str> = before.lines().collect();
     let b: Vec<&str> = after.lines().collect();
-    let mut out = format!("--- a/{name}\n+++ b/{name}\n");
-    if a.len().saturating_mul(b.len()) > 1_000_000 {
-        a.iter().for_each(|l| out.push_str(&format!("-{l}\n")));
-        b.iter().for_each(|l| out.push_str(&format!("+{l}\n")));
-        return out;
+    out.push(format!("--- a/{name}"));
+    out.push(format!("+++ b/{name}"));
+    if a.len().saturating_mul(b.len()) > 250_000 {
+        out.extend(a.iter().map(|l| format!("-{l}")));
+        out.extend(b.iter().map(|l| format!("+{l}")));
+        return;
     }
     // Longest common subsequence lengths of every pair of suffixes.
     let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
@@ -587,18 +680,17 @@ fn line_diff(name: &str, before: &str, after: &str) -> String {
     let (mut i, mut j) = (0, 0);
     while i < a.len() || j < b.len() {
         if i < a.len() && j < b.len() && a[i] == b[j] {
-            out.push_str(&format!(" {}\n", a[i]));
+            out.push(format!(" {}", a[i]));
             i += 1;
             j += 1;
         } else if j < b.len() && (i == a.len() || lcs[i][j + 1] >= lcs[i + 1][j]) {
-            out.push_str(&format!("+{}\n", b[j]));
+            out.push(format!("+{}", b[j]));
             j += 1;
         } else {
-            out.push_str(&format!("-{}\n", a[i]));
+            out.push(format!("-{}", a[i]));
             i += 1;
         }
     }
-    out
 }
 
 /// Protected entries of a running in-place sandbox were replaced, removed or

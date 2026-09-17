@@ -452,6 +452,114 @@ fn a_breach_with_unchanged_files_has_no_diff() {
     assert_eq!(breach.config_diff, "");
 }
 
+#[test]
+fn the_snapshot_binds_exactly_what_it_watches() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let l = layout(dir.path(), &repo);
+    l.prepare(&record(dir.path())).unwrap();
+    let snapshot = l.snapshot().unwrap();
+    assert_eq!(snapshot.late_ro_binds(), l.late_ro_binds());
+    // `modules` appearing afterwards changes the layout's answer, not the
+    // snapshot's.
+    std::fs::create_dir(l.modules()).unwrap();
+    assert!(!snapshot.late_ro_binds().contains(&l.modules()));
+    assert!(l.late_ro_binds().contains(&l.modules()));
+}
+
+/// With a pid, a `mountinfo` that cannot be read is no evidence that anything
+/// is still bound.
+#[test]
+fn an_unreadable_mountinfo_is_a_breach() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let l = layout(dir.path(), &repo);
+    l.prepare(&record(dir.path())).unwrap();
+    let snapshot = l.snapshot().unwrap();
+    assert_eq!(snapshot.check(None), None);
+    let breach = snapshot.check(Some(u32::MAX)).unwrap();
+    assert_eq!(breach.entries.len(), snapshot.late_ro_binds().len() + 1);
+    assert_eq!(breach.entries[0], ".git");
+    assert!(breach.entries.contains(&".git/config".to_string()));
+    assert_eq!(breach.config_diff, "");
+}
+
+/// Plan N1: after a breach the agent may have had `.git/config` to itself, so
+/// what is there must not stall or flood the check that stops it.
+#[cfg(unix)]
+#[test]
+fn a_breach_is_answered_promptly_whatever_replaced_the_config() {
+    fn check_within(snapshot: in_place::ProtectedSnapshot) -> in_place::ProtectionBreach {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(snapshot.check(None));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("check blocked")
+            .expect("a breach")
+    }
+    let fresh = || {
+        let sub = tempfile::tempdir().unwrap();
+        let repo = common::init_repo(sub.path());
+        let l = layout(sub.path(), &repo);
+        l.prepare(&record(sub.path())).unwrap();
+        let snapshot = l.snapshot().unwrap();
+        // Moved aside rather than removed, so the new entry cannot get its
+        // inode number back: identity is all `check(None)` has.
+        std::fs::rename(l.config(), l.git_dir.join("config.old")).unwrap();
+        (sub, l, snapshot)
+    };
+
+    // A FIFO with no writer: a plain open would wait forever.
+    let (_keep, l, snapshot) = fresh();
+    assert!(std::process::Command::new("mkfifo")
+        .arg(l.config())
+        .status()
+        .unwrap()
+        .success());
+    let breach = check_within(snapshot);
+    assert_eq!(breach.entries, [".git/config"]);
+    assert_eq!(
+        breach.config_diff,
+        ".git/config is no longer a regular file\n"
+    );
+
+    // A symlink to an endless device.
+    let (_keep, l, snapshot) = fresh();
+    std::os::unix::fs::symlink("/dev/zero", l.config()).unwrap();
+    let breach = check_within(snapshot);
+    assert_eq!(
+        breach.config_diff,
+        ".git/config is no longer a regular file\n"
+    );
+
+    // A sparse file far larger than anything worth reading.
+    let (_keep, l, snapshot) = fresh();
+    std::fs::File::create(l.config())
+        .unwrap()
+        .set_len(100 << 30)
+        .unwrap();
+    let breach = check_within(snapshot);
+    assert_eq!(
+        breach.config_diff,
+        ".git/config is larger than 256 KiB; not shown\n"
+    );
+
+    // A regular file of many lines, with a terminal escape in it: the diff
+    // is capped and the escape does not reach the log as one.
+    let (_keep, l, snapshot) = fresh();
+    let long: String = (0..1000)
+        .map(|i| format!("\tkey{i} = \x1b[2Jvalue\n"))
+        .collect();
+    std::fs::write(l.config(), long).unwrap();
+    let breach = check_within(snapshot);
+    let lines: Vec<&str> = breach.config_diff.lines().collect();
+    assert_eq!(lines.len(), 201, "{}", breach.config_diff);
+    assert!(lines[200].starts_with("... ") && lines[200].ends_with(" more lines not shown"));
+    assert!(!breach.config_diff.contains('\x1b'));
+    assert!(breach.config_diff.contains("\\u{1b}[2Jvalue"));
+}
+
 /// The escape R1 in the plan closes, from the daemon's side: a planted
 /// `commondir` with a config of its own must not reach the pinned git.
 #[cfg(unix)]
@@ -562,7 +670,7 @@ mod bwrap {
             id: "ws_inplace".into(),
             rw_binds: l.rw_binds().iter().map(same).collect(),
             ro_binds: vec![],
-            late_ro_binds: l.late_ro_binds().iter().map(same).collect(),
+            late_ro_binds: snapshot.late_ro_binds().iter().map(same).collect(),
             home,
             run_dir: run,
             env: vec![],
@@ -812,6 +920,66 @@ try config-worktree "printf x > .git/config.worktree"
             !mounts.contains(&format!(" {} ", l.worktrees().display())),
             "the bind should be gone:\n{mounts}"
         );
+        (sleeper.killer)();
+        handle.shutdown().await.unwrap();
+    }
+
+    /// Plan N2: git's lock-and-rename often hands `.git/config` its old inode
+    /// number back (two writes in a row, as `git branch -u` does), so only the
+    /// mount check sees that the bind is gone.
+    #[tokio::test]
+    async fn two_host_config_writes_are_a_breach_whatever_the_inode() {
+        if !bwrap_available() {
+            eprintln!("SKIP: bwrap unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = common::init_repo(dir.path());
+        let l = layout(dir.path(), &repo);
+        let (handle, snapshot) = sandbox_over(dir.path(), &l).await;
+        let (pid, sleeper) = sandbox_host_pid(&handle).await;
+        assert_eq!(snapshot.check(Some(pid)), None);
+        common::git_ok(&repo, &["config", "branch.main.remote", "origin"]);
+        common::git_ok(&repo, &["config", "branch.main.merge", "refs/heads/main"]);
+        let breach = snapshot.check(Some(pid)).unwrap();
+        assert_eq!(breach.entries, [".git/config"]);
+        assert!(
+            breach
+                .config_diff
+                .lines()
+                .any(|line| line == "+\tmerge = refs/heads/main"),
+            "{}",
+            breach.config_diff
+        );
+        (sleeper.killer)();
+        handle.shutdown().await.unwrap();
+    }
+
+    /// Plan N4: a checkout reached through a symlinked directory is watched
+    /// under whichever spelling the sandbox's `mountinfo` uses, so an
+    /// untouched session is not a breach on every poll.
+    #[tokio::test]
+    async fn a_checkout_under_a_symlinked_directory_is_not_a_breach() {
+        if !bwrap_available() {
+            eprintln!("SKIP: bwrap unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        common::init_repo(&real);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let l = layout(dir.path(), &link.join("repo"));
+        let (handle, snapshot) = sandbox_over(dir.path(), &l).await;
+        let (pid, sleeper) = sandbox_host_pid(&handle).await;
+        assert_eq!(snapshot.check(Some(pid)), None);
+        let (_, out) = run_in(
+            &handle,
+            &format!("printf x >> '{}' && echo WROTE", l.config().display()),
+        )
+        .await;
+        assert!(!out.contains("WROTE"), "the config bind is missing");
         (sleeper.killer)();
         handle.shutdown().await.unwrap();
     }
