@@ -54,6 +54,11 @@ pub async fn merge(
     message: Option<String>,
 ) -> Result<MergeResult, RpcError> {
     let ws = d.workspace(id)?;
+    // Before the state check: an in-place workspace has nothing to merge in
+    // any state, and the IDE branches on this reason rather than the prose.
+    if ws.kind == bondsymphonic_proto::WorkspaceKind::InPlace {
+        return Err(crate::workspace::in_place::nothing_to_merge());
+    }
     if ws.state != WorkspaceState::Ready {
         return Err(RpcError::invalid_params(format!(
             "workspace {} is not ready",

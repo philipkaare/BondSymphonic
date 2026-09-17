@@ -28,6 +28,11 @@ pub async fn create_pr(
     draft: bool,
 ) -> Result<CreatePrResult, RpcError> {
     let ws = d.workspace(id)?;
+    // Before the state check: an in-place workspace has nothing to merge in
+    // any state, and the IDE branches on this reason rather than the prose.
+    if ws.kind == bondsymphonic_proto::WorkspaceKind::InPlace {
+        return Err(crate::workspace::in_place::nothing_to_merge());
+    }
     // The same gate `merge` applies. Pushing out of a workspace that is still
     // `Creating`, or one that failed, would publish a half-formed branch.
     if ws.state != WorkspaceState::Ready {

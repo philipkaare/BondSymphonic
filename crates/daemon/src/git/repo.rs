@@ -352,6 +352,74 @@ async fn remotes(git: &Git, repo: &Path) -> Result<Vec<String>, RpcError> {
         .collect())
 }
 
+/// The branch checked out, or `None` for a detached `HEAD`.
+async fn head_branch(git: &Git, repo: &Path) -> Result<Option<String>, RpcError> {
+    match git
+        .run(repo, &["symbolic-ref", "--short", "-q", "HEAD"])
+        .await
+    {
+        Ok(o) => Ok(Some(o.stdout.trim().to_string())),
+        Err(e) if e.data.as_ref().and_then(|d| d["exit_code"].as_i64()) == Some(1) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `core.hooksPath` as the repository's config sets it, or `None`.
+async fn configured_hooks_path(git: &Git, repo: &Path) -> Result<Option<String>, RpcError> {
+    match git.run(repo, &["config", "--get", "core.hooksPath"]).await {
+        Ok(o) => Ok(Some(o.stdout.trim().to_string())),
+        Err(e) if e.data.as_ref().and_then(|d| d["exit_code"].as_i64()) == Some(1) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `configured` (a `core.hooksPath` value) relative to `root`, with `/`
+/// separators, when it resolves inside the working tree -- `.` for the root
+/// itself -- and `None` when it resolves outside it or inside `.git`, which an
+/// in-place agent cannot write. A relative value is relative to the root,
+/// which is where git runs hooks from in a repository with a working tree.
+pub fn hooks_path_in_tree(root: &Path, configured: &str) -> Option<String> {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return None;
+    }
+    let expanded = match configured.strip_prefix("~/") {
+        Some(rest) => daemon_home()?.join(rest),
+        None => PathBuf::from(configured),
+    };
+    let resolved = if expanded.is_absolute() {
+        expanded
+    } else {
+        root.join(expanded)
+    };
+    let resolved = canonical_ish(&normalise(&resolved));
+    let root = canonical_ish(root);
+    let rel = resolved.strip_prefix(&root).ok()?;
+    if rel.starts_with(".git") {
+        return None;
+    }
+    if rel.as_os_str().is_empty() {
+        return Some(".".into());
+    }
+    Some(rel.to_string_lossy().replace('\\', "/"))
+}
+
+/// `..` and `.` taken out lexically, so a hooks path that climbs out of the
+/// root is seen to, even when the directory it names does not exist.
+fn normalise(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 pub async fn inspect(git: &Git, repo: &Path) -> Result<RepoInfo, RpcError> {
     // A folder that is not a repository — or is one only by way of a parent — is
     // an answer rather than a failure: the New Agent dialog asks about a folder
@@ -360,7 +428,8 @@ pub async fn inspect(git: &Git, repo: &Path) -> Result<RepoInfo, RpcError> {
     if !exists_as_directory(repo)? {
         return Ok(not_a_repo(false));
     }
-    match classify(git, repo).await? {
+    let kind = classify(git, repo).await?;
+    match &kind {
         RepoKind::Root | RepoKind::Worktree => {}
         RepoKind::NotARepo => return Ok(not_a_repo(true)),
         RepoKind::InsideEnclosing { root } => {
@@ -377,22 +446,24 @@ pub async fn inspect(git: &Git, repo: &Path) -> Result<RepoInfo, RpcError> {
         }
         RepoKind::Bare => return Err(bare_repository_error(repo)),
     }
-    // Four independent questions, asked at once. `repo.inspect` is what the New
+    // Six independent questions, asked at once. `repo.inspect` is what the New
     // Agent dialog waits on while the user looks at an empty panel, and on a
-    // large repository under `/mnt/c` the four answers took long enough in
+    // large repository under `/mnt/c` the answers took long enough in
     // sequence to reach the IDE's 30 s timeout. None of them reads what another
     // wrote, so nothing here depends on the order they come back in; the branch
     // list is only *consulted* by the default-branch fallback, which is done
     // below once both have arrived.
     //
-    // `try_join!` rather than four spawned tasks: these are child processes, so
+    // `try_join!` rather than spawned tasks: these are child processes, so
     // there is nothing for a thread to do but wait, and the first failure still
     // ends the call with that failure the way the sequence did.
-    let (branches, configured_head, is_dirty, remotes) = tokio::try_join!(
+    let (branches, configured_head, is_dirty, remotes, head_branch, hooks_path) = tokio::try_join!(
         local_branches(git, repo),
         configured_head(git, repo),
         is_dirty(git, repo),
         remotes(git, repo),
+        head_branch(git, repo),
+        configured_hooks_path(git, repo),
     )?;
     let default_branch = configured_head.unwrap_or_else(|| {
         branches
@@ -409,9 +480,9 @@ pub async fn inspect(git: &Git, repo: &Path) -> Result<RepoInfo, RpcError> {
         remotes,
         is_repo: true,
         exists: true,
-        head_branch: None,
-        in_place_refusal: None,
-        hooks_path_in_tree: None,
+        head_branch,
+        in_place_refusal: crate::workspace::in_place::in_place_refusal(&kind, repo),
+        hooks_path_in_tree: hooks_path.and_then(|p| hooks_path_in_tree(repo, &p)),
     })
 }
 

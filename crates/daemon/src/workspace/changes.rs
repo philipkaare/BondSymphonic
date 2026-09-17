@@ -1,13 +1,16 @@
-//! `workspace.changes` and `workspace.diff`: what a workspace changed relative
-//! to the merge-base of its base branch, computed with git and read through the
-//! pinned `worktree_git` so an agent-writable worktree cannot steer git.
+//! `workspace.changes` and `workspace.diff`: what a workspace changed: a
+//! worktree workspace relative to the merge-base of its base branch, an
+//! in-place one relative to `HEAD`. Computed with git and read through the
+//! pinned `worktree_git` (or [`InPlaceLayout::git`]) so an agent-writable
+//! worktree cannot steer git.
 
 use crate::daemon::Daemon;
 use crate::git::Git;
+use crate::workspace::in_place::{self, InPlaceLayout};
 use crate::workspace::lifecycle::layout_for;
 use crate::workspace::Workspace;
 use bondsymphonic_proto::{
-    ChangedFile, ChangesResult, DiffResult, FileStatus, RpcError, WorkspaceId,
+    ChangedFile, ChangesResult, DiffResult, FileStatus, RpcError, WorkspaceId, WorkspaceKind,
 };
 use std::collections::HashMap;
 
@@ -17,6 +20,28 @@ async fn merge_base(git: &Git, ws: &Workspace) -> Result<String, RpcError> {
         .run(&ws.worktree_path, &["merge-base", &ws.base_branch, "HEAD"])
         .await?;
     Ok(out.stdout.trim().to_string())
+}
+
+/// The pinned git for `ws`'s tree and the commit (or tree) its changes are
+/// measured against.
+///
+/// A worktree workspace is measured from where its branch left the base: its
+/// commits are the work. An in-place workspace has no branch of its own, so its
+/// changes are what `git status` would show -- staged, unstaged and untracked,
+/// against `HEAD` -- whatever the agent has committed or switched to since.
+async fn measuring(d: &Daemon, ws: &Workspace) -> Result<(Git, String), RpcError> {
+    match ws.kind {
+        WorkspaceKind::InPlace => {
+            let git = InPlaceLayout::new(&ws.worktree_path, &d.dirs.no_hooks()).git();
+            let base = in_place::diff_base(&git, &ws.worktree_path).await?;
+            Ok((git, base))
+        }
+        WorkspaceKind::Worktree => {
+            let git = layout_for(d, ws).await?.worktree_git();
+            let base = merge_base(&git, ws).await?;
+            Ok((git, base))
+        }
+    }
 }
 
 /// Line endings belong to the checkout, not to the change: git stores blobs with
@@ -31,23 +56,46 @@ fn normalise_eol(s: String) -> String {
     }
 }
 
-/// Changed files vs the merge-base, committed and uncommitted alike, one entry
-/// per path, sorted by path.
+/// Changed files vs the base (see [`measuring`]), committed and uncommitted
+/// alike, one entry per path, sorted by path.
 pub async fn changes(d: &Daemon, id: &WorkspaceId) -> Result<ChangesResult, RpcError> {
     let ws = d.workspace(id)?;
-    let layout = layout_for(d, &ws).await?;
-    let git = layout.worktree_git();
+    let (git, base) = measuring(d, &ws).await?;
     let cwd = ws.worktree_path.clone();
-    let base = merge_base(&git, &ws).await?;
 
     // Three reads of one commit range, asked at once. None of them looks at
     // what another returned, and `workspace.changes` runs on every refresh of
     // the Changes panel, so the call costs the slowest of the three rather than
     // the sum. They are consistent with each other for the same reason they were
     // before: the merge-base was resolved once, above, and all three are read-only.
-    let name_status_args = ["diff", "--name-status", "-M", "-z", &base, "--"];
-    let numstat_args = ["diff", "--numstat", "-M", "-z", &base, "--"];
-    let status_args = ["status", "--porcelain=v2", "--untracked-files=all", "-z"];
+    //
+    // `in_place::IGNORE_SUBMODULES` on each: an embedded repository's own config
+    // would otherwise run when a status or diff looks into it (plan R3).
+    let name_status_args = [
+        "diff",
+        "--name-status",
+        "-M",
+        "-z",
+        in_place::IGNORE_SUBMODULES,
+        &base,
+        "--",
+    ];
+    let numstat_args = [
+        "diff",
+        "--numstat",
+        "-M",
+        "-z",
+        in_place::IGNORE_SUBMODULES,
+        &base,
+        "--",
+    ];
+    let status_args = [
+        "status",
+        "--porcelain=v2",
+        "--untracked-files=all",
+        in_place::IGNORE_SUBMODULES,
+        "-z",
+    ];
     let (name_status, numstat, status) = tokio::try_join!(
         git.run(&cwd, &name_status_args),
         git.run(&cwd, &numstat_args),
@@ -89,7 +137,7 @@ pub async fn changes(d: &Daemon, id: &WorkspaceId) -> Result<ChangesResult, RpcE
     })
 }
 
-/// Base text (merge-base version, empty if the path did not exist there) and
+/// Base text (the base's version, empty if the path did not exist there) and
 /// working-tree text (empty if deleted or binary) for one repo-relative path.
 pub async fn diff(d: &Daemon, id: &WorkspaceId, path: &str) -> Result<DiffResult, RpcError> {
     let ws = d.workspace(id)?;
@@ -100,8 +148,7 @@ pub async fn diff(d: &Daemon, id: &WorkspaceId, path: &str) -> Result<DiffResult
         // side of a diff and would reach the editor looking like file content.
         return Err(RpcError::invalid_params("path is a directory"));
     }
-    let layout = layout_for(d, &ws).await?;
-    let git = layout.worktree_git();
+    let (git, base) = measuring(d, &ws).await?;
     let cwd = ws.worktree_path.clone();
     // Git speaks `/` in every pathspec, on every platform. `resolve` accepts the
     // separator the client's platform uses, so on Windows it has to be converted
@@ -112,14 +159,14 @@ pub async fn diff(d: &Daemon, id: &WorkspaceId, path: &str) -> Result<DiffResult
     } else {
         path.to_owned()
     };
-    let spec = format!("{}:{}", merge_base(&git, &ws).await?, spec_path);
-    // "Does this path exist at the merge-base" asked as its own question, before
-    // anything is read. A missing path is a normal "added" file and its base side
-    // is empty; every other failure — a lock conflict, a damaged object store, the
-    // 60 s timeout — has to stay an error, because an empty base side is
-    // indistinguishable from a new file and would report every line as added.
-    // Reading the answer off the *read* would conflate the two, which is what this
-    // used to do.
+    let spec = format!("{base}:{spec_path}");
+    // "Does this path exist at the base (see [`measuring`])" asked as its own
+    // question, before anything is read. A missing path is a normal "added"
+    // file and its base side is empty; every other failure — a lock conflict, a
+    // damaged object store, the 60 s timeout — has to stay an error, because an
+    // empty base side is indistinguishable from a new file and would report
+    // every line as added. Reading the answer off the *read* would conflate the
+    // two, which is what this used to do.
     let base_exists = match git.run(&cwd, &["cat-file", "-e", &spec]).await {
         Ok(_) => true,
         Err(e) if absent_at_rev(&e) => false,
