@@ -2346,7 +2346,9 @@ mod sandbox_retry {
             .unwrap_or_else(|| panic!("the refusal never reached the banner\n{}", run.context));
         assert!(first < second, "{}", run.context);
         assert!(
-            run.journal.iter().any(|m| m == "workspace.restart:ws_retry1"),
+            run.journal
+                .iter()
+                .any(|m| m == "workspace.restart:ws_retry1"),
             "{}",
             run.context
         );
@@ -2394,7 +2396,9 @@ mod sandbox_retry {
             run.context
         );
         assert!(
-            !run.journal.iter().any(|m| m.starts_with("workspace.restart")),
+            !run.journal
+                .iter()
+                .any(|m| m.starts_with("workspace.restart")),
             "{}",
             run.context
         );

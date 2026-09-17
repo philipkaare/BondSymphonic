@@ -1242,7 +1242,10 @@ fn a_tab_carries_its_workspace_problem_until_the_workspace_is_ready() {
         WorkspaceState::Error("sandbox would not start".into()),
     ));
     assert_eq!(
-        restored.workspace_problem.as_ref().map(|p| p.detail.as_str()),
+        restored
+            .workspace_problem
+            .as_ref()
+            .map(|p| p.detail.as_str()),
         Some("sandbox would not start")
     );
 
