@@ -853,10 +853,13 @@ starts, records three things:
   refused by `prepare`, and one that gains a second is a breach: a write through
   the other name reaches the same file with identity and mount intact;
 - the contents of everything under `.git` that git runs or reads as
-  configuration — `config`, `config.worktree`, `commondir`, and the listings and
-  contents of `hooks`, `info`, `remotes`, `branches` and `modules` — bounded by
-  `COVERED_CAP` paths and `COVERED_BYTES_CAP` bytes, in a fixed sorted order, so
-  that a repository with hundreds of submodules cannot make the check unbounded;
+  configuration — `config`, `config.worktree`, `commondir`, the listings and
+  contents of `hooks`, `info`, `remotes`, `branches` and `modules`, and the
+  `config.worktree` and `commondir` of each registration under `worktrees`,
+  which is where the same alias trick would otherwise reach a *worktree*
+  workspace's own gitdir — bounded by `COVERED_CAP` paths and
+  `COVERED_BYTES_CAP` bytes, in a fixed sorted order, so that a repository with
+  hundreds of submodules cannot make the check unbounded;
 - the mount points each entry was bound at.
 
 Every `PROTECTION_POLL` (250 ms) while the sandbox is up,
