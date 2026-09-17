@@ -143,6 +143,20 @@ CloseGroupRunner::CloseGroupRunner(AppController* controller, GroupModel* model,
                              stepDone(message);
                          }
                      });
+    // A refusal is neither a success nor a failure on the wire, and the plain
+    // destroy above is the only step that can meet one. The daemon does not
+    // refuse an in-place workspace -- nothing of the user's is removed, so
+    // there is nothing to weigh -- but a tab whose `kind` is stale would send
+    // this call to a worktree workspace, and a run that heard nothing back
+    // would wait for an answer that is never coming. It stops instead, with
+    // the group intact, which is what every other refusal here does.
+    QObject::connect(c, &AppController::workspaceDestroyRefused, this,
+                     [this](const QString& workspaceId, bool, bool) {
+                         if (m_current >= 0 && m_steps.at(m_current).workspaceId == workspaceId) {
+                             stepDone(QStringLiteral(
+                                 "the daemon would not close it without discarding work"));
+                         }
+                     });
 }
 
 void CloseGroupRunner::start() {
@@ -287,6 +301,27 @@ extern "C" std::int32_t bs_widget_test_close_group_closes_an_in_place_workspace_
     // The run must not be left waiting on an answer that already came.
     if (finished != 1 || ok) {
         return 4;
+    }
+
+    // A refusal stops the run rather than leaving it waiting. It cannot happen
+    // for a workspace the daemon agrees is in place, but a stale `kind` is what
+    // would send the plain destroy to a workspace that has work to weigh.
+    int refusedFinished = 0;
+    bool refusedOk = true;
+    QString refusedMessage;
+    auto* refused = new CloseGroupRunner(&controller, &model, QStringLiteral("here"), steps);
+    QObject::connect(refused, &CloseGroupRunner::finished,
+                     [&](bool succeeded, const QString&, const QString& message) {
+                         ++refusedFinished;
+                         refusedOk = succeeded;
+                         refusedMessage = message;
+                     });
+    refused->start();
+    controller.workspaceDestroyRefused(inPlaceId, true, false);
+    QCoreApplication::processEvents();
+    if (refusedFinished != 1 || refusedOk ||
+        !refusedMessage.contains(QLatin1String("without discarding work"))) {
+        return 6;
     }
 
     // A worktree workspace still goes through the discard, which is the forced
