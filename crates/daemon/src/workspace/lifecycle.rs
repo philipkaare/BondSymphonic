@@ -498,7 +498,6 @@ fn watch_protection(
                 .get(&id)
                 .is_some_and(|current| Arc::ptr_eq(current, &handle))
         };
-        let mut pid_missing = false;
         let breach = loop {
             tokio::time::sleep(in_place::PROTECTION_POLL).await;
             if !is_current(&d) {
@@ -506,20 +505,10 @@ fn watch_protection(
             }
             // Always with a pid: a replaced file can come back with the same
             // inode, so the sandbox's own mount table is the check that
-            // counts. A sandbox whose pid cannot be found is usually one on
-            // its way down, which `watch_sandbox` is about to report, so it
-            // gets one poll's grace. After that, pid 0 -- which has no
-            // `/proc` entry, and an unreadable mount table is no evidence
-            // that anything is still bound.
-            let pid = match handle.host_pid() {
-                Some(pid) => pid,
-                None if !pid_missing => {
-                    pid_missing = true;
-                    continue;
-                }
-                None => 0,
-            };
-            pid_missing = false;
+            // counts. A live sandbox whose pid cannot be found has no mount
+            // table to vouch for it, so it gets pid 0, which has no `/proc`
+            // entry and so reads as a breach.
+            let pid = handle.host_pid().unwrap_or(0);
             // Off the runtime: on a DrvFs mount even an `lstat` can wait on
             // Windows.
             let check = {
