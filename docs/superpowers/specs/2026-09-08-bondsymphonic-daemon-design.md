@@ -998,6 +998,43 @@ the exit code lands. Bounded, because a killed grandchild can hold the write end
 open indefinitely and an exit nobody announces is worse than one that cannot say
 why.
 
+**One exit, announced once, with its reason.** The two paths race, and a flag
+decides which of them announces; the rules below are what keep that race from
+deciding *what* the client hears.
+
+- **The reader bounds its own pipe waits.** Once the process has exited, each
+  stdout read gets 1 s of silence (`READER_DRAIN`, measured from the last line,
+  so output already in the pipe is still read however slow the disk work
+  between lines is), and then the 1 s stderr wait above. A grandchild holding
+  stdout open costs the reader a second, not the exit.
+- **Close, claim, publish, in that order.** Each path closes the agent's record
+  (8.5) *before* it claims the announcement, and publishes with
+  `AgentSink::publish_state`, which cannot yield. An abort or a cancellation
+  therefore never lands between the claim and the publish — the case in which
+  the flag is set, the event is never sent, and the other path stays quiet
+  because it reads the flag as somebody else's announcement. `AgentSink::state`
+  closes the record itself, and is not used on these paths for exactly that
+  reason.
+- **`stop` waits for the reader** for its two pipe bounds plus `RECORD_GRACE`
+  (3 s) for its disk work — 5 s in all — and aborts it only then. The record
+  close used to count against the pipe budget alone, so a disk busy with a
+  parallel build decided whether the exit kept its reason or was announced at
+  all. When `stop` does abort the reader it makes the stderr wait itself; when
+  the reader finished normally it does not wait again.
+- **Every record close on an exit path is bounded by `RECORD_GRACE`.** `stop`
+  holds the adapter's lock and a workspace restart or destroy waits on it, so a
+  disk that does not answer must not hold them. When the bound runs out the
+  close stays queued and `Exited` is published anyway (8.5 says what a restart
+  then finds).
+- **Both paths build the same detail**: the `is_error` result's message with the
+  exit code after it when the agent is in `error`, otherwise the stderr tail and
+  the code. Which of them announces is timing; the reason is true either way.
+
+The reader's session-id write is waited for too, up to 2 s
+(`SESSION_RECORD_WAIT`, 8.5), before it reads the next line. Longer, and a disk
+held up for seconds would keep the reader from the line saying why the turn
+failed until `stop` had given up.
+
 Unknown message types are stored verbatim as `system {subtype:"raw"}` so nothing
 is lost when Claude Code adds message kinds.
 
@@ -1099,6 +1136,31 @@ options, started_at, ended_at}`. `options` never carries `api_key` — the key i
 given to one process and is not state to keep. The file is rewritten whole
 through a temporary and a rename, when an agent starts, when the CLI reports its
 session id, and when the process ends.
+
+**How the writes happen.** Every write ends in an `fsync`, so none of them runs
+on a tokio worker. The start's record, and its removal after a failed spawn, are
+done by the start itself on the blocking pool and awaited. A running agent's
+writes — its session id, and the record's close — go through one ordered queue
+per records file, worked by a thread of its own, so the last session id queued
+is the one the file ends up with:
+
+- **The session id** is queued and waited for up to 2 s
+  (`SESSION_RECORD_WAIT`) before the reader reads on. Once a client has seen
+  anything after the `init` line, the id is on disk — on any disk that answers
+  within that bound. On one that does not, the write stays queued and the
+  reader goes on, because the alternative is an exit that cannot say why the
+  turn failed (8.2).
+- **The close** is written once: the first `AgentSink::ended` queues it with the
+  time the process ended and waits for it; later calls return at once, even
+  while that write is still going. The exit paths bound that wait (8.2), and a
+  close that outlasts the bound is still written when the disk comes back. A
+  daemon that goes before then finds the record open at the next start, and
+  restores the agent as one that ended when the daemon restarted.
+- **On the way out**, `main` flushes the queue, bounded to 5 s, as soon as the
+  server has stopped and before any sandbox is shut down: the IDE gives the
+  whole exit five seconds before it kills the relay, and the queue does not
+  outlive the process. A crash loses whatever is still queued, which on a disk
+  that answers is at most the one write in flight.
 
 The record is written **before** the process is spawned, and removed again if
 the spawn fails. Writing it afterwards leaves a window in which the CLI's `init`
