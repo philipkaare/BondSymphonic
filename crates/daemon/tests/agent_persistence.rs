@@ -526,8 +526,9 @@ async fn the_repos_claude_settings_reach_the_workspace_home() {
 
 /// Once a client has seen what the agent said after naming its session, the
 /// session id is on disk: a daemon that dies at that moment comes back with a
-/// session to resume. Every record write is made a second slower here, which a
-/// reader that only queued the write would overtake.
+/// session to resume. Every record write is made half a second slower here,
+/// which a reader that only queued the write would overtake, and which leaves
+/// the reader's two-second wait room on a loaded machine.
 #[tokio::test]
 async fn the_session_id_is_on_disk_before_the_lines_after_it_are_seen() {
     let _guard = ENV.lock().await;
@@ -542,7 +543,7 @@ async fn the_session_id_is_on_disk_before_the_lines_after_it_are_seen() {
 
     let (port, token, d, cancel) = start_daemon(&root).await;
     d.agents
-        .delay_every_record_write_for_tests(Duration::from_secs(1));
+        .delay_every_record_write_for_tests(Duration::from_millis(500));
     let mut c = Client::connect(port, &token).await;
     let ws = create_ws(&mut c, &repo, "durable").await;
     let ag = start_agent(&mut c, &ws.id, options()).await.unwrap();

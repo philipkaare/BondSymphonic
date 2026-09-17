@@ -1035,12 +1035,16 @@ impl AgentAdapter for ClaudeAdapter {
         // An abort now lands only on a reader stuck on the disk, or on one fed
         // without pause by something that outlived the process, and never
         // between its claim and its publish, which cannot yield.
-        let reader_finished = tokio::time::timeout(
-            READER_DRAIN + STDERR_DRAIN + RECORD_GRACE,
-            &mut running.reader_task,
-        )
-        .await
-        .is_ok();
+        // Finished means finished normally: a reader that panicked never made
+        // its stderr wait, so this path still makes it.
+        let reader_finished = matches!(
+            tokio::time::timeout(
+                READER_DRAIN + STDERR_DRAIN + RECORD_GRACE,
+                &mut running.reader_task,
+            )
+            .await,
+            Ok(Ok(()))
+        );
         if !reader_finished {
             warn!(agent = %self.sink.agent_id(), "agent output reader did not finish; stopping it");
             running.reader_task.abort();

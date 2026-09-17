@@ -199,6 +199,19 @@ async fn serve(args: Args) -> Result<()> {
     });
 
     server.run(shutdown).await?;
+    // The agents' record writes still queued -- a session id reported a moment
+    // ago above all -- are what the next daemon restores the agents from, and
+    // the queue does not outlive this function. First, before the sandboxes:
+    // the IDE gives the whole exit five seconds before it kills the relay, and
+    // shutting a sandbox down can take longer than that. Bounded, because a
+    // daemon that cannot exit is worse than one that loses a write.
+    if !daemon
+        .agents
+        .flush_records(std::time::Duration::from_secs(5))
+        .await
+    {
+        tracing::warn!("some agent record writes were still queued at exit");
+    }
     // A setup terminal is an unsandboxed login or install waiting on a person,
     // so it must not outlive the daemon that opened it.
     daemon.shutdown_host().await;
@@ -207,17 +220,6 @@ async fn serve(args: Args) -> Result<()> {
     let sandboxes: Vec<_> = daemon.sandboxes.lock().drain().map(|(_, h)| h).collect();
     for h in sandboxes {
         let _ = h.shutdown().await;
-    }
-    // The agents' record writes still queued -- a session id reported a moment
-    // ago above all -- are what the next daemon restores the agents from, and
-    // the queue does not outlive this function. Bounded, because a daemon that
-    // cannot exit is worse than one that loses a write.
-    if !daemon
-        .agents
-        .flush_records(std::time::Duration::from_secs(5))
-        .await
-    {
-        tracing::warn!("some agent record writes were still queued at exit");
     }
     tracing::info!("daemon exited");
     Ok(())

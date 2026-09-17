@@ -278,15 +278,20 @@ pub const SESSION_RECORD_WAIT: std::time::Duration = std::time::Duration::from_s
 /// receiver that resolves once it has run -- or has panicked, which is logged.
 fn queue_write(
     records: &Arc<AgentRecords>,
+    agent: Option<&AgentId>,
     what: &'static str,
     write: impl FnOnce(&AgentRecords) + Send + 'static,
 ) -> tokio::sync::oneshot::Receiver<()> {
     let (done, finished) = tokio::sync::oneshot::channel();
     let target = records.clone();
+    let agent = agent.cloned();
     records.queue().push(Box::new(move || {
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write(&target)));
         if ran.is_err() {
-            warn!("{what} panicked");
+            match &agent {
+                Some(agent) => warn!(agent = %agent, "{what} panicked"),
+                None => warn!("{what} panicked"),
+            }
         }
         let _ = done.send(());
     }));
@@ -443,9 +448,12 @@ impl AgentSink {
             return;
         };
         let agent = self.agent_id.clone();
-        let written = queue_write(records, "recording an agent's session id", move |records| {
-            records.update(&agent, |r| r.session_id = Some(id))
-        });
+        let written = queue_write(
+            records,
+            Some(&self.agent_id),
+            "recording an agent's session id",
+            move |records| records.update(&agent, |r| r.session_id = Some(id)),
+        );
         if tokio::time::timeout(SESSION_RECORD_WAIT, written)
             .await
             .is_err()
@@ -487,11 +495,16 @@ impl AgentSink {
         // Waited for, behind whatever was queued before it: a client that
         // reacts to `Exited` by restarting the daemon must find the record
         // closed.
-        let _ = queue_write(records, "closing an agent's record", move |records| {
-            records.update(&agent, |r| {
-                r.ended_at.get_or_insert(now);
-            })
-        })
+        let _ = queue_write(
+            records,
+            Some(&self.agent_id),
+            "closing an agent's record",
+            move |records| {
+                records.update(&agent, |r| {
+                    r.ended_at.get_or_insert(now);
+                })
+            },
+        )
         .await;
     }
 
@@ -631,7 +644,7 @@ impl AgentManager {
     /// session id still queued at that point is a conversation the next daemon
     /// cannot offer to resume.
     pub async fn flush_records(&self, within: std::time::Duration) -> bool {
-        let flushed = queue_write(&self.records, "flushing the agent records", |_| {});
+        let flushed = queue_write(&self.records, None, "flushing the agent records", |_| {});
         tokio::time::timeout(within, flushed).await.is_ok()
     }
 
