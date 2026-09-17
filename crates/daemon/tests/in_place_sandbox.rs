@@ -554,8 +554,8 @@ fn a_snapshot_notices_replaced_removed_and_rewritten_entries() {
     assert_eq!(
         breach.sentence(),
         "Git files this workspace protects changed while the agent was running (.git/config, \
-         .git/worktrees), so its sandbox was stopped. Check .git/config for settings you did \
-         not make — the daemon log shows what changed — then press Retry."
+         .git/worktrees), so its sandbox was stopped. See what changed, check .git/config for \
+         settings you did not make, then press Retry."
     );
 }
 

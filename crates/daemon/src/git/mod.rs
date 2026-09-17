@@ -103,14 +103,25 @@ impl Git {
     /// The `git` every runner below starts from: this `Git`'s `-c` prefix, its
     /// environment, the working directory and the three pipes.
     ///
-    /// **The one place `LC_ALL` and `GIT_TERMINAL_PROMPT` are set.** Both are
-    /// load-bearing rather than tidiness, and a runner that forgot one would be
-    /// wrong in a way nothing shouts about: half the daemon's error handling
-    /// reads git's own wording — "not a git repository", "must be run in a work
-    /// tree", "does not exist in" — and a translated git turns every one of
-    /// those into an unexplained failure, while a git that may prompt hangs on a
-    /// credential question nobody is there to answer until the 60 s timeout.
-    /// Adding a fourth runner gets them by construction, which is the point.
+    /// **The one place `LC_ALL`, `GIT_TERMINAL_PROMPT` and
+    /// `GIT_NO_REPLACE_OBJECTS` are set.** All three are load-bearing rather
+    /// than tidiness, and a runner that forgot one would be wrong in a way
+    /// nothing shouts about: half the daemon's error handling reads git's own
+    /// wording — "not a git repository", "must be run in a work tree", "does
+    /// not exist in" — and a translated git turns every one of those into an
+    /// unexplained failure, while a git that may prompt hangs on a credential
+    /// question nobody is there to answer until the 60 s timeout. Adding a
+    /// fourth runner gets them by construction, which is the point.
+    ///
+    /// `GIT_NO_REPLACE_OBJECTS` because `refs/replace/<oid>` makes git read one
+    /// commit or tree where another is named, and an agent can write
+    /// `refs/replace` in both workspace kinds — the shared ref store is
+    /// read-write in a worktree workspace and the whole `.git` is in an in-place
+    /// one. Without it an agent could decide what the daemon's own diff shows
+    /// the user before they press Merge, and what that merge then merges. The
+    /// cost is that a `git replace` the *user* made is honoured by their own git
+    /// and not by the daemon's; that is the right way round, because the
+    /// daemon's job here is to report what is actually recorded.
     ///
     /// Stdin is `null` here; [`Git::run_with_stdin`] is the one caller that
     /// overrides it.
@@ -126,6 +137,7 @@ impl Git {
             .current_dir(cwd)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("LC_ALL", "C")
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

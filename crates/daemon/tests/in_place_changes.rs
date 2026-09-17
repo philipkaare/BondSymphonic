@@ -207,7 +207,7 @@ async fn inspect_names_the_checked_out_branch_and_whether_it_can_be_worked_in_pl
 }
 
 #[tokio::test]
-async fn inspect_reports_a_hooks_path_inside_the_working_tree() {
+async fn inspect_reports_a_hooks_path_the_agent_could_write() {
     let dir = tempfile::tempdir().unwrap();
     let repo = common::init_repo(dir.path());
     let git = Git::new();
@@ -221,8 +221,21 @@ async fn inspect_reports_a_hooks_path_inside_the_working_tree() {
             dir.path().join("elsewhere").to_string_lossy().into_owned(),
             None,
         ),
-        (".git/hooks".to_string(), None),
         ("../outside".to_string(), None),
+        // Only the entries the sandbox binds read-only are out of an agent's
+        // reach. The rest of `.git` is read-write to it, so a hooks path there
+        // names programs it can write, and the dialog has to say so.
+        (".git/hooks".to_string(), None),
+        (".git/info".to_string(), None),
+        (".git/modules".to_string(), None),
+        (".git/worktrees".to_string(), None),
+        (".git/remotes".to_string(), None),
+        (".git/branches".to_string(), None),
+        (".git/hooks/nested".to_string(), None),
+        (".git/my-hooks".to_string(), Some(".git/my-hooks")),
+        // The same place, spelled to look as though it were exempt.
+        (".git/hooks/../my-hooks".to_string(), Some(".git/my-hooks")),
+        (".git".to_string(), Some(".git")),
     ] {
         common::git_ok(&repo, &["config", "core.hooksPath", &configured]);
         let info = repo::inspect(&git, &repo).await.unwrap();
@@ -299,4 +312,41 @@ async fn merging_into_a_checkout_does_not_run_an_embedded_repositorys_config() {
         "the merge ran the embedded repository's config"
     );
     cancel.cancel();
+}
+
+/// Plan I5: an agent can write `refs/replace/<oid>` -- the shared ref store is
+/// read-write in a worktree workspace and the whole `.git` is in an in-place
+/// one -- and git reads one commit where another is named wherever such a ref
+/// exists. That would let an agent choose what the user is shown before they
+/// press Merge, and what the merge then merges.
+#[tokio::test]
+async fn the_daemons_git_does_not_honour_a_planted_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    std::fs::write(repo.join("README.md"), "real\n").unwrap();
+    common::commit_all(&repo, &[], "real");
+    let real = common::git_out(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("README.md"), "decoy\n").unwrap();
+    common::commit_all(&repo, &[], "decoy");
+    let decoy = common::git_out(&repo, &["rev-parse", "HEAD"]);
+    common::git_ok(
+        &repo,
+        &["update-ref", &format!("refs/replace/{real}"), &decoy],
+    );
+    // The agent's own git, and the user's, do honour it.
+    assert_eq!(
+        common::git_out(&repo, &["log", "-1", "--format=%s", &real]),
+        "decoy"
+    );
+
+    let git = Git::new();
+    assert_eq!(
+        git.run(&repo, &["log", "-1", "--format=%s", &real])
+            .await
+            .unwrap()
+            .stdout
+            .trim(),
+        "real",
+        "the daemon's git followed a planted refs/replace"
+    );
 }

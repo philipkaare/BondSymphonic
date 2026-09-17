@@ -387,10 +387,21 @@ async fn configured_hooks_path(git: &Git, repo: &Path) -> Result<Option<String>,
 }
 
 /// `configured` (a `core.hooksPath` value) relative to `root`, with `/`
-/// separators, when it resolves inside the working tree -- `.` for the root
-/// itself -- and `None` when it resolves outside it or inside `.git`, which an
-/// in-place agent cannot write. A relative value is relative to the root,
-/// which is where git runs hooks from in a repository with a working tree.
+/// separators, when the programs it names are ones an in-place agent could
+/// write -- `.` for the root itself -- and `None` when they are not.
+///
+/// "Ones an agent could write", not "inside the working tree": an agent working
+/// in place gets the whole repository read-write, `.git` included, and only the
+/// handful of entries the sandbox binds read-only are out of its reach
+/// ([`crate::workspace::in_place::InPlaceLayout::late_ro_binds`]). So
+/// `core.hooksPath = .git/my-hooks` -- or `.git/hooks/../my-hooks`, which
+/// normalises to the same thing -- names hooks the agent can write just as
+/// surely as `.husky/_` does, and the only value under `.git` that does not is
+/// one inside a read-only entry. Anything outside the repository root is the
+/// user's own and outside every sandbox.
+///
+/// A relative value is relative to the root, which is where git runs hooks from
+/// in a repository with a working tree.
 pub fn hooks_path_in_tree(root: &Path, configured: &str) -> Option<String> {
     let configured = configured.trim();
     if configured.is_empty() {
@@ -408,13 +419,40 @@ pub fn hooks_path_in_tree(root: &Path, configured: &str) -> Option<String> {
     let resolved = canonical_ish(&normalise(&resolved));
     let root = canonical_ish(root);
     let rel = resolved.strip_prefix(&root).ok()?;
-    if rel.starts_with(".git") {
+    if read_only_to_an_agent(rel) {
         return None;
     }
     if rel.as_os_str().is_empty() {
         return Some(".".into());
     }
     Some(rel.to_string_lossy().replace('\\', "/"))
+}
+
+/// Whether a root-relative path is one an in-place sandbox cannot write: one of
+/// the directories under `.git` the daemon binds read-only, or something inside
+/// one.
+///
+/// Named as directories rather than taken from the bind list itself because
+/// this answers a question about a repository nobody has made a workspace of
+/// yet -- the New Agent dialog asks it before there is a layout. The list is
+/// [`crate::workspace::in_place::InPlaceLayout::late_ro_binds`]'s directories;
+/// the files among those binds (`config`, `commondir`, `config.worktree`) can
+/// never be a hooks *path*.
+fn read_only_to_an_agent(rel: &Path) -> bool {
+    use crate::workspace::in_place::ON_DEMAND_DIRS;
+    let mut parts = rel.components();
+    if parts.next().map(|c| c.as_os_str()) != Some(std::ffi::OsStr::new(".git")) {
+        return false;
+    }
+    let Some(under) = parts.next() else {
+        // `.git` itself, which is not a hooks path anyone means, and which
+        // holds the read-write rest of the git directory.
+        return false;
+    };
+    ["hooks", "info", "modules"]
+        .iter()
+        .chain(ON_DEMAND_DIRS.iter())
+        .any(|name| under.as_os_str() == std::ffi::OsStr::new(name))
 }
 
 /// `..` and `.` taken out lexically, so a hooks path that climbs out of the

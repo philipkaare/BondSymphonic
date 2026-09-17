@@ -1171,8 +1171,8 @@ impl ProtectionBreach {
         }
         format!(
             "Git files this workspace protects changed while the agent was running ({}), so its \
-             sandbox was stopped. Check .git/config for settings you did not make — the daemon \
-             log shows what changed — then press Retry.",
+             sandbox was stopped. See what changed, check .git/config for settings you did not \
+             make, then press Retry.",
             self.named()
         )
     }
