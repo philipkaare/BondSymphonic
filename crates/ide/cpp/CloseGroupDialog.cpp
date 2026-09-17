@@ -3,11 +3,13 @@
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDialogButtonBox>
 #include <QFormLayout>
 #include <QLabel>
 #include <QPushButton>
 #include <QVBoxLayout>
+#include <cstdint>
 
 namespace {
 
@@ -130,6 +132,17 @@ CloseGroupRunner::CloseGroupRunner(AppController* controller, GroupModel* model,
                              stepDone(message);
                          }
                      });
+    // The plain destroy an in-place step sends reports its failures on the
+    // leaner signal instead, and a run that heard neither would wait for an
+    // answer that never comes. Only one of the two is emitted per failure, and
+    // `stepDone` has set `m_current` to -1 by the time any second one could
+    // arrive.
+    QObject::connect(c, &AppController::workspaceOpFailed, this,
+                     [this](const QString& workspaceId, const QString&, const QString& message) {
+                         if (m_current >= 0 && m_steps.at(m_current).workspaceId == workspaceId) {
+                             stepDone(message);
+                         }
+                     });
 }
 
 void CloseGroupRunner::start() {
@@ -176,6 +189,16 @@ void CloseGroupRunner::next() {
         m_controller->mergeWorkspace(step.workspaceId, QStringLiteral("merge"), QString());
         return;
     }
+    if (step.inPlace) {
+        // "Close (files are kept)" is the plain destroy the tab menu sends, not
+        // a discard: nothing of the user's is removed, so there is nothing to
+        // force. The daemon ignores `force` for this kind, which makes this
+        // defence in depth rather than a fix -- but a forced destroy is the one
+        // request that would delete a checkout if it were ever routed to a
+        // workspace of the other kind by mistake.
+        m_controller->destroyWorkspace(step.workspaceId, false);
+        return;
+    }
     m_controller->discardWorkspace(step.workspaceId);
 }
 
@@ -193,3 +216,99 @@ void CloseGroupRunner::stepDone(const QString& message) {
                   QStringLiteral("%1: %2").arg(step.name, message));
     deleteLater();
 }
+
+// The offscreen widget checks. See the note in `EditorArea.cpp`; `build.rs`
+// defines `BS_WIDGET_TESTS` for every profile but `release`, and
+// `bs_widget_test_begin` must have run first.
+#if defined(BS_WIDGET_TESTS)
+
+/// The dialog offers an in-place workspace "Close (files are kept)" and no
+/// merge, and the run behind that row sends a plain destroy rather than the
+/// forced one a discard is -- and finishes when that call fails, which is the
+/// signal a destroy reports on.
+extern "C" std::int32_t bs_widget_test_close_group_closes_an_in_place_workspace_plainly() {
+    AppController controller;
+    GroupModel model;
+    const QString inPlaceId = QStringLiteral("ws_inplace");
+    const QString worktreeId = QStringLiteral("ws_worktree");
+
+    QList<CloseGroupChoice> rows;
+    CloseGroupChoice inPlace;
+    inPlace.workspaceId = inPlaceId;
+    inPlace.name = QStringLiteral("checkout");
+    inPlace.inPlace = true;
+    rows.append(inPlace);
+    CloseGroupDialog dialog(QStringLiteral("here"), rows);
+    auto* combo = dialog.findChild<QComboBox*>(QStringLiteral("CloseGroupChoice_") + inPlaceId);
+    if (combo == nullptr || combo->count() != 2) {
+        return 1;
+    }
+    if (combo->itemText(1) != QLatin1String("Close (files are kept)")) {
+        return 2;
+    }
+
+    // What the runner does with that row. There is no daemon behind this
+    // controller, so both calls fail at once -- on different signals, which is
+    // what tells them apart: a discard is a workspace operation and reports on
+    // `workspaceOperationFailed`, a destroy on `workspaceOpFailed`.
+    int destroys = 0;
+    int discards = 0;
+    QObject::connect(&controller, &AppController::workspaceOpFailed,
+                     [&destroys](const QString&, const QString& op, const QString&) {
+                         if (op == QLatin1String("workspace.destroy")) {
+                             ++destroys;
+                         }
+                     });
+    QObject::connect(&controller, &AppController::workspaceOperationFailed,
+                     [&discards](const QString&, const QString& op, const QString&,
+                                 const QString&) {
+                         if (op == QLatin1String("workspace.destroy")) {
+                             ++discards;
+                         }
+                     });
+
+    QList<CloseGroupChoice> steps;
+    CloseGroupChoice closing = inPlace;
+    closing.action = CloseGroupAction::Discard;
+    steps.append(closing);
+    auto* runner = new CloseGroupRunner(&controller, &model, QStringLiteral("here"), steps);
+    int finished = 0;
+    bool ok = true;
+    QObject::connect(runner, &CloseGroupRunner::finished,
+                     [&finished, &ok](bool succeeded, const QString&, const QString&) {
+                         ++finished;
+                         ok = succeeded;
+                     });
+    runner->start();
+    QCoreApplication::processEvents();
+    if (destroys != 1 || discards != 0) {
+        return 3;
+    }
+    // The run must not be left waiting on an answer that already came.
+    if (finished != 1 || ok) {
+        return 4;
+    }
+
+    // A worktree workspace still goes through the discard, which is the forced
+    // destroy its confirmation named.
+    destroys = 0;
+    discards = 0;
+    QList<CloseGroupChoice> worktreeSteps;
+    CloseGroupChoice discarding;
+    discarding.workspaceId = worktreeId;
+    discarding.name = QStringLiteral("feature");
+    discarding.action = CloseGroupAction::Discard;
+    worktreeSteps.append(discarding);
+    auto* second = new CloseGroupRunner(&controller, &model, QStringLiteral("here"), worktreeSteps);
+    int secondFinished = 0;
+    QObject::connect(second, &CloseGroupRunner::finished,
+                     [&secondFinished](bool, const QString&, const QString&) { ++secondFinished; });
+    second->start();
+    QCoreApplication::processEvents();
+    if (discards != 1 || destroys != 0 || secondFinished != 1) {
+        return 5;
+    }
+    return 0;
+}
+
+#endif // BS_WIDGET_TESTS

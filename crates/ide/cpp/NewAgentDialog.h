@@ -154,6 +154,10 @@ private:
     QRadioButton* m_inPlaceMode = nullptr;
     /// What working in place means, under the choice while it is selected.
     QLabel* m_inPlaceHelp = nullptr;
+    /// How the checkout's git files are protected on a Windows drive, where
+    /// they cannot be made read-only for the agent. Shown with the choice, for
+    /// a repository on such a drive only.
+    QLabel* m_driveNote = nullptr;
     /// The repository runs hooks from inside its working tree, which an agent
     /// working in place can rewrite. Plain text: the path is the repository's.
     QLabel* m_hooksWarning = nullptr;

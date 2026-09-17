@@ -49,6 +49,26 @@ constexpr int kPromptRows = 4;
 /// than with a guess.
 const char* kNoRunConfig = "(none)";
 
+/// Whether `path` names a folder on a Windows drive rather than inside the
+/// distro, in either spelling the dialog can be holding: `C:\repo`, which is
+/// what the file dialog and the Recent list hand back, and `/mnt/c/repo`,
+/// which is the same folder as the daemon knows it.
+///
+/// It decides one sentence in this dialog, and nothing the daemon does. A
+/// repository kept inside the distro is reached as `\\wsl.localhost\...` or as
+/// a plain POSIX path, and neither is a drive.
+bool onAWindowsDrive(const QString& path) {
+    if (path.size() >= 2 && path.at(0).isLetter() && path.at(1) == QLatin1Char(':')) {
+        return true;
+    }
+    if (!path.startsWith(QLatin1Char('/'))) {
+        return false;
+    }
+    const QStringList parts = path.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+    return parts.size() >= 2 && parts.at(0) == QLatin1String("mnt") && parts.at(1).size() == 1 &&
+           parts.at(1).at(0).isLetter();
+}
+
 /// Whether the daemon has *said* it cannot run Claude Code.
 ///
 /// Read this way round on purpose. The capabilities arrive with the `hello`
@@ -136,6 +156,18 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     m_inPlaceHelp->setWordWrap(true);
     m_inPlaceHelp->setTextFormat(Qt::PlainText);
     form->addRow(QString(), m_inPlaceHelp);
+
+    m_driveNote = new QLabel(QStringLiteral("This folder is on a Windows drive. There the sandbox "
+                                            "cannot make .git read-only, so a change to it is "
+                                            "caught within a moment instead: the sandbox stops "
+                                            "and shows you what changed."),
+                             this);
+    m_driveNote->setObjectName(QStringLiteral("NewAgentDriveNote"));
+    m_driveNote->setWordWrap(true);
+    m_driveNote->setTextFormat(Qt::PlainText);
+    // Not the hint's red: this is how the protection works here, not something
+    // that will go wrong.
+    form->addRow(QString(), m_driveNote);
 
     m_hooksWarning = new QLabel(this);
     m_hooksWarning->setObjectName(QStringLiteral("NewAgentHooksWarning"));
@@ -665,6 +697,7 @@ void NewAgentDialog::updateModeState() {
     }
     const bool inPlace = m_inPlaceMode->isChecked();
     m_form->setRowVisible(m_inPlaceHelp, inPlace);
+    m_form->setRowVisible(m_driveNote, inPlace && onAWindowsDrive(repoPath()));
     m_hooksWarning->setText(
         m_hooksPath.isEmpty()
             ? QString()
@@ -1019,6 +1052,64 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_offers_the_checkout_itse
     if (inPlace->isEnabled() || dialog.inPlace() || dialog.inPlaceAvailable() ||
         !inPlace->toolTip().contains(QLatin1String("linked worktree"))) {
         return 9;
+    }
+    return 0;
+}
+
+/// On a Windows drive the checkout's git files cannot be made read-only for
+/// the agent, and the dialog says so where the choice is made -- for a
+/// repository on such a drive, and only while working in place is chosen.
+extern "C" std::int32_t bs_widget_test_new_agent_dialog_says_how_a_windows_drive_is_protected() {
+    AppController controller;
+    GroupModel model;
+    const QString inside = QStringLiteral("/home/bs/alpha");
+    NewAgentDialog distro(&controller, &model, inside);
+    auto* note = distro.findChild<QLabel*>(QStringLiteral("NewAgentDriveNote"));
+    auto* inPlace = distro.findChild<QRadioButton*>(QStringLiteral("NewAgentInPlaceMode"));
+    if (note == nullptr || inPlace == nullptr) {
+        return 1;
+    }
+    // A repository inside the distro is on ext4, where the read-only binds
+    // hold, and has nothing to say here.
+    inPlace->setChecked(true);
+    if (!note->isHidden()) {
+        return 2;
+    }
+
+    const QString drive = QStringLiteral("C:\\git\\alpha");
+    NewAgentDialog windows(&controller, &model, drive);
+    note = windows.findChild<QLabel*>(QStringLiteral("NewAgentDriveNote"));
+    inPlace = windows.findChild<QRadioButton*>(QStringLiteral("NewAgentInPlaceMode"));
+    auto* worktree = windows.findChild<QRadioButton*>(QStringLiteral("NewAgentWorktreeMode"));
+    if (note == nullptr || inPlace == nullptr || worktree == nullptr) {
+        return 3;
+    }
+    // A worktree workspace is not in the user's checkout, so the note is not
+    // about it.
+    worktree->setChecked(true);
+    if (!note->isHidden()) {
+        return 4;
+    }
+    inPlace->setChecked(true);
+    if (note->isHidden()) {
+        return 5;
+    }
+    if (!note->text().contains(QLatin1String("Windows drive")) ||
+        !note->text().contains(QLatin1String("read-only")) ||
+        !note->text().contains(QLatin1String("shows you what changed"))) {
+        return 6;
+    }
+
+    // The same folder as the daemon knows it is the same folder.
+    NewAgentDialog mounted(&controller, &model, QStringLiteral("/mnt/c/git/alpha"));
+    note = mounted.findChild<QLabel*>(QStringLiteral("NewAgentDriveNote"));
+    inPlace = mounted.findChild<QRadioButton*>(QStringLiteral("NewAgentInPlaceMode"));
+    if (note == nullptr || inPlace == nullptr) {
+        return 7;
+    }
+    inPlace->setChecked(true);
+    if (note->isHidden()) {
+        return 8;
     }
     return 0;
 }
