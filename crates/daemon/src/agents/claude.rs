@@ -1375,22 +1375,14 @@ settings = \"s.json\"
                 "plan"
             ]
         );
-
-        let options = |mode: &str| AgentStartOptions {
-            command: None,
-            resume_session: None,
-            model: None,
-            permission_mode: Some(mode.to_owned()),
-            api_key: None,
-        };
-        assert!(claude_argv(&options("default"), "linux_bwrap").is_ok());
-        assert!(claude_argv(&options("manual"), "linux_bwrap").is_ok());
-        assert!(claude_argv(&options("bypassPermissions"), "linux_bwrap").is_ok());
-        assert!(claude_argv(&options("nonsense"), "linux_bwrap").is_err());
     }
 
     /// `BS_CLAUDE_BIN` is process-wide, so every case that touches it lives in
-    /// one test -- the probe's choice of program included.
+    /// one test -- the probe's choice of program included, and whether each
+    /// permission mode is accepted. The mode checks used to sit in the test
+    /// above and read the variable without setting it, which raced this one:
+    /// run beside the whitespace case below they saw a hook of `"   "` and
+    /// failed, once in a while, on a mode the CLI takes.
     #[test]
     fn claude_argv_and_probe_bin_pin_the_program_the_flags_and_the_permission_mode() {
         const BWRAP: &str = SANDBOXED_BACKEND;
@@ -1405,6 +1397,17 @@ settings = \"s.json\"
         // The flag assertions run under the hook, so they say nothing about
         // whether this host has Claude Code installed.
         std::env::set_var("BS_CLAUDE_BIN", "claude");
+        let options = |mode: &str| AgentStartOptions {
+            command: None,
+            resume_session: None,
+            model: None,
+            permission_mode: Some(mode.to_owned()),
+            api_key: None,
+        };
+        assert!(claude_argv(&options("default"), BWRAP).is_ok());
+        assert!(claude_argv(&options("manual"), BWRAP).is_ok());
+        assert!(claude_argv(&options("bypassPermissions"), BWRAP).is_ok());
+        assert!(claude_argv(&options("nonsense"), BWRAP).is_err());
         assert_eq!(
             claude_argv(&plain, NOOP).unwrap(),
             [
