@@ -496,6 +496,15 @@ sandbox cannot fully close off:
 The shape is Visual Studio's: the editor is the fixed centre, and everything
 else is a tool window docked around it.
 
+A splash screen sits over the window from launch until the IDE is ready to
+use: it names the phase — launching the daemon, connecting, checking the
+prerequisites, loading your workspaces — and goes away on its own once the
+daemon has answered all three, which is a few seconds on an ordinary launch.
+It does not wait for each workspace's restore; those come up behind it as
+`Creating` and open themselves. Clicking it dismisses it early, and it never
+stays longer than 30 seconds — after that, whatever went wrong is in the
+status bar and under **Settings > Setup**.
+
 - **Explorer** (left), **Agent** (right) and **Output** (bottom) can each be
   dragged to another edge, floated off the window, tabbed together, or closed.
   The editor cannot — it is the centre, and a window with nowhere to put a file

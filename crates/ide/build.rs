@@ -89,6 +89,8 @@ fn main() {
             "cpp/RunPanel.cpp",
             "cpp/MainWindow.h",
             "cpp/MainWindow.cpp",
+            "cpp/SplashScreen.h",
+            "cpp/SplashScreen.cpp",
             "cpp/app.cpp",
             "cpp/Branding.cpp",
         ])

@@ -1,6 +1,7 @@
 #include "app.h"
 #include "Branding.h"
 #include "MainWindow.h"
+#include "SplashScreen.h"
 #include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
@@ -48,8 +49,33 @@ std::int32_t run_app() {
                          }
                      });
 
+    // Up before the window is even built, so the first thing on screen says the
+    // IDE is checking rather than an empty Setup page and a "not logged in"
+    // gate -- which is what one user watched for ten seconds and quit on. A
+    // top-level of its own, so the window's construction and dock restore
+    // below are exactly what they were. Not under `BS_SMOKE_SCRIPT`: that is
+    // the IDE's automated-run switch (see `menuTest` in `MainWindow.cpp`), and
+    // the offscreen end-to-end suite must not have a second top-level competing
+    // with the window for activation.
+    SplashScreen* splash = nullptr;
+    if (qEnvironmentVariableIsEmpty("BS_SMOKE_SCRIPT")) {
+        splash = new SplashScreen(controller);
+        splash->show();
+    }
+
     MainWindow window(controller, groupModel, fileTreeModel, changesModel, runModel);
     window.show();
+    if (splash != nullptr) {
+        // The window is shown behind the splash; when the splash goes the
+        // window is what the user is looking at, and should be what has focus.
+        // Deleted from the loop rather than from inside its own signal.
+        QObject::connect(splash, &SplashScreen::finished, &window, [&window, splash] {
+            window.raise();
+            window.activateWindow();
+            splash->deleteLater();
+        });
+        splash->raise();
+    }
     controller->start();
     return app.exec();
 }
