@@ -14,8 +14,9 @@ class QTimer;
 class QVBoxLayout;
 
 /// The Setup section of the Settings dialog: one row per prerequisite, a button
-/// on the ones the IDE can fix by opening a terminal, that terminal underneath,
-/// and the sign-in link the terminal printed.
+/// on the ones the IDE can fix by opening a terminal and on the two sign-ins it
+/// can undo again, that terminal underneath, and the sign-in link the terminal
+/// printed.
 ///
 /// The page owns no state of its own. Every row is rebuilt from the
 /// `prereqsChecked` payload, so what it shows is always the daemon's last
@@ -69,12 +70,22 @@ private:
     /// patched: there are eight of them, and a partial update is how a page
     /// ends up showing a fix button for something that has since been fixed.
     void clearRows();
-    /// Adds one row: glyph, name, detail, and either the button that fixes it
-    /// or the command that would.
+    /// Adds one row: glyph, name, detail, and then -- for a failing one -- the
+    /// button that fixes it or the command that would, and for a passing
+    /// sign-in the button that undoes it.
     void addRow(const QString& name, bool ok, const QString& detail, const QString& fixHint);
     /// The setup action that fixes `name`, or empty when only a person with a
     /// package manager can.
     static QString actionFor(const QString& name);
+    /// The setup action that undoes `name`, or empty for a prerequisite that
+    /// is nothing to do with a sign-in.
+    ///
+    /// Only the two OAuth sessions have one. A stale `claude` or `gh` login
+    /// that the matching `auth login` will not overwrite -- a switched
+    /// account, a token the provider has since revoked -- leaves the row
+    /// ticked and the agent failing, and the only way out of that from inside
+    /// the IDE is to throw the session away first.
+    static QString logoutActionFor(const QString& name);
     /// What the button for `action` says.
     static QString buttonTextFor(const QString& action);
 
@@ -87,8 +98,8 @@ private:
     /// A failed `system.setup_pty`. The page has to come out of its in-flight
     /// state itself: nothing else will, and the buttons stay dead until it does.
     void onOperationFailed(const QString& op, const QString& message);
-    /// Enables or disables every fix button at once, so a click cannot start a
-    /// second action while one is being opened.
+    /// Enables or disables every action button at once, so a click cannot
+    /// start a second action while one is being opened.
     void setActionsEnabled(bool enabled);
     /// Opens a login URL the terminal printed in the desktop browser, and
     /// raises the row that offers it again by hand.
@@ -167,8 +178,9 @@ private:
     /// the controller's, not this page's -- is left alone. Non-empty means a
     /// request is in flight and every fix button is disabled.
     QString m_pendingAction;
-    /// The fix buttons of the current rows, so they can be disabled together.
-    /// Cleared with the rows they belong to.
+    /// The action buttons of the current rows -- the fixes and the two
+    /// logouts alike -- so they can be disabled together. Cleared with the
+    /// rows they belong to.
     QList<QPushButton*> m_actionButtons;
     /// The PTY the last `setupPtyOpened` named, empty once its process has
     /// ended or it has been closed. Remembered here rather than read back off

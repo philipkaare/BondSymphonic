@@ -1301,7 +1301,7 @@ pub fn network_denial(ws: &Option<WorkspaceId>, ev: &Event) -> Option<(String, S
     Some((workspace.0.clone(), host.to_owned()))
 }
 
-/// The four setup terminals, by the names the UI and the daemon both use.
+/// The six setup terminals, by the names the UI and the daemon both use.
 /// Anything else is refused here rather than sent on: the enum is the whole
 /// point of `system.setup_pty`, and a typo should fail loudly and locally.
 fn parse_setup_action(action: &str) -> Option<SetupAction> {
@@ -1310,6 +1310,12 @@ fn parse_setup_action(action: &str) -> Option<SetupAction> {
         "gh_login" => Some(SetupAction::GhLogin),
         "install_claude" => Some(SetupAction::InstallClaude),
         "install_gh" => Some(SetupAction::InstallGh),
+        // The two that undo a sign-in rather than make one, offered on a
+        // prerequisite that already passes. Nothing else about them is
+        // different: the same host terminal, and the same re-check when it
+        // exits, which is what turns the row's tick back into a cross.
+        "claude_logout" => Some(SetupAction::ClaudeLogout),
+        "gh_logout" => Some(SetupAction::GhLogout),
         _ => None,
     }
 }

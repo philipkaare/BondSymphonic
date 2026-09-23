@@ -53,6 +53,24 @@ constexpr int kPastedFeedbackMs = 8000;
 /// ellipsis and says nothing; the tooltip and the buttons still work.
 constexpr int kMinLinkWidth = 40;
 
+/// The command a logout action runs, for the tooltip that names it. "Log out
+/// of Claude Code" does not say what is about to happen to the machine, and
+/// this is a button whose whole effect is to break a prerequisite that
+/// currently passes: the command is the one thing that makes that concrete,
+/// and it is the same line a user would have typed in the distro themselves.
+QString logoutCommandFor(const QString& action) {
+    return action == QLatin1String("claude_logout") ? QStringLiteral("claude auth logout")
+                                                    : QStringLiteral("gh auth logout");
+}
+
+/// The name a logout button carries, so a test can find it without the page
+/// growing an accessor for rows it rebuilds from every check. `bs`-prefixed,
+/// like `bsClaudeLogin` in `TranscriptView.cpp`.
+QString logoutButtonName(const QString& action) {
+    return action == QLatin1String("claude_logout") ? QStringLiteral("bsClaudeLogout")
+                                                    : QStringLiteral("bsGhLogout");
+}
+
 } // namespace
 
 SetupPage::SetupPage(AppController* controller, QWidget* parent)
@@ -263,6 +281,18 @@ QString SetupPage::actionFor(const QString& name) {
     return QString();
 }
 
+QString SetupPage::logoutActionFor(const QString& name) {
+    if (name == QLatin1String("claude_auth")) {
+        return QStringLiteral("claude_logout");
+    }
+    if (name == QLatin1String("gh_auth")) {
+        return QStringLiteral("gh_logout");
+    }
+    // Everything else is a binary, a kernel feature or the sandbox: there is
+    // no session to put away, so a passing row stays a statement of fact.
+    return QString();
+}
+
 QString SetupPage::buttonTextFor(const QString& action) {
     if (action == QLatin1String("install_claude")) {
         return QStringLiteral("Install Claude Code");
@@ -273,7 +303,21 @@ QString SetupPage::buttonTextFor(const QString& action) {
     if (action == QLatin1String("install_gh")) {
         return QStringLiteral("Install GitHub CLI");
     }
-    return QStringLiteral("Log in to GitHub");
+    if (action == QLatin1String("gh_login")) {
+        return QStringLiteral("Log in to GitHub");
+    }
+    if (action == QLatin1String("claude_logout")) {
+        return QStringLiteral("Log out of Claude Code");
+    }
+    if (action == QLatin1String("gh_logout")) {
+        return QStringLiteral("Log out of GitHub");
+    }
+    // Every action spelled out, with no fallthrough. `gh_login` used to be
+    // whatever was left over, which was true while logging in to GitHub was
+    // the last action there was; the moment the logouts arrived that default
+    // would have labelled both of them "Log in to GitHub", and a button that
+    // signs you out under that name is worse than no button.
+    return QString();
 }
 
 void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
@@ -315,7 +359,39 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
     detailLabel->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
     layout->addWidget(detailLabel, 1);
 
+    // The one way a button on this page is made, whichever ending builds it.
+    // Both have to join `m_actionButtons`: that list is what goes dead while a
+    // `system.setup_pty` is in flight, and a logout left out of it would be the
+    // one click that can still orphan the terminal the reply has not named yet.
+    auto addActionButton = [this, row, layout](const QString& action) {
+        auto* button = new QPushButton(buttonTextFor(action), row);
+        QObject::connect(button, &QPushButton::clicked, this,
+                         [this, action] { runAction(action); });
+        // A re-check can rebuild the rows while a request is still in flight,
+        // and the new buttons must be as dead as the ones they replaced.
+        button->setEnabled(m_pendingAction.isEmpty());
+        m_actionButtons.append(button);
+        layout->addWidget(button);
+        return button;
+    };
+
     if (ok) {
+        // A passing prerequisite is a statement of fact, with one exception:
+        // an OAuth session can pass this check and still be the wrong one --
+        // a switched account, a token the provider revoked -- and `auth login`
+        // will not overwrite a session that is already there. Without this the
+        // only way out was a terminal outside the IDE.
+        const QString logout = logoutActionFor(name);
+        if (!logout.isEmpty()) {
+            QPushButton* button = addActionButton(logout);
+            button->setObjectName(logoutButtonName(logout));
+            // No colour and no emphasis of any kind: this is the secondary
+            // thing a row that is already fine can offer, and it should not
+            // pull the eye away from the rows that are not fine. The tooltip
+            // is where it says what it will actually run.
+            button->setToolTip(
+                QStringLiteral("Run `%1` in a terminal here").arg(logoutCommandFor(logout)));
+        }
         m_rowsLayout->addWidget(row);
         return;
     }
@@ -334,13 +410,7 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
         m_rowsLayout->addWidget(row);
         return;
     }
-    auto* button = new QPushButton(buttonTextFor(action), row);
-    QObject::connect(button, &QPushButton::clicked, this, [this, action] { runAction(action); });
-    // A re-check can rebuild the rows while a request is still in flight, and
-    // the new buttons must be as dead as the ones they replaced.
-    button->setEnabled(m_pendingAction.isEmpty());
-    m_actionButtons.append(button);
-    layout->addWidget(button);
+    addActionButton(action);
     m_rowsLayout->addWidget(row);
 }
 
@@ -556,6 +626,15 @@ namespace {
 const char* const kMarkupPrereq =
     "[{\"name\":\"claude\",\"ok\":false,\"detail\":\"<b>x</b>\",\"fix_hint\":\"\"}]";
 
+/// The two states a sign-in row can be in. The same prerequisite twice,
+/// because what the page puts on that row is the whole difference between
+/// them: a session that is there can be thrown away, and one that is not can
+/// be made.
+const char* const kClaudeAuthOk =
+    "[{\"name\":\"claude_auth\",\"ok\":true,\"detail\":\"signed in\",\"fix_hint\":\"\"}]";
+const char* const kClaudeAuthMissing =
+    "[{\"name\":\"claude_auth\",\"ok\":false,\"detail\":\"not signed in\",\"fix_hint\":\"\"}]";
+
 /// One prerequisite the daemon found and one it did not, so a single payload
 /// draws both glyphs.
 const char* const kMixedPrereqs =
@@ -580,6 +659,18 @@ QString terminalNote(const SetupPage& page) {
 QPushButton* fixButton(const SetupPage& page) {
     for (QPushButton* button : page.findChildren<QPushButton*>()) {
         if (button->text() == QLatin1String("Install Claude Code")) {
+            return button;
+        }
+    }
+    return nullptr;
+}
+
+/// Any button on the page reading exactly `text`, or null. By the label
+/// because that is what the user is choosing between, and the point of the
+/// checks below is that a row never offers both of them at once.
+QPushButton* buttonSaying(const SetupPage& page, const char* text) {
+    for (QPushButton* button : page.findChildren<QPushButton*>()) {
+        if (button->text() == QLatin1String(text)) {
             return button;
         }
     }
@@ -774,6 +865,65 @@ extern "C" std::int32_t bs_widget_test_setup_page_says_what_was_pasted() {
     QCoreApplication::processEvents();
     if (terminalNote(page) != running) {
         return 7;
+    }
+    return 0;
+}
+
+/// A sign-in that passes still gets a button, and it is the opposite one.
+///
+/// The row used to end at the tick, which was right for a binary that is
+/// installed and wrong for an OAuth session: `claude auth login` will not
+/// replace a session that is already there, so a stale one -- the wrong
+/// account, a revoked token -- left the row ticked, the agent failing, and no
+/// way out of it from inside the IDE. What a passing row needs is the undo,
+/// and what a failing one needs is still the fix; neither ever wants both.
+extern "C" std::int32_t bs_widget_test_setup_page_offers_a_logout_for_a_live_session() {
+    AppController controller;
+    {
+        SetupPage page(&controller);
+        controller.prereqsChecked(QString::fromUtf8(kClaudeAuthOk));
+        auto* logout = page.findChild<QPushButton*>(QStringLiteral("bsClaudeLogout"));
+        if (logout == nullptr) {
+            return 1;
+        }
+        if (logout->text() != QLatin1String("Log out of Claude Code")) {
+            return 2;
+        }
+        // The tooltip, because the label says which provider and nothing
+        // about what will be run against the machine.
+        if (!logout->toolTip().contains(QLatin1String("claude auth logout"))) {
+            return 3;
+        }
+        // A row that passes does not also offer to fix itself.
+        if (buttonSaying(page, "Log in to Claude Code") != nullptr) {
+            return 4;
+        }
+        // The request itself is deferred by a turn of the event loop, which is
+        // not running here. What the click does now is what is being checked:
+        // the logout goes through the same `runAction` as the fixes, so it is
+        // in `m_actionButtons` and dies with them while a `system.setup_pty`
+        // is in flight. A logout left out of that list is the one click that
+        // can still orphan a PTY the reply has not named yet.
+        logout->click();
+        if (logout->isEnabled()) {
+            return 5;
+        }
+        // And closing Settings re-checks, because a logout is exactly the kind
+        // of thing that makes the window's answer out of date.
+        if (!page.ranAction()) {
+            return 6;
+        }
+    }
+
+    {
+        SetupPage page(&controller);
+        controller.prereqsChecked(QString::fromUtf8(kClaudeAuthMissing));
+        if (page.findChild<QPushButton*>(QStringLiteral("bsClaudeLogout")) != nullptr) {
+            return 7;
+        }
+        if (buttonSaying(page, "Log in to Claude Code") == nullptr) {
+            return 8;
+        }
     }
     return 0;
 }
