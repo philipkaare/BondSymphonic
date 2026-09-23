@@ -4317,3 +4317,602 @@ mod in_place_breach_detail {
         }
     }
 }
+
+/// Selecting a tab whose agent has ended starts it again -- once, resuming the
+/// conversation -- and an agent that dies of that start bars the workspace from
+/// any more of them. And an agent exit asks the daemon about the prerequisites
+/// again, once however many exits arrive together.
+///
+/// Two workspaces, because a selection has to come *from* somewhere: the first
+/// carries a live agent and is where the run starts, the second carries an
+/// agent the daemon reports as ended with a session to resume. Nothing else
+/// starts that one -- the automatic start at launch skips an agent that exited,
+/// deliberately -- so every `agent.start` these runs see is the selection's
+/// doing. The `select-tab` seam alternates the active tab between the two, so
+/// the run visits the ended one twice, and the second visit is what the loop
+/// guard has to refuse.
+///
+/// The two exit scenarios arm no seam at all, which is what makes them the
+/// control for the first two: no selection, no `agent.start`.
+mod agent_auto_restart {
+    use super::{drain, wait_for};
+    use bondsymphonic_ide::model::persistence::{PersistedGroup, StateFile, STATE_VERSION};
+    use bondsymphonic_proto::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    const TOKEN: &str = "auto-restart-token";
+    /// Three waits and the quit: the seam makes four selections a second and a
+    /// half apart, and the last of them has to have been answered -- or refused
+    /// -- before the window goes.
+    const SCRIPT: &str = "wait,wait,wait,quit";
+    /// The workspace whose agent is alive. Its session id is its own, so an
+    /// assertion naming the other one's cannot be satisfied by a start sent
+    /// here.
+    const LIVE_WORKSPACE: &str = "ws_auto1";
+    const LIVE_NAME: &str = "auto-live";
+    const LIVE_AGENT: &str = "ag_auto_live";
+    const LIVE_SESSION: &str = "sess-auto-1";
+    /// The workspace under test: ready, Claude, with an ended agent behind it.
+    const DEAD_WORKSPACE: &str = "ws_auto2";
+    const DEAD_NAME: &str = "auto-dead";
+    const DEAD_AGENT: &str = "ag_auto_old";
+    const SESSION: &str = "sess-auto-2";
+    /// What the fake daemon hands back for an `agent.start`.
+    const NEW_AGENT: &str = "ag_auto_new";
+    /// How the daemon words an agent that died as it started, which is what an
+    /// expired Claude login looks like from the IDE's side.
+    const DIED: &str = "claude exited with code 1: the session has expired";
+    /// The line the window prints when an automatic start is what sent the
+    /// request. The journal shows a start was sent; this shows which path sent
+    /// it.
+    const AUTO_STARTED: &str = "BS_MENU_TEST agent-auto-started target=ws_auto2 ";
+    /// Every arrival of the seam at the tab under test.
+    const SELECTED_DEAD: &str = "BS_MENU_TEST select-tab target=ws_auto2 ";
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+    type Journal = Arc<Mutex<Vec<String>>>;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Scenario {
+        /// The started agent lives, and reports itself idle the way a real one
+        /// does.
+        StartWorks,
+        /// The started agent dies at once. The seam comes back to the tab after
+        /// that, which is the visit the loop guard has to refuse.
+        StartDies,
+        /// No selections: one agent exits, and that alone has to reach the
+        /// daemon as a prerequisite check.
+        OneExit,
+        /// No selections: three exits inside a few milliseconds, which is what
+        /// a sandbox backend going down looks like.
+        ExitBurst,
+    }
+
+    #[test]
+    fn selecting_a_tab_whose_agent_ended_starts_one_agent_resuming_its_session() {
+        if bondsymphonic_ide::testing::skip_without_qt("auto restart on selection") {
+            return;
+        }
+        let run = run_ide(Scenario::StartWorks);
+        // The control. An absence proves nothing about a run whose selections
+        // never happened, and the assertion below is that the *second* visit
+        // asked for nothing more.
+        let visits = run
+            .out
+            .lines()
+            .filter(|l| l.starts_with(SELECTED_DEAD))
+            .count();
+        assert!(
+            visits >= 2,
+            "the seam reached {DEAD_WORKSPACE} {visits} times, so this run proves nothing\n{}",
+            run.context
+        );
+        assert!(
+            run.out.lines().any(|l| l.starts_with(AUTO_STARTED)),
+            "the start was not the selection's doing\n{}",
+            run.context
+        );
+        // One start, naming the workspace that was selected and the session the
+        // daemon's own record carried: the conversation is resumed, not
+        // replaced by an empty one.
+        assert_eq!(
+            run.journal
+                .iter()
+                .filter(|m| m.starts_with("agent.start"))
+                .collect::<Vec<_>>(),
+            [&format!("agent.start:{DEAD_WORKSPACE}:{SESSION}")],
+            "{}",
+            run.context
+        );
+        // And the other half of the prerequisite claim: no agent exited in this
+        // run, so the only check is the one the controller makes on connect.
+        assert_eq!(
+            run.journal
+                .iter()
+                .filter(|m| *m == "system.check_prereqs")
+                .count(),
+            1,
+            "something other than an agent exit asked for a prerequisite check\n{}",
+            run.context
+        );
+    }
+
+    #[test]
+    fn an_agent_that_dies_of_an_automatic_start_gets_no_second_one() {
+        if bondsymphonic_ide::testing::skip_without_qt("auto restart loop guard") {
+            return;
+        }
+        let run = run_ide(Scenario::StartDies);
+        let visits = run
+            .out
+            .lines()
+            .filter(|l| l.starts_with(SELECTED_DEAD))
+            .count();
+        assert!(
+            visits >= 2,
+            "the seam reached {DEAD_WORKSPACE} {visits} times, so the tab was never selected a \
+             second time and this run proves nothing\n{}",
+            run.context
+        );
+        assert!(
+            run.out.lines().any(|l| l.starts_with(AUTO_STARTED)),
+            "the first start never happened, so there is no loop to guard\n{}",
+            run.context
+        );
+        assert_eq!(
+            run.journal
+                .iter()
+                .filter(|m| m.starts_with("agent.start"))
+                .collect::<Vec<_>>(),
+            [&format!("agent.start:{DEAD_WORKSPACE}:{SESSION}")],
+            "an agent that died of being started was started again\n{}",
+            run.context
+        );
+    }
+
+    #[test]
+    fn an_agent_exit_asks_the_daemon_about_the_prerequisites_again() {
+        if bondsymphonic_ide::testing::skip_without_qt("exit rechecks prerequisites") {
+            return;
+        }
+        let run = run_ide(Scenario::OneExit);
+        run.assert_one_check_after_the_exits(1);
+        // Nothing was selected, so nothing was started: the exit is news about
+        // the login, not a reason to restart an agent where it stopped.
+        assert!(
+            !run.journal.iter().any(|m| m.starts_with("agent.start")),
+            "an agent exit started an agent by itself\n{}",
+            run.context
+        );
+    }
+
+    #[test]
+    fn a_burst_of_exits_asks_about_the_prerequisites_once() {
+        if bondsymphonic_ide::testing::skip_without_qt("exit burst rechecks once") {
+            return;
+        }
+        let run = run_ide(Scenario::ExitBurst);
+        run.assert_one_check_after_the_exits(3);
+    }
+
+    struct Run {
+        out: String,
+        journal: Vec<String>,
+        context: String,
+    }
+
+    impl Run {
+        /// That `sent` exits reached the window and exactly one prerequisite
+        /// check followed them. Counted from the daemon's own marker rather
+        /// than from the start of the journal, because the controller checks
+        /// once on connect and that one is not what these runs are about.
+        fn assert_one_check_after_the_exits(&self, sent: usize) {
+            let after: Vec<&String> = self
+                .journal
+                .iter()
+                .skip_while(|m| *m != "sent:exits")
+                .collect();
+            assert!(
+                !after.is_empty(),
+                "the fake daemon never sent the exits\n{}",
+                self.context
+            );
+            assert_eq!(
+                after.iter().filter(|m| **m == "sent:exit").count(),
+                sent,
+                "the fake daemon did not send {sent} exits, so this run proves nothing\n{}",
+                self.context
+            );
+            assert_eq!(
+                after
+                    .iter()
+                    .filter(|m| **m == "system.check_prereqs")
+                    .count(),
+                1,
+                "the exits did not produce exactly one prerequisite check\n{}",
+                self.context
+            );
+            // The connect-time check is the control: a run with none of those
+            // has a broken controller rather than a working trigger.
+            assert!(
+                self.journal
+                    .iter()
+                    .take(self.journal.len() - after.len())
+                    .any(|m| m == "system.check_prereqs"),
+                "the controller never checked the prerequisites on connect\n{}",
+                self.context
+            );
+        }
+    }
+
+    fn run_ide(scenario: Scenario) -> Run {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (addr, journal) = rt.block_on(fake_daemon(scenario));
+
+        let tag = match scenario {
+            Scenario::StartWorks => "works",
+            Scenario::StartDies => "dies",
+            Scenario::OneExit => "one",
+            Scenario::ExitBurst => "burst",
+        };
+        let config = std::env::temp_dir().join(format!("bs-auto-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("config dir");
+        let state_path = config.join("state.json");
+        // Both tabs in one group, the live one in front: the seam steps between
+        // them, and a group with one tab has nowhere to step.
+        let saved = StateFile {
+            version: STATE_VERSION,
+            groups: vec![PersistedGroup {
+                name: "auto".to_owned(),
+                workspace_ids: vec![LIVE_WORKSPACE.to_owned(), DEAD_WORKSPACE.to_owned()],
+                ..PersistedGroup::default()
+            }],
+            active_workspace: Some(LIVE_WORKSPACE.to_owned()),
+            ..StateFile::default()
+        };
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&saved).expect("state json"),
+        )
+        .expect("seed state.json");
+
+        // The exit scenarios arm nothing at all: an exit must start no agent,
+        // and a seam that was not armed cannot be what proves it.
+        let menu_test = match scenario {
+            Scenario::StartWorks | Scenario::StartDies => format!("select-tab={DEAD_WORKSPACE}"),
+            Scenario::OneExit | Scenario::ExitBurst => String::new(),
+        };
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", SCRIPT)
+            .env("BS_MENU_TEST", menu_test)
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", &state_path)
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let journal = journal.lock().expect("journal mutex").clone();
+        let context =
+            format!("requests: {journal:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(
+            status.success(),
+            "the IDE exited with {status}, expected 0\n{context}"
+        );
+        assert!(
+            !format!("{out}{err}").contains("panicked at"),
+            "the IDE logged a panic\n{context}"
+        );
+        let _ = std::fs::remove_dir_all(&config);
+        Run {
+            out,
+            journal,
+            context,
+        }
+    }
+
+    /// An `agent.state` event for one of the two workspaces' agents.
+    fn state_event(
+        workspace: &str,
+        agent: &str,
+        state: AgentState,
+        detail: Option<&str>,
+    ) -> ServerMessage {
+        ServerMessage::event(
+            Some(WorkspaceId(workspace.to_owned())),
+            Event::AgentStateChanged {
+                agent_id: AgentId(agent.to_owned()),
+                state,
+                detail: detail.map(str::to_owned),
+            },
+        )
+    }
+
+    async fn fake_daemon(scenario: Scenario) -> (std::net::SocketAddr, Journal) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let recorded = journal.clone();
+
+        tokio::spawn(async move {
+            let mut exits_sent = false;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (r, mut w) = stream.into_split();
+                let mut r = BufReader::new(r);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let ClientMessage::Request { id, request } =
+                        codec::decode(line.trim_end()).expect("decode");
+                    // The workspace and the session an `agent.start` asked to
+                    // resume, because both are the claim: a start naming the
+                    // other workspace, or naming no session, would satisfy a
+                    // journal that only counted methods.
+                    let method = match &request {
+                        Request::AgentStart(p) => format!(
+                            "agent.start:{}:{}",
+                            p.workspace_id.0,
+                            p.options.resume_session.clone().unwrap_or_default()
+                        ),
+                        other => other.method_name().to_owned(),
+                    };
+                    recorded.lock().expect("journal mutex").push(method);
+                    let mut after: Vec<ServerMessage> = Vec::new();
+                    // Long enough for the reply to have been applied: the state
+                    // event below is about the agent the start's own answer
+                    // records, and events travel on their own channel.
+                    let mut delay = Duration::from_millis(200);
+                    let mut marked = false;
+                    let reply = match request {
+                        Request::Hello(p) if p.token == TOKEN => Some(ServerMessage::ok(
+                            id,
+                            &HelloResult {
+                                daemon_version: "0.0.0-fake".into(),
+                                capabilities: Capabilities {
+                                    sandbox_backend: "noop".into(),
+                                    git_protect: false,
+                                    adapters: vec![AgentAdapterKind::Claude],
+                                },
+                                protocol_version: Some(PROTOCOL_VERSION),
+                            },
+                        )),
+                        Request::Hello(_) => Some(ServerMessage::err(id, RpcError::unauthorized())),
+                        // Everything passes, every time. A failing prerequisite
+                        // would open Settings over the run, and what is
+                        // asserted here is that the question was asked at all.
+                        Request::SystemCheckPrereqs {} => Some(ServerMessage::ok(
+                            id,
+                            &CheckPrereqsResult {
+                                items: vec![PrereqStatus {
+                                    name: "claude_auth".into(),
+                                    ok: true,
+                                    detail: "logged in".into(),
+                                    fix_hint: None,
+                                }],
+                            },
+                        )),
+                        Request::WorkspaceList {} => {
+                            // The exits, once the tabs exist to hear of them.
+                            if matches!(scenario, Scenario::OneExit | Scenario::ExitBurst)
+                                && !exits_sent
+                            {
+                                exits_sent = true;
+                                marked = true;
+                                delay = Duration::from_millis(1_500);
+                                after.push(state_event(
+                                    LIVE_WORKSPACE,
+                                    LIVE_AGENT,
+                                    AgentState::Exited,
+                                    Some(DIED),
+                                ));
+                                if scenario == Scenario::ExitBurst {
+                                    // Every agent in the window at once, which
+                                    // is what a sandbox backend going down
+                                    // looks like from here.
+                                    after.push(state_event(
+                                        DEAD_WORKSPACE,
+                                        DEAD_AGENT,
+                                        AgentState::Exited,
+                                        Some(DIED),
+                                    ));
+                                    after.push(state_event(
+                                        LIVE_WORKSPACE,
+                                        LIVE_AGENT,
+                                        AgentState::Exited,
+                                        Some(DIED),
+                                    ));
+                                }
+                            }
+                            Some(ServerMessage::ok(
+                                id,
+                                &WorkspaceListResult {
+                                    workspaces: vec![live(), dead()],
+                                },
+                            ))
+                        }
+                        Request::WorkspaceGet(p) => Some(ServerMessage::ok(
+                            id,
+                            &if p.workspace_id.0 == LIVE_WORKSPACE {
+                                live()
+                            } else {
+                                dead()
+                            },
+                        )),
+                        Request::AgentStart(_) => {
+                            after.push(state_event(
+                                DEAD_WORKSPACE,
+                                NEW_AGENT,
+                                match scenario {
+                                    Scenario::StartDies => AgentState::Exited,
+                                    _ => AgentState::Idle,
+                                },
+                                match scenario {
+                                    Scenario::StartDies => Some(DIED),
+                                    _ => None,
+                                },
+                            ));
+                            Some(ServerMessage::ok(
+                                id,
+                                &AgentStartResult {
+                                    agent_id: AgentId(NEW_AGENT.to_owned()),
+                                },
+                            ))
+                        }
+                        // The live agent's history says it is live. The state a
+                        // history carries is the pane's reading of the
+                        // conversation, and answering `Exited` for every agent
+                        // would describe a workspace this run says is working.
+                        Request::AgentHistory(p) => Some(ServerMessage::ok(
+                            id,
+                            &HistoryResult {
+                                messages: vec![],
+                                state: if p.agent_id.0 == LIVE_AGENT {
+                                    AgentState::Idle
+                                } else {
+                                    AgentState::Exited
+                                },
+                                detail: None,
+                            },
+                        )),
+                        Request::FsListDir(_) => {
+                            Some(ServerMessage::ok(id, &ListDirResult { entries: vec![] }))
+                        }
+                        Request::FsWatch(_) => Some(ServerMessage::ok(id, &Empty {})),
+                        Request::WorkspaceChanges(_) => {
+                            Some(ServerMessage::ok(id, &ChangesResult { files: vec![] }))
+                        }
+                        Request::WorkspaceStatus(_) => Some(ServerMessage::ok(
+                            id,
+                            &WorkspaceStatusResult { entries: vec![] },
+                        )),
+                        Request::RepoDetectRunConfigs(_) => Some(ServerMessage::ok(
+                            id,
+                            &DetectRunConfigsResult {
+                                configs: vec![],
+                                network_allow: vec![],
+                                warnings: vec![],
+                            },
+                        )),
+                        Request::RunList(_) => {
+                            Some(ServerMessage::ok(id, &RunListResult { runs: vec![] }))
+                        }
+                        other => Some(ServerMessage::err(
+                            id,
+                            RpcError::internal(format!("not implemented: {}", other.method_name())),
+                        )),
+                    };
+                    let Some(reply) = reply else {
+                        break;
+                    };
+                    if w.write_all(codec::encode(&reply).as_bytes()).await.is_err() {
+                        break;
+                    }
+                    if after.is_empty() {
+                        continue;
+                    }
+                    tokio::time::sleep(delay).await;
+                    if marked {
+                        // Where the prerequisite assertions count from. Written
+                        // before the exits, so a check that raced them is still
+                        // counted as theirs.
+                        recorded
+                            .lock()
+                            .expect("journal mutex")
+                            .push("sent:exits".to_owned());
+                    }
+                    for message in after {
+                        if w.write_all(codec::encode(&message).as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if marked {
+                            recorded
+                                .lock()
+                                .expect("journal mutex")
+                                .push("sent:exit".to_owned());
+                        }
+                    }
+                }
+            }
+        });
+
+        (addr, journal)
+    }
+
+    /// The workspace whose agent is running.
+    fn live() -> WorkspaceInfo {
+        workspace(
+            LIVE_WORKSPACE,
+            LIVE_NAME,
+            LIVE_AGENT,
+            AgentState::Idle,
+            LIVE_SESSION,
+        )
+    }
+
+    /// The workspace whose agent has ended, with the session a restart resumes.
+    /// Ready, so nothing about the workspace itself is what keeps an agent from
+    /// starting in it: these runs are about the agent alone.
+    fn dead() -> WorkspaceInfo {
+        workspace(
+            DEAD_WORKSPACE,
+            DEAD_NAME,
+            DEAD_AGENT,
+            AgentState::Exited,
+            SESSION,
+        )
+    }
+
+    fn workspace(
+        id: &str,
+        name: &str,
+        agent: &str,
+        state: AgentState,
+        session: &str,
+    ) -> WorkspaceInfo {
+        let mut info = super::workspace(id, name, WorkspaceState::Ready, &[]);
+        let record = AgentSummary {
+            id: AgentId(agent.to_owned()),
+            adapter: AgentAdapterKind::Claude,
+            state,
+            session_id: Some(session.to_owned()),
+            command: None,
+            model: None,
+            permission_mode: None,
+        };
+        info.agents = vec![record.id.clone()];
+        info.agent_records = vec![record];
+        info
+    }
+}

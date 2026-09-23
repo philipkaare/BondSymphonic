@@ -65,6 +65,55 @@ namespace {
 /// recognises.
 constexpr int kWindowStateVersion = 2;
 
+/// How long `requestPrereqRecheck` waits before it asks.
+///
+/// A window's worth of agents exits within a few milliseconds of each other
+/// when the daemon's sandbox backend goes, and an expired login kills every one
+/// of them as it starts; a second of waiting turns that into the one request it
+/// really is. Short enough that the composer is replaced by the login gate
+/// while the user is still reading the banner that said the agent stopped.
+constexpr int kPrereqRecheckMs = 1'000;
+
+/// How recent an answer has to be for coming back to the window not to ask for
+/// another one.
+///
+/// Alt-tabbing is not news. Without this every switch back put a prerequisite
+/// check on the wire -- a dozen a minute while the user works between the IDE
+/// and a browser -- and the one case worth asking about is the machine that was
+/// left alone for an hour with a session that has since expired. A minute is
+/// far below that and far above a switch to a terminal and back.
+constexpr int kPrereqRecheckIdleMs = 60'000;
+
+/// How long a newly selected tab's ended agent waits before it is started.
+///
+/// The selection is what asks, so the wait only has to cover the user passing
+/// *through* the tab: Ctrl+PageDown held down walks the whole group, and
+/// starting an agent in each one on the way would be a request per tab and a
+/// conversation resumed in workspaces nobody looked at. Half a second is longer
+/// than a keystroke and shorter than a glance.
+constexpr int kAutoRestartDelayMs = 500;
+
+/// How soon after an automatic start an exit means the agent is not coming
+/// back, and the workspace gets no more automatic starts.
+///
+/// An agent that dies within half a minute of being started died *of* being
+/// started -- a missing login, a command that is not there, a repository the
+/// CLI refuses -- and starting it again would produce the loop the banner
+/// exists to make visible. One that ran for longer than that was a working
+/// agent, and its death is news of its own.
+constexpr int kAutoRestartLoopMs = 30'000;
+
+/// **Test-only**: how long the `select-tab` seam waits between selections, and
+/// how many it makes.
+///
+/// Each one has to cover `kAutoRestartDelayMs`, the start reaching the daemon
+/// and the answer -- or the exit -- coming back, or the run would prove nothing
+/// about what the second visit to the tab does. Four selections, because the
+/// seam alternates: two arrivals at the named tab is the fewest that can show a
+/// guard holding on the second.
+constexpr int kSeamSelectMs = 1'500;
+constexpr int kSeamSelects = 4;
+
 /// The steps in `BS_MENU_TEST`, as one string. **Test-only**: empty in every
 /// ordinary run, and then everything below that reads it is inert.
 ///
@@ -125,6 +174,11 @@ MainWindow::MainWindow(AppController* controller, GroupModel* groupModel, FileTr
       m_fileTreeModel(fileTreeModel), m_changesModel(changesModel), m_runModel(runModel) {
     setWindowTitle("BondSymphonic");
     resize(1400, 900);
+    // Before anything that reads it. The prerequisite re-check treats the
+    // launch as an answer -- the controller checks on connect -- so a window
+    // that is activated as it comes up must find a clock that is already
+    // running rather than an invalid one.
+    m_clock.start();
     // The widgets before the menus that act on them: the File, Edit and View
     // items reach into the editor area, and the Window menu is made of the
     // docks' own toggle actions, so both have to exist before `buildMenus`
@@ -206,6 +260,17 @@ void MainWindow::changeEvent(QEvent* event) {
     QMainWindow::changeEvent(event);
     if (event->type() == QEvent::PaletteChange) {
         applySeparatorBand();
+    }
+    // Coming back to the window, and only that direction: `ActivationChange`
+    // fires on the way out as well, where there is nobody to show an answer to.
+    // The machine may have been asleep, or merely left alone long enough for a
+    // Claude session to time out, and this is the first moment the IDE could
+    // find out -- an expired session is otherwise discovered by the first prompt
+    // failing. Throttled, so a user working between the window and a browser
+    // does not ask once per switch; the launch counts as the last answer.
+    if (event->type() == QEvent::ActivationChange && isActiveWindow() &&
+        m_clock.elapsed() - m_prereqRecheckedAt >= kPrereqRecheckIdleMs) {
+        requestPrereqRecheck();
     }
 }
 
@@ -583,6 +648,31 @@ void MainWindow::onPrereqsChecked(const QString& json) {
         // `openSettings` spins a nested event loop for the length of the
         // dialog. Queuing it lets this handler finish first.
         QTimer::singleShot(0, this, [this] { showSetupPage(); });
+    }
+}
+
+void MainWindow::requestPrereqRecheck() {
+    if (m_prereqRecheck == nullptr) {
+        m_prereqRecheck = new QTimer(this);
+        m_prereqRecheck->setSingleShot(true);
+        QObject::connect(m_prereqRecheck, &QTimer::timeout, this, [this] {
+            // Recorded when the request goes out rather than when an answer
+            // comes back, so a check the daemon cannot answer still counts.
+            // During a reconnect every one of these fails, and the failure is
+            // logged and not shown -- see `onPrereqsCheckFailed` -- but a
+            // trigger that did not count its own attempts would ask again on
+            // the next activation, and again, for as long as the daemon was
+            // away.
+            m_prereqRecheckedAt = m_clock.elapsed();
+            m_controller->recheckPrereqs();
+        });
+    }
+    // A wait already running is the burst this exists to collapse. Left alone
+    // rather than restarted: `start()` on each exit would push the deadline out
+    // by a second every time, so a workspace full of dying agents would never
+    // reach the daemon at all.
+    if (!m_prereqRecheck->isActive()) {
+        m_prereqRecheck->start(kPrereqRecheckMs);
     }
 }
 
@@ -1353,9 +1443,35 @@ void MainWindow::onAgentExited(const QString& agentId, const QString& state,
     if (state != QLatin1String("exited")) {
         return;
     }
+    // An agent that stopped is the one event that says the Claude login may have
+    // gone: a session that times out mid-session kills the CLI as it starts, and
+    // what the daemon puts in `detail` below is that failure. Asked before
+    // anything else here, and for every exit whatever else is true of the
+    // workspace -- the expired-session case is exactly one whose start the
+    // window sent itself, so it takes the `m_autoStarting` branch below and
+    // would never be asked about from there. The check is one request, and a
+    // wrong guess costs it; the other way round is a green tick over a login
+    // that has gone and a composer that refuses every prompt.
+    requestPrereqRecheck();
     const QString workspaceId = m_groupModel->agentWorkspaceId(agentId);
     if (workspaceId.isEmpty()) {
         return;
+    }
+    // An agent this window started by itself, dead again this soon: the start
+    // was the cause, and this workspace gets no more automatic ones until
+    // somebody asks with the failure in front of them. Read before the branches
+    // below, because a stop the sandbox or a restart explains is where a start
+    // that cannot work shows up first.
+    //
+    // The exit is attributed to the automatic start without matching agent ids:
+    // a late exit from the agent that was being *replaced* bars the workspace
+    // too. Deliberately the conservative way round -- what is lost is an
+    // automatic restart the user can still ask for by hand, and what it buys is
+    // that no crash can be hidden by this feature.
+    if (m_autoRestartedAt.contains(workspaceId)) {
+        if (m_clock.elapsed() - m_autoRestartedAt.take(workspaceId) < kAutoRestartLoopMs) {
+            m_autoRestartBarred.insert(workspaceId);
+        }
     }
     // The one banner the IDE raises about an agent rather than about a git
     // command, and the only one that offers to act. It exists because the
@@ -1363,10 +1479,14 @@ void MainWindow::onAgentExited(const QString& agentId, const QString& state,
     // so an agent that stopped by itself is the single case left where the
     // user has to be told and given something to press.
     //
-    // Not restarted automatically. A crash that repeats would become a loop
+    // Not restarted where it stopped. A crash that repeats would become a loop
     // reporting itself as a working agent, and the difference between "it came
     // back" and "it has died eleven times" is the thing the user most needs to
-    // see.
+    // see. Selecting the tab is the one thing that does start it again --
+    // `armAutoRestart`, because that is the user asking -- and the same rule is
+    // kept there: the second death in a row bars the workspace, so the loop
+    // still ends on a banner rather than in a restart cycle.
+    //
     // A stop the user's own Retry asked for. `onWorkspaceRestarted` starts the
     // agent again; a failed Retry leaves the workspace's banner, whose Retry is
     // the way back for the agent too.
@@ -1448,6 +1568,90 @@ void MainWindow::startAgentsThatHaveNone() {
     }
 }
 
+bool MainWindow::mayAutoRestart(const QString& workspaceId) const {
+    if (workspaceId.isEmpty() || !m_groupModel->agentNeedsStart(workspaceId)) {
+        return false;
+    }
+    // One automatic start per death, and none at all for a workspace whose
+    // agent has already died of one. See `m_autoRestartedAt`, which is also
+    // what keeps a re-selection from asking for a second agent while the first
+    // request is still on the wire, and `m_autoStarting`, which is the same
+    // guard the other start paths use.
+    if (m_autoStarting.contains(workspaceId) || m_autoRestartedAt.contains(workspaceId) ||
+        m_autoRestartBarred.contains(workspaceId)) {
+        return false;
+    }
+    // A workspace that cannot run owns its own failure: its banner says what
+    // went wrong and its Retry brings the sandbox *and* the agent back, so an
+    // `agent.start` from here would fail with `SandboxError` and put a box over
+    // a pane that was already saying the true thing. Exactly the set
+    // `onAgentExited` refuses to raise "The agent stopped." over.
+    if (m_workspaceProblems.contains(workspaceId) || m_restarting.contains(workspaceId)) {
+        return false;
+    }
+    // The sandbox as the tab has it, read the way `startAgentsThatHaveNone`
+    // reads it. `Done` is not among them: that is what an ended agent is called,
+    // and it is the whole point of this.
+    const QString status = tabFor(workspaceId).value("status").toString();
+    if (status == QLatin1String("Creating") || status == QLatin1String("SandboxDown") ||
+        status == QLatin1String("Error")) {
+        return false;
+    }
+    // And a workspace on its way out, which the tab cannot say: a destroy and an
+    // ended agent both read as `Done` there, so the daemon's own word is the
+    // only thing that tells them apart.
+    return m_workspaceStates.value(workspaceId) != QLatin1String("destroying");
+}
+
+void MainWindow::armAutoRestart(const QString& workspaceId, const QString& previousWorkspaceId) {
+    // A selection, and nothing else. `onActiveTabChanged` runs on every
+    // republish of the model -- a glyph, a heartbeat, a renamed branch -- and
+    // the same tab arriving again is not somebody asking for anything. Nor is a
+    // tab that came forward because the one in front of it was destroyed: the
+    // user's last act there was a destroy, and answering it by starting an agent
+    // in the workspace next door is not what they asked for.
+    if (workspaceId == previousWorkspaceId || !workspaceIsOpen(previousWorkspaceId)) {
+        return;
+    }
+    // One timer, however many model changes the selection provokes on its way
+    // through. A timer already armed for another tab is left to fire and refuse:
+    // it re-asks everything below, and the tab it was for is not the active one
+    // any more.
+    if (m_autoRestartArmed == workspaceId || !mayAutoRestart(workspaceId)) {
+        return;
+    }
+    m_autoRestartArmed = workspaceId;
+    QTimer::singleShot(kAutoRestartDelayMs, this, [this, workspaceId] {
+        if (m_autoRestartArmed == workspaceId) {
+            m_autoRestartArmed.clear();
+        }
+        // Asked again, because half a second is long enough for all of it to
+        // have changed: the user may have stepped past this tab, pressed the
+        // banner's Restart themselves, or the sandbox may have gone down under
+        // it.
+        if (activeWorkspaceId() != workspaceId || !mayAutoRestart(workspaceId)) {
+            return;
+        }
+        m_autoRestartedAt.insert(workspaceId, m_clock.elapsed());
+        // Booked in the same set as every other start, so nothing -- a workspace
+        // change, a reconnect, a second selection -- can ask for a second agent
+        // while this one is on its way.
+        m_autoStarting.insert(workspaceId);
+        m_agentArea->setStarting(workspaceId, true);
+        // The transcript's options when there is one, for the same reason the
+        // Restart button uses them: they carry the session id, so the
+        // conversation the user is looking at continues instead of being
+        // replaced by an empty one. A pane with no transcript falls back to what
+        // the tab was created with.
+        TranscriptModel* model = m_agentArea->transcriptModel(workspaceId);
+        const QString options = model == nullptr
+                                    ? tabFor(workspaceId).value("options_json").toString()
+                                    : model->restartOptionsJson();
+        m_controller->startAgent(workspaceId, options);
+        announceMenuTest("agent-auto-started", workspaceId, options);
+    });
+}
+
 void MainWindow::syncWorkspaceProblems() {
     const QJsonArray groups = QJsonDocument::fromJson(m_groupModel->getStateJson().toUtf8())
                                   .object()
@@ -1463,6 +1667,11 @@ void MainWindow::syncWorkspaceProblems() {
                 continue;
             }
             present.insert(workspaceId);
+            // Inert unless armed, and then only for the workspace the step
+            // names. Here rather than on a signal of its own because this
+            // already runs on every model change, and the seam needs the tab to
+            // exist before it can select it.
+            selectTabsForTest(workspaceId);
             const QJsonObject problem = tab.value("workspace_problem").toObject();
             if (problem.isEmpty()) {
                 if (m_workspaceProblems.remove(workspaceId) > 0) {
@@ -1512,6 +1721,53 @@ void MainWindow::syncWorkspaceProblems() {
             it = m_workspaceProblems.erase(it);
         }
     }
+}
+
+void MainWindow::selectTabsForTest(const QString& workspaceId) {
+    const char* const step = "select-tab";
+    // Only the workspace the step names, and armed once: see `menuTestTarget`.
+    if (m_seamSelecting || menuTestTarget(step) != workspaceId) {
+        return;
+    }
+    m_seamSelecting = true;
+    // A repeating timer rather than one selection: what has to be observable is
+    // the *second* visit to a tab whose agent has ended, and the way a user
+    // reaches that is by going somewhere else and coming back. So the seam
+    // alternates -- away when the named tab is in front, back to it when it is
+    // not -- and every arrival is announced, so a run can say which one it is
+    // asserting about.
+    QTimer* timer = new QTimer(this);
+    timer->setInterval(kSeamSelectMs);
+    QObject::connect(timer, &QTimer::timeout, this, [this, timer, workspaceId, step] {
+        if (m_seamSelects >= kSeamSelects) {
+            timer->stop();
+            return;
+        }
+        const bool away = activeWorkspaceId() == workspaceId;
+        int group = -1;
+        int tab = -1;
+        QString target;
+        for (int g = 0; g < m_groupModel->groupCount() && target.isEmpty(); ++g) {
+            for (int t = 0; t < m_groupModel->tabCount(g) && target.isEmpty(); ++t) {
+                const QString id = m_groupModel->tabWorkspaceId(g, t);
+                if (id.isEmpty() || (away ? id == workspaceId : id != workspaceId)) {
+                    continue;
+                }
+                target = id;
+                group = g;
+                tab = t;
+            }
+        }
+        // Nothing to move to yet -- a run with one tab so far. The next tick
+        // tries again, and none of them is counted until one lands.
+        if (target.isEmpty()) {
+            return;
+        }
+        ++m_seamSelects;
+        m_groupModel->setActive(group, tab);
+        announceMenuTest(step, target, QString());
+    });
+    timer->start();
 }
 
 void MainWindow::pressBannerForTest(const QString& workspaceId, const char* step,
@@ -1681,6 +1937,11 @@ void MainWindow::resumeAgentAfterRestart(const QString& workspaceId) {
     // and an agent is what it is for. Booked in the same set as the automatic
     // start, so neither can ask for a second one.
     if (m_groupModel->agentNeedsStart(workspaceId) && !m_autoStarting.contains(workspaceId)) {
+        // The workspace is coming back at the user's request, sandbox and all,
+        // which is the other way the bar on automatic starts is lifted: whatever
+        // killed the agent last time has just been dealt with.
+        m_autoRestartBarred.remove(workspaceId);
+        m_autoRestartedAt.remove(workspaceId);
         m_autoStarting.insert(workspaceId);
         m_agentArea->setStarting(workspaceId, true);
         // The transcript's options when it has them, for the same reason a
@@ -1738,6 +1999,13 @@ void MainWindow::onStartAgentRequested(const QString& workspaceId) {
         return;
     }
     m_agentArea->setStarting(workspaceId, true);
+    // The user pressing Restart with the failure in front of them is the one
+    // thing that lifts the bar on automatic starts: they have decided this is
+    // worth another try, which is precisely the decision the bar was refusing to
+    // make on their behalf. The booking goes too, so the next death is a fresh
+    // one as far as `armAutoRestart` is concerned.
+    m_autoRestartBarred.remove(workspaceId);
+    m_autoRestartedAt.remove(workspaceId);
     // The transcript's own options, which are the tab's plus the session id it
     // saw in the history: a restart after an agent exited -- or after a daemon
     // restart left the workspace with none -- resumes the conversation rather
@@ -2214,6 +2482,10 @@ void MainWindow::onActiveTabChanged() {
     // so this is a no-op on every later activation.
     restoreEditorsFor(workspaceId);
     rebindCost();
+    // Last, and after the pane exists: a tab the user has just selected whose
+    // agent has ended is them asking for it back, and the transcript the request
+    // takes its session from is built by `showWorkspace` above.
+    armAutoRestart(workspaceId, previousWorkspaceId);
 }
 
 void MainWindow::updateWindowTitle(const QJsonObject& active) {

@@ -1,4 +1,5 @@
 #pragma once
+#include <QElapsedTimer>
 #include <QHash>
 #include <QKeySequence>
 #include <QList>
@@ -32,6 +33,7 @@ class QMoveEvent;
 class QPlainTextEdit;
 class QResizeEvent;
 class QTabWidget;
+class QTimer;
 class RunPanel;
 class RunPanelModel;
 class SettingsDialog;
@@ -72,6 +74,10 @@ protected:
     /// separators are painted in a colour mixed from it, so they have to be
     /// mixed again rather than kept. Deliberately deaf to `StyleChange`, which
     /// is what [`applySeparatorBand`]'s own `setStyleSheet` raises.
+    ///
+    /// Coming back to the window is the other thing that arrives here, and the
+    /// moment a prerequisite is most likely to have expired while nobody was
+    /// looking: see [`requestPrereqRecheck`].
     void changeEvent(QEvent* event) override;
 
 private:
@@ -119,6 +125,21 @@ private:
     /// Decides, from the daemon's prerequisite list, between opening Settings
     /// on Setup, a status-bar warning with a way there, and neither.
     void onPrereqsChecked(const QString& json);
+    /// Asks the daemon to check the prerequisites again, once, a beat from now.
+    ///
+    /// The prerequisites are checked at start-up and when Settings closes, and
+    /// for `claude_auth` that is not enough: an OAuth session that times out
+    /// mid-session leaves the IDE with a green tick, an open composer and a
+    /// prompt that fails every time. Nothing polls -- a check runs the daemon's
+    /// whole prerequisite suite, and one every few seconds for an answer that
+    /// changes twice a month is a cost paid for nothing -- so the two things
+    /// that *suggest* an answer has gone stale ask instead: an agent that
+    /// exited, and the window being activated after a long absence.
+    ///
+    /// Debounced, because the first of those arrives in bursts: a daemon whose
+    /// sandbox backend died reports every agent in the window exiting within a
+    /// few milliseconds of each other, and one check answers for all of them.
+    void requestPrereqRecheck();
     void buildDocks();
     /// Puts the Run panel's configuration actions back into the Run menu, in
     /// front of [`m_runConfigMenuAnchor`]. The old ones are gone by the time
@@ -295,7 +316,75 @@ private:
     /// A workspace whose agent exited is skipped. That is a failure with a
     /// banner and a Restart button on it, and starting it again from here
     /// would turn one crash into a loop that looks like a working agent.
+    /// Selecting such a tab is the one thing that does start it again: see
+    /// [`armAutoRestart`].
     void startAgentsThatHaveNone();
+
+    /// Starts `workspaceId`'s ended agent again, shortly, because the user has
+    /// just selected its tab -- which is them asking for it.
+    ///
+    /// The banner's Restart is still there and still says what happened. What
+    /// this adds is that looking at the tab counts as pressing it: the agent is
+    /// what the workspace is for, and a user who has switched to a dead one has
+    /// no other reason to be there. Delayed by [`kAutoRestartDelayMs`] and
+    /// re-checked when it fires, so stepping through the tabs does not start an
+    /// agent in each one on the way past.
+    ///
+    /// `previousWorkspaceId` is the tab this one replaced. A selection is the
+    /// only trigger: `onActiveTabChanged` also runs on every republish of the
+    /// model -- a status glyph, a heartbeat, a workspace the daemon renamed --
+    /// and arming on those would restart an agent in a workspace the user is
+    /// merely watching. A previous tab that is *gone* is not a selection
+    /// either: the tab that comes forward when its neighbour is destroyed was
+    /// chosen by nobody.
+    void armAutoRestart(const QString& workspaceId, const QString& previousWorkspaceId);
+    /// Whether an automatic start for `workspaceId` is allowed at all, asked
+    /// once when the timer is armed and again when it fires. Everything that
+    /// owns the failure itself says no here: a workspace with a problem (its
+    /// banner has the Retry), one being restarted or destroyed, one whose
+    /// sandbox is not up, one with a start already in flight, one that has
+    /// already had its automatic start for this death, and one barred by
+    /// [`m_autoRestartBarred`].
+    bool mayAutoRestart(const QString& workspaceId) const;
+    /// When each workspace's automatic start was sent, on [`m_clock`].
+    ///
+    /// Two jobs, both about not doing this twice. An entry means this
+    /// workspace has had its one automatic start for the death it is in, so
+    /// re-selecting the tab while that start is on its way -- or just after it
+    /// answered, while the tab still reads `Done` because no `agent.state` has
+    /// arrived yet -- cannot ask for a second agent. And the moment it was sent
+    /// is what [`onAgentExited`] measures the next exit against.
+    QHash<QString, qint64> m_autoRestartedAt;
+    /// Workspaces whose agent died again straight after an automatic start, and
+    /// so get no more of them.
+    ///
+    /// This is what keeps the property the banner was protecting: a crash that
+    /// repeats must not become a loop that reports itself as a working agent.
+    /// Lifted by the user asking for the agent themselves -- the banner's
+    /// Restart -- or by a workspace restart, because both are someone deciding
+    /// the thing is worth another try with the failure in front of them.
+    QSet<QString> m_autoRestartBarred;
+    /// The workspace an armed automatic start is for, so a burst of model
+    /// changes arms one timer rather than one each.
+    QString m_autoRestartArmed;
+    /// The window's own monotonic clock, started in the constructor. Not the
+    /// wall clock: both things measured against it are "how long ago", and a
+    /// timezone change or an NTP step would make that negative.
+    QElapsedTimer m_clock;
+    /// The debounce behind [`requestPrereqRecheck`], made on first use.
+    QTimer* m_prereqRecheck = nullptr;
+    /// When the last re-check this window asked for was sent, on [`m_clock`].
+    /// Zero is the launch, which is when the controller's own first check runs,
+    /// so an activation in the first minute of the run asks for nothing.
+    qint64 m_prereqRecheckedAt = 0;
+    /// Test seam: drives the active tab to and from the workspace
+    /// `select-tab=<id>` names, so the automatic start above and the guard on
+    /// it can be seen from outside. See [`announceMenuTest`].
+    void selectTabsForTest(const QString& workspaceId);
+    /// Whether that chain of selections has been armed, and how many it has
+    /// made. Test-only, and inert without `BS_SMOKE_SCRIPT`.
+    bool m_seamSelecting = false;
+    int m_seamSelects = 0;
 
     /// Workspaces whose automatic `agent.start` is still in flight.
     ///
