@@ -10,6 +10,26 @@ use common::{create_ws, init_repo, start_daemon, Client};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+/// How long [`watch`] gives a registration to land. A test worktree is a
+/// handful of directories and registers in well under a millisecond; this is
+/// a margin, placed far past the measurement, not the measurement.
+const REGISTRATION_SETTLE: Duration = Duration::from_millis(250);
+
+/// Sends `fs.watch` for `ws` and waits for the watch to be in place. The reply
+/// only says the registration is scheduled - it runs on a blocking thread so
+/// that a huge tree cannot hold the runtime, and the daemon does not wait for
+/// it - so a test that writes the moment the reply lands would race the watch
+/// and, losing, wait five seconds for an event that was never going to come.
+async fn watch(c: &mut Client, ws: &WorkspaceId) {
+    c.call(Request::FsWatch(FsWatchParams {
+        workspace_id: ws.clone(),
+        enable: true,
+    }))
+    .await
+    .unwrap();
+    tokio::time::sleep(REGISTRATION_SETTLE).await;
+}
+
 /// Waits up to `limit` for an `fs.changed` for `ws`, pumping the connection so
 /// buffered events reach the client: `Client` only surfaces events it read
 /// while waiting for a response, so a cheap request is what delivers them.
@@ -49,12 +69,7 @@ async fn reading_the_worktree_is_not_a_change_but_writing_it_is() {
     let ws = create_ws(&mut c, &repo, "reads").await;
     let worktree = std::path::Path::new(&ws.worktree_path).to_path_buf();
 
-    c.call(Request::FsWatch(FsWatchParams {
-        workspace_id: ws.id.clone(),
-        enable: true,
-    }))
-    .await
-    .unwrap();
+    watch(&mut c, &ws.id).await;
 
     // A plain read, then the two ways git reads the whole worktree: directly,
     // and through the `workspace.changes` request that closed the loop.
@@ -100,12 +115,7 @@ async fn a_burst_of_writes_is_one_event_with_sorted_paths() {
     let mut c = Client::connect(port, &token).await;
     let ws = create_ws(&mut c, &repo, "burst").await;
 
-    c.call(Request::FsWatch(FsWatchParams {
-        workspace_id: ws.id.clone(),
-        enable: true,
-    }))
-    .await
-    .unwrap();
+    watch(&mut c, &ws.id).await;
 
     // Written straight to the worktree rather than through `fs.write_file`: no
     // RPC round trip between the two writes, so the second one is comfortably
@@ -143,12 +153,7 @@ async fn watch_reports_relative_paths_debounced_and_ignores_target_dir() {
     let mut c = Client::connect(port, &token).await;
     let ws = create_ws(&mut c, &repo, "alpha").await;
 
-    c.call(Request::FsWatch(FsWatchParams {
-        workspace_id: ws.id.clone(),
-        enable: true,
-    }))
-    .await
-    .unwrap();
+    watch(&mut c, &ws.id).await;
     // Idempotent: a second enable must not install a second watcher.
     c.call(Request::FsWatch(FsWatchParams {
         workspace_id: ws.id.clone(),
@@ -289,13 +294,12 @@ async fn ignored_directories_are_not_watched_and_new_directories_are() {
     std::fs::create_dir_all(worktree.join("src")).unwrap();
 
     let before = inotify_watch_count();
-    c.call(Request::FsWatch(FsWatchParams {
-        workspace_id: ws.id.clone(),
-        enable: true,
-    }))
-    .await
-    .unwrap();
+    watch(&mut c, &ws.id).await;
     let installed = inotify_watch_count() - before;
+    assert!(
+        installed >= 1,
+        "the watch did not land within the settle time"
+    );
     // The worktree, src/, and the root's own entry: three, and a handful of
     // slack for anything else the fixture leaves in the tree. `< SUBDIRS`
     // would let 199 leaked watches through and still pass.
@@ -353,27 +357,31 @@ async fn ignored_directories_are_not_watched_and_new_directories_are() {
     cancel.cancel();
 }
 
-/// Enabling a watch on a big tree walks that tree, and the walk must not be
-/// done under the lock every other `fs.watch` needs: a `disable` for another
-/// workspace, issued while a 5,000-directory tree is being walked, returns
-/// at once rather than after the walk.
+/// Enabling a watch on a big tree walks that tree, and nothing waits for the
+/// walk: not the `enable` that asked for it, which returns once the
+/// registration is scheduled, and not a `disable` for another workspace
+/// issued while the 5,000-directory tree is being walked. The walk used to
+/// run on the caller's thread, and in the daemon the caller is a runtime
+/// worker: on a 77,274-directory checkout over 9P that held the worker for
+/// minutes and every request on the connection timed out behind it.
 ///
 /// Both watchers are driven directly rather than over the protocol, so the
-/// timing measured is the lock's and not the connection's.
+/// timing measured is the registration's and not the connection's, and the
+/// runtime is multi-threaded so the walk really is under way while the
+/// `disable` is timed.
 ///
 /// Linux only, and not because of the kernel: the walk being timed is the
 /// per-directory one inotify needs, and on every other backend a recursive
 /// watch is a single call that returns at once. There the test would pass
 /// without a walk to be blocked behind, which is worse than not running.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enabling_a_big_tree_does_not_block_other_workspaces_watches() {
     // Held for the whole test: the 5,000 watches this installs must not be in
     // place while the test above is counting this process's watches.
     let _serial = WATCH_COUNT.lock().await;
     use bondsymphonic_daemon::fs_watch::Watchers;
     use bondsymphonic_daemon::server::broadcast::{EventBus, EVENT_BUS_CAPACITY};
-    use std::sync::Arc;
 
     let dir = tempfile::tempdir().unwrap();
     let big = dir.path().join("big");
@@ -385,61 +393,51 @@ async fn enabling_a_big_tree_does_not_block_other_workspaces_watches() {
     let small = dir.path().join("small");
     std::fs::create_dir_all(&small).unwrap();
 
-    let watchers = Arc::new(Watchers::default());
+    let watchers = Watchers::default();
     let events = EventBus::new(EVENT_BUS_CAPACITY);
     let small_id: WorkspaceId = "ws_small".into();
-    watchers
-        .enable(small_id.clone(), small.clone(), events.clone())
-        .unwrap();
+    watchers.enable(small_id.clone(), small.clone(), events.clone());
+    watchers.registered(&small_id).await;
 
-    // The walk runs on a blocking thread; the disable is timed from the
-    // runtime once the walk is known to be under way.
-    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let big_id: WorkspaceId = "ws_big".into();
-    let walk = {
-        let (w, s, ev) = (watchers.clone(), started.clone(), events.clone());
-        tokio::task::spawn_blocking(move || {
-            s.store(true, std::sync::atomic::Ordering::SeqCst);
-            let t = Instant::now();
-            w.enable(big_id, big, ev).unwrap();
-            t.elapsed()
-        })
-    };
-    while !started.load(std::sync::atomic::Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
     let t = Instant::now();
-    tokio::task::spawn_blocking({
-        let w = watchers.clone();
-        move || w.disable(&small_id)
-    })
-    .await
-    .unwrap();
-    let disable_took = t.elapsed();
-    let enable_took = walk.await.unwrap();
+    watchers.enable(big_id.clone(), big, events.clone());
+    let enable_took = t.elapsed();
+    let d = Instant::now();
+    watchers.disable(&small_id);
+    let disable_took = d.elapsed();
+    watchers.registered(&big_id).await;
+    let registration_took = t.elapsed();
     eprintln!(
-        "enable of 5,000 dirs took {enable_took:?}; concurrent disable took {disable_took:?}"
+        "registration of 5,000 dirs took {registration_took:?}; enable took {enable_took:?}; \
+         concurrent disable took {disable_took:?}"
     );
     // The property is a comparison, so it is asserted as one. A wall-clock
     // bound on either measurement is really a bound on how fast the host is:
-    // the old lower bound on `enable_took` said the fixture had to be *slow*,
-    // which a fast machine with a warm dentry cache can honestly fail, and the
-    // old 100 ms ceiling on `disable_took` could be spent by the
-    // `spawn_blocking` hand-off alone on a loaded runner. The ratio says what
-    // the test is actually about: if `enable` held the lock across its walk,
-    // the disable behind it would take nearly as long, not a quarter of it.
+    // a lower bound on `registration_took` would say the fixture had to be
+    // *slow*, which a fast machine with a warm dentry cache can honestly fail,
+    // and a tight ceiling on the other two could be spent by scheduling alone
+    // on a loaded runner. The ratios say what the test is actually about: an
+    // `enable` that walked inline would take as long as the registration, and
+    // a `disable` behind a lock held across the walk nearly as long, not a
+    // quarter of it.
     assert!(
-        disable_took * 4 < enable_took,
-        "disable took {disable_took:?} against a concurrent {enable_took:?} walk: \
+        enable_took * 4 < registration_took,
+        "enable took {enable_took:?} of a {registration_took:?} registration: \
+         that is the shape of a walk on the request path"
+    );
+    assert!(
+        disable_took * 4 < registration_took,
+        "disable took {disable_took:?} against a concurrent {registration_took:?} walk: \
          that is the shape of a lock held across the walk"
     );
-    // The ratio alone would also be satisfied by a stalled disable sitting
+    // The ratios alone would also be satisfied by a stalled call sitting
     // behind an even slower walk, so one absolute bound stays - placed far past
     // any scheduling hiccup rather than near the measurement, so that only a
     // real stall can reach it.
     assert!(
-        disable_took < Duration::from_secs(2),
-        "disable took {disable_took:?}: no hand-off to a blocking thread costs that, \
-         however loaded the host is"
+        enable_took < Duration::from_secs(2) && disable_took < Duration::from_secs(2),
+        "enable took {enable_took:?} and disable {disable_took:?}: nothing that merely \
+         schedules a task or aborts one costs that, however loaded the host is"
     );
 }

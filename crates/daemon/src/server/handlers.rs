@@ -166,7 +166,7 @@ impl Handler for WorkspaceHandler {
                 if p.enable {
                     let root = d.workspace(&p.workspace_id)?.worktree_path;
                     d.watchers
-                        .enable(p.workspace_id.clone(), root, d.events.clone())?;
+                        .enable(p.workspace_id.clone(), root, d.events.clone());
                 } else {
                     d.watchers.disable(&p.workspace_id);
                 }
