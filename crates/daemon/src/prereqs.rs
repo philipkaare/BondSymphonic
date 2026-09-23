@@ -1,5 +1,6 @@
 use crate::sandbox::{self, SandboxBackend};
 use bondsymphonic_proto::PrereqStatus;
+use std::future::Future;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -128,14 +129,8 @@ async fn claude_auth(claude_bin: &str) -> PrereqStatus {
     )
 }
 
-/// The seven host-level prerequisites, in their spec order, followed by
-/// `backend`'s own [`SandboxBackend::check`] result as the eighth item
-/// (named `sandbox`). This is what `system.check_prereqs` reports: the daemon
-/// knows its running backend and reports on that one, not a hypothetical one.
-pub async fn check_all_with_backend(backend: &dyn SandboxBackend) -> Vec<PrereqStatus> {
-    let mut v = Vec::new();
-
-    let git = match run("git", &["--version"]).await {
+async fn check_git() -> PrereqStatus {
+    match run("git", &["--version"]).await {
         Ok((true, out)) => match parse_git_version(&out) {
             Some((maj, min)) if (maj, min) >= (2, 40) => status("git", true, out, ""),
             Some(_) => status(
@@ -147,9 +142,14 @@ pub async fn check_all_with_backend(backend: &dyn SandboxBackend) -> Vec<PrereqS
             None => status("git", false, out, "sudo apt-get install -y git"),
         },
         _ => status("git", false, "git not found", "sudo apt-get install -y git"),
-    };
-    v.push(git);
+    }
+}
 
+/// `bwrap --version`, then — only once that found a binary — whether it can
+/// open an unprivileged user namespace. The second probe runs the binary the
+/// first just looked for, so the two stay in sequence; the pair as a whole runs
+/// beside the other probes.
+async fn check_bwrap_and_userns() -> (PrereqStatus, PrereqStatus) {
     let mut bwrap = check_binary(
         "bwrap",
         &["--version"],
@@ -157,10 +157,8 @@ pub async fn check_all_with_backend(backend: &dyn SandboxBackend) -> Vec<PrereqS
     )
     .await;
     bwrap.name = "bwrap".into();
-    let bwrap_ok = bwrap.ok;
-    v.push(bwrap);
 
-    let userns = if bwrap_ok {
+    let userns = if bwrap.ok {
         match run(
             "bwrap",
             &["--ro-bind", "/", "/", "--unshare-all", "--die-with-parent", "true"],
@@ -184,34 +182,27 @@ pub async fn check_all_with_backend(backend: &dyn SandboxBackend) -> Vec<PrereqS
             "sudo apt-get install -y bubblewrap",
         )
     };
-    v.push(userns);
+    (bwrap, userns)
+}
 
-    // The same resolver the adapter spawns with, so the version this reports
-    // and the binary an agent runs are the same file. Never a bare `claude`:
-    // under WSL that can resolve to a Windows build on `/mnt/c`.
-    let claude_bin = match crate::agents::claude::host_claude_bin() {
-        Some(p) => p.to_string_lossy().to_string(),
-        None => crate::agents::claude::pinned_claude_path()
-            .to_string_lossy()
-            .to_string(),
-    };
+async fn check_claude(claude_bin: &str) -> PrereqStatus {
     let mut claude = check_binary(
-        &claude_bin,
+        claude_bin,
         &["--version"],
         "curl -fsSL https://claude.ai/install.sh | bash",
     )
     .await;
     claude.name = "claude".into();
-    v.push(claude);
+    claude
+}
 
-    v.push(claude_auth(&claude_bin).await);
-
+/// `gh --version`, then — only once that found a binary — `gh auth status`.
+/// Sequential for the same reason as [`check_bwrap_and_userns`].
+async fn check_gh_and_auth() -> (PrereqStatus, PrereqStatus) {
     let mut gh = check_binary("gh", &["--version"], "sudo apt-get install -y gh").await;
     gh.name = "gh".into();
-    let gh_ok = gh.ok;
-    v.push(gh);
 
-    let gh_auth = if gh_ok {
+    let gh_auth = if gh.ok {
         match run("gh", &["auth", "status"]).await {
             Ok((true, out)) => status(
                 "gh_auth",
@@ -230,9 +221,72 @@ pub async fn check_all_with_backend(backend: &dyn SandboxBackend) -> Vec<PrereqS
             "sudo apt-get install -y gh && gh auth login",
         )
     };
-    v.push(gh_auth);
-    v.extend(backend.check().await);
+    (gh, gh_auth)
+}
+
+/// Runs the probe groups beside each other and lays their answers out in the
+/// spec order: `git, bwrap, userns, claude, claude_auth, gh, gh_auth, sandbox`.
+///
+/// Six groups rather than eight probes: `userns` runs the binary `bwrap
+/// --version` just looked for, and `gh auth status` is only asked once `gh
+/// --version` has found one, so each of those pairs is one group and keeps its
+/// sequence inside it. `claude auth status` is deliberately *not* grouped with
+/// `claude --version`: it never waited on the version answer (a `claude` too old
+/// or too slow for the version probe still gets the credentials-file fallback),
+/// and grouping them would make the login answer wait on a probe it does not
+/// need. The backend's own check spawns its own `bwrap` and reads none of the
+/// others, so it is a group of its own too.
+///
+/// `join!` rather than spawned tasks, as in `repo.inspect`: these are child
+/// processes, so there is nothing for a thread to do but wait. A function over
+/// futures rather than the `join!` inlined into [`check_all_with_backend`] so a
+/// test can hand it probes that only sleep and measure that the sleeps overlap.
+async fn join_probes(
+    git: impl Future<Output = PrereqStatus>,
+    bwrap_userns: impl Future<Output = (PrereqStatus, PrereqStatus)>,
+    claude: impl Future<Output = PrereqStatus>,
+    claude_auth: impl Future<Output = PrereqStatus>,
+    gh_auth: impl Future<Output = (PrereqStatus, PrereqStatus)>,
+    sandbox: impl Future<Output = Vec<PrereqStatus>>,
+) -> Vec<PrereqStatus> {
+    let (git, (bwrap, userns), claude, claude_auth, (gh, gh_auth), sandbox) =
+        tokio::join!(git, bwrap_userns, claude, claude_auth, gh_auth, sandbox);
+    let mut v = vec![git, bwrap, userns, claude, claude_auth, gh, gh_auth];
+    v.extend(sandbox);
     v
+}
+
+/// The seven host-level prerequisites, in their spec order, followed by
+/// `backend`'s own [`SandboxBackend::check`] result as the eighth item
+/// (named `sandbox`). This is what `system.check_prereqs` reports: the daemon
+/// knows its running backend and reports on that one, not a hypothetical one.
+///
+/// The probes run beside each other (see [`join_probes`] for the grouping), so
+/// the check costs its slowest probe and never more than one [`CHECK_TIMEOUT`].
+/// In sequence it cost their sum: on a freshly booted distro (2026-09-23)
+/// `claude auth status --json` alone took 3.6 s, `gh auth status` 1.4 s and
+/// `claude --version` 0.7 s, and at a true cold start the IDE's first
+/// `system.check_prereqs` had not answered 11 s in — which the IDE shows as
+/// "Claude Code is not logged in" over an empty Setup page.
+pub async fn check_all_with_backend(backend: &dyn SandboxBackend) -> Vec<PrereqStatus> {
+    // The same resolver the adapter spawns with, so the version this reports
+    // and the binary an agent runs are the same file. Never a bare `claude`:
+    // under WSL that can resolve to a Windows build on `/mnt/c`.
+    let claude_bin = match crate::agents::claude::host_claude_bin() {
+        Some(p) => p.to_string_lossy().to_string(),
+        None => crate::agents::claude::pinned_claude_path()
+            .to_string_lossy()
+            .to_string(),
+    };
+    join_probes(
+        check_git(),
+        check_bwrap_and_userns(),
+        check_claude(&claude_bin),
+        claude_auth(&claude_bin),
+        check_gh_and_auth(),
+        backend.check(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -284,6 +338,52 @@ mod tests {
     #[tokio::test]
     async fn check_all_has_stable_order() {
         let names: Vec<String> = check_all().await.into_iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            [
+                "git",
+                "bwrap",
+                "userns",
+                "claude",
+                "claude_auth",
+                "gh",
+                "gh_auth",
+                "sandbox",
+            ]
+        );
+    }
+
+    /// The probes have to overlap, not merely stand next to each other in the
+    /// source. Every group sleeps 300 ms in total (the pairs 150 ms per half,
+    /// since a pair is sequential by design), so joined they take ~300 ms and
+    /// in sequence 1.8 s; the bound sits well under the sum so a `join_probes`
+    /// that awaited any one group before the rest would be caught. Sleeps
+    /// rather than `sleep 0.3` child processes so it runs on Windows too and
+    /// process-spawn jitter cannot flake it.
+    #[tokio::test]
+    async fn probes_run_beside_each_other_in_spec_order() {
+        async fn probe(name: &'static str, ms: u64) -> PrereqStatus {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            status(name, true, "", "")
+        }
+        let start = std::time::Instant::now();
+        let names: Vec<String> = join_probes(
+            probe("git", 300),
+            async { (probe("bwrap", 150).await, probe("userns", 150).await) },
+            probe("claude", 300),
+            probe("claude_auth", 300),
+            async { (probe("gh", 150).await, probe("gh_auth", 150).await) },
+            async { vec![probe("sandbox", 300).await] },
+        )
+        .await
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+        let took = start.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "six 300 ms groups took {took:?}: they ran in sequence, not beside each other"
+        );
         assert_eq!(
             names,
             [
