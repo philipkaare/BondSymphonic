@@ -2,6 +2,7 @@ pub mod client;
 pub mod ffi;
 pub mod highlight;
 pub mod launcher;
+pub mod logfile;
 pub mod model;
 pub mod qobjects;
 /// The Qt-less skip the integration tests share.

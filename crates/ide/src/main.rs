@@ -6,9 +6,10 @@ fn main() {
         println!("{}", version_line());
         std::process::exit(0);
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("BS_LOG").unwrap_or_else(|_| "info".into()))
-        .init();
+    // The console as before, plus `%LOCALAPPDATA%\BondSymphonic\logs\ide.log`:
+    // see `logfile` for the launch-time hang that had to be diagnosed without
+    // one.
+    bondsymphonic_ide::logfile::init();
     let code = bondsymphonic_ide::ffi::ffi::run_app();
     std::process::exit(code);
 }
