@@ -141,9 +141,10 @@ private:
     /// Drops down the repositories the user has created workspaces in before.
     QToolButton* m_recent = nullptr;
     QComboBox* m_baseBranch = nullptr;
-    /// An indeterminate bar beside the combo while `repo.inspect` is out, which
-    /// is the one part of the row that says the wait is going somewhere. Hidden
-    /// in both settled states.
+    /// An indeterminate strip across the row under the combo while
+    /// `repo.inspect` is out, which is the one part of the row that says the
+    /// wait is going somewhere. Hidden in both settled states, but its space is
+    /// kept: the fields below must not move as it comes and goes.
     QProgressBar* m_branchBusy = nullptr;
     /// The branch the user last had in the combo, so an explicit choice
     /// survives a move to another repository. It is kept here rather than read

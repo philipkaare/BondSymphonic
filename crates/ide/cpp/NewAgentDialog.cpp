@@ -6,6 +6,7 @@
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
 #include <QAbstractItemModel>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFileDialog>
@@ -22,7 +23,9 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRadioButton>
+#include <QRect>
 #include <QSignalBlocker>
+#include <QSizePolicy>
 #include <QStringList>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -36,9 +39,13 @@ const char* kNewGroupEntry = "New group…";
 const char* kClaudeAdapter = "claude";
 const char* kTerminalAdapter = "terminal";
 
-/// How wide the busy bar beside the base-branch combo is. Narrow enough that
-/// the combo keeps the row, wide enough for the sweep to read as motion.
-constexpr int kBranchBusyWidth = 16;
+/// How tall the busy strip under the base-branch combo is. The bar used to sit
+/// beside the combo at sixteen pixels wide, where the sweep had no room to
+/// travel and read as a rendering artefact rather than as a repository still
+/// being read -- the one thing the row has to say while `repo.inspect` is out.
+/// It spans the row instead, and a few pixels of height are what keep it a
+/// strip belonging to the combo rather than a second control below it.
+constexpr int kBranchBusyHeight = 6;
 
 /// How many lines of opening prompt are visible before the box scrolls.
 constexpr int kPromptRows = 4;
@@ -183,15 +190,33 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     m_baseBranch->setObjectName(QStringLiteral("NewAgentBaseBranch"));
     m_baseBranch->setEditable(true);
     m_branchBusy = new QProgressBar(this);
+    m_branchBusy->setObjectName(QStringLiteral("NewAgentBranchBusy"));
     // A range of nothing is Qt's indeterminate bar: there is no progress to
     // report, only that something is still out.
     m_branchBusy->setRange(0, 0);
     m_branchBusy->setTextVisible(false);
-    m_branchBusy->setMaximumWidth(kBranchBusyWidth);
-    auto* branchRow = new QHBoxLayout();
+    m_branchBusy->setFixedHeight(kBranchBusyHeight);
+    // Hiding a widget takes its space out of the layout with it, and the row
+    // would close up the instant the branches landed: Name, Adapter and every
+    // field under them would jump up by the strip's height under a pointer
+    // already on its way to one of them. Retaining the hidden size keeps the
+    // row the same height in all three of its states, and keeps
+    // `updateBranchState` the one place that decides when the strip is on
+    // screen -- it still only shows and hides, with nothing to swap in.
+    QSizePolicy busyPolicy = m_branchBusy->sizePolicy();
+    busyPolicy.setRetainSizeWhenHidden(true);
+    m_branchBusy->setSizePolicy(busyPolicy);
+    auto* branchRow = new QVBoxLayout();
     branchRow->setContentsMargins(0, 0, 0, 0);
-    branchRow->addWidget(m_baseBranch, 1);
+    // Flush against the combo rather than the layout's ordinary gap: touching
+    // it, the strip reads as the combo still filling itself in; a few pixels
+    // away it reads as a widget of its own that happens to be running.
+    branchRow->setSpacing(0);
+    branchRow->addWidget(m_baseBranch);
     branchRow->addWidget(m_branchBusy);
+    // Still a form row, so "Base branch:" lines up with the top of the field
+    // the way "Initial prompt:" lines up with the top of its box, rather than
+    // drifting down to the middle of the combo and the strip together.
     form->addRow("Base branch:", branchRow);
     // The settled state, so the bar is not on screen for the instant before the
     // constructor's own inspection puts it there.
@@ -895,7 +920,29 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_offers_claude_before_the
     return 0;
 }
 
-/// The Base branch combo says which of its three states it is in.
+namespace {
+
+/// Runs the layout of `dialog` and of everything inside it, so the geometry
+/// read afterwards is the geometry the user would get.
+///
+/// `activate` alone settles the top layout; the nested ones -- the form row
+/// holding the combo and its busy strip -- are only reached because every child
+/// layout is activated too. Both are needed: without the resize the dialog
+/// keeps Qt's default rectangle and the form is laid out into the wrong width,
+/// and without the activation nothing is laid out at all.
+void forceLayout(QWidget& dialog) {
+    if (QLayout* top = dialog.layout()) {
+        top->activate();
+    }
+    for (QLayout* nested : dialog.findChildren<QLayout*>()) {
+        nested->activate();
+    }
+}
+
+} // namespace
+
+/// The Base branch combo says which of its three states it is in, and says the
+/// waiting one large enough to be seen without moving anything else.
 ///
 /// An empty enabled combo is indistinguishable from a repository with no
 /// branches, and `repo.inspect` on a cold or remote repository takes seconds to
@@ -906,9 +953,28 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_says_branches_are_loadin
     GroupModel model;
     NewAgentDialog dialog(&controller, &model, QString::fromUtf8(kDialogRepo));
     auto* combo = dialog.findChild<QComboBox*>(QStringLiteral("NewAgentBaseBranch"));
-    if (combo == nullptr) {
+    auto* busy = dialog.findChild<QProgressBar*>(QStringLiteral("NewAgentBranchBusy"));
+    // A row below the branch row, which is what must not move under the user.
+    auto* below = dialog.findChild<QComboBox*>(QStringLiteral("NewAgentModel"));
+    auto* form = dialog.findChild<QFormLayout*>();
+    if (combo == nullptr || busy == nullptr || below == nullptr || form == nullptr) {
         return 1;
     }
+    // Every rectangle read below is the default one Qt hands an unlaid-out
+    // widget until the layout has actually run, and a check against those would
+    // pass whatever the row looked like. `activate` is what runs it, on a
+    // dialog given the size it would open at.
+    //
+    // Not `show()`, which is the obvious way to make a layout happen and takes
+    // this process down with it: nothing in this suite has ever put a top-level
+    // window on screen -- the MainWindow checks build their window and never
+    // show it, and the terminal checks resize -- and showing one here aborts
+    // the run outright, with no Qt message and before the check can answer a
+    // code. Reverting the row to its old layout does not help, so it is
+    // showing a window in this harness that is unsupported, not anything the
+    // row does.
+    dialog.resize(dialog.sizeHint());
+    forceLayout(dialog);
 
     // The constructor inspected, so the dialog is waiting for the branch list.
     if (combo->isEnabled()) {
@@ -917,6 +983,22 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_says_branches_are_loadin
     if (!combo->currentText().contains(QLatin1String("Loading"))) {
         return 3;
     }
+    // And the wait is visible. Squeezed in beside the combo the bar was sixteen
+    // pixels of sweep in the corner of the row; it is the width of the combo
+    // now, directly beneath the thing it is filling.
+    if (busy->isHidden()) {
+        return 9;
+    }
+    if (busy->width() < combo->width()) {
+        return 10;
+    }
+    if (busy->y() < combo->y() + combo->height()) {
+        return 11;
+    }
+    // Where the fields below the row sit while the strip is up, and how tall
+    // the form is with it. Both have to survive the strip going away.
+    const QRect loadingRow = below->geometry();
+    const int loadingHeight = form->sizeHint().height();
 
     controller.repoInspected(
         QString::fromUtf8(kDialogRepo),
@@ -926,6 +1008,19 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_says_branches_are_loadin
         // The loading item has to be gone before the branches go in, or it is
         // a third entry in a list of two.
         return 4;
+    }
+    forceLayout(dialog);
+    if (!busy->isHidden()) {
+        return 12;
+    }
+    // The strip is gone and nothing has moved. A hidden widget is dropped from
+    // its layout, so without the size retained for it the rows below would
+    // climb by its height at the moment the branches land -- which is the
+    // moment the user reaches for them. Only the height of the form is
+    // compared: the combo is wider holding "Loading branches…" than holding
+    // "main", and the row is welcome to be narrower once that word is gone.
+    if (below->geometry() != loadingRow || form->sizeHint().height() != loadingHeight) {
+        return 13;
     }
 
     auto* path = dialog.findChild<QLineEdit*>(QStringLiteral("NewAgentRepoPath"));
