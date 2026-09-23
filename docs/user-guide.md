@@ -607,10 +607,16 @@ A Claude Code workspace's pane shows the conversation as it arrives.
   still a banner you have to read rather than a loop that reports itself as a
   working agent. A workspace whose sandbox is down is left to its own banner and
   its **Retry**, which brings the agent back with it.
-- **It is a selection that starts it, so the tab that is already in front when
-  the IDE opens is not started.** Nothing was selected to put it there. Its
-  banner's **Restart** still works, and so does switching to another tab and
-  back.
+- **The tab the IDE opens on is started too**, although nobody selected it. It
+  is the case a restarted daemon leaves you in: every restored tab is bound to an
+  agent that is no longer running, and without this the one tab you are already
+  looking at would be the only one needing a switch away and back. Three things
+  hold it back, all meaning "this is not a leftover record": the window has since
+  moved to another tab, an agent has already run in that workspace during this
+  session, or the workspace has shown you a banner at any point in this run. The
+  last is the usual reason a dead agent is *not* started for you — a workspace
+  that has been down recovers through its **Retry**, which brings the sandbox and
+  the agent back together.
 - **The turn cost and the agent's own system lines** are the small grey italics
   under an answer. Settings' Agents section has **Show turn cost and system
   lines**, on by default; turning it off hides both in every open transcript at
