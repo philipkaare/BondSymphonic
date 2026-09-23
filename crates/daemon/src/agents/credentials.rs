@@ -19,9 +19,23 @@
 //! workspace's worktree is added to it as a trusted project (§8.3), because
 //! Claude Code keeps that consent per project directory and a sandbox home has
 //! never seen this one.
+//!
+//! The login also travels *back*. An OAuth access token expires within hours,
+//! and when it does the CLI inside the sandbox refreshes it — and the refresh
+//! rotates the refresh token, so the one the daemon user's own file still holds
+//! is dead from that moment. Nothing told the host: `ws_be2db101`'s copy was
+//! rewritten by a refresh on 2026-09-14, every later start seeded that dead
+//! refresh token into a fresh sandbox, and each new agent answered "OAuth
+//! session expired and could not be refreshed" while `claude auth status` on
+//! the host, which only reads the file, said "logged in". So a workspace copy
+//! that is newer and still a working login is copied back to the host: see
+//! [`write_back_login_from`] for what it must be, and for the one way this
+//! could do harm.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 /// The files copied out of the daemon user's home, relative to both homes, with
 /// whether the file is a secret.
@@ -335,6 +349,312 @@ pub fn seed_claude_files(home: &Path, worktree: &Path) -> Vec<&'static str> {
     // it could create is a source it could dictate.
     let source_home = daemon_home().unwrap_or_else(|| PathBuf::from("/nonexistent/no-daemon-home"));
     seed_claude_files_from(&source_home, home, worktree)
+}
+
+/// The login file, relative to a home; the same name [`FILES`] copies.
+const CREDENTIALS: &str = ".claude/.credentials.json";
+
+/// What one `.credentials.json` says, as far as the write-back needs to read
+/// it. The file is `{"claudeAiOauth": {accessToken, refreshToken, expiresAt,
+/// refreshTokenExpiresAt, scopes, subscriptionType, ...}}`; everything not
+/// named here stays the CLI's business, because a write-back copies the bytes
+/// and never re-serialises them.
+#[derive(Debug, PartialEq)]
+struct Login {
+    access_token: String,
+    refresh_token: String,
+    scopes: Option<serde_json::Value>,
+    subscription_type: Option<serde_json::Value>,
+    expires_at: Option<i64>,
+    refresh_token_expires_at: Option<i64>,
+}
+
+impl Login {
+    /// `None` when the bytes are not a credentials file at all: not JSON, or
+    /// JSON with no `claudeAiOauth` object in it.
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        let oauth = v.get("claudeAiOauth")?.as_object()?;
+        let string = |k: &str| {
+            oauth
+                .get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let stamp = |k: &str| oauth.get(k).and_then(|v| v.as_i64());
+        Some(Self {
+            access_token: string("accessToken"),
+            refresh_token: string("refreshToken"),
+            scopes: oauth.get("scopes").cloned(),
+            subscription_type: oauth.get("subscriptionType").cloned(),
+            expires_at: stamp("expiresAt"),
+            refresh_token_expires_at: stamp("refreshTokenExpiresAt"),
+        })
+    }
+
+    /// Whether this file would log anyone in. The file the CLI leaves behind
+    /// after a refresh that failed parses fine and has both tokens empty.
+    fn is_live(&self) -> bool {
+        !self.access_token.is_empty() && !self.refresh_token.is_empty()
+    }
+}
+
+/// Why a workspace copy was not written back; each is one `warn!`, and a copy
+/// that is merely not newer or not different is none, because that is the
+/// ordinary state of every workspace.
+#[derive(Debug, PartialEq)]
+enum Rejected {
+    Symlink,
+    Unparsable,
+    Emptied,
+    OtherAccount,
+}
+
+/// The host's copy, as the write-back compares against it: its mtime, and the
+/// login in it -- `None` when the file does not parse, which is compared
+/// against as "nothing matches".
+struct Host {
+    mtime: SystemTime,
+    login: Option<Login>,
+}
+
+/// Copies the login in `home` back over the daemon user's when it is a newer,
+/// working copy of the same login. Answers whether it did.
+///
+/// Newer is by mtime: the CLI rewrites the file when it refreshes, and the
+/// host's own CLI does the same, so a copy older than the host's is a workspace
+/// that has not refreshed since the user last did, and its refresh token is the
+/// dead one.
+///
+/// Working is the one condition that keeps this from doing harm. A refresh
+/// that fails -- with the dead token this feature exists to stop seeding --
+/// makes the CLI write the file back with **empty** `accessToken` and
+/// `refreshToken` and `expiresAt: 0`. That file is newer than the host's, and
+/// copying it back would wipe a live host login on the strength of a workspace
+/// that had already lost its own. So the copy must parse and carry both tokens,
+/// or it is refused and said so in the log.
+///
+/// Same login is the rest, and it answers a different threat. The workspace
+/// home is the agent's to write, so the copy can be anything: an agent that
+/// planted the tokens of an account it controls, with a fresh mtime, would
+/// have the daemon replace the user's login with them, and every later `claude`
+/// the user ran on the host would run as that account. Nothing in the file
+/// names the account, so it cannot be checked outright; what can be is that a
+/// refresh changes only the tokens and their expiries. A copy is accepted only
+/// when its `scopes` and `subscriptionType` equal the host's exactly, neither
+/// expiry has moved backwards, and the tokens actually differ (a copy that
+/// equals the host's has nothing to bring). A planted file from another
+/// account of the same tier and scopes still passes, and that is stated here
+/// rather than hidden: the agent already holds the user's live tokens, so the
+/// bar this raises is against substitution, not disclosure, and every
+/// write-back is logged at `info` with the workspace it came from so a
+/// substituted login is a line in the log, not a mystery.
+///
+/// A host with no login at all gets none: the user has logged out, or never
+/// logged in, and a workspace restoring a login the user put away is the very
+/// thing the mirror in [`seed_claude_files_from`] exists to stop. A host whose
+/// file is *there* but not a working login -- the emptied file, this time on
+/// the host, from a refresh that failed because a workspace had rotated the
+/// token first -- is the case worth having: that is the login coming back from
+/// the one place it still works.
+///
+/// Both files are handled as their owners deserve. The workspace copy is read
+/// without following a symlink at its path, or at `.claude` above it, since
+/// either is the agent's to plant. The host's is replaced by a rename of a
+/// private temporary, so there is never a moment with no login file and never
+/// a write through whatever the destination name resolves to; a host
+/// destination that is itself a symlink is the user's own arrangement and is
+/// refused rather than replaced.
+pub fn write_back_login_from(home: &Path, host_home: &Path) -> bool {
+    let ws = home
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let _serialised = WRITE_BACK.lock();
+    // The host first: with no login there, nothing may be restored.
+    let Some(host) = host_login(host_home) else {
+        return false;
+    };
+    let from = home.join(CREDENTIALS);
+    let candidate = match refreshed_login(&from, &host) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return false,
+        Err(why) => {
+            tracing::warn!(ws = %ws, path = %from.display(), why = ?why, "a workspace login was not written back");
+            return false;
+        }
+    };
+    let to = host_home.join(CREDENTIALS);
+    match replace_private(&to, &candidate) {
+        Ok(()) => {
+            tracing::info!(ws = %ws, "a login the workspace refreshed was written back to the daemon user");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(ws = %ws, path = %to.display(), error = %e, "could not write a refreshed login back");
+            false
+        }
+    }
+}
+
+/// [`write_back_login_from`] into the daemon user's own home.
+pub fn write_back_login(home: &Path) -> bool {
+    daemon_home().is_some_and(|host| write_back_login_from(home, &host))
+}
+
+/// The newest refreshed login among every home under `homes`, written back.
+///
+/// Before a workspace is seeded, not only when an agent exits: the workspace
+/// that refreshed may still be running, and the one about to start would
+/// otherwise be handed the host's stale copy. Newest first, and done at the
+/// first that is written, because from then on the host is the newest.
+pub fn write_back_any_refreshed_login_from(homes: &Path, host_home: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(homes) else {
+        return false;
+    };
+    let mut candidates: Vec<(SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter_map(|home| {
+            let md = std::fs::symlink_metadata(home.join(CREDENTIALS)).ok()?;
+            Some((md.modified().ok()?, home))
+        })
+        .collect();
+    candidates.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+    candidates
+        .iter()
+        .any(|(_, home)| write_back_login_from(home, host_home))
+}
+
+/// [`write_back_any_refreshed_login_from`] into the daemon user's own home.
+pub fn write_back_any_refreshed_login(homes: &Path) -> bool {
+    daemon_home().is_some_and(|host| write_back_any_refreshed_login_from(homes, &host))
+}
+
+/// One write-back at a time. Two agents can exit together, and a start's sweep
+/// can meet an exit; each compares the host's file and then replaces it, and
+/// interleaved they would each have compared against a file the other was
+/// about to replace.
+static WRITE_BACK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// The host's login file as the write-back compares against it, or `None` when
+/// there is none to compare against -- absent, a symlink, or not a file.
+fn host_login(host_home: &Path) -> Option<Host> {
+    let path = host_home.join(CREDENTIALS);
+    let md = match std::fs::symlink_metadata(&path) {
+        Ok(md) => md,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "could not look at the daemon user's login");
+            return None;
+        }
+    };
+    if md.is_symlink() || !md.is_file() {
+        tracing::warn!(path = %path.display(), "the daemon user's login is not a plain file; no login is written back to it");
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    Some(Host {
+        mtime: md.modified().ok()?,
+        login: Login::parse(&bytes),
+    })
+}
+
+/// The bytes at `from` when they are a newer, working copy of `host`'s login;
+/// `Ok(None)` when they are nothing to act on, and the reason when they were
+/// refused.
+fn refreshed_login(from: &Path, host: &Host) -> Result<Option<Vec<u8>>, Rejected> {
+    // `.claude` above the file as well as the file: a directory symlink there
+    // would make the path below it resolve anywhere.
+    let dir_is_real = from
+        .parent()
+        .and_then(|p| std::fs::symlink_metadata(p).ok())
+        .is_some_and(|md| md.is_dir() && !md.is_symlink());
+    if !dir_is_real {
+        return Ok(None);
+    }
+    let md = match std::fs::symlink_metadata(from) {
+        Ok(md) => md,
+        Err(_) => return Ok(None),
+    };
+    if md.is_symlink() {
+        return Err(Rejected::Symlink);
+    }
+    if !md.is_file() || md.modified().ok().is_none_or(|m| m <= host.mtime) {
+        return Ok(None);
+    }
+    let bytes = read_without_following(from).map_err(|_| Rejected::Symlink)?;
+    let login = Login::parse(&bytes).ok_or(Rejected::Unparsable)?;
+    if !login.is_live() {
+        return Err(Rejected::Emptied);
+    }
+    let Some(theirs) = &host.login else {
+        // A host file that is not a credentials file at all is not one this
+        // can vouch for a copy of.
+        return Err(Rejected::OtherAccount);
+    };
+    let same_login = login.scopes == theirs.scopes
+        && login.subscription_type == theirs.subscription_type
+        && login.expires_at >= theirs.expires_at
+        && login.refresh_token_expires_at >= theirs.refresh_token_expires_at;
+    if !same_login {
+        return Err(Rejected::OtherAccount);
+    }
+    if login.access_token == theirs.access_token && login.refresh_token == theirs.refresh_token {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+/// Reads `path` refusing, on Unix, to follow a symlink at its final component
+/// even if one was raced in after the caller looked. The sandbox, and so the
+/// agent that could race, is Unix-only; elsewhere the caller's look suffices.
+fn read_without_following(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(path)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut f, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Replaces the file at `path` with `body`, private from the moment it exists
+/// and never absent: the body goes into a sibling temporary made the way
+/// [`create_private`] makes every secret, is synced, and is renamed over the
+/// destination. A rename replaces a name and follows nothing, and a temporary
+/// that was already there -- which only another daemon could have left -- is
+/// refused by `create_new` rather than reused.
+fn replace_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    let tmp_name = format!(
+        ".{}.{}-{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        SERIAL.fetch_add(1, Ordering::Relaxed)
+    );
+    let tmp = path.with_file_name(tmp_name);
+    let written = (|| {
+        let mut f = create_private(&tmp)?;
+        f.write_all(body)?;
+        // Before the rename: a crash between an unsynced rename and the data
+        // reaching the disk can leave the name pointing at an empty file, and
+        // an empty login file is a logged-out user.
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 #[cfg(test)]
@@ -815,6 +1135,260 @@ mod tests {
             std::fs::read_to_string(&bait).unwrap(),
             "still here",
             "its target must be untouched"
+        );
+    }
+
+    /// A credentials file the shape the CLI writes, with the fields the
+    /// write-back compares fixed so two of these differ only in what a refresh
+    /// changes.
+    fn creds(access: &str, refresh: &str, expires_at: i64) -> String {
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": access,
+                "refreshToken": refresh,
+                "expiresAt": expires_at,
+                "refreshTokenExpiresAt": 1_800_000_000_000i64,
+                "scopes": ["user:inference", "user:profile"],
+                "subscriptionType": "max",
+                "rateLimitTier": "default_claude_max_5x",
+            }
+        })
+        .to_string()
+    }
+
+    /// The tokens as the host held them, and as a workspace's refresh rotated
+    /// them: same account, later expiry, both tokens new.
+    const HOST: (&str, &str, i64) = ("sk-ant-oat01-host", "sk-ant-ort01-host", 1_000);
+    const REFRESHED: (&str, &str, i64) = ("sk-ant-oat01-new", "sk-ant-ort01-new", 2_000);
+
+    /// Writes `body` at `path` with an mtime `secs` after a fixed origin, so a
+    /// test says which file is newer instead of relying on the clock and the
+    /// filesystem's idea of resolution.
+    fn write_at(path: PathBuf, body: &str, secs: u64) {
+        write(path.clone(), body);
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + secs);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    /// The bug, seen end to end: the workspace refreshed and the host still
+    /// holds the rotated-away refresh token. The refreshed copy comes back
+    /// byte for byte, private, and a second look finds nothing left to bring.
+    #[test]
+    fn a_login_a_workspace_refreshed_is_written_back_to_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host-home");
+        let ws = dir.path().join("homes").join("ws_1");
+        write_at(host.join(CREDENTIALS), &creds(HOST.0, HOST.1, HOST.2), 0);
+        let refreshed = creds(REFRESHED.0, REFRESHED.1, REFRESHED.2);
+        write_at(ws.join(CREDENTIALS), &refreshed, 60);
+
+        assert!(write_back_login_from(&ws, &host));
+        assert_eq!(
+            std::fs::read_to_string(host.join(CREDENTIALS)).unwrap(),
+            refreshed
+        );
+        #[cfg(unix)]
+        assert_eq!(mode_of(&host.join(CREDENTIALS)), 0o600);
+        assert!(
+            !write_back_login_from(&ws, &host),
+            "the host has these tokens now; there is nothing to write"
+        );
+    }
+
+    /// The one way this feature could do harm. After a refresh fails the CLI
+    /// writes the file back with both tokens empty, and that file is newer
+    /// than the host's. It must never land on the host: the host's login may
+    /// well be the working one.
+    ///
+    /// Twice: as the CLI really writes it, with `expiresAt: 0`, which the
+    /// expiry rule would refuse on its own; and with the expiries left intact,
+    /// so the empty tokens are the only thing wrong with it and the check on
+    /// them is shown to be load-bearing by itself.
+    #[test]
+    fn an_emptied_login_is_never_written_back() {
+        for emptied in [creds("", "", 0), creds("", "", REFRESHED.2)] {
+            let dir = tempfile::tempdir().unwrap();
+            let host = dir.path().join("host-home");
+            let ws = dir.path().join("homes").join("ws_1");
+            let live = creds(HOST.0, HOST.1, HOST.2);
+            write_at(host.join(CREDENTIALS), &live, 0);
+            write_at(ws.join(CREDENTIALS), &emptied, 60);
+
+            assert!(!write_back_login_from(&ws, &host), "{emptied}");
+            assert_eq!(
+                std::fs::read_to_string(host.join(CREDENTIALS)).unwrap(),
+                live,
+                "a dead workspace login must not wipe a live host one"
+            );
+        }
+    }
+
+    /// The user logged in again on the host after this workspace refreshed:
+    /// the host's copy is the newer, and the workspace's refresh token is the
+    /// one that is dead.
+    ///
+    /// The relogin's expiries are deliberately no later than the workspace
+    /// copy's. Ordinarily they would be, and the expiry rule would refuse the
+    /// copy by itself; here only its age says no, so this is the mtime rule
+    /// pinned on its own.
+    #[test]
+    fn an_older_workspace_copy_is_not_written_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host-home");
+        let ws = dir.path().join("homes").join("ws_1");
+        let relogin = creds("sk-ant-oat01-relogin", "sk-ant-ort01-relogin", HOST.2);
+        write_at(host.join(CREDENTIALS), &relogin, 60);
+        write_at(
+            ws.join(CREDENTIALS),
+            &creds(REFRESHED.0, REFRESHED.1, REFRESHED.2),
+            0,
+        );
+
+        assert!(!write_back_login_from(&ws, &host));
+        assert_eq!(
+            std::fs::read_to_string(host.join(CREDENTIALS)).unwrap(),
+            relogin
+        );
+    }
+
+    /// The substitution the same-login rule is for: a planted file from some
+    /// other account, fresher than the host's and a working login in its own
+    /// right, is refused because what a refresh does not change has changed.
+    #[test]
+    fn a_login_from_another_account_is_not_written_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host-home");
+        let ws = dir.path().join("homes").join("ws_1");
+        let live = creds(HOST.0, HOST.1, HOST.2);
+        write_at(host.join(CREDENTIALS), &live, 0);
+        let planted = creds(REFRESHED.0, REFRESHED.1, REFRESHED.2).replace("\"max\"", "\"pro\"");
+        write_at(ws.join(CREDENTIALS), &planted, 60);
+
+        assert!(!write_back_login_from(&ws, &host));
+        assert_eq!(
+            std::fs::read_to_string(host.join(CREDENTIALS)).unwrap(),
+            live
+        );
+    }
+
+    /// A host with no login has logged out, and a workspace may not undo
+    /// that -- the same rule the mirror in the seeding keeps.
+    #[test]
+    fn a_host_with_no_login_gets_none_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host-home");
+        std::fs::create_dir_all(host.join(".claude")).unwrap();
+        let ws = dir.path().join("homes").join("ws_1");
+        write_at(
+            ws.join(CREDENTIALS),
+            &creds(REFRESHED.0, REFRESHED.1, REFRESHED.2),
+            60,
+        );
+
+        assert!(!write_back_login_from(&ws, &host));
+        assert!(!host.join(CREDENTIALS).exists());
+    }
+
+    /// The workspace copy's path is the agent's to plant a symlink at. The
+    /// bait it points at is a perfectly good refreshed login, newer than the
+    /// host's; through the link it must be neither read nor written back.
+    #[test]
+    fn a_symlink_planted_at_the_workspace_copy_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host-home");
+        let ws = dir.path().join("homes").join("ws_1");
+        let live = creds(HOST.0, HOST.1, HOST.2);
+        write_at(host.join(CREDENTIALS), &live, 0);
+        let bait = dir.path().join("bait");
+        let baited = creds(REFRESHED.0, REFRESHED.1, REFRESHED.2);
+        write_at(bait.clone(), &baited, 60);
+        std::fs::create_dir_all(ws.join(".claude")).unwrap();
+        let planted = ws.join(CREDENTIALS);
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&bait, &planted).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&bait, &planted).is_ok();
+        if !made {
+            eprintln!("SKIP: this host will not create file symlinks");
+            return;
+        }
+
+        assert!(!write_back_login_from(&ws, &host));
+        assert_eq!(
+            std::fs::read_to_string(host.join(CREDENTIALS)).unwrap(),
+            live,
+            "nothing may reach the host through the link"
+        );
+        assert_eq!(std::fs::read_to_string(&bait).unwrap(), baited);
+        assert!(
+            std::fs::symlink_metadata(&planted).unwrap().is_symlink(),
+            "the link is refused, not replaced: this is a read, not a seeding"
+        );
+    }
+
+    /// The host side of the same discipline: the destination is the user's
+    /// own, and a symlink there is their arrangement, so it is neither written
+    /// through nor swapped out for a real file.
+    #[test]
+    fn a_symlinked_host_login_is_refused_rather_than_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host-home");
+        let ws = dir.path().join("homes").join("ws_1");
+        let elsewhere = dir.path().join("dotfiles").join("credentials.json");
+        let live = creds(HOST.0, HOST.1, HOST.2);
+        write_at(elsewhere.clone(), &live, 0);
+        std::fs::create_dir_all(host.join(".claude")).unwrap();
+        let link = host.join(CREDENTIALS);
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&elsewhere, &link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&elsewhere, &link).is_ok();
+        if !made {
+            eprintln!("SKIP: this host will not create file symlinks");
+            return;
+        }
+        write_at(
+            ws.join(CREDENTIALS),
+            &creds(REFRESHED.0, REFRESHED.1, REFRESHED.2),
+            60,
+        );
+
+        assert!(!write_back_login_from(&ws, &host));
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), live);
+    }
+
+    /// Why the sweep runs before every seeding: workspace A refreshed and is
+    /// still running, and workspace B is about to start. B must get A's
+    /// tokens, not the host's dead ones -- and the sweep takes the newest, so
+    /// a third workspace's older copy is not what wins.
+    #[test]
+    fn seeding_after_a_write_back_hands_the_new_tokens_to_the_next_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host-home");
+        let homes = dir.path().join("homes");
+        write_at(host.join(CREDENTIALS), &creds(HOST.0, HOST.1, HOST.2), 0);
+        let refreshed = creds(REFRESHED.0, REFRESHED.1, REFRESHED.2);
+        write_at(homes.join("ws_a").join(CREDENTIALS), &refreshed, 120);
+        write_at(
+            homes.join("ws_c").join(CREDENTIALS),
+            &creds("sk-ant-oat01-mid", "sk-ant-ort01-mid", 1_500),
+            60,
+        );
+
+        assert!(write_back_any_refreshed_login_from(&homes, &host));
+        let b = homes.join("ws_b");
+        let seeded = seed_claude_files_from(&host, &b, &dir.path().join("wt"));
+        assert!(seeded.contains(&CREDENTIALS));
+        assert_eq!(
+            std::fs::read_to_string(b.join(CREDENTIALS)).unwrap(),
+            refreshed,
+            "the next workspace starts with the tokens that work"
         );
     }
 }

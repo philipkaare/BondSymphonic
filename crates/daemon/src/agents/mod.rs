@@ -326,6 +326,10 @@ pub struct AgentSink {
     /// record is closed once: the moment the process ended is what it wants,
     /// and a second write would only put an `fsync` in front of whoever asked.
     closed: Arc<AtomicBool>,
+    /// The workspace home the agent ran with, so a login it refreshed can be
+    /// written back when it exits: see [`credentials::write_back_login_from`].
+    /// `None` in the unit tests below, which have no home.
+    home: Option<PathBuf>,
 }
 
 impl AgentSink {
@@ -349,6 +353,7 @@ impl AgentSink {
             order: Arc::new(tokio::sync::Mutex::new(())),
             records: None,
             closed: Arc::new(AtomicBool::new(false)),
+            home: None,
         }
     }
 
@@ -358,6 +363,13 @@ impl AgentSink {
     /// without a data directory: only [`AgentManager`] has one.
     pub fn with_records(mut self, records: Arc<AgentRecords>) -> Self {
         self.records = Some(records);
+        self
+    }
+
+    /// Names the workspace home the agent runs with, so the login in it is
+    /// written back to the daemon user when the agent exits.
+    pub fn with_home(mut self, home: PathBuf) -> Self {
+        self.home = Some(home);
         self
     }
 
@@ -486,6 +498,17 @@ impl AgentSink {
         self.store.ended(&self.agent_id);
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
+        }
+        // The process is gone, so its login file is settled: if it refreshed
+        // the tokens, the host's refresh token is dead and this is the copy
+        // that works. Ahead of the record close, which can queue behind a
+        // disk that is stuck; a client that restarts the daemon on `Exited`
+        // must find the login written back as surely as the record closed.
+        if let Some(home) = self.home.clone() {
+            off_the_runtime("writing a refreshed login back", move || {
+                credentials::write_back_login(&home);
+            })
+            .await;
         }
         let Some(records) = &self.records else {
             return;
@@ -827,6 +850,15 @@ impl AgentManager {
         // logged out would otherwise stay that way forever.
         let phase = Instant::now();
         let home = d.dirs.home(&ws.id);
+        // And before the seeding, from every workspace: one whose agent is
+        // still running may have refreshed the tokens, and the copy it holds
+        // is then the only working one -- seeding the host's stale copy here
+        // would start this agent with a refresh token that is already dead.
+        let homes = d.dirs.homes.clone();
+        off_the_runtime("pulling a refreshed login back", move || {
+            credentials::write_back_any_refreshed_login(&homes);
+        })
+        .await;
         let seeded = credentials::seed_claude_files(&home, &ws.worktree_path);
         if !seeded.is_empty() {
             info!(ws = %ws.id, files = ?seeded, "seeded claude credentials");
@@ -854,7 +886,8 @@ impl AgentManager {
             ws.id.clone(),
             entry.clone(),
         )
-        .with_records(self.records.clone());
+        .with_records(self.records.clone())
+        .with_home(home.clone());
         let mut adapter = ClaudeAdapter::new(sink, handle, argv, env, ws.worktree_path.clone());
         // The record goes down *before* the process is spawned, and this
         // ordering is the whole of what makes the session id survivable.
