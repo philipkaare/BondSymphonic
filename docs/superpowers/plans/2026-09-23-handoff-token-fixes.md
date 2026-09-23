@@ -24,6 +24,7 @@ this was written and their uncommitted edits may be in the working tree (see
 | `8b21eee` | IDE: splash screen until connected + prerequisites answered + list arrived |
 | `d5cde45` | daemon: `fs.watch` registers off the runtime, in-flight guard, no walk on a v9fs root |
 | `d809170` | daemon: `platform.claude.com` allowed in the sandbox (the CLI's OAuth token endpoint) |
+| (next) | daemon: a login a workspace refreshed is written back to the host; emptied copies never; host with no login gets none |
 
 ## Root causes found today, for the record
 
@@ -49,15 +50,9 @@ below ship.
 
 ## In flight (uncommitted when written — check `git status`)
 
-- **Token write-back** (`daemon-writeback`): `crates/daemon/src/agents/credentials.rs`
-  + `agents/mod.rs`. When a workspace home's `.claude/.credentials.json` is
-  newer and valid (non-empty tokens), copy it back to the host (0600, atomic,
-  no symlink following either side) at agent exit and before each seeding. An
-  **emptied** copy must never be written back. Tests planned: newer-valid
-  written back; emptied never; older never; planted symlink not followed;
-  seeding after write-back hands out the new tokens. Note: crate-wide
-  `cargo fmt --check` was failing on this file (two long chains ~375, ~461)
-  while in progress.
+- **Token write-back** — SHIPPED (see table). Optional follow-ups: an end-to-end test of the
+  `ended()`/`start` call sites (`agents/mod.rs` ~502 and ~853); the per-start warn for a stale
+  emptied copy in a dead workspace, if it proves noisy.
 - **CLI auth sentence → not logged in** (`ide-auth-failure`):
   `crates/ide/src/qobjects/app_controller.rs` (`auth_failure_in(detail)` rule,
   `claude_auth_override`), `MainWindow.cpp`, `TranscriptView.*`, tests in
