@@ -1104,6 +1104,17 @@ void MainWindow::connectController() {
         m_agentArea->setClaudeLoggedIn(m_controller->getClaudeLoggedIn());
     });
     m_agentArea->setClaudeLoggedIn(m_controller->getClaudeLoggedIn());
+    // And whether that check has answered at all. `claudeLoggedIn` is false
+    // before the first answer because nothing is known, and a gate that read
+    // it alone said "not logged in" to a user who was; while this is false the
+    // gate says it is checking instead. A separate setter rather than one call
+    // with two flags: the two facts move at different times -- storing an API
+    // key opens the gate with no check at all -- and folding them would have
+    // every caller pass a flag it did not change.
+    QObject::connect(m_controller, &AppController::prereqsAnsweredChanged, this, [this] {
+        m_agentArea->setPrereqsAnswered(m_controller->getPrereqsAnswered());
+    });
+    m_agentArea->setPrereqsAnswered(m_controller->getPrereqsAnswered());
     QObject::connect(m_agentArea, &AgentArea::loginRequested, this, &MainWindow::showSetupPage);
     // A workspace that cannot run. Retry is its own request; Remove is the
     // tab menu's destroy, confirmation and busy check included, because it is

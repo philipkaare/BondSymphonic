@@ -7,6 +7,7 @@
 #include <QCoreApplication>
 #include <QColor>
 #include <QDesktopServices>
+#include <QEvent>
 #include <QFont>
 #include <QFontMetrics>
 #include <QGuiApplication>
@@ -40,6 +41,7 @@ constexpr int kPrereqCount = 8;
 
 const QString kOk = QStringLiteral("✓");
 const QString kBad = QStringLiteral("✗");
+const QChar kEllipsis(0x2026);
 
 /// How long "Link copied" stays on the sign-in row.
 constexpr int kCopiedFeedbackMs = 3000;
@@ -187,6 +189,8 @@ SetupPage::SetupPage(AppController* controller, QWidget* parent)
     QObject::connect(m_recheckButton, &QPushButton::clicked, this,
                      [this] { m_controller->recheckPrereqs(); });
     QObject::connect(m_controller, &AppController::prereqsChecked, this, &SetupPage::applyPrereqs);
+    QObject::connect(m_controller, &AppController::prereqsCheckFailed, this,
+                     &SetupPage::onPrereqsCheckFailed);
     QObject::connect(m_controller, &AppController::setupPtyOpened, this,
                      &SetupPage::onSetupPtyOpened);
     QObject::connect(m_controller, &AppController::operationFailed, this,
@@ -208,7 +212,12 @@ SetupPage::SetupPage(AppController* controller, QWidget* parent)
     // being an empty box until something happens to trigger another check;
     // "Re-check" is beneath it for anything that has changed since.
     const QString last = m_controller->prereqsJson();
-    if (!last.isEmpty()) {
+    if (last.isEmpty()) {
+        // No answer yet, which is not the same as nothing to show: a blank
+        // section reads as broken, and the one user who met it had been sent
+        // here to log in by a gate that was waiting on the same check.
+        showCheckingRow();
+    } else {
         applyPrereqs(last);
     }
 }
@@ -234,6 +243,7 @@ void SetupPage::setPtyCloser(std::function<void(const QString& ptyId)> close) {
 }
 
 void SetupPage::applyPrereqs(const QString& json) {
+    m_answered = true;
     clearRows();
     const QJsonArray items = QJsonDocument::fromJson(json.toUtf8()).array();
     for (const QJsonValue& value : items) {
@@ -241,6 +251,33 @@ void SetupPage::applyPrereqs(const QString& json) {
         addRow(item.value("name").toString(), item.value("ok").toBool(),
                item.value("detail").toString(), item.value("fix_hint").toString());
     }
+    m_rowsLayout->addStretch(1);
+}
+
+void SetupPage::showCheckingRow() {
+    clearRows();
+    QHBoxLayout* layout = nullptr;
+    m_rowsLayout->addWidget(makeRow(QString(), QColor(), QString(),
+                                    QStringLiteral("Checking the prerequisites") + kEllipsis,
+                                    &layout));
+    m_rowsLayout->addStretch(1);
+}
+
+void SetupPage::onPrereqsCheckFailed(const QString& message) {
+    if (m_answered) {
+        // There is an answer on the page already. It is still the daemon's
+        // last word, the status bar is saying the connection is down, and
+        // the check is re-run on every reconnect.
+        return;
+    }
+    clearRows();
+    QHBoxLayout* layout = nullptr;
+    m_rowsLayout->addWidget(makeRow(
+        kBad, theme::ink(theme::removed(), theme::isDark(palette())), QString(),
+        QStringLiteral("The daemon could not check the prerequisites: %1 "
+                       "Re-check asks it again.")
+            .arg(message),
+        &layout));
     m_rowsLayout->addStretch(1);
 }
 
@@ -320,32 +357,27 @@ QString SetupPage::buttonTextFor(const QString& action) {
     return QString();
 }
 
-void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
-                       const QString& fixHint) {
+QWidget* SetupPage::makeRow(const QString& glyph, const QColor& glyphColour, const QString& name,
+                            const QString& detail, QHBoxLayout** layout) {
     auto* row = new QWidget(m_rowsHost);
-    auto* layout = new QHBoxLayout(row);
-    layout->setContentsMargins(0, 2, 0, 2);
+    auto* rowLayout = new QHBoxLayout(row);
+    rowLayout->setContentsMargins(0, 2, 0, 2);
 
-    auto* glyph = new QLabel(ok ? kOk : kBad, row);
-    // The IDE's two judgements, read from `theme` rather than written out
-    // again here: a prerequisite that is in place is the same green as a line
-    // that was added, and one that is missing the same red as a line that is
-    // gone, which is the red `GroupBar` already puts on a failed agent.
-    //
-    // Through `ink`, because the glyph is text. The theme's accents are picked
-    // as fills for a light background and sit too close to a dark one.
-    const QColor glyphColour =
-        theme::ink(ok ? theme::added() : theme::removed(), theme::isDark(palette()));
-    glyph->setStyleSheet(QStringLiteral("color:%1").arg(glyphColour.name()));
-    glyph->setFixedWidth(glyph->fontMetrics().horizontalAdvance(kBad) * 2);
-    layout->addWidget(glyph);
+    auto* glyphLabel = new QLabel(glyph, row);
+    if (glyphColour.isValid()) {
+        glyphLabel->setStyleSheet(QStringLiteral("color:%1").arg(glyphColour.name()));
+    }
+    // Sized for the cross whatever the glyph is, so a row with none -- the
+    // "checking" row -- lines its detail up with the rows that replace it.
+    glyphLabel->setFixedWidth(glyphLabel->fontMetrics().horizontalAdvance(kBad) * 2);
+    rowLayout->addWidget(glyphLabel);
 
     auto* label = new QLabel(name, row);
     QFont nameFont = label->font();
     nameFont.setBold(true);
     label->setFont(nameFont);
     label->setMinimumWidth(label->fontMetrics().horizontalAdvance(QStringLiteral("claude_auth  ")));
-    layout->addWidget(label);
+    rowLayout->addWidget(label);
 
     auto* detailLabel = new QLabel(detail, row);
     // The daemon wrote this sentence, and it names commands and paths. Left at
@@ -357,7 +389,25 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
     detailLabel->setWordWrap(true);
     // Selectable so a failure can be pasted into a bug report.
     detailLabel->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-    layout->addWidget(detailLabel, 1);
+    rowLayout->addWidget(detailLabel, 1);
+
+    *layout = rowLayout;
+    return row;
+}
+
+void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
+                       const QString& fixHint) {
+    // The IDE's two judgements, read from `theme` rather than written out
+    // again here: a prerequisite that is in place is the same green as a line
+    // that was added, and one that is missing the same red as a line that is
+    // gone, which is the red `GroupBar` already puts on a failed agent.
+    //
+    // Through `ink`, because the glyph is text. The theme's accents are picked
+    // as fills for a light background and sit too close to a dark one.
+    const QColor glyphColour =
+        theme::ink(ok ? theme::added() : theme::removed(), theme::isDark(palette()));
+    QHBoxLayout* layout = nullptr;
+    QWidget* row = makeRow(ok ? kOk : kBad, glyphColour, name, detail, &layout);
 
     // The one way a button on this page is made, whichever ending builds it.
     // Both have to join `m_actionButtons`: that list is what goes dead while a
@@ -923,6 +973,89 @@ extern "C" std::int32_t bs_widget_test_setup_page_offers_a_logout_for_a_live_ses
         }
         if (buttonSaying(page, "Log in to Claude Code") == nullptr) {
             return 8;
+        }
+    }
+    return 0;
+}
+
+/// The row that says the check has not answered, or could not.
+QLabel* rowSaying(const SetupPage& page, const char* prefix) {
+    for (QLabel* label : page.findChildren<QLabel*>()) {
+        if (label->text().startsWith(QLatin1String(prefix))) {
+            return label;
+        }
+    }
+    return nullptr;
+}
+
+/// Lets the rows a rebuild took down actually go, so a label that was on one
+/// of them stops being found. `clearRows` defers the deletes, and nothing here
+/// runs an event loop to collect them.
+void collectRows() {
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+}
+
+/// Before the daemon has answered, the section says it is checking rather than
+/// showing nothing, and says so as a row so it sits where the rows will.
+///
+/// The first `system.check_prereqs` on a freshly booted distro took eleven
+/// seconds. A user sent here by the composer gate in that window found an
+/// empty section, took it for a broken page, and quit -- logged in all along.
+extern "C" std::int32_t bs_widget_test_setup_page_says_it_is_checking_first() {
+    {
+        AppController controller;
+        SetupPage page(&controller);
+        if (rowSaying(page, "Checking the prerequisites") == nullptr) {
+            return 1;
+        }
+        // The one row lays out like the eight it stands in for: the same
+        // glyph and name slots, blank.
+        QLabel* detail = rowSaying(page, "Checking the prerequisites");
+        if (detail->textFormat() != Qt::PlainText) {
+            return 2;
+        }
+        // The real answer takes its place.
+        controller.prereqsChecked(QString::fromUtf8(kMixedPrereqs));
+        collectRows();
+        if (rowSaying(page, "Checking the prerequisites") != nullptr) {
+            return 3;
+        }
+        if (rowSaying(page, "not installed") == nullptr) {
+            return 4;
+        }
+    }
+    {
+        // The daemon could not answer before anything was drawn: the row says
+        // so, with its message, and the Re-check button is still there.
+        AppController controller;
+        SetupPage page(&controller);
+        controller.prereqsCheckFailed(QStringLiteral("daemon connection lost"));
+        collectRows();
+        if (rowSaying(page, "Checking the prerequisites") != nullptr) {
+            return 5;
+        }
+        QLabel* failed = rowSaying(page, "The daemon could not check the prerequisites");
+        if (failed == nullptr || !failed->text().contains(QLatin1String("daemon connection lost"))) {
+            return 6;
+        }
+        if (buttonSaying(page, "Re-check") == nullptr) {
+            return 7;
+        }
+        // An answer after the failure draws the rows as ever.
+        controller.prereqsChecked(QString::fromUtf8(kMixedPrereqs));
+        collectRows();
+        if (rowSaying(page, "The daemon could not check the prerequisites") != nullptr) {
+            return 8;
+        }
+        if (rowSaying(page, "not installed") == nullptr) {
+            return 9;
+        }
+        // A failure after an answer leaves the answer up: it is still the
+        // daemon's last word, and the status bar reports the failure.
+        controller.prereqsCheckFailed(QStringLiteral("daemon connection lost"));
+        collectRows();
+        if (rowSaying(page, "not installed") == nullptr) {
+            return 10;
         }
     }
     return 0;

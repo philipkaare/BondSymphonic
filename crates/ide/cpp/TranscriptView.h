@@ -74,6 +74,17 @@ public:
     /// happens in the setup terminal, which is a PTY and can.
     void setClaudeLoggedIn(bool loggedIn);
 
+    /// Whether the daemon has answered the prerequisite check at all, per the
+    /// controller's `prereqsAnswered`. Changes only what the closed gate says.
+    ///
+    /// Before the first answer `setClaudeLoggedIn` is false because nothing is
+    /// known yet, not because anyone is logged out, and a gate that read the
+    /// one flag told a logged-in user "Claude Code is not logged in" and sent
+    /// them to Settings -- where the same unanswered check drew an empty page.
+    /// Until this is true the gate says it is checking and offers nothing:
+    /// there is nothing to fix yet.
+    void setPrereqsAnswered(bool answered);
+
     /// What the pane says while the transcript is empty: that the agent is
     /// there, what it will answer as, where the work came from and where it
     /// happens. `origin` is `workspacelabel::origin`'s repository and base
@@ -174,6 +185,10 @@ private:
     /// Puts `message` in the banner, or takes it down when both the daemon's
     /// state and the last request are clean.
     void refreshBanner();
+    /// Rewrites the closed gate from the two flags: "checking" with no button
+    /// until the prerequisite check has answered, and the login sentence with
+    /// the button once it has answered no.
+    void refreshGate();
 
     /// Builds the frame for one item, connecting a tool card's toggle back to
     /// the model at `index`.
@@ -235,6 +250,9 @@ private:
     QWidget* m_composer = nullptr;
     /// What stands in the composer's place until Claude Code is logged in.
     QWidget* m_loginGate = nullptr;
+    /// The gate's sentence and its button; see [`refreshGate`].
+    QLabel* m_gateText = nullptr;
+    QPushButton* m_loginButton = nullptr;
     PromptInput* m_input = nullptr;
     QPushButton* m_interrupt = nullptr;
     /// Which model answers here, and what this agent asks before it acts. Both
@@ -272,6 +290,9 @@ private:
     /// See [`setClaudeLoggedIn`]. True until told otherwise, so a view built
     /// without a window around it behaves as it always did.
     bool m_loggedIn = true;
+    /// See [`setPrereqsAnswered`]. True until told otherwise, for the same
+    /// reason.
+    bool m_prereqsAnswered = true;
     /// The agent id the pane had when the start was asked for. A different one
     /// arriving is the start answering, whether the pane had none before or was
     /// restarting one that exited.

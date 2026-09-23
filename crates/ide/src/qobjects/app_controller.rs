@@ -389,6 +389,20 @@ pub mod qobject {
         /// re-check a setup terminal triggers when it exits, so the composer
         /// comes back without an IDE restart.
         #[qproperty(bool, claude_logged_in)]
+        /// Whether a `system.check_prereqs` has answered on the live
+        /// connection. False at start-up, true from the first `prereqs_checked`
+        /// on, and false again when the connection is lost until the reconnect's
+        /// own check answers.
+        ///
+        /// `claude_logged_in` is false before the first answer, and a composer
+        /// gate that read that alone said "Claude Code is not logged in" and
+        /// offered the login to a user who was. On a freshly booted distro the
+        /// first check can take ten seconds, which is plenty of time to open
+        /// Settings and quit. This is what lets the gate say it is still
+        /// checking instead. A check the daemon could not answer leaves this
+        /// false: the question is still open, and the status bar already says
+        /// why.
+        #[qproperty(bool, prereqs_answered)]
         type AppController = super::AppControllerRust;
 
         #[qsignal]
@@ -1349,6 +1363,12 @@ fn parse_setup_action(action: &str) -> Option<SetupAction> {
 fn publish_connection_loss(qt: &QtHandle, losing: ConnectionState) {
     let _ = qt.queue(move |mut q| {
         q.as_mut().rust_mut().client = None;
+        // The answer went with the connection: the reconnect runs its own
+        // check, and until that answers a composer gate must say it is
+        // checking rather than claim an answer nobody has given yet. The
+        // answer's contents stay -- the gate and the setup page keep drawing
+        // the last thing the daemon said.
+        q.as_mut().set_prereqs_answered(false);
         q.set_state(losing);
     });
 }
@@ -1396,6 +1416,9 @@ pub struct AppControllerRust {
     /// in. Backs the `claudeLoggedIn` property; see [`claude_gate_open`] for
     /// what the transcript panes do with it.
     claude_logged_in: bool,
+    /// Whether the live connection's prerequisite check has answered. Backs
+    /// the `prereqsAnswered` property; see there.
+    prereqs_answered: bool,
     /// The last `prereqs_checked` payload, so a setup page built later can
     /// draw its rows without waiting for another check. See `prereqs_json`.
     prereqs_json: QString,
@@ -1427,6 +1450,7 @@ impl Default for AppControllerRust {
             // Shut until a check says otherwise: the composer must not be open
             // in the seconds before the first `system.check_prereqs` answers.
             claude_logged_in: false,
+            prereqs_answered: false,
             prereqs_json: QString::from(""),
             prereqs_any_failed: false,
             claude_auth_ok: false,
@@ -2875,6 +2899,10 @@ impl qobject::AppController {
             rust.setup_prompt.checked(answer.blocked);
         }
         self.as_mut().refresh_claude_logged_in();
+        // After the gate, so a pane that hears the answer has already heard
+        // whether it opens: the other way round, a logged-in user's composer
+        // gate would read "not logged in" for the instant between the two.
+        self.as_mut().set_prereqs_answered(true);
         self.prereqs_checked(QString::from(&answer.json));
     }
 

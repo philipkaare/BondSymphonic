@@ -97,6 +97,12 @@ public:
     /// Code is logged in -- and the setup terminal is where the login happens.
     void setClaudeLoggedIn(bool loggedIn);
 
+    /// Whether the prerequisite check has answered at all, per the controller's
+    /// `prereqsAnswered`. Applied to every transcript pane the same way, and
+    /// for the same reason: a pane built before the answer must say it is
+    /// checking, not that nobody is logged in.
+    void setPrereqsAnswered(bool answered);
+
     /// Whether every transcript shows the turn cost and the agent's own system
     /// lines. Applied to the panes that exist and remembered for the ones built
     /// afterwards, for the same reason the login gate is: a workspace whose tab
@@ -261,4 +267,8 @@ private:
     /// See [`setClaudeLoggedIn`]. False until the first prerequisite check
     /// answers, so a pane built in the seconds before it opens no composer.
     bool m_claudeLoggedIn = false;
+    /// See [`setPrereqsAnswered`]. False until the first check answers, which
+    /// is what makes a pane built before then say "checking" rather than
+    /// offer a login to a user who already has one.
+    bool m_prereqsAnswered = false;
 };

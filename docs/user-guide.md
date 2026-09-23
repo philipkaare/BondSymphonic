@@ -126,7 +126,11 @@ unfixed — and the **Set up…** link in the status bar goes there whenever a c
 is failing. If the same problem is still there later, or a new one appears, it
 opens by itself again. It is where logging in to Claude Code and to GitHub
 happens; there is no Help > Setup any more, because a login is a setting you
-come back to when a token expires.
+come back to when a token expires. Until the daemon has answered its first
+check — ten seconds or so on a distro that has just booted — the section shows
+a single row, *Checking the prerequisites…*, which the answer replaces by
+itself; if the daemon could not answer, the row says so and **Re-check** asks
+again.
 
 The section lists eight checks, each with a tick or a cross and the detail
 behind it:
@@ -533,8 +537,10 @@ A Claude Code workspace's pane shows the conversation as it arrives.
   `claude -p`, and `-p` mode cannot log in — typing `/login` into the chat
   answers "login is not available in this environment" — so the login has to
   happen in the setup terminal. The box comes back on its own when the check
-  passes, and immediately when you store a key; there is no restart. Terminal
-  tabs are unaffected.
+  passes, and immediately when you store a key; there is no restart. Before the
+  daemon has answered its first check the foot of the pane says *Checking
+  whether Claude Code is logged in…* with no button, and clears itself when the
+  answer comes. Terminal tabs are unaffected.
 - **Transcript.** Your prompts, the assistant's answers rendered as Markdown,
   one card per tool call with its input and its result, and a line per turn with
   what it cost and how long it took.

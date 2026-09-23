@@ -261,6 +261,7 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     // wait for something that is never going to happen on its own, whereas
     // this says what is missing and leads to the one place it can be fixed.
     m_loginGate = new QWidget(this);
+    m_loginGate->setObjectName(QStringLiteral("bsClaudeGate"));
     // Stacked, not side by side. The agent pane is a dock now and is routinely
     // a couple of hundred pixels wide; beside a button whose text sets its
     // width, a wrapped sentence is squeezed into whatever is left and comes out
@@ -270,21 +271,25 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     auto* gateLayout = new QVBoxLayout(m_loginGate);
     gateLayout->setContentsMargins(4, 4, 4, 4);
     gateLayout->setSpacing(4);
-    auto* gateText = new QLabel(
-        QStringLiteral("Claude Code is not logged in, so this agent cannot answer yet."),
-        m_loginGate);
-    gateText->setWordWrap(true);
-    gateText->setEnabled(false);
-    gateLayout->addWidget(gateText);
-    auto* loginButton =
+    // The sentence is written by `refreshGate`, which is also what decides
+    // whether the button is there: until the daemon has answered, the gate is
+    // shut because nothing is known, and a gate that said "not logged in" then
+    // was read as exactly that by a user who was logged in the whole time.
+    m_gateText = new QLabel(m_loginGate);
+    m_gateText->setObjectName(QStringLiteral("bsClaudeGateText"));
+    m_gateText->setWordWrap(true);
+    m_gateText->setEnabled(false);
+    gateLayout->addWidget(m_gateText);
+    m_loginButton =
         new QPushButton(QStringLiteral("Log in to Claude Code") + QChar(kEllipsis), m_loginGate);
     // Named so a test can find it without the view growing an accessor for it.
-    loginButton->setObjectName(QStringLiteral("bsClaudeLogin"));
-    loginButton->setToolTip(QStringLiteral("Open Settings on the Setup section"));
-    gateLayout->addWidget(loginButton, 0, Qt::AlignLeft);
+    m_loginButton->setObjectName(QStringLiteral("bsClaudeLogin"));
+    m_loginButton->setToolTip(QStringLiteral("Open Settings on the Setup section"));
+    gateLayout->addWidget(m_loginButton, 0, Qt::AlignLeft);
     m_loginGate->hide();
     outer->addWidget(m_loginGate);
-    QObject::connect(loginButton, &QPushButton::clicked, this,
+    refreshGate();
+    QObject::connect(m_loginButton, &QPushButton::clicked, this,
                      [this] { emit loginRequested(); });
 
     m_coalesce = new QTimer(this);
@@ -500,6 +505,30 @@ void TranscriptView::setClaudeLoggedIn(bool loggedIn) {
     // which is whatever the model says now rather than what it said when the
     // gate went up.
     onStateChanged();
+}
+
+void TranscriptView::setPrereqsAnswered(bool answered) {
+    if (m_prereqsAnswered == answered) {
+        return;
+    }
+    m_prereqsAnswered = answered;
+    refreshGate();
+}
+
+void TranscriptView::refreshGate() {
+    if (!m_prereqsAnswered) {
+        // Not "not logged in": nothing is known yet. On a freshly booted distro
+        // the first check can take ten seconds, and the user who read the old
+        // sentence in that window went to Settings to log in again, found the
+        // page empty and quit. There is nothing to fix yet, so no button.
+        m_gateText->setText(QStringLiteral("Checking whether Claude Code is logged in") +
+                            QChar(kEllipsis));
+        m_loginButton->hide();
+        return;
+    }
+    m_gateText->setText(
+        QStringLiteral("Claude Code is not logged in, so this agent cannot answer yet."));
+    m_loginButton->show();
 }
 
 void TranscriptView::setStarting(bool starting) {
@@ -1343,6 +1372,62 @@ extern "C" std::int32_t bs_widget_test_transcript_announces_a_switch_when_it_lan
     model.setAgentId(QStringLiteral("ag_second"));
     if (view.noticeTextsForTest().size() != 1) {
         return 7;
+    }
+    return 0;
+}
+
+/// The closed gate says it is checking until the daemon has answered, and only
+/// then that Claude Code is not logged in.
+///
+/// Before the first `system.check_prereqs` answers, `claudeLoggedIn` is false
+/// because nothing is known, and the gate used to read that as a login being
+/// missing: "Claude Code is not logged in" and a button to go and log in. On a
+/// freshly booted distro the answer took eleven seconds, and the user, who was
+/// logged in the whole time, went to Settings to log in again, found a page
+/// with no rows on it and quit.
+extern "C" std::int32_t bs_widget_test_transcript_gate_says_it_is_checking_first() {
+    TranscriptModel model;
+    TranscriptView view(&model);
+    auto* gate = view.findChild<QWidget*>(QStringLiteral("bsClaudeGate"));
+    auto* text = view.findChild<QLabel*>(QStringLiteral("bsClaudeGateText"));
+    auto* login = view.findChild<QPushButton*>(QStringLiteral("bsClaudeLogin"));
+    if (gate == nullptr || text == nullptr || login == nullptr) {
+        return 1;
+    }
+
+    // The window's order on start-up: the area is told nothing is known and
+    // nobody is logged in, in whichever order the two properties are read.
+    view.setPrereqsAnswered(false);
+    view.setClaudeLoggedIn(false);
+    if (gate->isHidden()) {
+        return 2;
+    }
+    if (!text->text().startsWith(QLatin1String("Checking whether Claude Code is logged in"))) {
+        return 3;
+    }
+    // Nothing to fix yet, so nothing to click.
+    if (!login->isHidden()) {
+        return 4;
+    }
+
+    // The answer arrives and it is no: now the sentence is a fact and the
+    // button is the way to change it.
+    view.setPrereqsAnswered(true);
+    if (gate->isHidden()) {
+        return 5;
+    }
+    if (text->text() !=
+        QLatin1String("Claude Code is not logged in, so this agent cannot answer yet.")) {
+        return 6;
+    }
+    if (login->isHidden()) {
+        return 7;
+    }
+
+    // The answer is yes: no gate at all.
+    view.setClaudeLoggedIn(true);
+    if (!gate->isHidden()) {
+        return 8;
     }
     return 0;
 }

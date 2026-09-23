@@ -7,6 +7,8 @@
 class AppController;
 class TerminalSession;
 class TerminalWidget;
+class QColor;
+class QHBoxLayout;
 class QLabel;
 class QPushButton;
 class QResizeEvent;
@@ -66,6 +68,18 @@ protected:
 private:
     /// Rebuilds the rows from a `prereqsChecked` payload.
     void applyPrereqs(const QString& json);
+    /// One row saying the check has not answered yet, in place of the rows.
+    ///
+    /// Drawn while the controller has no payload at all, which on a freshly
+    /// booted distro is the first ten seconds or so. The section used to be
+    /// blank for those seconds, and a user sent here by the composer gate to
+    /// log in found nothing to log in with and quit -- logged in all along.
+    void showCheckingRow();
+    /// The check could not be answered before any answer was drawn: one row
+    /// saying so, with the message, and "Re-check" beneath it as the way on.
+    /// After an answer the rows stay as they are -- they are still the last
+    /// thing the daemon said -- and the status bar reports the failure.
+    void onPrereqsCheckFailed(const QString& message);
     /// Drops every row widget. The rows are rebuilt wholesale rather than
     /// patched: there are eight of them, and a partial update is how a page
     /// ends up showing a fix button for something that has since been fixed.
@@ -74,6 +88,11 @@ private:
     /// button that fixes it or the command that would, and for a passing
     /// sign-in the button that undoes it.
     void addRow(const QString& name, bool ok, const QString& detail, const QString& fixHint);
+    /// The front of every row -- glyph, name, detail -- laid out the same way
+    /// whichever row it is, and the layout to put the rest on. An invalid
+    /// `glyphColour` leaves the glyph in the palette's own ink.
+    QWidget* makeRow(const QString& glyph, const QColor& glyphColour, const QString& name,
+                     const QString& detail, QHBoxLayout** layout);
     /// The setup action that fixes `name`, or empty when only a person with a
     /// package manager can.
     static QString actionFor(const QString& name);
@@ -192,4 +211,9 @@ private:
     /// See [`ranAction`]. Set when an action's terminal is opened and never
     /// cleared: the page is destroyed with the dialog that asks.
     bool m_ranAction = false;
+    /// Whether the rows on the page are a real answer. What a failed check
+    /// asks before replacing them: the page's own record, rather than the
+    /// controller's copy of the payload, because it is the rows that are
+    /// being kept or not.
+    bool m_answered = false;
 };
