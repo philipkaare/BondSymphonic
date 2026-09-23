@@ -39,6 +39,16 @@ pub mod qobject {
         #[qsignal]
         fn load_failed(self: Pin<&mut ChangesModel>, message: QString);
 
+        /// A `workspace.changes` request has just gone out; `changesLoaded` or
+        /// `loadFailed` follows. Emitted for every refresh, the ones this model
+        /// starts on its own from `fs.changed` included, because the list's
+        /// view has no other way to know one is in flight. On an in-place
+        /// workspace on a Windows drive the answer takes seconds warm and
+        /// minutes cold, and until this existed the tab showed the previous
+        /// list -- or nothing -- for the whole of that wait.
+        #[qsignal]
+        fn refresh_started(self: Pin<&mut ChangesModel>);
+
         /// Points the model at a workspace: enables `fs.watch` for it, fetches
         /// the list, and keeps it current. The empty id detaches the model and
         /// reports an empty list. Naming the workspace it already holds does
@@ -46,8 +56,8 @@ pub mod qobject {
         #[qinvokable]
         fn set_workspace(self: Pin<&mut ChangesModel>, workspace_id: QString);
 
-        /// Re-fetches the list now. Answers with `changesLoaded` or
-        /// `loadFailed`.
+        /// Re-fetches the list now. Says so with `refreshStarted` once the
+        /// request is out, then answers with `changesLoaded` or `loadFailed`.
         #[qinvokable]
         fn refresh(self: Pin<&mut ChangesModel>);
 
@@ -191,7 +201,7 @@ impl qobject::ChangesModel {
         self.refresh();
     }
 
-    pub fn refresh(self: Pin<&mut Self>) {
+    pub fn refresh(mut self: Pin<&mut Self>) {
         let workspace = self.as_ref().rust().workspace_id.clone();
         if workspace.is_empty() {
             self.changes_loaded(QString::from("[]"));
@@ -204,6 +214,9 @@ impl qobject::ChangesModel {
                 return;
             }
         };
+        // After the connection check, not before it: a refresh with no daemon
+        // fails synchronously above, and nothing is in flight to be shown.
+        self.as_mut().refresh_started();
         let qt = self.as_ref().qt_thread();
         runtime().spawn(async move {
             let params = WorkspaceIdParams {

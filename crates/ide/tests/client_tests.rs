@@ -507,14 +507,33 @@ fn the_new_agent_dialog_waits_two_minutes_for_the_repository() {
     );
 }
 
-/// Everything else keeps the 30 s default, including the other two calls the
-/// Changes toolbar makes.
+/// The two the Explorer sends against the tree at launch and on every
+/// activation. `workspace.changes` is a `git status` and a walk for untracked
+/// files, `repo.detect_run_configs` a directory walk, and on an in-place
+/// workspace on a Windows drive both go over 9P: measured in the distro, the
+/// status alone took over 120 s cold, 38 s on the next run and 4.5 s warm. At
+/// 30 s the Changes list opened on "request timed out" on every cold launch,
+/// for a listing that was on its way.
+#[test]
+fn the_explorer_waits_two_minutes_for_the_tree() {
+    assert_eq!(
+        default_timeout_for("workspace.changes"),
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        default_timeout_for("repo.detect_run_configs"),
+        Duration::from_secs(120)
+    );
+}
+
+/// Everything else keeps the 30 s default, including the status the Changes
+/// toolbar reads for its summary before a Discard.
 #[test]
 fn every_other_method_keeps_the_default_wait() {
     for method in [
         "workspace.list",
         "workspace.destroy",
-        "workspace.changes",
+        "workspace.status",
         "agent.history",
         "hello",
         "a.method.this.build.has.never.heard.of",

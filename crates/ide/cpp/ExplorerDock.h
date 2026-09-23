@@ -15,6 +15,7 @@ class QEvent;
 class QResizeEvent;
 class QStandardItem;
 class QStandardItemModel;
+class QTimer;
 class QToolButton;
 class QTreeView;
 class QWidget;
@@ -31,7 +32,13 @@ class QWidget;
 ///
 /// The Changes tab holds no listing of its own either: `ChangesModel` keeps
 /// itself current from the daemon's `fs.changed` events, and every list it
-/// publishes replaces the tab's rows wholesale.
+/// publishes replaces the tab's rows wholesale. A listing that is slow to
+/// come back is announced with the same "Loading…" row a directory shows, in
+/// place of the list it is about to replace: on a checkout reached through
+/// `/mnt/c` the answer is seconds away warm and minutes away cold, and a stale
+/// list shown for that long reads as the current one. A listing that comes
+/// back promptly -- the ordinary worktree, refreshing on every file an agent
+/// saves -- swaps the list in place, with no row in between.
 class ExplorerDock : public QDockWidget {
     Q_OBJECT
 public:
@@ -113,6 +120,12 @@ private:
     void onDoubleClicked(const QModelIndex& index);
     void onEntriesLoaded(const QString& path, const QString& entriesJson);
     void onLoadFailed(const QString& path, const QString& message);
+    /// A `workspace.changes` request went out: the grace timer starts, and
+    /// the list stays up.
+    void onChangesRequested();
+    /// The grace period ran out with no answer: the tab says it is loading,
+    /// until the answer replaces that.
+    void onChangesLoading();
     /// Replaces every row of the Changes tab from one `workspace.changes`
     /// answer. The list is always complete, never an increment.
     void onChangesLoaded(const QString& json);
@@ -154,6 +167,9 @@ private:
     QStandardItemModel* m_items = nullptr;
     QTreeView* m_changesView = nullptr;
     QStandardItemModel* m_changeItems = nullptr;
+    /// Single-shot, restarted by every `refreshStarted` and stopped by the
+    /// answer; its firing is what puts the loading row up.
+    QTimer* m_changesGrace = nullptr;
     /// The header strip's first line: the workspace name, or the empty state.
     /// The header strip itself, kept because its fill is re-derived whenever
     /// the palette changes.

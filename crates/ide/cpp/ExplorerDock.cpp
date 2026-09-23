@@ -23,6 +23,7 @@
 #include <QStringList>
 #include <QStyle>
 #include <QTabWidget>
+#include <QTimer>
 #include <QToolButton>
 #include <QTreeView>
 #include <QVBoxLayout>
@@ -56,6 +57,19 @@ QColor statusColour(const QString& status, bool dark) {
 /// The narrowest the worktree path is elided to. Below this the elision eats
 /// the whole path and leaves an ellipsis, which says less than a clipped path.
 constexpr int kMinPathWidth = 40;
+
+/// How long a `workspace.changes` request may be out before the Changes tab
+/// says it is loading.
+///
+/// The list refreshes on every `fs.changed`, and an agent editing files sends
+/// those constantly. On an ordinary worktree on the WSL side the answer takes
+/// about 300 ms, so a row put up the moment the request left would blink the
+/// list to "Loading…" on every file the agent saved. Well over twice that
+/// measured figure, so the row never shows on the common path; and well under
+/// the 4.5 s a warm `/mnt/c` checkout takes, let alone the minutes a cold one
+/// does, so the wait that needs announcing is announced long before anyone
+/// wonders whether the panel is broken.
+constexpr int kChangesGraceMs = 800;
 
 /// One right-aligned count for the `+` and `−` columns.
 QStandardItem* makeCount(int n) {
@@ -96,6 +110,8 @@ ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, AppContr
     m_changeItems->setHorizontalHeaderLabels({ QStringLiteral("Path"), QStringLiteral("Status"),
                                                QStringLiteral("+"), QString(QChar(0x2212)) });
     m_changesView = new QTreeView(tabs);
+    // Named for the offscreen check below, which reads the rows through it.
+    m_changesView->setObjectName(QStringLiteral("ExplorerChangesView"));
     m_changesView->setModel(m_changeItems);
     m_changesView->setRootIsDecorated(false);
     m_changesView->setUniformRowHeights(true);
@@ -104,6 +120,12 @@ ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, AppContr
     for (int column = 1; column < m_changeItems->columnCount(); ++column) {
         m_changesView->header()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
     }
+    m_changesGrace = new QTimer(this);
+    // Named for the offscreen check below, which drives it rather than waits.
+    m_changesGrace->setObjectName(QStringLiteral("ExplorerChangesGrace"));
+    m_changesGrace->setSingleShot(true);
+    m_changesGrace->setInterval(kChangesGraceMs);
+    QObject::connect(m_changesGrace, &QTimer::timeout, this, &ExplorerDock::onChangesLoading);
     // The toolbar goes above the list rather than in the window's menus: what
     // Merge and Discard act on is the thing the list is showing, and the two
     // belong next to each other.
@@ -125,7 +147,10 @@ ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, AppContr
     QObject::connect(m_changesView, &QTreeView::doubleClicked, this,
                      &ExplorerDock::onChangeActivated);
     // The model refreshes itself from `fs.changed`, so the tab follows the
-    // worktree without anyone pressing Refresh.
+    // worktree without anyone pressing Refresh -- which is also why the model
+    // has to say when a refresh starts: the dock does not see most of them.
+    QObject::connect(m_changes, &ChangesModel::refreshStarted, this,
+                     &ExplorerDock::onChangesRequested);
     QObject::connect(m_changes, &ChangesModel::changesLoaded, this,
                      &ExplorerDock::onChangesLoaded);
     QObject::connect(m_changes, &ChangesModel::loadFailed, this, &ExplorerDock::onChangesFailed);
@@ -389,7 +414,23 @@ void ExplorerDock::onLoadFailed(const QString& path, const QString& message) {
     noteAnswered(path);
 }
 
+void ExplorerDock::onChangesRequested() {
+    // `start` on a running timer restarts it: a second request before the
+    // first has answered moves the deadline, it does not add one.
+    m_changesGrace->start();
+}
+
+void ExplorerDock::onChangesLoading() {
+    // The previous list goes now rather than when the answer lands. The wait
+    // is long enough on a Windows-drive checkout that a list left up for it
+    // would be read as current, and a failure at the end of it would then
+    // replace a list that was never true.
+    m_changeItems->removeRows(0, m_changeItems->rowCount());
+    m_changeItems->appendRow(makePlaceholder());
+}
+
 void ExplorerDock::onChangesLoaded(const QString& json) {
+    m_changesGrace->stop();
     // No `refreshSummary()` here. The model reloads itself from every
     // `fs.changed` event, so an agent writing files put one `workspace.summary`
     // on the wire per keystroke's worth of output -- for a number nothing is
@@ -422,6 +463,7 @@ void ExplorerDock::onChangesLoaded(const QString& json) {
 }
 
 void ExplorerDock::onChangesFailed(const QString& message) {
+    m_changesGrace->stop();
     m_changeItems->removeRows(0, m_changeItems->rowCount());
     m_changeItems->appendRow(makeError(message));
 }
@@ -520,3 +562,149 @@ QStandardItem* ExplorerDock::makeError(const QString& message) {
     item->setToolTip(message);
     return item;
 }
+
+// --- offscreen test entries --------------------------------------------------
+//
+// See the note in `EditorArea.cpp`. `bs_widget_test_begin` must have run first.
+#if defined(BS_WIDGET_TESTS)
+#include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
+#include <QAbstractItemModel>
+#include <QCoreApplication>
+#include <cstdint>
+
+namespace {
+
+/// The Changes tab's rows, read through the view the dock names for this.
+const QAbstractItemModel* changesRows(const ExplorerDock& dock) {
+    const auto* view = dock.findChild<QTreeView*>(QStringLiteral("ExplorerChangesView"));
+    return view == nullptr ? nullptr : view->model();
+}
+
+/// The first column of row `row`, or an empty string past the end.
+QString rowText(const QAbstractItemModel& rows, int row) {
+    return rows.index(row, 0).data().toString();
+}
+
+/// Whether the tab is showing the two-file list the check loads.
+bool showsTheList(const QAbstractItemModel& rows) {
+    return rows.rowCount() == 2 && rowText(rows, 0) == QLatin1String("src/main.rs") &&
+           rowText(rows, 1) == QLatin1String("notes.md");
+}
+
+/// Whether the tab is showing the one loading row and nothing else.
+bool showsLoading(const QAbstractItemModel& rows) {
+    return rows.rowCount() == 1 && rowText(rows, 0).contains(QLatin1String("Loading"));
+}
+
+/// Fires `grace` now, if it is running, without waiting the grace period out.
+///
+/// The interval goes to zero and the pending timer event is delivered, which
+/// runs the real timeout connection; only the wait is skipped. No event loop
+/// runs in this suite, so a check cannot sleep the period away and let the
+/// timer fire on its own -- and a check that slept would take the better part
+/// of a second per assertion for a number the dock is free to change.
+void fireGrace(QTimer* grace) {
+    if (grace->isActive()) {
+        grace->setInterval(0);
+    }
+    QCoreApplication::processEvents();
+}
+
+} // namespace
+
+/// The Changes tab keeps its list while a refresh answers promptly, and says
+/// it is loading once one has been out for the grace period; the answer --
+/// the list or the failure -- takes the loading row's place.
+///
+/// Both halves are the point. The first version of the row went up on every
+/// `refreshStarted`, and the model refreshes on every `fs.changed`: an agent
+/// saving files would have blinked the list to "Loading…" on every save, on an
+/// ordinary worktree where the answer is 300 ms away. Before that the tab
+/// showed the previous list until the answer landed, and on an in-place
+/// workspace on a Windows drive that is seconds warm and minutes cold -- long
+/// enough for a stale list to be read as the current one. The model is driven
+/// from here rather than through a daemon because the dock's part is the
+/// rendering of the three signals, whichever refresh -- a tab switch, a
+/// Refresh click or an `fs.changed` the dock never sees -- sent them.
+extern "C" std::int32_t bs_widget_test_explorer_changes_say_they_are_loading() {
+    AppController controller;
+    FileTreeModel fileTree;
+    ChangesModel changes;
+    ExplorerDock dock(&fileTree, &changes, &controller);
+    const QAbstractItemModel* rows = changesRows(dock);
+    auto* grace = dock.findChild<QTimer*>(QStringLiteral("ExplorerChangesGrace"));
+    if (rows == nullptr || grace == nullptr) {
+        return 1;
+    }
+    const QString list = QStringLiteral(
+        R"([{"path":"src/main.rs","status":"modified","additions":3,"deletions":1},)"
+        R"({"path":"notes.md","status":"untracked","additions":0,"deletions":0}])");
+    changes.refreshStarted();
+    changes.changesLoaded(list);
+    if (!showsTheList(*rows)) {
+        return 2;
+    }
+    // (a) A refresh that answers inside the grace period: the list stays up
+    // the whole time, and nothing is left ticking afterwards. The events are
+    // pumped after the request goes out so that a grace period of nothing at
+    // all -- a zero timer fires on the first pump -- is caught here.
+    changes.refreshStarted();
+    QCoreApplication::processEvents();
+    if (!showsTheList(*rows)) {
+        return 3;
+    }
+    if (!grace->isActive()) {
+        return 4;
+    }
+    changes.changesLoaded(list);
+    if (grace->isActive()) {
+        return 5;
+    }
+    fireGrace(grace);
+    if (!showsTheList(*rows)) {
+        return 6;
+    }
+    // A second request before the first answers moves the deadline rather
+    // than adding one: the answer stops the only timer there is.
+    changes.refreshStarted();
+    changes.refreshStarted();
+    changes.changesLoaded(list);
+    fireGrace(grace);
+    if (!showsTheList(*rows) || grace->isActive()) {
+        return 7;
+    }
+    // (b) A refresh still out when the grace period ends: the loading row
+    // replaces the list, not nothing and not the list it is about to
+    // supersede.
+    changes.refreshStarted();
+    fireGrace(grace);
+    if (!showsLoading(*rows)) {
+        return 8;
+    }
+    // (c) A failure replaces the loading row with the reason, as it always did.
+    const QString failure = QStringLiteral("workspace.changes failed: request timed out");
+    changes.loadFailed(failure);
+    if (rows->rowCount() != 1 || rowText(*rows, 0) != failure) {
+        return 9;
+    }
+    if (grace->isActive()) {
+        return 10;
+    }
+    // And the list landing after the row replaces it too; the empty list is
+    // an answer, with no rows and no loading row.
+    changes.refreshStarted();
+    fireGrace(grace);
+    changes.changesLoaded(list);
+    if (!showsTheList(*rows)) {
+        return 11;
+    }
+    changes.refreshStarted();
+    fireGrace(grace);
+    changes.changesLoaded(QStringLiteral("[]"));
+    if (rows->rowCount() != 0) {
+        return 12;
+    }
+    return 0;
+}
+
+#endif // BS_WIDGET_TESTS

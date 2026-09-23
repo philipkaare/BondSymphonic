@@ -80,6 +80,19 @@ pub const CREATE_PR_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 ///
 /// `workspace.restart` gets it too: it starts a sandbox, which is part of what
 /// a create does, and may re-register the worktree with git on the way.
+///
+/// So do `workspace.changes` and `repo.detect_run_configs`, the two the IDE
+/// sends against the tree at launch and on every activation. The first is a
+/// `git status` plus a walk for untracked files, the second a directory walk,
+/// and on an in-place workspace whose checkout is on a Windows drive both run
+/// over 9P. Measured from inside the distro on a real repository: the status
+/// took over 120 s on the first run after a cold start, 38 s on the next and
+/// about 4.5 s once warm. At 30 s both failed on every cold launch, and the
+/// Explorer's Changes list opened on `workspace.changes failed: request timed
+/// out` for a listing that was going to arrive. Two minutes covers the warm
+/// and the second run; the very first after a cold start can still outlast it,
+/// and the loading row the list shows meanwhile is what says the wait is a
+/// wait and not a failure.
 pub const REPOSITORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long `method` is given when the client has not been told otherwise.
@@ -93,7 +106,11 @@ pub fn default_timeout_for(method: &str) -> Duration {
     match method {
         "workspace.merge" => MERGE_REQUEST_TIMEOUT,
         "workspace.create_pr" => CREATE_PR_REQUEST_TIMEOUT,
-        "repo.inspect" | "workspace.create" | "workspace.restart" => REPOSITORY_REQUEST_TIMEOUT,
+        "repo.inspect"
+        | "workspace.create"
+        | "workspace.restart"
+        | "workspace.changes"
+        | "repo.detect_run_configs" => REPOSITORY_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
 }

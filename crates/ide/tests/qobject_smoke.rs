@@ -1612,6 +1612,7 @@ mod cpp_widgets {
         fn bs_widget_test_new_agent_dialog_says_how_a_windows_drive_is_protected() -> i32;
         fn bs_widget_test_close_group_closes_an_in_place_workspace_plainly() -> i32;
         fn bs_widget_test_setup_page_offers_a_logout_for_a_live_session() -> i32;
+        fn bs_widget_test_explorer_changes_say_they_are_loading() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1625,7 +1626,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 43] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 44] = [
             // These four build a whole MainWindow, and each begins by pointing
             // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
             // is load-bearing rather than tidy: the state store settles its
@@ -1806,6 +1807,10 @@ mod cpp_widgets {
             (
                 "SetupPage offers a logout on a passing sign-in and the login on a failing one",
                 bs_widget_test_setup_page_offers_a_logout_for_a_live_session,
+            ),
+            (
+                "Explorer's Changes tab says it is loading while workspace.changes is out",
+                bs_widget_test_explorer_changes_say_they_are_loading,
             ),
         ];
 
