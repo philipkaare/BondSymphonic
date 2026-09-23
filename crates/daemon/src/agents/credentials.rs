@@ -9,7 +9,11 @@
 //!
 //! Copying happens both when a workspace is created and every time an agent
 //! starts, so a login performed after the workspace existed reaches it without
-//! the user having to recreate anything.
+//! the user having to recreate anything. It is a mirror rather than a top-up:
+//! a file the daemon user no longer has is removed from the workspace home too,
+//! so `claude auth logout` reaches every existing workspace at the next start
+//! instead of leaving each one its own working copy of the session that was
+//! just put away.
 //!
 //! `.claude.json` is the one file that is written rather than copied: the
 //! workspace's worktree is added to it as a trusted project (§8.3), because
@@ -229,13 +233,16 @@ pub(crate) fn claude_json_with_trust(source: Option<&str>, worktree: &Path) -> S
     serde_json::Value::Object(root).to_string()
 }
 
-/// Copies the Claude Code login out of `source_home` into `home`, overwriting
-/// what is already there so a fresh login refreshes an existing workspace, and
-/// marks `worktree` as a project this home trusts.
+/// Mirrors the Claude Code login out of `source_home` into `home`, overwriting
+/// what is already there so a fresh login refreshes an existing workspace,
+/// removing what `source_home` no longer has so a logout does too, and marks
+/// `worktree` as a project this home trusts.
 ///
-/// Returns the relative names actually written, for logging. Every failure is
-/// non-fatal: a missing file simply means the user has not logged in (or has no
-/// settings), and the agent will say so itself when it starts. `.claude.json` is
+/// Returns the relative names actually written, for logging; a name whose
+/// source is gone is not among them, because nothing was written for it. Every
+/// failure is non-fatal: a missing file simply means the user has not logged in
+/// (or has logged out, or has no settings), and the agent will say so itself
+/// when it starts. `.claude.json` is
 /// the exception that is always written, because the trust entry has to be there
 /// whether or not the daemon user has a file to merge it into.
 pub fn seed_claude_files_from(
@@ -278,10 +285,22 @@ pub fn seed_claude_files_from(
             }
             continue;
         }
+        let to = home.join(rel);
         if !from.is_file() {
+            // The daemon user has no such file, so neither may this workspace.
+            //
+            // Skipping instead would leave the *last* copy in place, and for
+            // `.credentials.json` that copy is a working login: after
+            // `claude auth logout` every existing workspace would go on
+            // answering with the session the user had just put away, and the
+            // logout would look like it had not worked. The seeding mirrors the
+            // daemon user's home in both directions for that reason -- a file
+            // that is gone there is gone here.
+            if let Err(e) = clear_destination(&to) {
+                tracing::warn!(path = %to.display(), error = %e, "could not remove a seeded file the daemon user no longer has");
+            }
             continue;
         }
-        let to = home.join(rel);
         if let Some(parent) = to.parent() {
             // `ensure_real_dir`, not `create_dir_all`: the agent can leave a
             // symlink at `<home>/.claude` pointing out of the workspace, and
@@ -719,6 +738,83 @@ mod tests {
         assert_eq!(
             v["projects"][worktree.to_string_lossy().as_ref()]["hasTrustDialogAccepted"],
             true
+        );
+    }
+
+    /// What makes the Setup page's Log out button mean anything for a workspace
+    /// that already exists.
+    ///
+    /// `claude auth logout` removes the daemon user's `.credentials.json`. Every
+    /// workspace created before that has a copy of it, and the copy is a working
+    /// login: a seeding that only ever added files would leave each one able to
+    /// answer as the account the user had just signed out of. The removal has to
+    /// travel the same way the login does.
+    #[test]
+    fn a_login_the_daemon_user_no_longer_has_is_taken_out_of_the_workspace_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src-home");
+        let dst = dir.path().join("ws-home");
+        let worktree = dir.path().join("wt");
+        write(src.join(".claude/.credentials.json"), "{\"t\":1}");
+        write(src.join(".claude/settings.json"), "{\"a\":1}");
+        seed_claude_files_from(&src, &dst, &worktree);
+        assert!(dst.join(".claude/.credentials.json").is_file());
+
+        // The logout: the tokens go, the settings stay.
+        std::fs::remove_file(src.join(".claude/.credentials.json")).unwrap();
+
+        let seeded = seed_claude_files_from(&src, &dst, &worktree);
+        assert!(
+            !seeded.contains(&".claude/.credentials.json"),
+            "nothing was written for it: {seeded:?}"
+        );
+        assert!(
+            !dst.join(".claude/.credentials.json").exists(),
+            "the workspace must not keep a login the daemon user has put away"
+        );
+        assert!(
+            dst.join(".claude/settings.json").is_file(),
+            "a file the daemon user still has is untouched"
+        );
+    }
+
+    /// The mirror unlinks rather than following, the same as every other write
+    /// into a workspace home. An agent can leave a symlink at the destination,
+    /// and a removal that followed one would delete the daemon user's own
+    /// credentials on the host -- the very file the seeding reads.
+    #[test]
+    fn a_symlink_at_a_vanished_files_destination_is_unlinked_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src-home");
+        let dst = dir.path().join("ws-home");
+        let worktree = dir.path().join("wt");
+        // A file the agent would like removed, standing in for anything on the
+        // host that is not this workspace's business.
+        let bait = dir.path().join("bait");
+        std::fs::write(&bait, "still here").unwrap();
+        // Only settings in the source, so `.credentials.json` is the vanished
+        // one on the very first seeding.
+        write(src.join(".claude/settings.json"), "{}");
+        std::fs::create_dir_all(dst.join(".claude")).unwrap();
+        let planted = dst.join(".claude/.credentials.json");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&bait, &planted).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&bait, &planted).is_ok();
+        if !made {
+            return;
+        }
+
+        seed_claude_files_from(&src, &dst, &worktree);
+
+        assert!(
+            std::fs::symlink_metadata(&planted).is_err(),
+            "the planted link must be gone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&bait).unwrap(),
+            "still here",
+            "its target must be untouched"
         );
     }
 }

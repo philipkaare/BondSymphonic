@@ -26,9 +26,10 @@ pub struct PrereqStatus {
     pub fix_hint: Option<String>,
 }
 
-/// The setup commands a client may ask the daemon to run in a host terminal,
-/// one per prerequisite that a person has to fix interactively. Each names a
-/// command the daemon already knows; the request never carries a command line.
+/// The setup commands a client may ask the daemon to run in a host terminal:
+/// the ones that fix a prerequisite a person has to fix interactively, and the
+/// two that undo a login again. Each names a command the daemon already knows;
+/// the request never carries a command line.
 ///
 /// That is the whole point of the enum. A setup terminal runs on the host,
 /// outside every sandbox, with the daemon user's own home and network, so a
@@ -45,6 +46,15 @@ pub enum SetupAction {
     InstallClaude,
     /// Install the GitHub CLI, fixing `gh`.
     InstallGh,
+    /// Log out of Claude again, breaking `claude_auth` on purpose.
+    ///
+    /// The one setup action whose point is to make a prerequisite fail: a
+    /// session that has to be replaced -- an account switch, or an OAuth login
+    /// that has gone stale in a way `claude auth login` will not overwrite --
+    /// starts by getting rid of the one that is there.
+    ClaudeLogout,
+    /// Log out of GitHub again, breaking `gh_auth` on purpose.
+    GhLogout,
 }
 
 /// What `repo.inspect` knows about a path the user picked.

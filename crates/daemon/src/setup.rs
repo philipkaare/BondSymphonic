@@ -3,7 +3,9 @@
 //! Four of the prerequisites `system.check_prereqs` reports cannot be fixed by
 //! the daemon on its own — two installs and two interactive logins. Each is
 //! fixed by running one known command in a terminal the user can see and type
-//! into, which is what `system.setup_pty` opens.
+//! into, which is what `system.setup_pty` opens. The two logouts run there for
+//! the same reason, though what they do is the opposite: they take a login
+//! away, so the user can put a different one in its place.
 //!
 //! Those commands run on the *host*, outside every workspace sandbox: a login
 //! has to write credentials into the daemon user's real home and reach the
@@ -23,11 +25,13 @@ pub const HOST_BACKEND: &str = "noop";
 
 /// Every action, for callers that need to enumerate them (tests, and any future
 /// listing of what the daemon can fix).
-pub const ALL_ACTIONS: [SetupAction; 4] = [
+pub const ALL_ACTIONS: [SetupAction; 6] = [
     SetupAction::ClaudeLogin,
     SetupAction::GhLogin,
     SetupAction::InstallClaude,
     SetupAction::InstallGh,
+    SetupAction::ClaudeLogout,
+    SetupAction::GhLogout,
 ];
 
 /// The command each action runs. The whole table is literal: an action selects
@@ -42,6 +46,12 @@ pub fn setup_argv(action: SetupAction) -> Vec<String> {
             "curl -fsSL https://claude.ai/install.sh | bash",
         ],
         SetupAction::InstallGh => &["sudo", "apt-get", "install", "-y", "gh"],
+        // Logging out is as interactive as logging in -- `gh auth logout` asks
+        // which host to forget and then asks again whether it means it -- so
+        // both run in the same terminal the logins do rather than being fired
+        // off with no way to answer them.
+        SetupAction::ClaudeLogout => &["claude", "auth", "logout"],
+        SetupAction::GhLogout => &["gh", "auth", "logout"],
     };
     argv.iter().map(|s| (*s).to_string()).collect()
 }
@@ -105,9 +115,30 @@ mod tests {
             setup_argv(SetupAction::InstallGh),
             ["sudo", "apt-get", "install", "-y", "gh"]
         );
+        assert_eq!(
+            setup_argv(SetupAction::ClaudeLogout),
+            ["claude", "auth", "logout"]
+        );
+        assert_eq!(setup_argv(SetupAction::GhLogout), ["gh", "auth", "logout"]);
     }
 
-    /// The table is closed: every action runs one of four known programs, and
+    /// Each provider's logout runs the same program as its login. What makes a
+    /// logout safe is that it is the login's own tool putting its own
+    /// credentials away: nothing here deletes a file by path, so no row can be
+    /// pointed at something that is not a session.
+    #[test]
+    fn each_logout_runs_its_own_providers_tool() {
+        assert_eq!(
+            setup_argv(SetupAction::ClaudeLogout)[0],
+            setup_argv(SetupAction::ClaudeLogin)[0]
+        );
+        assert_eq!(
+            setup_argv(SetupAction::GhLogout)[0],
+            setup_argv(SetupAction::GhLogin)[0]
+        );
+    }
+
+    /// The table is closed: every action runs one of the four known programs, and
     /// the only input is the action, so there is no argument through which a
     /// caller could reach a program of its own. A new action added without a
     /// row would not compile; one added with a row lands here.
