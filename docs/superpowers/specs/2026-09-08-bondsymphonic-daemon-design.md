@@ -1043,7 +1043,8 @@ without namespace support (with a loud warning in the UI), and via
 ### 7.1 Allowlist
 `HostPattern` is either an exact host (`api.anthropic.com`) or a suffix wildcard
 (`*.npmjs.org`). Ports are unrestricted. Default list: `api.anthropic.com`,
-`*.anthropic.com`, `registry.npmjs.org`, `*.npmjs.org`, `pypi.org`,
+`*.anthropic.com`, `platform.claude.com` (the CLI's OAuth token endpoint),
+`registry.npmjs.org`, `*.npmjs.org`, `pypi.org`,
 `files.pythonhosted.org`, `crates.io`, `static.crates.io`, `index.crates.io`,
 `github.com`, `*.github.com`, `*.githubusercontent.com`. The repo's
 `bondsymphonic.toml` `[network] allow = [...]` extends it; `workspace.set_allowlist`

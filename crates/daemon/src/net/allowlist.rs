@@ -22,16 +22,28 @@ use crate::runs::config::RepoConfig;
 use std::net::Ipv6Addr;
 
 /// The hosts every workspace may reach without any configuration: the Anthropic
-/// API the agent talks to, and the package registries a repo has to fetch from
-/// to build at all.
+/// API the agent talks to, the host that refreshes its login, and the package
+/// registries a repo has to fetch from to build at all.
+///
+/// `platform.claude.com` is where the Claude Code CLI refreshes an OAuth token
+/// (`/v1/oauth/token`) and where its connectivity preflight says hello
+/// (`/v1/oauth/hello`); every other call it makes goes to `api.anthropic.com`.
+/// The proxy is the sandbox's only way out, so without this entry a token that
+/// expires mid-run cannot be renewed, and every agent fails with "OAuth session
+/// expired and could not be refreshed" until the user logs in again on the
+/// host. `claude.ai` is deliberately absent: the CLI only sends the user's
+/// browser there, and reaches it itself for opt-in features (connectors,
+/// routines), never to authenticate.
 ///
 /// Kept in the daemon spec's order (§7.1) so the two lists can be diffed by
-/// eye. `crates.io`, `static.crates.io` and `index.crates.io` are listed
+/// eye, with the token host slotted in after the API hosts it belongs with.
+/// `crates.io`, `static.crates.io` and `index.crates.io` are listed
 /// separately rather than folded into `*.crates.io`, because the wildcard would
 /// also open every future subdomain of a registry we need three names from.
-pub const DEFAULT_ALLOW: [&str; 12] = [
+pub const DEFAULT_ALLOW: [&str; 13] = [
     "api.anthropic.com",
     "*.anthropic.com",
+    "platform.claude.com",
     "registry.npmjs.org",
     "*.npmjs.org",
     "pypi.org",
@@ -315,6 +327,7 @@ mod tests {
         let a = Allowlist::from_strings(&DEFAULT_ALLOW.map(String::from));
         for ok in [
             "api.anthropic.com",
+            "platform.claude.com",
             "registry.npmjs.org",
             "index.crates.io",
             "raw.githubusercontent.com",
@@ -322,7 +335,33 @@ mod tests {
         ] {
             assert!(a.allows(ok), "{ok}");
         }
-        for no in ["example.com", "evil-github.com", "githubusercontent.com"] {
+        for no in [
+            "example.com",
+            "evil-github.com",
+            "githubusercontent.com",
+            "claude.com",
+        ] {
+            assert!(!a.allows(no), "{no}");
+        }
+    }
+
+    /// The CLI renews its login at `platform.claude.com`, and nowhere else on
+    /// that domain. With the host missing every agent died with "OAuth session
+    /// expired and could not be refreshed" the moment its token aged out; with
+    /// it listed as an exact entry rather than `*.claude.com`, a lookalike
+    /// subdomain and the bare apex stay out.
+    #[test]
+    fn default_list_reaches_the_oauth_token_host_and_only_that_host() {
+        let a = Allowlist::from_strings(&DEFAULT_ALLOW.map(String::from));
+        assert!(a.allows("platform.claude.com"));
+        assert!(a.allows("PLATFORM.CLAUDE.COM."));
+        for no in [
+            "claude.com",
+            "evil-platform.claude.com",
+            "api.platform.claude.com",
+            "platform.claude.com.evil.example",
+            "claude.ai",
+        ] {
             assert!(!a.allows(no), "{no}");
         }
     }
