@@ -14,7 +14,7 @@ use crate::workspace::registry::Registry;
 use crate::workspace::{lifecycle, DataDirs, Workspace};
 use bondsymphonic_proto::*;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -186,6 +186,28 @@ pub struct Daemon {
     pub git: Git,
     pub backend: Arc<dyn SandboxBackend>,
     pub sandboxes: Mutex<HashMap<WorkspaceId, Arc<dyn SandboxHandle>>>,
+    /// The workspaces whose startup restore has not yet published a final
+    /// state. Every one of them reads as `Creating` to clients, whatever the
+    /// registry says; see [`Daemon::workspace`] and [`Daemon::workspace_info`].
+    ///
+    /// The registry records what a workspace *was* when the last daemon
+    /// stopped, and `restore` brings each one up in turn, minutes apart on a
+    /// cold disk. Until its turn comes a workspace persisted `Ready` has no
+    /// sandbox, and a client that took the registry's word for it sent an
+    /// `agent.start` that could not be served. The IDE already reads a
+    /// restoring workspace as `Creating`, so that is what is shown.
+    ///
+    /// In memory only, never written to `workspaces.json`: a *persisted*
+    /// `Creating` means "creation was interrupted when the daemon stopped",
+    /// which `restore` turns into an `Error` telling the user to remove the
+    /// workspace. A daemon killed mid-restore must find its workspaces as they
+    /// were and restore them again, not be told they were half-made.
+    ///
+    /// Filled by `restore_snapshot` before the server accepts its first
+    /// request, and emptied one workspace at a time as `restore` publishes
+    /// that workspace's final state -- or as a restart or destroy takes the
+    /// workspace over, since the restore then skips it.
+    pub restoring: Mutex<HashSet<WorkspaceId>>,
     pub events: EventBus,
     pub ptys: PtyManager,
     /// Live `fs.watch` subscriptions, one per workspace worktree.
@@ -220,6 +242,7 @@ impl Daemon {
             git: Git::new(),
             backend,
             sandboxes: Mutex::new(HashMap::new()),
+            restoring: Mutex::new(HashSet::new()),
             events: events.clone(),
             ptys: PtyManager::new(events.clone()),
             watchers: Watchers::default(),
@@ -277,10 +300,41 @@ impl Daemon {
         let _ = host.handle.shutdown().await;
     }
 
+    /// A workspace as the daemon currently holds it: the registry's record,
+    /// with the [`restoring`](Self::restoring) overlay applied. This is what
+    /// every request that acts on a workspace's state reads (`agent.start`,
+    /// `run.start`, `pty.open`), so a workspace the restore has not reached yet
+    /// is refused as "not ready" rather than served against a sandbox that is
+    /// not there. `registry.get` is the record without the overlay, for the
+    /// restore itself and for whoever takes a workspace over from it.
     pub fn workspace(&self, id: &WorkspaceId) -> Result<Workspace, RpcError> {
-        self.registry
+        let mut ws = self
+            .registry
             .get(id)
-            .ok_or_else(|| RpcError::not_found(format!("workspace {id}")))
+            .ok_or_else(|| RpcError::not_found(format!("workspace {id}")))?;
+        if self.is_restoring(id) {
+            ws.state = WorkspaceState::Creating;
+        }
+        Ok(ws)
+    }
+
+    fn is_restoring(&self, id: &WorkspaceId) -> bool {
+        self.restoring.lock().contains(id)
+    }
+
+    /// Marks `id` as awaiting its startup restore: see
+    /// [`restoring`](Self::restoring).
+    pub fn mark_restoring(&self, id: &WorkspaceId) {
+        self.restoring.lock().insert(id.clone());
+    }
+
+    /// Takes the restore overlay off `id`: its state is the registry's again.
+    /// Called by `restore` right before it publishes the final state, and by a
+    /// restart or destroy that reaches the workspace before the restore does.
+    /// Idempotent, so every path that ends a restore can call it without
+    /// asking who else did.
+    pub fn clear_restoring(&self, id: &WorkspaceId) {
+        self.restoring.lock().remove(id);
     }
 
     pub fn sandbox(&self, id: &WorkspaceId) -> Result<Arc<dyn SandboxHandle>, RpcError> {
@@ -296,9 +350,14 @@ impl Daemon {
     /// `runs`: the registry is a file that outlives the daemon while both of
     /// those are live processes, so the lists come from their managers here
     /// instead. Every path that hands a `WorkspaceInfo` to a client goes
-    /// through this.
+    /// through this, which is also what makes the [`restoring`](Self::restoring)
+    /// overlay reach `workspace.list`, `workspace.get` and every state event
+    /// alike.
     pub fn workspace_info(&self, ws: &Workspace) -> WorkspaceInfo {
         let mut info = ws.info();
+        if self.is_restoring(&ws.id) {
+            info.state = WorkspaceState::Creating;
+        }
         info.agent_records = self.agents.records_of(&ws.id);
         // The same agents by id, for a client older than the records field.
         info.agents = info.agent_records.iter().map(|a| a.id.clone()).collect();

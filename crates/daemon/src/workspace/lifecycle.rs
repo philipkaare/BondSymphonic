@@ -14,6 +14,7 @@ use crate::workspace::{now_rfc3339, Workspace};
 use bondsymphonic_proto::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// The account whose `/home/<user>` the bwrap backend mounts the sandbox home at.
 ///
@@ -73,6 +74,16 @@ pub const PROXY_BYPASS: &str = "localhost,127.0.0.1";
 /// anyway. Exceeded, the workspace is still usable — it simply has no route out
 /// until it is restarted — which beats refusing to open it at all.
 const SHIM_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One phase-timing line, at `info`, in the one shape every launch-time
+/// phase shares: `op` is what a person greps for (`restore`, `agent.start`),
+/// `phase` is the step, and `elapsed_ms` is how long it took. `info` rather
+/// than `debug` because each one fires once per workspace per launch, and a
+/// cold launch that takes minutes is exactly when the log has to say where.
+pub fn log_phase(id: &WorkspaceId, op: &'static str, phase: &'static str, started: Instant) {
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    tracing::info!(ws = %id, op, phase, elapsed_ms, "{op}: {phase} took {elapsed_ms} ms");
+}
 
 /// Says out loud that a workspace has lost its way out of the sandbox.
 ///
@@ -202,6 +213,7 @@ fn finish_spec(
 }
 
 pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcError> {
+    let phase = Instant::now();
     for p in [
         d.dirs.cache(&ws.id),
         d.dirs.home(&ws.id),
@@ -209,6 +221,8 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
     ] {
         std::fs::create_dir_all(p).map_err(|e| RpcError::io(&e))?;
     }
+    log_phase(&ws.id, "start_sandbox", "create_dirs", phase);
+    let phase = Instant::now();
     let (spec, protection) = match ws.kind {
         WorkspaceKind::Worktree => {
             let layout = layout_for(d, ws).await?;
@@ -242,8 +256,12 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
             (in_place_spec_for(d, ws, &layout, &snapshot), Some(snapshot))
         }
     };
+    // `layout_for` for a worktree; `prepare` and `snapshot` for an in-place
+    // checkout. Both read the repository's `.git`, wherever that lives.
+    log_phase(&ws.id, "start_sandbox", "spec", phase);
     // Before the sandbox, not after: the shim inside it connects to this socket
     // as its first act, and a sandbox that came up first would race it.
+    let phase = Instant::now();
     let proxy = d
         .proxies
         .start(
@@ -253,7 +271,11 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
             d.events.clone(),
         )
         .await?;
-    let handle = match d.backend.start(&spec).await {
+    log_phase(&ws.id, "start_sandbox", "proxies.start", phase);
+    let phase = Instant::now();
+    let started = d.backend.start(&spec).await;
+    log_phase(&ws.id, "start_sandbox", "backend.start", phase);
+    let handle = match started {
         Ok(h) => h,
         // Nothing will ever connect to that listener now.
         Err(e) => {
@@ -269,7 +291,9 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
         watch_protection(d, &ws.id, handle.clone(), snapshot);
     }
     if d.backend.name() == BWRAP_BACKEND {
+        let phase = Instant::now();
         start_shim(d, ws, &handle).await;
+        log_phase(&ws.id, "start_sandbox", "start_shim", phase);
     }
     Ok(())
 }
@@ -1047,6 +1071,10 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
     let gate = gate(id);
     let mut count = gate.lock().await;
     *count += 1;
+    // As in `restart`: the startup restore skips a workspace whose count has
+    // moved, so its overlay is this destroy's to take off -- and the `Error` a
+    // failed destroy leaves behind must read as such, not as `Creating`.
+    d.clear_restoring(id);
     let ws = d.workspace(id)?;
     if ws.kind == WorkspaceKind::InPlace {
         // `force` means nothing here, and there is no dirty or unmerged check:
@@ -1287,6 +1315,7 @@ fn report_repaired(d: &Daemon, ws: &Workspace) {
 /// a bare `No such file or directory` from deep inside `start_sandbox` is what
 /// this replaced. The code stays that of the underlying failure.
 async fn bring_up(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcError> {
+    let phase = Instant::now();
     match ws.kind {
         // No worktree to repair and no registration to put back: only the
         // checkout itself has to still be there.
@@ -1295,7 +1324,11 @@ async fn bring_up(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcError> {
         }
         WorkspaceKind::Worktree => worktree_bring_up(d, ws).await?,
     }
-    start_sandbox(d, ws).await.map_err(|e| {
+    log_phase(&ws.id, "bring_up", "checks", phase);
+    let phase = Instant::now();
+    let started = start_sandbox(d, ws).await;
+    log_phase(&ws.id, "bring_up", "start_sandbox", phase);
+    started.map_err(|e| {
         RpcError::new(
             e.code,
             format!("The sandbox could not be started: {}", e.message),
@@ -1315,6 +1348,7 @@ async fn worktree_bring_up(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
             ),
         ));
     }
+    let phase = Instant::now();
     let layout = layout_for(d, ws).await.map_err(|e| {
         RpcError::new(
             e.code,
@@ -1325,7 +1359,11 @@ async fn worktree_bring_up(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
             ),
         )
     })?;
-    if worktree::ensure_registered(&layout).await? == worktree::Registration::Repaired {
+    log_phase(&ws.id, "bring_up", "layout_for", phase);
+    let phase = Instant::now();
+    let registration = worktree::ensure_registered(&layout).await?;
+    log_phase(&ws.id, "bring_up", "ensure_registered", phase);
+    if registration == worktree::Registration::Repaired {
         report_repaired(d, ws);
     }
     Ok(())
@@ -1370,12 +1408,22 @@ pub struct RestoreEntry {
 
 /// The workspaces the startup restore will bring up. `main` takes this before
 /// the server accepts its first request, so nothing a client does can be in it.
+///
+/// Each one is marked as restoring here, in the same breath and for the same
+/// reason: from the first request on, a workspace in this list reads
+/// `Creating` until [`restore`] has published what it really is
+/// (see [`Daemon::restoring`]). A workspace whose gate is already held is left
+/// out of that, as it is left out of the restore: a restart or destroy owns
+/// its state.
 pub fn restore_snapshot(d: &Daemon) -> Vec<RestoreEntry> {
     d.registry
         .list()
         .into_iter()
         .map(|ws| {
             let ops = gate(&ws.id).try_lock().ok().map(|count| *count);
+            if ops.is_some() {
+                d.mark_restoring(&ws.id);
+            }
             RestoreEntry { ws, ops }
         })
         .collect()
@@ -1394,15 +1442,31 @@ pub fn restore_snapshot(d: &Daemon) -> Vec<RestoreEntry> {
 /// state now. A workspace the last daemon left `Creating` or `Destroying` is
 /// not brought up either — nobody is going to finish that, and a half-removed
 /// worktree must not come back `Ready` — but put in `Error` with what to do.
+///
+/// Whatever the outcome, the workspace stops reading `Creating` here
+/// ([`Daemon::clear_restoring`]) -- on the skip paths too, since nobody else
+/// will -- and right *before* the final state goes into the registry, so the
+/// `WorkspaceStateChanged` event that `set_state` publishes carries the real
+/// state and not the overlay. A `workspace.list` in the gap between the two
+/// reads the recorded state, and by then the sandbox is up (or the failure
+/// is decided), so that state is at worst one event out of date.
+///
+/// Every phase is timed and said at `info`, once per workspace per launch:
+/// the restore of a worktree whose `.git` sits on a 9P mount has taken
+/// minutes, and which step took them could not be told from the log.
 pub async fn restore(d: &Arc<Daemon>, entry: RestoreEntry) {
     let id = entry.ws.id.clone();
+    let started = Instant::now();
     let gate = gate(&id);
     let count = gate.lock().await;
+    log_phase(&id, "restore", "gate", started);
     let Some(ws) = d.registry.get(&id) else {
+        d.clear_restoring(&id);
         return;
     };
     if entry.ops != Some(*count) {
         tracing::debug!(ws = %id, "restore skipped: the workspace was restarted or destroyed meanwhile");
+        d.clear_restoring(&id);
         return;
     }
     // What the IDE calls taking a workspace away, which for an in-place one
@@ -1423,8 +1487,13 @@ pub async fn restore(d: &Arc<Daemon>, entry: RestoreEntry) {
         )),
         WorkspaceState::Ready | WorkspaceState::SandboxDown | WorkspaceState::Error(_) => {
             // A sandbox already registered is not this restore's to leak.
+            let phase = Instant::now();
             tear_down_sandbox(d, &id).await;
-            match bring_up(d, &ws).await {
+            log_phase(&id, "restore", "tear_down_sandbox", phase);
+            let phase = Instant::now();
+            let outcome = bring_up(d, &ws).await;
+            log_phase(&id, "restore", "bring_up", phase);
+            match outcome {
                 Ok(()) => WorkspaceState::Ready,
                 Err(e) => {
                     tracing::warn!(ws = %id, "restore failed: {}", e.message);
@@ -1433,9 +1502,13 @@ pub async fn restore(d: &Arc<Daemon>, entry: RestoreEntry) {
             }
         }
     };
+    d.clear_restoring(&id);
+    let phase = Instant::now();
     if let Err(e) = d.set_state(&id, state).await {
         tracing::warn!(ws = %id, "could not record the restored state: {}", e.message);
     }
+    log_phase(&id, "restore", "set_state", phase);
+    log_phase(&id, "restore", "total", started);
 }
 
 /// Stops everything that runs in a workspace's sandbox, and the sandbox.
@@ -1478,8 +1551,15 @@ pub async fn restart(d: &Arc<Daemon>, id: &WorkspaceId) -> Result<WorkspaceInfo,
     let gate = gate(id);
     let mut count = gate.lock().await;
     // Read under the gate: a destroy that held it may have removed the
-    // workspace, or left it in `Error`.
-    let ws = d.workspace(id)?;
+    // workspace, or left it in `Error`. The registry's own record, not
+    // `d.workspace`: a workspace the startup restore has not reached yet reads
+    // `Creating` to clients, and a Retry on one is exactly what the count
+    // below is for -- this restart takes it over and the restore skips it --
+    // so it must not be refused as "being created".
+    let ws = d
+        .registry
+        .get(id)
+        .ok_or_else(|| RpcError::not_found(format!("workspace {id}")))?;
     match ws.state {
         WorkspaceState::Creating | WorkspaceState::Destroying => {
             return Err(RpcError::invalid_params(format!(
@@ -1495,6 +1575,11 @@ pub async fn restart(d: &Arc<Daemon>, id: &WorkspaceId) -> Result<WorkspaceInfo,
         WorkspaceState::Ready | WorkspaceState::SandboxDown | WorkspaceState::Error(_) => {}
     }
     *count += 1;
+    // This restart owns the workspace's state from here: the restore will skip
+    // it, so the overlay it would have taken off comes off now, or the `Ready`
+    // published below would read `Creating` until the restore got round to
+    // skipping it.
+    d.clear_restoring(id);
     tear_down_sandbox(d, id).await;
     match bring_up(d, &ws).await {
         Ok(()) => Ok(d.workspace_info(&d.set_state(id, WorkspaceState::Ready).await?)),
@@ -1732,5 +1817,263 @@ mod tests {
     #[test]
     fn ignores_lines_that_are_not_entries() {
         assert!(parse_porcelain_v2("# branch.oid abc\n\n! ignored.txt\n").is_empty());
+    }
+
+    /// A daemon over `data`, with one in-place workspace on a fresh `git init`
+    /// checkout persisted in `state` -- as the previous daemon would have left
+    /// it -- and nothing restored yet.
+    ///
+    /// In place rather than a worktree because its restore runs no git: the
+    /// checks are a few stats, and `start_sandbox` over the noop backend makes
+    /// a couple of directories. That is enough sandbox for the overlay to be
+    /// tested against, and it keeps the test to one process spawn.
+    ///
+    /// `id` has to be the test's own: the gates are one static per process,
+    /// and a snapshot taken while another test holds the gate of the same id
+    /// leaves that workspace to the holder, exactly as it would a restart.
+    async fn daemon_with_persisted(
+        dir: &Path,
+        id: &str,
+        state: WorkspaceState,
+    ) -> (
+        Arc<Daemon>,
+        Workspace,
+        tokio::sync::broadcast::Receiver<ServerMessage>,
+    ) {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let events = crate::server::broadcast::EventBus::new(64);
+        let rx = events.subscribe();
+        let d = Daemon::new(
+            crate::workspace::DataDirs::new(dir.join("data")),
+            crate::sandbox::backend_for("noop"),
+            events,
+        )
+        .unwrap();
+        let ws = Workspace {
+            id: id.into(),
+            name: id.into(),
+            repo_path: repo.clone(),
+            base_branch: "main".into(),
+            branch: "main".into(),
+            worktree_path: repo,
+            created_at: now_rfc3339(),
+            allowlist: vec![],
+            kind: WorkspaceKind::InPlace,
+            state,
+            agents: vec![],
+            runs: vec![],
+        };
+        d.registry.insert(ws.clone()).await.unwrap();
+        (d, ws, rx)
+    }
+
+    /// The state `workspaces.json` holds for `id` right now: what the next
+    /// daemon would restore from.
+    fn persisted_state(d: &Daemon, id: &WorkspaceId) -> WorkspaceState {
+        let text = std::fs::read_to_string(d.dirs.registry_file()).unwrap();
+        let file: serde_json::Value = serde_json::from_str(&text).unwrap();
+        file["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["id"] == id.as_str())
+            .map(|w| serde_json::from_value(w["state"].clone()).unwrap())
+            .expect("the workspace is in the registry file")
+    }
+
+    /// The last `workspace.state` event published for `id`.
+    fn last_published_state(
+        rx: &mut tokio::sync::broadcast::Receiver<ServerMessage>,
+        id: &WorkspaceId,
+    ) -> Option<WorkspaceState> {
+        let mut last = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let ServerMessage::Event {
+                event: Event::WorkspaceStateChanged { info },
+                ..
+            } = msg
+            {
+                if &info.id == id {
+                    last = Some(info.state);
+                }
+            }
+        }
+        last
+    }
+
+    /// An `agent.start` against `id`, which has to be answered -- a refusal is
+    /// the answer wanted -- within a bound far below the client's own timeout.
+    async fn agent_start_answer(
+        d: &Daemon,
+        id: &WorkspaceId,
+    ) -> Result<AgentStartResult, RpcError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            d.agents.start(
+                d,
+                AgentStartParams {
+                    workspace_id: id.clone(),
+                    adapter: AgentAdapterKind::Claude,
+                    options: AgentStartOptions {
+                        command: None,
+                        resume_session: None,
+                        model: None,
+                        permission_mode: None,
+                        api_key: None,
+                    },
+                },
+            ),
+        )
+        .await
+        .expect("agent.start answered rather than hanging")
+    }
+
+    /// Between the snapshot `main` takes before the first request and the end
+    /// of a workspace's own restore, the workspace has no sandbox, whatever
+    /// the registry says. Every client-facing reading says `Creating` for
+    /// that long -- so an `agent.start` is refused at once, not left to time
+    /// out -- while the file on disk keeps the `Ready` the next daemon must
+    /// restore from. Once the restore has published, everything says `Ready`.
+    #[tokio::test]
+    async fn a_workspace_reads_creating_until_its_restore_has_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, ws, mut rx) =
+            daemon_with_persisted(dir.path(), "ws_restore_pending", WorkspaceState::Ready).await;
+        let id = ws.id.clone();
+
+        let snapshot = restore_snapshot(&d);
+
+        // Pending: taken, not started.
+        assert_eq!(d.workspace(&id).unwrap().state, WorkspaceState::Creating);
+        assert_eq!(
+            d.workspace_info(&d.registry.get(&id).unwrap()).state,
+            WorkspaceState::Creating
+        );
+        assert_eq!(d.registry.get(&id).unwrap().state, WorkspaceState::Ready);
+        assert_eq!(persisted_state(&d, &id), WorkspaceState::Ready);
+        let refused = agent_start_answer(&d, &id).await.unwrap_err();
+        assert_eq!(
+            refused.code,
+            ErrorCode::InvalidParams,
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains("is not ready"),
+            "{}",
+            refused.message
+        );
+
+        // In progress: the restore is under way but held up before it can
+        // publish -- here on the workspace's gate, which is where a restore
+        // waits behind a Retry or a Close of the same workspace.
+        let held = gate(&id).lock_owned().await;
+        let restoring = {
+            let d = d.clone();
+            tokio::spawn(async move { d.restore_workspaces_from(snapshot).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!restoring.is_finished());
+        assert_eq!(d.workspace(&id).unwrap().state, WorkspaceState::Creating);
+        assert_eq!(persisted_state(&d, &id), WorkspaceState::Ready);
+        let refused = agent_start_answer(&d, &id).await.unwrap_err();
+        assert_eq!(
+            refused.code,
+            ErrorCode::InvalidParams,
+            "{}",
+            refused.message
+        );
+
+        drop(held);
+        restoring.await.unwrap();
+
+        // Done: the overlay is gone, the sandbox is there, and the event that
+        // told the client so carried the real state.
+        assert_eq!(d.workspace(&id).unwrap().state, WorkspaceState::Ready);
+        assert_eq!(
+            d.workspace_info(&d.registry.get(&id).unwrap()).state,
+            WorkspaceState::Ready
+        );
+        assert_eq!(persisted_state(&d, &id), WorkspaceState::Ready);
+        assert!(d.sandbox(&id).is_ok(), "the restore left a sandbox behind");
+        assert_eq!(
+            last_published_state(&mut rx, &id),
+            Some(WorkspaceState::Ready)
+        );
+        assert!(d.restoring.lock().is_empty());
+    }
+
+    /// A Retry that reaches a workspace before the startup restore does owns
+    /// its state from then on: the `Ready` it publishes must not read as
+    /// `Creating` until the restore gets round to skipping the workspace.
+    #[tokio::test]
+    async fn a_restart_that_gets_there_first_takes_the_overlay_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, ws, mut rx) = daemon_with_persisted(
+            dir.path(),
+            "ws_restore_retried",
+            WorkspaceState::SandboxDown,
+        )
+        .await;
+        let id = ws.id.clone();
+
+        let snapshot = restore_snapshot(&d);
+        assert_eq!(d.workspace(&id).unwrap().state, WorkspaceState::Creating);
+
+        let info = restart(&d, &id).await.unwrap();
+        assert_eq!(info.state, WorkspaceState::Ready);
+        assert_eq!(d.workspace(&id).unwrap().state, WorkspaceState::Ready);
+        assert_eq!(
+            last_published_state(&mut rx, &id),
+            Some(WorkspaceState::Ready)
+        );
+        assert!(d.restoring.lock().is_empty());
+
+        // The restore then skips it and changes nothing.
+        d.restore_workspaces_from(snapshot).await;
+        assert_eq!(d.workspace(&id).unwrap().state, WorkspaceState::Ready);
+        assert_eq!(persisted_state(&d, &id), WorkspaceState::Ready);
+        assert_eq!(last_published_state(&mut rx, &id), None);
+        assert!(d.restoring.lock().is_empty());
+    }
+
+    /// A `Creating` the registry really holds is a creation the last daemon
+    /// never finished, and the restore turns it into an `Error` saying so. The
+    /// overlay must not hide that: once the restore has published, the
+    /// workspace reads `Error`, on disk and to clients alike.
+    #[tokio::test]
+    async fn a_persisted_creating_ends_as_the_error_the_restore_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, ws, mut rx) =
+            daemon_with_persisted(dir.path(), "ws_restore_halfmade", WorkspaceState::Creating)
+                .await;
+        let id = ws.id.clone();
+
+        let snapshot = restore_snapshot(&d);
+        assert_eq!(d.workspace(&id).unwrap().state, WorkspaceState::Creating);
+        d.restore_workspaces_from(snapshot).await;
+
+        let state = d.workspace(&id).unwrap().state;
+        let WorkspaceState::Error(message) = &state else {
+            panic!("expected Error, got {state:?}");
+        };
+        assert!(
+            message.contains("interrupted when the daemon stopped"),
+            "{message}"
+        );
+        assert_eq!(persisted_state(&d, &id), state);
+        assert_eq!(last_published_state(&mut rx, &id), Some(state));
+        assert!(d.restoring.lock().is_empty());
     }
 }

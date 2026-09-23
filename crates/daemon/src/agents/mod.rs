@@ -13,6 +13,7 @@ pub mod persist;
 use crate::daemon::Daemon;
 use crate::ids::new_id;
 use crate::server::broadcast::EventBus;
+use crate::workspace::lifecycle::log_phase;
 use crate::workspace::now_rfc3339;
 use bondsymphonic_proto::*;
 use claude::{AgentAdapter, ClaudeAdapter};
@@ -22,6 +23,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
@@ -762,14 +764,27 @@ impl AgentManager {
         if p.adapter == AgentAdapterKind::Terminal {
             return Err(RpcError::invalid_params("terminal agents use pty.open"));
         }
+        // Each phase up to the spawn is timed and said at `info`, the way the
+        // startup restore's are (`lifecycle::log_phase`): an `agent.start`
+        // sent while the daemon was still restoring once went unanswered for
+        // the client's whole timeout, and nothing in the log said which of
+        // these steps it was waiting in.
+        let started = Instant::now();
+        let phase = Instant::now();
         let ws = d.workspace(&p.workspace_id)?;
+        log_phase(&ws.id, "agent.start", "workspace", phase);
+        // `d.workspace` shows a workspace the startup restore has not reached
+        // yet as `Creating`, so this is also what refuses a start against a
+        // sandbox that is not there yet, at once rather than after a timeout.
         if ws.state != WorkspaceState::Ready {
             return Err(RpcError::invalid_params(format!(
                 "workspace {} is not ready",
                 ws.id
             )));
         }
+        let phase = Instant::now();
         let handle = d.sandbox(&ws.id)?;
+        log_phase(&ws.id, "agent.start", "sandbox", phase);
         // One start at a time in a workspace, from here to the moment the
         // process is up.
         //
@@ -787,6 +802,7 @@ impl AgentManager {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
+        let phase = Instant::now();
         let _gate = gate.try_lock_owned().map_err(|_| {
             RpcError::new(
                 ErrorCode::Conflict,
@@ -794,6 +810,7 @@ impl AgentManager {
             )
             .with_data(serde_json::json!({ "reason": REASON_AGENT_STARTING }))
         })?;
+        log_phase(&ws.id, "agent.start", "gate", phase);
         // The backend decides how the CLI is named: bound into the sandbox at a
         // fixed path under bwrap, and at its host path where there are no
         // mounts. Resolved before anything is spawned, so a missing install is
@@ -801,11 +818,14 @@ impl AgentManager {
         let argv = claude::claude_argv(&p.options, d.backend.name())?;
         // And before anything is written: a CLI that cannot even say its
         // version is one this workspace should not be prepared for.
+        let phase = Instant::now();
         claude::probe_claude(&self.probed, d.backend.name()).await?;
+        log_phase(&ws.id, "agent.start", "probe_claude", phase);
 
         // Again at start, not only at creation: the user may have logged in
         // since this workspace was made, and a workspace that was created
         // logged out would otherwise stay that way forever.
+        let phase = Instant::now();
         let home = d.dirs.home(&ws.id);
         let seeded = credentials::seed_claude_files(&home, &ws.worktree_path);
         if !seeded.is_empty() {
@@ -815,6 +835,7 @@ impl AgentManager {
         // there: a repository that pins its own settings is pinning the tools
         // the agent may use, and the daemon user's copy must not win.
         claude::apply_repo_settings(&ws.worktree_path, &home)?;
+        log_phase(&ws.id, "agent.start", "seed_home", phase);
 
         // The key is given to this one command, never written into the sandbox
         // spec: the spec's environment reaches every process in the workspace,
@@ -861,11 +882,16 @@ impl AgentManager {
             ended_at: None,
         };
         let records = self.records.clone();
+        let phase = Instant::now();
         off_the_runtime("recording a started agent", move || records.upsert(record)).await;
+        log_phase(&ws.id, "agent.start", "records.upsert", phase);
         // Registered only once it is really running, so a failed start leaves
         // no agent behind for the IDE to find -- and no record either, since
         // nothing ever ran under this id.
-        if let Err(e) = adapter.start().await {
+        let phase = Instant::now();
+        let spawned = adapter.start().await;
+        log_phase(&ws.id, "agent.start", "adapter.start", phase);
+        if let Err(e) = spawned {
             let records = self.records.clone();
             let gone = id.clone();
             off_the_runtime("taking back a failed start's record", move || {
@@ -883,6 +909,7 @@ impl AgentManager {
                 adapter: Some(tokio::sync::Mutex::new(Box::new(adapter))),
             }),
         );
+        log_phase(&ws.id, "agent.start", "total", started);
         Ok(AgentStartResult { agent_id: id })
     }
 
