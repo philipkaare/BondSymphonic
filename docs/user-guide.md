@@ -968,9 +968,15 @@ daemon are shipped as a pair. This IDE speaks protocol **2** (the version that
 added working directly in a checkout, below); a daemon still on protocol 1
 answers this way rather than silently ignoring a request it has never heard of.
 
-**Reading the logs.** Neither side writes a log file. The daemon's own output
-and its `daemon.log` protocol events are folded into the IDE's log stream, so
-starting the IDE from a console shows both:
+**Reading the logs.** The IDE writes its log stream to
+`%LOCALAPPDATA%\BondSymphonic\logs\ide.log`; the launch before it is kept
+beside it as `ide.1.log`, and older ones are dropped. The daemon's own output
+and its `daemon.log` protocol events are folded into that same stream (lines
+tagged `daemon`), so the file has both sides of a launch, and it is the first
+thing to attach when the IDE hangs or fails to start. The same lines go to the
+console when the IDE is started from one. `BS_LOG` takes any `tracing` filter
+and applies to both; `BS_LOG_FILE=0` turns the file off and leaves the console
+as the only output.
 
 ```powershell
 $env:BS_LOG = "debug"
@@ -1193,6 +1199,7 @@ nothing when unset, which is every ordinary run.
 - **`BS_PACKAGED_EXE`**: the built `dist\BondSymphonic\bondsymphonic-ide.exe`
   that `crates/ide/tests/packaged_smoke.rs` exercises. Unset, that test skips.
 - **`BS_LOG`**: the `tracing` filter for the IDE's own log stream, which also
+- **`BS_LOG_FILE`**: `0` or empty turns off `%LOCALAPPDATA%\BondSymphonic\logs\ide.log`; unset, the file is written and rotated on every launch.
   carries the daemon's.
 
 One more hook belongs to the fake daemons in the tests rather than to the IDE: a
