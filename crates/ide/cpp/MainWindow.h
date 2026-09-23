@@ -330,13 +330,18 @@ private:
     /// re-checked when it fires, so stepping through the tabs does not start an
     /// agent in each one on the way past.
     ///
-    /// `previousWorkspaceId` is the tab this one replaced. A selection is the
-    /// only trigger: `onActiveTabChanged` also runs on every republish of the
-    /// model -- a status glyph, a heartbeat, a workspace the daemon renamed --
-    /// and arming on those would restart an agent in a workspace the user is
+    /// `previousWorkspaceId` is the tab this one replaced. A selection is one of
+    /// the two triggers: `onActiveTabChanged` also runs on every republish of
+    /// the model -- a status glyph, a heartbeat, a workspace the daemon renamed
+    /// -- and arming on those would restart an agent in a workspace the user is
     /// merely watching. A previous tab that is *gone* is not a selection
     /// either: the tab that comes forward when its neighbour is destroyed was
     /// chosen by nobody.
+    ///
+    /// The other is the tab the window opened on, which nobody selects and
+    /// which after a daemon restart is bound to an ended agent record like
+    /// every other restored tab. See [`m_frontTabSettled`] and
+    /// [`m_agentSeenRunning`] for what keeps that one narrow.
     void armAutoRestart(const QString& workspaceId, const QString& previousWorkspaceId);
     /// Whether an automatic start for `workspaceId` is allowed at all, asked
     /// once when the timer is armed and again when it fires. Everything that
@@ -346,6 +351,14 @@ private:
     /// already had its automatic start for this death, and one barred by
     /// [`m_autoRestartBarred`].
     bool mayAutoRestart(const QString& workspaceId) const;
+    /// Whether the *second* trigger applies: `workspaceId` is the tab the window
+    /// opened on, nothing has run in it and nothing has gone wrong with it. The
+    /// bounds are spelled out at the definition; each one is a state in which
+    /// this would otherwise keep firing, and each was found by a test going red.
+    ///
+    /// Asked when the timer is armed and again when it fires, because half a
+    /// second is long enough for a start somebody else sent to have answered.
+    bool mayStartFrontTab(const QString& workspaceId) const;
     /// When each workspace's automatic start was sent, on [`m_clock`].
     ///
     /// Two jobs, both about not doing this twice. An entry means this
@@ -367,6 +380,30 @@ private:
     /// The workspace an armed automatic start is for, so a burst of model
     /// changes arms one timer rather than one each.
     QString m_autoRestartArmed;
+    /// Whether the window has moved off the tab it opened on.
+    ///
+    /// The opening tab is the one case where nobody can have selected anything
+    /// and the user is still looking at a workspace, so it is the one case the
+    /// selection rule cannot serve. This ends that: it flips the first time the
+    /// active workspace becomes a different one -- or none -- for any reason,
+    /// and never flips back. From then on a dead agent waits to be asked for,
+    /// like every other tab's.
+    bool m_frontTabSettled = false;
+    /// Workspaces an agent has run in during this session: one whose start
+    /// answered, or one the window has seen in front with nothing to start (a
+    /// live agent, or a terminal tab that never wants one).
+    ///
+    /// What the opening-tab trigger turns on the absence of. An agent that ran
+    /// in this session and then stopped is news the user was there for -- their
+    /// own Stop, or a crash they watched happen -- and news is what the banner
+    /// is for. Only an agent that was already dead the first time the window saw
+    /// the tab is a leftover record rather than an event, and that is the
+    /// daemon-restart case this exists for.
+    QSet<QString> m_agentSeenRunning;
+    /// Workspaces that have shown the user a banner about themselves at any
+    /// point in this run, which [`m_workspaceProblems`] forgets the moment they
+    /// recover. See [`mayStartFrontTab`].
+    QSet<QString> m_hadWorkspaceProblem;
     /// The window's own monotonic clock, started in the constructor. Not the
     /// wall clock: both things measured against it are "how long ago", and a
     /// timezone change or an NTP step would make that negative.
@@ -446,6 +483,12 @@ private:
     /// Records the state of every `WorkspaceInfo` in `json`, which is one info
     /// object or an array of them.
     void noteWorkspaceStates(const QString& json);
+    /// Every workspace the daemon has ever reported as `destroying`, which
+    /// [`m_workspaceStates`] cannot answer because the next report overwrites
+    /// it -- including a stale `Ready` sent after the destroy had begun. No
+    /// agent is ever started automatically in one of these again; see
+    /// [`mayAutoRestart`].
+    QSet<QString> m_seenDestroying;
     /// Workspaces whose banner is showing "The agent stopped." from
     /// `onAgentExited`, so the agent coming back -- or its sandbox turning
     /// out to be what stopped it -- can take exactly that down.

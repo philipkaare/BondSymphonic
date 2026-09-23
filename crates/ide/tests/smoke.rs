@@ -4390,6 +4390,10 @@ mod agent_auto_restart {
         /// No selections: three exits inside a few milliseconds, which is what
         /// a sandbox backend going down looks like.
         ExitBurst,
+        /// The window comes up *on* the ended agent's tab, and no seam is armed
+        /// at all: the only trigger left is the tab the window opened on, which
+        /// is what a daemon restart leaves the user looking at.
+        FrontTab,
     }
 
     #[test]
@@ -4470,6 +4474,40 @@ mod agent_auto_restart {
                 .collect::<Vec<_>>(),
             [&format!("agent.start:{DEAD_WORKSPACE}:{SESSION}")],
             "an agent that died of being started was started again\n{}",
+            run.context
+        );
+    }
+
+    #[test]
+    fn the_tab_the_window_opened_on_has_its_ended_agent_started() {
+        if bondsymphonic_ide::testing::skip_without_qt("auto restart on the opening tab") {
+            return;
+        }
+        let run = run_ide(Scenario::FrontTab);
+        // Nobody selected anything -- the selection seam is not armed in this
+        // run -- so the tab the window came up on is the only thing that can
+        // have asked. This is the daemon-restart case: every restored Claude tab
+        // is bound to an ended agent record, and the one in front used to be the
+        // only tab in the window that needed a switch away and back first.
+        assert!(
+            !run.out.contains("BS_MENU_TEST select-tab"),
+            "a selection was driven after all, so this run proves nothing about the opening              tab
+{}",
+            run.context
+        );
+        assert!(
+            run.out.lines().any(|l| l.starts_with(AUTO_STARTED)),
+            "the tab the window opened on never had its agent started
+{}",
+            run.context
+        );
+        assert_eq!(
+            run.journal
+                .iter()
+                .filter(|m| m.starts_with("agent.start"))
+                .collect::<Vec<_>>(),
+            [&format!("agent.start:{DEAD_WORKSPACE}:{SESSION}")],
+            "{}",
             run.context
         );
     }
@@ -4561,6 +4599,7 @@ mod agent_auto_restart {
             Scenario::StartDies => "dies",
             Scenario::OneExit => "one",
             Scenario::ExitBurst => "burst",
+            Scenario::FrontTab => "front",
         };
         let config = std::env::temp_dir().join(format!("bs-auto-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&config);
@@ -4575,7 +4614,14 @@ mod agent_auto_restart {
                 workspace_ids: vec![LIVE_WORKSPACE.to_owned(), DEAD_WORKSPACE.to_owned()],
                 ..PersistedGroup::default()
             }],
-            active_workspace: Some(LIVE_WORKSPACE.to_owned()),
+            // Which tab the window comes up on. The ended agent's own tab for
+            // the opening-tab trigger, and the live one for every scenario that
+            // is about a selection: a trigger that only fires on the tab in
+            // front proves nothing from the tab in front.
+            active_workspace: Some(match scenario {
+                Scenario::FrontTab => DEAD_WORKSPACE.to_owned(),
+                _ => LIVE_WORKSPACE.to_owned(),
+            }),
             ..StateFile::default()
         };
         std::fs::write(
@@ -4589,6 +4635,10 @@ mod agent_auto_restart {
         let menu_test = match scenario {
             Scenario::StartWorks | Scenario::StartDies => format!("select-tab={DEAD_WORKSPACE}"),
             Scenario::OneExit | Scenario::ExitBurst => String::new(),
+            // A step that reports and presses nothing: the window has to be in
+            // an announcing mood for the automatic start to say so, and no seam
+            // may touch the selection.
+            Scenario::FrontTab => "sandbox-banner".to_owned(),
         };
         let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
             .env("QT_QPA_PLATFORM", "offscreen")
@@ -4752,10 +4802,28 @@ mod agent_auto_restart {
                                     ));
                                 }
                             }
+                            // The daemon-restart shape: the sandbox is still
+                            // coming up when the window opens, so the first
+                            // thing the front tab is is ineligible. What starts
+                            // its agent is the `Ready` that follows, which is
+                            // why the opening-tab trigger has to outlive the
+                            // pass it was first asked in.
+                            let listed = if scenario == Scenario::FrontTab {
+                                delay = Duration::from_millis(1_500);
+                                after.push(ServerMessage::event(
+                                    Some(WorkspaceId(DEAD_WORKSPACE.to_owned())),
+                                    Event::WorkspaceStateChanged {
+                                        info: Box::new(dead_in(WorkspaceState::Ready)),
+                                    },
+                                ));
+                                dead_in(WorkspaceState::Creating)
+                            } else {
+                                dead()
+                            };
                             Some(ServerMessage::ok(
                                 id,
                                 &WorkspaceListResult {
-                                    workspaces: vec![live(), dead()],
+                                    workspaces: vec![live(), listed],
                                 },
                             ))
                         }
@@ -4885,13 +4953,24 @@ mod agent_auto_restart {
     /// Ready, so nothing about the workspace itself is what keeps an agent from
     /// starting in it: these runs are about the agent alone.
     fn dead() -> WorkspaceInfo {
-        workspace(
+        dead_in(WorkspaceState::Ready)
+    }
+
+    /// The same workspace in a state of the caller's choosing. A daemon that has
+    /// just restarted reports every workspace `Creating` and brings them up over
+    /// the next few seconds, and the opening-tab run comes up in the middle of
+    /// that: the tab is in front, its agent record is dead, and its sandbox is
+    /// not there yet.
+    fn dead_in(state: WorkspaceState) -> WorkspaceInfo {
+        let mut info = workspace(
             DEAD_WORKSPACE,
             DEAD_NAME,
             DEAD_AGENT,
             AgentState::Exited,
             SESSION,
-        )
+        );
+        info.state = state;
+        info
     }
 
     fn workspace(
@@ -4907,6 +4986,327 @@ mod agent_auto_restart {
             adapter: AgentAdapterKind::Claude,
             state,
             session_id: Some(session.to_owned()),
+            command: None,
+            model: None,
+            permission_mode: None,
+        };
+        info.agents = vec![record.id.clone()];
+        info.agent_records = vec![record];
+        info
+    }
+}
+
+/// A tab that comes forward because its neighbour was destroyed is not a tab
+/// anybody selected, and its ended agent stays ended.
+///
+/// This is the hole the opening-tab trigger opens. That trigger exists because
+/// nobody can select the tab a window comes up on, and it has to survive
+/// republishes to outlast the seconds in which the workspace is still coming up
+/// -- so on its own it would also cover a tab that arrives in front later, for a
+/// reason that is the opposite of the user asking for an agent: they have just
+/// destroyed the workspace next door. `m_frontTabSettled` is what draws that
+/// line, and this is the run that holds it there.
+///
+/// Two workspaces. The first is in error, which is what gives its banner a
+/// Remove button for the seam to press; the second is ready, Claude, and bound
+/// to an ended agent with a session to resume -- eligible in every way except
+/// that nobody asked.
+mod front_tab_after_destroy {
+    use super::{drain, wait_for};
+    use bondsymphonic_ide::model::persistence::{PersistedGroup, StateFile, STATE_VERSION};
+    use bondsymphonic_proto::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    const TOKEN: &str = "front-destroy-token";
+    /// The Remove is pressed off the first banner, the destroy answered, and the
+    /// tab behind it is then in front for the rest of the run -- several times
+    /// longer than the automatic start's own delay, so an absence here is a
+    /// refusal rather than a race.
+    const SCRIPT: &str = "wait,wait,wait,quit";
+    /// The workspace the seam destroys: in error, so its banner has the Remove.
+    /// No agent record at all, so nothing about *it* can put an `agent.start` on
+    /// the wire and the one this run forbids can only be the other one's.
+    const GONE: &str = "ws_gone1";
+    const GONE_NAME: &str = "gone-one";
+    /// The workspace that is left, and comes forward because the other went.
+    const NEXT: &str = "ws_after1";
+    const NEXT_NAME: &str = "after-one";
+    const NEXT_AGENT: &str = "ag_after_old";
+    const NEXT_SESSION: &str = "sess-after-1";
+    /// Why the first workspace could not be started, as the daemon words it.
+    const REASON: &str = "The worktree's git registration was missing and could not be restored.";
+    /// `sandbox-remove` presses the banner's Remove and `destroy-yes` answers the
+    /// confirmation with Force unticked; `sandbox-banner` is what makes the
+    /// window announce at all.
+    const MENU_TEST: &str = "sandbox-banner,sandbox-remove=ws_gone1,destroy-yes=ws_gone1";
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+    type Journal = Arc<Mutex<Vec<String>>>;
+
+    #[test]
+    fn a_tab_that_comes_forward_when_its_neighbour_is_destroyed_starts_no_agent() {
+        if bondsymphonic_ide::testing::skip_without_qt("no auto restart after a destroy") {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (addr, journal) = rt.block_on(fake_daemon());
+
+        let config = std::env::temp_dir().join(format!("bs-front-destroy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("config dir");
+        let state_path = config.join("state.json");
+        // The failing workspace in front, so the tab that comes forward has
+        // never been activated before: its first activation is the destroy's
+        // doing, which is the whole case.
+        let saved = StateFile {
+            version: STATE_VERSION,
+            groups: vec![PersistedGroup {
+                name: "front".to_owned(),
+                workspace_ids: vec![GONE.to_owned(), NEXT.to_owned()],
+                ..PersistedGroup::default()
+            }],
+            active_workspace: Some(GONE.to_owned()),
+            ..StateFile::default()
+        };
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&saved).expect("state json"),
+        )
+        .expect("seed state.json");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", SCRIPT)
+            .env("BS_MENU_TEST", MENU_TEST)
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", &state_path)
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let seen = journal.lock().expect("journal mutex").clone();
+        let context = format!("requests: {seen:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(
+            status.success(),
+            "the IDE exited with {status}, expected 0\n{context}"
+        );
+        assert!(
+            !format!("{out}{err}").contains("panicked at"),
+            "the IDE logged a panic\n{context}"
+        );
+        let _ = std::fs::remove_dir_all(&config);
+
+        // The first control: the destroy the seam pressed really went out.
+        let destroyed = seen
+            .iter()
+            .position(|m| m == &format!("workspace.destroy:{GONE}"))
+            .unwrap_or_else(|| panic!("the seam never destroyed {GONE}\n{context}"));
+        // The second, and the one that makes the absence below mean anything: the
+        // surviving tab really did come forward. Only an activation builds a pane
+        // and attaches its transcript, and only an attach sends `agent.history`,
+        // so this request *is* the tab being shown -- and its place after the
+        // destroy is what says the destroy is why.
+        let shown = seen
+            .iter()
+            .position(|m| m == &format!("agent.history:{NEXT_AGENT}"))
+            .unwrap_or_else(|| {
+                panic!("{NEXT} never came forward, so this run proves nothing\n{context}")
+            });
+        assert!(
+            destroyed < shown,
+            "{NEXT} was already in front before the destroy\n{context}"
+        );
+        // And the claim. Nobody selected this tab and nobody opened the window on
+        // it: it is in front because the workspace beside it was destroyed, and
+        // an agent started here would be the IDE answering a destroy with a new
+        // conversation.
+        assert!(
+            !seen.iter().any(|m| m.starts_with("agent.start")),
+            "an agent was started in a tab that came forward on its own\n{context}"
+        );
+    }
+
+    async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let recorded = journal.clone();
+
+        tokio::spawn(async move {
+            // Which workspaces a list still reports. The destroy takes the first
+            // one out, so a list that arrives after it describes the world the
+            // window is already showing.
+            let mut gone_destroyed = false;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (r, mut w) = stream.into_split();
+                let mut r = BufReader::new(r);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let ClientMessage::Request { id, request } =
+                        codec::decode(line.trim_end()).expect("decode");
+                    // Three of these carry more than their method name: which
+                    // workspace was destroyed, which agent a pane attached to,
+                    // and which workspace and session a start asked for.
+                    let method = match &request {
+                        Request::WorkspaceDestroy(p) => {
+                            format!("workspace.destroy:{}", p.workspace_id.0)
+                        }
+                        Request::AgentHistory(p) => format!("agent.history:{}", p.agent_id.0),
+                        Request::AgentStart(p) => format!(
+                            "agent.start:{}:{}",
+                            p.workspace_id.0,
+                            p.options.resume_session.clone().unwrap_or_default()
+                        ),
+                        other => other.method_name().to_owned(),
+                    };
+                    recorded.lock().expect("journal mutex").push(method);
+                    let reply = match request {
+                        Request::Hello(p) if p.token == TOKEN => ServerMessage::ok(
+                            id,
+                            &HelloResult {
+                                daemon_version: "0.0.0-fake".into(),
+                                capabilities: Capabilities {
+                                    sandbox_backend: "noop".into(),
+                                    git_protect: false,
+                                    adapters: vec![AgentAdapterKind::Claude],
+                                },
+                                protocol_version: Some(PROTOCOL_VERSION),
+                            },
+                        ),
+                        Request::Hello(_) => ServerMessage::err(id, RpcError::unauthorized()),
+                        Request::SystemCheckPrereqs {} => ServerMessage::ok(
+                            id,
+                            &CheckPrereqsResult {
+                                items: vec![PrereqStatus {
+                                    name: "claude_auth".into(),
+                                    ok: true,
+                                    detail: "logged in".into(),
+                                    fix_hint: None,
+                                }],
+                            },
+                        ),
+                        Request::WorkspaceList {} => {
+                            let mut workspaces = vec![next()];
+                            if !gone_destroyed {
+                                workspaces.insert(0, gone());
+                            }
+                            ServerMessage::ok(id, &WorkspaceListResult { workspaces })
+                        }
+                        Request::WorkspaceGet(p) => ServerMessage::ok(
+                            id,
+                            &if p.workspace_id.0 == GONE {
+                                gone()
+                            } else {
+                                next()
+                            },
+                        ),
+                        Request::WorkspaceDestroy(_) => {
+                            gone_destroyed = true;
+                            ServerMessage::ok(id, &Empty {})
+                        }
+                        Request::AgentHistory(_) => ServerMessage::ok(
+                            id,
+                            &HistoryResult {
+                                messages: vec![],
+                                state: AgentState::Exited,
+                                detail: None,
+                            },
+                        ),
+                        // Answered rather than refused, although the run forbids
+                        // it: a refusal would put a modal box over the window and
+                        // turn the assertion into a timeout that says nothing
+                        // about what the IDE did.
+                        Request::AgentStart(_) => ServerMessage::ok(
+                            id,
+                            &AgentStartResult {
+                                agent_id: AgentId("ag_after_new".to_owned()),
+                            },
+                        ),
+                        Request::FsListDir(_) => {
+                            ServerMessage::ok(id, &ListDirResult { entries: vec![] })
+                        }
+                        Request::FsWatch(_) => ServerMessage::ok(id, &Empty {}),
+                        Request::WorkspaceChanges(_) => {
+                            ServerMessage::ok(id, &ChangesResult { files: vec![] })
+                        }
+                        Request::WorkspaceStatus(_) => {
+                            ServerMessage::ok(id, &WorkspaceStatusResult { entries: vec![] })
+                        }
+                        Request::RepoDetectRunConfigs(_) => ServerMessage::ok(
+                            id,
+                            &DetectRunConfigsResult {
+                                configs: vec![],
+                                network_allow: vec![],
+                                warnings: vec![],
+                            },
+                        ),
+                        Request::RunList(_) => {
+                            ServerMessage::ok(id, &RunListResult { runs: vec![] })
+                        }
+                        other => ServerMessage::err(
+                            id,
+                            RpcError::internal(format!("not implemented: {}", other.method_name())),
+                        ),
+                    };
+                    if w.write_all(codec::encode(&reply).as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        (addr, journal)
+    }
+
+    /// The workspace the seam destroys. In error and with no agent of its own.
+    fn gone() -> WorkspaceInfo {
+        super::workspace(
+            GONE,
+            GONE_NAME,
+            WorkspaceState::Error(REASON.to_owned()),
+            &[],
+        )
+    }
+
+    /// The workspace that is left: ready, with an ended agent and a session a
+    /// restart would resume. Everything an automatic start needs except somebody
+    /// asking for it.
+    fn next() -> WorkspaceInfo {
+        let mut info = super::workspace(NEXT, NEXT_NAME, WorkspaceState::Ready, &[]);
+        let record = AgentSummary {
+            id: AgentId(NEXT_AGENT.to_owned()),
+            adapter: AgentAdapterKind::Claude,
+            state: AgentState::Exited,
+            session_id: Some(NEXT_SESSION.to_owned()),
             command: None,
             model: None,
             permission_mode: None,

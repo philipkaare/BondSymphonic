@@ -1033,6 +1033,16 @@ void MainWindow::connectController() {
                          // would kill the conversation it just resumed.
                          m_agentArea->setRestartOffered(workspaceId, false);
                          m_autoStarting.remove(workspaceId);
+                         // An agent has run here in this session, which is what
+                         // the opening-tab start in `armAutoRestart` refuses to
+                         // act over. Recorded here as well as off the tab's own
+                         // status, because the tab does not know yet: it reads
+                         // `Done` until the first `agent.state` for the new
+                         // agent arrives, and a trigger that re-asked on every
+                         // republish would spend that gap asking for a second
+                         // agent -- which is exactly what a Retry's own start
+                         // ran into.
+                         m_agentSeenRunning.insert(workspaceId);
                          // The banner that said it had stopped is out of date
                          // the moment it is running again.
                          clearAgentStopped(workspaceId);
@@ -1600,17 +1610,75 @@ bool MainWindow::mayAutoRestart(const QString& workspaceId) const {
     // And a workspace on its way out, which the tab cannot say: a destroy and an
     // ended agent both read as `Done` there, so the daemon's own word is the
     // only thing that tells them apart.
-    return m_workspaceStates.value(workspaceId) != QLatin1String("destroying");
+    //
+    // Ever, not currently. A destroy is not a state a workspace comes back from,
+    // and a `Ready` that arrives after one is a stale event from the daemon's
+    // own pipeline -- which is exactly what `sandbox_retry_destroying` sends. A
+    // check on the *latest* word would take that Ready at face value and start
+    // an agent in a workspace that is being deleted, which the daemon answers
+    // `NotFound` and the window answers with a box. The cost is a workspace
+    // whose destroy the daemon refused after announcing it: it keeps its
+    // banner's Restart and loses only the automatic start.
+    return !m_seenDestroying.contains(workspaceId);
+}
+
+bool MainWindow::mayStartFrontTab(const QString& workspaceId) const {
+    // The window is still on the tab it opened on. Nobody selected that tab and
+    // nobody can: it is the one the session came up on, and after a daemon
+    // restart it is bound to an ended agent record like every other restored
+    // tab -- so without this it is the only tab in the window that needs a
+    // switch away and back before it will work.
+    //
+    // Level-triggered rather than edge-triggered, deliberately: at launch the
+    // front tab is still `Creating` and `mayAutoRestart` rightly refuses, and by
+    // the next republish the selection rule can no longer fire, so a one-pass
+    // version would start nothing at all. That makes the bounds below the whole
+    // safety of it -- every one of them is a state the window would otherwise
+    // keep re-asking in, and every one of them was found by an existing test
+    // going red.
+    if (m_frontTabSettled) {
+        return false;
+    }
+    // An agent has run here in this session. Then its death is an event the user
+    // was present for -- their own Stop, or a crash they watched -- and the
+    // banner is the answer to an event. Only an agent that was already dead the
+    // first time the window saw the tab is a leftover record rather than news,
+    // and that is the daemon restart this exists for. It is also what keeps the
+    // window off the gap between an `agent.start` answering and the first
+    // `agent.state` arriving, in which the tab still reads `Done`.
+    if (m_agentSeenRunning.contains(workspaceId)) {
+        return false;
+    }
+    // And the workspace has never shown the user a banner. A workspace that has
+    // been down, failed to start or had a Retry refused owns its own recovery:
+    // its banner says what is wrong and its Retry brings the sandbox and the
+    // agent back together. It is also full of moments in which it reads ready
+    // with a dead agent -- a restart being carried out, a refusal a beat behind
+    // the state it refuses -- and a trigger asked on every republish would take
+    // each of those for the daemon-restart case and start an agent in it.
+    return !m_hadWorkspaceProblem.contains(workspaceId);
 }
 
 void MainWindow::armAutoRestart(const QString& workspaceId, const QString& previousWorkspaceId) {
-    // A selection, and nothing else. `onActiveTabChanged` runs on every
-    // republish of the model -- a glyph, a heartbeat, a renamed branch -- and
-    // the same tab arriving again is not somebody asking for anything. Nor is a
-    // tab that came forward because the one in front of it was destroyed: the
-    // user's last act there was a destroy, and answering it by starting an agent
-    // in the workspace next door is not what they asked for.
-    if (workspaceId == previousWorkspaceId || !workspaceIsOpen(previousWorkspaceId)) {
+    // This tab has an agent that is running, or is not the kind of tab that
+    // wants one. Remembered because the opening-tab trigger below turns on
+    // exactly the absence of it: an agent that lived in this run and then
+    // stopped is news, and the banner is the answer to news.
+    if (!m_groupModel->agentNeedsStart(workspaceId)) {
+        m_agentSeenRunning.insert(workspaceId);
+    }
+    // A selection. `onActiveTabChanged` runs on every republish of the model --
+    // a glyph, a heartbeat, a renamed branch -- and the same tab arriving again
+    // is not somebody asking for anything. Nor is a tab that came forward
+    // because the one in front of it was destroyed: the user's last act there
+    // was a destroy, and answering it by starting an agent in the workspace next
+    // door is not what they asked for.
+    const bool selected =
+        workspaceId != previousWorkspaceId && workspaceIsOpen(previousWorkspaceId);
+    // Or the tab the window opened on, which nobody selected and which the user
+    // is nonetheless looking at from the first second: see [`mayStartFrontTab`].
+    const bool opening = mayStartFrontTab(workspaceId);
+    if (!selected && !opening) {
         return;
     }
     // One timer, however many model changes the selection provokes on its way
@@ -1621,7 +1689,7 @@ void MainWindow::armAutoRestart(const QString& workspaceId, const QString& previ
         return;
     }
     m_autoRestartArmed = workspaceId;
-    QTimer::singleShot(kAutoRestartDelayMs, this, [this, workspaceId] {
+    QTimer::singleShot(kAutoRestartDelayMs, this, [this, workspaceId, selected, opening] {
         if (m_autoRestartArmed == workspaceId) {
             m_autoRestartArmed.clear();
         }
@@ -1630,6 +1698,14 @@ void MainWindow::armAutoRestart(const QString& workspaceId, const QString& previ
         // banner's Restart themselves, or the sandbox may have gone down under
         // it.
         if (activeWorkspaceId() != workspaceId || !mayAutoRestart(workspaceId)) {
+            return;
+        }
+        // And the opening-tab trigger is asked again in full, because the whole
+        // of *it* can have changed too: half a second is exactly long enough for
+        // a start somebody else sent -- a Retry's own resume -- to have answered,
+        // and a start that had already given this workspace an agent is the one
+        // thing that must not be followed by a second one.
+        if (opening && !selected && !mayStartFrontTab(workspaceId)) {
             return;
         }
         m_autoRestartedAt.insert(workspaceId, m_clock.elapsed());
@@ -1698,6 +1774,12 @@ void MainWindow::syncWorkspaceProblems() {
                 continue;
             }
             m_workspaceProblems.insert(workspaceId, shown);
+            // And that it ever had one, which the map above forgets as soon as
+            // the workspace recovers. See `mayStartFrontTab`: a workspace that
+            // has shown the user a banner in this run is a workspace whose agent
+            // comes back with its Retry, not because its tab happens to be the
+            // one in front.
+            m_hadWorkspaceProblem.insert(workspaceId);
             m_agentArea->setWorkspaceProblem(workspaceId, title, detail, inPlace, whatChanged);
             // An agent that stopped just before its sandbox was reported down
             // stopped because of it. The problem says so and its Retry brings
@@ -1899,7 +1981,13 @@ void MainWindow::noteWorkspaceStates(const QString& json) {
         const QJsonObject info = value.toObject();
         const QString id = info.value("id").toString();
         if (!id.isEmpty()) {
-            m_workspaceStates.insert(id, info.value("state").toString());
+            const QString state = info.value("state").toString();
+            m_workspaceStates.insert(id, state);
+            // Kept apart from the state above, which the next report overwrites.
+            // See `mayAutoRestart` for why this one has to be remembered.
+            if (state == QLatin1String("destroying")) {
+                m_seenDestroying.insert(id);
+            }
         }
     }
 }
@@ -2408,6 +2496,11 @@ void MainWindow::onActiveTabChanged() {
     if (active.isEmpty()) {
         // No tab at all: there is nothing to switch away *to*, and the id held
         // here may name a workspace that has just been destroyed.
+        //
+        // And the window is no longer on the tab it opened on -- there is not a
+        // tab to be on -- which ends the opening-tab start for good. See
+        // [`armAutoRestart`].
+        m_frontTabSettled = m_frontTabSettled || !m_previousWorkspaceId.isEmpty();
         m_previousWorkspaceId.clear();
         m_agentArea->showPlaceholder();
         m_shellArea->showPlaceholder();
@@ -2437,6 +2530,13 @@ void MainWindow::onActiveTabChanged() {
     // `false` twice.
     const QString previousWorkspaceId = m_previousWorkspaceId;
     m_previousWorkspaceId = workspaceId;
+    // The window has moved off the tab it opened on, whatever moved it: a
+    // selection, a destroy, a workspace that went away. Recorded here rather
+    // than in [`armAutoRestart`] so that it is true *before* this pass decides
+    // anything -- a tab that comes forward because its neighbour was destroyed
+    // is one the window has moved to, not the one it opened on.
+    m_frontTabSettled = m_frontTabSettled ||
+                        (!previousWorkspaceId.isEmpty() && previousWorkspaceId != workspaceId);
     m_groupModel->refreshAttention(previousWorkspaceId);
     m_explorer->setWorkspace(workspaceId);
     // The open files move with the agent: each has a worktree of its own, so a
