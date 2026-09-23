@@ -148,6 +148,16 @@ CLI**, **Log in to GitHub**. Pressing it runs that command in a terminal pane in
 the dialog, on the host rather than inside a sandbox, because a login has to
 write to your home directory. When the command exits the checks re-run.
 
+**Log out again from the same place.** A check that is *passing* carries a
+button too — **Log out of Claude Code** or **Log out of GitHub** — which runs
+`claude auth logout` or `gh auth logout` in the same terminal pane. You want it
+when a session has to be replaced rather than renewed: switching accounts, or an
+OAuth login that has gone stale in a way logging in again will not overwrite. A
+logout reaches workspaces that already exist as well: the credential files are
+copied into each workspace afresh every time an agent starts, and a file you no
+longer have is removed there too, so the next agent to start really is signed
+out rather than carrying on with the old session.
+
 **The sign-in link.** `claude auth login` prints a URL and then waits for the
 code the browser gives you. The IDE opens that URL in your browser for you, and
 a **Sign-in link** row appears under the terminal with the URL on it, a **Copy**
@@ -175,6 +185,14 @@ ends the `claude auth login` process it was running, so a sign-in half way
 through is abandoned. Closing it after a successful login is safe: the checks
 re-run when the dialog closes, so the ticks and the chat box catch up either
 way.
+
+**The checks re-run by themselves when they might have changed.** As well as on
+the **Re-check** button and on closing the dialog, they run when an agent stops
+— an expired session kills the agent at start-up, and that is the moment the
+tick is most likely to be out of date — and when you come back to the window
+after being away, at most once a minute. This is what makes an OAuth session
+that timed out while the IDE was open show up as a cross and a closed prompt box
+instead of a green tick and prompts that fail.
 
 **Re-check** runs the checks again, and so does closing the dialog. The four
 *blocking* checks are `git`, `bwrap`, `userns` and `sandbox`: without them there
@@ -569,15 +587,30 @@ A Claude Code workspace's pane shows the conversation as it arrives.
 - **Interrupt** abandons the current turn and leaves the agent alive. It is the
   only one of the old three buttons left, because ending a turn acts on the
   conversation rather than on the process.
-- **Restart.** An agent that exits on its own is not restarted automatically — a
-  crash that repeated would become a loop reporting itself as a working agent.
-  It puts the reason in a banner offering **Restart agent**, and the same action
-  is in **Workspace > Restart agent** (`Ctrl+Shift+R`) and in Settings' Agents
-  section. Restart starts a new agent with `--resume` pointed at the session id,
-  so the conversation continues rather than beginning again. The session id is
-  read out of the transcript, and when the transcript cannot supply one — a
-  damaged or truncated history — the id the daemon recorded for that agent is
-  used instead.
+- **Restart.** An agent that exits on its own puts the reason in a banner
+  offering **Restart agent**, and the same action is in **Workspace > Restart
+  agent** (`Ctrl+Shift+R`) and in Settings' Agents section. Restart starts a new
+  agent with `--resume` pointed at the session id, so the conversation continues
+  rather than beginning again. The session id is read out of the transcript, and
+  when the transcript cannot supply one — a damaged or truncated history — the
+  id the daemon recorded for that agent is used instead.
+- **Selecting a tab whose agent has stopped starts it again**, half a second
+  later, with the same `--resume` a Restart uses, so the conversation continues.
+  Switching to the tab is taken as asking for it: the agent is what the
+  workspace is for, and there is no other reason to be looking at a dead one.
+  The half second is so that holding Ctrl+PageDown through a group does not
+  start an agent in every tab on the way past.
+  It happens once per stop, and an agent that dies again within half a minute of
+  being started this way died *of* being started — a missing login, a command
+  that is not there — so that workspace gets no more automatic starts until you
+  press **Restart** yourself or retry the workspace. A crash that repeats is
+  still a banner you have to read rather than a loop that reports itself as a
+  working agent. A workspace whose sandbox is down is left to its own banner and
+  its **Retry**, which brings the agent back with it.
+- **It is a selection that starts it, so the tab that is already in front when
+  the IDE opens is not started.** Nothing was selected to put it there. Its
+  banner's **Restart** still works, and so does switching to another tab and
+  back.
 - **The turn cost and the agent's own system lines** are the small grey italics
   under an answer. Settings' Agents section has **Show turn cost and system
   lines**, on by default; turning it off hides both in every open transcript at
