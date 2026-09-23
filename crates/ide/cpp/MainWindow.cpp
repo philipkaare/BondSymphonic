@@ -103,6 +103,13 @@ constexpr int kAutoRestartDelayMs = 500;
 /// agent, and its death is news of its own.
 constexpr int kAutoRestartLoopMs = 30'000;
 
+/// `ConnectionState::Connected` as the controller's `connectionState` property
+/// carries it: the one value of that property under which the daemon's events
+/// can arrive. Every other value -- launching, connecting, lost, reconnecting --
+/// is a connection on which nothing has been said yet, or one whose word is
+/// stale. Mirrors `ConnectionState::as_i32` in `model/app_state.rs`.
+constexpr int kConnectionConnected = 3;
+
 /// **Test-only**: how long the `select-tab` seam waits between selections, and
 /// how many it makes.
 ///
@@ -865,6 +872,17 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::connectionStateChanged, this, &MainWindow::onConnectionStateChanged);
     QObject::connect(m_controller, &AppController::statusMessageChanged, this, &MainWindow::onConnectionStateChanged);
     QObject::connect(m_controller, &AppController::daemonVersionChanged, this, &MainWindow::onConnectionStateChanged);
+    // What the daemon announced by event was said on a connection that is now
+    // gone. Forgotten the moment the connection is, rather than on
+    // `reconnected`: that signal comes after the new connection's list, and
+    // after any event the new daemon sent in the meantime, so clearing on it
+    // would throw away exactly the announcement the opening-tab start is
+    // waiting for. See `m_stateAnnounced`.
+    QObject::connect(m_controller, &AppController::connectionStateChanged, this, [this] {
+        if (m_controller->getConnectionState() != kConnectionConnected) {
+            m_stateAnnounced.clear();
+        }
+    });
     // No showMessage() here: a temporary status bar message hides every addWidget()
     // widget while it is shown, including the sandbox label the details hang off.
     QObject::connect(m_controller, &AppController::prereqWarning, this, [this](const QString& msg) {
@@ -954,6 +972,13 @@ void MainWindow::connectController() {
                      });
     QObject::connect(m_controller, &AppController::workspaceChanged, this,
                      [this](const QString& info) {
+                         // Before the model is told, because telling it is what
+                         // asks `armAutoRestart`, and this event is the one
+                         // thing the opening-tab start is waiting for. Recorded
+                         // afterwards it would be seen only by the *next*
+                         // republish -- which a daemon that has finished
+                         // restoring and has nothing more to say never sends.
+                         noteWorkspaceAnnounced(info);
                          m_groupModel->applyWorkspaceInfo(info);
                          noteWorkspaceStates(info);
                          resumeUnansweredRestarts(false);
@@ -1656,7 +1681,22 @@ bool MainWindow::mayStartFrontTab(const QString& workspaceId) const {
     // with a dead agent -- a restart being carried out, a refusal a beat behind
     // the state it refuses -- and a trigger asked on every republish would take
     // each of those for the daemon-restart case and start an agent in it.
-    return !m_hadWorkspaceProblem.contains(workspaceId);
+    if (m_hadWorkspaceProblem.contains(workspaceId)) {
+        return false;
+    }
+    // And the daemon has said, by event on this connection, what state the
+    // workspace is in. `mayAutoRestart` reads the tab's status, and the tab's
+    // status comes from the `workspace.list` -- which cannot be believed here.
+    // A daemon restores its workspaces one at a time after coming up and lists
+    // one persisted `ready` as `ready` from the first request until its own
+    // restore of it finishes, minutes later for a repository on `/mnt/c`; so
+    // at launch this tab read `Ready` over a sandbox that did not exist, the
+    // `agent.start` sent against it hung until the request timed out, and the
+    // window put up a box titled `agent.start` over the tab. The event a
+    // finished restore emits is the daemon's own word that the workspace is
+    // there, and it is the only word this trigger takes. A selection does not
+    // wait for it: that is the user asking, with the tab in front of them.
+    return m_stateAnnounced.contains(workspaceId);
 }
 
 void MainWindow::armAutoRestart(const QString& workspaceId, const QString& previousWorkspaceId) {
@@ -1676,7 +1716,10 @@ void MainWindow::armAutoRestart(const QString& workspaceId, const QString& previ
     const bool selected =
         workspaceId != previousWorkspaceId && workspaceIsOpen(previousWorkspaceId);
     // Or the tab the window opened on, which nobody selected and which the user
-    // is nonetheless looking at from the first second: see [`mayStartFrontTab`].
+    // is nonetheless looking at from the first second -- once the daemon has
+    // said by event that the workspace is there, because the list it came up
+    // on says `ready` of a workspace still being restored: see
+    // [`mayStartFrontTab`].
     const bool opening = mayStartFrontTab(workspaceId);
     if (!selected && !opening) {
         return;
@@ -1989,6 +2032,13 @@ void MainWindow::noteWorkspaceStates(const QString& json) {
                 m_seenDestroying.insert(id);
             }
         }
+    }
+}
+
+void MainWindow::noteWorkspaceAnnounced(const QString& infoJson) {
+    const QString id = QJsonDocument::fromJson(infoJson.toUtf8()).object().value("id").toString();
+    if (!id.isEmpty()) {
+        m_stateAnnounced.insert(id);
     }
 }
 
@@ -2421,6 +2471,14 @@ void MainWindow::onWorkspaceOpFailed(const QString& workspaceId, const QString& 
         // change may try again. A sandbox that was still coming up is exactly
         // the failure worth retrying, and it is the common one.
         m_autoStarting.remove(workspaceId);
+        // Nor has this workspace had its one automatic start for this death:
+        // the request failed, so no agent was started and none can exit of it.
+        // Left in place, the entry refused every later trigger for the rest of
+        // the session, and a tab whose launch-time start had timed out against
+        // a sandbox still being restored was never started once the sandbox
+        // came up. `m_autoRestartBarred` is untouched -- a failed *request* is
+        // not the crashed *agent* that bar is for.
+        m_autoRestartedAt.remove(workspaceId);
     }
     reportFailure(op, message);
 }
@@ -2629,6 +2687,7 @@ void MainWindow::onWorkspaceDestroyed(const QString& workspaceId) {
     m_restartUnanswered.remove(workspaceId);
     m_agentStopped.remove(workspaceId);
     m_workspaceStates.remove(workspaceId);
+    m_stateAnnounced.remove(workspaceId);
     // Panes first: the model change that follows re-selects a surviving tab,
     // and the areas must no longer hold the dead one when it does. The editor
     // tabs go with them: there is nothing left to save the file to.

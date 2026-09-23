@@ -341,7 +341,9 @@ private:
     /// The other is the tab the window opened on, which nobody selects and
     /// which after a daemon restart is bound to an ended agent record like
     /// every other restored tab. See [`m_frontTabSettled`] and
-    /// [`m_agentSeenRunning`] for what keeps that one narrow.
+    /// [`m_agentSeenRunning`] for what keeps that one narrow, and
+    /// [`m_stateAnnounced`] for why it waits for the daemon's own event before
+    /// it believes the workspace is there to start an agent in.
     void armAutoRestart(const QString& workspaceId, const QString& previousWorkspaceId);
     /// Whether an automatic start for `workspaceId` is allowed at all, asked
     /// once when the timer is armed and again when it fires. Everything that
@@ -352,9 +354,13 @@ private:
     /// [`m_autoRestartBarred`].
     bool mayAutoRestart(const QString& workspaceId) const;
     /// Whether the *second* trigger applies: `workspaceId` is the tab the window
-    /// opened on, nothing has run in it and nothing has gone wrong with it. The
-    /// bounds are spelled out at the definition; each one is a state in which
-    /// this would otherwise keep firing, and each was found by a test going red.
+    /// opened on, nothing has run in it, nothing has gone wrong with it, and the
+    /// daemon has announced its state by event on this connection. The bounds
+    /// are spelled out at the definition; each one is a state in which this
+    /// would otherwise keep firing, and each was found by a test going red --
+    /// the last one by a user's window, which put up a box titled `agent.start`
+    /// over a workspace the daemon had listed `ready` while it was still
+    /// restoring it.
     ///
     /// Asked when the timer is armed and again when it fires, because half a
     /// second is long enough for a start somebody else sent to have answered.
@@ -483,6 +489,28 @@ private:
     /// Records the state of every `WorkspaceInfo` in `json`, which is one info
     /// object or an array of them.
     void noteWorkspaceStates(const QString& json);
+    /// Workspaces whose state the daemon has announced by a `workspace.state`
+    /// event on the current connection, as opposed to in the answer to a
+    /// `workspace.list`.
+    ///
+    /// The list cannot be trusted about whether a workspace is there to start an
+    /// agent in. A daemon restores its workspaces one at a time after it comes
+    /// up and lists a workspace persisted `ready` as `ready` from the first
+    /// request until its own restore finishes -- minutes, for a repository
+    /// reached through `/mnt/c` -- so at launch the opening tab read `Ready`
+    /// with no sandbox behind it, the `agent.start` sent against it hung until
+    /// the request timed out, and the window put up a box saying so. A daemon
+    /// that has finished restoring a workspace says so with an event, and that
+    /// event is what the opening-tab start waits for; see [`mayStartFrontTab`].
+    /// Only that trigger reads this: a selection is the user asking, with the
+    /// tab in front of them.
+    ///
+    /// Emptied when the connection is lost. A reconnect is to a daemon that may
+    /// have restarted and be restoring everything again, and what it announced
+    /// last time says nothing about what it has now.
+    QSet<QString> m_stateAnnounced;
+    /// Records that `infoJson` -- one `WorkspaceInfo` -- arrived as an event.
+    void noteWorkspaceAnnounced(const QString& infoJson);
     /// Every workspace the daemon has ever reported as `destroying`, which
     /// [`m_workspaceStates`] cannot answer because the next report overwrites
     /// it -- including a stale `Ready` sent after the destroy had begun. No

@@ -4394,7 +4394,21 @@ mod agent_auto_restart {
         /// at all: the only trigger left is the tab the window opened on, which
         /// is what a daemon restart leaves the user looking at.
         FrontTab,
+        /// The opening tab again, but the daemon lists its workspace `ready`
+        /// from the first request and only announces it by event two seconds
+        /// later -- which is what a daemon that is still restoring the
+        /// workspace does, and what put a box titled `agent.start` over a
+        /// user's window.
+        StaleReady,
+        /// The opening tab again: the first `agent.start` is refused with a
+        /// `SandboxError`, the way a start against a sandbox that is not there
+        /// is, and the daemon then announces the workspace ready.
+        StartRefused,
     }
+    /// The journal line the fake daemon writes just before it sends the
+    /// `workspace.state ready` event, so a run can say which side of that
+    /// event a start was on.
+    const SENT_READY: &str = "sent:ready";
 
     #[test]
     fn selecting_a_tab_whose_agent_ended_starts_one_agent_resuming_its_session() {
@@ -4537,6 +4551,81 @@ mod agent_auto_restart {
         run.assert_one_check_after_the_exits(3);
     }
 
+    #[test]
+    fn a_workspace_listed_ready_is_not_started_until_the_daemon_announces_it() {
+        if bondsymphonic_ide::testing::skip_without_qt("stale ready at launch") {
+            return;
+        }
+        let run = run_ide(Scenario::StaleReady);
+        assert!(
+            !run.out.contains("BS_MENU_TEST select-tab"),
+            "a selection was driven after all, so this run proves nothing about the opening tab\n{}",
+            run.context
+        );
+        // The daemon listed the workspace `ready` and said nothing more for two
+        // seconds. A daemon that is still restoring the workspace looks exactly
+        // like that, and a start sent into that silence goes against a sandbox
+        // that does not exist: on a user's machine it hung until the request
+        // timed out and the window put up a box. So nothing before the event,
+        // and the one start after it, resuming the session the record carried.
+        let starts_and_event: Vec<String> = run
+            .journal
+            .iter()
+            .filter(|m| m.starts_with("agent.start") || *m == SENT_READY)
+            .cloned()
+            .collect();
+        assert_eq!(
+            starts_and_event,
+            [
+                SENT_READY.to_owned(),
+                format!("agent.start:{DEAD_WORKSPACE}:{SESSION}"),
+            ],
+            "the opening tab was started on the list's word, or not on the event's\n{}",
+            run.context
+        );
+        assert!(
+            run.out.lines().any(|l| l.starts_with(AUTO_STARTED)),
+            "the start was not the opening tab's doing\n{}",
+            run.context
+        );
+    }
+
+    #[test]
+    fn an_automatic_start_the_daemon_refuses_is_tried_again_when_the_workspace_is_ready() {
+        if bondsymphonic_ide::testing::skip_without_qt("refused automatic start retries") {
+            return;
+        }
+        let run = run_ide(Scenario::StartRefused);
+        assert!(
+            !run.out.contains("BS_MENU_TEST select-tab"),
+            "a selection was driven after all, so this run proves nothing about the opening tab\n{}",
+            run.context
+        );
+        // The first start was refused -- no agent came of it, so nothing can
+        // have crashed -- and the daemon then said the workspace was ready. That
+        // is the launch-time shape once more, and it has to be answered the
+        // same way: with a start, not with a tab that stays dead for the rest
+        // of the session because its one automatic start has been spent.
+        let start = format!("agent.start:{DEAD_WORKSPACE}:{SESSION}");
+        let starts_and_events: Vec<String> = run
+            .journal
+            .iter()
+            .filter(|m| m.starts_with("agent.start") || *m == SENT_READY)
+            .cloned()
+            .collect();
+        assert_eq!(
+            starts_and_events,
+            [
+                SENT_READY.to_owned(),
+                start.clone(),
+                SENT_READY.to_owned(),
+                start
+            ],
+            "a refused automatic start was not tried again once the workspace was ready\n{}",
+            run.context
+        );
+    }
+
     struct Run {
         out: String,
         journal: Vec<String>,
@@ -4600,6 +4689,8 @@ mod agent_auto_restart {
             Scenario::OneExit => "one",
             Scenario::ExitBurst => "burst",
             Scenario::FrontTab => "front",
+            Scenario::StaleReady => "stale",
+            Scenario::StartRefused => "refused",
         };
         let config = std::env::temp_dir().join(format!("bs-auto-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&config);
@@ -4619,7 +4710,9 @@ mod agent_auto_restart {
             // is about a selection: a trigger that only fires on the tab in
             // front proves nothing from the tab in front.
             active_workspace: Some(match scenario {
-                Scenario::FrontTab => DEAD_WORKSPACE.to_owned(),
+                Scenario::FrontTab | Scenario::StaleReady | Scenario::StartRefused => {
+                    DEAD_WORKSPACE.to_owned()
+                }
                 _ => LIVE_WORKSPACE.to_owned(),
             }),
             ..StateFile::default()
@@ -4638,7 +4731,9 @@ mod agent_auto_restart {
             // A step that reports and presses nothing: the window has to be in
             // an announcing mood for the automatic start to say so, and no seam
             // may touch the selection.
-            Scenario::FrontTab => "sandbox-banner".to_owned(),
+            Scenario::FrontTab | Scenario::StaleReady | Scenario::StartRefused => {
+                "sandbox-banner".to_owned()
+            }
         };
         let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
             .env("QT_QPA_PLATFORM", "offscreen")
@@ -4700,6 +4795,17 @@ mod agent_auto_restart {
         )
     }
 
+    /// The `workspace.state` event a finished restore of the dead workspace
+    /// emits: the workspace `ready`, its agent record still ended.
+    fn ready_event() -> ServerMessage {
+        ServerMessage::event(
+            Some(WorkspaceId(DEAD_WORKSPACE.to_owned())),
+            Event::WorkspaceStateChanged {
+                info: Box::new(dead_in(WorkspaceState::Ready)),
+            },
+        )
+    }
+
     async fn fake_daemon(scenario: Scenario) -> (std::net::SocketAddr, Journal) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
@@ -4708,11 +4814,23 @@ mod agent_auto_restart {
 
         tokio::spawn(async move {
             let mut exits_sent = false;
+            // How many `agent.start`s have been answered, for the scenario that
+            // refuses the first and takes the second.
+            let mut starts_answered = 0usize;
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                let (r, mut w) = stream.into_split();
+                let (r, w) = stream.into_split();
+                // Shared with the tasks that send the delayed events below, so
+                // the read loop never sleeps: a request the window sends during
+                // a delay is read -- and journaled -- when it arrives, not after
+                // the delay, and the journal's order is the wire's. The markers
+                // the runs assert against are only worth something on those
+                // terms; read in line with the sleeps, an `agent.start` sent
+                // half a second after the list was journaled after a marker
+                // written two seconds after it.
+                let w = Arc::new(tokio::sync::Mutex::new(w));
                 let mut r = BufReader::new(r);
                 let mut line = String::new();
                 loop {
@@ -4742,6 +4860,10 @@ mod agent_auto_restart {
                     // records, and events travel on their own channel.
                     let mut delay = Duration::from_millis(200);
                     let mut marked = false;
+                    // A journal line to write just before the messages below go
+                    // out, when a run needs to know which side of them a
+                    // request was on.
+                    let mut announce: Option<&'static str> = None;
                     let reply = match request {
                         Request::Hello(p) if p.token == TOKEN => Some(ServerMessage::ok(
                             id,
@@ -4808,17 +4930,27 @@ mod agent_auto_restart {
                             // its agent is the `Ready` that follows, which is
                             // why the opening-tab trigger has to outlive the
                             // pass it was first asked in.
-                            let listed = if scenario == Scenario::FrontTab {
-                                delay = Duration::from_millis(1_500);
-                                after.push(ServerMessage::event(
-                                    Some(WorkspaceId(DEAD_WORKSPACE.to_owned())),
-                                    Event::WorkspaceStateChanged {
-                                        info: Box::new(dead_in(WorkspaceState::Ready)),
-                                    },
-                                ));
-                                dead_in(WorkspaceState::Creating)
-                            } else {
-                                dead()
+                            //
+                            // Or the older daemon's shape: the workspace is
+                            // listed `ready` while its restore is still running,
+                            // and only the event two seconds on says it is
+                            // there. Two seconds is four times the automatic
+                            // start's own delay, so a start sent on the list's
+                            // word lands well before the marker.
+                            let listed = match scenario {
+                                Scenario::FrontTab | Scenario::StartRefused => {
+                                    delay = Duration::from_millis(1_500);
+                                    announce = Some(SENT_READY);
+                                    after.push(ready_event());
+                                    dead_in(WorkspaceState::Creating)
+                                }
+                                Scenario::StaleReady => {
+                                    delay = Duration::from_millis(2_000);
+                                    announce = Some(SENT_READY);
+                                    after.push(ready_event());
+                                    dead()
+                                }
+                                _ => dead(),
                             };
                             Some(ServerMessage::ok(
                                 id,
@@ -4835,7 +4967,26 @@ mod agent_auto_restart {
                                 dead()
                             },
                         )),
+                        // The first start refused the way the real daemon
+                        // refuses one against a sandbox it has not brought up,
+                        // and the workspace then announced ready -- the same
+                        // event that follows a finished restore.
+                        Request::AgentStart(_)
+                            if scenario == Scenario::StartRefused && starts_answered == 0 =>
+                        {
+                            starts_answered += 1;
+                            announce = Some(SENT_READY);
+                            after.push(ready_event());
+                            Some(ServerMessage::err(
+                                id,
+                                RpcError::new(
+                                    ErrorCode::SandboxError,
+                                    format!("sandbox for {DEAD_WORKSPACE} is not running"),
+                                ),
+                            ))
+                        }
                         Request::AgentStart(_) => {
+                            starts_answered += 1;
                             after.push(state_event(
                                 DEAD_WORKSPACE,
                                 NEW_AGENT,
@@ -4901,36 +5052,55 @@ mod agent_auto_restart {
                     let Some(reply) = reply else {
                         break;
                     };
-                    if w.write_all(codec::encode(&reply).as_bytes()).await.is_err() {
+                    if w.lock()
+                        .await
+                        .write_all(codec::encode(&reply).as_bytes())
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                     if after.is_empty() {
                         continue;
                     }
-                    tokio::time::sleep(delay).await;
-                    if marked {
-                        // Where the prerequisite assertions count from. Written
-                        // before the exits, so a check that raced them is still
-                        // counted as theirs.
-                        recorded
-                            .lock()
-                            .expect("journal mutex")
-                            .push("sent:exits".to_owned());
-                    }
-                    for message in after {
-                        if w.write_all(codec::encode(&message).as_bytes())
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                    let w = w.clone();
+                    let recorded = recorded.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
                         if marked {
+                            // Where the prerequisite assertions count from.
+                            // Written before the exits, so a check that raced
+                            // them is still counted as theirs.
                             recorded
                                 .lock()
                                 .expect("journal mutex")
-                                .push("sent:exit".to_owned());
+                                .push("sent:exits".to_owned());
                         }
-                    }
+                        // Likewise before the event it names: a start that
+                        // raced the event is on the wrong side of the marker,
+                        // which is the side the assertion is about.
+                        if let Some(mark) = announce {
+                            recorded
+                                .lock()
+                                .expect("journal mutex")
+                                .push(mark.to_owned());
+                        }
+                        let mut w = w.lock().await;
+                        for message in after {
+                            if w.write_all(codec::encode(&message).as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if marked {
+                                recorded
+                                    .lock()
+                                    .expect("journal mutex")
+                                    .push("sent:exit".to_owned());
+                            }
+                        }
+                    });
                 }
             }
         });
