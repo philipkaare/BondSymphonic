@@ -190,7 +190,9 @@ impl ExecClient {
         }
         // Last, so anything watching for the sandbox's death sees it only once
         // the outstanding work has already been failed.
-        let _ = self.died.send(true);
+        // Retain death even if no watcher is subscribed at this instant.
+        // Companion registries can subscribe after shutdown has completed.
+        self.died.send_replace(true);
     }
 
     /// Watches for the sandbox going away. The value is `false` while it is

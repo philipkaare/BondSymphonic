@@ -1,3 +1,4 @@
+pub mod agent_sandboxes;
 pub mod changes;
 pub mod in_place;
 pub mod lifecycle;
@@ -163,6 +164,9 @@ impl DataDirs {
             self.home(id),
             self.cache(id),
             self.run(id),
+            self.root.join("agent-homes/codex").join(id.as_str()),
+            self.root.join("agent-run/codex").join(id.as_str()),
+            self.root.join("agent-caches/codex").join(id.as_str()),
         ] {
             let _ = std::fs::remove_dir_all(p);
         }

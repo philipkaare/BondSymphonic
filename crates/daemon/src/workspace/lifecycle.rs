@@ -443,6 +443,7 @@ pub async fn set_allowlist(
         .await?;
     d.proxies
         .set_allowlist(id, Allowlist::from_strings(&ws.allowlist));
+    d.agent_sandboxes.set_allowlist(&ws).await;
     d.emit_state(&ws);
     Ok(Empty {})
 }
@@ -1195,6 +1196,7 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
     // until after the sandbox went down they would simply vanish with it, and a
     // client would go on showing an agent that no longer exists.
     d.agents.stop_all_in(id).await;
+    d.agent_sandboxes.stop_workspace(id).await;
     // Before the worktree goes away, so the teardown itself is not reported as a
     // burst of `fs.changed` for a workspace that is on its way out.
     d.watchers.disable(id);
@@ -1392,7 +1394,7 @@ fn gates() -> &'static parking_lot::Mutex<std::collections::HashMap<WorkspaceId,
     GATES.get_or_init(Default::default)
 }
 
-fn gate(id: &WorkspaceId) -> Gate {
+pub(crate) fn gate(id: &WorkspaceId) -> Gate {
     gates().lock().entry(id.clone()).or_default().clone()
 }
 
@@ -1523,6 +1525,7 @@ pub async fn restore(d: &Arc<Daemon>, entry: RestoreEntry) {
 async fn tear_down_sandbox(d: &Daemon, id: &WorkspaceId) {
     d.runs.stop_all_in(id).await;
     d.agents.stop_all_in(id).await;
+    d.agent_sandboxes.stop_workspace(id).await;
     d.ptys.close_workspace(id).await;
     // The guard is dropped before the await, as in `destroy`.
     let old = d.sandboxes.lock().remove(id);

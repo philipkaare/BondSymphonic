@@ -811,6 +811,15 @@ impl AgentManager {
         p: AgentStartParams,
     ) -> Result<AgentStartResult, RpcError> {
         let backend = backend::backend_for(p.adapter)?;
+        let _lifecycle = crate::workspace::lifecycle::gate(&p.workspace_id)
+            .try_lock_owned()
+            .map_err(|_| {
+                RpcError::new(
+                    ErrorCode::Conflict,
+                    "another operation is running in this workspace",
+                )
+                .with_data(serde_json::json!({"reason":REASON_AGENT_STARTING}))
+            })?;
         // Each phase up to the spawn is timed and said at `info`, the way the
         // startup restore's are (`lifecycle::log_phase`): an `agent.start`
         // sent while the daemon was still restoring once went unanswered for
@@ -830,7 +839,7 @@ impl AgentManager {
             )));
         }
         let phase = Instant::now();
-        let handle = d.sandbox(&ws.id)?;
+        let handle = d.agent_sandboxes.ensure(d, &ws, backend.as_ref()).await?;
         log_phase(&ws.id, "agent.start", "sandbox", phase);
         // One start at a time in a workspace, from here to the moment the
         // process is up.

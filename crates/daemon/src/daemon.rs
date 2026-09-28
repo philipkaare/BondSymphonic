@@ -217,6 +217,7 @@ pub struct Daemon {
     /// One allowlisting proxy per live workspace: the only route out of a
     /// sandbox, and the only place the allowlist is enforced.
     pub proxies: crate::net::proxy::ProxyRegistry,
+    pub agent_sandboxes: crate::workspace::agent_sandboxes::AgentSandboxes,
     /// The running runs, which is where `WorkspaceInfo.runs` comes from.
     pub runs: crate::runs::manager::RunManager,
     /// `system.list_models`'s in-memory cache of the Models API's last
@@ -252,6 +253,7 @@ impl Daemon {
             watchers: Watchers::default(),
             agents,
             proxies: crate::net::proxy::ProxyRegistry::default(),
+            agent_sandboxes: Default::default(),
             runs: crate::runs::manager::RunManager::new(events),
             models: crate::models::ModelsCache::new(),
             host: tokio::sync::OnceCell::new(),
