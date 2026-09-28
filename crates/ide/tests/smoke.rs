@@ -5532,6 +5532,13 @@ mod claude_auth_override {
     /// The sentence the gate shows: the CLI's, without the daemon's suffix.
     const SENTENCE: &str =
         "Failed to authenticate: OAuth session expired and could not be refreshed";
+    /// What the daemon puts beside a turn the server refused: the errored
+    /// `result`'s own text. The CLI does not exit on a token the server
+    /// refuses -- a revoked one, or a long-lived one gone bad -- it answers the
+    /// turn with this and waits for the next message, so the agent's `error`
+    /// state is the only place the failure shows up. Recorded from CLI 2.1.263
+    /// with a well-shaped bogus `CLAUDE_CODE_OAUTH_TOKEN` on 2026-09-28.
+    const REFUSED: &str = "Failed to authenticate. API Error: 401 OAuth access token is invalid.";
     /// The seam that announces the gate and opens the login; see `MainWindow`.
     const MENU_TEST: &str = "claude-gate";
     const GATE_CLOSED: &str = "BS_MENU_TEST claude-gate target=closed question=";
@@ -5552,7 +5559,35 @@ mod claude_auth_override {
         if bondsymphonic_ide::testing::skip_without_qt("CLI auth failure overrides the tick") {
             return;
         }
-        let run = run_ide();
+        assert_gate_follows_the_cli(AgentState::Exited, DIED, SENTENCE, true);
+    }
+
+    /// The same verdict when the agent does not die of it. A refused token
+    /// leaves the CLI running with an errored turn, and the gate has to shut on
+    /// that turn's detail just as it does on an exit's. No re-check is asserted
+    /// here: the window asks for one on an exit, and this is not one.
+    #[test]
+    fn a_turn_the_server_refused_shuts_the_gate_until_the_login_terminal_exits() {
+        if bondsymphonic_ide::testing::skip_without_qt(
+            "CLI auth failure in a turn overrides the tick",
+        ) {
+            return;
+        }
+        assert_gate_follows_the_cli(AgentState::Error, REFUSED, REFUSED, false);
+    }
+
+    /// Runs the window against a daemon whose agent reports `state` with
+    /// `detail`, and checks the gate shut with `sentence` on it, stayed shut
+    /// through any green re-check, and reopened on the login terminal's exit.
+    /// `exit_rechecks` is whether the report is one the window re-checks the
+    /// prerequisites on.
+    fn assert_gate_follows_the_cli(
+        state: AgentState,
+        detail: &'static str,
+        sentence: &str,
+        exit_rechecks: bool,
+    ) {
+        let run = run_ide(state, detail);
         let lines: Vec<&str> = run
             .out
             .lines()
@@ -5562,10 +5597,10 @@ mod claude_auth_override {
         // The exit shut the gate, and the sentence on it is the CLI's own.
         let closed = lines
             .iter()
-            .position(|l| *l == format!("{GATE_CLOSED}{SENTENCE}"))
+            .position(|l| *l == format!("{GATE_CLOSED}{sentence}"))
             .unwrap_or_else(|| {
                 panic!(
-                    "the agent's exit did not shut the gate with the CLI's sentence\n{}",
+                    "the agent's {state:?} did not shut the gate with the CLI's sentence\n{}",
                     run.context
                 )
             });
@@ -5589,6 +5624,19 @@ mod claude_auth_override {
         // before its terminal exited -- and the gate stayed shut through it.
         // This is the check that used to turn the cross back into a tick.
         let after_login = &lines[login + 1..];
+        assert!(
+            !after_login.iter().any(|l| l.starts_with(CHECKED_OPEN)),
+            "a prerequisite check on its own reopened the gate\n{}",
+            run.context
+        );
+        if !exit_rechecks {
+            assert!(
+                after_login.iter().any(|l| *l == GATE_OPEN),
+                "the login terminal's exit did not reopen the gate\n{}",
+                run.context
+            );
+            return;
+        }
         let rechecked = after_login
             .iter()
             .position(|l| l.starts_with(CHECKED_CLOSED))
@@ -5604,11 +5652,6 @@ mod claude_auth_override {
                 .iter()
                 .any(|l| l.starts_with(GATE_OPEN)),
             "the gate reopened before the login terminal had exited\n{}",
-            run.context
-        );
-        assert!(
-            !after_login.iter().any(|l| l.starts_with(CHECKED_OPEN)),
-            "a prerequisite check on its own reopened the gate\n{}",
             run.context
         );
         assert!(
@@ -5636,14 +5679,16 @@ mod claude_auth_override {
         context: String,
     }
 
-    fn run_ide() -> Run {
+    fn run_ide(state: AgentState, detail: &'static str) -> Run {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
-        let (addr, journal) = rt.block_on(fake_daemon());
+        let (addr, journal) = rt.block_on(fake_daemon(state, detail));
 
-        let config = std::env::temp_dir().join(format!("bs-authov-{}", std::process::id()));
+        // Per state: the two tests run in parallel in one process.
+        let config =
+            std::env::temp_dir().join(format!("bs-authov-{}-{state:?}", std::process::id()));
         let _ = std::fs::remove_dir_all(&config);
         std::fs::create_dir_all(&config).expect("config dir");
         let state_path = config.join("state.json");
@@ -5706,7 +5751,10 @@ mod claude_auth_override {
         }
     }
 
-    async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
+    async fn fake_daemon(
+        state: AgentState,
+        detail: &'static str,
+    ) -> (std::net::SocketAddr, Journal) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let journal: Journal = Arc::new(Mutex::new(Vec::new()));
@@ -5774,8 +5822,8 @@ mod claude_auth_override {
                                     Some(WorkspaceId(WORKSPACE.to_owned())),
                                     Event::AgentStateChanged {
                                         agent_id: AgentId(AGENT.to_owned()),
-                                        state: AgentState::Exited,
-                                        detail: Some(DIED.to_owned()),
+                                        state,
+                                        detail: Some(detail.to_owned()),
                                     },
                                 ));
                             }

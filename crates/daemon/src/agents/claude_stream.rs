@@ -225,7 +225,15 @@ pub fn parse_line(line: &str) -> Vec<Parsed> {
 }
 
 /// What to show beside an errored turn: the CLI's own error list when it sent
-/// one, else the result subtype, which at least names the failure mode.
+/// one, else the result's own text, else the result subtype, which at least
+/// names the failure mode.
+///
+/// The text matters for a failed login. A token the server refuses does not
+/// end the CLI in stream-json input mode; 2.1.263 answers the turn with
+/// `is_error: true`, `subtype: "success"`, no `errors`, and `result: "Failed to
+/// authenticate. API Error: 401 …"`, then waits for the next message. That
+/// sentence is the one place the failure is named, and the IDE reads this
+/// detail to mark Claude as not logged in (see its `auth_failure_in`).
 ///
 /// A subtype that says nothing is dropped rather than shown. Claude Code
 /// 2.1.263 answers a logged-out turn with `is_error: true` and
@@ -250,6 +258,10 @@ fn error_detail(result: &Value) -> String {
         .unwrap_or_default();
     if !joined.is_empty() {
         return joined;
+    }
+    let text = str_at(result, "result").trim();
+    if !text.is_empty() {
+        return text.to_owned();
     }
     match str_at(result, "subtype") {
         "" | "success" => "the agent ended the turn with an error".to_owned(),
@@ -479,6 +491,38 @@ mod tests {
         let mut with_errors = base("success");
         with_errors["errors"] = json!(["Not logged in", "run /login"]);
         assert_eq!(detail(with_errors), "Not logged in; run /login");
+    }
+
+    /// A token the server refuses -- revoked, or the long-lived one gone bad --
+    /// does not end the CLI in stream-json input mode: it answers the turn with
+    /// an errored `result` whose `result` text is the API's sentence, and waits
+    /// for the next message. Recorded from CLI 2.1.263 with a well-shaped bogus
+    /// `CLAUDE_CODE_OAUTH_TOKEN` on 2026-09-28. That sentence is the only place
+    /// the failure is named, and the IDE reads it from the state's detail to
+    /// mark Claude as not logged in, so it has to be the detail.
+    #[test]
+    fn an_errored_result_names_the_clis_own_sentence() {
+        let line = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "result": "Failed to authenticate. API Error: 401 OAuth access token is invalid.",
+            "terminal_reason": "api_error",
+            "session_id": "s",
+            "total_cost_usd": 0.0,
+            "duration_ms": 50,
+            "num_turns": 1,
+        });
+        let detail = parse_line(&line.to_string())
+            .into_iter()
+            .find_map(|p| match p {
+                Parsed::State(S::Error, detail) => detail,
+                _ => None,
+            });
+        assert_eq!(
+            detail.as_deref(),
+            Some("Failed to authenticate. API Error: 401 OAuth access token is invalid.")
+        );
     }
 
     /// A tool that returns anything but plain text -- reading a screenshot is

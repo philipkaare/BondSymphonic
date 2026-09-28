@@ -1246,7 +1246,7 @@ pub fn claude_gate_open(claude_auth_ok: bool, api_key_set: bool) -> bool {
 }
 
 /// The phrases the Claude Code CLI uses when it cannot authenticate, as they
-/// appear in an agent's exit detail. Matched case-insensitively, as a small
+/// appear in an agent's exit detail or in the detail of a turn that errored. Matched case-insensitively, as a small
 /// explicit list: a rule that guessed from "auth" or "token" would also match
 /// an agent that died of a network error while *using* a token, and the wrong
 /// verdict here shuts every composer in the window.
@@ -1261,11 +1261,18 @@ const CLI_AUTH_FAILURES: [&str; 5] = [
 /// What the setup page's `claude_auth` row says to do about an override, as
 /// its `fix_hint`. A plain login does not always help: the CLI reads the
 /// credentials file, finds the dead token there, and tries to refresh it again.
+///
+/// A new long-lived token comes first because it is the remedy that holds:
+/// agents use it in preference to the credentials file, and it has no refresh
+/// to race. Logging out and in stays as the alternative, but for a user who
+/// already has a long-lived token it is the worse one -- the logout removes
+/// that token and puts agents back on the refreshing login.
 pub const CLAUDE_AUTH_OVERRIDE_FIX: &str =
-    "Settings > Setup: Log out of Claude Code, then Log in to Claude Code again";
+    "Settings > Setup: Set up long-lived token, or Log out of Claude Code, then Log in to Claude Code again";
 
 /// The CLI's own sentence about a login that has gone, if an agent's exit
-/// detail carries one; `None` for every other exit.
+/// detail -- or the detail of a turn that errored -- carries one; `None` for
+/// every other detail.
 ///
 /// The daemon's `claude_auth` prerequisite runs `claude auth status`, which only
 /// reads `~/.claude/.credentials.json` and answers `loggedIn: true` for a file
@@ -1276,6 +1283,13 @@ pub const CLAUDE_AUTH_OVERRIDE_FIX: &str =
 /// into a banner, the re-check the exit triggered came back green, the composer
 /// stayed open, and the next prompt started another agent that died the same
 /// way.
+///
+/// A token the server refuses once the agent is running -- a revoked one, or a
+/// long-lived one gone bad -- does not kill the CLI at all: in the adapter's
+/// stream-json mode it answers the turn with an error, `Failed to authenticate.
+/// API Error: 401 OAuth access token is invalid.`, and waits for the next
+/// message. The daemon puts that sentence in the agent's `error` state detail,
+/// and it is read here the same way.
 ///
 /// Returns the line of the detail that matched, without the daemon's own
 /// `(exit code N)` suffix: it is shown in place of the gate's paraphrase, and
@@ -1536,8 +1550,8 @@ pub struct AppControllerRust {
     /// the credentials file and cannot see that the refresh token in it is
     /// dead. Only the CLI can, and it says so exactly once, at exit. So:
     ///
-    /// * **Set** when an agent exits with a detail [`auth_failure_in`]
-    ///   recognises. From that moment `claudeLoggedIn` is false and the setup
+    /// * **Set** when an agent exits, or ends a turn in error, with a detail
+    ///   [`auth_failure_in`] recognises. From that moment `claudeLoggedIn` is false and the setup
     ///   page's `claude_auth` row is a cross, whatever the daemon answers.
     /// * **Cleared** when the Claude login, logout, or setup-token terminal
     ///   opened through `open_setup_pty` exits -- the login is the fix, and
@@ -1868,8 +1882,10 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
                     // Before the signal, so the window's handler -- which
                     // re-checks the prerequisites on every exit -- finds the
                     // gate already shut when it runs, and so does the pane
-                    // that draws the banner.
-                    if state == AgentState::Exited {
+                    // that draws the banner. An errored turn counts as well
+                    // as an exit: a token the server refuses leaves the CLI
+                    // running, and the turn's error is all it says.
+                    if matches!(state, AgentState::Exited | AgentState::Error) {
                         if let Some(sentence) = auth_failure_in(&detail) {
                             q.as_mut().set_claude_auth_override(Some(sentence));
                         }
@@ -3832,6 +3848,9 @@ mod tests {
             "FAILED TO AUTHENTICATE: whatever",
             "Not logged in · Please run /login",
             "server answered invalid_grant",
+            // A turn the server refused, as the daemon reports it from the
+            // errored result (CLI 2.1.263, a revoked token).
+            "Failed to authenticate. API Error: 401 OAuth access token is invalid.",
         ] {
             assert_eq!(
                 auth_failure_in(detail).as_deref(),
@@ -3847,9 +3866,10 @@ mod tests {
         );
     }
 
-    /// An exit that says nothing about the login is not one, whatever else
-    /// went wrong: a crash, a missing binary, a plain exit code, a sandbox that
-    /// went away. The wrong verdict here shuts every composer in the window.
+    /// An exit or an errored turn that says nothing about the login is not
+    /// one, whatever else went wrong: a crash, a missing binary, a plain exit
+    /// code, a sandbox that went away, a turn that ran out of turns. The wrong
+    /// verdict here shuts every composer in the window.
     #[test]
     fn other_exits_are_not_auth_failures() {
         for detail in [
@@ -3860,6 +3880,9 @@ mod tests {
             "panicked at src/main.rs:1:1",
             "error: network is unreachable",
             "authorization header rejected by proxy",
+            "the agent ended the turn with an error",
+            "error_max_turns",
+            "API Error: 529 Overloaded",
         ] {
             assert_eq!(auth_failure_in(detail), None, "{detail:?} must not match");
         }
@@ -3867,7 +3890,7 @@ mod tests {
 
     /// The setup page draws its rows from the payload, so the override lands
     /// there as a failed `claude_auth` row carrying the CLI's sentence and the
-    /// log-out-then-in hint; every other row is left exactly as the daemon
+    /// override's fix hint; every other row is left exactly as the daemon
     /// said it, and a list with no such row grows one.
     #[test]
     fn the_override_rewrites_only_the_claude_auth_row() {
