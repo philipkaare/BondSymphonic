@@ -58,7 +58,40 @@ Claude unconditionally once it has refused `Terminal`.
 - New Agent dialog: a backend chooser (Claude, Codex; OpenCode later). The model
   and permission-mode lists follow the chosen backend; the model list comes from
   that backend's `list_models` (`system.list_models` gains an `adapter` param,
-  default Claude).
+  default Claude). The preselected backend is the Settings default (§2.1).
+
+### 2.1 Settings: the backends on equal footing
+
+The user's requirement: Claude, Codex and OpenCode are **equals** in Settings. No
+backend is the "real" one with the others bolted on.
+
+- Settings → **Agents** has a small common part — *New agents use* (the default
+  backend, among the enabled ones) and *Show turn cost and system lines* — and
+  below it **one section per backend, all built from the same template**, shown
+  as tabs *Claude | Codex | OpenCode*:
+  1. **Enabled** checkbox;
+  2. **Sign-in**: the backend's credential(s) — Claude: Anthropic API key and
+     the Claude sign-in/long-lived token; Codex: OpenAI API key and the ChatGPT
+     sign-in; OpenCode: its providers (sub-project 2) — each with its Setup
+     buttons (install, log in, log out) right there;
+  3. **Default model** (from that backend's `list_models`);
+  4. **Default permission mode** (that backend's own modes).
+- The template is data-driven from what the daemon reports per backend, so the
+  OpenCode tab arrives with sub-project 2 without restructuring. Until then the
+  dialog shows the tabs of the backends the daemon knows.
+- Settings storage becomes per backend: `backends.<id>.{enabled,
+  default_model, default_permission_mode}` plus `default_backend`. The existing
+  top-level `default_permission_mode` migrates to `backends.claude` on first
+  load; Claude is enabled by default, Codex and OpenCode are not.
+- The "no mode named → the Settings default" rule (`start_options`, commit
+  `f22c844`) uses the chosen backend's default mode; the same rule is added for
+  the default model.
+- The Setup page keeps the machine-wide rows (git, bwrap, userns, sandbox, gh)
+  in a *System* group and shows one group per **enabled** backend with that
+  backend's rows — Claude's too, so disabling Claude hides its rows exactly as a
+  disabled Codex hides Codex's.
+- Keys stay in the Windows credential store, one entry per backend
+  (`anthropic_api_key`, `openai_api_key`).
 
 ## 3. The Codex adapter
 
@@ -102,8 +135,8 @@ Unrecognised notifications degrade to `System { subtype: "raw" }`, as
 
 ## 4. Authentication
 
-- **API key**: Settings gets "OpenAI API key", stored in the Windows credential
-  store (a second entry beside `anthropic_api_key`), sent per start like the
+- **API key**: Settings → Agents → Codex gets "OpenAI API key", stored in the
+  Windows credential store (`openai_api_key`), sent per start like the
   Anthropic key and given to the agent process only. Because a bare
   `OPENAI_API_KEY` does not authenticate Codex, the daemon passes a provider
   config whose `env_key` names it (to be verified, §7).
@@ -128,8 +161,8 @@ Unrecognised notifications degrade to `System { subtype: "raw" }`, as
   key set, or `auth.json` present in the shared `CODEX_HOME`).
 - New setup actions: `InstallCodex` (`curl -fsSL https://chatgpt.com/codex/install.sh | sh`,
   literal argv like the others), `CodexLogin`, `CodexLogout`.
-- Shown only when Codex is enabled: a Settings checkbox "Enable Codex", or the
-  `codex` binary already present.
+- Shown only when Codex is enabled in Settings → Agents → Codex (§2.1); the
+  same rule now applies to Claude's rows.
 
 ## 6. Network
 
@@ -166,6 +199,8 @@ per-key `CODEX_HOME` instead; if 5 fails, the design comes back to the user.
 - Credentials: API key never on argv, in a log line or in the sandbox spec; the
   shared `CODEX_HOME` bind present only for Codex sandboxes.
 - Allowlist: OpenAI hosts reachable only from Codex sandboxes.
-- IDE: backend chooser, per-backend model and mode lists, Setup rows hidden when
-  Codex is not enabled, the OpenAI key in Settings.
+- IDE: backend chooser, per-backend model and mode lists, the Settings tabs built
+  from one template (same controls per backend), the settings migration of the
+  old top-level permission mode, per-backend defaults applied by `start_options`,
+  Setup groups hidden for disabled backends (Claude included).
 - Daemon tests on Windows and in the distro; `cargo fmt --check` clean.
