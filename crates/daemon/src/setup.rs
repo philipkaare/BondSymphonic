@@ -25,13 +25,14 @@ pub const HOST_BACKEND: &str = "noop";
 
 /// Every action, for callers that need to enumerate them (tests, and any future
 /// listing of what the daemon can fix).
-pub const ALL_ACTIONS: [SetupAction; 6] = [
+pub const ALL_ACTIONS: [SetupAction; 7] = [
     SetupAction::ClaudeLogin,
     SetupAction::GhLogin,
     SetupAction::InstallClaude,
     SetupAction::InstallGh,
     SetupAction::ClaudeLogout,
     SetupAction::GhLogout,
+    SetupAction::ClaudeSetupToken,
 ];
 
 /// The command each action runs. The whole table is literal: an action selects
@@ -52,8 +53,37 @@ pub fn setup_argv(action: SetupAction) -> Vec<String> {
         // off with no way to answer them.
         SetupAction::ClaudeLogout => &["claude", "auth", "logout"],
         SetupAction::GhLogout => &["gh", "auth", "logout"],
+        // The command that mints the long-lived token this daemon stores and
+        // hands agents as `CLAUDE_CODE_OAUTH_TOKEN`; Task 3 captures its
+        // output from this same terminal.
+        SetupAction::ClaudeSetupToken => &["claude", "setup-token"],
     };
     argv.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// What has to happen before a setup terminal opens, ahead of `open_host`.
+///
+/// A logout takes away every way an agent authenticates, and the long-lived
+/// token is one of them: `claude auth logout` only ever touches the daemon
+/// user's `~/.claude/.credentials.json`, and never heard of the token file
+/// this daemon keeps beside it, so without this the token would keep working
+/// as a login for every agent after the user believed they had logged out.
+///
+/// A missing token file is not an error here -- most logouts happen with no
+/// token ever having been minted -- so the removal's own `Ok`/`Err` is only
+/// logged, never propagated; `system.setup_pty` still opens the terminal
+/// either way.
+pub(crate) fn before_setup(root: &Path, action: SetupAction) {
+    if action != SetupAction::ClaudeLogout {
+        return;
+    }
+    let path = crate::agents::token::token_path(root);
+    match crate::agents::token::remove(&path) {
+        Ok(()) => tracing::info!(path = %path.display(), "long-lived claude token removed"),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "long-lived claude token not removed")
+        }
+    }
 }
 
 /// The daemon user's own home directory, which is where a setup command has to
@@ -120,6 +150,19 @@ mod tests {
             ["claude", "auth", "logout"]
         );
         assert_eq!(setup_argv(SetupAction::GhLogout), ["gh", "auth", "logout"]);
+        assert_eq!(
+            setup_argv(SetupAction::ClaudeSetupToken),
+            ["claude", "setup-token"]
+        );
+    }
+
+    #[test]
+    fn the_setup_token_action_runs_setup_token_and_nothing_else() {
+        assert_eq!(
+            setup_argv(SetupAction::ClaudeSetupToken),
+            ["claude", "setup-token"]
+        );
+        assert!(ALL_ACTIONS.contains(&SetupAction::ClaudeSetupToken));
     }
 
     /// Each provider's logout runs the same program as its login. What makes a
@@ -171,5 +214,26 @@ mod tests {
     #[test]
     fn the_host_home_is_never_empty() {
         assert!(!host_home().as_os_str().is_empty());
+    }
+
+    /// [`before_setup`]: a Claude logout takes the long-lived token with it,
+    /// any other action leaves it alone, and an absent token never panics.
+    #[test]
+    fn a_claude_logout_removes_the_token_and_nothing_else_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = crate::agents::token::token_path(root);
+        let token = "sk-ant-oat01-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdEfGhIjKlAA";
+
+        crate::agents::token::write(&path, token).unwrap();
+        before_setup(root, SetupAction::ClaudeLogin);
+        assert!(path.exists(), "a login must not touch the token");
+
+        before_setup(root, SetupAction::ClaudeLogout);
+        assert!(!path.exists(), "a logout must remove the token");
+
+        // Absent already: must not panic.
+        before_setup(root, SetupAction::ClaudeLogout);
+        assert!(!path.exists());
     }
 }

@@ -258,6 +258,11 @@ impl Request {
                 cols: 80,
                 rows: 24,
             }),
+            SystemSetupPty(SetupPtyParams {
+                action: SetupAction::ClaudeSetupToken,
+                cols: 80,
+                rows: 24,
+            }),
             RepoInspect(RepoPathParams { path: "/r".into() }),
             RepoDetectRunConfigs(RepoPathParams { path: "/r".into() }),
             WorkspaceCreate(WorkspaceCreateParams {

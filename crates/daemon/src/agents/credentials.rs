@@ -631,7 +631,7 @@ fn read_without_following(path: &Path) -> std::io::Result<Vec<u8>> {
 /// destination. A rename replaces a name and follows nothing, and a temporary
 /// that was already there -- which only another daemon could have left -- is
 /// refused by `create_new` rather than reused.
-fn replace_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
+pub(crate) fn replace_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
     static SERIAL: AtomicU64 = AtomicU64::new(0);
     let tmp_name = format!(
         ".{}.{}-{}.tmp",

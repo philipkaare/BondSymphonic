@@ -55,6 +55,10 @@ pub enum SetupAction {
     ClaudeLogout,
     /// Log out of GitHub again, breaking `gh_auth` on purpose.
     GhLogout,
+    /// Create a long-lived subscription token with `claude setup-token`. The
+    /// daemon captures it from the terminal's output and gives it to agents
+    /// as `CLAUDE_CODE_OAUTH_TOKEN`.
+    ClaudeSetupToken,
 }
 
 /// What `repo.inspect` knows about a path the user picked.

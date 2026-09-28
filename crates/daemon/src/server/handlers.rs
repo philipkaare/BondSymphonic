@@ -117,6 +117,7 @@ impl Handler for WorkspaceHandler {
             // it needs the daemon and cannot live in `SystemHandler` with the
             // other `system.*` methods.
             Request::SystemSetupPty(p) => {
+                crate::setup::before_setup(&d.dirs.root, p.action);
                 let opened = d
                     .ptys
                     .open_host(
