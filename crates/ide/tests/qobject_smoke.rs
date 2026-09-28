@@ -1584,6 +1584,7 @@ mod cpp_widgets {
         fn bs_widget_test_transcript_coalesces_a_streamed_answer() -> i32;
         fn bs_widget_test_new_agent_dialog_takes_its_own_inspect_failure() -> i32;
         fn bs_widget_test_new_agent_dialog_offers_claude_before_the_daemon_answers() -> i32;
+        fn bs_widget_test_new_agent_dialog_refills_models_keeping_the_selection() -> i32;
         fn bs_widget_test_setup_page_says_what_was_pasted() -> i32;
         fn bs_widget_test_group_bar_names_the_repository() -> i32;
         fn bs_widget_test_new_agent_dialog_says_branches_are_loading() -> i32;
@@ -1599,6 +1600,7 @@ mod cpp_widgets {
         fn bs_widget_test_new_agent_dialog_always_sends_a_permission_mode() -> i32;
         fn bs_widget_test_settings_offers_the_one_permission_list() -> i32;
         fn bs_widget_test_transcript_composer_offers_model_and_mode() -> i32;
+        fn bs_widget_test_transcript_refill_models_keeps_the_selection() -> i32;
         fn bs_widget_test_transcript_welcomes_an_empty_pane() -> i32;
         fn bs_widget_test_transcript_hides_the_small_grey_lines() -> i32;
         fn bs_widget_test_agent_area_holds_a_restartable_banner() -> i32;
@@ -1631,7 +1633,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 49] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 51] = [
             // These four build a whole MainWindow, and each begins by pointing
             // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
             // is load-bearing rather than tidy: the state store settles its
@@ -1718,6 +1720,10 @@ mod cpp_widgets {
                 bs_widget_test_new_agent_dialog_offers_claude_before_the_daemon_answers,
             ),
             (
+                "NewAgentDialog refills its model list, keeping the selection",
+                bs_widget_test_new_agent_dialog_refills_models_keeping_the_selection,
+            ),
+            (
                 "SetupPage says what was pasted, since the prompt will not",
                 bs_widget_test_setup_page_says_what_was_pasted,
             ),
@@ -1760,6 +1766,10 @@ mod cpp_widgets {
             (
                 "The composer offers a model and a permission mode",
                 bs_widget_test_transcript_composer_offers_model_and_mode,
+            ),
+            (
+                "The composer's refill keeps the model row's selection",
+                bs_widget_test_transcript_refill_models_keeps_the_selection,
             ),
             (
                 "An empty pane says what it is waiting as",

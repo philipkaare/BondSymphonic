@@ -1242,6 +1242,68 @@ extern "C" std::int32_t bs_widget_test_transcript_composer_offers_model_and_mode
     return 0;
 }
 
+/// `refillModels` is what `AgentArea` calls on every open transcript pane
+/// when `system.list_models` answers. It has to behave like
+/// `applyOptionsToChoices` in the one way that matters here: the re-fill must
+/// never read as the user asking for a restart, and whatever the combo was
+/// already showing -- a choice still on the new list, or one typed by hand
+/// that no list has ever carried -- must survive it.
+extern "C" std::int32_t bs_widget_test_transcript_refill_models_keeps_the_selection() {
+    // A pane already showing a choice that is still on the list the fetch
+    // is about to bring.
+    TranscriptModel listedModel;
+    listedModel.setOptionsJson(
+        QStringLiteral(R"({"model":"claude-sonnet-5","permission_mode":"manual"})"));
+    TranscriptView listed(&listedModel);
+    auto* listedCombo = listed.findChild<QComboBox*>(QStringLiteral("TranscriptModelChoice"));
+    if (listedCombo == nullptr ||
+        listedCombo->currentData().toString() != QLatin1String("claude-sonnet-5")) {
+        return 1;
+    }
+    QStringList listedSent;
+    QObject::connect(&listed, &TranscriptView::optionsChanged, &listed,
+                     [&listedSent](const QString& json) { listedSent.append(json); });
+
+    // A pane showing a model no list has ever carried -- typed by hand, or
+    // an id this build has since stopped offering.
+    TranscriptModel typedModel;
+    typedModel.setOptionsJson(
+        QStringLiteral(R"({"model":"claude-typed-by-hand","permission_mode":"manual"})"));
+    TranscriptView typed(&typedModel);
+    auto* typedCombo = typed.findChild<QComboBox*>(QStringLiteral("TranscriptModelChoice"));
+    if (typedCombo == nullptr ||
+        typedCombo->currentText() != QLatin1String("claude-typed-by-hand")) {
+        return 2;
+    }
+    QStringList typedSent;
+    QObject::connect(&typed, &TranscriptView::optionsChanged, &typed,
+                     [&typedSent](const QString& json) { typedSent.append(json); });
+
+    // The fetch that triggers both panes' refill: "claude-sonnet-5" is still
+    // on it, so `listed` exercises "still on the list"; "claude-typed-by-hand"
+    // is not, so `typed` exercises "kept as text".
+    agentchoices::setModels({ { QStringLiteral("Sonnet 5"), QStringLiteral("claude-sonnet-5") },
+                               { QStringLiteral("Haiku 4.5"),
+                                 QStringLiteral("claude-haiku-4-5-20251001") } });
+    listed.refillModels();
+    typed.refillModels();
+    agentchoices::resetModelsForTest();
+
+    if (listedCombo->currentData().toString() != QLatin1String("claude-sonnet-5")) {
+        return 3;
+    }
+    if (typedCombo->currentText() != QLatin1String("claude-typed-by-hand")) {
+        return 4;
+    }
+    // Neither refill looked like the user asking for a restart: a pane told
+    // what it already runs on -- which is what a refill is -- must stay
+    // silent, the same rule `applyOptionsToChoices` follows.
+    if (!listedSent.isEmpty() || !typedSent.isEmpty()) {
+        return 5;
+    }
+    return 0;
+}
+
 /// A pane with nothing in it says what is waiting, and stops saying it the
 /// moment there is something to read instead.
 ///

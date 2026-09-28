@@ -921,6 +921,56 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_offers_claude_before_the
     return 0;
 }
 
+/// The dialog connects to `AppController::modelsChecked` itself, in its own
+/// constructor: it can be open when a fetch lands, since the fetch is asked
+/// once per connection rather than once per dialog. The refill has to keep
+/// whatever the Model row already shows, listed or typed -- the same promise
+/// `TranscriptView::refillModels` makes to an open transcript pane.
+extern "C" std::int32_t
+bs_widget_test_new_agent_dialog_refills_models_keeping_the_selection() {
+    AppController controller;
+    GroupModel model;
+    NewAgentDialog dialog(&controller, &model, QString::fromUtf8(kDialogRepo));
+
+    auto* models = dialog.findChild<QComboBox*>(QStringLiteral("NewAgentModel"));
+    if (models == nullptr) {
+        return 1;
+    }
+    const int sonnet = models->findData(QStringLiteral("claude-sonnet-5"));
+    if (sonnet < 0) {
+        return 2;
+    }
+    models->setCurrentIndex(sonnet);
+
+    // The fetch the dialog's own connection reacts to. In the real wiring
+    // `MainWindow::applyModels` -- connected before any dialog exists -- has
+    // already called `agentchoices::setModels` by the time a dialog's own
+    // slot for the same signal runs; done here by hand for the same effect.
+    // The payload itself is not read by this dialog's handler, only by
+    // `MainWindow::applyModels`.
+    agentchoices::setModels({ { QStringLiteral("Sonnet 5"), QStringLiteral("claude-sonnet-5") },
+                               { QStringLiteral("Haiku 4.5"),
+                                 QStringLiteral("claude-haiku-4-5-20251001") } });
+    controller.modelsChecked(
+        QStringLiteral(R"([{"id":"claude-sonnet-5","label":"Sonnet 5"}])"));
+    if (models->currentData().toString() != QLatin1String("claude-sonnet-5")) {
+        agentchoices::resetModelsForTest();
+        return 3;
+    }
+
+    // A typed id the next fetch does not carry stays as typed text rather
+    // than snapping back to "Default".
+    models->setCurrentText(QStringLiteral("claude-typed-by-hand"));
+    agentchoices::setModels({ { QStringLiteral("Sonnet 5"), QStringLiteral("claude-sonnet-5") } });
+    controller.modelsChecked(
+        QStringLiteral(R"([{"id":"claude-sonnet-5","label":"Sonnet 5"}])"));
+    agentchoices::resetModelsForTest();
+    if (models->currentText() != QLatin1String("claude-typed-by-hand")) {
+        return 4;
+    }
+    return 0;
+}
+
 namespace {
 
 /// Runs the layout of `dialog` and of everything inside it, so the geometry

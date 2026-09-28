@@ -159,6 +159,27 @@ mod tests {
         assert_eq!(newest_per_family(&[newer.clone(), older]), vec![newer]);
     }
 
+    /// An exact tie on `created_at` within one family: the first of the two
+    /// in input order wins, because the comparison in `newest_per_family` is
+    /// a strict `<` -- a later entry only replaces the one already kept when
+    /// it is strictly newer, never on an equal timestamp. Nothing in the real
+    /// `system.list_models` answer is expected to tie -- two live models of
+    /// one family sharing a `created_at` to the second -- but the rule has to
+    /// be *some* fixed pick rather than whichever the API's own ordering, or
+    /// a future re-sort, happens to leave last.
+    #[test]
+    fn an_exact_tie_within_one_family_keeps_the_first_one_listed() {
+        let first = model("claude-opus-5", "Claude Opus 5", "2026-01-01T00:00:00Z");
+        let second = model("claude-opus-5-5", "Claude Opus 5.5", "2026-01-01T00:00:00Z");
+        assert_eq!(
+            newest_per_family(&[first.clone(), second.clone()]),
+            vec![first.clone()]
+        );
+        // Order-dependent, on purpose: swapping the input order changes which
+        // one is "first" and so which one wins.
+        assert_eq!(newest_per_family(&[second.clone(), first]), vec![second]);
+    }
+
     #[test]
     fn model_choices_strips_the_claude_prefix_and_carries_the_id_through() {
         let models = fixture();
