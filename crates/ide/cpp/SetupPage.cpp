@@ -73,6 +73,17 @@ QString logoutButtonName(const QString& action) {
                                                     : QStringLiteral("bsGhLogout");
 }
 
+/// The long-lived token button's own name, since it is only ever offered on
+/// `claude_auth` -- unlike the logout button above, there is nothing to
+/// dispatch on.
+const QString kTokenButtonName = QStringLiteral("bsClaudeSetupToken");
+
+/// What the token button's tooltip says: the command it runs, and why an
+/// agent cares.
+const QString kTokenButtonTooltip = QStringLiteral(
+    "Run `claude setup-token` in a terminal here; agents then use that token instead of your "
+    "login");
+
 } // namespace
 
 SetupPage::SetupPage(AppController* controller, QWidget* parent)
@@ -330,6 +341,21 @@ QString SetupPage::logoutActionFor(const QString& name) {
     return QString();
 }
 
+QString SetupPage::tokenActionFor(const QString& name, bool ok, const QString& detail) {
+    if (name != QLatin1String("claude_auth")) {
+        return QString();
+    }
+    // Offered on a failing row unconditionally -- there is no detail to read
+    // a token out of when the CLI is not signed in at all -- and on a passing
+    // one whenever the detail is not already the token's own sentence, which
+    // is the daemon's way of saying `~/.bondsymphonic/claude-oauth-token` is
+    // there and this row is standing on it already.
+    if (!ok || detail != QLatin1String("long-lived token")) {
+        return QStringLiteral("claude_setup_token");
+    }
+    return QString();
+}
+
 QString SetupPage::buttonTextFor(const QString& action) {
     if (action == QLatin1String("install_claude")) {
         return QStringLiteral("Install Claude Code");
@@ -348,6 +374,9 @@ QString SetupPage::buttonTextFor(const QString& action) {
     }
     if (action == QLatin1String("gh_logout")) {
         return QStringLiteral("Log out of GitHub");
+    }
+    if (action == QLatin1String("claude_setup_token")) {
+        return QStringLiteral("Set up long-lived token");
     }
     // Every action spelled out, with no fallthrough. `gh_login` used to be
     // whatever was left over, which was true while logging in to GitHub was
@@ -442,6 +471,12 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
             button->setToolTip(
                 QStringLiteral("Run `%1` in a terminal here").arg(logoutCommandFor(logout)));
         }
+        const QString token = tokenActionFor(name, ok, detail);
+        if (!token.isEmpty()) {
+            QPushButton* button = addActionButton(token);
+            button->setObjectName(kTokenButtonName);
+            button->setToolTip(kTokenButtonTooltip);
+        }
         m_rowsLayout->addWidget(row);
         return;
     }
@@ -461,6 +496,12 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
         return;
     }
     addActionButton(action);
+    const QString token = tokenActionFor(name, ok, detail);
+    if (!token.isEmpty()) {
+        QPushButton* button = addActionButton(token);
+        button->setObjectName(kTokenButtonName);
+        button->setToolTip(kTokenButtonTooltip);
+    }
     m_rowsLayout->addWidget(row);
 }
 
@@ -684,6 +725,23 @@ const char* const kClaudeAuthOk =
     "[{\"name\":\"claude_auth\",\"ok\":true,\"detail\":\"signed in\",\"fix_hint\":\"\"}]";
 const char* const kClaudeAuthMissing =
     "[{\"name\":\"claude_auth\",\"ok\":false,\"detail\":\"not signed in\",\"fix_hint\":\"\"}]";
+
+/// A passing `claude_auth` in the two states the long-lived token offer tells
+/// apart: signed in through the ordinary login, and already carrying the
+/// token. The second string is the daemon's exact sentence, matched
+/// literally by `tokenActionFor` -- see the constraints doc for why the CLI
+/// login case must not read as this one.
+const char* const kClaudeAuthLoggedIn =
+    "[{\"name\":\"claude_auth\",\"ok\":true,\"detail\":\"logged in to Claude\",\"fix_hint\":\"\"}]";
+const char* const kClaudeAuthLongLivedToken =
+    "[{\"name\":\"claude_auth\",\"ok\":true,\"detail\":\"long-lived token\",\"fix_hint\":\"\"}]";
+
+/// `gh_auth`, passing and failing, to show the token offer never reaches a
+/// row that has nothing to do with Claude.
+const char* const kGhAuthOk =
+    "[{\"name\":\"gh_auth\",\"ok\":true,\"detail\":\"signed in\",\"fix_hint\":\"\"}]";
+const char* const kGhAuthMissing =
+    "[{\"name\":\"gh_auth\",\"ok\":false,\"detail\":\"not signed in\",\"fix_hint\":\"\"}]";
 
 /// One prerequisite the daemon found and one it did not, so a single payload
 /// draws both glyphs.
@@ -973,6 +1031,71 @@ extern "C" std::int32_t bs_widget_test_setup_page_offers_a_logout_for_a_live_ses
         }
         if (buttonSaying(page, "Log in to Claude Code") == nullptr) {
             return 8;
+        }
+    }
+    return 0;
+}
+
+/// The long-lived token offer sits beside whichever button the row already
+/// has -- the login on a failing row, the logout on a passing one -- and
+/// drops out only once the row's own detail says the token is already there.
+/// `gh_auth` never sees it: `claude setup-token` has nothing to do with
+/// GitHub.
+extern "C" std::int32_t bs_widget_test_setup_page_offers_the_long_lived_token() {
+    AppController controller;
+    {
+        // Failing: the login button and the token offer both.
+        SetupPage page(&controller);
+        controller.prereqsChecked(QString::fromUtf8(kClaudeAuthMissing));
+        if (buttonSaying(page, "Log in to Claude Code") == nullptr) {
+            return 1;
+        }
+        if (page.findChild<QPushButton*>(QStringLiteral("bsClaudeSetupToken")) == nullptr) {
+            return 2;
+        }
+    }
+    {
+        // Passing through the ordinary login, not yet a token: the logout and
+        // the offer both.
+        SetupPage page(&controller);
+        controller.prereqsChecked(QString::fromUtf8(kClaudeAuthLoggedIn));
+        if (page.findChild<QPushButton*>(QStringLiteral("bsClaudeLogout")) == nullptr) {
+            return 3;
+        }
+        QPushButton* token =
+            page.findChild<QPushButton*>(QStringLiteral("bsClaudeSetupToken"));
+        if (token == nullptr) {
+            return 4;
+        }
+        if (token->text() != QLatin1String("Set up long-lived token")) {
+            return 5;
+        }
+        if (!token->toolTip().contains(QLatin1String("claude setup-token"))) {
+            return 6;
+        }
+    }
+    {
+        // Passing and already a token: the logout stays, the offer does not
+        // -- there is nothing left for it to fix.
+        SetupPage page(&controller);
+        controller.prereqsChecked(QString::fromUtf8(kClaudeAuthLongLivedToken));
+        if (page.findChild<QPushButton*>(QStringLiteral("bsClaudeLogout")) == nullptr) {
+            return 7;
+        }
+        if (page.findChild<QPushButton*>(QStringLiteral("bsClaudeSetupToken")) != nullptr) {
+            return 8;
+        }
+    }
+    {
+        // gh_auth, passing and failing alike: never offered.
+        SetupPage page(&controller);
+        controller.prereqsChecked(QString::fromUtf8(kGhAuthOk));
+        if (page.findChild<QPushButton*>(QStringLiteral("bsClaudeSetupToken")) != nullptr) {
+            return 9;
+        }
+        controller.prereqsChecked(QString::fromUtf8(kGhAuthMissing));
+        if (page.findChild<QPushButton*>(QStringLiteral("bsClaudeSetupToken")) != nullptr) {
+            return 10;
         }
     }
     return 0;

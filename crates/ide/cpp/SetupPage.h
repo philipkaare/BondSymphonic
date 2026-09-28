@@ -105,6 +105,17 @@ private:
     /// ticked and the agent failing, and the only way out of that from inside
     /// the IDE is to throw the session away first.
     static QString logoutActionFor(const QString& name);
+    /// The setup action that offers a long-lived token in place of `name`'s
+    /// sign-in, or empty everywhere but `claude_auth`.
+    ///
+    /// Offered whether the row passes or fails, and kept apart from
+    /// `actionFor`/`logoutActionFor` because it does not replace either: a
+    /// failing row still wants its login button beside it, and a passing one
+    /// still wants its logout, since `claude setup-token` neither needs nor
+    /// disturbs an existing session. Keyed on the CLI's own detail string --
+    /// `"long-lived token"` -- rather than a flag the daemon would have to
+    /// invent, because that string already carries the answer.
+    static QString tokenActionFor(const QString& name, bool ok, const QString& detail);
     /// What the button for `action` says.
     static QString buttonTextFor(const QString& action);
 

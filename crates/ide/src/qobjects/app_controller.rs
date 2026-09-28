@@ -1405,7 +1405,7 @@ pub fn network_denial(ws: &Option<WorkspaceId>, ev: &Event) -> Option<(String, S
     Some((workspace.0.clone(), host.to_owned()))
 }
 
-/// The six setup terminals, by the names the UI and the daemon both use.
+/// The seven setup terminals, by the names the UI and the daemon both use.
 /// Anything else is refused here rather than sent on: the enum is the whole
 /// point of `system.setup_pty`, and a typo should fail loudly and locally.
 fn parse_setup_action(action: &str) -> Option<SetupAction> {
@@ -1420,6 +1420,10 @@ fn parse_setup_action(action: &str) -> Option<SetupAction> {
         // exits, which is what turns the row's tick back into a cross.
         "claude_logout" => Some(SetupAction::ClaudeLogout),
         "gh_logout" => Some(SetupAction::GhLogout),
+        // Also a host terminal on `claude_auth`, offered whether the row
+        // passes or fails: `claude setup-token` neither needs nor disturbs an
+        // existing login.
+        "claude_setup_token" => Some(SetupAction::ClaudeSetupToken),
         _ => None,
     }
 }
@@ -1535,10 +1539,11 @@ pub struct AppControllerRust {
     /// * **Set** when an agent exits with a detail [`auth_failure_in`]
     ///   recognises. From that moment `claudeLoggedIn` is false and the setup
     ///   page's `claude_auth` row is a cross, whatever the daemon answers.
-    /// * **Cleared** when the Claude login or logout terminal opened through
-    ///   `open_setup_pty` exits -- the login is the fix, and the re-check the
-    ///   setup page sends on that exit then decides the gate on its own -- and
-    ///   on connection loss, where the reconnect's check starts from nothing.
+    /// * **Cleared** when the Claude login, logout, or setup-token terminal
+    ///   opened through `open_setup_pty` exits -- the login is the fix, and
+    ///   the re-check the setup page sends on that exit then decides the gate
+    ///   on its own -- and on connection loss, where the reconnect's check
+    ///   starts from nothing.
     /// * **Not cleared** by a re-check on its own. That is the case that lied:
     ///   the window re-checks on every agent exit, and the check came back
     ///   green over the very login the agent had just died of.
@@ -1547,10 +1552,10 @@ pub struct AppControllerRust {
     /// override, or empty. Kept beside it rather than instead of it because the
     /// property is a `QString` and the rule above is written in `Option`.
     claude_auth_failure: QString,
-    /// The PTY of the last Claude login or logout terminal `open_setup_pty`
-    /// opened, so its `pty.exit` is recognised as the login having been done.
-    /// Only those two: an `install_claude` or a GitHub login says nothing about
-    /// whether the Claude token is alive.
+    /// The PTY of the last Claude login, logout, or setup-token terminal
+    /// `open_setup_pty` opened, so its `pty.exit` is recognised as the login
+    /// having been done. Only those three: an `install_claude` or a GitHub
+    /// login says nothing about whether the Claude token is alive.
     login_pty: Option<PtyId>,
     /// Whether a prerequisite answer should open Settings on Setup, and
     /// whether one already has. See [`SetupPrompt`].
@@ -1876,9 +1881,10 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
                     )
                 });
             }
-            // A setup terminal ending. Only the Claude login or logout one
-            // means anything here: its exit is the login having been done,
-            // which is what the CLI's verdict about the old one yields to.
+            // A setup terminal ending. Only the Claude login, logout, or
+            // setup-token one means anything here: its exit is the login
+            // having been done, which is what the CLI's verdict about the old
+            // one yields to.
             Event::PtyExit { pty_id, .. } => {
                 let _ = qt.queue(move |mut q| {
                     if q.as_ref().rust().login_pty.as_ref() == Some(&pty_id) {
@@ -3009,11 +3015,19 @@ impl qobject::AppController {
                 Ok(res) => {
                     let id = res.pty_id.to_string();
                     tracing::info!("setup terminal for {name} opened as {id}");
-                    // A Claude login or logout: remembered so its exit lifts
-                    // the CLI's verdict about the old login. See `login_pty`.
-                    let login =
-                        matches!(action, SetupAction::ClaudeLogin | SetupAction::ClaudeLogout)
-                            .then(|| res.pty_id.clone());
+                    // A Claude login, logout, or setup-token: remembered so
+                    // its exit lifts the CLI's verdict about the old login.
+                    // See `login_pty`. The token terminal earns the same
+                    // treatment as a login: it runs `claude setup-token`
+                    // against the same CLI, and a stale override must not
+                    // survive it either.
+                    let login = matches!(
+                        action,
+                        SetupAction::ClaudeLogin
+                            | SetupAction::ClaudeLogout
+                            | SetupAction::ClaudeSetupToken
+                    )
+                    .then(|| res.pty_id.clone());
                     let _ = qt.queue(move |mut q| {
                         if let Some(pty) = login {
                             q.as_mut().rust_mut().login_pty = Some(pty);
@@ -3784,6 +3798,16 @@ mod tests {
         );
         assert!(text.contains("build-daemon.ps1"), "{text:?}");
         assert!(text.contains("reinstall the package"), "{text:?}");
+    }
+
+    /// The seventh setup terminal recognised alongside the other six, by the
+    /// same name the daemon and `SetupPage` both use for it.
+    #[test]
+    fn parse_setup_action_recognises_the_setup_token_terminal() {
+        assert_eq!(
+            parse_setup_action("claude_setup_token"),
+            Some(SetupAction::ClaudeSetupToken)
+        );
     }
 
     /// The CLI's exact sentence from the day this was written, as the daemon

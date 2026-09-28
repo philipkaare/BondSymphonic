@@ -220,6 +220,35 @@ Claude Code has no login of its own. Leaving the field empty keeps the stored
 key; **Remove key** deletes it. The same dialog sets the default permission mode
 new agents start with.
 
+### A long-lived token for agents
+
+The `claude_auth` row carries a second button, **Set up long-lived token**,
+beside whichever of **Log in to Claude Code** or **Log out of Claude Code**
+the row already offers. It disappears once the row's own detail says the
+token is already there, and comes back if you ever log out again.
+
+**What it is.** A token good for one year, which agents use instead of your
+own Claude Code login. Without it every agent shares your interactive
+session, so starting a second agent — or running `claude` yourself while
+one is working — can log the others out from under themselves; the token
+gives every agent a credential of its own that logging in and out
+yourself never touches.
+
+**How.** File > Settings… > Setup > **Set up long-lived token**, then finish
+the sign-in in the browser exactly as you would for **Log in to Claude
+Code** — the same sign-in-link row and Ctrl+V paste apply. It runs `claude
+setup-token` in the terminal pane; the daemon reads the token off that
+terminal's own output and keeps it at `~/.bondsymphonic/claude-oauth-token`
+inside the distro, never showing it to you again.
+
+**Limits.** The token's scope is inference only, which is all an agent needs.
+Remote Control and Claude in Chrome still need a full `claude auth login`,
+run by hand in a terminal outside the IDE.
+
+**Renew and remove.** Run **Set up long-lived token** again before the year
+is up to replace it. **Log out of Claude Code** removes the token along with
+the ordinary login — both at once, one button.
+
 ---
 
 ## Creating an agent workspace
