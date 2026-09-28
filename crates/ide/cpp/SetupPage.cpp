@@ -55,14 +55,18 @@ constexpr int kPastedFeedbackMs = 8000;
 /// ellipsis and says nothing; the tooltip and the buttons still work.
 constexpr int kMinLinkWidth = 40;
 
-/// The command a logout action runs, for the tooltip that names it. "Log out
-/// of Claude Code" does not say what is about to happen to the machine, and
-/// this is a button whose whole effect is to break a prerequisite that
-/// currently passes: the command is the one thing that makes that concrete,
-/// and it is the same line a user would have typed in the distro themselves.
-QString logoutCommandFor(const QString& action) {
-    return action == QLatin1String("claude_logout") ? QStringLiteral("claude auth logout")
-                                                    : QStringLiteral("gh auth logout");
+/// The tooltip a logout button carries: what it will do to the machine. "Log
+/// out of Claude Code" does not say, and this is a button whose whole effect is
+/// to break a prerequisite that currently passes: the command is the one thing
+/// that makes that concrete, and it is the same line a user would have typed in
+/// the distro themselves. The Claude logout also deletes the long-lived token
+/// the daemon stored, before the command runs, so it says that too -- a user
+/// with a token who presses it is putting agents back on the refreshing login.
+QString logoutTooltipFor(const QString& action) {
+    return action == QLatin1String("claude_logout")
+               ? QStringLiteral(
+                     "Remove the long-lived token and run `claude auth logout` in a terminal here")
+               : QStringLiteral("Run `gh auth logout` in a terminal here");
 }
 
 /// The name a logout button carries, so a test can find it without the page
@@ -468,8 +472,7 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
             // thing a row that is already fine can offer, and it should not
             // pull the eye away from the rows that are not fine. The tooltip
             // is where it says what it will actually run.
-            button->setToolTip(
-                QStringLiteral("Run `%1` in a terminal here").arg(logoutCommandFor(logout)));
+            button->setToolTip(logoutTooltipFor(logout));
         }
         const QString token = tokenActionFor(name, ok, detail);
         if (!token.isEmpty()) {
@@ -1000,6 +1003,11 @@ extern "C" std::int32_t bs_widget_test_setup_page_offers_a_logout_for_a_live_ses
         // The tooltip, because the label says which provider and nothing
         // about what will be run against the machine.
         if (!logout->toolTip().contains(QLatin1String("claude auth logout"))) {
+            return 3;
+        }
+        // And that it takes the long-lived token with it, which the command
+        // alone does not say.
+        if (!logout->toolTip().contains(QLatin1String("long-lived token"))) {
             return 3;
         }
         // A row that passes does not also offer to fix itself.

@@ -121,6 +121,11 @@ impl Handler for WorkspaceHandler {
             // it needs the daemon and cannot live in `SystemHandler` with the
             // other `system.*` methods.
             Request::SystemSetupPty(p) => {
+                // For a logout this removes the long-lived token even if the
+                // terminal below then fails to open. Acceptable: the user sees
+                // that error and can press the button again, and removing the
+                // token first is the order the spec (§4.4) sets: once a user
+                // has asked to log out, no agent started afterwards is given it.
                 crate::setup::before_setup(&d.dirs.root, p.action);
                 // `claude setup-token` prints the long-lived token once and never
                 // again, so its terminal's output is scanned on the way past and

@@ -148,8 +148,9 @@ behind it:
 
 **Log in here, not in a terminal.** A failing check the IDE can fix carries a
 button — **Install Claude Code**, **Log in to Claude Code**, **Install GitHub
-CLI**, **Log in to GitHub**. Pressing it runs that command in a terminal pane in
-the dialog, on the host rather than inside a sandbox, because a login has to
+CLI**, **Log in to GitHub** — and the `claude_auth` row also offers **Set up
+long-lived token** (see [below](#a-long-lived-token-for-agents)). Pressing one
+runs that command in a terminal pane in the dialog, on the host rather than inside a sandbox, because a login has to
 write to your home directory. When the command exits the checks re-run.
 
 **Log out again from the same place.** A check that is *passing* carries a
@@ -199,10 +200,14 @@ that timed out while the IDE was open show up as a cross and a closed prompt box
 instead of a green tick and prompts that fail. One case the check cannot see: a
 refresh token the server has revoked still reads as logged in, because `claude
 auth status` only looks at the credentials file. When an agent exits reporting
-that — *OAuth session expired and could not be refreshed* — the `claude_auth`
-row turns into a cross carrying the CLI's sentence and stays one through every
-re-check until you have pressed **Log out of Claude Code** and then **Log in to
-Claude Code** here.
+that — *OAuth session expired and could not be refreshed* — or a turn fails
+with *Failed to authenticate* (a token the server has revoked, which leaves the
+agent running but refusing every prompt), the `claude_auth` row turns into a
+cross carrying the CLI's sentence and stays one through every re-check until
+you have pressed **Set up long-lived token** here — the fix that lasts, see
+[below](#a-long-lived-token-for-agents) — or, instead, **Log out of Claude
+Code** and then **Log in to Claude Code**. If you already use a long-lived
+token, prefer setting up a new one: logging out deletes it.
 
 **Re-check** runs the checks again, and so does closing the dialog. The four
 *blocking* checks are `git`, `bwrap`, `userns` and `sandbox`: without them there
@@ -247,7 +252,9 @@ run by hand in a terminal outside the IDE.
 
 **Renew and remove.** Run **Set up long-lived token** again before the year
 is up to replace it. **Log out of Claude Code** removes the token along with
-the ordinary login — both at once, one button.
+the ordinary login — both at once, one button. Agents already running keep the
+credentials they started with: restart them to pick up a new token, or to drop
+the old one after logging out.
 
 ---
 
@@ -586,10 +593,12 @@ A Claude Code workspace's pane shows the conversation as it arrives.
   whether Claude Code is logged in…* with no button, and clears itself when the
   answer comes. An agent that dies at start reporting an expired session —
   *Failed to authenticate: OAuth session expired and could not be refreshed* —
-  closes the box again with the CLI's own sentence over the button, whatever
-  the check says, because the check only reads the credentials file and cannot
-  see a dead refresh token; **Log out of Claude Code** then **Log in** under
-  Settings > Setup is the fix, and the box comes back when that terminal exits.
+  or whose turn fails with *Failed to authenticate* closes the box again with
+  the CLI's own sentence over the button, whatever the check says, because the
+  check only reads the credentials file and cannot see a dead token; **Set up
+  long-lived token** under Settings > Setup is the fix (or **Log out of Claude
+  Code** then **Log in**, which also deletes any long-lived token), and the box
+  comes back when that terminal exits.
   Terminal tabs are unaffected.
 - **Transcript.** Your prompts, the assistant's answers rendered as Markdown,
   one card per tool call with its input and its result, and a line per turn with
