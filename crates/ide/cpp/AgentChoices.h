@@ -20,14 +20,35 @@ namespace agentchoices {
 
 /// What the user reads, and what is sent. `label` is for a person and may be
 /// rewritten freely; `id` is the CLI's own word and may not.
+///
+/// `QString`, not `const char*`: the model list can be replaced at runtime
+/// with what `system.list_models` fetched, and those strings do not live for
+/// the length of the program the way a string literal does. See [`setModels`].
 struct Choice {
-    const char* label;
-    const char* id;
+    QString label;
+    QString id;
 };
 
 /// The models offered, in the order they are offered. The first is the empty
 /// id, which means "send no `--model` and let Claude Code decide".
+///
+/// A built-in fallback -- `Opus 5.5`, `Fable 5.1`, `Sonnet 5`, `Haiku 4.5` --
+/// until [`setModels`] has replaced it with what `system.list_models` fetched;
+/// the same fallback comes back if a fetch fails, because [`setModels`] is
+/// simply never called then.
 const QList<Choice>& models();
+
+/// Replaces the models offered with `fetched`, keeping the empty "Default"
+/// entry first. Called once per connection, when the daemon's
+/// `system.list_models` has answered; never on a failure, which leaves
+/// whatever `models()` was already returning -- the built-in fallback, or an
+/// earlier successful fetch -- in place.
+///
+/// A combo already on screen when this runs is not told by it: see
+/// `AgentArea::refillModels` and `NewAgentDialog`'s own connection to
+/// `AppController::modelsChecked` for what refills one, preserving its
+/// current selection.
+void setModels(const QList<Choice>& fetched);
 
 /// The permission modes offered, in the order they are offered.
 ///
@@ -61,6 +82,13 @@ QString labelForPermissionMode(const QString& id);
 /// workspace created with a model this build has never heard of still shows it.
 void fillModelCombo(QComboBox* combo, const QString& selected);
 
+/// The id `combo` currently stands for: the data behind the label if its text
+/// matches one of the list's labels, or the text itself when it does not -- a
+/// model typed by hand rather than picked. Also what a refill has to capture
+/// before re-filling the same combo, so the choice survives even when the
+/// fetch that triggered the refill dropped that id from the list.
+QString modelComboSelection(const QComboBox* combo);
+
 /// Fills `combo` with the permission modes and selects `selected`, falling back
 /// to the first entry -- the one that asks about everything -- for an id the
 /// list does not hold. A mode that cannot be shown must never silently become a
@@ -80,5 +108,12 @@ void fillPermissionCombo(QComboBox* combo, const QString& selected);
 inline const char* defaultPermissionMode() {
     return "bypassPermissions";
 }
+
+#if defined(BS_WIDGET_TESTS)
+/// Test seam: undoes [`setModels`], so one check's simulated fetch does not
+/// leak into the next -- every offscreen widget check but this one assumes
+/// `models()` is still the built-in fallback.
+void resetModelsForTest();
+#endif
 
 } // namespace agentchoices

@@ -322,6 +322,14 @@ void AgentArea::setClaudeAuthFailure(const QString& sentence) {
     }
 }
 
+void AgentArea::refillModels() {
+    for (TranscriptView* view : m_transcripts) {
+        if (view != nullptr) {
+            view->refillModels();
+        }
+    }
+}
+
 void AgentArea::setShowMeta(bool show) {
     m_showMeta = show;
     for (TranscriptView* view : m_transcripts) {

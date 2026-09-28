@@ -721,14 +721,25 @@ void TranscriptView::applyOptionsToChoices() {
 }
 
 QString TranscriptView::chosenModelId() const {
-    const QString shown = m_modelChoice->currentText().trimmed();
-    // A label off the list stands for the id behind it -- nobody types "Opus 5"
-    // at a CLI -- and anything else is an id typed by hand.
-    const int listed = m_modelChoice->findText(shown);
-    const QString id = listed >= 0 ? m_modelChoice->itemData(listed).toString() : shown;
+    const QString id = agentchoices::modelComboSelection(m_modelChoice);
     // See the bridge: an empty string there means "leave the stored model
     // alone", so the one id that really is empty needs a word of its own.
     return id.isEmpty() ? QStringLiteral("-") : id;
+}
+
+void TranscriptView::refillModels() {
+    // Captured off the combo as it stands, not off `chosenModelId`: that one
+    // rewrites "let Claude Code decide" to `-` for the options bridge, and a
+    // refill has to hand `fillModelCombo` the plain id, empty or not.
+    const QString selected = agentchoices::modelComboSelection(m_modelChoice);
+    // Guarded like `applyOptionsToChoices`: `fillModelCombo` clears and
+    // re-fills the combo, which walks its current index through whatever the
+    // new list's first entry is on the way to `selected`, and each of those
+    // stops is a `currentIndexChanged` this pane must not read as a restart.
+    m_applyingOptions = true;
+    agentchoices::fillModelCombo(m_modelChoice, selected);
+    m_applyingOptions = false;
+    updateWelcome();
 }
 
 void TranscriptView::emitOptionsChanged() {
@@ -1150,7 +1161,7 @@ extern "C" std::int32_t bs_widget_test_transcript_coalesces_a_streamed_answer() 
 extern "C" std::int32_t bs_widget_test_transcript_composer_offers_model_and_mode() {
     TranscriptModel model;
     model.setOptionsJson(
-        QStringLiteral(R"({"model":"claude-opus-5","permission_mode":"manual"})"));
+        QStringLiteral(R"({"model":"claude-opus-5-5","permission_mode":"manual"})"));
     TranscriptView view(&model);
 
     auto* models = view.findChild<QComboBox*>(QStringLiteral("TranscriptModelChoice"));
@@ -1167,7 +1178,7 @@ extern "C" std::int32_t bs_widget_test_transcript_composer_offers_model_and_mode
     QStringList sent;
     QObject::connect(&view, &TranscriptView::optionsChanged, &view,
                      [&sent](const QString& optionsJson) { sent.append(optionsJson); });
-    if (models->currentData().toString() != QLatin1String("claude-opus-5") ||
+    if (models->currentData().toString() != QLatin1String("claude-opus-5-5") ||
         modes->currentData().toString() != QLatin1String("manual")) {
         return 3;
     }
@@ -1185,7 +1196,7 @@ extern "C" std::int32_t bs_widget_test_transcript_composer_offers_model_and_mode
         QLatin1String("bypassPermissions")) {
         return 6;
     }
-    if (chosen.value(QStringLiteral("model")).toString() != QLatin1String("claude-opus-5")) {
+    if (chosen.value(QStringLiteral("model")).toString() != QLatin1String("claude-opus-5-5")) {
         // One field changes; the rest of the tab's options go along untouched,
         // which is what makes this a switch rather than a new agent.
         return 7;
@@ -1242,7 +1253,7 @@ extern "C" std::int32_t bs_widget_test_transcript_composer_offers_model_and_mode
 extern "C" std::int32_t bs_widget_test_transcript_welcomes_an_empty_pane() {
     TranscriptModel model;
     model.setOptionsJson(
-        QStringLiteral(R"({"model":"claude-opus-5","permission_mode":"bypassPermissions"})"));
+        QStringLiteral(R"({"model":"claude-opus-5-5","permission_mode":"bypassPermissions"})"));
     TranscriptView view(&model);
     view.setWelcome(QStringLiteral("agent-4"), QStringLiteral("BondSymphonic @ main"),
                     QStringLiteral("/home/bs/.bondsymphonic/worktrees/ws_1"));
@@ -1351,7 +1362,7 @@ extern "C" std::int32_t bs_widget_test_transcript_hides_the_small_grey_lines() {
 extern "C" std::int32_t bs_widget_test_transcript_announces_a_switch_when_it_lands() {
     TranscriptModel model;
     model.setOptionsJson(
-        QStringLiteral(R"({"model":"claude-opus-5","permission_mode":"manual"})"));
+        QStringLiteral(R"({"model":"claude-opus-5-5","permission_mode":"manual"})"));
     model.setAgentId(QStringLiteral("ag_first"));
     TranscriptView view(&model);
 

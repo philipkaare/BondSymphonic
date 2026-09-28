@@ -217,8 +217,7 @@ extern "C" std::int32_t bs_widget_test_settings_offers_the_one_permission_list()
         return 2;
     }
     for (int i = 0; i < modes->count(); ++i) {
-        if (modes->itemData(i).toString() !=
-            QString::fromUtf8(agentchoices::permissionModes().at(i).id)) {
+        if (modes->itemData(i).toString() != agentchoices::permissionModes().at(i).id) {
             return 3;
         }
     }

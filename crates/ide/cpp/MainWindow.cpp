@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "AgentArea.h"
+#include "AgentChoices.h"
 #include "Branding.h"
 #include "ChangesToolbar.h"
 #include "CloseGroupDialog.h"
@@ -658,6 +659,28 @@ void MainWindow::onPrereqsChecked(const QString& json) {
     }
 }
 
+void MainWindow::applyModels(const QString& json) {
+    const QJsonArray fetched = QJsonDocument::fromJson(json.toUtf8()).array();
+    QList<agentchoices::Choice> choices;
+    choices.reserve(fetched.size());
+    for (const QJsonValue& entry : fetched) {
+        const QJsonObject choice = entry.toObject();
+        choices.append({ choice.value(QStringLiteral("label")).toString(),
+                          choice.value(QStringLiteral("id")).toString() });
+    }
+    // Never called with nothing in it -- the controller does not emit the
+    // signal over a failed fetch -- but an empty array would still mean
+    // `agentchoices::setModels` replacing the fallback with just "Default",
+    // which is worse than leaving the fallback alone.
+    if (choices.isEmpty()) {
+        return;
+    }
+    agentchoices::setModels(choices);
+    // Every combo `fillModelCombo` has already filled sees the new list from
+    // here on; only a combo already on screen has to be told.
+    m_agentArea->refillModels();
+}
+
 void MainWindow::requestPrereqRecheck() {
     if (m_prereqRecheck == nullptr) {
         m_prereqRecheck = new QTimer(this);
@@ -1125,6 +1148,13 @@ void MainWindow::connectController() {
         m_agentArea->setClaudeAuthFailure(m_controller->getClaudeAuthFailure());
     });
     m_agentArea->setClaudeAuthFailure(m_controller->getClaudeAuthFailure());
+    // The newest model per family, once `system.list_models` has answered.
+    // Nothing to apply up front the way the three above do: the signal is
+    // never emitted over a failed fetch, so there is no answer to have missed
+    // by the time this connection is made -- `start()` runs after this
+    // window, and every connection it makes, is already built.
+    QObject::connect(m_controller, &AppController::modelsChecked, this,
+                     &MainWindow::applyModels);
     // Test seam: says which way the gate went and on what, and answers the
     // CLI's verdict the way the setup page's button would -- by opening the
     // Claude login terminal -- so a run can see that a re-check alone leaves

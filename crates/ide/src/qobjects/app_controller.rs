@@ -427,6 +427,17 @@ pub mod qobject {
         #[qsignal]
         fn prereqs_checked(self: Pin<&mut AppController>, json: QString);
 
+        /// The newest model of each family, as a JSON array of
+        /// `{"id", "label"}` objects (see
+        /// [`crate::model::models::model_choices`]). Emitted once per
+        /// connection, after `system.list_models` has answered -- never on a
+        /// failure, which is a warning in the log rather than a signal: the
+        /// model combo's C++ fallback list is what the dropdowns already show,
+        /// and losing it over a fetch nobody asked to see fail would be a
+        /// worse day than staying on it.
+        #[qsignal]
+        fn models_checked(self: Pin<&mut AppController>, json: QString);
+
         /// A setup terminal is open. `action` is echoed back from the call, so
         /// a page that started two of them can tell which answered; `pty_id`
         /// is an ordinary PTY id, taking `pty.write`, `pty.resize` and
@@ -2050,6 +2061,48 @@ async fn run_prereq_check(client: &DaemonClient, qt: &QtHandle) -> bool {
     true
 }
 
+/// One `system.list_models`, computing
+/// [`crate::model::models::newest_per_family`] and reporting it as
+/// `models_checked`. Never awaited by its callers, which spawn it instead:
+/// see the call sites for why.
+///
+/// Any error -- no Claude credentials on the daemon side, the network, a
+/// daemon too old to know the method -- is a warning, never a hard failure:
+/// `agentchoices`'s C++ fallback list is what the dropdowns already show, and
+/// there is nothing here worth retrying the way [`check_prereqs`] retries,
+/// because the daemon answer is cached for an hour and the next connection
+/// tries again regardless.
+async fn fetch_models(client: DaemonClient, qt: QtHandle) {
+    let params = ListModelsParams {
+        api_key: api_key_for_start(),
+    };
+    let models = match client
+        .request::<ListModelsResult>(Request::SystemListModels(params))
+        .await
+    {
+        Ok(res) => res.models,
+        Err(e) => {
+            tracing::warn!("system.list_models failed: {e}");
+            return;
+        }
+    };
+    let choices = crate::model::models::model_choices(&models);
+    if choices.is_empty() {
+        // Every id failed to start with `claude-`, or the daemon answered
+        // with no models at all: nothing here is worth showing over the
+        // fallback list.
+        return;
+    }
+    let Ok(json) = serde_json::to_string(&choices) else {
+        return;
+    };
+    tracing::info!(
+        families = choices.len(),
+        "fetched the newest model per family"
+    );
+    let _ = qt.queue(move |mut q| q.as_mut().models_checked(QString::from(&json)));
+}
+
 /// One prerequisite check, as the answers the UI actually asks for.
 ///
 /// The list crosses the boundary as JSON because the setup page draws a row per
@@ -2543,12 +2596,17 @@ async fn connect_once(
                 smoke::run(steps, list_client, list_qt).await;
             }
         });
+        // Alongside the prerequisite check, on its own task: a model list
+        // nobody has asked to see yet must never hold up a connection the
+        // rest of the window is already waiting on.
+        runtime().spawn(fetch_models(client.clone(), qt.clone()));
         check_prereqs(client, qt.clone()).await;
     } else {
         // A reconnect re-syncs in order and announces itself only once that is
         // done, so anything listening for `reconnected` can take it that the
         // prerequisites and the workspace list have already been reported.
         // Awaited rather than spawned for exactly that reason.
+        runtime().spawn(fetch_models(client.clone(), qt.clone()));
         check_prereqs(client.clone(), qt.clone()).await;
         load_workspace_list(client, qt.clone()).await;
         let announced = i64::try_from(generation).unwrap_or(i64::MAX);

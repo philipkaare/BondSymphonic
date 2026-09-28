@@ -74,6 +74,12 @@ public:
     /// happens in the setup terminal, which is a PTY and can.
     void setClaudeLoggedIn(bool loggedIn);
 
+    /// `system.list_models` answered, so the dropdown is re-filled from
+    /// `agentchoices::models()`'s new contents, keeping whatever it currently
+    /// shows: a choice still on the new list stays selected by id, and a
+    /// typed or no-longer-listed one stays as text.
+    void refillModels();
+
     /// Whether the daemon has answered the prerequisite check at all, per the
     /// controller's `prereqsAnswered`. Changes only what the closed gate says.
     ///

@@ -125,6 +125,10 @@ private:
     /// Decides, from the daemon's prerequisite list, between opening Settings
     /// on Setup, a status-bar warning with a way there, and neither.
     void onPrereqsChecked(const QString& json);
+    /// `AppController::modelsChecked`: parses the newest-model-per-family
+    /// list, replaces `agentchoices`' runtime model list with it, and
+    /// re-fills every open transcript's combo, preserving its selection.
+    void applyModels(const QString& json);
     /// Asks the daemon to check the prerequisites again, once, a beat from now.
     ///
     /// The prerequisites are checked at start-up and when Settings closes, and

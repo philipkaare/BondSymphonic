@@ -17,6 +17,7 @@ pub mod app_state;
 pub mod diff;
 pub mod editor_buffer;
 pub mod file_tree;
+pub mod models;
 pub mod persistence;
 pub mod run_config;
 pub mod terminal_grid;

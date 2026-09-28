@@ -266,6 +266,14 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     // be offered to the next agent as though somebody had chosen it.
     agentchoices::fillModelCombo(m_claudeModel, QString());
     m_claudeModel->setInsertPolicy(QComboBox::NoInsert);
+    // A dialog can be open when `system.list_models` answers -- it is asked
+    // once per connection, not once per dialog -- so the combo it already
+    // built is re-filled rather than left showing the fallback for the rest
+    // of the session. `chosenModel` captures what is already there, listed or
+    // typed, before the list under it changes.
+    QObject::connect(m_controller, &AppController::modelsChecked, this, [this] {
+        agentchoices::fillModelCombo(m_claudeModel, chosenModel());
+    });
     form->addRow("Model:", m_claudeModel);
 
     m_permissionMode = new QComboBox(this);
@@ -424,14 +432,7 @@ QString NewAgentDialog::optionsJson() const {
 }
 
 QString NewAgentDialog::chosenModel() const {
-    const QString shown = m_claudeModel->currentText().trimmed();
-    // A label off the list stands for the id behind it -- nobody types
-    // "Opus 5" at a CLI -- and anything else is an id typed by hand.
-    const int listed = m_claudeModel->findText(shown);
-    if (listed >= 0) {
-        return m_claudeModel->itemData(listed).toString();
-    }
-    return shown;
+    return agentchoices::modelComboSelection(m_claudeModel);
 }
 
 QString NewAgentDialog::initialPrompt() const {
@@ -1064,8 +1065,7 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_always_sends_a_permissio
         return 2;
     }
     for (int i = 0; i < modes->count(); ++i) {
-        if (modes->itemData(i).toString() !=
-            QString::fromUtf8(agentchoices::permissionModes().at(i).id)) {
+        if (modes->itemData(i).toString() != agentchoices::permissionModes().at(i).id) {
             return 3;
         }
     }

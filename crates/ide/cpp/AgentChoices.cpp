@@ -7,8 +7,8 @@ namespace {
 /// The label paired with `id` in `list`, or an empty string.
 QString labelIn(const QList<agentchoices::Choice>& list, const QString& id) {
     for (const agentchoices::Choice& choice : list) {
-        if (QString::fromUtf8(choice.id) == id) {
-            return QString::fromUtf8(choice.label);
+        if (choice.id == id) {
+            return choice.label;
         }
     }
     return QString();
@@ -17,24 +17,57 @@ QString labelIn(const QList<agentchoices::Choice>& list, const QString& id) {
 void fill(QComboBox* combo, const QList<agentchoices::Choice>& list) {
     combo->clear();
     for (const agentchoices::Choice& choice : list) {
-        combo->addItem(QString::fromUtf8(choice.label), QString::fromUtf8(choice.id));
+        combo->addItem(choice.label, choice.id);
     }
+}
+
+/// What `system.list_models` fetched, once a fetch has succeeded -- empty
+/// until then, and again after [`resetModelsForTest`]. Kept apart from the
+/// fallback below rather than overwriting it, so a fetch that never comes back
+/// (an old daemon, one with no Claude credentials) leaves the fallback in
+/// place rather than an empty combo.
+QList<agentchoices::Choice>& fetchedModels() {
+    static QList<agentchoices::Choice> models;
+    return models;
+}
+
+/// Whether [`fetchedModels`] holds a real answer. A plain `bool` rather than
+/// `fetchedModels().isEmpty()`, because "Default" alone -- a fetch that came
+/// back with no models in it -- is a real, if unlikely, answer too.
+bool& hasFetchedModels() {
+    static bool has = false;
+    return has;
 }
 
 } // namespace
 
 const QList<agentchoices::Choice>& agentchoices::models() {
-    static const QList<Choice> kModels{
+    // The built-in fallback: what a dropdown shows until the first
+    // `system.list_models` answers, and what it goes back to showing if a
+    // fetch fails. Kept in the shape `newest_per_family` -- the daemon-side
+    // and IDE-side selection this fallback stands in for -- delivers it: the
+    // newest model of each family, newest first, labelled with `display_name`
+    // less its "Claude " prefix.
+    static const QList<Choice> kFallback{
         // Just "Default". The pane is a dock and is routinely narrow enough
         // that a longer label scrolls its editable line edit to the end and
         // shows the user "ode decides)", which is worse than saying less. The
         // combo's tooltip carries the meaning.
-        { "Default", "" },
-        { "Opus 5", "claude-opus-5" },
-        { "Sonnet 5", "claude-sonnet-5" },
-        { "Haiku 4.5", "claude-haiku-4-5-20251001" },
+        { QStringLiteral("Default"), QStringLiteral("") },
+        { QStringLiteral("Opus 5.5"), QStringLiteral("claude-opus-5-5") },
+        { QStringLiteral("Fable 5.1"), QStringLiteral("claude-fable-5-1") },
+        { QStringLiteral("Sonnet 5"), QStringLiteral("claude-sonnet-5") },
+        { QStringLiteral("Haiku 4.5"), QStringLiteral("claude-haiku-4-5-20251001") },
     };
-    return kModels;
+    return hasFetchedModels() ? fetchedModels() : kFallback;
+}
+
+void agentchoices::setModels(const QList<Choice>& fetched) {
+    QList<Choice>& storage = fetchedModels();
+    storage.clear();
+    storage.append({ QStringLiteral("Default"), QStringLiteral("") });
+    storage += fetched;
+    hasFetchedModels() = true;
 }
 
 const QList<agentchoices::Choice>& agentchoices::permissionModes() {
@@ -92,6 +125,14 @@ void agentchoices::fillModelCombo(QComboBox* combo, const QString& selected) {
     }
 }
 
+QString agentchoices::modelComboSelection(const QComboBox* combo) {
+    const QString shown = combo->currentText().trimmed();
+    // A label off the list stands for the id behind it -- nobody types
+    // "Opus 5.5" at a CLI -- and anything else is an id typed by hand.
+    const int listed = combo->findText(shown);
+    return listed >= 0 ? combo->itemData(listed).toString() : shown;
+}
+
 void agentchoices::fillPermissionCombo(QComboBox* combo, const QString& selected) {
     combo->setEditable(false);
     fill(combo, permissionModes());
@@ -124,7 +165,7 @@ extern "C" std::int32_t bs_widget_test_agent_choices_are_one_list() {
     const QStringList ids{ QStringLiteral("bypassPermissions"), QStringLiteral("acceptEdits"),
                            QStringLiteral("plan"), QStringLiteral("manual") };
     for (int i = 0; i < ids.size(); ++i) {
-        if (QString::fromUtf8(agentchoices::permissionModes().at(i).id) != ids.at(i)) {
+        if (agentchoices::permissionModes().at(i).id != ids.at(i)) {
             return 2;
         }
     }
@@ -136,8 +177,8 @@ extern "C" std::int32_t bs_widget_test_agent_choices_are_one_list() {
     // not give one. The day the host protocol lands, this is the assertion that
     // says the labels have to go back to their plain names.
     for (const agentchoices::Choice& choice : agentchoices::permissionModes()) {
-        const QString id = QString::fromUtf8(choice.id);
-        const QString label = QString::fromUtf8(choice.label);
+        const QString& id = choice.id;
+        const QString& label = choice.label;
         if ((id == QLatin1String("manual") || id == QLatin1String("acceptEdits")) &&
             !label.contains(QLatin1String("block"))) {
             return 11;
@@ -147,7 +188,7 @@ extern "C" std::int32_t bs_widget_test_agent_choices_are_one_list() {
         return 12;
     }
     for (const agentchoices::Choice& choice : agentchoices::permissionModes()) {
-        const QString id = QString::fromUtf8(choice.id);
+        const QString& id = choice.id;
         // `dontAsk` denies in silence, which is the failure this batch exists
         // to remove rather than to offer as a setting, and `default` is the
         // spelling the IDE stopped using.
@@ -160,9 +201,12 @@ extern "C" std::int32_t bs_widget_test_agent_choices_are_one_list() {
         return 4;
     }
 
+    // "Default" plus the built-in fallback: the newest model of each family
+    // as of this writing, which is also what `newest_per_family`'s own fixture
+    // test expects the daemon to answer with today.
     QComboBox models;
     agentchoices::fillModelCombo(&models, QStringLiteral("claude-sonnet-5"));
-    if (models.count() != 4 || models.currentData().toString() != QLatin1String("claude-sonnet-5")) {
+    if (models.count() != 5 || models.currentData().toString() != QLatin1String("claude-sonnet-5")) {
         return 5;
     }
     if (!models.isEditable()) {
@@ -187,7 +231,43 @@ extern "C" std::int32_t bs_widget_test_agent_choices_are_one_list() {
     if (stale.currentData().toString() != QLatin1String("manual")) {
         return 9;
     }
+
+    // A fetch landing replaces the list; a combo already showing a choice that
+    // is still on the new list keeps it selected across the refill.
+    agentchoices::setModels({ { QStringLiteral("Sonnet 5"), QStringLiteral("claude-sonnet-5") },
+                               { QStringLiteral("Next"), QStringLiteral("claude-next-1") } });
+    if (agentchoices::models().size() != 3) {
+        // "Default" plus the two just given.
+        agentchoices::resetModelsForTest();
+        return 13;
+    }
+    agentchoices::fillModelCombo(&models, agentchoices::modelComboSelection(&models));
+    if (models.count() != 3 ||
+        models.currentData().toString() != QLatin1String("claude-sonnet-5")) {
+        agentchoices::resetModelsForTest();
+        return 14;
+    }
+
+    // An id the new list dropped -- here, one that was never on any list --
+    // is kept as typed text rather than snapping to "Default".
+    agentchoices::fillModelCombo(&typed, agentchoices::modelComboSelection(&typed));
+    if (typed.currentText() != QLatin1String("claude-something-new")) {
+        agentchoices::resetModelsForTest();
+        return 15;
+    }
+
+    // Cleanup: every check after this one in the same process must see the
+    // built-in fallback, not this check's simulated fetch.
+    agentchoices::resetModelsForTest();
+    if (agentchoices::models().size() != 5) {
+        return 16;
+    }
     return 0;
+}
+
+void agentchoices::resetModelsForTest() {
+    fetchedModels().clear();
+    hasFetchedModels() = false;
 }
 
 #endif // BS_WIDGET_TESTS

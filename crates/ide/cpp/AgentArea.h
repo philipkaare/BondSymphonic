@@ -117,6 +117,12 @@ public:
     /// showing lines the user turned off.
     void setShowMeta(bool show);
 
+    /// `system.list_models` answered: every transcript pane's model combo is
+    /// re-filled from the new list, keeping its current choice. Nothing to
+    /// remember for panes built afterwards -- a pane reads `agentchoices::models()`
+    /// fresh when it is built, so it is already born with the new list.
+    void refillModels();
+
     /// Closes the workspace's PTY or transcript and drops its pane.
     void removeWorkspace(const QString& workspaceId);
 
