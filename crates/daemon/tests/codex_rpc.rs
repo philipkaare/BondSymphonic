@@ -66,3 +66,42 @@ async fn unanswered_call_is_bounded() {
     assert!(error.message.contains("timed out"));
     rpc.close().await;
 }
+
+#[tokio::test]
+async fn parallel_responses_route_by_id_and_auth_errors_are_backend_specific() {
+    let (client, server) = tokio::io::duplex(8192);
+    let (reader, writer) = tokio::io::split(client);
+    let (rpc, _events) = CodexRpc::connect(
+        Box::pin(reader),
+        Box::pin(writer),
+        vec!["key-sentinel".into()],
+        Duration::from_secs(2),
+    );
+    let peer = tokio::spawn(async move {
+        let (r, mut w) = tokio::io::split(server);
+        let mut lines = BufReader::new(r).lines();
+        let first: serde_json::Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let second: serde_json::Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        w.write_all(
+            format!(
+                "{}\n",
+                json!({"id":second["id"],"error":{"message":"401 Unauthorized key-sentinel"}})
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        w.write_all(format!("{}\n", json!({"id":first["id"],"result":"first"})).as_bytes())
+            .await
+            .unwrap();
+    });
+    let (first, second) = tokio::join!(rpc.call("first", json!({})), rpc.call("second", json!({})));
+    assert_eq!(first.unwrap(), "first");
+    let failure = second.unwrap_err();
+    assert_eq!(failure.code, bondsymphonic_proto::ErrorCode::Unauthorized);
+    assert_eq!(failure.data.unwrap()["reason"], "codex_auth_failed");
+    assert!(!failure.message.contains("key-sentinel"));
+    peer.await.unwrap();
+}

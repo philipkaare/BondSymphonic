@@ -139,3 +139,24 @@ async fn shutdown_kills_a_peer_that_ignores_closed_stdin() {
         .unwrap();
     assert_eq!(entry.state().0, AgentState::Exited);
 }
+
+#[tokio::test]
+async fn eof_with_approval_outstanding_announces_exit_only_once() {
+    let (_dir, mut adapter, entry, _) = fixture("approvaldie", None).await;
+    adapter.start().await.unwrap();
+    let _ = adapter.send("first".into()).await;
+    wait_state(&entry, AgentState::Exited).await;
+    let epoch = entry.epoch();
+    assert!(adapter
+        .permission_reply(
+            "codex:\"server-approval\"".into(),
+            PermissionDecision::Deny,
+            None,
+            None
+        )
+        .await
+        .is_err());
+    adapter.stop().await.unwrap();
+    adapter.stop().await.unwrap();
+    assert_eq!(entry.epoch(), epoch);
+}

@@ -37,9 +37,11 @@ for line in sys.stdin:
         turn += 1
         emit({"id": m["id"], "result": {"turn": {"id": str(turn)}}})
         event("turn/started", {"threadId": thread, "turn": {"id": str(turn)}})
-        if mode == "approval":
+        if mode in ("approval", "approvaldie"):
             emit({"id": "server-approval", "method": "item/commandExecution/requestApproval",
                   "params": {"threadId": thread, "turnId": str(turn), "itemId": "cmd", "command": "echo test"}})
+            if mode == "approvaldie":
+                sys.exit(2)
     elif method == "turn/steer":
         assert p["expectedTurnId"] == str(turn)
         emit({"id": m["id"], "result": {"turnId": str(turn)}})

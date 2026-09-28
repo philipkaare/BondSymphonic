@@ -34,7 +34,17 @@ impl Calls {
 }
 
 pub fn error(message: impl Into<String>) -> RpcError {
-    RpcError::new(ErrorCode::AgentError, message)
+    let message = message.into();
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("unauthorized")
+        || lower.contains("authentication required")
+        || lower.contains("invalid api key")
+    {
+        RpcError::new(ErrorCode::Unauthorized, message)
+            .with_data(json!({"reason":"codex_auth_failed", "adapter":"codex"}))
+    } else {
+        RpcError::new(ErrorCode::AgentError, message)
+    }
 }
 
 pub struct CodexRpc {
