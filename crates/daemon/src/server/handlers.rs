@@ -39,6 +39,13 @@ impl Handler for WorkspaceHandler {
                 )
                 .await,
             }),
+            // The daemon fetches on the agent's own credentials (or the
+            // caller's `api_key`), so this lives beside the other workspace
+            // and agent methods rather than in `SystemHandler`, which has no
+            // `Daemon` to read them from.
+            Request::SystemListModels(p) => {
+                ok(crate::models::list_models(d, p.api_key.as_deref()).await?)
+            }
             Request::RepoInspect(p) => {
                 ok(crate::git::repo::inspect(&d.git, std::path::Path::new(&p.path)).await?)
             }

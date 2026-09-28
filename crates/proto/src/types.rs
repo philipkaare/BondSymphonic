@@ -418,6 +418,16 @@ pub enum AgentMessageBody {
     },
 }
 
+/// One model as the Anthropic Models API describes it, trimmed to what the
+/// model dropdown needs: `system.list_models`' `parse_models` reads these
+/// three fields out of a much larger object and ignores the rest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub display_name: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogLevel {

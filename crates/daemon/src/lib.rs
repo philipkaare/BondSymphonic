@@ -4,6 +4,7 @@ pub mod fs;
 pub mod fs_watch;
 pub mod git;
 pub mod ids;
+pub mod models;
 pub mod net;
 pub mod prereqs;
 pub mod pty;

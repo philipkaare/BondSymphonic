@@ -219,6 +219,10 @@ pub struct Daemon {
     pub proxies: crate::net::proxy::ProxyRegistry,
     /// The running runs, which is where `WorkspaceInfo.runs` comes from.
     pub runs: crate::runs::manager::RunManager,
+    /// `system.list_models`'s in-memory cache of the Models API's last
+    /// successful answer, one entry per credential kind. See
+    /// [`crate::models::ModelsCache`].
+    pub models: crate::models::ModelsCache,
     /// The handle the setup terminals (`system.setup_pty`) run under: not a
     /// sandbox at all, but the daemon user's own home and environment. See
     /// [`Daemon::host`]. Built on first use, because most daemons never open a
@@ -249,6 +253,7 @@ impl Daemon {
             agents,
             proxies: crate::net::proxy::ProxyRegistry::default(),
             runs: crate::runs::manager::RunManager::new(events),
+            models: crate::models::ModelsCache::new(),
             host: tokio::sync::OnceCell::new(),
         }))
     }

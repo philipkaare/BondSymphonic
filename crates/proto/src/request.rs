@@ -120,6 +120,15 @@ params!(RunStartParams {
     port: Option<u16>
 });
 params!(RunIdParams { run_id: RunId });
+// The one caller-supplied input to `system.list_models`: an API key to fetch
+// with instead of whatever credential the daemon would otherwise choose.
+// `#[serde(default)]` so a request missing the field -- there is no client
+// built before this method existed, but every other params struct in this
+// file defaults its optional fields the same way -- still deserialises.
+params!(ListModelsParams {
+    #[serde(default)]
+    api_key: Option<String>
+});
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
@@ -195,6 +204,13 @@ pub enum Request {
     RunStop(RunIdParams),
     #[serde(rename = "run.list")]
     RunList(WorkspaceIdParams),
+    /// The newest model per family, for the model dropdown: the daemon fetches
+    /// `GET /v1/models` with whichever of the caller's Claude credentials it
+    /// has, newest first as Anthropic returns them. Additive -- an old daemon
+    /// answers it with the same "not implemented" every unknown method gets --
+    /// so it does not move [`crate::PROTOCOL_VERSION`].
+    #[serde(rename = "system.list_models")]
+    SystemListModels(ListModelsParams),
 }
 
 impl Request {
@@ -235,6 +251,7 @@ impl Request {
             RunStart(_) => "run.start",
             RunStop(_) => "run.stop",
             RunList(_) => "run.list",
+            SystemListModels(_) => "system.list_models",
         }
     }
 
@@ -382,6 +399,7 @@ impl Request {
             RunList(WorkspaceIdParams {
                 workspace_id: ws.clone(),
             }),
+            SystemListModels(ListModelsParams { api_key: None }),
         ]
     }
 }
@@ -519,6 +537,13 @@ pub struct RunStartResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunListResult {
     pub runs: Vec<RunInfo>,
+}
+/// What `system.list_models` answers: every model the Models API reported,
+/// exactly in the order it reported them -- newest first, per family, which is
+/// the order the model dropdown wants and no daemon-side sort is needed to get.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ListModelsResult {
+    pub models: Vec<ModelInfo>,
 }
 /// For methods with no meaningful result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
