@@ -8,13 +8,35 @@ pub struct Capabilities {
     pub sandbox_backend: String, // "linux_bwrap" | "noop"
     pub git_protect: bool,
     pub adapters: Vec<AgentAdapterKind>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<BackendDescriptor>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentAdapterKind {
     Claude,
+    Codex,
     Terminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackendChoice {
+    pub id: String,
+    pub label: String,
+}
+
+/// Known backends include uninstalled ones, so Settings can offer installation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackendDescriptor {
+    pub id: AgentAdapterKind,
+    pub label: String,
+    pub permission_modes: Vec<BackendChoice>,
+    pub default_permission_mode: String,
+    pub permission_note: String,
+    pub credential_label: String,
+    pub prerequisite_names: Vec<String>,
+    pub setup_actions: Vec<SetupAction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

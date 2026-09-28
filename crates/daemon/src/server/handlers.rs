@@ -23,7 +23,13 @@ impl Handler for WorkspaceHandler {
     async fn handle(&self, req: Request, ctx: &ConnCtx) -> Result<Value, RpcError> {
         // `hello` carries the token, so `SystemHandler` is the one that authenticates.
         if matches!(req, Request::Hello(_)) {
-            return self.system.handle(req, ctx).await;
+            let value = self.system.handle(req, ctx).await?;
+            let mut hello: HelloResult =
+                serde_json::from_value(value).map_err(|e| RpcError::internal(e.to_string()))?;
+            let backends = crate::agents::backend::known_backends();
+            hello.capabilities.adapters = crate::agents::backend::runnable_adapters(&backends);
+            hello.capabilities.backends = backends.iter().map(|b| b.descriptor()).collect();
+            return ok(hello);
         }
         if !ctx.is_authenticated() {
             return Err(RpcError::unauthorized());
@@ -44,7 +50,10 @@ impl Handler for WorkspaceHandler {
             // and agent methods rather than in `SystemHandler`, which has no
             // `Daemon` to read them from.
             Request::SystemListModels(p) => {
-                ok(crate::models::list_models(d, p.api_key.as_deref()).await?)
+                let backend = crate::agents::backend::backend_for(
+                    p.adapter.unwrap_or(AgentAdapterKind::Claude),
+                )?;
+                ok(backend.list_models(d, p.api_key.as_deref()).await?)
             }
             Request::RepoInspect(p) => {
                 ok(crate::git::repo::inspect(&d.git, std::path::Path::new(&p.path)).await?)

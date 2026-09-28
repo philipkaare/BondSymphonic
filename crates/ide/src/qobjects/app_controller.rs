@@ -2074,6 +2074,7 @@ async fn run_prereq_check(client: &DaemonClient, qt: &QtHandle) -> bool {
 /// tries again regardless.
 async fn fetch_models(client: DaemonClient, qt: QtHandle) {
     let params = ListModelsParams {
+        adapter: None,
         api_key: api_key_for_start(),
     };
     let models = match client

@@ -23,6 +23,7 @@ impl Default for ServerConfig {
         Self {
             bind_port: 0,
             capabilities: Capabilities {
+                backends: vec![],
                 sandbox_backend: "noop".into(),
                 git_protect: false,
                 // Both, as `main.rs` advertises them: this default is what the

@@ -47,6 +47,7 @@ async fn fake_daemon(
                     &HelloResult {
                         daemon_version: "9.9.9".into(),
                         capabilities: Capabilities {
+                            backends: vec![],
                             sandbox_backend: "noop".into(),
                             git_protect: false,
                             adapters: vec![],

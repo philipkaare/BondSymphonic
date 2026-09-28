@@ -127,6 +127,8 @@ params!(RunIdParams { run_id: RunId });
 // file defaults its optional fields the same way -- still deserialises.
 params!(ListModelsParams {
     #[serde(default)]
+    adapter: Option<AgentAdapterKind>,
+    #[serde(default)]
     api_key: Option<String>
 });
 
@@ -399,7 +401,10 @@ impl Request {
             RunList(WorkspaceIdParams {
                 workspace_id: ws.clone(),
             }),
-            SystemListModels(ListModelsParams { api_key: None }),
+            SystemListModels(ListModelsParams {
+                adapter: None,
+                api_key: None,
+            }),
         ]
     }
 }

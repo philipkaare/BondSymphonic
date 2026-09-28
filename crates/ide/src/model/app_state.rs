@@ -406,6 +406,7 @@ pub fn permission_attention(name: &str) -> String {
 pub fn adapter_name(kind: AgentAdapterKind) -> &'static str {
     match kind {
         AgentAdapterKind::Claude => "claude",
+        AgentAdapterKind::Codex => "codex",
         AgentAdapterKind::Terminal => "terminal",
     }
 }
@@ -415,6 +416,7 @@ pub fn adapter_name(kind: AgentAdapterKind) -> &'static str {
 pub fn adapter_from_name(name: &str) -> AgentAdapterKind {
     match name.trim().to_ascii_lowercase().as_str() {
         "terminal" => AgentAdapterKind::Terminal,
+        "codex" => AgentAdapterKind::Codex,
         _ => AgentAdapterKind::Claude,
     }
 }

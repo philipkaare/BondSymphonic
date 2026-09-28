@@ -163,6 +163,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                         &HelloResult {
                             daemon_version: "0.0.0-fake".into(),
                             capabilities: Capabilities {
+                                backends: vec![],
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
                                 adapters: vec![
@@ -619,6 +620,7 @@ mod task_10 {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![
@@ -890,6 +892,7 @@ mod task_10_agent_state_race {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![

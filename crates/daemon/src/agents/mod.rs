@@ -5,7 +5,10 @@
 //! The [`AgentManager`] that owns processes lives alongside this; what is here
 //! is the part that has no process in it, so it can be tested on its own.
 
+pub mod adapter;
+pub mod backend;
 pub mod claude;
+pub mod claude_backend;
 pub mod claude_stream;
 pub mod credentials;
 pub mod persist;
@@ -17,8 +20,8 @@ use crate::ids::new_id;
 use crate::server::broadcast::EventBus;
 use crate::workspace::lifecycle::log_phase;
 use crate::workspace::now_rfc3339;
+use adapter::AgentAdapter;
 use bondsymphonic_proto::*;
-use claude::{AgentAdapter, ClaudeAdapter};
 use parking_lot::Mutex;
 use persist::{AgentRecord, AgentRecords};
 use std::collections::HashMap;
@@ -804,9 +807,7 @@ impl AgentManager {
         d: &Daemon,
         p: AgentStartParams,
     ) -> Result<AgentStartResult, RpcError> {
-        if p.adapter == AgentAdapterKind::Terminal {
-            return Err(RpcError::invalid_params("terminal agents use pty.open"));
-        }
+        let backend = backend::backend_for(p.adapter)?;
         // Each phase up to the spawn is timed and said at `info`, the way the
         // startup restore's are (`lifecycle::log_phase`): an `agent.start`
         // sent while the daemon was still restoring once went unanswered for
@@ -854,53 +855,8 @@ impl AgentManager {
             .with_data(serde_json::json!({ "reason": REASON_AGENT_STARTING }))
         })?;
         log_phase(&ws.id, "agent.start", "gate", phase);
-        // The backend decides how the CLI is named: bound into the sandbox at a
-        // fixed path under bwrap, and at its host path where there are no
-        // mounts. Resolved before anything is spawned, so a missing install is
-        // a `PrereqMissing` naming the path rather than an exec failure.
-        let argv = claude::claude_argv(&p.options, d.backend.name())?;
-        // And before anything is written: a CLI that cannot even say its
-        // version is one this workspace should not be prepared for.
-        let phase = Instant::now();
-        claude::probe_claude(&self.probed, d.backend.name()).await?;
-        log_phase(&ws.id, "agent.start", "probe_claude", phase);
-
-        // Again at start, not only at creation: the user may have logged in
-        // since this workspace was made, and a workspace that was created
-        // logged out would otherwise stay that way forever.
-        let phase = Instant::now();
+        let prepared = backend.prepare(d, &ws, &p.options).await?;
         let home = d.dirs.home(&ws.id);
-        // And before the seeding, from every workspace: one whose agent is
-        // still running may have refreshed the tokens, and the copy it holds
-        // is then the only working one -- seeding the host's stale copy here
-        // would start this agent with a refresh token that is already dead.
-        let homes = d.dirs.homes.clone();
-        off_the_runtime("pulling a refreshed login back", move || {
-            credentials::write_back_any_refreshed_login(&homes);
-        })
-        .await;
-        let seeded = credentials::seed_claude_files(&home, &ws.worktree_path);
-        if !seeded.is_empty() {
-            info!(ws = %ws.id, files = ?seeded, "seeded claude credentials");
-        }
-        // After the seeding, because it overwrites what the seeding just put
-        // there: a repository that pins its own settings is pinning the tools
-        // the agent may use, and the daemon user's copy must not win.
-        claude::apply_repo_settings(&ws.worktree_path, &home)?;
-        log_phase(&ws.id, "agent.start", "seed_home", phase);
-
-        // The key or token is given to this one command, never written into
-        // the sandbox spec: the spec's environment reaches every process in
-        // the workspace, including terminals the user opens. A key the IDE
-        // sent is an explicit choice and wins; otherwise the long-lived token,
-        // which never needs refreshing -- see `token.rs` for why that matters.
-        let root = d.dirs.root.clone();
-        let token = tokio::task::spawn_blocking(move || {
-            crate::agents::token::read(&crate::agents::token::token_path(&root))
-        })
-        .await
-        .unwrap_or(None);
-        let env = agent_auth_env(p.options.api_key.as_deref(), token);
 
         let id = self.mint_id();
         let entry = Arc::new(AgentEntry::new(ws.id.clone(), p.adapter));
@@ -911,9 +867,13 @@ impl AgentManager {
             ws.id.clone(),
             entry.clone(),
         )
-        .with_records(self.records.clone())
-        .with_home(home.clone());
-        let mut adapter = ClaudeAdapter::new(sink, handle, argv, env, ws.worktree_path.clone());
+        .with_records(self.records.clone());
+        let sink = if p.adapter == AgentAdapterKind::Claude {
+            sink.with_home(home)
+        } else {
+            sink
+        };
+        let mut adapter = backend.adapter(sink, handle, prepared);
         // The record goes down *before* the process is spawned, and this
         // ordering is the whole of what makes the session id survivable.
         //
@@ -964,7 +924,7 @@ impl AgentManager {
                 entry,
                 ordinal: self.next_ordinal.fetch_add(1, Ordering::SeqCst),
                 started_with,
-                adapter: Some(tokio::sync::Mutex::new(Box::new(adapter))),
+                adapter: Some(tokio::sync::Mutex::new(adapter)),
             }),
         );
         log_phase(&ws.id, "agent.start", "total", started);

@@ -1,6 +1,27 @@
 use bondsymphonic_proto::*;
 
 #[test]
+fn backend_selection_is_additive_and_old_replies_still_decode() {
+    let params: ListModelsParams = serde_json::from_str("{}").unwrap();
+    assert_eq!(params.adapter, None);
+    let capabilities: Capabilities = serde_json::from_str(
+        r#"{"sandbox_backend":"noop","git_protect":false,"adapters":["claude","terminal"]}"#,
+    )
+    .unwrap();
+    assert!(capabilities.backends.is_empty());
+    let request: Request =
+        serde_json::from_str(r#"{"method":"system.list_models","params":{"adapter":"codex"}}"#)
+            .unwrap();
+    assert!(matches!(
+        request,
+        Request::SystemListModels(ListModelsParams {
+            adapter: Some(AgentAdapterKind::Codex),
+            ..
+        })
+    ));
+}
+
+#[test]
 fn ids_serialize_transparently() {
     let id = WorkspaceId("ws_0a1b2c3d".into());
     let json = serde_json::to_string(&id).unwrap();

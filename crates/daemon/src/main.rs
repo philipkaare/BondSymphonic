@@ -6,7 +6,7 @@ use bondsymphonic_daemon::server::dispatch::SystemHandler;
 use bondsymphonic_daemon::server::handlers::WorkspaceHandler;
 use bondsymphonic_daemon::server::{Server, ServerConfig};
 use bondsymphonic_daemon::workspace::DataDirs;
-use bondsymphonic_proto::{AgentAdapterKind, Capabilities};
+use bondsymphonic_proto::Capabilities;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -138,9 +138,12 @@ async fn serve(args: Args) -> Result<()> {
     // `backend_for` downgrades an unsupported name to noop, so the running
     // backend's own name is what gets advertised.
     let capabilities = Capabilities {
+        backends: bondsymphonic_daemon::agents::backend::descriptors(),
         sandbox_backend: backend.name().into(),
         git_protect: backend.name() == "linux_bwrap",
-        adapters: vec![AgentAdapterKind::Claude, AgentAdapterKind::Terminal],
+        adapters: bondsymphonic_daemon::agents::backend::runnable_adapters(
+            &bondsymphonic_daemon::agents::backend::known_backends(),
+        ),
     };
 
     let server = Server::bind(ServerConfig {

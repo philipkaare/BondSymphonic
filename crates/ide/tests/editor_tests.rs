@@ -649,6 +649,7 @@ mod review_fixes_task_7 {
                                 &HelloResult {
                                     daemon_version: "9.9.9".into(),
                                     capabilities: Capabilities {
+                                        backends: vec![],
                                         sandbox_backend: "noop".into(),
                                         git_protect: false,
                                         adapters: vec![],
