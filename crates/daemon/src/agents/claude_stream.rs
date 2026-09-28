@@ -299,7 +299,7 @@ pub fn control_response_line(
     message: Option<String>,
 ) -> String {
     let inner = match decision {
-        PermissionDecision::Allow => {
+        PermissionDecision::Allow | PermissionDecision::AllowForSession => {
             let mut allow = json!({ "behavior": "allow" });
             if let (Some(obj), Some(input)) = (allow.as_object_mut(), updated_input) {
                 obj.insert("updatedInput".to_owned(), input);

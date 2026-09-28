@@ -28,6 +28,46 @@ fn delta(seq: u64, text: &str) -> AgentMessage {
     )
 }
 
+#[test]
+fn codex_completion_preserves_session_without_fabricating_a_cost_row() {
+    let mut t = Transcript::default();
+    t.apply(&delta(1, "hello"));
+    t.apply(&msg(
+        2,
+        AgentMessageBody::AssistantText {
+            text: "hello".into(),
+        },
+    ));
+    t.apply(&msg(
+        3,
+        AgentMessageBody::System {
+            subtype: "codex_turn".into(),
+            data: json!({"status":"completed","cost_available":false}),
+        },
+    ));
+    t.apply(&msg(
+        4,
+        AgentMessageBody::Result {
+            cost_usd: 0.0,
+            duration_ms: 12,
+            num_turns: 1,
+            session_id: "thread".into(),
+        },
+    ));
+    assert_eq!(t.session_id.as_deref(), Some("thread"));
+    assert_eq!(
+        t.items
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::Assistant { .. }))
+            .count(),
+        1
+    );
+    assert!(!t
+        .items
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::Result { .. })));
+}
+
 /// Partial messages arrive as deltas and are then repeated in full. One
 /// assistant bubble must come out of that, not three.
 #[test]

@@ -227,6 +227,7 @@ pub struct Transcript {
     /// The daemon's explanation of the state, or empty.
     pub state_detail: String,
     pub cost_usd: f64,
+    pub cost_available: bool,
     pub turns: u32,
     pub session_id: Option<String>,
     pub pending: Option<PendingPermission>,
@@ -245,6 +246,7 @@ impl Default for Transcript {
             state: TabAgentState::Unknown,
             state_detail: String::new(),
             cost_usd: 0.0,
+            cost_available: true,
             turns: 0,
             session_id: None,
             pending: None,
@@ -364,10 +366,21 @@ impl Transcript {
                 self.cost_usd += cost_usd;
                 self.turns += num_turns;
                 self.session_id = Some(session_id.clone());
+                if !self.cost_available {
+                    return self.push(TranscriptItem::System {
+                        text: format!("turn completed in {duration_ms} ms"),
+                    });
+                }
                 self.push(TranscriptItem::Result {
                     cost_usd: *cost_usd,
                     duration_ms: *duration_ms,
                     num_turns: *num_turns,
+                })
+            }
+            AgentMessageBody::System { subtype, data } if subtype == "codex_turn" => {
+                self.cost_available = false;
+                self.push(TranscriptItem::System {
+                    text: format!("Codex turn: {}", truncate(&compact(data), SYSTEM_DATA_MAX)),
                 })
             }
             AgentMessageBody::System { subtype, data } if subtype == "init" => {

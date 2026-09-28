@@ -1034,7 +1034,9 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journals) {
                     // The answer, and the rest of the turn it unblocks.
                     Request::AgentPermissionReply(p) => {
                         let decision = match p.decision {
-                            PermissionDecision::Allow => "allow",
+                            PermissionDecision::Allow | PermissionDecision::AllowForSession => {
+                                "allow"
+                            }
                             PermissionDecision::Deny => "deny",
                         };
                         Journals::push(&recorded_replies, format!("{}:{decision}", p.request_id));
