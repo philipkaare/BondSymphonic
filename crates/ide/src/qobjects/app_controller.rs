@@ -2072,6 +2072,17 @@ struct PrereqAnswer {
 /// unparseable string is not fatal: the daemon's defaults are a working agent,
 /// which is a better answer than refusing to start one.
 fn start_options(options_json: &str) -> AgentStartOptions {
+    start_options_with_default(options_json, &Settings::load().default_permission_mode)
+}
+
+/// [`start_options`] with the user's default permission mode passed in.
+///
+/// A start that names no mode gets the default rather than the CLI's own,
+/// which asks before every tool. A tab restored onto an agent the daemon
+/// remembers as started without one -- anything started before the IDE sent a
+/// mode, and so every restart and automatic resume of it since -- used to go
+/// on asking for approvals whatever the user had chosen in Settings.
+fn start_options_with_default(options_json: &str, default_mode: &str) -> AgentStartOptions {
     // Written out rather than parsed from `{}`: `AgentStartOptions` derives no
     // `Default`, and a literal turns a future proto change into a compile
     // error here instead of a panic in the running IDE.
@@ -2094,6 +2105,9 @@ fn start_options(options_json: &str) -> AgentStartOptions {
     // of this field. C++ has no business setting it, and a value that arrived
     // in `options_json` must be dropped rather than passed through.
     options.api_key = api_key_for_start();
+    if options.permission_mode.as_deref().is_none_or(str::is_empty) && !default_mode.is_empty() {
+        options.permission_mode = Some(default_mode.to_owned());
+    }
     options
 }
 
@@ -3773,6 +3787,32 @@ const UNKNOWN_SUMMARY: &str = r#"{"dirty":false,"changed_files":-1}"#;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tab restored onto an agent that was started without a mode carries
+    /// none, and before this every restart of it asked for approvals whatever
+    /// the user's default said. A mode that was chosen is left alone.
+    #[test]
+    fn a_start_with_no_permission_mode_gets_the_users_default() {
+        let unset = start_options_with_default(r#"{"resume_session":"s1"}"#, "bypassPermissions");
+        assert_eq!(unset.permission_mode.as_deref(), Some("bypassPermissions"));
+        assert_eq!(unset.resume_session.as_deref(), Some("s1"));
+
+        for empty in ["", "{}", "not json"] {
+            let options = start_options_with_default(empty, "acceptEdits");
+            assert_eq!(
+                options.permission_mode.as_deref(),
+                Some("acceptEdits"),
+                "{empty:?}"
+            );
+        }
+
+        let chosen =
+            start_options_with_default(r#"{"permission_mode":"plan"}"#, "bypassPermissions");
+        assert_eq!(chosen.permission_mode.as_deref(), Some("plan"));
+
+        let blank = start_options_with_default(r#"{"permission_mode":""}"#, "bypassPermissions");
+        assert_eq!(blank.permission_mode.as_deref(), Some("bypassPermissions"));
+    }
 
     /// The reconnect loop's whole decision about a dead daemon is the exit
     /// code, so that is what this pins. Exit 2 is the daemon's "another daemon
