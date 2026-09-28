@@ -2,7 +2,7 @@
 //!
 //! The CLI prints the token once, in its own full-screen UI, and says it will
 //! never show it again. A host setup terminal's output passes through a
-//! [`TokenCapture`] on its way to the IDE (see `pty::OutputTap`), so the
+//! [`TokenCapture`] on its way to the IDE (see [`crate::pty::OutputTap`]), so the
 //! daemon can store the token with [`super::token::write`] without the user
 //! having to copy and paste a secret anywhere.
 //!
@@ -21,6 +21,7 @@
 //!
 //! Nothing here ever logs the token or any part of it.
 
+use crate::pty::OutputTap;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -227,17 +228,20 @@ impl TokenScanner {
     }
 }
 
-/// A [`TokenScanner`] tied to the file the token belongs in: what the
-/// `claude setup-token` terminal's output tap holds.
+/// A [`TokenScanner`] tied to the file the token belongs in: the
+/// `claude setup-token` terminal's [`OutputTap`](crate::pty::OutputTap).
 ///
-/// Dropping it -- which the pump does when the terminal ends -- logs once if no
-/// token was ever seen, so a login that finished without the daemon storing
-/// anything (the user closed the terminal early, or the CLI changed how it
-/// prints the token) is visible in the log rather than only as agents that
-/// later fail to authenticate.
+/// Dropping it -- which [`finish`](OutputTap::finish) does, ahead of the
+/// terminal's exit -- logs once if no token was ever seen, so a login that
+/// finished without the daemon storing anything (the user closed the terminal
+/// early, or the CLI changed how it prints the token) is visible in the log
+/// rather than only as agents that later fail to authenticate.
 pub struct TokenCapture {
     scanner: TokenScanner,
     path: PathBuf,
+    /// The store started by [`feed`](OutputTap::feed), until `finish` has
+    /// waited for it. There is at most one: the scanner returns a token once.
+    pending: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl TokenCapture {
@@ -245,27 +249,49 @@ impl TokenCapture {
         Self {
             scanner: TokenScanner::new(),
             path,
+            pending: None,
         }
     }
+}
 
-    /// Scans `bytes`, and when they complete the token, stores it at the
-    /// capture's path.
+impl OutputTap for TokenCapture {
+    /// Scans `bytes`, and when they complete the token, starts storing it at
+    /// the capture's path.
     ///
     /// The store happens on the blocking pool: the caller is the terminal's
     /// pump task on a tokio worker, and [`super::token::write`] ends in an
     /// `fsync`, which on a slow disk would stall every other task on that
-    /// worker. The handle is returned so a test can wait for the write; the
-    /// pump drops it, and the write finishes on its own. Must be called from
-    /// within a tokio runtime.
-    pub fn feed(&mut self, bytes: &[u8]) -> Option<tokio::task::JoinHandle<()>> {
-        let token = self.scanner.push(bytes)?;
+    /// worker. [`finish`](OutputTap::finish) is what waits for it. Must be
+    /// called from within a tokio runtime.
+    fn feed(&mut self, bytes: &[u8]) {
+        let Some(token) = self.scanner.push(bytes) else {
+            return;
+        };
         let path = self.path.clone();
-        Some(tokio::task::spawn_blocking(
-            move || match super::token::write(&path, &token) {
+        self.pending = Some(tokio::task::spawn_blocking(move || {
+            match super::token::write(&path, &token) {
                 Ok(()) => info!(path = %path.display(), "long-lived claude token stored"),
                 Err(e) => warn!(path = %path.display(), "long-lived claude token not stored: {e}"),
-            },
-        ))
+            }
+        }));
+    }
+
+    /// Waits for the store `feed` started, if any. `claude setup-token` exits
+    /// straight after printing the token, so without this the IDE's re-check
+    /// on `pty.exit` could run before the file exists and still report the
+    /// login as the plain one. The pump bounds the wait.
+    fn finish(mut self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
+        let pending = self.pending.take();
+        Box::pin(async move {
+            if let Some(write) = pending {
+                // A panic in the write is the only error, and it has nothing
+                // to add to what the write itself logs.
+                let _ = write.await;
+            }
+            // `self` drops here, after the write: the missed-token warning in
+            // `Drop` lands ahead of the exit too.
+            drop(self);
+        })
     }
 }
 
@@ -399,22 +425,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn capture_stores_the_token_once() {
+    #[tokio::test]
+    async fn capture_stores_the_token_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = super::super::token::token_path(dir.path());
         let mut c = TokenCapture::new(path.clone());
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            for chunk in FIXTURE.chunks(7) {
-                if let Some(write) = c.feed(chunk) {
-                    write.await.unwrap();
-                }
-            }
-            assert!(c.feed(FIXTURE).is_none());
-        });
+        for chunk in FIXTURE.chunks(7) {
+            c.feed(chunk);
+        }
+        // A redraw starts no second write.
+        c.feed(FIXTURE);
+        Box::new(c).finish().await;
+        assert_eq!(super::super::token::read(&path).as_deref(), Some(EXPECTED));
+    }
+
+    #[tokio::test]
+    async fn the_token_is_on_disk_by_the_time_finish_resolves() {
+        // Fed in one go and finished at once, as when `claude setup-token`
+        // prints the token and exits in the same breath: nothing between the
+        // two gives the blocking write time to land on its own.
+        let dir = tempfile::tempdir().unwrap();
+        let path = super::super::token::token_path(dir.path());
+        let mut c = TokenCapture::new(path.clone());
+        c.feed(FIXTURE);
+        Box::new(c).finish().await;
         assert_eq!(super::super::token::read(&path).as_deref(), Some(EXPECTED));
     }
 }

@@ -70,12 +70,28 @@ const SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
 /// Terminal output is published in chunks of at most this many bytes.
 const CHUNK: usize = 4096;
 
+/// How long the pump waits for an [`OutputTap`] to finish before it announces
+/// the exit anyway. The one tap's unfinished work is a single small file write,
+/// so this is only ever reached on a disk that has stopped answering, and a
+/// terminal whose `pty.exit` never comes would be worse than a late token.
+const TAP_FINISH_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Something that sees a terminal's output as the pump reads it, before it is
-/// published: called on the pump task once per read, in order, and dropped
-/// when the terminal ends -- so it must not block. The one user is the
-/// `claude setup-token` terminal, whose output carries the token the daemon
-/// stores (see [`crate::agents::token_scan`]).
-pub type OutputTap = Box<dyn FnMut(&[u8]) + Send>;
+/// published. The one user is the `claude setup-token` terminal, whose output
+/// carries the token the daemon stores (see [`crate::agents::token_scan`]).
+pub trait OutputTap: Send {
+    /// Called on the pump task once per read, in order, so it must not block.
+    fn feed(&mut self, bytes: &[u8]);
+
+    /// Called once when the terminal ends, and awaited -- within
+    /// [`TAP_FINISH_GRACE`] -- before `pty.exit` is published.
+    ///
+    /// That ordering is the point. `claude setup-token` exits the moment it has
+    /// printed the token, and a client re-checks its prerequisites as soon as
+    /// it sees the exit; if the token were still being written then, the check
+    /// would find no token and report the login as if nothing had happened.
+    fn finish(self: Box<Self>) -> futures::future::BoxFuture<'static, ()>;
+}
 
 /// One live terminal. The reader half lives in the pump task instead, so
 /// nothing here is held across a read.
@@ -205,7 +221,7 @@ impl PtyManager {
         d: &Daemon,
         argv: Vec<String>,
         size: PtySize,
-        tap: Option<OutputTap>,
+        tap: Option<Box<dyn OutputTap>>,
     ) -> Result<PtyOpenResult, RpcError> {
         let host = d.host().await?;
         let child = host
@@ -233,7 +249,7 @@ impl PtyManager {
         mut child: SandboxChild,
         workspace_id: Option<WorkspaceId>,
         backend: &'static str,
-        mut tap: Option<OutputTap>,
+        mut tap: Option<Box<dyn OutputTap>>,
     ) -> Result<PtyOpenResult, RpcError> {
         let Some(pty) = child.pty.take() else {
             // The child is running but there is no terminal to reach it by, so
@@ -294,7 +310,7 @@ impl PtyManager {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         if let Some(tap) = tap.as_mut() {
-                            tap(&buf[..n]);
+                            tap.feed(&buf[..n]);
                         }
                         events.publish(
                             workspace_id.clone(),
@@ -306,9 +322,20 @@ impl PtyManager {
                     }
                 }
             }
-            // Before the exit is announced, so whatever the tap does as it goes
-            // (the setup-token capture logs a missed token) lands ahead of it.
-            drop(tap);
+            // Before the exit is announced, so whatever the tap still has to do
+            // (the setup-token capture's write, or its log of a missed token)
+            // lands ahead of it. See `OutputTap::finish`.
+            if let Some(tap) = tap {
+                if tokio::time::timeout(TAP_FINISH_GRACE, tap.finish())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        pty = %pid,
+                        "terminal output tap did not finish in time; announcing the exit anyway"
+                    );
+                }
+            }
             let code = match ended {
                 Some((code, _)) => code,
                 // The terminal ended first; give the child a moment to be reaped.
@@ -519,6 +546,74 @@ async fn close_session(sessions: &Sessions, id: &PtyId) -> Result<Empty, RpcErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A child that prints `output` and exits 0 at once, the way
+    /// `claude setup-token` does after printing its token.
+    fn child_that_prints(output: &'static [u8]) -> SandboxChild {
+        let (tx, exit) = tokio::sync::oneshot::channel();
+        tx.send(0).unwrap();
+        SandboxChild {
+            pid: 1,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            pty: Some(crate::sandbox::PtyIo {
+                reader: Box::pin(output),
+                writer: Box::pin(tokio::io::sink()),
+                resizer: Box::new(|_| Ok(())),
+            }),
+            exit,
+            killer: Box::new(|| {}),
+            signal: Box::new(|_| {}),
+        }
+    }
+
+    /// A tap whose `finish` takes a while, and says when it is done.
+    struct SlowTap(Arc<AtomicBool>);
+
+    impl OutputTap for SlowTap {
+        fn feed(&mut self, _: &[u8]) {}
+        fn finish(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                self.0.store(true, Ordering::SeqCst);
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_exit_is_announced_only_after_the_tap_has_finished() {
+        let events = EventBus::new(64);
+        let mut rx = events.subscribe();
+        let ptys = PtyManager::new(events);
+        let finished = Arc::new(AtomicBool::new(false));
+        ptys.adopt(
+            child_that_prints(b"bye"),
+            None,
+            "noop",
+            Some(Box::new(SlowTap(finished.clone()))),
+        )
+        .await
+        .unwrap();
+        loop {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("pty.exit in time")
+                .unwrap();
+            if let ServerMessage::Event {
+                event: Event::PtyExit { .. },
+                ..
+            } = msg
+            {
+                break;
+            }
+        }
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "pty.exit was published before the tap finished"
+        );
+    }
 
     #[test]
     fn the_default_command_is_a_login_shell_except_for_noop_on_windows() {

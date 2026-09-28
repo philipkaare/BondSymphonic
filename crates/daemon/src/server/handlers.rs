@@ -126,12 +126,9 @@ impl Handler for WorkspaceHandler {
                 // again, so its terminal's output is scanned on the way past and
                 // the token stored where agents read it from.
                 let tap = (p.action == SetupAction::ClaudeSetupToken).then(|| {
-                    let mut capture = crate::agents::token_scan::TokenCapture::new(
+                    Box::new(crate::agents::token_scan::TokenCapture::new(
                         crate::agents::token::token_path(&d.dirs.root),
-                    );
-                    Box::new(move |bytes: &[u8]| {
-                        capture.feed(bytes);
-                    }) as crate::pty::OutputTap
+                    )) as Box<dyn crate::pty::OutputTap>
                 });
                 let opened = d
                     .ptys
