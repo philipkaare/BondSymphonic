@@ -2,3 +2,6 @@
 *.ndjson text eol=lf
 *.py text eol=lf
 *.sh text eol=lf
+
+# Terminal captures are byte-exact: their CRLFs and lone LFs both carry meaning.
+*.raw binary

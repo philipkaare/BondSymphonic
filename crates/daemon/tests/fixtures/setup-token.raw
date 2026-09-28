@@ -1,0 +1,37 @@
+[6n[?9001h[?1004h[m]0;claude[?25h]0;claude[?25l[?2004h[?1004h[?2031h[<u[>1u[>4;2m[?2026h[38;2;215;119;87mWelcome[1Cto[1CClaude[1CCode[38;2;102;102;102m[1Cv2.1.177[m
+..........................................................[33C
+[91C
+[91C
+[91C
+            ░░░░░░[73C
+    ░░░   ░░░░░░░░░░[71C
+   ░░░░░░░░░░░░░░░░░░░[69C
+[91C
+[38;2;102;102;102m                           ░░░░[m[21C██[K[37C
+[38;2;102;102;102m                         ░░░░░░░░░░[m[15C██▒▒██[K[35C
+                                            ▒▒      ██   ▒[33C
+       [38;2;215;119;87m█████████[26X[m[26C▒▒░░▒▒      ▒ ▒▒[K[33C
+      [38;2;215;119;87m[48;2;0;0;0m██▄█████▄██[m                           ▒▒         ▒▒[K[34C
+       [38;2;215;119;87m█████████[27X[m[27C░          ▒[K[36C
+.......[38;2;215;119;87m█ █   █ █[m..........................░..........▒....[K[33C
+[91C[?2026l
+[91C[>0q[?2026h[38;2;0;0;0m[30;2H✢[m[1COpening[1Cbrowser[1Cto[1Csign[1Cin…[?2026l
+[91C[?2026h[?2026l[38;2;0;0;0m[29;2H*[?2026h[?2026l[m[38;2;0;0;0m✶[m[?2026h[?2026l[38;2;0;0;0m✻[m[?2026h[?2026l[38;2;0;0;0m✽[?2026h[?2026l[m[38;2;0;0;0m✻[m[?2026h[?2026l[38;2;0;0;0m✶[m[?2026h[?2026l[38;2;0;0;0m*[?2026h[?2026l[m[38;2;0;0;0m✢[m[?2026h[?2026l[38;2;0;0;0m·[m[?2026h[?2026l[38;2;0;0;0m✢[?2026h[?2026l[m[38;2;0;0;0m*[m[?2026h[?2026l[38;2;0;0;0m✻[m[?2026h[?2026l[38;2;0;0;0m✽[m[?2026h[?2026l[38;2;0;0;0m✻[m[?2026h[?2026l[38;2;0;0;0m✶[?2026h[?2026l[m[38;2;0;0;0m*[?2026h[?2026l[m[38;2;0;0;0m✢[m[?2026h[?2026l[38;2;0;0;0m·[m[?2026h[38;2;102;102;102mBrowser didn't open? Use the url below to sign in (c to copy)[m
+
+[38;2;102;102;102mhttps://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d196[m
+[38;2;102;102;102m2f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcal[m
+[38;2;102;102;102mlback&scope=user%3Ainference&code_challenge=REDACTED&cod[m
+[38;2;102;102;102me_challenge_method=S256&state=REDACTED[18C[m
+[91C
+[91C
+ Paste code here if prompted >[61C[?2026l
+[91C[?2026h[21;2H[K[38;2;44;122;57m
+✓ Long-lived authentication token created successfully![m
+[K
+ Your OAuth token (valid for 1 year):[K
+[K
+ [38;2;150;108;30msk-ant-oat01-PtYgjmUhBel31iEl2hpChYgCfrL1spNxnyVmihA-2O76UMFxFkM-R5Kjp1vRt_1fjORS-6ilI8ihN[27;2H5KXSc7Tvo-hBKqFYAA[38;2;102;102;102m[29;2HStore this token securely. You won't be able to see it again.[m
+
+ [38;2;102;102;102mUse this token by setting: export CLAUDE_CODE_OAUTH_TOKEN=<token>[K[25C[m
+[91C[?2026l
+[91C[?2026h[?2026l[?25h[?1006l[?1003l[?1002l[?1000l[>4m[<u[?2031l[?2004l[>4m[<u[?2031l[?2004l[?9001l[?1004l

@@ -10,6 +10,7 @@ pub mod claude_stream;
 pub mod credentials;
 pub mod persist;
 pub mod token;
+pub mod token_scan;
 
 use crate::daemon::Daemon;
 use crate::ids::new_id;

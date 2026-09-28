@@ -70,6 +70,13 @@ const SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
 /// Terminal output is published in chunks of at most this many bytes.
 const CHUNK: usize = 4096;
 
+/// Something that sees a terminal's output as the pump reads it, before it is
+/// published: called on the pump task once per read, in order, and dropped
+/// when the terminal ends -- so it must not block. The one user is the
+/// `claude setup-token` terminal, whose output carries the token the daemon
+/// stores (see [`crate::agents::token_scan`]).
+pub type OutputTap = Box<dyn FnMut(&[u8]) + Send>;
+
 /// One live terminal. The reader half lives in the pump task instead, so
 /// nothing here is held across a read.
 struct Session {
@@ -174,7 +181,7 @@ impl PtyManager {
                 pty: Some(size),
             })
             .await?;
-        self.adopt(child, Some(ws.id), d.backend.name()).await
+        self.adopt(child, Some(ws.id), d.backend.name(), None).await
     }
 
     /// Opens a terminal on the host, outside every sandbox, running one of the
@@ -190,11 +197,15 @@ impl PtyManager {
     /// is where `claude` installs itself and need not be on a daemon's inherited
     /// path. Inheriting the rest is deliberate: a setup terminal should behave
     /// like the user's own shell, and it runs as that same user.
+    ///
+    /// `tap`, when given, sees the terminal's output as it is read; see
+    /// [`OutputTap`].
     pub async fn open_host(
         &self,
         d: &Daemon,
         argv: Vec<String>,
         size: PtySize,
+        tap: Option<OutputTap>,
     ) -> Result<PtyOpenResult, RpcError> {
         let host = d.host().await?;
         let child = host
@@ -206,7 +217,8 @@ impl PtyManager {
                 pty: Some(size),
             })
             .await?;
-        self.adopt(child, None, crate::setup::HOST_BACKEND).await
+        self.adopt(child, None, crate::setup::HOST_BACKEND, tap)
+            .await
     }
 
     /// Takes ownership of a freshly spawned child: registers it as a session
@@ -221,6 +233,7 @@ impl PtyManager {
         mut child: SandboxChild,
         workspace_id: Option<WorkspaceId>,
         backend: &'static str,
+        mut tap: Option<OutputTap>,
     ) -> Result<PtyOpenResult, RpcError> {
         let Some(pty) = child.pty.take() else {
             // The child is running but there is no terminal to reach it by, so
@@ -279,15 +292,23 @@ impl PtyManager {
                 };
                 match read {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => events.publish(
-                        workspace_id.clone(),
-                        Event::PtyOutput {
-                            pty_id: pid.clone(),
-                            data_b64: b64(&buf[..n]),
-                        },
-                    ),
+                    Ok(n) => {
+                        if let Some(tap) = tap.as_mut() {
+                            tap(&buf[..n]);
+                        }
+                        events.publish(
+                            workspace_id.clone(),
+                            Event::PtyOutput {
+                                pty_id: pid.clone(),
+                                data_b64: b64(&buf[..n]),
+                            },
+                        )
+                    }
                 }
             }
+            // Before the exit is announced, so whatever the tap does as it goes
+            // (the setup-token capture logs a missed token) lands ahead of it.
+            drop(tap);
             let code = match ended {
                 Some((code, _)) => code,
                 // The terminal ended first; give the child a moment to be reaped.

@@ -122,6 +122,17 @@ impl Handler for WorkspaceHandler {
             // other `system.*` methods.
             Request::SystemSetupPty(p) => {
                 crate::setup::before_setup(&d.dirs.root, p.action);
+                // `claude setup-token` prints the long-lived token once and never
+                // again, so its terminal's output is scanned on the way past and
+                // the token stored where agents read it from.
+                let tap = (p.action == SetupAction::ClaudeSetupToken).then(|| {
+                    let mut capture = crate::agents::token_scan::TokenCapture::new(
+                        crate::agents::token::token_path(&d.dirs.root),
+                    );
+                    Box::new(move |bytes: &[u8]| {
+                        capture.feed(bytes);
+                    }) as crate::pty::OutputTap
+                });
                 let opened = d
                     .ptys
                     .open_host(
@@ -131,6 +142,7 @@ impl Handler for WorkspaceHandler {
                             cols: p.cols.max(2),
                             rows: p.rows.max(1),
                         },
+                        tap,
                     )
                     .await?;
                 // A host terminal runs unsandboxed and belongs to the connection that
