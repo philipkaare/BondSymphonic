@@ -196,7 +196,13 @@ the **Re-check** button and on closing the dialog, they run when an agent stops
 tick is most likely to be out of date — and when you come back to the window
 after being away, at most once a minute. This is what makes an OAuth session
 that timed out while the IDE was open show up as a cross and a closed prompt box
-instead of a green tick and prompts that fail.
+instead of a green tick and prompts that fail. One case the check cannot see: a
+refresh token the server has revoked still reads as logged in, because `claude
+auth status` only looks at the credentials file. When an agent exits reporting
+that — *OAuth session expired and could not be refreshed* — the `claude_auth`
+row turns into a cross carrying the CLI's sentence and stays one through every
+re-check until you have pressed **Log out of Claude Code** and then **Log in to
+Claude Code** here.
 
 **Re-check** runs the checks again, and so does closing the dialog. The four
 *blocking* checks are `git`, `bwrap`, `userns` and `sandbox`: without them there
@@ -549,7 +555,13 @@ A Claude Code workspace's pane shows the conversation as it arrives.
   passes, and immediately when you store a key; there is no restart. Before the
   daemon has answered its first check the foot of the pane says *Checking
   whether Claude Code is logged in…* with no button, and clears itself when the
-  answer comes. Terminal tabs are unaffected.
+  answer comes. An agent that dies at start reporting an expired session —
+  *Failed to authenticate: OAuth session expired and could not be refreshed* —
+  closes the box again with the CLI's own sentence over the button, whatever
+  the check says, because the check only reads the credentials file and cannot
+  see a dead refresh token; **Log out of Claude Code** then **Log in** under
+  Settings > Setup is the fix, and the box comes back when that terminal exits.
+  Terminal tabs are unaffected.
 - **Transcript.** Your prompts, the assistant's answers rendered as Markdown,
   one card per tool call with its input and its result, and a line per turn with
   what it cost and how long it took.

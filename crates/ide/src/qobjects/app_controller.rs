@@ -403,6 +403,18 @@ pub mod qobject {
         /// false: the question is still open, and the status bar already says
         /// why.
         #[qproperty(bool, prereqs_answered)]
+        /// What the Claude Code CLI itself said when an agent could not
+        /// authenticate, or empty. Non-empty overrides the daemon's
+        /// `claude_auth` tick: `claude_logged_in` is false for as long as this
+        /// is set, whatever the last check answered.
+        ///
+        /// The daemon's check runs `claude auth status`, which reads the
+        /// credentials file and says logged in even when the refresh token in
+        /// it is dead. Only the CLI finds that out, at start, and says so once
+        /// in its exit detail -- and a re-check afterwards comes back green
+        /// again. See `AppControllerRust::claude_auth_override` for when it is
+        /// set and cleared. The composer gate shows this sentence verbatim.
+        #[qproperty(QString, claude_auth_failure)]
         type AppController = super::AppControllerRust;
 
         #[qsignal]
@@ -1233,6 +1245,84 @@ pub fn claude_gate_open(claude_auth_ok: bool, api_key_set: bool) -> bool {
     api_key_set || claude_auth_ok
 }
 
+/// The phrases the Claude Code CLI uses when it cannot authenticate, as they
+/// appear in an agent's exit detail. Matched case-insensitively, as a small
+/// explicit list: a rule that guessed from "auth" or "token" would also match
+/// an agent that died of a network error while *using* a token, and the wrong
+/// verdict here shuts every composer in the window.
+const CLI_AUTH_FAILURES: [&str; 5] = [
+    "oauth session expired",
+    "could not be refreshed",
+    "failed to authenticate",
+    "not logged in",
+    "invalid_grant",
+];
+
+/// What the setup page's `claude_auth` row says to do about an override, as
+/// its `fix_hint`. A plain login does not always help: the CLI reads the
+/// credentials file, finds the dead token there, and tries to refresh it again.
+pub const CLAUDE_AUTH_OVERRIDE_FIX: &str =
+    "Settings > Setup: Log out of Claude Code, then Log in to Claude Code again";
+
+/// The CLI's own sentence about a login that has gone, if an agent's exit
+/// detail carries one; `None` for every other exit.
+///
+/// The daemon's `claude_auth` prerequisite runs `claude auth status`, which only
+/// reads `~/.claude/.credentials.json` and answers `loggedIn: true` for a file
+/// whose refresh token the server has since revoked. The one thing that finds
+/// out is the CLI itself, at start, and it says so exactly once -- in the exit
+/// detail of the agent it killed: `Failed to authenticate: OAuth session
+/// expired and could not be refreshed`. Before this rule, that sentence went
+/// into a banner, the re-check the exit triggered came back green, the composer
+/// stayed open, and the next prompt started another agent that died the same
+/// way.
+///
+/// Returns the line of the detail that matched, without the daemon's own
+/// `(exit code N)` suffix: it is shown in place of the gate's paraphrase, and
+/// the user should read what the CLI said.
+pub fn auth_failure_in(detail: &str) -> Option<String> {
+    let line = detail.lines().map(str::trim).find(|line| {
+        let lower = line.to_lowercase();
+        CLI_AUTH_FAILURES
+            .iter()
+            .any(|phrase| lower.contains(phrase))
+    })?;
+    let line = match line.rfind(" (exit code ") {
+        Some(at) if line.ends_with(')') => &line[..at],
+        _ => line,
+    };
+    Some(line.to_owned())
+}
+
+/// `items` with its `claude_auth` entry failed by the CLI's own account: the
+/// list as the setup page should draw it while an override is set.
+///
+/// The one place the rewrite happens. The page draws a cross and the **Log in**
+/// button from `ok: false` on this row, so rewriting the payload is what lets
+/// it do that without learning anything about overrides; the row's `detail` is
+/// the CLI's sentence and its `fix_hint` is [`CLAUDE_AUTH_OVERRIDE_FIX`]. A list
+/// with no such row -- an agent that died before the first check answered --
+/// gets one appended, and a payload that does not parse is treated as empty
+/// for the same reason: the cross must be there whatever the daemon managed to
+/// say.
+pub fn override_claude_auth(items_json: &str, sentence: &str) -> String {
+    let mut items: Vec<PrereqStatus> = serde_json::from_str(items_json).unwrap_or_default();
+    let row = PrereqStatus {
+        name: CLAUDE_AUTH_PREREQ.to_owned(),
+        ok: false,
+        detail: sentence.to_owned(),
+        fix_hint: Some(CLAUDE_AUTH_OVERRIDE_FIX.to_owned()),
+    };
+    match items
+        .iter_mut()
+        .find(|item| item.name == CLAUDE_AUTH_PREREQ)
+    {
+        Some(item) => *item = row,
+        None => items.push(row),
+    }
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
+}
+
 /// Whether a prerequisite answer should open the Settings dialog on Setup by
 /// itself.
 ///
@@ -1369,6 +1459,10 @@ fn publish_connection_loss(qt: &QtHandle, losing: ConnectionState) {
         // answer's contents stay -- the gate and the setup page keep drawing
         // the last thing the daemon said.
         q.as_mut().set_prereqs_answered(false);
+        // The CLI's verdict went with it too. The reconnect's own check starts
+        // from nothing, and an override held across a daemon restart would
+        // shut the composer over a login the user may have renewed meanwhile.
+        q.as_mut().set_claude_auth_override(None);
         q.set_state(losing);
     });
 }
@@ -1430,6 +1524,34 @@ pub struct AppControllerRust {
     /// a key stored or removed later recomputes the gate without re-reading
     /// the list.
     claude_auth_ok: bool,
+    /// The CLI's own sentence about a login that has gone, overriding
+    /// `claude_auth_ok` while it is set. Backs the `claudeAuthFailure`
+    /// property; see [`auth_failure_in`] for the sentence.
+    ///
+    /// The rule, because the daemon cannot apply it: the daemon's check reads
+    /// the credentials file and cannot see that the refresh token in it is
+    /// dead. Only the CLI can, and it says so exactly once, at exit. So:
+    ///
+    /// * **Set** when an agent exits with a detail [`auth_failure_in`]
+    ///   recognises. From that moment `claudeLoggedIn` is false and the setup
+    ///   page's `claude_auth` row is a cross, whatever the daemon answers.
+    /// * **Cleared** when the Claude login or logout terminal opened through
+    ///   `open_setup_pty` exits -- the login is the fix, and the re-check the
+    ///   setup page sends on that exit then decides the gate on its own -- and
+    ///   on connection loss, where the reconnect's check starts from nothing.
+    /// * **Not cleared** by a re-check on its own. That is the case that lied:
+    ///   the window re-checks on every agent exit, and the check came back
+    ///   green over the very login the agent had just died of.
+    claude_auth_override: Option<String>,
+    /// The same sentence as the `claudeAuthFailure` property reads it: the
+    /// override, or empty. Kept beside it rather than instead of it because the
+    /// property is a `QString` and the rule above is written in `Option`.
+    claude_auth_failure: QString,
+    /// The PTY of the last Claude login or logout terminal `open_setup_pty`
+    /// opened, so its `pty.exit` is recognised as the login having been done.
+    /// Only those two: an `install_claude` or a GitHub login says nothing about
+    /// whether the Claude token is alive.
+    login_pty: Option<PtyId>,
     /// Whether a prerequisite answer should open Settings on Setup, and
     /// whether one already has. See [`SetupPrompt`].
     setup_prompt: SetupPrompt,
@@ -1454,6 +1576,9 @@ impl Default for AppControllerRust {
             prereqs_json: QString::from(""),
             prereqs_any_failed: false,
             claude_auth_ok: false,
+            claude_auth_override: None,
+            claude_auth_failure: QString::from(""),
+            login_pty: None,
             setup_prompt: SetupPrompt::default(),
         }
     }
@@ -1734,12 +1859,32 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
                 // agent no tab is running yet is held by `GroupModel`, which is
                 // where a tab learns its agent; see `group_model::
                 // HeldAgentStates`.
-                let _ = qt.queue(move |q| {
+                let _ = qt.queue(move |mut q| {
+                    // Before the signal, so the window's handler -- which
+                    // re-checks the prerequisites on every exit -- finds the
+                    // gate already shut when it runs, and so does the pane
+                    // that draws the banner.
+                    if state == AgentState::Exited {
+                        if let Some(sentence) = auth_failure_in(&detail) {
+                            q.as_mut().set_claude_auth_override(Some(sentence));
+                        }
+                    }
                     q.agent_state_changed(
                         QString::from(&id),
                         QString::from(word),
                         QString::from(&detail),
                     )
+                });
+            }
+            // A setup terminal ending. Only the Claude login or logout one
+            // means anything here: its exit is the login having been done,
+            // which is what the CLI's verdict about the old one yields to.
+            Event::PtyExit { pty_id, .. } => {
+                let _ = qt.queue(move |mut q| {
+                    if q.as_ref().rust().login_pty.as_ref() == Some(&pty_id) {
+                        q.as_mut().rust_mut().login_pty = None;
+                        q.as_mut().set_claude_auth_override(None);
+                    }
                 });
             }
             Event::DaemonLog { level, message, .. } => {
@@ -2864,7 +3009,15 @@ impl qobject::AppController {
                 Ok(res) => {
                     let id = res.pty_id.to_string();
                     tracing::info!("setup terminal for {name} opened as {id}");
-                    let _ = qt.queue(move |q| {
+                    // A Claude login or logout: remembered so its exit lifts
+                    // the CLI's verdict about the old login. See `login_pty`.
+                    let login =
+                        matches!(action, SetupAction::ClaudeLogin | SetupAction::ClaudeLogout)
+                            .then(|| res.pty_id.clone());
+                    let _ = qt.queue(move |mut q| {
+                        if let Some(pty) = login {
+                            q.as_mut().rust_mut().login_pty = Some(pty);
+                        }
                         q.setup_pty_opened(QString::from(&name), QString::from(&id))
                     });
                 }
@@ -2874,7 +3027,52 @@ impl qobject::AppController {
     }
 
     pub fn prereqs_any_failed(&self) -> bool {
-        self.rust().prereqs_any_failed
+        // An override is a failing row, so the status bar's "Set up…" link is
+        // offered for it as for any other cross on the page.
+        self.rust().prereqs_any_failed || self.rust().claude_auth_override.is_some()
+    }
+
+    /// Sets or clears the CLI's verdict about the login, and everything that
+    /// reads it: the `claudeAuthFailure` property, the composer gate, and the
+    /// setup page's payload. See `claude_auth_override` for the rule.
+    ///
+    /// The page is told by a `prereqs_checked` carrying the rewritten payload,
+    /// even though no check ran: a Settings dialog already open when the agent
+    /// dies would otherwise keep its tick until the next answer, and the one
+    /// the exit triggers is a second away at best and can fail. Nothing else
+    /// changes: setting the same sentence twice -- a burst of agents dying of
+    /// the same login -- costs one rewrite and no repaint.
+    fn set_claude_auth_override(mut self: Pin<&mut Self>, sentence: Option<String>) {
+        if self.as_ref().rust().claude_auth_override == sentence {
+            return;
+        }
+        match &sentence {
+            Some(text) => tracing::warn!("Claude Code says its login has gone: {text}"),
+            None => tracing::info!("the Claude login has been redone; the daemon's check decides"),
+        }
+        self.as_mut().rust_mut().claude_auth_override = sentence.clone();
+        self.as_mut()
+            .set_claude_auth_failure(QString::from(&sentence.unwrap_or_default()));
+        self.as_mut().refresh_claude_logged_in();
+        // Only on the way up: the terminal exit that clears it is followed by
+        // the setup page's own re-check, whose answer is the payload to draw.
+        if self.as_ref().rust().claude_auth_override.is_some() {
+            let json = self.as_ref().published_prereqs_json();
+            self.prereqs_checked(json);
+        }
+    }
+
+    /// The prerequisite list as everything outside this object sees it: the
+    /// daemon's last answer, with its `claude_auth` row failed by the CLI's own
+    /// account while an override is set. See [`override_claude_auth`].
+    fn published_prereqs_json(&self) -> QString {
+        match &self.rust().claude_auth_override {
+            Some(sentence) => QString::from(&override_claude_auth(
+                &self.rust().prereqs_json.to_string(),
+                sentence,
+            )),
+            None => self.rust().prereqs_json.clone(),
+        }
     }
 
     pub fn note_setup_shown(mut self: Pin<&mut Self>) {
@@ -2903,7 +3101,11 @@ impl qobject::AppController {
         // whether it opens: the other way round, a logged-in user's composer
         // gate would read "not logged in" for the instant between the two.
         self.as_mut().set_prereqs_answered(true);
-        self.prereqs_checked(QString::from(&answer.json));
+        // As published, not as answered: a check that comes back green over a
+        // login the CLI has just reported dead is exactly the answer the
+        // override exists to correct, and the page must not draw it.
+        let json = self.as_ref().published_prereqs_json();
+        self.prereqs_checked(json);
     }
 
     pub fn should_auto_open_setup(&self) -> bool {
@@ -2911,7 +3113,7 @@ impl qobject::AppController {
     }
 
     pub fn prereqs_json(&self) -> QString {
-        self.rust().prereqs_json.clone()
+        self.published_prereqs_json()
     }
 
     pub fn validate_workspace_name(&self, name: QString) -> QString {
@@ -2951,11 +3153,17 @@ impl qobject::AppController {
     ///
     /// The daemon's half of [`claude_gate_open`] was decided when its answer
     /// was decoded, so this re-reads the credential store and not the list.
+    ///
+    /// The CLI's verdict outranks the daemon's half. While an override is set,
+    /// the daemon's `claude_auth: ok` is the green tick over a dead refresh
+    /// token that this whole rule exists for, and it counts as `false` here.
     fn refresh_claude_logged_in(mut self: Pin<&mut Self>) {
-        let logged_in = claude_gate_open(
-            self.as_ref().rust().claude_auth_ok,
-            crate::qobjects::settings::api_key_set(),
-        );
+        let daemon_half = {
+            let rust = self.as_ref();
+            let rust = rust.rust();
+            rust.claude_auth_ok && rust.claude_auth_override.is_none()
+        };
+        let logged_in = claude_gate_open(daemon_half, crate::qobjects::settings::api_key_set());
         self.as_mut().set_claude_logged_in(logged_in);
     }
 
@@ -3576,5 +3784,104 @@ mod tests {
         );
         assert!(text.contains("build-daemon.ps1"), "{text:?}");
         assert!(text.contains("reinstall the package"), "{text:?}");
+    }
+
+    /// The CLI's exact sentence from the day this was written, as the daemon
+    /// delivers it: the reason leads and the exit code trails.
+    const EXPIRED: &str =
+        "Failed to authenticate: OAuth session expired and could not be refreshed (exit code 1)";
+
+    /// Every phrase on the list, in either case, is the CLI saying the login
+    /// has gone; the sentence handed back is the line that said so, without the
+    /// daemon's exit-code suffix.
+    #[test]
+    fn each_cli_auth_phrase_is_recognised_in_any_case() {
+        assert_eq!(
+            auth_failure_in(EXPIRED).as_deref(),
+            Some("Failed to authenticate: OAuth session expired and could not be refreshed")
+        );
+        for detail in [
+            "OAuth session expired",
+            "oauth SESSION expired, sorry",
+            "the token could not be refreshed",
+            "Failed to authenticate",
+            "FAILED TO AUTHENTICATE: whatever",
+            "Not logged in · Please run /login",
+            "server answered invalid_grant",
+        ] {
+            assert_eq!(
+                auth_failure_in(detail).as_deref(),
+                Some(detail),
+                "{detail:?} must be recognised"
+            );
+        }
+        // A multi-line tail: the matching line, not the whole tail.
+        let tail = "warning: something else\nFailed to authenticate: token gone\nexit code 1";
+        assert_eq!(
+            auth_failure_in(tail).as_deref(),
+            Some("Failed to authenticate: token gone")
+        );
+    }
+
+    /// An exit that says nothing about the login is not one, whatever else
+    /// went wrong: a crash, a missing binary, a plain exit code, a sandbox that
+    /// went away. The wrong verdict here shuts every composer in the window.
+    #[test]
+    fn other_exits_are_not_auth_failures() {
+        for detail in [
+            "",
+            "exit code 1",
+            "claude: command not found",
+            "the sandbox stopped (exit code 137)",
+            "panicked at src/main.rs:1:1",
+            "error: network is unreachable",
+            "authorization header rejected by proxy",
+        ] {
+            assert_eq!(auth_failure_in(detail), None, "{detail:?} must not match");
+        }
+    }
+
+    /// The setup page draws its rows from the payload, so the override lands
+    /// there as a failed `claude_auth` row carrying the CLI's sentence and the
+    /// log-out-then-in hint; every other row is left exactly as the daemon
+    /// said it, and a list with no such row grows one.
+    #[test]
+    fn the_override_rewrites_only_the_claude_auth_row() {
+        let daemon = serde_json::to_string(&[
+            PrereqStatus {
+                name: "git".into(),
+                ok: true,
+                detail: "git 2.43".into(),
+                fix_hint: None,
+            },
+            PrereqStatus {
+                name: CLAUDE_AUTH_PREREQ.into(),
+                ok: true,
+                detail: "logged in to Claude".into(),
+                fix_hint: None,
+            },
+        ])
+        .unwrap();
+        let sentence = auth_failure_in(EXPIRED).unwrap();
+        let items: Vec<PrereqStatus> =
+            serde_json::from_str(&override_claude_auth(&daemon, &sentence)).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items[0].ok && items[0].name == "git", "{items:?}");
+        let auth = &items[1];
+        assert_eq!(auth.name, CLAUDE_AUTH_PREREQ);
+        assert!(!auth.ok);
+        assert_eq!(auth.detail, sentence);
+        assert_eq!(auth.fix_hint.as_deref(), Some(CLAUDE_AUTH_OVERRIDE_FIX));
+        // The daemon's list itself is untouched by the rewrite.
+        assert!(claude_auth_ok(
+            &serde_json::from_str::<Vec<PrereqStatus>>(&daemon).unwrap()
+        ));
+
+        for empty in ["", "[]", "not json"] {
+            let items: Vec<PrereqStatus> =
+                serde_json::from_str(&override_claude_auth(empty, &sentence)).unwrap();
+            assert_eq!(items.len(), 1, "{empty:?}");
+            assert!(items[0].name == CLAUDE_AUTH_PREREQ && !items[0].ok);
+        }
     }
 }

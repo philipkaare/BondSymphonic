@@ -85,6 +85,18 @@ public:
     /// there is nothing to fix yet.
     void setPrereqsAnswered(bool answered);
 
+    /// What the Claude Code CLI itself said when an agent could not
+    /// authenticate, per the controller's `claudeAuthFailure`, or empty.
+    /// Changes only what the closed gate says: while it is set the gate's
+    /// sentence is this one, verbatim, over the same login button.
+    ///
+    /// A third setter rather than a flag on `setClaudeLoggedIn`, for the same
+    /// reason `setPrereqsAnswered` is: the facts move at different times, and
+    /// the gate going up for this reason is the one case where the paraphrase
+    /// -- "not logged in" -- is what the daemon's own check just contradicted.
+    /// The user should read what the CLI said, which names the fix.
+    void setClaudeAuthFailure(const QString& sentence);
+
     /// What the pane says while the transcript is empty: that the agent is
     /// there, what it will answer as, where the work came from and where it
     /// happens. `origin` is `workspacelabel::origin`'s repository and base
@@ -293,6 +305,8 @@ private:
     /// See [`setPrereqsAnswered`]. True until told otherwise, for the same
     /// reason.
     bool m_prereqsAnswered = true;
+    /// See [`setClaudeAuthFailure`]. Empty until the CLI has said otherwise.
+    QString m_authFailure;
     /// The agent id the pane had when the start was asked for. A different one
     /// arriving is the start answering, whether the pane had none before or was
     /// restarting one that exited.

@@ -1115,6 +1115,47 @@ void MainWindow::connectController() {
         m_agentArea->setPrereqsAnswered(m_controller->getPrereqsAnswered());
     });
     m_agentArea->setPrereqsAnswered(m_controller->getPrereqsAnswered());
+    // And what the CLI itself said, when an agent died of a login the daemon's
+    // check still calls good. The check reads the credentials file and cannot
+    // see a dead refresh token; the CLI can, says so once in the exit detail,
+    // and the re-check `onAgentExited` sends comes back green over it. While
+    // this is set the controller holds `claudeLoggedIn` false, and the gate
+    // shows this sentence rather than its paraphrase, because it names the fix.
+    QObject::connect(m_controller, &AppController::claudeAuthFailureChanged, this, [this] {
+        m_agentArea->setClaudeAuthFailure(m_controller->getClaudeAuthFailure());
+    });
+    m_agentArea->setClaudeAuthFailure(m_controller->getClaudeAuthFailure());
+    // Test seam: says which way the gate went and on what, and answers the
+    // CLI's verdict the way the setup page's button would -- by opening the
+    // Claude login terminal -- so a run can see that a re-check alone leaves
+    // the gate shut and the login's exit is what reopens it. Inert without
+    // `BS_SMOKE_SCRIPT`; see `menuTest`.
+    if (menuTest().contains(QLatin1String("claude-gate"))) {
+        const auto gateWord = [this] {
+            return QString::fromLatin1(m_controller->getClaudeLoggedIn() ? "open" : "closed");
+        };
+        QObject::connect(m_controller, &AppController::claudeLoggedInChanged, this,
+                         [this, gateWord] {
+                             announceMenuTest("claude-gate", gateWord(),
+                                              m_controller->getClaudeAuthFailure());
+                         });
+        // Once: on the first payload published with the verdict on it. A
+        // second login while the first is out would be the page's own guard
+        // to refuse, not this seam's. The flag lives in the closure so the
+        // seam adds nothing to the window itself.
+        QObject::connect(m_controller, &AppController::prereqsChecked, this,
+                         [this, gateWord, driven = false]() mutable {
+                             announceMenuTest("claude-gate-checked", gateWord(),
+                                              m_controller->getClaudeAuthFailure());
+                             if (driven || m_controller->getClaudeAuthFailure().isEmpty()) {
+                                 return;
+                             }
+                             driven = true;
+                             m_controller->openSetupPty(QStringLiteral("claude_login"), 80, 24);
+                             announceMenuTest("claude-login", QStringLiteral("claude_login"),
+                                              QString());
+                         });
+    }
     QObject::connect(m_agentArea, &AgentArea::loginRequested, this, &MainWindow::showSetupPage);
     // A workspace that cannot run. Retry is its own request; Remove is the
     // tab menu's destroy, confirmation and busy check included, because it is

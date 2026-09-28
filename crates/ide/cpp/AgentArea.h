@@ -103,6 +103,13 @@ public:
     /// checking, not that nobody is logged in.
     void setPrereqsAnswered(bool answered);
 
+    /// What the Claude Code CLI itself said when an agent could not
+    /// authenticate, per the controller's `claudeAuthFailure`, or empty.
+    /// Applied to every transcript pane the same way, and remembered for the
+    /// ones built afterwards: the gate the pane is born with must say what the
+    /// CLI said, not the paraphrase the daemon's tick contradicts.
+    void setClaudeAuthFailure(const QString& sentence);
+
     /// Whether every transcript shows the turn cost and the agent's own system
     /// lines. Applied to the panes that exist and remembered for the ones built
     /// afterwards, for the same reason the login gate is: a workspace whose tab
@@ -271,4 +278,6 @@ private:
     /// is what makes a pane built before then say "checking" rather than
     /// offer a login to a user who already has one.
     bool m_prereqsAnswered = false;
+    /// See [`setClaudeAuthFailure`]. Empty until the CLI has said otherwise.
+    QString m_claudeAuthFailure;
 };

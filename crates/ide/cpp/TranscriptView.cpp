@@ -515,7 +515,26 @@ void TranscriptView::setPrereqsAnswered(bool answered) {
     refreshGate();
 }
 
+void TranscriptView::setClaudeAuthFailure(const QString& sentence) {
+    if (m_authFailure == sentence) {
+        return;
+    }
+    m_authFailure = sentence;
+    refreshGate();
+}
+
 void TranscriptView::refreshGate() {
+    // The CLI's own verdict first, ahead of "checking": it is a fact the CLI
+    // established at the agent's exit, not a guess, and the check in flight is
+    // the one that comes back green over it. The daemon's tick said logged in
+    // while every agent died at start with this sentence in its exit detail
+    // and nobody surfaced it; the sentence names the fix, so it is shown as
+    // the CLI wrote it, over the same button as the paraphrase below.
+    if (!m_authFailure.isEmpty()) {
+        m_gateText->setText(m_authFailure);
+        m_loginButton->show();
+        return;
+    }
     if (!m_prereqsAnswered) {
         // Not "not logged in": nothing is known yet. On a freshly booted distro
         // the first check can take ten seconds, and the user who read the old
@@ -1428,6 +1447,70 @@ extern "C" std::int32_t bs_widget_test_transcript_gate_says_it_is_checking_first
     view.setClaudeLoggedIn(true);
     if (!gate->isHidden()) {
         return 8;
+    }
+    return 0;
+}
+
+/// With the CLI's own verdict set, the closed gate says what the CLI said and
+/// offers the login; with it cleared, the gate is back to its own words.
+///
+/// The daemon's `claude_auth` check reads the credentials file and said logged
+/// in over a refresh token the server had revoked. Every agent died at start
+/// with "Failed to authenticate: OAuth session expired and could not be
+/// refreshed" in its exit detail, the re-check came back green, and the
+/// composer stayed open over it. The sentence names the fix -- log out, log in
+/// -- and a paraphrase of it would not.
+extern "C" std::int32_t bs_widget_test_transcript_gate_shows_the_cli_auth_failure() {
+    const QString said =
+        QStringLiteral("Failed to authenticate: OAuth session expired and could not be refreshed");
+    TranscriptModel model;
+    TranscriptView view(&model);
+    auto* gate = view.findChild<QWidget*>(QStringLiteral("bsClaudeGate"));
+    auto* text = view.findChild<QLabel*>(QStringLiteral("bsClaudeGateText"));
+    auto* login = view.findChild<QPushButton*>(QStringLiteral("bsClaudeLogin"));
+    if (gate == nullptr || text == nullptr || login == nullptr) {
+        return 1;
+    }
+    // A logged-in session, as the daemon reported it: no gate.
+    view.setPrereqsAnswered(true);
+    view.setClaudeLoggedIn(true);
+    if (!gate->isHidden()) {
+        return 2;
+    }
+    // The agent exits with the CLI's sentence and the controller shuts the
+    // gate over the daemon's tick. The two arrive in this order from the
+    // window: the failure, then the property it drives.
+    view.setClaudeAuthFailure(said);
+    view.setClaudeLoggedIn(false);
+    if (gate->isHidden()) {
+        return 3;
+    }
+    if (text->text() != said) {
+        return 4;
+    }
+    if (login->isHidden()) {
+        return 5;
+    }
+    // The verdict outranks "checking": it is a fact, not a guess, and the
+    // check in flight is the one that lied.
+    view.setPrereqsAnswered(false);
+    if (text->text() != said || login->isHidden()) {
+        return 6;
+    }
+    view.setPrereqsAnswered(true);
+    // The login terminal exited and the verdict is lifted while the daemon's
+    // answer is still the old one: the gate goes back to its own words.
+    view.setClaudeAuthFailure(QString());
+    if (text->text() !=
+        QLatin1String("Claude Code is not logged in, so this agent cannot answer yet.")) {
+        return 7;
+    }
+    if (login->isHidden()) {
+        return 8;
+    }
+    view.setClaudeLoggedIn(true);
+    if (!gate->isHidden()) {
+        return 9;
     }
     return 0;
 }

@@ -5486,3 +5486,429 @@ mod front_tab_after_destroy {
         info
     }
 }
+
+/// The CLI's own verdict about a dead login outranks the daemon's tick, until
+/// the login has actually been redone.
+///
+/// The daemon's `claude_auth` check runs `claude auth status`, which reads the
+/// credentials file and says logged in even when the refresh token in it has
+/// been revoked. Only the CLI finds that out, at start, and it says so once --
+/// in the exit detail of the agent it killed. The window re-checks on every
+/// exit, and that check came back green: a tick on the setup page, an open
+/// composer, and every prompt starting another agent that died the same way.
+///
+/// One Claude workspace with a live agent. The fake daemon lets the agent exit
+/// with the CLI's sentence, answers every prerequisite check green, and answers
+/// the Claude login terminal the seam opens with a PTY that exits two and a
+/// half seconds later -- after the window's debounced re-check has been asked
+/// and answered. What has to be visible from outside is that the gate shut on
+/// the exit, stayed shut through that re-check, and reopened on the login's
+/// exit.
+mod claude_auth_override {
+    use super::{drain, wait_for};
+    use bondsymphonic_ide::model::persistence::{PersistedGroup, StateFile, STATE_VERSION};
+    use bondsymphonic_proto::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    const TOKEN: &str = "auth-override-token";
+    /// Nine seconds: the exit at one and a half, the re-check a second after
+    /// it, the login's PTY exit two and a half seconds after the login was
+    /// opened, and room after that for the last announcement to land.
+    const SCRIPT: &str = "wait,wait,wait,quit";
+    const WORKSPACE: &str = "ws_authov1";
+    const NAME: &str = "auth-override";
+    const AGENT: &str = "ag_authov_live";
+    const SESSION: &str = "sess-authov-1";
+    /// The PTY the fake hands back for the login terminal.
+    const LOGIN_PTY: &str = "pty_authov_login";
+    /// What the daemon put in the exit detail on the day: the CLI's sentence,
+    /// with the daemon's exit code on the end of it.
+    const DIED: &str =
+        "Failed to authenticate: OAuth session expired and could not be refreshed (exit code 1)";
+    /// The sentence the gate shows: the CLI's, without the daemon's suffix.
+    const SENTENCE: &str =
+        "Failed to authenticate: OAuth session expired and could not be refreshed";
+    /// The seam that announces the gate and opens the login; see `MainWindow`.
+    const MENU_TEST: &str = "claude-gate";
+    const GATE_CLOSED: &str = "BS_MENU_TEST claude-gate target=closed question=";
+    const GATE_OPEN: &str = "BS_MENU_TEST claude-gate target=open question=";
+    const CHECKED_CLOSED: &str = "BS_MENU_TEST claude-gate-checked target=closed question=";
+    const CHECKED_OPEN: &str = "BS_MENU_TEST claude-gate-checked target=open question=";
+    const LOGIN_DRIVEN: &str = "BS_MENU_TEST claude-login target=claude_login ";
+    /// How long after the login terminal opens its process ends. Longer than
+    /// the window's re-check debounce, so the re-check answers while the
+    /// terminal is still up, which is the order the claim is about.
+    const LOGIN_EXIT_DELAY: Duration = Duration::from_millis(2_500);
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+    type Journal = Arc<Mutex<Vec<String>>>;
+
+    #[test]
+    fn a_cli_auth_failure_shuts_the_gate_until_the_login_terminal_exits() {
+        if bondsymphonic_ide::testing::skip_without_qt("CLI auth failure overrides the tick") {
+            return;
+        }
+        let run = run_ide();
+        let lines: Vec<&str> = run
+            .out
+            .lines()
+            .filter(|l| l.starts_with("BS_MENU_TEST claude-"))
+            .collect();
+
+        // The exit shut the gate, and the sentence on it is the CLI's own.
+        let closed = lines
+            .iter()
+            .position(|l| *l == format!("{GATE_CLOSED}{SENTENCE}"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the agent's exit did not shut the gate with the CLI's sentence\n{}",
+                    run.context
+                )
+            });
+        // The seam answered it the way the setup page's button does.
+        let login = lines
+            .iter()
+            .position(|l| l.starts_with(LOGIN_DRIVEN))
+            .unwrap_or_else(|| panic!("the seam never opened the login terminal\n{}", run.context));
+        assert!(
+            login > closed,
+            "the login was opened before the gate shut\n{}",
+            run.context
+        );
+        assert!(
+            run.journal.iter().any(|m| m == "system.setup_pty"),
+            "the login terminal never reached the daemon\n{}",
+            run.context
+        );
+
+        // A prerequisite check answered green after the login was opened and
+        // before its terminal exited -- and the gate stayed shut through it.
+        // This is the check that used to turn the cross back into a tick.
+        let after_login = &lines[login + 1..];
+        let rechecked = after_login
+            .iter()
+            .position(|l| l.starts_with(CHECKED_CLOSED))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no prerequisite answer was published with the gate still shut after the \
+                     login was opened\n{}",
+                    run.context
+                )
+            });
+        assert!(
+            !after_login[..rechecked]
+                .iter()
+                .any(|l| l.starts_with(GATE_OPEN)),
+            "the gate reopened before the login terminal had exited\n{}",
+            run.context
+        );
+        assert!(
+            !after_login.iter().any(|l| l.starts_with(CHECKED_OPEN)),
+            "a prerequisite check on its own reopened the gate\n{}",
+            run.context
+        );
+        assert!(
+            run.journal
+                .iter()
+                .filter(|m| *m == "system.check_prereqs")
+                .count()
+                >= 2,
+            "the exit never produced a re-check, so this run proves nothing\n{}",
+            run.context
+        );
+
+        // The login terminal's exit is what lifts the verdict: the gate reopens
+        // on the daemon's standing answer, with no sentence on it.
+        assert!(
+            after_login[rechecked..].iter().any(|l| *l == GATE_OPEN),
+            "the login terminal's exit did not reopen the gate\n{}",
+            run.context
+        );
+    }
+
+    struct Run {
+        out: String,
+        journal: Vec<String>,
+        context: String,
+    }
+
+    fn run_ide() -> Run {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (addr, journal) = rt.block_on(fake_daemon());
+
+        let config = std::env::temp_dir().join(format!("bs-authov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("config dir");
+        let state_path = config.join("state.json");
+        let saved = StateFile {
+            version: STATE_VERSION,
+            groups: vec![PersistedGroup {
+                name: "auth".to_owned(),
+                workspace_ids: vec![WORKSPACE.to_owned()],
+                ..PersistedGroup::default()
+            }],
+            active_workspace: Some(WORKSPACE.to_owned()),
+            ..StateFile::default()
+        };
+        std::fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&saved).expect("state json"),
+        )
+        .expect("seed state.json");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", SCRIPT)
+            .env("BS_MENU_TEST", MENU_TEST)
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", &state_path)
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let journal = journal.lock().expect("journal mutex").clone();
+        let context =
+            format!("requests: {journal:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(
+            status.success(),
+            "the IDE exited with {status}, expected 0\n{context}"
+        );
+        assert!(
+            !format!("{out}{err}").contains("panicked at"),
+            "the IDE logged a panic\n{context}"
+        );
+        let _ = std::fs::remove_dir_all(&config);
+        Run {
+            out,
+            journal,
+            context,
+        }
+    }
+
+    async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let recorded = journal.clone();
+
+        tokio::spawn(async move {
+            let mut exit_sent = false;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (r, w) = stream.into_split();
+                // Shared with the tasks that send the delayed events, so the
+                // read loop never sleeps and the journal's order is the wire's.
+                let w = Arc::new(tokio::sync::Mutex::new(w));
+                let mut r = BufReader::new(r);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let ClientMessage::Request { id, request } =
+                        codec::decode(line.trim_end()).expect("decode");
+                    recorded
+                        .lock()
+                        .expect("journal mutex")
+                        .push(request.method_name().to_owned());
+                    let mut after: Vec<ServerMessage> = Vec::new();
+                    let mut delay = Duration::from_millis(200);
+                    let reply = match request {
+                        Request::Hello(p) if p.token == TOKEN => Some(ServerMessage::ok(
+                            id,
+                            &HelloResult {
+                                daemon_version: "0.0.0-fake".into(),
+                                capabilities: Capabilities {
+                                    sandbox_backend: "noop".into(),
+                                    git_protect: false,
+                                    adapters: vec![AgentAdapterKind::Claude],
+                                },
+                                protocol_version: Some(PROTOCOL_VERSION),
+                            },
+                        )),
+                        Request::Hello(_) => Some(ServerMessage::err(id, RpcError::unauthorized())),
+                        // Green, every time: this is the daemon that cannot see
+                        // the dead token, and the check that lied.
+                        Request::SystemCheckPrereqs {} => Some(ServerMessage::ok(
+                            id,
+                            &CheckPrereqsResult {
+                                items: vec![PrereqStatus {
+                                    name: "claude_auth".into(),
+                                    ok: true,
+                                    detail: "logged in to Claude".into(),
+                                    fix_hint: None,
+                                }],
+                            },
+                        )),
+                        Request::WorkspaceList {} => {
+                            // The exit, once the tab exists to hear of it.
+                            if !exit_sent {
+                                exit_sent = true;
+                                delay = Duration::from_millis(1_500);
+                                after.push(ServerMessage::event(
+                                    Some(WorkspaceId(WORKSPACE.to_owned())),
+                                    Event::AgentStateChanged {
+                                        agent_id: AgentId(AGENT.to_owned()),
+                                        state: AgentState::Exited,
+                                        detail: Some(DIED.to_owned()),
+                                    },
+                                ));
+                            }
+                            Some(ServerMessage::ok(
+                                id,
+                                &WorkspaceListResult {
+                                    workspaces: vec![workspace()],
+                                },
+                            ))
+                        }
+                        Request::WorkspaceGet(_) => Some(ServerMessage::ok(id, &workspace())),
+                        // The login terminal: a PTY that ends on its own a
+                        // while later, which is what a login that was typed
+                        // through looks like from here.
+                        Request::SystemSetupPty(p) => {
+                            assert_eq!(p.action, SetupAction::ClaudeLogin);
+                            delay = LOGIN_EXIT_DELAY;
+                            after.push(ServerMessage::event(
+                                None,
+                                Event::PtyExit {
+                                    pty_id: PtyId(LOGIN_PTY.to_owned()),
+                                    code: 0,
+                                },
+                            ));
+                            Some(ServerMessage::ok(
+                                id,
+                                &PtyOpenResult {
+                                    pty_id: PtyId(LOGIN_PTY.to_owned()),
+                                },
+                            ))
+                        }
+                        // Should the window start an agent after the exit, it
+                        // gets one that lives: nothing here is about restarts.
+                        Request::AgentStart(_) => {
+                            after.push(ServerMessage::event(
+                                Some(WorkspaceId(WORKSPACE.to_owned())),
+                                Event::AgentStateChanged {
+                                    agent_id: AgentId("ag_authov_new".to_owned()),
+                                    state: AgentState::Idle,
+                                    detail: None,
+                                },
+                            ));
+                            Some(ServerMessage::ok(
+                                id,
+                                &AgentStartResult {
+                                    agent_id: AgentId("ag_authov_new".to_owned()),
+                                },
+                            ))
+                        }
+                        Request::AgentHistory(_) => Some(ServerMessage::ok(
+                            id,
+                            &HistoryResult {
+                                messages: vec![],
+                                state: AgentState::Idle,
+                                detail: None,
+                            },
+                        )),
+                        Request::FsListDir(_) => {
+                            Some(ServerMessage::ok(id, &ListDirResult { entries: vec![] }))
+                        }
+                        Request::FsWatch(_) => Some(ServerMessage::ok(id, &Empty {})),
+                        Request::WorkspaceChanges(_) => {
+                            Some(ServerMessage::ok(id, &ChangesResult { files: vec![] }))
+                        }
+                        Request::WorkspaceStatus(_) => Some(ServerMessage::ok(
+                            id,
+                            &WorkspaceStatusResult { entries: vec![] },
+                        )),
+                        Request::RepoDetectRunConfigs(_) => Some(ServerMessage::ok(
+                            id,
+                            &DetectRunConfigsResult {
+                                configs: vec![],
+                                network_allow: vec![],
+                                warnings: vec![],
+                            },
+                        )),
+                        Request::RunList(_) => {
+                            Some(ServerMessage::ok(id, &RunListResult { runs: vec![] }))
+                        }
+                        other => Some(ServerMessage::err(
+                            id,
+                            RpcError::internal(format!("not implemented: {}", other.method_name())),
+                        )),
+                    };
+                    let Some(reply) = reply else {
+                        break;
+                    };
+                    if w.lock()
+                        .await
+                        .write_all(codec::encode(&reply).as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if after.is_empty() {
+                        continue;
+                    }
+                    let w = w.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let mut w = w.lock().await;
+                        for message in after {
+                            if w.write_all(codec::encode(&message).as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        });
+
+        (addr, journal)
+    }
+
+    /// The one workspace: ready, Claude, with a live agent that is about to
+    /// die of its login.
+    fn workspace() -> WorkspaceInfo {
+        let mut info = super::workspace(WORKSPACE, NAME, WorkspaceState::Ready, &[]);
+        let record = AgentSummary {
+            id: AgentId(AGENT.to_owned()),
+            adapter: AgentAdapterKind::Claude,
+            state: AgentState::Idle,
+            session_id: Some(SESSION.to_owned()),
+            command: None,
+            model: None,
+            permission_mode: None,
+        };
+        info.agents = vec![record.id.clone()];
+        info.agent_records = vec![record];
+        info
+    }
+}

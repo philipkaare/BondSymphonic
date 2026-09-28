@@ -285,6 +285,7 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
         // composer that is taken away a moment later.
         view->setClaudeLoggedIn(m_claudeLoggedIn);
         view->setPrereqsAnswered(m_prereqsAnswered);
+        view->setClaudeAuthFailure(m_claudeAuthFailure);
         // And with what the window said about this workspace before the pane
         // existed, which for a workspace just created is all of it.
         applyWelcome(workspaceId, view);
@@ -308,6 +309,15 @@ void AgentArea::setPrereqsAnswered(bool answered) {
     for (TranscriptView* view : m_transcripts) {
         if (view != nullptr) {
             view->setPrereqsAnswered(answered);
+        }
+    }
+}
+
+void AgentArea::setClaudeAuthFailure(const QString& sentence) {
+    m_claudeAuthFailure = sentence;
+    for (TranscriptView* view : m_transcripts) {
+        if (view != nullptr) {
+            view->setClaudeAuthFailure(sentence);
         }
     }
 }
