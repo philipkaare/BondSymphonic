@@ -268,12 +268,12 @@ impl OutputTap for TokenCapture {
             return;
         };
         let path = self.path.clone();
-        self.pending = Some(tokio::task::spawn_blocking(move || {
-            match super::token::write(&path, &token) {
+        self.pending = Some(tokio::task::spawn_blocking(
+            move || match super::token::write(&path, &token) {
                 Ok(()) => info!(path = %path.display(), "long-lived claude token stored"),
                 Err(e) => warn!(path = %path.display(), "long-lived claude token not stored: {e}"),
-            }
-        }));
+            },
+        ));
     }
 
     /// Waits for the store `feed` started, if any. `claude setup-token` exits

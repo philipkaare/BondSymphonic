@@ -1165,7 +1165,10 @@ mod tests {
             let env = agent_auth_env(key, Some("sk-ant-oat01-t".into()));
             assert_eq!(
                 env,
-                vec![("CLAUDE_CODE_OAUTH_TOKEN".to_owned(), "sk-ant-oat01-t".to_owned())]
+                vec![(
+                    "CLAUDE_CODE_OAUTH_TOKEN".to_owned(),
+                    "sk-ant-oat01-t".to_owned()
+                )]
             );
         }
     }
