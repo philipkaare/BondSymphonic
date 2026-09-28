@@ -1,7 +1,8 @@
 # Codex adapter — design
 
-Date: 2026-09-28. Status: approved in chat by the user, section by section; this
-spec awaits their review before planning. It is sub-project 1 of 2: the second,
+Date: 2026-09-28. Status: approved in chat by the user, section by section;
+planning resumed on the user's instruction to continue. Separate sandboxes and
+proxies per backend were confirmed by the user during planning. It is sub-project 1 of 2: the second,
 an OpenCode adapter for OpenAI-compatible model servers (Ollama, vLLM, SGLang),
 reuses the backend layer this one introduces and gets its own spec.
 
@@ -23,10 +24,14 @@ Decisions made with the user:
 - The ChatGPT sign-in's rotating refresh token is handled by **one shared
   `CODEX_HOME`** bound into every Codex sandbox, with login failures surfaced the
   way Claude's are, and Setup suggesting an API key for many concurrent agents.
+- Agents using different backends in the same workspace use **separate
+  sandboxes and proxies**, sharing the workspace files. Adding Codex must not
+  expose its shared login directory or extra network defaults to Claude.
 
 Out of scope: OpenCode (sub-project 2); an agent loop of our own; Codex cloud
-tasks; Codex as an MCP server (removed upstream); per-command "ask every time"
-approvals (Codex removed `untrusted`).
+tasks; Codex as an MCP server; additional permission modes beyond the two chosen
+below. Preflight found `untrusted` in the 0.158.0 schema, so the earlier claim
+that it had been removed must not appear in UI copy.
 
 ## 2. The backend layer (shared with sub-project 2)
 
@@ -59,6 +64,29 @@ Claude unconditionally once it has refused `Terminal`.
   and permission-mode lists follow the chosen backend; the model list comes from
   that backend's `list_models` (`system.list_models` gains an `adapter` param,
   default Claude). The preselected backend is the Settings default (§2.1).
+
+### 2.0 Sandbox ownership
+
+The existing sandbox and proxy are per workspace, so backend-specific mounts
+and network defaults cannot be implemented by adding them to that shared
+sandbox. The user selected separate sandboxes per backend during planning.
+
+- Keep the existing workspace sandbox for Claude, terminals, file operations,
+  and runs, preserving its behavior.
+- Lazily create a companion sandbox per `(workspace, backend)` for Codex, with
+  its own home, runtime directory, proxy listener, and lifecycle generation.
+  Multiple Codex agents in that workspace reuse the Codex sandbox.
+- Bind the same workspace files and git protection mounts into both sandboxes.
+  Only the Codex sandbox receives the shared `CODEX_HOME` directory and Codex's
+  additional network defaults.
+- Workspace allowlist edits apply to each proxy, combined with its backend
+  defaults. Explicit user-added hosts continue to work in either sandbox.
+- Workspace restart, destruction, and daemon shutdown clean up all companion
+  processes and proxies. A stale watcher must not tear down a replacement.
+  A companion failure ends its agents without taking down the base sandbox.
+
+The companion registry should accommodate OpenCode later, but this sub-project
+does not implement or advertise that adapter.
 
 ### 2.1 Settings: the backends on equal footing
 
@@ -100,6 +128,8 @@ backend is the "real" one with the others bolted on.
   workspace sandbox. The binary is bound read-only at `/opt/bs/codex`, like
   `CLAUDE_IN_SANDBOX`. The version is pinned and probed like Claude's, because
   app-server is documented as experimental.
+- Preflight pins 0.158.0 and also requires its matching `codex-code-mode-host`
+  executable, bound read-only beside Codex at `/opt/bs/codex-code-mode-host`.
 - Start: `initialize` → `initialized` → `thread/start` with the worktree as cwd,
   the model, the approval policy (§3.3) and sandbox `danger-full-access` — Codex's
   own sandbox is bubblewrap too and does not nest reliably; our bwrap and proxy
@@ -131,7 +161,7 @@ Unrecognised notifications degrade to `System { subtype: "raw" }`, as
   with `accept` / `decline` (`acceptForSession` for "always").
 - Permission modes for Codex: **YOLO** (approval policy `never`, the default, as
   for Claude) and **"Ask when Codex wants to"** (`on-request`). The dialog says
-  plainly that "ask before every command" is not available for Codex.
+  plainly that BondSymphonic offers these two Codex approval modes.
 
 ## 4. Authentication
 
@@ -188,6 +218,12 @@ Done in the distro before the plan is executed, like the token work's §3:
 
 If 2 fails, the API key is written with `codex login --with-api-key` into a
 per-key `CODEX_HOME` instead; if 5 fails, the design comes back to the user.
+
+Execution update: the user explicitly deferred the real API-key check and
+authorized continuing implementation with local API-key transport tests.
+ChatGPT turns, commands/patches in the real outer sandbox, both approval types,
+resume, steer, and interrupt were captured on 0.158.0. See
+`../plans/notes/2026-09-28-codex-preflight.md` for evidence and validation limits.
 
 ## 8. Testing
 
