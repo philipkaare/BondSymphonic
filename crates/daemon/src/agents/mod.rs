@@ -265,6 +265,24 @@ async fn off_the_runtime(what: &'static str, f: impl FnOnce() + Send + 'static) 
     }
 }
 
+/// The environment given to the one command an agent's CLI runs -- never to
+/// the sandbox spec, which every process in the workspace inherits.
+///
+/// An `api_key` the IDE sent is an explicit choice and wins over the
+/// long-lived token; a blank key (the IDE's "unset" spelling) is treated as
+/// absent. With neither, nothing is added: the CLI falls back to whatever
+/// `.credentials.json` seeding already put in the workspace home.
+pub(crate) fn agent_auth_env(
+    api_key: Option<&str>,
+    token: Option<String>,
+) -> Vec<(String, String)> {
+    match (api_key.filter(|k| !k.is_empty()), token) {
+        (Some(key), _) => vec![("ANTHROPIC_API_KEY".to_owned(), key.to_owned())],
+        (None, Some(t)) => vec![("CLAUDE_CODE_OAUTH_TOKEN".to_owned(), t)],
+        (None, None) => vec![],
+    }
+}
+
 /// How long an agent's stdout reader waits for the session id it reported to
 /// reach the records file before it reads on.
 ///
@@ -870,13 +888,18 @@ impl AgentManager {
         claude::apply_repo_settings(&ws.worktree_path, &home)?;
         log_phase(&ws.id, "agent.start", "seed_home", phase);
 
-        // The key is given to this one command, never written into the sandbox
-        // spec: the spec's environment reaches every process in the workspace,
-        // including terminals the user opens.
-        let env = match p.options.api_key.as_deref().filter(|k| !k.is_empty()) {
-            Some(key) => vec![("ANTHROPIC_API_KEY".to_owned(), key.to_owned())],
-            None => vec![],
-        };
+        // The key or token is given to this one command, never written into
+        // the sandbox spec: the spec's environment reaches every process in
+        // the workspace, including terminals the user opens. A key the IDE
+        // sent is an explicit choice and wins; otherwise the long-lived token,
+        // which never needs refreshing -- see `token.rs` for why that matters.
+        let root = d.dirs.root.clone();
+        let token = tokio::task::spawn_blocking(move || {
+            crate::agents::token::read(&crate::agents::token::token_path(&root))
+        })
+        .await
+        .unwrap_or(None);
+        let env = agent_auth_env(p.options.api_key.as_deref(), token);
 
         let id = self.mint_id();
         let entry = Arc::new(AgentEntry::new(ws.id.clone(), p.adapter));
@@ -1125,6 +1148,31 @@ impl AgentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_api_key_the_ide_sent_wins_over_the_token() {
+        let env = agent_auth_env(Some("sk-ant-api03-k"), Some("sk-ant-oat01-t".into()));
+        assert_eq!(
+            env,
+            vec![("ANTHROPIC_API_KEY".to_owned(), "sk-ant-api03-k".to_owned())]
+        );
+    }
+
+    #[test]
+    fn the_token_is_given_when_there_is_no_api_key() {
+        for key in [None, Some("")] {
+            let env = agent_auth_env(key, Some("sk-ant-oat01-t".into()));
+            assert_eq!(
+                env,
+                vec![("CLAUDE_CODE_OAUTH_TOKEN".to_owned(), "sk-ant-oat01-t".to_owned())]
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_given_when_there_is_neither() {
+        assert!(agent_auth_env(None, None).is_empty());
+    }
 
     #[tokio::test]
     async fn transcript_store_round_trips_and_skips_corrupt_lines() {

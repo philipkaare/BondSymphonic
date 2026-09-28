@@ -69,7 +69,7 @@ fn home() -> std::path::PathBuf {
 /// where no real backend is at hand, such as the CLI's own startup check
 /// before it knows which backend it will run.
 pub async fn check_all() -> Vec<PrereqStatus> {
-    check_all_with_backend(&*sandbox::backend_for("noop")).await
+    check_all_with_backend(&*sandbox::backend_for("noop"), None).await
 }
 
 /// Whether Claude Code is logged in.
@@ -95,8 +95,16 @@ fn logged_in_from_json(out: &str) -> Option<bool> {
     v.get("loggedIn")?.as_bool()
 }
 
-async fn claude_auth(claude_bin: &str) -> PrereqStatus {
-    const FIX: &str = "run `claude auth login` in the distro, or set ANTHROPIC_API_KEY";
+async fn claude_auth(claude_bin: &str, token: Option<&std::path::Path>) -> PrereqStatus {
+    const FIX: &str = "run `claude setup-token` (Setup → Set up long-lived token) or `claude auth login` in the distro, or set ANTHROPIC_API_KEY";
+    // A stored long-lived token is authoritative on its own: it is what
+    // `agent_auth_env` (`agents/mod.rs`) actually gives the agent process, so
+    // this is the true answer to "will an agent be able to log in", and it is
+    // checked before the CLI is even asked -- a token file makes the `claude
+    // auth status` round trip unnecessary.
+    if token.and_then(crate::agents::token::read).is_some() {
+        return status("claude_auth", true, "long-lived token", FIX);
+    }
     if let Ok((_, out)) = run(claude_bin, &["auth", "status", "--json"]).await {
         if let Some(logged_in) = logged_in_from_json(&out) {
             return status(
@@ -268,7 +276,10 @@ async fn join_probes(
 /// `claude --version` 0.7 s, and at a true cold start the IDE's first
 /// `system.check_prereqs` had not answered 11 s in — which the IDE shows as
 /// "Claude Code is not logged in" over an empty Setup page.
-pub async fn check_all_with_backend(backend: &dyn SandboxBackend) -> Vec<PrereqStatus> {
+pub async fn check_all_with_backend(
+    backend: &dyn SandboxBackend,
+    token_path: Option<&std::path::Path>,
+) -> Vec<PrereqStatus> {
     // The same resolver the adapter spawns with, so the version this reports
     // and the binary an agent runs are the same file. Never a bare `claude`:
     // under WSL that can resolve to a Windows build on `/mnt/c`.
@@ -282,7 +293,7 @@ pub async fn check_all_with_backend(backend: &dyn SandboxBackend) -> Vec<PrereqS
         check_git(),
         check_bwrap_and_userns(),
         check_claude(&claude_bin),
-        claude_auth(&claude_bin),
+        claude_auth(&claude_bin, token_path),
         check_gh_and_auth(),
         backend.check(),
     )
@@ -324,6 +335,29 @@ mod tests {
         assert_eq!(parse_git_version("git version 2.43.0"), Some((2, 43)));
         assert_eq!(parse_git_version("nonsense"), None);
     }
+    #[tokio::test]
+    async fn a_token_file_passes_claude_auth_without_asking_the_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = crate::agents::token::token_path(dir.path());
+        crate::agents::token::write(&p, "sk-ant-oat01-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AA")
+            .unwrap();
+        let s = claude_auth("definitely-not-a-real-binary-xyz", Some(&p)).await;
+        assert!(s.ok, "{s:?}");
+        assert_eq!(s.detail, "long-lived token");
+    }
+
+    /// A malformed token file is the same as no file at all: `claude_auth`
+    /// falls through to the existing credentials-file fallback rather than
+    /// reporting success on garbage.
+    #[tokio::test]
+    async fn a_malformed_token_file_falls_through_to_the_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = crate::agents::token::token_path(dir.path());
+        std::fs::write(&p, "not a token").unwrap();
+        let s = claude_auth("definitely-not-a-real-binary-xyz", Some(&p)).await;
+        assert_ne!(s.detail, "long-lived token");
+    }
+
     #[tokio::test]
     async fn missing_binary_reports_fix_hint() {
         let s = check_binary(
