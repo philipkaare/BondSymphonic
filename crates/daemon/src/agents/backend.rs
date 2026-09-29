@@ -1,5 +1,5 @@
 //! CLI-specific preparation, separate from sandbox and process ownership.
-use super::{adapter::AgentAdapter, claude_backend::ClaudeBackend, AgentSink};
+use super::{adapter::AgentAdapter, claude_backend::ClaudeBackend, codex_backend::CodexBackend, AgentSink};
 use crate::{daemon::Daemon, sandbox::SandboxHandle, workspace::Workspace};
 use async_trait::async_trait;
 use bondsymphonic_proto::*;
@@ -50,15 +50,12 @@ pub fn backend_for(kind: AgentAdapterKind) -> Result<Arc<dyn Backend>, RpcError>
     match kind {
         AgentAdapterKind::Claude => Ok(Arc::new(ClaudeBackend)),
         AgentAdapterKind::Terminal => Err(RpcError::invalid_params("terminal agents use pty.open")),
-        AgentAdapterKind::Codex => Err(RpcError::new(
-            ErrorCode::PrereqMissing,
-            "Codex backend is not installed",
-        )),
+        AgentAdapterKind::Codex => Ok(Arc::new(CodexBackend)),
     }
 }
 
 pub fn known_backends() -> Vec<Arc<dyn Backend>> {
-    vec![Arc::new(ClaudeBackend)]
+    vec![Arc::new(ClaudeBackend),Arc::new(CodexBackend)]
 }
 
 pub fn runnable_adapters(backends: &[Arc<dyn Backend>]) -> Vec<AgentAdapterKind> {

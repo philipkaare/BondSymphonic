@@ -38,13 +38,15 @@ impl Handler for WorkspaceHandler {
         match req {
             // Overrides `SystemHandler`'s default (noop-backend) check: the daemon
             // knows which backend it actually started with.
-            Request::SystemCheckPrereqs {} => ok(CheckPrereqsResult {
-                items: crate::prereqs::check_all_with_backend(
+            Request::SystemCheckPrereqs {} => {
+                let mut items = crate::prereqs::check_all_with_backend(
                     d.backend.as_ref(),
                     Some(&crate::agents::token::token_path(&d.dirs.root)),
                 )
-                .await,
-            }),
+                .await;
+                items.extend(crate::agents::codex_backend::prerequisites(&d.dirs.root).await);
+                ok(CheckPrereqsResult {items})
+            },
             // The daemon fetches on the agent's own credentials (or the
             // caller's `api_key`), so this lives beside the other workspace
             // and agent methods rather than in `SystemHandler`, which has no
@@ -153,7 +155,7 @@ impl Handler for WorkspaceHandler {
                 });
                 let opened = d
                     .ptys
-                    .open_host(
+                    .open_host_with_env(
                         d,
                         crate::setup::setup_argv(p.action),
                         crate::sandbox::PtySize {
@@ -161,6 +163,7 @@ impl Handler for WorkspaceHandler {
                             rows: p.rows.max(1),
                         },
                         tap,
+                        crate::setup::setup_env(&d.dirs.root,p.action),
                     )
                     .await?;
                 // A host terminal runs unsandboxed and belongs to the connection that

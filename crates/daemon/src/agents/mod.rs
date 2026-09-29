@@ -11,6 +11,7 @@ pub mod claude;
 pub mod claude_backend;
 pub mod claude_stream;
 pub mod codex;
+pub mod codex_backend;
 pub mod codex_rpc;
 pub mod codex_stream;
 pub mod credentials;
@@ -811,6 +812,11 @@ impl AgentManager {
         p: AgentStartParams,
     ) -> Result<AgentStartResult, RpcError> {
         let backend = backend::backend_for(p.adapter)?;
+        // Preserve the public "not ready" refusal while restore owns the
+        // lifecycle gate. Read again under the gate below before preparing.
+        if d.workspace(&p.workspace_id)?.state != WorkspaceState::Ready {
+            return Err(RpcError::invalid_params(format!("workspace {} is not ready", p.workspace_id)));
+        }
         let _lifecycle = crate::workspace::lifecycle::gate(&p.workspace_id)
             .try_lock_owned()
             .map_err(|_| {
@@ -838,9 +844,6 @@ impl AgentManager {
                 ws.id
             )));
         }
-        let phase = Instant::now();
-        let handle = d.agent_sandboxes.ensure(d, &ws, backend.as_ref()).await?;
-        log_phase(&ws.id, "agent.start", "sandbox", phase);
         // One start at a time in a workspace, from here to the moment the
         // process is up.
         //
@@ -868,6 +871,9 @@ impl AgentManager {
         })?;
         log_phase(&ws.id, "agent.start", "gate", phase);
         let prepared = backend.prepare(d, &ws, &p.options).await?;
+        let phase = Instant::now();
+        let handle = d.agent_sandboxes.ensure(d, &ws, backend.as_ref()).await?;
+        log_phase(&ws.id, "agent.start", "sandbox", phase);
         let home = d.dirs.home(&ws.id);
 
         let id = self.mint_id();

@@ -25,7 +25,7 @@ pub const HOST_BACKEND: &str = "noop";
 
 /// Every action, for callers that need to enumerate them (tests, and any future
 /// listing of what the daemon can fix).
-pub const ALL_ACTIONS: [SetupAction; 7] = [
+pub const ALL_ACTIONS: [SetupAction; 10] = [
     SetupAction::ClaudeLogin,
     SetupAction::GhLogin,
     SetupAction::InstallClaude,
@@ -33,6 +33,9 @@ pub const ALL_ACTIONS: [SetupAction; 7] = [
     SetupAction::ClaudeLogout,
     SetupAction::GhLogout,
     SetupAction::ClaudeSetupToken,
+    SetupAction::InstallCodex,
+    SetupAction::CodexLogin,
+    SetupAction::CodexLogout,
 ];
 
 /// The command each action runs. The whole table is literal: an action selects
@@ -57,8 +60,18 @@ pub fn setup_argv(action: SetupAction) -> Vec<String> {
         // hands agents as `CLAUDE_CODE_OAUTH_TOKEN`; Task 3 captures its
         // output from this same terminal.
         SetupAction::ClaudeSetupToken => &["claude", "setup-token"],
+        SetupAction::InstallCodex => &["bash", "-lc", include_str!("../../../scripts/install-codex.sh")],
+        SetupAction::CodexLogin => &["codex", "-c", "cli_auth_credentials_store=\"file\"", "login", "--device-auth"],
+        SetupAction::CodexLogout => &["codex", "-c", "cli_auth_credentials_store=\"file\"", "logout"],
     };
     argv.iter().map(|s| (*s).to_string()).collect()
+}
+
+pub fn setup_env(root: &Path, action: SetupAction) -> Vec<(String,String)> {
+    match action {
+        SetupAction::CodexLogin | SetupAction::CodexLogout => vec![("CODEX_HOME".into(),crate::agents::codex_backend::codex_home(root).display().to_string())],
+        _ => vec![],
+    }
 }
 
 /// What has to happen before a setup terminal opens, ahead of `open_host`.
@@ -190,7 +203,7 @@ mod tests {
         for action in ALL_ACTIONS {
             let argv = setup_argv(action);
             assert!(
-                ["claude", "gh", "bash", "sudo"].contains(&argv[0].as_str()),
+                ["claude", "codex", "gh", "bash", "sudo"].contains(&argv[0].as_str()),
                 "{action:?} runs an unexpected program: {argv:?}"
             );
         }

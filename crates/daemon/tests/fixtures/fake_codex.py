@@ -3,6 +3,10 @@ import json
 import sys
 import time
 
+if "--version" in sys.argv:
+    print("codex-cli 0.158.0")
+    sys.exit(0)
+
 mode = sys.argv[1] if len(sys.argv) > 1 else "normal"
 initialized = False
 thread = "new-thread"
@@ -29,6 +33,13 @@ for line in sys.stdin:
         emit({"id": m["id"], "result": {"userAgent": "fake"}})
     elif method == "initialized":
         initialized = True
+    elif method == "model/list":
+        assert initialized
+        if mode == "models-error":
+            emit({"id":m["id"],"error":{"message":"model discovery failed"}})
+        else:
+            ident = "other-account" if mode == "models-other" else "second" if p.get("cursor") else "first"
+            emit({"id":m["id"],"result":{"data":[] if mode == "models-empty" else [{"id":ident,"displayName":ident}],"nextCursor":"page2" if mode == "models" and not p.get("cursor") else None}})
     elif method in ("thread/start", "thread/resume"):
         assert initialized
         thread = p.get("threadId", "new-thread")

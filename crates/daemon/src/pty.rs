@@ -223,12 +223,24 @@ impl PtyManager {
         size: PtySize,
         tap: Option<Box<dyn OutputTap>>,
     ) -> Result<PtyOpenResult, RpcError> {
+        self.open_host_with_env(d,argv,size,tap,Vec::new()).await
+    }
+
+    pub async fn open_host_with_env(
+        &self,
+        d: &Daemon,
+        argv: Vec<String>,
+        size: PtySize,
+        tap: Option<Box<dyn OutputTap>>,
+        mut env: Vec<(String,String)>,
+    ) -> Result<PtyOpenResult, RpcError> {
         let host = d.host().await?;
+        env.push(crate::setup::path_with_local_bin(&host.home));
         let child = host
             .handle
             .spawn(SandboxCommand {
                 argv,
-                env: vec![crate::setup::path_with_local_bin(&host.home)],
+                env,
                 cwd: None,
                 pty: Some(size),
             })

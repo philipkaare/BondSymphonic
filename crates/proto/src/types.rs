@@ -81,6 +81,9 @@ pub enum SetupAction {
     /// daemon captures it from the terminal's output and gives it to agents
     /// as `CLAUDE_CODE_OAUTH_TOKEN`.
     ClaudeSetupToken,
+    InstallCodex,
+    CodexLogin,
+    CodexLogout,
 }
 
 /// What `repo.inspect` knows about a path the user picked.
