@@ -2,6 +2,7 @@
 #include <QList>
 #include <QString>
 #include <QWidget>
+#include <QJsonObject>
 #include <functional>
 
 class AppController;
@@ -59,6 +60,8 @@ public:
     /// only have changed if something was run to change it, and this is the
     /// page that runs those things.
     bool ranAction() const;
+    void runAction(const QString& action);
+    void setBackendSettings(const QJsonObject& settings);
 
 protected:
     /// Re-elides the sign-in URL: the label's width is only known once the
@@ -123,7 +126,7 @@ private:
     /// Refused while another action's `system.setup_pty` is still in flight:
     /// the reply carries no pty id this page could close, so a second request
     /// would leave the first one's process running with nothing attached.
-    void runAction(const QString& action);
+    QJsonObject m_backendSettings;
     void onSetupPtyOpened(const QString& action, const QString& ptyId);
     /// A failed `system.setup_pty`. The page has to come out of its in-flight
     /// state itself: nothing else will, and the buttons stay dead until it does.

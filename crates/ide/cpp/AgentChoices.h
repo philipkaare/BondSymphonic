@@ -1,6 +1,7 @@
 #pragma once
 #include <QList>
 #include <QString>
+#include <QJsonArray>
 
 class QComboBox;
 
@@ -36,7 +37,7 @@ struct Choice {
 /// until [`setModels`] has replaced it with what `system.list_models` fetched;
 /// the same fallback comes back if a fetch fails, because [`setModels`] is
 /// simply never called then.
-const QList<Choice>& models();
+const QList<Choice>& models(const QString& backend = QStringLiteral("claude"));
 
 /// Replaces the models offered with `fetched`, keeping the empty "Default"
 /// entry first. Called once per connection, when the daemon's
@@ -49,6 +50,8 @@ const QList<Choice>& models();
 /// `AppController::modelsChecked` for what refills one, preserving its
 /// current selection.
 void setModels(const QList<Choice>& fetched);
+void setModels(const QString& backend, const QList<Choice>& fetched);
+void setDescriptors(const QJsonArray& descriptors);
 
 /// The permission modes offered, in the order they are offered.
 ///
@@ -64,23 +67,23 @@ void setModels(const QList<Choice>& fetched);
 /// that silently denies is worse than one that says it denies, so it says it.
 /// YOLO is first and is the default, because it is the only one that lets an
 /// agent finish a job -- and the sandbox is what makes that reasonable.
-const QList<Choice>& permissionModes();
+const QList<Choice>& permissionModes(const QString& backend = QStringLiteral("claude"));
 
 /// The sentence shown beside every permission-mode chooser, saying why the
 /// modes read the way they do. One string, because three dialogs offering three
 /// explanations of the same defect is three chances to leave one behind when it
 /// is fixed.
-QString permissionNote();
+QString permissionNote(const QString& backend = QStringLiteral("claude"));
 
 /// The label for an id, or the id itself when the list does not hold it -- a
 /// model name the user typed is shown as they typed it.
-QString labelForModel(const QString& id);
-QString labelForPermissionMode(const QString& id);
+QString labelForModel(const QString& id, const QString& backend = QStringLiteral("claude"));
+QString labelForPermissionMode(const QString& id, const QString& backend = QStringLiteral("claude"));
 
 /// Fills `combo` with the models, editable, and selects `selected`. An id the
 /// list does not hold becomes the edit text rather than being dropped, so a
 /// workspace created with a model this build has never heard of still shows it.
-void fillModelCombo(QComboBox* combo, const QString& selected);
+void fillModelCombo(QComboBox* combo, const QString& selected, const QString& backend = QStringLiteral("claude"));
 
 /// The id `combo` currently stands for: the data behind the label if its text
 /// matches one of the list's labels, or the text itself when it does not -- a
@@ -93,7 +96,7 @@ QString modelComboSelection(const QComboBox* combo);
 /// to the first entry -- the one that asks about everything -- for an id the
 /// list does not hold. A mode that cannot be shown must never silently become a
 /// quieter one.
-void fillPermissionCombo(QComboBox* combo, const QString& selected);
+void fillPermissionCombo(QComboBox* combo, const QString& selected, const QString& backend = QStringLiteral("claude"));
 
 /// The mode a Claude agent starts on when nothing else has been chosen. The
 /// mode is always sent, so this is a floor rather than a fallback.

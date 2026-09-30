@@ -205,8 +205,11 @@ pub struct Settings {
     /// settings dialog can say "stored in the Windows credential store" without
     /// reading the key back out just to find out whether there is one.
     pub api_key_set: bool,
+    pub backends: std::collections::BTreeMap<String,crate::model::backends::BackendSettings>,
+    pub default_backend: String,
     /// The permission mode a new Claude agent starts on, as the New Agent
     /// dialog's initial combo value.
+    #[serde(skip_serializing)]
     pub default_permission_mode: String,
     /// Which palette the application wears: `system` (whatever Windows is
     /// doing, and whatever it changes to at dusk), `light` or `dark`. A word
@@ -228,6 +231,8 @@ impl Default for Settings {
             daemon_path: "~/.bondsymphonic/bin/bondsymphonic-daemon".into(),
             log_level: "info".into(),
             api_key_set: false,
+            backends: crate::model::backends::default_settings(),
+            default_backend: "claude".into(),
             default_permission_mode: DEFAULT_PERMISSION_MODE.into(),
             theme: DEFAULT_THEME.into(),
             show_agent_meta: DEFAULT_SHOW_AGENT_META,
@@ -236,6 +241,20 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn from_json(raw:&str) -> Result<Self,serde_json::Error> {
+        let value:serde_json::Value=serde_json::from_str(raw)?;
+        let mut settings:Self=serde_json::from_value(value.clone())?;
+        if value.get("backends").and_then(|b|b.get("claude")).is_none() {
+            let mode=if settings.default_permission_mode==UNDOCUMENTED_PERMISSION_MODE {DOCUMENTED_ASK_MODE}else{&settings.default_permission_mode};
+            settings.backends.insert("claude".into(),crate::model::backends::BackendSettings{enabled:true,default_model:String::new(),default_permission_mode:mode.into()});
+        }
+        for (id,defaults) in crate::model::backends::default_settings(){settings.backends.entry(id).or_insert(defaults);}
+        let claude=settings.backends.get_mut("claude").expect("Claude defaults inserted");
+        if claude.default_permission_mode==UNDOCUMENTED_PERMISSION_MODE {claude.default_permission_mode=DOCUMENTED_ASK_MODE.into();}
+        settings.default_permission_mode=claude.default_permission_mode.clone();
+        Ok(settings)
+    }
+
     pub fn path() -> Option<PathBuf> {
         path_override(SETTINGS_PATH_ENV).or_else(|| config_dir().map(|d| d.join("settings.json")))
     }
@@ -274,7 +293,7 @@ impl Settings {
         // leave the file in place.
         let parsed = std::str::from_utf8(&bytes)
             .map_err(|e| e.to_string())
-            .and_then(|raw| serde_json::from_str::<Self>(raw).map_err(|e| e.to_string()));
+            .and_then(|raw| Self::from_json(raw).map_err(|e| e.to_string()));
         match parsed {
             Ok(mut settings) => {
                 if settings.default_permission_mode == UNDOCUMENTED_PERMISSION_MODE {
@@ -329,7 +348,10 @@ impl Settings {
                 std::fs::create_dir_all(dir)?;
             }
         }
-        let json = serde_json::to_string_pretty(self)
+        // Retain the legacy Rust setter while writing only the backend shape.
+        let mut stored=self.clone();
+        if let Some(claude)=stored.backends.get_mut("claude") {claude.default_permission_mode=self.default_permission_mode.clone();}
+        let json = serde_json::to_string_pretty(&stored)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let tmp = crate::model::persistence::temp_path(&p);
         match crate::model::persistence::write_and_rename(&tmp, &p, json.as_bytes()) {
@@ -438,6 +460,33 @@ pub fn api_key() -> Option<String> {
 /// flag, so a key deleted in Credential Manager is not still advertised.
 pub fn api_key_set() -> bool {
     api_key().is_some()
+}
+
+pub fn backend_api_key(kind:bondsymphonic_proto::AgentAdapterKind) -> Option<String> {
+    if kind==bondsymphonic_proto::AgentAdapterKind::Claude {return api_key();}
+    let name=crate::model::backends::credential_name(kind)?;
+    match keyring::Entry::new(KEYRING_SERVICE,name).and_then(|e|e.get_password()) {
+        Ok(key)=>normalise_api_key(&key).map(str::to_owned),
+        Err(keyring::Error::NoEntry)=>None,
+        Err(e)=>{tracing::warn!("backend credential could not be read: {e}");None}
+    }
+}
+
+pub fn set_backend_api_key(kind:bondsymphonic_proto::AgentAdapterKind,key:&str) -> bool {
+    if kind==bondsymphonic_proto::AgentAdapterKind::Claude {return set_api_key(key);}
+    let Some(name)=crate::model::backends::credential_name(kind) else{return false};
+    let Some(key)=normalise_api_key(key) else{return false};
+    match keyring::Entry::new(KEYRING_SERVICE,name).and_then(|e|e.set_password(key)) {
+        Ok(())=>true,Err(e)=>{tracing::warn!("backend credential could not be stored: {e}");false}
+    }
+}
+
+pub fn clear_backend_api_key(kind:bondsymphonic_proto::AgentAdapterKind) -> bool {
+    if kind==bondsymphonic_proto::AgentAdapterKind::Claude {return clear_api_key();}
+    let Some(name)=crate::model::backends::credential_name(kind) else{return false};
+    match keyring::Entry::new(KEYRING_SERVICE,name).and_then(|e|e.delete_credential()) {
+        Ok(())|Err(keyring::Error::NoEntry)=>true,Err(e)=>{tracing::warn!("backend credential could not be removed: {e}");false}
+    }
 }
 
 /// Removes the key. Deleting one that is not there is success: the caller asked

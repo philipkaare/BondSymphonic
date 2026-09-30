@@ -1,6 +1,8 @@
 #include "AgentChoices.h"
 #include <QComboBox>
 #include <QLineEdit>
+#include <QMap>
+#include <QJsonObject>
 
 namespace {
 
@@ -26,10 +28,10 @@ void fill(QComboBox* combo, const QList<agentchoices::Choice>& list) {
 /// fallback below rather than overwriting it, so a fetch that never comes back
 /// (an old daemon, one with no Claude credentials) leaves the fallback in
 /// place rather than an empty combo.
-QList<agentchoices::Choice>& fetchedModels() {
-    static QList<agentchoices::Choice> models;
-    return models;
-}
+QMap<QString, QList<agentchoices::Choice>> backendModels;
+QMap<QString, QList<agentchoices::Choice>> backendModes;
+QMap<QString, QString> backendNotes;
+QList<agentchoices::Choice>& fetchedModels() { return backendModels[QStringLiteral("claude")]; }
 
 /// Whether [`fetchedModels`] holds a real answer. A plain `bool` rather than
 /// `fetchedModels().isEmpty()`, because "Default" alone -- a fetch that came
@@ -41,7 +43,10 @@ bool& hasFetchedModels() {
 
 } // namespace
 
-const QList<agentchoices::Choice>& agentchoices::models() {
+const QList<agentchoices::Choice>& agentchoices::models(const QString& backend) {
+    if (backendModels.contains(backend)) return backendModels[backend];
+    static const QList<Choice> defaultOnly{{QStringLiteral("Default"), QString()}};
+    if (backend != QLatin1String("claude")) return defaultOnly;
     // The built-in fallback: what a dropdown shows until the first
     // `system.list_models` answers, and what it goes back to showing if a
     // fetch fails. Kept in the shape `newest_per_family` -- the daemon-side
@@ -63,14 +68,21 @@ const QList<agentchoices::Choice>& agentchoices::models() {
 }
 
 void agentchoices::setModels(const QList<Choice>& fetched) {
-    QList<Choice>& storage = fetchedModels();
+    setModels(QStringLiteral("claude"), fetched);
+}
+
+void agentchoices::setModels(const QString& backend, const QList<Choice>& fetched) {
+    QList<Choice>& storage = backendModels[backend];
     storage.clear();
     storage.append({ QStringLiteral("Default"), QStringLiteral("") });
     storage += fetched;
     hasFetchedModels() = true;
 }
 
-const QList<agentchoices::Choice>& agentchoices::permissionModes() {
+const QList<agentchoices::Choice>& agentchoices::permissionModes(const QString& backend) {
+    if (backendModes.contains(backend)) return backendModes[backend];
+    static const QList<Choice> empty;
+    if (backend != QLatin1String("claude")) return empty;
     // The labels say what these modes DO here, which is not what their names
     // promise. Claude Code asks its host before running a tool that needs
     // approval, and the daemon passes `--permission-prompts host` without ever
@@ -89,28 +101,30 @@ const QList<agentchoices::Choice>& agentchoices::permissionModes() {
     return kModes;
 }
 
-QString agentchoices::permissionNote() {
+QString agentchoices::permissionNote(const QString& backend) {
+    if (backendNotes.contains(backend)) return backendNotes[backend];
+    if (backend != QLatin1String("claude")) return QString();
     return QStringLiteral(
         "Claude Code cannot reach this window to ask, so a tool that needs approval is refused "
         "rather than queued. YOLO runs everything — the sandbox, the worktree and the network "
         "proxy are what make that reasonable.");
 }
 
-QString agentchoices::labelForModel(const QString& id) {
-    const QString label = labelIn(models(), id);
+QString agentchoices::labelForModel(const QString& id, const QString& backend) {
+    const QString label = labelIn(models(backend), id);
     return label.isEmpty() ? id : label;
 }
 
-QString agentchoices::labelForPermissionMode(const QString& id) {
-    const QString label = labelIn(permissionModes(), id);
+QString agentchoices::labelForPermissionMode(const QString& id, const QString& backend) {
+    const QString label = labelIn(permissionModes(backend), id);
     return label.isEmpty() ? id : label;
 }
 
-void agentchoices::fillModelCombo(QComboBox* combo, const QString& selected) {
+void agentchoices::fillModelCombo(QComboBox* combo, const QString& selected, const QString& backend) {
     // Editable, because Claude Code takes any model name and a list that
     // refused one would be this IDE deciding what the CLI supports.
     combo->setEditable(true);
-    fill(combo, models());
+    fill(combo, models(backend));
     const int index = combo->findData(selected);
     if (index >= 0) {
         combo->setCurrentIndex(index);
@@ -133,10 +147,11 @@ QString agentchoices::modelComboSelection(const QComboBox* combo) {
     return listed >= 0 ? combo->itemData(listed).toString() : shown;
 }
 
-void agentchoices::fillPermissionCombo(QComboBox* combo, const QString& selected) {
+void agentchoices::fillPermissionCombo(QComboBox* combo, const QString& selected, const QString& backend) {
     combo->setEditable(false);
-    fill(combo, permissionModes());
-    const int index = combo->findData(selected);
+    fill(combo, permissionModes(backend));
+    const QString mode = backend == "claude" && selected == "default" ? QStringLiteral("manual") : selected;
+    const int index = combo->findData(mode);
     if (index >= 0) {
         combo->setCurrentIndex(index);
         return;
@@ -146,8 +161,24 @@ void agentchoices::fillPermissionCombo(QComboBox* combo, const QString& selected
     // read is not consent to run every tool unasked. Restrictive here means
     // "refuses", which is useless but is the user's to discover rather than
     // ours to decide for them.
-    const int manual = combo->findData(QStringLiteral("manual"));
+    if (!mode.isEmpty()) { combo->addItem(mode, mode); combo->setCurrentIndex(combo->count()-1); return; }
+    const int manual = combo->findData(backend == QLatin1String("claude") ? QStringLiteral("manual") : QStringLiteral("on-request"));
     combo->setCurrentIndex(manual >= 0 ? manual : 0);
+}
+
+void agentchoices::setDescriptors(const QJsonArray& descriptors) {
+    backendModes.clear(); backendNotes.clear();
+    for (const auto& value : descriptors) {
+        const auto descriptor=value.toObject();
+        const auto id=descriptor.value("id").toString();
+        QList<Choice> modes;
+        for (const auto& entry : descriptor.value("permission_modes").toArray()) {
+            const auto mode=entry.toObject();
+            modes.append({mode.value("label").toString(),mode.value("id").toString()});
+        }
+        backendModes.insert(id,modes);
+        backendNotes.insert(id,descriptor.value("permission_note").toString());
+    }
 }
 
 // The offscreen widget checks. See the note in `EditorArea.cpp`; `build.rs`
@@ -266,7 +297,9 @@ extern "C" std::int32_t bs_widget_test_agent_choices_are_one_list() {
 }
 
 void agentchoices::resetModelsForTest() {
-    fetchedModels().clear();
+    backendModels.clear();
+    backendModes.clear();
+    backendNotes.clear();
     hasFetchedModels() = false;
 }
 

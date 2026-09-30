@@ -491,7 +491,11 @@ impl qobject::TranscriptModel {
             .flatten();
         // "Always allow" only means anything alongside Allow: there is no
         // "always deny" in the permission bar.
-        if allow && always_allow {
+        let kind=serde_json::from_str::<serde_json::Value>(&self.rust().options_json.to_string()).ok()
+            .and_then(|v|v.get("adapter").and_then(|v|v.as_str()).and_then(crate::model::backends::parse))
+            .unwrap_or(bondsymphonic_proto::AgentAdapterKind::Claude);
+        let (decision,remember)=crate::model::backends::permission_reply(kind,allow,always_allow);
+        if remember {
             if let Some(name) = tool {
                 self.as_mut().rust_mut().always_allow.insert(name);
             }
@@ -500,11 +504,6 @@ impl qobject::TranscriptModel {
             self.as_mut().rust_mut().transcript.pending = None;
             self.as_mut().sync_pending();
         }
-        let decision = if allow {
-            PermissionDecision::Allow
-        } else {
-            PermissionDecision::Deny
-        };
         let message = message.to_string();
         self.send_permission_reply(
             request_id,

@@ -10,6 +10,7 @@ use crate::client::router::EventRouter;
 use crate::client::{ClientError, DaemonClient};
 use crate::launcher::{self, LaunchSpec};
 use crate::model::app_state::{compose_status, ConnectionState, Workspaces};
+use crate::model::backends;
 use crate::model::persistence::{self, StateFile, StateStore};
 use crate::model::transcript::agent_state_word;
 use crate::qobjects::settings::Settings;
@@ -44,6 +45,11 @@ pub struct Shared {
 }
 
 static SHARED: OnceLock<std::sync::Mutex<Option<Shared>>> = OnceLock::new();
+
+static MODEL_GENERATIONS: OnceLock<std::sync::Mutex<backends::ReplyGenerations>> = OnceLock::new();
+fn model_generations() -> &'static std::sync::Mutex<backends::ReplyGenerations> {
+    MODEL_GENERATIONS.get_or_init(Default::default)
+}
 
 /// Set once the connection has ended, so an operation attempted afterwards can
 /// say the connection was lost rather than that it never started.
@@ -153,6 +159,7 @@ pub fn publish_shared(shared: Shared) {
 /// made before the reconnect lands issues a request on it and fails with a
 /// protocol error instead of a sentence the user can act on.
 pub fn on_connection_lost() {
+    model_generations().lock().unwrap().disconnect();
     CONNECTION_WAS_LOST.store(true, std::sync::atomic::Ordering::SeqCst);
     *shared_slot().lock().expect("shared handle mutex poisoned") = None;
 }
@@ -812,6 +819,29 @@ pub mod qobject {
         #[qinvokable]
         fn capabilities_json(self: &AppController) -> QString;
 
+        #[qinvokable]
+        fn backend_descriptors_json(self: &AppController) -> QString;
+        #[qinvokable]
+        fn backend_settings_json(self: &AppController) -> QString;
+        #[qinvokable]
+        fn save_backend_settings(self: Pin<&mut AppController>, json: QString) -> bool;
+        #[qinvokable]
+        fn backend_api_key_set(self: &AppController, backend: QString) -> bool;
+        #[qinvokable]
+        fn backend_logged_in(self: &AppController, backend: QString) -> bool;
+        #[qinvokable]
+        fn backend_auth_failure(self: &AppController, backend: QString) -> QString;
+        #[qinvokable]
+        fn set_backend_api_key(self: Pin<&mut AppController>, backend: QString, key: QString) -> bool;
+        #[qinvokable]
+        fn clear_backend_api_key(self: Pin<&mut AppController>, backend: QString) -> bool;
+        #[qinvokable]
+        fn refresh_backend_models(self: Pin<&mut AppController>, backend: QString);
+        #[qsignal]
+        fn backend_settings_changed(self: Pin<&mut AppController>);
+        #[qsignal]
+        fn backend_models_checked(self: Pin<&mut AppController>, backend: QString, json: QString, generation: i64);
+
         /// Stores the Anthropic API key in the Windows credential store,
         /// replacing any previous one. Returns whether it was stored.
         ///
@@ -1435,6 +1465,9 @@ pub fn network_denial(ws: &Option<WorkspaceId>, ev: &Event) -> Option<(String, S
 /// point of `system.setup_pty`, and a typo should fail loudly and locally.
 fn parse_setup_action(action: &str) -> Option<SetupAction> {
     match action {
+        "codex_login" => Some(SetupAction::CodexLogin),
+        "codex_logout" => Some(SetupAction::CodexLogout),
+        "install_codex" => Some(SetupAction::InstallCodex),
         "claude_login" => Some(SetupAction::ClaudeLogin),
         "gh_login" => Some(SetupAction::GhLogin),
         "install_claude" => Some(SetupAction::InstallClaude),
@@ -1492,6 +1525,10 @@ fn publish_connection_loss(qt: &QtHandle, losing: ConnectionState) {
         // from nothing, and an override held across a daemon restart would
         // shut the composer over a login the user may have renewed meanwhile.
         q.as_mut().set_claude_auth_override(None);
+        q.as_mut().rust_mut().codex_auth_failure=None;
+        q.as_mut().rust_mut().codex_login_pty=None;
+        q.as_mut().rust_mut().agent_backends.clear();
+        q.as_mut().backend_settings_changed();
         q.set_state(losing);
     });
 }
@@ -1582,6 +1619,9 @@ pub struct AppControllerRust {
     /// having been done. Only those three: an `install_claude` or a GitHub
     /// login says nothing about whether the Claude token is alive.
     login_pty: Option<PtyId>,
+    codex_login_pty: Option<PtyId>,
+    codex_auth_failure: Option<String>,
+    agent_backends: std::collections::HashMap<String,AgentAdapterKind>,
     /// Whether a prerequisite answer should open Settings on Setup, and
     /// whether one already has. See [`SetupPrompt`].
     setup_prompt: SetupPrompt,
@@ -1609,6 +1649,9 @@ impl Default for AppControllerRust {
             claude_auth_override: None,
             claude_auth_failure: QString::from(""),
             login_pty: None,
+            codex_login_pty: None,
+            codex_auth_failure: None,
+            agent_backends: Default::default(),
             setup_prompt: SetupPrompt::default(),
         }
     }
@@ -1897,8 +1940,9 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
                     // as an exit: a token the server refuses leaves the CLI
                     // running, and the turn's error is all it says.
                     if matches!(state, AgentState::Exited | AgentState::Error) {
-                        if let Some(sentence) = auth_failure_in(&detail) {
-                            q.as_mut().set_claude_auth_override(Some(sentence));
+                        let backend=q.as_ref().rust().agent_backends.get(&id).copied();
+                        if let Some(backend)=backend {
+                            q.as_mut().note_backend_auth_error(backend,&detail);
                         }
                     }
                     q.agent_state_changed(
@@ -1917,6 +1961,12 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
                     if q.as_ref().rust().login_pty.as_ref() == Some(&pty_id) {
                         q.as_mut().rust_mut().login_pty = None;
                         q.as_mut().set_claude_auth_override(None);
+                    }
+                    if q.as_ref().rust().codex_login_pty.as_ref()==Some(&pty_id) {
+                        q.as_mut().rust_mut().codex_login_pty=None;
+                        q.as_mut().rust_mut().codex_auth_failure=None;
+                        q.as_mut().refresh_backend_models(QString::from("codex"));
+                        q.backend_settings_changed();
                     }
                 });
             }
@@ -2011,7 +2061,19 @@ async fn check_prereqs(client: DaemonClient, qt: QtHandle) {
 ///
 /// Answers whether the daemon answered at all, which is what decides whether
 /// the caller retries. A list full of failing prerequisites is an answer.
+fn prerequisite_enabled(name: &str) -> bool {
+    let settings=Settings::load();
+    for id in ["claude","codex"] {
+        if name==id || name.starts_with(&format!("{id}_")) {
+            return settings.backends.get(id).is_some_and(|s|s.enabled);
+        }
+    }
+    true
+}
+
 async fn run_prereq_check(client: &DaemonClient, qt: &QtHandle) -> bool {
+    let connection=connection_generation();
+    let generation=model_generations().lock().unwrap().begin("prereqs");
     let items = match client
         .request::<CheckPrereqsResult>(Request::SystemCheckPrereqs {})
         .await
@@ -2024,7 +2086,7 @@ async fn run_prereq_check(client: &DaemonClient, qt: &QtHandle) -> bool {
     };
     let failures: Vec<String> = items
         .iter()
-        .filter(|i| !i.ok)
+        .filter(|i| !i.ok && prerequisite_enabled(&i.name))
         .map(|i| {
             let fix = i
                 .fix_hint
@@ -2053,6 +2115,7 @@ async fn run_prereq_check(client: &DaemonClient, qt: &QtHandle) -> bool {
         claude_auth_ok: claude_auth_ok(&items),
     };
     let _ = qt.queue(move |mut q| {
+        if connection_generation()!=connection || !model_generations().lock().unwrap().accepts("prereqs",generation){return;}
         q.as_mut().apply_prereqs(answer);
         if !failures.is_empty() {
             q.prereq_warning(QString::from(&failures.join("\n")));
@@ -2073,9 +2136,15 @@ async fn run_prereq_check(client: &DaemonClient, qt: &QtHandle) -> bool {
 /// because the daemon answer is cached for an hour and the next connection
 /// tries again regardless.
 async fn fetch_models(client: DaemonClient, qt: QtHandle) {
+    let generation=model_generations().lock().unwrap().begin("claude");
+    fetch_backend_models(client,qt,AgentAdapterKind::Claude,generation).await;
+}
+
+async fn fetch_backend_models(client: DaemonClient, qt: QtHandle, kind: AgentAdapterKind, generation: u64) {
+    let connection=connection_generation();
     let params = ListModelsParams {
-        adapter: None,
-        api_key: api_key_for_start(),
+        adapter: (kind!=AgentAdapterKind::Claude).then_some(kind),
+        api_key: crate::qobjects::settings::backend_api_key(kind),
     };
     let models = match client
         .request::<ListModelsResult>(Request::SystemListModels(params))
@@ -2087,8 +2156,10 @@ async fn fetch_models(client: DaemonClient, qt: QtHandle) {
             return;
         }
     };
-    let choices = crate::model::models::model_choices(&models);
-    if choices.is_empty() {
+    let choices = if kind==AgentAdapterKind::Claude {crate::model::models::model_choices(&models)} else {
+        models.into_iter().map(|m|crate::model::models::ModelChoice{id:m.id,label:m.display_name}).collect()
+    };
+    if kind==AgentAdapterKind::Claude && choices.is_empty() {
         // Every id failed to start with `claude-`, or the daemon answered
         // with no models at all: nothing here is worth showing over the
         // fallback list.
@@ -2101,7 +2172,11 @@ async fn fetch_models(client: DaemonClient, qt: QtHandle) {
         families = choices.len(),
         "fetched the newest model per family"
     );
-    let _ = qt.queue(move |mut q| q.as_mut().models_checked(QString::from(&json)));
+    let _ = qt.queue(move |mut q| {
+        if connection_generation()!=connection || !model_generations().lock().unwrap().accepts(backends::word(kind),generation){return;}
+        if kind==AgentAdapterKind::Claude {q.as_mut().models_checked(QString::from(&json));}
+        q.backend_models_checked(QString::from(backends::word(kind)),QString::from(&json),generation as i64);
+    });
 }
 
 /// One prerequisite check, as the answers the UI actually asks for.
@@ -2125,10 +2200,6 @@ struct PrereqAnswer {
 /// Parses the options a dialog built and merges the stored API key in. An
 /// unparseable string is not fatal: the daemon's defaults are a working agent,
 /// which is a better answer than refusing to start one.
-fn start_options(options_json: &str) -> AgentStartOptions {
-    start_options_with_default(options_json, &Settings::load().default_permission_mode)
-}
-
 /// [`start_options`] with the user's default permission mode passed in.
 ///
 /// A start that names no mode gets the default rather than the CLI's own,
@@ -2136,6 +2207,7 @@ fn start_options(options_json: &str) -> AgentStartOptions {
 /// remembers as started without one -- anything started before the IDE sent a
 /// mode, and so every restart and automatic resume of it since -- used to go
 /// on asking for approvals whatever the user had chosen in Settings.
+#[cfg(test)]
 fn start_options_with_default(options_json: &str, default_mode: &str) -> AgentStartOptions {
     // Written out rather than parsed from `{}`: `AgentStartOptions` derives no
     // `Default`, and a literal turns a future proto change into a compile
@@ -2173,12 +2245,13 @@ async fn start_agent_and_prompt(
     shared: Shared,
     qt: QtHandle,
     workspace: WorkspaceId,
+    adapter: AgentAdapterKind,
     options: AgentStartOptions,
     initial_prompt: String,
 ) {
     let params = AgentStartParams {
         workspace_id: workspace.clone(),
-        adapter: AgentAdapterKind::Claude,
+        adapter,
         options,
     };
     let agent_id = match shared
@@ -2188,12 +2261,17 @@ async fn start_agent_and_prompt(
     {
         Ok(res) => res.agent_id,
         Err(e) => {
+            let detail=e.to_string();
+            let _=qt.queue(move |mut q|q.as_mut().note_backend_auth_error(adapter,&detail));
             report_workspace_op_failure(&qt, workspace.to_string(), "agent.start", e.to_string());
             return;
         }
     };
     let (ws, id) = (workspace.to_string(), agent_id.to_string());
-    let _ = qt.queue(move |q| q.agent_started(QString::from(&ws), QString::from(&id)));
+    let _ = qt.queue(move |mut q| {
+        q.as_mut().rust_mut().agent_backends.insert(id.clone(),adapter);
+        q.agent_started(QString::from(&ws), QString::from(&id));
+    });
 
     if initial_prompt.is_empty() {
         return;
@@ -2227,6 +2305,11 @@ async fn load_workspace_list(client: DaemonClient, qt: QtHandle) {
                 tracing::info!(count = res.workspaces.len(), attempt, "workspaces_listed");
                 let list = res.workspaces;
                 let _ = qt.queue(move |mut q| {
+                    for workspace in &list {
+                        for agent in &workspace.agent_records {
+                            q.as_mut().rust_mut().agent_backends.insert(agent.id.to_string(),agent.adapter);
+                        }
+                    }
                     // The first list is the one the persisted arrangement is
                     // reconciled against: the groups come back as the user left
                     // them, and the workspaces the daemon has lost are dropped
@@ -2576,7 +2659,8 @@ async fn connect_once(
         // State first, then the version, so `apply_daemon_version`
         // recomposes the text as "daemon: connected v<version>".
         q.as_mut().set_state(ConnectionState::Connected);
-        q.apply_daemon_version(QString::from(version.as_str()));
+        q.as_mut().apply_daemon_version(QString::from(version.as_str()));
+        q.backend_settings_changed();
     });
 
     if first {
@@ -2652,7 +2736,7 @@ impl qobject::AppController {
         self: Pin<&mut Self>,
         params: WorkspaceCreateParams,
         echo: CreateEcho,
-        agent: Option<(AgentStartOptions, String)>,
+        agent: Option<(AgentAdapterKind, AgentStartOptions, String)>,
     ) {
         let qt = self.qt_thread();
         // The same rule the dialog greys Create out on, applied again where the
@@ -2701,8 +2785,8 @@ impl qobject::AppController {
                     QString::from(&echo.run_config),
                 )
             });
-            if let Some((options, prompt)) = agent {
-                start_agent_and_prompt(shared, qt, id, options, prompt).await;
+            if let Some((adapter, options, prompt)) = agent {
+                start_agent_and_prompt(shared, qt, id, adapter, options, prompt).await;
             }
         });
     }
@@ -2751,6 +2835,10 @@ impl qobject::AppController {
         in_place: bool,
     ) {
         let options_json = options_json.to_string();
+        let (adapter, options) = match self.resolved_start(&options_json) {
+            Ok(start) => start,
+            Err(message) => { report_failure(&self.qt_thread(), "agent.start", message); return; }
+        };
         self.create_workspace_inner(
             create_params(
                 repo_path.to_string(),
@@ -2761,7 +2849,7 @@ impl qobject::AppController {
             ),
             CreateEcho {
                 group: group.to_string(),
-                adapter: "claude".to_owned(),
+                adapter: backends::word(adapter).to_owned(),
                 command: String::new(),
                 // Echoed back to the window verbatim, so the tab keeps what the
                 // user asked for and can start the agent again with it. The API
@@ -2770,14 +2858,17 @@ impl qobject::AppController {
                 options_json: options_json.clone(),
                 run_config: run_config.to_string(),
             },
-            Some((start_options(&options_json), initial_prompt.to_string())),
+            Some((adapter, options, initial_prompt.to_string())),
         );
     }
 
     pub fn start_agent(self: Pin<&mut Self>, workspace_id: QString, options_json: QString) {
         let qt = self.qt_thread();
         let workspace = WorkspaceId(workspace_id.to_string());
-        let options = start_options(&options_json.to_string());
+        let (adapter, options) = match self.resolved_start(&options_json.to_string()) {
+            Ok(start) => start,
+            Err(message) => { report_workspace_op_failure(&qt, workspace.to_string(), "agent.start", message); return; }
+        };
         let shared = match require_connection() {
             Ok(shared) => shared,
             // Named, like the in-flight failure in `start_agent_and_prompt`:
@@ -2797,6 +2888,7 @@ impl qobject::AppController {
             shared,
             qt,
             workspace,
+            adapter,
             options,
             String::new(),
         ));
@@ -3118,6 +3210,10 @@ impl qobject::AppController {
                     )
                     .then(|| res.pty_id.clone());
                     let _ = qt.queue(move |mut q| {
+                        if matches!(action,SetupAction::CodexLogin|SetupAction::CodexLogout) {
+                            q.as_mut().rust_mut().codex_login_pty=Some(res.pty_id);
+                            model_generations().lock().unwrap().begin("codex");
+                        }
                         if let Some(pty) = login {
                             q.as_mut().rust_mut().login_pty = Some(pty);
                         }
@@ -3192,6 +3288,17 @@ impl qobject::AppController {
     /// The whole point of the struct is that nothing downstream parses the list
     /// again: it is read once, where the daemon's reply is decoded.
     fn apply_prereqs(mut self: Pin<&mut Self>, answer: PrereqAnswer) {
+        // A successful installation becomes runnable without reconnecting the daemon.
+        if let (Ok(mut caps),Ok(items))=(serde_json::from_str::<Capabilities>(&self.rust().capabilities.to_string()),serde_json::from_str::<Vec<PrereqStatus>>(&answer.json)) {
+            for descriptor in &caps.backends {
+                let name=backends::word(descriptor.id);
+                if let Some(item)=items.iter().find(|item|item.name==name) {
+                    caps.adapters.retain(|id|*id!=descriptor.id);
+                    if item.ok {caps.adapters.push(descriptor.id);}
+                }
+            }
+            self.as_mut().rust_mut().capabilities=QString::from(&serde_json::to_string(&caps).unwrap_or_default());
+        }
         {
             let mut rust = self.as_mut().rust_mut();
             rust.prereqs_json = QString::from(&answer.json);
@@ -3208,7 +3315,8 @@ impl qobject::AppController {
         // login the CLI has just reported dead is exactly the answer the
         // override exists to correct, and the page must not draw it.
         let json = self.as_ref().published_prereqs_json();
-        self.prereqs_checked(json);
+        self.as_mut().prereqs_checked(json);
+        self.backend_settings_changed();
     }
 
     pub fn should_auto_open_setup(&self) -> bool {
@@ -3228,6 +3336,105 @@ impl qobject::AppController {
 
     pub fn capabilities_json(&self) -> QString {
         self.rust().capabilities.clone()
+    }
+
+    fn backend_descriptors(&self) -> Vec<BackendDescriptor> {
+        serde_json::from_str::<Capabilities>(&self.rust().capabilities.to_string()).ok()
+            .filter(|c| !c.backends.is_empty()).map(|c|c.backends)
+            .unwrap_or_else(backends::legacy_descriptors)
+    }
+
+    fn resolved_start(&self, raw: &str) -> Result<(AgentAdapterKind, AgentStartOptions), String> {
+        let (kind, mut options)=backends::resolve_start(raw,&Settings::load(),&self.backend_descriptors())?;
+        if let Ok(caps)=serde_json::from_str::<Capabilities>(&self.rust().capabilities.to_string()) {
+            if !caps.adapters.contains(&kind) {return Err(format!("Install {} in Settings before starting an agent",backends::word(kind)));}
+        }
+        options.api_key=crate::qobjects::settings::backend_api_key(kind);
+        Ok((kind,options))
+    }
+
+    pub fn backend_descriptors_json(&self) -> QString {
+        QString::from(&serde_json::to_string(&self.backend_descriptors()).unwrap_or_default())
+    }
+
+    pub fn backend_settings_json(&self) -> QString {
+        let s=Settings::load();
+        QString::from(&serde_json::json!({"backends":s.backends,"default_backend":s.default_backend}).to_string())
+    }
+
+    pub fn save_backend_settings(mut self: Pin<&mut Self>, json: QString) -> bool {
+        let Ok(value)=serde_json::from_str::<serde_json::Value>(&json.to_string()) else{return false};
+        let Ok(mut settings)=Settings::try_load() else{return false};
+        if let Some(entries)=value.get("backends").and_then(|v|v.as_object()) {
+            for (id,value) in entries {
+                let Ok(entry)=serde_json::from_value::<backends::BackendSettings>(value.clone()) else{return false};
+                settings.backends.insert(id.clone(),entry);
+            }
+        }
+        if let Some(id)=value.get("default_backend").and_then(|v|v.as_str()) {settings.default_backend=id.into();}
+        if let Some(claude)=settings.backends.get("claude") {settings.default_permission_mode=claude.default_permission_mode.clone();}
+        if settings.save().is_err(){return false;}
+        self.as_mut().backend_settings_changed();
+        true
+    }
+
+    pub fn backend_api_key_set(&self, backend: QString) -> bool {
+        backends::parse(&backend.to_string()).and_then(crate::qobjects::settings::backend_api_key).is_some()
+    }
+
+    pub fn backend_logged_in(&self, backend: QString) -> bool {
+        let id=backend.to_string();
+        if id=="claude" {return self.rust().claude_logged_in;}
+        if id!="codex" || self.rust().codex_auth_failure.is_some(){return false;}
+        self.backend_api_key_set(backend) || serde_json::from_str::<Vec<PrereqStatus>>(&self.rust().prereqs_json.to_string()).unwrap_or_default().iter().any(|item|item.name=="codex_auth"&&item.ok)
+    }
+
+    pub fn backend_auth_failure(&self, backend: QString) -> QString {
+        if backend.to_string()=="claude" {return self.rust().claude_auth_failure.clone();}
+        QString::from(self.rust().codex_auth_failure.as_deref().unwrap_or_default())
+    }
+
+    fn note_backend_auth_error(mut self: Pin<&mut Self>, kind: AgentAdapterKind, detail: &str) {
+        if kind==AgentAdapterKind::Claude {
+            if let Some(sentence)=auth_failure_in(detail){self.as_mut().set_claude_auth_override(Some(sentence));}
+        } else if kind==AgentAdapterKind::Codex {
+            let lower=detail.to_ascii_lowercase();
+            if ["unauthorized","authentication required","invalid api key","invalid_api_key","codex_auth_failed","not logged in"].iter().any(|s|lower.contains(s)) {
+                self.as_mut().rust_mut().codex_auth_failure=Some("Codex authentication failed. Sign in again or replace its API key in Settings.".into());
+                self.backend_settings_changed();
+            }
+        }
+    }
+
+    pub fn set_backend_api_key(mut self: Pin<&mut Self>, backend: QString, key: QString) -> bool {
+        let Some(kind)=backends::parse(&backend.to_string()) else{return false};
+        if !crate::qobjects::settings::set_backend_api_key(kind,&key.to_string()){return false;}
+        if kind==AgentAdapterKind::Codex {self.as_mut().rust_mut().codex_auth_failure=None;}
+        self.as_mut().refresh_claude_logged_in();
+        model_generations().lock().unwrap().begin("prereqs");
+        if shared().is_some(){self.as_mut().recheck_prereqs();}
+        self.as_mut().refresh_backend_models(backend);
+        self.backend_settings_changed();
+        true
+    }
+
+    pub fn clear_backend_api_key(mut self: Pin<&mut Self>, backend: QString) -> bool {
+        let Some(kind)=backends::parse(&backend.to_string()) else{return false};
+        if !crate::qobjects::settings::clear_backend_api_key(kind){return false;}
+        self.as_mut().refresh_claude_logged_in();
+        model_generations().lock().unwrap().begin("prereqs");
+        if shared().is_some(){self.as_mut().recheck_prereqs();}
+        self.as_mut().refresh_backend_models(backend);
+        self.backend_settings_changed();
+        true
+    }
+
+    pub fn refresh_backend_models(self: Pin<&mut Self>, backend: QString) {
+        let Some(kind)=backends::parse(&backend.to_string()).filter(|k|*k!=AgentAdapterKind::Terminal) else{return};
+        // Invalidate before checking the connection: an old reply must not survive a key change.
+        let generation=model_generations().lock().unwrap().begin(backends::word(kind));
+        let Ok(shared)=require_connection() else{return};
+        runtime().spawn(fetch_backend_models(shared.client,self.qt_thread(),kind,generation));
     }
 
     pub fn set_api_key(mut self: Pin<&mut Self>, key: QString) -> bool {

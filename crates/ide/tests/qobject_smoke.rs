@@ -244,6 +244,19 @@ fn a_restored_agent_tab_crosses_the_boundary_with_its_adapter_and_agent() {
     );
 }
 
+#[test]
+fn a_restored_codex_tab_restarts_with_its_original_backend_and_choices() {
+    let mut listed=info("ws_codex","codex",WorkspaceState::Ready);
+    listed.agent_records.push(AgentSummary{id:AgentId("ag_codex".into()),adapter:AgentAdapterKind::Codex,state:AgentState::Exited,session_id:Some("thread-1".into()),command:None,model:Some("typed-model".into()),permission_mode:Some("on-request".into())});
+    let tab=AgentTab::from_workspace_info(&listed);
+    assert!(tab.agent_needs_start());
+    let options:serde_json::Value=serde_json::from_str(&tab.options_json).unwrap();
+    assert_eq!(options["adapter"],"codex");
+    assert_eq!(options["model"],"typed-model");
+    assert_eq!(options["permission_mode"],"on-request");
+    assert_eq!(options["resume_session"],"thread-1");
+}
+
 /// `cached_entries` returns what `FileTreeModel` stored from `fs.list_dir`.
 #[test]
 fn file_entries_json_round_trips() {

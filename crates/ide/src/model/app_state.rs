@@ -461,7 +461,7 @@ impl AgentTab {
     /// workspace, and after a daemon restart that record is an agent that is
     /// not running; waiting for it to report in would wait forever.
     pub fn agent_needs_start(&self) -> bool {
-        if self.adapter != AgentAdapterKind::Claude {
+        if self.adapter == AgentAdapterKind::Terminal {
             return false;
         }
         !matches!(
@@ -540,6 +540,9 @@ impl AgentTab {
 /// user is looking at, which is the one thing Restart exists to keep.
 fn restart_options_json(agent: &AgentSummary) -> String {
     let mut options = serde_json::Map::new();
+    if agent.adapter != AgentAdapterKind::Claude {
+        options.insert("adapter".into(),serde_json::Value::String(adapter_name(agent.adapter).into()));
+    }
     for (key, value) in [
         ("command", &agent.command),
         ("model", &agent.model),

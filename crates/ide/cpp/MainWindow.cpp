@@ -1155,6 +1155,17 @@ void MainWindow::connectController() {
     // window, and every connection it makes, is already built.
     QObject::connect(m_controller, &AppController::modelsChecked, this,
                      &MainWindow::applyModels);
+    QObject::connect(m_controller,&AppController::backendModelsChecked,this,[this](const QString& backend,const QString& json,qint64) {
+        QList<agentchoices::Choice> choices;
+        for (const auto& value : QJsonDocument::fromJson(json.toUtf8()).array()) {
+            const auto entry=value.toObject(); choices.append({entry.value("label").toString(),entry.value("id").toString()});
+        }
+        agentchoices::setModels(backend,choices); m_agentArea->refillModels();
+    });
+    QObject::connect(m_controller,&AppController::backendSettingsChanged,this,[this] {
+        agentchoices::setDescriptors(QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array());
+        m_agentArea->setBackendAuth("codex",m_controller->backendLoggedIn("codex"),m_controller->backendAuthFailure("codex"));
+    });
     // Test seam: says which way the gate went and on what, and answers the
     // CLI's verdict the way the setup page's button would -- by opening the
     // Claude login terminal -- so a run can see that a re-check alone leaves
@@ -1358,7 +1369,7 @@ void MainWindow::onNewAgent() {
     if (dialog.inPlaceAvailable()) {
         m_controller->setNewAgentInPlace(dialog.inPlace());
     }
-    if (dialog.adapter() == "claude") {
+    if (dialog.adapter() != "terminal") {
         // One call: the workspace, the agent in it and its opening prompt. The
         // controller emits `workspaceCreated` as soon as the workspace exists,
         // so a slow `agent.start` happens in front of the user.
@@ -1645,7 +1656,7 @@ void MainWindow::startAgentsThatHaveNone() {
     for (const QJsonValue& groupValue : groups) {
         for (const QJsonValue& tabValue : groupValue.toObject().value("tabs").toArray()) {
             const QJsonObject tab = tabValue.toObject();
-            if (tab.value("adapter").toString() != QLatin1String("claude")) {
+            if (tab.value("adapter").toString() == QLatin1String("terminal")) {
                 continue;
             }
             if (!tab.value("agent_id").toString().isEmpty()) {
@@ -2755,6 +2766,7 @@ void MainWindow::rebindCost() {
 }
 
 void MainWindow::updateCostLabel() {
+    if (activeTab().value("adapter").toString()=="codex") { m_costLabel->setText("Cost unavailable"); return; }
     const QString workspaceId = activeWorkspaceId();
     TranscriptModel* model =
         workspaceId.isEmpty() ? nullptr : m_agentArea->transcriptModel(workspaceId);

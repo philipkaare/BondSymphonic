@@ -27,6 +27,7 @@ class AgentArea : public QStackedWidget {
     Q_OBJECT
 public:
     explicit AgentArea(QWidget* parent = nullptr);
+    void setBackendAuth(const QString& backend, bool loggedIn, const QString& failure);
 
 signals:
     /// A transcript pane asked for an agent to be started (or restarted) in
@@ -202,6 +203,8 @@ public:
     void setOptionsJson(const QString& workspaceId, const QString& optionsJson);
 
 private:
+    QHash<QString,bool> m_backendLoggedIn;
+    QHash<QString,QString> m_backendAuthFailure;
     /// Creates the transcript pane for `workspaceId` if it has none, and
     /// attaches it to `agentId` when that is new. Returns the pane.
     TranscriptView* ensureTranscript(const QString& workspaceId, const QString& agentId);

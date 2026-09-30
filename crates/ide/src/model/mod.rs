@@ -14,6 +14,7 @@
 pub const DEFAULT_DISTRO: &str = "bondsymphonic";
 
 pub mod app_state;
+pub mod backends;
 pub mod diff;
 pub mod editor_buffer;
 pub mod file_tree;

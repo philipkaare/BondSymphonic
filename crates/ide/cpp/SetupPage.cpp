@@ -25,6 +25,7 @@
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
+#include <QSet>
 #include <cstdint>
 #include <utility>
 
@@ -261,12 +262,28 @@ void SetupPage::applyPrereqs(const QString& json) {
     m_answered = true;
     clearRows();
     const QJsonArray items = QJsonDocument::fromJson(json.toUtf8()).array();
-    for (const QJsonValue& value : items) {
-        const QJsonObject item = value.toObject();
-        addRow(item.value("name").toString(), item.value("ok").toBool(),
-               item.value("detail").toString(), item.value("fix_hint").toString());
+    const auto descriptors=QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array();
+    const auto settings=m_backendSettings.isEmpty() ? QJsonDocument::fromJson(m_controller->backendSettingsJson().toUtf8()).object().value("backends").toObject() : m_backendSettings;
+    QSet<QString> backendNames;
+    for (const auto& value : descriptors) for (const auto& name : value.toObject().value("prerequisite_names").toArray()) backendNames.insert(name.toString());
+    auto addItem=[this](const QJsonObject& item) {
+        addRow(item.value("name").toString(),item.value("ok").toBool(),item.value("detail").toString(),item.value("fix_hint").toString());
+    };
+    m_rowsLayout->addWidget(new QLabel("System",m_rowsHost));
+    for (const auto& value : items) if (!backendNames.contains(value.toObject().value("name").toString())) addItem(value.toObject());
+    for (const auto& value : descriptors) {
+        const auto descriptor=value.toObject(); const QString id=descriptor.value("id").toString();
+        if (!settings.value(id).toObject().value("enabled").toBool()) continue;
+        m_rowsLayout->addWidget(new QLabel(descriptor.value("label").toString(),m_rowsHost));
+        const auto names=descriptor.value("prerequisite_names").toArray();
+        for (const auto& item : items) if (names.contains(item.toObject().value("name"))) addItem(item.toObject());
     }
     m_rowsLayout->addStretch(1);
+}
+
+void SetupPage::setBackendSettings(const QJsonObject& settings) {
+    m_backendSettings=settings;
+    if (m_answered) applyPrereqs(m_controller->prereqsJson());
 }
 
 void SetupPage::showCheckingRow() {
@@ -316,6 +333,8 @@ void SetupPage::clearRows() {
 }
 
 QString SetupPage::actionFor(const QString& name) {
+    if (name == "codex") return "install_codex";
+    if (name == "codex_auth") return "codex_login";
     if (name == QLatin1String("claude")) {
         return QStringLiteral("install_claude");
     }
@@ -334,6 +353,7 @@ QString SetupPage::actionFor(const QString& name) {
 }
 
 QString SetupPage::logoutActionFor(const QString& name) {
+    if (name == "codex_auth") return "codex_logout";
     if (name == QLatin1String("claude_auth")) {
         return QStringLiteral("claude_logout");
     }
@@ -361,6 +381,9 @@ QString SetupPage::tokenActionFor(const QString& name, bool ok, const QString& d
 }
 
 QString SetupPage::buttonTextFor(const QString& action) {
+    if (action == "install_codex") return "Install Codex";
+    if (action == "codex_login") return "Sign in to ChatGPT";
+    if (action == "codex_logout") return "Sign out of Codex";
     if (action == QLatin1String("install_claude")) {
         return QStringLiteral("Install Claude Code");
     }

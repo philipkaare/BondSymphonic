@@ -17,6 +17,10 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QVBoxLayout>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QTabWidget>
+#include <QSignalBlocker>
 
 namespace {
 
@@ -27,7 +31,7 @@ constexpr int kDialogHeight = 700;
 
 } // namespace
 
-SettingsDialog::SettingsDialog(AppController* controller, QWidget* parent)
+SettingsDialog::SettingsDialog(AppController* controller, QWidget* parent, const QJsonArray& suppliedDescriptors)
     : QDialog(parent), m_controller(controller) {
     setWindowTitle("Settings");
     // Modal, even though a login terminal runs inside it. Modality stops input
@@ -64,44 +68,80 @@ SettingsDialog::SettingsDialog(AppController* controller, QWidget* parent)
     auto* form = new QFormLayout(agentBox);
     bodyLayout->addWidget(agentBox);
 
-    auto* keyRow = new QHBoxLayout();
-    m_apiKey = new QLineEdit(agentBox);
-    // Password echo, and never populated from the store: the field is a way in
-    // for a new key, not a way to read the one that is already there.
-    m_apiKey->setEchoMode(QLineEdit::Password);
-    m_removeKey = new QPushButton("Remove key", agentBox);
-    keyRow->addWidget(m_apiKey, 1);
-    keyRow->addWidget(m_removeKey, 0);
-    form->addRow("Anthropic API key:", keyRow);
-
-    auto* note = new QLabel(
-        "Used only when Claude Code has no login of its own. Leave empty to keep the stored key.",
-        agentBox);
-    note->setWordWrap(true);
-    note->setEnabled(false);
-    form->addRow(QString(), note);
-
-    m_permissionMode = new QComboBox(agentBox);
-    m_permissionMode->setObjectName(QStringLiteral("SettingsPermissionMode"));
-    m_permissionMode->setToolTip(QStringLiteral(
-        "What an agent created from here on asks before it acts. An agent that already exists is "
-        "changed from the dropdown under its own transcript."));
-    agentchoices::fillPermissionCombo(m_permissionMode, m_controller->defaultPermissionMode());
-    // "New agents start on", not "Default permission mode": this setting has
-    // never reached an agent that already exists, and a label saying "default"
-    // invites the user to change it here and wonder why the running agent
-    // carried on as it was.
-    form->addRow("New agents start on:", m_permissionMode);
-
-    // Beside the chooser, because the labels alone cannot say why a mode called
-    // "Ask every time" blocks instead. One string from `agentchoices`, so the
-    // day the host protocol lands there is one sentence to delete rather than
-    // three to find.
-    auto* permissionNote = new QLabel(agentchoices::permissionNote(), agentBox);
-    permissionNote->setObjectName(QStringLiteral("SettingsPermissionNote"));
-    permissionNote->setWordWrap(true);
-    permissionNote->setEnabled(false);
-    form->addRow(QString(), permissionNote);
+    m_settings=QJsonDocument::fromJson(m_controller->backendSettingsJson().toUtf8()).object();
+    const auto descriptors=suppliedDescriptors.isEmpty() ? QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array() : suppliedDescriptors;
+    agentchoices::setDescriptors(descriptors);
+    m_defaultBackend=new QComboBox(agentBox);
+    m_defaultBackend->setObjectName(QStringLiteral("DefaultBackend"));
+    form->addRow("New agents use:",m_defaultBackend);
+    auto* tabs=new QTabWidget(agentBox);
+    tabs->setObjectName(QStringLiteral("BackendTabs"));
+    form->addRow(tabs);
+    for (const auto& value : descriptors) {
+        const auto descriptor=value.toObject();
+        const QString id=descriptor.value("id").toString();
+        const auto settings=m_settings.value("backends").toObject().value(id).toObject();
+        auto* page=new QWidget(tabs);
+        auto* backendForm=new QFormLayout(page);
+        auto* enabled=new QCheckBox("Enabled",page);
+        enabled->setObjectName("BackendEnabled_"+id);
+        enabled->setChecked(settings.value("enabled").toBool());
+        backendForm->addRow(enabled);
+        auto* actions=new QHBoxLayout();
+        for (const auto& actionValue : descriptor.value("setup_actions").toArray()) {
+            const QString action=actionValue.toString();
+            QString label=action;
+            label.replace('_',' ');
+            auto* button=new QPushButton(label,page);
+            actions->addWidget(button);
+            QObject::connect(button,&QPushButton::clicked,this,[this,action] {
+                m_setup->runAction(action); revealSetup();
+            });
+        }
+        backendForm->addRow("Sign-in and installation:",actions);
+        auto* model=new QComboBox(page);
+        model->setObjectName("BackendModel_"+id);
+        agentchoices::fillModelCombo(model,settings.value("default_model").toString(),id);
+        model->setInsertPolicy(QComboBox::NoInsert);
+        backendForm->addRow("Default model:",model);
+        auto* mode=new QComboBox(page);
+        mode->setObjectName(id=="claude" ? QStringLiteral("SettingsPermissionMode") : "BackendMode_"+id);
+        agentchoices::fillPermissionCombo(mode,settings.value("default_permission_mode").toString(descriptor.value("default_permission_mode").toString()),id);
+        backendForm->addRow("Default permissions:",mode);
+        auto* note=new QLabel(descriptor.value("permission_note").toString(),page);
+        note->setWordWrap(true);
+        backendForm->addRow(note);
+        auto* keyRow=new QHBoxLayout();
+        auto* key=new QLineEdit(page);
+        key->setObjectName("BackendKey_"+id);
+        key->setEchoMode(QLineEdit::Password);
+        auto* remove=new QPushButton("Remove key",page);
+        const auto refreshKey=[this,id,key,remove] {
+            const bool stored=m_controller->backendApiKeySet(id);
+            key->setPlaceholderText(stored ? "Stored in Windows Credential Manager" : "Leave empty to use sign-in");
+            remove->setEnabled(stored);
+        };
+        refreshKey();
+        QObject::connect(remove,&QPushButton::clicked,this,[this,id,key,refreshKey] {
+            if (!m_controller->clearBackendApiKey(id)) QMessageBox::warning(this,"Settings","The credential could not be removed.");
+            key->clear(); refreshKey();
+        });
+        keyRow->addWidget(key,1); keyRow->addWidget(remove);
+        backendForm->addRow(descriptor.value("credential_label").toString()+":",keyRow);
+        auto* keyNote=new QLabel(id=="codex" ? "A stored API key takes precedence over ChatGPT sign-in. Leave empty to keep the stored key." : "Used when Claude has no login. Leave empty to keep the stored key.",page);
+        keyNote->setWordWrap(true); backendForm->addRow(keyNote);
+        const QString label=descriptor.value("label").toString(id);
+        m_backends.insert(id,{label,enabled,key,remove,model,mode});
+        tabs->addTab(page,label);
+        QObject::connect(enabled,&QCheckBox::toggled,this,[this]{refreshDefaults();});
+        QObject::connect(m_controller,&AppController::backendModelsChecked,this,[id,model](const QString& backend,const QString&,qint64) {
+            if (backend==id) {const QSignalBlocker blocker(model); agentchoices::fillModelCombo(model,agentchoices::modelComboSelection(model),id);}
+        });
+        m_controller->refreshBackendModels(id);
+    }
+    refreshDefaults();
+    const int defaultIndex=m_defaultBackend->findData(m_settings.value("default_backend").toString());
+    if (defaultIndex>=0) m_defaultBackend->setCurrentIndex(defaultIndex);
 
     m_showMeta = new QCheckBox("Show turn cost and system lines", agentBox);
     m_showMeta->setObjectName(QStringLiteral("SettingsShowAgentMeta"));
@@ -135,9 +175,7 @@ SettingsDialog::SettingsDialog(AppController* controller, QWidget* parent)
 
     QObject::connect(buttons, &QDialogButtonBox::accepted, this, &SettingsDialog::accept);
     QObject::connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
-    QObject::connect(m_removeKey, &QPushButton::clicked, this, &SettingsDialog::removeKey);
 
-    refreshKeyState();
 }
 
 void SettingsDialog::revealSetup() {
@@ -148,36 +186,41 @@ void SettingsDialog::revealSetup() {
     m_setup->setFocus();
 }
 
-void SettingsDialog::refreshKeyState() {
-    const bool stored = m_controller->apiKeySet();
-    m_apiKey->setPlaceholderText(stored ? "stored in the Windows credential store"
-                                        : "sk-ant-…");
-    m_removeKey->setEnabled(stored);
-}
-
-void SettingsDialog::removeKey() {
-    if (!m_controller->clearApiKey()) {
-        QMessageBox::warning(this, "Settings", "The key could not be removed from the credential "
-                                               "store. Windows Credential Manager has the detail.");
+void SettingsDialog::refreshDefaults() {
+    const QString selected=m_defaultBackend->currentData().toString();
+    m_defaultBackend->clear();
+    auto entries=m_settings.value("backends").toObject();
+    for (auto it=m_backends.cbegin();it!=m_backends.cend();++it) {
+        if (it->enabled->isChecked()) m_defaultBackend->addItem(it->label,it.key());
+        auto entry=entries.value(it.key()).toObject(); entry.insert("enabled",it->enabled->isChecked()); entries.insert(it.key(),entry);
     }
-    m_apiKey->clear();
-    refreshKeyState();
+    const int index=m_defaultBackend->findData(selected);
+    if (index>=0) m_defaultBackend->setCurrentIndex(index);
+    m_settings.insert("backends",entries);
+    m_setup->setBackendSettings(entries);
 }
 
 void SettingsDialog::accept() {
-    m_controller->setDefaultPermissionMode(m_permissionMode->currentData().toString());
+    auto entries=m_settings.value("backends").toObject();
+    for (auto it=m_backends.cbegin();it!=m_backends.cend();++it) {
+        auto entry=entries.value(it.key()).toObject();
+        entry.insert("enabled",it->enabled->isChecked());
+        entry.insert("default_model",agentchoices::modelComboSelection(it->model));
+        entry.insert("default_permission_mode",it->mode->currentData().toString());
+        entries.insert(it.key(),entry);
+        const QString key=it->key->text().trimmed();
+        if (!key.isEmpty() && !m_controller->setBackendApiKey(it.key(),key)) {
+            QMessageBox::warning(this,"Settings","The API key could not be stored."); return;
+        }
+        it->key->clear();
+    }
+    m_settings.insert("backends",entries);
+    m_settings.insert("default_backend",m_defaultBackend->currentData().toString());
+    if (!m_controller->saveBackendSettings(QString::fromUtf8(QJsonDocument(m_settings).toJson(QJsonDocument::Compact)))) {
+        QMessageBox::warning(this,"Settings","The backend settings could not be saved."); return;
+    }
     m_controller->setShowAgentMeta(m_showMeta->isChecked());
     m_controller->setTheme(m_theme->currentData().toString());
-    // An empty field means "leave the stored key alone", which is what makes
-    // the placeholder honest: a dialog opened to change the permission mode
-    // must not wipe the key on the way out.
-    const QString key = m_apiKey->text().trimmed();
-    if (!key.isEmpty() && !m_controller->setApiKey(key)) {
-        QMessageBox::warning(this, "Settings", "The key could not be stored in the Windows "
-                                               "credential store, so it has not been saved.");
-        return;
-    }
-    m_apiKey->clear();
     QDialog::accept();
 }
 
@@ -209,6 +252,11 @@ void SettingsDialog::reject() {
 extern "C" std::int32_t bs_widget_test_settings_offers_the_one_permission_list() {
     AppController controller;
     SettingsDialog dialog(&controller);
+    if (dialog.findChild<QCheckBox*>(QStringLiteral("BackendEnabled_claude")) == nullptr ||
+        dialog.findChild<QComboBox*>(QStringLiteral("DefaultBackend")) == nullptr ||
+        dialog.findChild<QComboBox*>(QStringLiteral("BackendModel_claude")) == nullptr) {
+        return 20;
+    }
     auto* modes = dialog.findChild<QComboBox*>(QStringLiteral("SettingsPermissionMode"));
     if (modes == nullptr) {
         return 1;
@@ -225,6 +273,28 @@ extern "C" std::int32_t bs_widget_test_settings_offers_the_one_permission_list()
         modes->findData(QStringLiteral("dontAsk")) >= 0) {
         return 4;
     }
+    auto descriptors=QJsonDocument::fromJson(controller.backendDescriptorsJson().toUtf8()).array();
+    descriptors.append(QJsonObject{{"id","codex"},{"label","Codex"},{"default_permission_mode","never"},
+        {"permission_modes",QJsonArray{QJsonObject{{"id","never"},{"label","YOLO (sandboxed)"}},QJsonObject{{"id","on-request"},{"label","Ask when needed"}}}},
+        {"setup_actions",QJsonArray{"install_codex","codex_login","codex_logout"}},{"credential_label","OpenAI API key"}});
+    SettingsDialog both(&controller,nullptr,descriptors);
+    auto* enabled=both.findChild<QCheckBox*>("BackendEnabled_codex");
+    auto* model=both.findChild<QComboBox*>("BackendModel_codex");
+    auto* mode=both.findChild<QComboBox*>("BackendMode_codex");
+    auto* key=both.findChild<QLineEdit*>("BackendKey_codex");
+    auto* defaults=both.findChild<QComboBox*>("DefaultBackend");
+    if (!enabled || !model || !mode || !key || !defaults || mode->count()!=2 || !model->isEditable() || key->echoMode()!=QLineEdit::Password) return 21;
+    if (both.findChild<QCheckBox*>("BackendEnabled_opencode")) return 22;
+    enabled->setChecked(true);
+    if (defaults->findData("codex")<0) return 23;
+    both.findChild<QCheckBox*>("BackendEnabled_claude")->setChecked(false);
+    enabled->setChecked(false);
+    if (defaults->count()!=0) return 24;
+    model->setEditText("typed-codex-model");
+    agentchoices::setModels("codex",{{"New model","new-codex"}});
+    controller.backendModelsChecked("codex","[]",99);
+    if (agentchoices::modelComboSelection(model)!="typed-codex-model") return 25;
+    agentchoices::resetModelsForTest();
     return 0;
 }
 
