@@ -5645,7 +5645,7 @@ mod claude_auth_override {
         );
         if !exit_rechecks {
             assert!(
-                after_login.iter().any(|l| *l == GATE_OPEN),
+                after_login.contains(&GATE_OPEN),
                 "the login terminal's exit did not reopen the gate\n{}",
                 run.context
             );
@@ -5681,7 +5681,7 @@ mod claude_auth_override {
         // The login terminal's exit is what lifts the verdict: the gate reopens
         // on the daemon's standing answer, with no sentence on it.
         assert!(
-            after_login[rechecked..].iter().any(|l| *l == GATE_OPEN),
+            after_login[rechecked..].contains(&GATE_OPEN),
             "the login terminal's exit did not reopen the gate\n{}",
             run.context
         );

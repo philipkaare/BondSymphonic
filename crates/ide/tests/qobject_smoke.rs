@@ -246,15 +246,23 @@ fn a_restored_agent_tab_crosses_the_boundary_with_its_adapter_and_agent() {
 
 #[test]
 fn a_restored_codex_tab_restarts_with_its_original_backend_and_choices() {
-    let mut listed=info("ws_codex","codex",WorkspaceState::Ready);
-    listed.agent_records.push(AgentSummary{id:AgentId("ag_codex".into()),adapter:AgentAdapterKind::Codex,state:AgentState::Exited,session_id:Some("thread-1".into()),command:None,model:Some("typed-model".into()),permission_mode:Some("on-request".into())});
-    let tab=AgentTab::from_workspace_info(&listed);
+    let mut listed = info("ws_codex", "codex", WorkspaceState::Ready);
+    listed.agent_records.push(AgentSummary {
+        id: AgentId("ag_codex".into()),
+        adapter: AgentAdapterKind::Codex,
+        state: AgentState::Exited,
+        session_id: Some("thread-1".into()),
+        command: None,
+        model: Some("typed-model".into()),
+        permission_mode: Some("on-request".into()),
+    });
+    let tab = AgentTab::from_workspace_info(&listed);
     assert!(tab.agent_needs_start());
-    let options:serde_json::Value=serde_json::from_str(&tab.options_json).unwrap();
-    assert_eq!(options["adapter"],"codex");
-    assert_eq!(options["model"],"typed-model");
-    assert_eq!(options["permission_mode"],"on-request");
-    assert_eq!(options["resume_session"],"thread-1");
+    let options: serde_json::Value = serde_json::from_str(&tab.options_json).unwrap();
+    assert_eq!(options["adapter"], "codex");
+    assert_eq!(options["model"], "typed-model");
+    assert_eq!(options["permission_mode"], "on-request");
+    assert_eq!(options["resume_session"], "thread-1");
 }
 
 /// `cached_entries` returns what `FileTreeModel` stored from `fs.list_dir`.
@@ -748,7 +756,11 @@ fn settings_round_trip_the_api_key_flag_and_permission_mode() {
 
     let mut settings = Settings::load();
     settings.api_key_set = true;
-    settings.default_permission_mode = "acceptEdits".to_owned();
+    settings
+        .backends
+        .get_mut("claude")
+        .unwrap()
+        .default_permission_mode = "acceptEdits".to_owned();
     settings.save().expect("settings save");
 
     let loaded = Settings::load();

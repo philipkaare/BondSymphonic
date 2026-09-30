@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-28-codex-adapter-design.md`.
 
-**Status:** Ready for plan review. Repository inspected at `6e1b2bd`; the user confirmed separate sandboxes per backend during planning. No implementation or live Codex validation has been performed. Spec section 7 checks are execution gates, not assumed successes.
+**Status:** Implemented on `feat/codex-adapter`; integration verification and review fixes are recorded in `notes/2026-09-30-codex-verification.md`. Live ChatGPT tool execution and resume checks passed. Live API-key authentication is explicitly deferred by the user; the interactive live IDE workflow remains unverified. Original planning baseline: `6e1b2bd`, with separate sandboxes per backend confirmed by the user. The checklist below is the original execution brief; verification notes record the actual evidence and remaining limits.
 
 ## Global constraints
 

@@ -48,7 +48,8 @@ PermissionBar::PermissionBar(QWidget* parent) : QFrame(parent) {
 
 void PermissionBar::show(const QJsonObject& pending) {
     const QString requestId = pending.value(QStringLiteral("request_id")).toString();
-    m_always->setText(requestId.startsWith("codex:") ? "Allow for this Codex session" : "Always allow this tool for this session");
+    m_always->setText(requestId.startsWith("codex:") ? "Allow for this Codex session"
+                                                     : "Always allow this tool for this session");
     const QString tool = pending.value(QStringLiteral("tool_name")).toString();
     const QString summary = pending.value(QStringLiteral("summary")).toString();
     if (requestId != m_requestId) {

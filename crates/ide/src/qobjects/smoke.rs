@@ -229,6 +229,7 @@ pub(crate) async fn run(steps: Vec<String>, mut client: DaemonClient, qt: QtHand
     for step in steps {
         tracing::info!(target: "smoke", "step: {step}");
         let outcome = match step.as_str() {
+            "codex_live" => codex_live(&client, &qt, &repo).await,
             "create" => {
                 created += 1;
                 create(&client, &qt, &repo, created, TERMINAL_ADAPTER)
@@ -285,6 +286,46 @@ pub(crate) async fn run(steps: Vec<String>, mut client: DaemonClient, qt: QtHand
 /// a terminal pane for one and a transcript pane for the other.
 const TERMINAL_ADAPTER: &str = "terminal";
 const CLAUDE_ADAPTER: &str = "claude";
+
+/// Opt-in live check using the actual controller, pane and daemon. Its caller
+/// must supply a disposable repository and daemon data directory.
+async fn codex_live(client: &DaemonClient, qt: &QtHandle, repo: &str) -> Result<(), String> {
+    let repo = repo.to_owned();
+    qt.queue(move |q| q.create_workspace_with_agent_and_run(
+        QString::from(&repo),QString::from("main"),QString::from("codex-live"),QString::from(GROUP),
+        QString::from(r#"{"adapter":"codex","permission_mode":"never","model":""}"#),
+        QString::from("In this disposable test repository, run a shell command to write IDE_CODEX_OK and a newline to live-ide-proof.txt. Read it to verify the contents. Reply with IDE_CODEX_DONE."),
+        QString::from(""),false,false,
+    )).map_err(|_| "the Qt thread is gone".to_owned())?;
+    let workspace=tokio::time::timeout(Duration::from_secs(120),async {
+        loop {
+            let list=client.request::<WorkspaceListResult>(Request::WorkspaceList{}).await.map_err(|e|e.to_string())?;
+            if let Some(ws)=list.workspaces.into_iter().find(|ws|ws.name=="codex-live") {
+                if let Some(agent)=ws.agent_records.last() {
+                    if agent.adapter!=AgentAdapterKind::Codex {return Err("live IDE started the wrong backend".to_owned());}
+                    let history=client.request::<HistoryResult>(Request::AgentHistory(AgentIdParams{agent_id:agent.id.clone()})).await.map_err(|e|e.to_string())?;
+                    if matches!(history.state,AgentState::Error|AgentState::Exited) {return Err(format!("live agent failed: {:?}",history.detail));}
+                    if history.messages.iter().any(|m|matches!(&m.body,AgentMessageBody::AssistantText{text} if text.contains("IDE_CODEX_DONE"))) && history.state==AgentState::Idle {
+                        return Ok(ws.id);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }).await.map_err(|_|"live IDE Codex turn timed out".to_owned())??;
+    let proof = client
+        .request::<ReadFileResult>(Request::FsReadFile(FsPathParams {
+            workspace_id: workspace.clone(),
+            path: "live-ide-proof.txt".into(),
+        }))
+        .await
+        .map_err(|e| e.to_string())?;
+    if proof.content.trim() != "IDE_CODEX_OK" {
+        return Err("live IDE file proof did not match".into());
+    }
+    tracing::info!(target:"smoke","LIVE_IDE_CODEX_PASS");
+    destroy(client, qt, Some(workspace)).await
+}
 
 /// Creates a workspace and announces it with `workspace_created`, the signal
 /// both `createWorkspace*` invokables emit once the daemon has answered. That

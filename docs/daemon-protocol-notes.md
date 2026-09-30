@@ -31,6 +31,33 @@ behavior against the noop backend; on Linux the default is `linux_bwrap`.)
 
 ## 2. Drive the protocol
 
+### Backend discovery and Codex
+
+`hello.capabilities.backends` describes known backends, including ones whose CLI
+is not installed. Each descriptor supplies an `id`, display label, permission
+choices/default/note, credential label, prerequisite names and setup actions.
+`capabilities.adapters` contains the runnable adapters. Older daemons omit
+`backends`; clients fall back to Claude and must not infer Codex support.
+
+`agent.start.adapter` selects `claude` or `codex`; terminal sessions use
+`pty.open`. `system.list_models` accepts an optional `adapter` (omitted means
+Claude) and a transient `api_key`. Codex model discovery is uncached and paginated.
+Setup actions add `install_codex`, `codex_login` and `codex_logout`. The latter
+two use the same daemon-owned `CODEX_HOME` as Codex agents.
+
+Codex's app-server RPC stream is separate from the daemon protocol. Its approval
+IDs remain opaque, including the distinction between string and numeric IDs.
+`agent.permission_reply` additionally accepts `allow_for_session` for Codex;
+Claude clients continue to send `allow` or `deny`. A `codex_turn` system message
+reports usage, duration and completion status with `cost_available: false`.
+The compatibility `result` still carries a session ID, but its zero cost does
+not mean the turn was free.
+
+Codex's pinned compatibility version is 0.158.0. Live ChatGPT tool execution and
+cross-process resume have been verified. The real API-key preflight was explicitly
+deferred; environment-only key delivery, redaction and persistence exclusions
+are covered by local tests. See the [preflight notes](superpowers/plans/notes/2026-09-28-codex-preflight.md).
+
 The wire format is newline-delimited JSON, one message per line, in both
 directions:
 

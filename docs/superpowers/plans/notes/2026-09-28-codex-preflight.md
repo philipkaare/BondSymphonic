@@ -69,7 +69,7 @@ The generated 0.158.0 `ThreadStartParams` schema includes `untrusted` alongside
 `on-request` and `never`. The design's statement that Codex removed `untrusted`
 does not match this schema. Keep the two agreed product modes; do not tell users
 that the CLI lacks a capability on the basis of the earlier design claim.
-Runtime approval behavior inside the outer sandbox remains to be measured.
+Runtime approvals were subsequently verified in the outer sandbox, as recorded below.
 
 Official protocol reference: [Codex App Server](https://learn.chatgpt.com/docs/app-server).
 The generated schema for the pinned binary is the version-specific reference.
@@ -80,7 +80,7 @@ The generated schema for the pinned binary is the version-specific reference.
 |---|---|
 | Pinned Linux binary and protocol discovery | Passed for 0.158.0 |
 | Live command, file edit, approvals, steering, interrupt, resume | Passed; live-0.158.0.ndjson contains actual frames |
-| API-key provider `env_key` without auth.json | Live check explicitly deferred by user; still needs local transport/config tests |
+| API-key provider `env_key` without auth.json | Live check explicitly deferred by user; local environment-only delivery, provider configuration, redaction and persistence tests pass |
 | Auth-file replacement behavior | Pinned login/src/auth/storage.rs opens with truncate/write/create and flushes in place |
 | Login and turn hosts through proxy denial log | Live sandbox turns passed with api.openai.com, auth.openai.com, chatgpt.com only; no denials observed. Browser login runs outside the proxy, so its full host set is not measured |
 | Commands and patches inside the project's bwrap sandbox | Passed using actual BwrapBackend, ProxyRegistry, and proxy-shim |
@@ -99,8 +99,11 @@ Approval fixtures were captured using Codex's read-only inner policy inside the
 outer sandbox, with only disposable file writes requested. The shipped mode
 remains `danger-full-access` inside the outer sandbox, separately verified.
 Both command and file approval requests were accepted successfully. Interrupted
-turn completion was observed. Resume was checked in the same app-server;
-cross-process resume remains part of adapter integration validation.
+turn completion was observed. Resume was checked in the same app-server and
+subsequently through the production backend in a new process. On 2026-09-30 the
+live in-place test also passed tool execution and thread resume after a daemon
+restart. The mixed-backend test passed separate Claude/Codex histories, approvals,
+and restored backend/session identity in one workspace.
 
 The explicit live test is `codex_live_preflight` (ignored in offline suites).
 `scripts/run-codex-preflight.sh` runs it with required environment paths. Six
@@ -113,4 +116,6 @@ Implementation worktree: `.superpowers/worktrees/codex-adapter`, branch
 `feat/codex-adapter`. The approved plan/spec were copied into it. Windows git
 works there; Linux git cannot interpret its Windows absolute `.git` pointer.
 Run worktree bookkeeping with Windows git, and use a disposable Linux-native
-repository for live sandbox fixtures. No product sandbox behavior has changed.
+repository for live sandbox fixtures. The implemented Codex backend uses a
+companion sandbox with its own home, runtime, cache and proxy; the worktree and
+git protections are shared with the base workspace.

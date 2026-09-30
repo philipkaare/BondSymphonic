@@ -244,18 +244,28 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     form->addRow(QString(), m_nameHint);
 
     m_adapter = new QComboBox(this);
-    const auto backendSettings=QJsonDocument::fromJson(m_controller->backendSettingsJson().toUtf8()).object();
-    const auto descriptors=QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array();
+    const auto backendSettings =
+        QJsonDocument::fromJson(m_controller->backendSettingsJson().toUtf8()).object();
+    const auto descriptors =
+        QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array();
     agentchoices::setDescriptors(descriptors);
-    for (const auto& value : descriptors) {
-        const auto descriptor=value.toObject(); const QString id=descriptor.value("id").toString();
-        if (backendSettings.value("backends").toObject().value(id).toObject().value("enabled").toBool())
-            m_adapter->addItem(descriptor.value("label").toString(),id);
+    for (const auto &value : descriptors) {
+        const auto descriptor = value.toObject();
+        const QString id = descriptor.value("id").toString();
+        if (backendSettings.value("backends")
+                .toObject()
+                .value(id)
+                .toObject()
+                .value("enabled")
+                .toBool())
+            m_adapter->addItem(descriptor.value("label").toString(), id);
     }
     m_adapter->addItem("Terminal", kTerminalAdapter);
-    const int preferred=m_adapter->findData(backendSettings.value("default_backend").toString());
-    if (preferred>=0) m_adapter->setCurrentIndex(preferred);
-    if (adapter()=="claude" && daemonLacksClaude(m_controller)) m_adapter->setCurrentIndex(m_adapter->findData("terminal"));
+    const int preferred = m_adapter->findData(backendSettings.value("default_backend").toString());
+    if (preferred >= 0)
+        m_adapter->setCurrentIndex(preferred);
+    if (adapter() == "claude" && daemonLacksClaude(m_controller))
+        m_adapter->setCurrentIndex(m_adapter->findData("terminal"));
     form->addRow("Adapter:", m_adapter);
 
     m_command = new QLineEdit(this);
@@ -278,8 +288,10 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     // built is re-filled rather than left showing the fallback for the rest
     // of the session. `chosenModel` captures what is already there, listed or
     // typed, before the list under it changes.
-    QObject::connect(m_controller, &AppController::backendModelsChecked, this, [this](const QString& backend,const QString&,qint64) {
-        if (backend==adapter()) agentchoices::fillModelCombo(m_claudeModel, chosenModel(),backend);
+    QObject::connect(m_controller, &AppController::backendModelsChecked, this,
+                     [this](const QString &backend, const QString &, qint64) {
+                         if (backend == adapter())
+                             agentchoices::fillModelCombo(m_claudeModel, chosenModel(), backend);
     });
     form->addRow("Model:", m_claudeModel);
 
@@ -425,13 +437,10 @@ QString NewAgentDialog::optionsJson() const {
         return QString();
     }
     QJsonObject options;
-    options.insert("adapter",adapter());
+    options.insert("adapter", adapter());
     const QString model = chosenModel();
-    if (!model.isEmpty()) {
-        // Left out rather than sent empty: the daemon's own default is what an
-        // untouched field means, and "" is not a model name.
+    // Empty explicitly chooses the CLI default, overriding a configured model.
         options.insert("model", model);
-    }
     // Always, never conditionally. A permission mode left out is the CLI's own
     // default -- a fifth behaviour nobody chose, that nothing in the IDE can
     // show and that the combo the user just looked at does not describe.
@@ -714,18 +723,27 @@ void NewAgentDialog::onRunConfigsFailed(const QString& op, const QString& messag
 }
 
 void NewAgentDialog::onAdapterChanged() {
-    const bool agent=adapter()!=QString::fromUtf8(kTerminalAdapter);
-    m_form->setRowVisible(m_command,!agent);
-    m_form->setRowVisible(m_claudeModel,agent);
-    m_form->setRowVisible(m_permissionMode,agent);
-    m_form->setRowVisible(m_initialPrompt,agent);
-    const auto defaults=QJsonDocument::fromJson(m_controller->backendSettingsJson().toUtf8()).object().value("backends").toObject().value(adapter()).toObject();
-    agentchoices::fillModelCombo(m_claudeModel,defaults.value("default_model").toString(),adapter());
-    agentchoices::fillPermissionCombo(m_permissionMode,defaults.value("default_permission_mode").toString(),adapter());
-    if (auto* note=findChild<QLabel*>("NewAgentPermissionNote")) {
-        note->setText(agentchoices::permissionNote(adapter())); m_form->setRowVisible(note,agent);
+    const bool agent = adapter() != QString::fromUtf8(kTerminalAdapter);
+    m_form->setRowVisible(m_command, !agent);
+    m_form->setRowVisible(m_claudeModel, agent);
+    m_form->setRowVisible(m_permissionMode, agent);
+    m_form->setRowVisible(m_initialPrompt, agent);
+    const auto defaults = QJsonDocument::fromJson(m_controller->backendSettingsJson().toUtf8())
+                              .object()
+                              .value("backends")
+                              .toObject()
+                              .value(adapter())
+                              .toObject();
+    agentchoices::fillModelCombo(m_claudeModel, defaults.value("default_model").toString(),
+                                 adapter());
+    agentchoices::fillPermissionCombo(
+        m_permissionMode, defaults.value("default_permission_mode").toString(), adapter());
+    if (auto *note = findChild<QLabel *>("NewAgentPermissionNote")) {
+        note->setText(agentchoices::permissionNote(adapter()));
+        m_form->setRowVisible(note, agent);
     }
-    if (agent) m_controller->refreshBackendModels(adapter());
+    if (agent)
+        m_controller->refreshBackendModels(adapter());
     updateOkEnabled();
 }
 
@@ -797,12 +815,14 @@ void NewAgentDialog::updateOkEnabled() {
     // about at all. Each of the three creates a workspace forked off a branch
     // the user did not choose.
     const QString path = repoPath();
-    const auto caps=QJsonDocument::fromJson(m_controller->capabilitiesJson().toUtf8()).object();
-    const bool available=adapter()=="terminal" || !caps.contains("adapters") || caps.value("adapters").toArray().contains(adapter());
-    m_adapter->setToolTip(available ? QString() : "Install this backend in Settings before creating an agent.");
+    const auto caps = QJsonDocument::fromJson(m_controller->capabilitiesJson().toUtf8()).object();
+    const bool available = adapter() == "terminal" || !caps.contains("adapters") ||
+                           caps.value("adapters").toArray().contains(adapter());
+    m_adapter->setToolTip(available ? QString()
+                                    : "Install this backend in Settings before creating an agent.");
     const bool ok = available && !path.isEmpty() && path == m_pendingPath && !m_inspectPending &&
-                    !m_inspectFailed && (inPlace() || !baseBranch().isEmpty()) && !group().isEmpty() &&
-                    m_controller->validateWorkspaceName(name()).isEmpty();
+                    !m_inspectFailed && (inPlace() || !baseBranch().isEmpty()) &&
+                    !group().isEmpty() && m_controller->validateWorkspaceName(name()).isEmpty();
     m_buttons->button(QDialogButtonBox::Ok)->setEnabled(ok);
 }
 
@@ -919,7 +939,8 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_offers_claude_before_the
         return 3;
     }
     const QJsonObject none = QJsonDocument::fromJson(dialog.optionsJson().toUtf8()).object();
-    if (none.contains(QStringLiteral("model"))) {
+    if (!none.contains(QStringLiteral("model")) ||
+        !none.value(QStringLiteral("model")).toString().isEmpty()) {
         // The first entry is Claude Code's own default, which is sent by not
         // being sent: "" is not a model name.
         return 4;

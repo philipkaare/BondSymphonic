@@ -491,17 +491,26 @@ impl qobject::TranscriptModel {
             .flatten();
         // "Always allow" only means anything alongside Allow: there is no
         // "always deny" in the permission bar.
-        let kind=serde_json::from_str::<serde_json::Value>(&self.rust().options_json.to_string()).ok()
-            .and_then(|v|v.get("adapter").and_then(|v|v.as_str()).and_then(crate::model::backends::parse))
+        let kind = serde_json::from_str::<serde_json::Value>(&self.rust().options_json.to_string())
+            .ok()
+            .and_then(|v| {
+                v.get("adapter")
+                    .and_then(|v| v.as_str())
+                    .and_then(crate::model::backends::parse)
+            })
             .unwrap_or(bondsymphonic_proto::AgentAdapterKind::Claude);
-        let (decision,remember)=crate::model::backends::permission_reply(kind,allow,always_allow);
+        let (decision, remember) =
+            crate::model::backends::permission_reply(kind, allow, always_allow);
         if remember {
             if let Some(name) = tool {
                 self.as_mut().rust_mut().always_allow.insert(name);
             }
         }
         if answers_pending {
-            self.as_mut().rust_mut().transcript.pending = None;
+            self.as_mut()
+                .rust_mut()
+                .transcript
+                .answer_permission(&request_id);
             self.as_mut().sync_pending();
         }
         let message = message.to_string();
@@ -809,9 +818,8 @@ pub fn restart_options(options_json: &str, session: Option<&str>) -> String {
 ///
 /// `None` for either leaves whatever the tab holds, which is what a plain
 /// Restart passes. `Some("")` for the model is a choice rather than an absence
-/// -- "let Claude Code decide" -- and removes the key, because a key that is
-/// present says the tab pinned a model and an empty one would say it pinned
-/// nothing. The permission mode has no such spelling: it is always sent, so
+/// -- "let the CLI decide" -- and keeps an explicit empty string so the
+/// controller will not reapply the configured model. The permission mode is always sent, so
 /// `Some("")` there is ignored rather than obeyed.
 pub fn restart_options_with(
     options_json: &str,
@@ -826,7 +834,8 @@ pub fn restart_options_with(
     if let Some(map) = options.as_object_mut() {
         match model {
             Some("") => {
-                map.remove("model");
+                // Explicit CLI default must survive configured defaults on restart.
+                map.insert("model".to_owned(), serde_json::Value::String(String::new()));
             }
             Some(model) => {
                 map.insert(

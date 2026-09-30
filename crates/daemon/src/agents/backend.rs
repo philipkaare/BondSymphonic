@@ -1,5 +1,7 @@
 //! CLI-specific preparation, separate from sandbox and process ownership.
-use super::{adapter::AgentAdapter, claude_backend::ClaudeBackend, codex_backend::CodexBackend, AgentSink};
+use super::{
+    adapter::AgentAdapter, claude_backend::ClaudeBackend, codex_backend::CodexBackend, AgentSink,
+};
 use crate::{daemon::Daemon, sandbox::SandboxHandle, workspace::Workspace};
 use async_trait::async_trait;
 use bondsymphonic_proto::*;
@@ -55,7 +57,7 @@ pub fn backend_for(kind: AgentAdapterKind) -> Result<Arc<dyn Backend>, RpcError>
 }
 
 pub fn known_backends() -> Vec<Arc<dyn Backend>> {
-    vec![Arc::new(ClaudeBackend),Arc::new(CodexBackend)]
+    vec![Arc::new(ClaudeBackend), Arc::new(CodexBackend)]
 }
 
 pub fn runnable_adapters(backends: &[Arc<dyn Backend>]) -> Vec<AgentAdapterKind> {

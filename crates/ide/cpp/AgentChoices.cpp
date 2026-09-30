@@ -31,7 +31,7 @@ void fill(QComboBox* combo, const QList<agentchoices::Choice>& list) {
 QMap<QString, QList<agentchoices::Choice>> backendModels;
 QMap<QString, QList<agentchoices::Choice>> backendModes;
 QMap<QString, QString> backendNotes;
-QList<agentchoices::Choice>& fetchedModels() { return backendModels[QStringLiteral("claude")]; }
+QList<agentchoices::Choice> &fetchedModels() { return backendModels[QStringLiteral("claude")]; }
 
 /// Whether [`fetchedModels`] holds a real answer. A plain `bool` rather than
 /// `fetchedModels().isEmpty()`, because "Default" alone -- a fetch that came
@@ -43,10 +43,12 @@ bool& hasFetchedModels() {
 
 } // namespace
 
-const QList<agentchoices::Choice>& agentchoices::models(const QString& backend) {
-    if (backendModels.contains(backend)) return backendModels[backend];
+const QList<agentchoices::Choice> &agentchoices::models(const QString &backend) {
+    if (backendModels.contains(backend))
+        return backendModels[backend];
     static const QList<Choice> defaultOnly{{QStringLiteral("Default"), QString()}};
-    if (backend != QLatin1String("claude")) return defaultOnly;
+    if (backend != QLatin1String("claude"))
+        return defaultOnly;
     // The built-in fallback: what a dropdown shows until the first
     // `system.list_models` answers, and what it goes back to showing if a
     // fetch fails. Kept in the shape `newest_per_family` -- the daemon-side
@@ -71,18 +73,20 @@ void agentchoices::setModels(const QList<Choice>& fetched) {
     setModels(QStringLiteral("claude"), fetched);
 }
 
-void agentchoices::setModels(const QString& backend, const QList<Choice>& fetched) {
-    QList<Choice>& storage = backendModels[backend];
+void agentchoices::setModels(const QString &backend, const QList<Choice> &fetched) {
+    QList<Choice> &storage = backendModels[backend];
     storage.clear();
     storage.append({ QStringLiteral("Default"), QStringLiteral("") });
     storage += fetched;
     hasFetchedModels() = true;
 }
 
-const QList<agentchoices::Choice>& agentchoices::permissionModes(const QString& backend) {
-    if (backendModes.contains(backend)) return backendModes[backend];
+const QList<agentchoices::Choice> &agentchoices::permissionModes(const QString &backend) {
+    if (backendModes.contains(backend))
+        return backendModes[backend];
     static const QList<Choice> empty;
-    if (backend != QLatin1String("claude")) return empty;
+    if (backend != QLatin1String("claude"))
+        return empty;
     // The labels say what these modes DO here, which is not what their names
     // promise. Claude Code asks its host before running a tool that needs
     // approval, and the daemon passes `--permission-prompts host` without ever
@@ -101,26 +105,29 @@ const QList<agentchoices::Choice>& agentchoices::permissionModes(const QString& 
     return kModes;
 }
 
-QString agentchoices::permissionNote(const QString& backend) {
-    if (backendNotes.contains(backend)) return backendNotes[backend];
-    if (backend != QLatin1String("claude")) return QString();
+QString agentchoices::permissionNote(const QString &backend) {
+    if (backendNotes.contains(backend))
+        return backendNotes[backend];
+    if (backend != QLatin1String("claude"))
+        return QString();
     return QStringLiteral(
         "Claude Code cannot reach this window to ask, so a tool that needs approval is refused "
         "rather than queued. YOLO runs everything — the sandbox, the worktree and the network "
         "proxy are what make that reasonable.");
 }
 
-QString agentchoices::labelForModel(const QString& id, const QString& backend) {
+QString agentchoices::labelForModel(const QString &id, const QString &backend) {
     const QString label = labelIn(models(backend), id);
     return label.isEmpty() ? id : label;
 }
 
-QString agentchoices::labelForPermissionMode(const QString& id, const QString& backend) {
+QString agentchoices::labelForPermissionMode(const QString &id, const QString &backend) {
     const QString label = labelIn(permissionModes(backend), id);
     return label.isEmpty() ? id : label;
 }
 
-void agentchoices::fillModelCombo(QComboBox* combo, const QString& selected, const QString& backend) {
+void agentchoices::fillModelCombo(QComboBox *combo, const QString &selected,
+                                  const QString &backend) {
     // Editable, because Claude Code takes any model name and a list that
     // refused one would be this IDE deciding what the CLI supports.
     combo->setEditable(true);
@@ -147,37 +154,43 @@ QString agentchoices::modelComboSelection(const QComboBox* combo) {
     return listed >= 0 ? combo->itemData(listed).toString() : shown;
 }
 
-void agentchoices::fillPermissionCombo(QComboBox* combo, const QString& selected, const QString& backend) {
+void agentchoices::fillPermissionCombo(QComboBox *combo, const QString &selected,
+                                       const QString &backend) {
     combo->setEditable(false);
     fill(combo, permissionModes(backend));
-    const QString mode = backend == "claude" && selected == "default" ? QStringLiteral("manual") : selected;
+    const QString mode =
+        backend == "claude" && selected == "default" ? QStringLiteral("manual") : selected;
     const int index = combo->findData(mode);
     if (index >= 0) {
         combo->setCurrentIndex(index);
         return;
     }
-    // An unknown mode falls back to the most restrictive entry by name, never
-    // to index 0 -- index 0 is YOLO now, and a settings file this build cannot
-    // read is not consent to run every tool unasked. Restrictive here means
-    // "refuses", which is useless but is the user's to discover rather than
-    // ours to decide for them.
-    if (!mode.isEmpty()) { combo->addItem(mode, mode); combo->setCurrentIndex(combo->count()-1); return; }
-    const int manual = combo->findData(backend == QLatin1String("claude") ? QStringLiteral("manual") : QStringLiteral("on-request"));
+    // Preserve unknown explicit modes visibly. Silently choosing index 0 could
+    // enable YOLO without the user's consent.
+    if (!mode.isEmpty()) {
+        combo->addItem(mode, mode);
+        combo->setCurrentIndex(combo->count() - 1);
+        return;
+    }
+    const int manual =
+        combo->findData(backend == QLatin1String("claude") ? QStringLiteral("manual")
+                                                           : QStringLiteral("on-request"));
     combo->setCurrentIndex(manual >= 0 ? manual : 0);
 }
 
-void agentchoices::setDescriptors(const QJsonArray& descriptors) {
-    backendModes.clear(); backendNotes.clear();
-    for (const auto& value : descriptors) {
-        const auto descriptor=value.toObject();
-        const auto id=descriptor.value("id").toString();
+void agentchoices::setDescriptors(const QJsonArray &descriptors) {
+    backendModes.clear();
+    backendNotes.clear();
+    for (const auto &value : descriptors) {
+        const auto descriptor = value.toObject();
+        const auto id = descriptor.value("id").toString();
         QList<Choice> modes;
-        for (const auto& entry : descriptor.value("permission_modes").toArray()) {
-            const auto mode=entry.toObject();
-            modes.append({mode.value("label").toString(),mode.value("id").toString()});
+        for (const auto &entry : descriptor.value("permission_modes").toArray()) {
+            const auto mode = entry.toObject();
+            modes.append({mode.value("label").toString(), mode.value("id").toString()});
         }
-        backendModes.insert(id,modes);
-        backendNotes.insert(id,descriptor.value("permission_note").toString());
+        backendModes.insert(id, modes);
+        backendNotes.insert(id, descriptor.value("permission_note").toString());
     }
 }
 

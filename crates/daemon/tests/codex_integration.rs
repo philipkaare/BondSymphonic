@@ -116,6 +116,50 @@ async fn approves_raw_string_ids_once_and_rejects_unknown_ids() {
 }
 
 #[tokio::test]
+async fn answering_one_of_two_codex_approvals_keeps_the_agent_waiting() {
+    let (_dir, mut adapter, entry, store) = fixture("doubleapproval", None).await;
+    adapter.start().await.unwrap();
+    adapter.send("first".into()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let messages = store.read(&AgentId("agent".into())).await.unwrap();
+            if messages
+                .iter()
+                .filter(|m| matches!(m.body, AgentMessageBody::PermissionRequest { .. }))
+                .count()
+                == 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    adapter
+        .permission_reply(
+            "codex:\"server-approval\"".into(),
+            PermissionDecision::Allow,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(entry.state().0, AgentState::WaitingPermission);
+    adapter
+        .permission_reply(
+            "codex:\"second-approval\"".into(),
+            PermissionDecision::Deny,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    wait_state(&entry, AgentState::Idle).await;
+    adapter.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn initialization_eof_and_timeout_are_bounded_and_end_agent() {
     for mode in ["die", "hang"] {
         let (_dir, mut adapter, entry, _) = fixture(mode, None).await;
@@ -159,4 +203,16 @@ async fn eof_with_approval_outstanding_announces_exit_only_once() {
     adapter.stop().await.unwrap();
     adapter.stop().await.unwrap();
     assert_eq!(entry.epoch(), epoch);
+}
+
+#[tokio::test]
+async fn unsupported_server_requests_are_rejected_without_stalling_the_turn() {
+    let (_dir, mut adapter, entry, store) = fixture("unsupported", None).await;
+    adapter.start().await.unwrap();
+    adapter.send("first".into()).await.unwrap();
+    wait_state(&entry, AgentState::Idle).await;
+    let messages = store.read(&AgentId("agent".into())).await.unwrap();
+    assert!(messages.iter().any(|m| matches!(&m.body,
+        AgentMessageBody::System { data, .. } if data["method"] == "item/tool/requestUserInput")));
+    adapter.stop().await.unwrap();
 }

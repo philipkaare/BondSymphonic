@@ -60,16 +60,36 @@ pub fn setup_argv(action: SetupAction) -> Vec<String> {
         // hands agents as `CLAUDE_CODE_OAUTH_TOKEN`; Task 3 captures its
         // output from this same terminal.
         SetupAction::ClaudeSetupToken => &["claude", "setup-token"],
-        SetupAction::InstallCodex => &["bash", "-lc", include_str!("../../../scripts/install-codex.sh")],
-        SetupAction::CodexLogin => &["codex", "-c", "cli_auth_credentials_store=\"file\"", "login", "--device-auth"],
-        SetupAction::CodexLogout => &["codex", "-c", "cli_auth_credentials_store=\"file\"", "logout"],
+        SetupAction::InstallCodex => &[
+            "bash",
+            "-lc",
+            include_str!("../../../scripts/install-codex.sh"),
+        ],
+        SetupAction::CodexLogin => &[
+            "codex",
+            "-c",
+            "cli_auth_credentials_store=\"file\"",
+            "login",
+            "--device-auth",
+        ],
+        SetupAction::CodexLogout => &[
+            "codex",
+            "-c",
+            "cli_auth_credentials_store=\"file\"",
+            "logout",
+        ],
     };
     argv.iter().map(|s| (*s).to_string()).collect()
 }
 
-pub fn setup_env(root: &Path, action: SetupAction) -> Vec<(String,String)> {
+pub fn setup_env(root: &Path, action: SetupAction) -> Vec<(String, String)> {
     match action {
-        SetupAction::CodexLogin | SetupAction::CodexLogout => vec![("CODEX_HOME".into(),crate::agents::codex_backend::codex_home(root).display().to_string())],
+        SetupAction::CodexLogin | SetupAction::CodexLogout => vec![(
+            "CODEX_HOME".into(),
+            crate::agents::codex_backend::codex_home(root)
+                .display()
+                .to_string(),
+        )],
         _ => vec![],
     }
 }

@@ -300,6 +300,16 @@ pub fn seed_claude_files_from(
             continue;
         }
         let to = home.join(rel);
+        if let Some(parent) = to.parent() {
+            // `ensure_real_dir`, not `create_dir_all`: the agent can leave a
+            // symlink at `<home>/.claude` pointing out of the workspace, and
+            // `create_dir_all` would follow it and put the daemon user's own
+            // credentials wherever it points.
+            if let Err(e) = ensure_real_dir(parent) {
+                tracing::warn!(path = %parent.display(), error = %e, "could not create claude dir");
+                continue;
+            }
+        }
         if !from.is_file() {
             // The daemon user has no such file, so neither may this workspace.
             //
@@ -314,16 +324,6 @@ pub fn seed_claude_files_from(
                 tracing::warn!(path = %to.display(), error = %e, "could not remove a seeded file the daemon user no longer has");
             }
             continue;
-        }
-        if let Some(parent) = to.parent() {
-            // `ensure_real_dir`, not `create_dir_all`: the agent can leave a
-            // symlink at `<home>/.claude` pointing out of the workspace, and
-            // `create_dir_all` would follow it and put the daemon user's own
-            // credentials wherever it points.
-            if let Err(e) = ensure_real_dir(parent) {
-                tracing::warn!(path = %parent.display(), error = %e, "could not create claude dir");
-                continue;
-            }
         }
         // Cleared first, which is also what makes `create_new` succeed: it keeps
         // a stale mode from surviving a refresh, and unlinks a symlink planted at

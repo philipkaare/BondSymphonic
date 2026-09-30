@@ -28,7 +28,10 @@ Design: `docs/superpowers/specs/`. Plans: `docs/superpowers/plans/`.
   a data-dir instance lock, the daemon suite matched to its spec, an IDE job in CI,
   `package.ps1`, and this guide.
 
-Still placeholders: every agent adapter other than Claude Code and a plain terminal.
+Agent backends: Claude Code and Codex, plus a plain terminal. Enable Codex under
+Settings > Agents, install it there, then sign in to ChatGPT or store an OpenAI
+API key. Each backend has its own sandbox, proxy, credentials and defaults.
+See [agent backend setup](docs/user-guide.md#agent-backends).
 Known limits are listed per area in the [user guide](docs/user-guide.md).
 
 ## Quick start (Windows 11)

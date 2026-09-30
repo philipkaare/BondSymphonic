@@ -97,7 +97,13 @@ impl CodexAdapter {
         .await?;
         rpc.notify("initialized", json!({})).await?;
         let mut params = json!({"cwd":self.prepared.cwd, "approvalPolicy": self.prepared.options.permission_mode.as_deref().unwrap_or("never"), "sandbox":"danger-full-access"});
-        if let Some(model) = &self.prepared.options.model {
+        if let Some(model) = self
+            .prepared
+            .options
+            .model
+            .as_deref()
+            .filter(|model| !model.is_empty())
+        {
             params["model"] = json!(model);
         }
         let method = if let Some(session) = &self.prepared.options.resume_session {
@@ -167,6 +173,7 @@ impl AgentAdapter for CodexAdapter {
         let state = self.state.clone();
         let changed = self.changed.clone();
         let sink = self.sink.clone();
+        let event_rpc = rpc.clone();
         let mut pump = tokio::spawn(async move {
             let mut stream = CodexStream::default();
             while let Some(frame) = events.recv().await {
@@ -201,7 +208,13 @@ impl AgentAdapter for CodexAdapter {
                         );
                         changed.notify_waiters();
                     }
-                    _ => {}
+                    _ => {
+                        if let Some(id) = frame.get("id") {
+                            if event_rpc.reject_unsupported(id.clone()).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
                 }
                 for body in stream.ingest(frame) {
                     sink.message(body).await;
@@ -309,19 +322,28 @@ impl AgentAdapter for CodexAdapter {
             ));
         }
         let rpc = self.rpc()?;
-        let id = self
-            .state
-            .lock()
-            .approvals
-            .remove(&request_id)
-            .ok_or_else(|| RpcError::invalid_params("unknown or answered Codex approval"))?;
+        let id = {
+            let mut state = self.state.lock();
+            let id = state
+                .approvals
+                .remove(&request_id)
+                .ok_or_else(|| RpcError::invalid_params("unknown or answered Codex approval"))?;
+            self.sink.publish_state(
+                if state.approvals.is_empty() {
+                    AgentState::Working
+                } else {
+                    AgentState::WaitingPermission
+                },
+                None,
+            );
+            id
+        };
         let answer = match decision {
             PermissionDecision::Allow => "accept",
             PermissionDecision::AllowForSession => "acceptForSession",
             PermissionDecision::Deny => "decline",
         };
         // Publish before writing: a completion can arrive immediately after it.
-        self.sink.publish_state(AgentState::Working, None);
         self.sink
             .message(AgentMessageBody::System {
                 subtype: "permission_reply".into(),

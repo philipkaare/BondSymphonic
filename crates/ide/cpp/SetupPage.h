@@ -60,8 +60,9 @@ public:
     /// only have changed if something was run to change it, and this is the
     /// page that runs those things.
     bool ranAction() const;
-    void runAction(const QString& action);
-    void setBackendSettings(const QJsonObject& settings);
+    static QString buttonTextFor(const QString &action);
+    void runAction(const QString &action);
+    void setBackendSettings(const QJsonObject &settings);
 
 protected:
     /// Re-elides the sign-in URL: the label's width is only known once the
@@ -120,7 +121,6 @@ private:
     /// invent, because that string already carries the answer.
     static QString tokenActionFor(const QString& name, bool ok, const QString& detail);
     /// What the button for `action` says.
-    static QString buttonTextFor(const QString& action);
 
     /// Starts `action`'s terminal and reveals the pane it will appear in.
     /// Refused while another action's `system.setup_pty` is still in flight:

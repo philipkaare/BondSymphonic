@@ -30,8 +30,8 @@ class QScrollArea;
 class SettingsDialog : public QDialog {
     Q_OBJECT
 public:
-    explicit SettingsDialog(AppController* controller, QWidget* parent = nullptr,
-                            const QJsonArray& descriptors = QJsonArray());
+  explicit SettingsDialog(AppController *controller, QWidget *parent = nullptr,
+                          const QJsonArray &descriptors = QJsonArray());
 
     /// Scrolls the Setup section into view and gives it the focus. What
     /// `MainWindow::showSetupPage` calls, so the status-bar "Set up…" link and
@@ -49,7 +49,7 @@ public:
 private:
     /// Points the field's placeholder at whatever the credential store now
     /// says, and greys "Remove key" out when there is nothing to remove.
-    void refreshDefaults();
+  void refreshDefaults();
 
     AppController* m_controller;
     /// The whole setup page, hosted as this dialog's first section.
@@ -57,17 +57,17 @@ private:
     /// The scroller the sections live in, so `revealSetup` can bring the first
     /// one back into view in a dialog the user has scrolled.
     QScrollArea* m_scroll = nullptr;
-    struct BackendControls {
-        QString label;
-        QCheckBox* enabled;
-        QLineEdit* key;
-        QPushButton* removeKey;
-        QComboBox* model;
-        QComboBox* mode;
-    };
-    QMap<QString,BackendControls> m_backends;
-    QJsonObject m_settings;
-    QComboBox* m_defaultBackend = nullptr;
+  struct BackendControls {
+      QString label;
+      QCheckBox *enabled;
+      QLineEdit *key;
+      QPushButton *removeKey;
+      QComboBox *model;
+      QComboBox *mode;
+  };
+  QMap<QString, BackendControls> m_backends;
+  QJsonObject m_settings;
+  QComboBox *m_defaultBackend = nullptr;
     /// Whether the transcripts show the turn cost and the agent's own system
     /// lines. Applied to every open pane when this dialog closes, which is the
     /// window's job: this dialog knows the setting and no transcripts.

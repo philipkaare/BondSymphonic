@@ -1016,6 +1016,14 @@ impl ProtectedSnapshot {
         if entries.is_empty() {
             return None;
         }
+        // Identity checks and content checks can discover the same changes in
+        // different orders across filesystems. Keep diagnostics deterministic.
+        entries.sort_by_key(|name| {
+            self.entries
+                .iter()
+                .position(|entry| &entry.name == name)
+                .unwrap_or(usize::MAX)
+        });
         let mut lines = Vec::new();
         for (name, path, before) in &self.diff_files {
             line_diff(name, before, &read_protected(path), &mut lines);

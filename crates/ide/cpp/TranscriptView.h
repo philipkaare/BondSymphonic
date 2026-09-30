@@ -48,7 +48,7 @@ public:
     explicit TranscriptView(TranscriptModel* model, QWidget* parent = nullptr);
 
     TranscriptModel* model() const;
-    void setBackend(const QString& backend);
+    void setBackend(const QString &backend);
     QString backend() const { return m_backend; }
 
     /// Whether an `agent.start` for this pane is in flight. The prompt box says
@@ -172,7 +172,7 @@ protected:
     void changeEvent(QEvent* event) override;
 
 private:
-    QString m_backend = QStringLiteral("claude");
+  QString m_backend = QStringLiteral("claude");
     /// Mixes the banner's red into whatever the pane is now and installs it.
     /// Called from the constructor and from every palette change.
     void applyBannerWash();

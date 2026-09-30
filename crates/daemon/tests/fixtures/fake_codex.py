@@ -11,6 +11,7 @@ mode = sys.argv[1] if len(sys.argv) > 1 else "normal"
 initialized = False
 thread = "new-thread"
 turn = 0
+approvals_answered = 0
 
 
 def emit(value):
@@ -48,11 +49,17 @@ for line in sys.stdin:
         turn += 1
         emit({"id": m["id"], "result": {"turn": {"id": str(turn)}}})
         event("turn/started", {"threadId": thread, "turn": {"id": str(turn)}})
-        if mode in ("approval", "approvaldie"):
+        if mode == "unsupported":
+            emit({"id": "unsupported-request", "method": "item/tool/requestUserInput",
+                  "params": {"threadId": thread, "turnId": str(turn)}})
+        if mode in ("approval", "approvaldie", "doubleapproval"):
             emit({"id": "server-approval", "method": "item/commandExecution/requestApproval",
                   "params": {"threadId": thread, "turnId": str(turn), "itemId": "cmd", "command": "echo test"}})
             if mode == "approvaldie":
                 sys.exit(2)
+            if mode == "doubleapproval":
+                emit({"id": "second-approval", "method": "item/fileChange/requestApproval",
+                      "params": {"threadId": thread, "turnId": str(turn), "itemId": "edit"}})
     elif method == "turn/steer":
         assert p["expectedTurnId"] == str(turn)
         emit({"id": m["id"], "result": {"turnId": str(turn)}})
@@ -62,8 +69,15 @@ for line in sys.stdin:
         emit({"id": m["id"], "result": {}})
         event("turn/completed", {"threadId": thread, "turn": {"id": str(turn), "status": "interrupted"}})
     elif method is None:
-        assert m["id"] == "server-approval"
-        assert m["result"]["decision"] in ("accept", "decline", "acceptForSession")
+        if mode == "unsupported":
+            assert m["id"] == "unsupported-request"
+            assert m["error"]["code"] == -32601
+        else:
+            assert m["id"] in ("server-approval", "second-approval")
+            assert m["result"]["decision"] in ("accept", "decline", "acceptForSession")
+        approvals_answered += 1
+        if mode == "doubleapproval" and approvals_answered < 2:
+            continue
         event("turn/completed", {"threadId": thread, "turn": {"id": str(turn), "status": "completed"}})
     else:
         raise AssertionError(method)

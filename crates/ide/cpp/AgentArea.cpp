@@ -44,8 +44,10 @@ void AgentArea::showWorkspace(const QString& workspaceId, const QString& adapter
         // Backend identity is set before options and login state are applied.
         TranscriptView* view = ensureTranscript(workspaceId, agentId);
         view->setBackend(adapter);
-        view->setClaudeLoggedIn(adapter=="claude" ? m_claudeLoggedIn : m_backendLoggedIn.value(adapter,false));
-        view->setClaudeAuthFailure(adapter=="claude" ? m_claudeAuthFailure : m_backendAuthFailure.value(adapter));
+        view->setClaudeLoggedIn(adapter == "claude" ? m_claudeLoggedIn
+                                                    : m_backendLoggedIn.value(adapter, false));
+        view->setClaudeAuthFailure(adapter == "claude" ? m_claudeAuthFailure
+                                                       : m_backendAuthFailure.value(adapter));
         setCurrentWidget(m_pages.value(workspaceId, view));
         return;
     }
@@ -207,8 +209,8 @@ void AgentArea::setOptionsJson(const QString& workspaceId, const QString& option
     if (model == nullptr || optionsJson.isEmpty()) {
         return;
     }
-    auto options=QJsonDocument::fromJson(optionsJson.toUtf8()).object();
-    options.insert("adapter",view->backend());
+    auto options = QJsonDocument::fromJson(optionsJson.toUtf8()).object();
+    options.insert("adapter", view->backend());
     model->setOptionsJson(QString::fromUtf8(QJsonDocument(options).toJson(QJsonDocument::Compact)));
 }
 
@@ -301,17 +303,20 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
     return view;
 }
 
-void AgentArea::setBackendAuth(const QString& backend,bool loggedIn,const QString& failure) {
-    m_backendLoggedIn.insert(backend,loggedIn); m_backendAuthFailure.insert(backend,failure);
-    for (auto* view : m_transcripts) if (view && view->backend()==backend) {
-        view->setClaudeLoggedIn(loggedIn); view->setClaudeAuthFailure(failure);
-    }
+void AgentArea::setBackendAuth(const QString &backend, bool loggedIn, const QString &failure) {
+    m_backendLoggedIn.insert(backend, loggedIn);
+    m_backendAuthFailure.insert(backend, failure);
+    for (auto *view : m_transcripts)
+        if (view && view->backend() == backend) {
+            view->setClaudeLoggedIn(loggedIn);
+            view->setClaudeAuthFailure(failure);
+        }
 }
 
 void AgentArea::setClaudeLoggedIn(bool loggedIn) {
     m_claudeLoggedIn = loggedIn;
     for (TranscriptView* view : m_transcripts) {
-        if (view != nullptr && view->backend()=="claude") {
+        if (view != nullptr && view->backend() == "claude") {
             view->setClaudeLoggedIn(loggedIn);
         }
     }
@@ -329,7 +334,7 @@ void AgentArea::setPrereqsAnswered(bool answered) {
 void AgentArea::setClaudeAuthFailure(const QString& sentence) {
     m_claudeAuthFailure = sentence;
     for (TranscriptView* view : m_transcripts) {
-        if (view != nullptr && view->backend()=="claude") {
+        if (view != nullptr && view->backend() == "claude") {
             view->setClaudeAuthFailure(sentence);
         }
     }

@@ -582,6 +582,70 @@ fn reply(seq: u64, request_id: &str, decision: &str) -> AgentMessage {
     )
 }
 
+#[test]
+fn overlapping_codex_approvals_remain_answerable_in_order() {
+    let mut t = Transcript::default();
+    t.set_state(AgentState::WaitingPermission, None);
+    t.apply(&request(1, "codex:a"));
+    t.apply(&request(2, "codex:b"));
+    assert_eq!(t.pending.as_ref().unwrap().request_id, "codex:a");
+    t.apply(&reply(3, "codex:a", "allow"));
+    assert_eq!(t.pending.as_ref().unwrap().request_id, "codex:b");
+    t.apply(&msg(
+        4,
+        AgentMessageBody::ToolUse {
+            id: "tool-a".into(),
+            name: "Bash".into(),
+            input: json!({"command":"ls"}),
+        },
+    ));
+    assert_eq!(t.pending.as_ref().unwrap().request_id, "codex:b");
+    t.apply(&reply(5, "codex:b", "deny"));
+    assert!(t.pending.is_none());
+}
+
+#[test]
+fn queued_codex_replies_and_local_acknowledgments_do_not_hide_other_requests() {
+    let mut t = Transcript::default();
+    t.apply(&request(1, "codex:a"));
+    t.apply(&request(2, "codex:b"));
+    t.apply(&reply(3, "codex:b", "deny"));
+    assert_eq!(t.pending.as_ref().unwrap().request_id, "codex:a");
+    t.apply(&request(4, "codex:c"));
+    t.answer_permission("codex:a");
+    t.apply(&reply(5, "codex:a", "allow"));
+    assert_eq!(t.pending.as_ref().unwrap().request_id, "codex:c");
+    t.answer_permission("codex:c");
+    assert!(t.pending.is_none());
+}
+
+#[test]
+fn ending_a_turn_discards_all_queued_codex_approvals() {
+    for exit in [false, true] {
+        let mut t = Transcript::default();
+        t.set_state(AgentState::WaitingPermission, None);
+        t.apply(&request(1, "codex:a"));
+        t.apply(&request(2, "codex:b"));
+        if exit {
+            t.set_state(AgentState::Exited, None);
+        } else {
+            t.apply(&msg(
+                3,
+                AgentMessageBody::Result {
+                    cost_usd: 0.0,
+                    duration_ms: 1,
+                    num_turns: 1,
+                    session_id: "thread".into(),
+                },
+            ));
+        }
+        t.apply(&request(4, "codex:c"));
+        assert_eq!(t.pending.as_ref().unwrap().request_id, "codex:c");
+        t.answer_permission("codex:c");
+        assert!(t.pending.is_none());
+    }
+}
+
 /// The defect this fixes: a tab that re-attaches replays the request out of
 /// `agent.history`, raises the bar again, and the answer it sends names a
 /// request the adapter has already forgotten -- an error banner over a settled
@@ -859,10 +923,9 @@ fn changing_the_permission_mode_sends_one_even_when_the_tab_had_none() {
     let value: serde_json::Value = serde_json::from_str(&both).expect("json");
     assert_eq!(value["permission_mode"], "bypassPermissions");
     // The empty model id is "let Claude Code decide", which is a choice and not
-    // an absence: the key is removed rather than sent empty, because the daemon
-    // filters an empty string out anyway and a key that is there says the tab
-    // pinned a model.
-    assert!(value.get("model").is_none());
+    // an absence: retain an explicit empty string so configured backend defaults
+    // do not replace the user's choice on restart.
+    assert_eq!(value.get("model").and_then(|v| v.as_str()), Some(""));
 }
 
 /// Neither override is given, which is what the Restart button sends. The

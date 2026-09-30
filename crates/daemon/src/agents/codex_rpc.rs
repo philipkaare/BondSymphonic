@@ -164,6 +164,10 @@ impl CodexRpc {
         self.write(json!({"id":id,"result":result})).await
     }
 
+    pub async fn reject_unsupported(&self, id: Value) -> Result<(), RpcError> {
+        self.write(json!({"id":id,"error":{"code":-32601,"message":"This Codex request is not supported by BondSymphonic"}})).await
+    }
+
     pub async fn close_input(&self) {
         self.calls.lock().fail("Codex connection closed");
         self.writer.lock().await.take();

@@ -365,10 +365,11 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     onStateChanged();
 }
 
-void TranscriptView::setBackend(const QString& backend) {
-    if (m_backend==backend) return;
-    m_backend=backend;
-    m_loginButton->setText(backend=="codex" ? "Sign in to Codex…" : "Log in to Claude Code…");
+void TranscriptView::setBackend(const QString &backend) {
+    if (m_backend == backend)
+        return;
+    m_backend = backend;
+    m_loginButton->setText(backend == "codex" ? "Sign in to Codex…" : "Log in to Claude Code…");
     applyOptionsToChoices();
     refreshGate();
 }
@@ -548,13 +549,14 @@ void TranscriptView::refreshGate() {
         // the first check can take ten seconds, and the user who read the old
         // sentence in that window went to Settings to log in again, found the
         // page empty and quit. There is nothing to fix yet, so no button.
-        m_gateText->setText(QStringLiteral("Checking whether %1 is logged in").arg(m_backend=="codex" ? "Codex" : "Claude Code") +
+        m_gateText->setText(QStringLiteral("Checking whether %1 is logged in")
+                                .arg(m_backend == "codex" ? "Codex" : "Claude Code") +
                             QChar(kEllipsis));
         m_loginButton->hide();
         return;
     }
-    m_gateText->setText(
-        QStringLiteral("%1 is not logged in, so this agent cannot answer yet.").arg(m_backend=="codex" ? "Codex" : "Claude Code"));
+    m_gateText->setText(QStringLiteral("%1 is not logged in, so this agent cannot answer yet.")
+                            .arg(m_backend == "codex" ? "Codex" : "Claude Code"));
     m_loginButton->show();
 }
 
@@ -695,8 +697,8 @@ void TranscriptView::updateWelcome() {
     const QString model = chosenModelId();
     QStringList what{
         agentchoices::labelForModel(model == QStringLiteral("-") ? QString() : model, m_backend),
-        agentchoices::labelForPermissionMode(m_permissionChoice->currentData().toString(), m_backend)
-    };
+        agentchoices::labelForPermissionMode(m_permissionChoice->currentData().toString(),
+                                             m_backend)};
     if (!m_welcomeOrigin.isEmpty()) {
         what.append(m_welcomeOrigin);
     }
@@ -721,7 +723,11 @@ void TranscriptView::applyOptionsToChoices() {
     agentchoices::fillModelCombo(m_modelChoice, model, m_backend);
     agentchoices::fillPermissionCombo(
         m_permissionChoice,
-        mode.isEmpty() ? (m_backend=="codex" ? QStringLiteral("never") : QString::fromUtf8(agentchoices::defaultPermissionMode())) : mode, m_backend);
+        mode.isEmpty()
+            ? (m_backend == "codex" ? QStringLiteral("never")
+                                    : QString::fromUtf8(agentchoices::defaultPermissionMode()))
+            : mode,
+        m_backend);
     m_applyingOptions = false;
     m_sentModel = chosenModelId();
     m_sentMode = m_permissionChoice->currentData().toString();
@@ -769,8 +775,8 @@ void TranscriptView::emitOptionsChanged() {
     // still fail, and what answers afterwards would be the old agent.
     // `onStateChanged` posts it when a different agent id arrives, which is the
     // switch having actually taken place.
-    m_pendingSwitch = agentchoices::labelForModel(model,m_backend) + QStringLiteral(" · ") +
-                      agentchoices::labelForPermissionMode(mode,m_backend);
+    m_pendingSwitch = agentchoices::labelForModel(model, m_backend) + QStringLiteral(" · ") +
+                      agentchoices::labelForPermissionMode(mode, m_backend);
     emit optionsChanged(m_model->restartOptionsChoosing(model, mode));
 }
 
@@ -1232,7 +1238,8 @@ extern "C" std::int32_t bs_widget_test_transcript_composer_offers_model_and_mode
     }
     const QJsonObject undecided =
         QJsonDocument::fromJson(sent.at(2).toUtf8()).object();
-    if (undecided.contains(QStringLiteral("model"))) {
+    if (!undecided.contains(QStringLiteral("model")) ||
+        !undecided.value(QStringLiteral("model")).toString().isEmpty()) {
         return 11;
     }
 

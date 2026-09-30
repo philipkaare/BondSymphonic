@@ -11,6 +11,51 @@ version; `docs/superpowers/specs/` is the design behind it.
 
 ## Install
 
+### Agent backends
+
+**Settings > Agents** has a tab for each backend the connected daemon supports.
+Claude is enabled initially; Codex is disabled until you enable it. Each tab has
+Enabled, installation/sign-in actions, Default model, Default permissions, and a
+write-only API-key field. Keys are stored separately in Windows Credential
+Manager. An empty field keeps the stored key; Remove key deletes that backend's
+key. The common **New agents use** selector lists enabled backends. If all are
+disabled, New Agent offers a terminal. Disabling a backend leaves running agents
+alone and prevents new starts and restarts until it is enabled again.
+
+For Codex, press **Install Codex**, then **Sign in to ChatGPT** and follow the ChatGPT
+device sign-in instructions in the Setup terminal. The installer pins Codex
+**0.158.0** and its matching Code Mode helper; both are needed for tools to work.
+If device sign-in is unavailable on your account, the CLI's browser login is an
+alternative, but its callback must be reachable from the browser. In this WSL
+configuration, signing in with the Windows Codex CLI using the shared WSL
+`CODEX_HOME` was verified; a Windows browser could not reach the WSL callback.
+
+A stored OpenAI API key takes precedence over ChatGPT sign-in for Codex. Claude
+keeps its existing login/token-first behavior. A Codex login failure does not
+change Claude's login state. Model discovery is separate for each backend; you
+can type a model ID even when discovery is unavailable. The default model and
+permissions affect new agents. A restored or restarted agent keeps its selected
+backend, model, permission mode and session.
+
+Codex offers **never** (no approval prompts inside the outer sandbox) and
+**on-request** (the transcript presents requests from Codex). The session option
+on an approval sends Codex's own session-scoped decision. Commands and file edits
+appear as tool cards. Codex does not report a dollar cost through this adapter,
+so its status bar says **Cost unavailable**.
+
+Codex uses a private companion sandbox and network proxy, with separate home,
+cache and runtime directories from Claude. Agents in the same workspace share
+project files and the workspace's explicit network allowlist. Codex login and
+history live in the daemon data directory's `codex-home`, shared between Codex
+workspaces and retained when a workspace is deleted; Claude cannot mount it.
+The Codex proxy additionally permits `api.openai.com`, `auth.openai.com` and
+`chatgpt.com`.
+
+Existing settings migrate on read: Claude's old default permission mode moves
+into its backend entry, with `default` still becoming `manual`. An existing
+backend entry wins over the old field. A daemon without backend descriptors
+continues to expose Claude only; update the daemon before starting Codex.
+
 ### From a package
 
 You were handed a `BondSymphonic-<version>-win64.zip`.

@@ -815,7 +815,10 @@ impl AgentManager {
         // Preserve the public "not ready" refusal while restore owns the
         // lifecycle gate. Read again under the gate below before preparing.
         if d.workspace(&p.workspace_id)?.state != WorkspaceState::Ready {
-            return Err(RpcError::invalid_params(format!("workspace {} is not ready", p.workspace_id)));
+            return Err(RpcError::invalid_params(format!(
+                "workspace {} is not ready",
+                p.workspace_id
+            )));
         }
         let _lifecycle = crate::workspace::lifecycle::gate(&p.workspace_id)
             .try_lock_owned()

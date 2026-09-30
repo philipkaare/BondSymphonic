@@ -45,8 +45,8 @@ impl Handler for WorkspaceHandler {
                 )
                 .await;
                 items.extend(crate::agents::codex_backend::prerequisites(&d.dirs.root).await);
-                ok(CheckPrereqsResult {items})
-            },
+                ok(CheckPrereqsResult { items })
+            }
             // The daemon fetches on the agent's own credentials (or the
             // caller's `api_key`), so this lives beside the other workspace
             // and agent methods rather than in `SystemHandler`, which has no
@@ -163,7 +163,7 @@ impl Handler for WorkspaceHandler {
                             rows: p.rows.max(1),
                         },
                         tap,
-                        crate::setup::setup_env(&d.dirs.root,p.action),
+                        crate::setup::setup_env(&d.dirs.root, p.action),
                     )
                     .await?;
                 // A host terminal runs unsandboxed and belongs to the connection that

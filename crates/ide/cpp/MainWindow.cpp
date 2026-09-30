@@ -1155,17 +1155,39 @@ void MainWindow::connectController() {
     // window, and every connection it makes, is already built.
     QObject::connect(m_controller, &AppController::modelsChecked, this,
                      &MainWindow::applyModels);
-    QObject::connect(m_controller,&AppController::backendModelsChecked,this,[this](const QString& backend,const QString& json,qint64) {
-        QList<agentchoices::Choice> choices;
-        for (const auto& value : QJsonDocument::fromJson(json.toUtf8()).array()) {
-            const auto entry=value.toObject(); choices.append({entry.value("label").toString(),entry.value("id").toString()});
-        }
-        agentchoices::setModels(backend,choices); m_agentArea->refillModels();
+    QObject::connect(m_controller, &AppController::backendModelsChecked, this,
+                     [this](const QString &backend, const QString &json, qint64) {
+                         QList<agentchoices::Choice> choices;
+                         for (const auto &value : QJsonDocument::fromJson(json.toUtf8()).array()) {
+                             const auto entry = value.toObject();
+                             choices.append(
+                                 {entry.value("label").toString(), entry.value("id").toString()});
+                         }
+                         agentchoices::setModels(backend, choices);
+                         m_agentArea->refillModels();
+                     });
+    QObject::connect(m_controller, &AppController::backendSettingsChanged, this, [this] {
+        agentchoices::setDescriptors(
+            QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array());
+        m_agentArea->setBackendAuth("codex", m_controller->backendLoggedIn("codex"),
+                                    m_controller->backendAuthFailure("codex"));
     });
-    QObject::connect(m_controller,&AppController::backendSettingsChanged,this,[this] {
-        agentchoices::setDescriptors(QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array());
-        m_agentArea->setBackendAuth("codex",m_controller->backendLoggedIn("codex"),m_controller->backendAuthFailure("codex"));
-    });
+    if (menuTest().contains(QLatin1String("backend-auth"))) {
+        auto logout = std::make_shared<bool>(false);
+        QObject::connect(
+            m_controller, &AppController::backendSettingsChanged, this, [this, logout] {
+                const QString codex =
+                    m_controller->backendLoggedIn("codex") ? "codex-open" : "codex-closed";
+                const QString claude =
+                    m_controller->backendLoggedIn("claude") ? "claude-open" : "claude-closed";
+                announceMenuTest(*logout ? "backend-logout" : "backend-auth", codex, claude);
+                if (!*logout && m_controller->backendLoggedIn("claude") &&
+                    !m_controller->backendAuthFailure("codex").isEmpty()) {
+                    *logout = true;
+                    m_controller->openSetupPty("codex_logout", 80, 24);
+                }
+            });
+    }
     // Test seam: says which way the gate went and on what, and answers the
     // CLI's verdict the way the setup page's button would -- by opening the
     // Claude login terminal -- so a run can see that a re-check alone leaves
@@ -2766,7 +2788,10 @@ void MainWindow::rebindCost() {
 }
 
 void MainWindow::updateCostLabel() {
-    if (activeTab().value("adapter").toString()=="codex") { m_costLabel->setText("Cost unavailable"); return; }
+    if (activeTab().value("adapter").toString() == "codex") {
+        m_costLabel->setText("Cost unavailable");
+        return;
+    }
     const QString workspaceId = activeWorkspaceId();
     TranscriptModel* model =
         workspaceId.isEmpty() ? nullptr : m_agentArea->transcriptModel(workspaceId);

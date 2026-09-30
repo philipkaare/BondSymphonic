@@ -24,7 +24,7 @@
 use bondsymphonic_proto::{AgentMessage, AgentMessageBody, AgentState, PermissionDecision};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 /// Longest summary taken from a `Bash` command, in characters.
 const BASH_SUMMARY_MAX: usize = 80;
@@ -231,6 +231,7 @@ pub struct Transcript {
     pub turns: u32,
     pub session_id: Option<String>,
     pub pending: Option<PendingPermission>,
+    queued_permissions: VecDeque<PendingPermission>,
     /// Highest `seq` applied. `None` until the first message, so a daemon that
     /// numbers its first message `0` does not have it swallowed by the
     /// duplicate check.
@@ -250,6 +251,7 @@ impl Default for Transcript {
             turns: 0,
             session_id: None,
             pending: None,
+            queued_permissions: VecDeque::new(),
             last_seq: None,
         }
     }
@@ -344,12 +346,17 @@ impl Transcript {
                 input,
                 ..
             } => {
-                self.pending = Some(PendingPermission {
+                let permission = PendingPermission {
                     request_id: request_id.clone(),
                     tool_name: tool_name.clone(),
                     summary: tool_summary(tool_name, input),
                     input_json: compact(input),
-                });
+                };
+                if self.pending.is_some() {
+                    self.queued_permissions.push_back(permission);
+                } else {
+                    self.pending = Some(permission);
+                }
                 // No item: the permission bar shows it, and the tool card
                 // appears once the call actually runs.
                 Applied::Nothing
@@ -362,7 +369,8 @@ impl Transcript {
             } => {
                 // The turn is over; nothing in it is still waiting to be
                 // allowed.
-                self.answer_permission("");
+                self.pending = None;
+                self.queued_permissions.clear();
                 self.cost_usd += cost_usd;
                 self.turns += num_turns;
                 self.session_id = Some(session_id.clone());
@@ -441,6 +449,7 @@ impl Transcript {
             self.state.is(AgentState::WaitingPermission) && state != AgentState::WaitingPermission;
         if leaving_wait {
             self.pending = None;
+            self.queued_permissions.clear();
         }
         self.record_state(state, detail);
     }
@@ -512,6 +521,7 @@ impl Transcript {
         );
         if moved_on {
             self.pending = None;
+            self.queued_permissions.clear();
         }
         applied
     }
@@ -522,13 +532,28 @@ impl Transcript {
     /// defensive arms want: a tool call that is running, or a turn that has
     /// finished, says the question is settled without naming it. A
     /// `request_id` that names some *other* request leaves the bar alone.
-    fn answer_permission(&mut self, request_id: &str) {
+    pub fn answer_permission(&mut self, request_id: &str) {
+        // Codex may run other tools while a parallel approval is outstanding.
+        // Only an explicit reply or the final state settles those requests.
+        if request_id.is_empty() {
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.request_id.starts_with("codex:"))
+            {
+                return;
+            }
+            self.queued_permissions.clear();
+        } else {
+            self.queued_permissions
+                .retain(|p| p.request_id != request_id);
+        }
         let answered = self
             .pending
             .as_ref()
             .is_some_and(|p| request_id.is_empty() || p.request_id == request_id);
         if answered {
-            self.pending = None;
+            self.pending = self.queued_permissions.pop_front();
         }
     }
 
@@ -551,6 +576,7 @@ impl Transcript {
         let tool = self.pending.as_ref().map(|p| p.tool_name.clone())?;
         let decision = decide_permission(always_allow, &tool)?;
         let pending = self.pending.take()?;
+        self.pending = self.queued_permissions.pop_front();
         Some((pending, decision))
     }
 
