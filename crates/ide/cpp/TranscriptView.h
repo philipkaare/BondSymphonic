@@ -139,6 +139,12 @@ public:
     /// The frames on show, for a check that reads one back.
     int frameCount() const;
     QWidget* frameAt(int index) const;
+    /// Whether the "starting the agent" progress row is up, and what it says.
+    bool progressShown() const;
+    QString progressText() const;
+    /// Whether the prompt box refuses typing, and the banner's text.
+    bool inputLocked() const;
+    QString bannerText() const;
     /// The welcome's three lines, or empty when it is not on show.
     QString welcomeTextForTest() const;
     /// The view-level notices on show, newest last -- today the "switched to
@@ -221,6 +227,9 @@ private:
     void clearFrames();
     /// Whether an item of this kind is one of the two the meta setting hides.
     bool isHiddenMeta(const QString& kind) const;
+    /// Whether the agent is a record a daemon restart left behind, which the
+    /// window starts again rather than reports; see `kEndedByRestart`.
+    bool restartPending() const;
     /// How many frames are actually on show. Not [`m_frames`]'s length: a
     /// hidden meta item keeps its slot there so the list stays indexed by item,
     /// and holds a null.
@@ -265,6 +274,10 @@ private:
     QString m_welcomeOrigin;
     QString m_welcomeWorktree;
     QLabel* m_banner = nullptr;
+    /// A sentence over an indeterminate bar, up while an agent is on its way:
+    /// a start in flight, or a restored agent the window is about to start.
+    QWidget* m_progress = nullptr;
+    QLabel* m_progressText = nullptr;
     PermissionBar* m_permission = nullptr;
     /// The prompt box and its three buttons as one widget, so the login gate
     /// can replace the lot without touching any of them.

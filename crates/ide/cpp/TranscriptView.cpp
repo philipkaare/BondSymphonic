@@ -20,6 +20,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPalette>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
@@ -69,6 +70,16 @@ const char* kKindSystem = "system";
 const char* kStateWorking = "working";
 const char* kStateError = "error";
 const char* kStateExited = "exited";
+
+/// The exit details the daemon gives the agents it restores at startup
+/// (`ENDED_AT_RESTART` and `ENDED_BEFORE_RESTART` in the daemon's
+/// `agents/mod.rs`). Such an agent is not news: it is a record whose process a
+/// daemon restart took away, and the window starts it again as soon as its
+/// workspace is running and its tab is in front.
+const char* const kEndedByRestart[] = {
+    "the agent ended when the daemon restarted",
+    "the agent ended before the daemon restarted",
+};
 
 /// The label inside a text frame, or null for a frame built some other way.
 QLabel* bodyLabel(QWidget* frame) {
@@ -188,6 +199,25 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     applyBannerWash();
     m_banner->hide();
     outer->addWidget(m_banner);
+
+    m_progress = new QWidget(this);
+    m_progress->setObjectName(QStringLiteral("bsAgentProgress"));
+    auto* progressLayout = new QVBoxLayout(m_progress);
+    progressLayout->setContentsMargins(6, 4, 6, 4);
+    progressLayout->setSpacing(2);
+    m_progressText = new QLabel(m_progress);
+    m_progressText->setTextFormat(Qt::PlainText);
+    m_progressText->setWordWrap(true);
+    m_progressText->setEnabled(false);
+    progressLayout->addWidget(m_progressText);
+    auto* bar = new QProgressBar(m_progress);
+    // Indeterminate: nothing reports how far a start has got.
+    bar->setRange(0, 0);
+    bar->setTextVisible(false);
+    bar->setMaximumHeight(fontMetrics().height() / 2 + 2);
+    progressLayout->addWidget(bar);
+    m_progress->hide();
+    outer->addWidget(m_progress);
 
     m_permission = new PermissionBar(this);
     outer->addWidget(m_permission);
@@ -327,7 +357,10 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     // Attaching is what opens the box: until the id lands there is no agent to
     // send a prompt to.
     QObject::connect(model, &TranscriptModel::agentIdChanged, this, &TranscriptView::onStateChanged);
-    QObject::connect(model, &TranscriptModel::stateDetailChanged, this, &TranscriptView::refreshBanner);
+    // The whole state rather than only the banner: the detail is also what says
+    // whether an exited agent is one coming back; see `restartPending`.
+    QObject::connect(model, &TranscriptModel::stateDetailChanged, this,
+                     &TranscriptView::onStateChanged);
 
     QObject::connect(m_input, &PromptInput::submitted, this, [this](const QString& text) {
         if (m_model.isNull()) {
@@ -610,6 +643,12 @@ void TranscriptView::onStateChanged() {
         announceSwitch();
     }
     const bool noAgent = agentId.isEmpty();
+    // Coming back by itself: a start is in flight, or this is an agent a daemon
+    // restart left behind and the window is about to start it again. The pane
+    // says so over a moving bar instead of reporting the old exit as an error.
+    const bool comingBack = m_starting || (!m_workspaceDown && restartPending());
+    // The box is shut whenever there is no running agent to read it: text
+    // typed into it then would be sent nowhere.
     if (m_starting) {
         m_input->setBusy(true, QStringLiteral("starting the agent") + QChar(kEllipsis));
     } else if (m_workspaceDown) {
@@ -619,9 +658,18 @@ void TranscriptView::onStateChanged() {
         m_input->setBusy(true, QStringLiteral("no agent is running in this workspace"));
     } else if (busy) {
         m_input->setBusy(true, QStringLiteral("replaying history") + QChar(kEllipsis));
+    } else if (comingBack) {
+        m_input->setBusy(true, QStringLiteral("restarting the agent") + QChar(kEllipsis));
+    } else if (exited) {
+        m_input->setBusy(true, QStringLiteral("the agent is not running"));
+    } else if (state == QString::fromUtf8(kStateError)) {
+        m_input->setBusy(true, QStringLiteral("the agent stopped with an error"));
     } else {
         m_input->setBusy(working);
     }
+    m_progressText->setText(m_starting ? QStringLiteral("Starting the agent") + QChar(kEllipsis)
+                                       : QStringLiteral("Restarting the agent") + QChar(kEllipsis));
+    m_progress->setVisible(comingBack);
     m_interrupt->setEnabled(!noAgent && !m_starting && !busy && working);
     // Shut only while a start is already in flight or the history is still
     // being replayed. A pane whose agent has exited keeps them open on purpose:
@@ -642,6 +690,19 @@ void TranscriptView::setShowMeta(bool show) {
     // items have a frame at all, and rebuilding is the one path that already
     // knows how to answer that question for every item at once.
     rebuild();
+}
+
+bool TranscriptView::restartPending() const {
+    if (m_model.isNull() || m_model->getState() != QString::fromUtf8(kStateExited)) {
+        return false;
+    }
+    const QString detail = m_model->getStateDetail();
+    for (const char* ended : kEndedByRestart) {
+        if (detail == QLatin1String(ended)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool TranscriptView::isHiddenMeta(const QString& kind) const {
@@ -811,7 +872,11 @@ void TranscriptView::refreshBanner() {
         const QString detail = m_model->getStateDetail();
         if (state == QString::fromUtf8(kStateError)) {
             text = detail.isEmpty() ? QStringLiteral("The agent reported an error.") : detail;
-        } else if (state == QString::fromUtf8(kStateExited) && !detail.isEmpty()) {
+        } else if (state == QString::fromUtf8(kStateExited) && !detail.isEmpty() &&
+                   !m_starting && !restartPending()) {
+            // Not while the agent is coming back: the exit being replaced, or
+            // the one a daemon restart left behind, is not news; the progress
+            // row is what the pane says then.
             // An agent that dies at start-up -- not logged in, no API key, a
             // bad flag -- exits rather than erroring, and the daemon puts the
             // reason in this detail. Without the banner the tab simply goes
@@ -1027,6 +1092,16 @@ void TranscriptView::setTestItems(const QStringList& items) {
 }
 
 int TranscriptView::frameCount() const { return shownFrames(); }
+
+bool TranscriptView::progressShown() const { return !m_progress->isHidden(); }
+
+QString TranscriptView::progressText() const { return m_progressText->text(); }
+
+bool TranscriptView::inputLocked() const { return m_input->isBusy(); }
+
+QString TranscriptView::bannerText() const {
+    return m_banner->isHidden() ? QString() : m_banner->text();
+}
 
 QWidget* TranscriptView::frameAt(int index) const {
     return index >= 0 && index < m_frames.size() ? m_frames.at(index) : nullptr;
@@ -1433,6 +1508,64 @@ extern "C" std::int32_t bs_widget_test_transcript_hides_the_small_grey_lines() {
     if (cost == nullptr || !cost->text().contains(QLatin1String("turn 3"))) {
         // Back in its own place, not appended at the foot.
         return 6;
+    }
+    return 0;
+}
+
+/// Right after startup every restored agent reads `exited` with the daemon's
+/// "ended when the daemon restarted", and the window starts it again moments
+/// later. That used to be shown as an error banner over an open prompt box; it
+/// is a progress row over a shut one. The box is shut for every agent that is
+/// not running, since anything typed then would be sent nowhere.
+extern "C" std::int32_t bs_widget_test_transcript_shows_progress_while_the_agent_comes_back() {
+    TranscriptModel model;
+    TranscriptView view(&model);
+    model.setAgentId(QStringLiteral("ag_restored"));
+    model.setState(QStringLiteral("exited"));
+    model.setStateDetail(QString::fromUtf8(kEndedByRestart[0]));
+    if (!view.progressShown() || !view.bannerText().isEmpty() || !view.inputLocked()) {
+        return 1;
+    }
+    if (!view.progressText().startsWith(QLatin1String("Restarting"))) {
+        return 2;
+    }
+
+    // The window asks for the start: the row stays and says so.
+    view.setStarting(true);
+    if (!view.progressShown() || !view.progressText().startsWith(QLatin1String("Starting")) ||
+        !view.inputLocked()) {
+        return 3;
+    }
+
+    // The new agent answers: no row, an open box.
+    model.setAgentId(QStringLiteral("ag_new"));
+    model.setState(QStringLiteral("idle"));
+    model.setStateDetail(QString());
+    if (view.progressShown() || !view.bannerText().isEmpty() || view.inputLocked()) {
+        return 4;
+    }
+
+    // An agent that really stopped is news: the banner says why, there is no
+    // progress row, and the box is shut.
+    model.setState(QStringLiteral("exited"));
+    model.setStateDetail(QStringLiteral("exit code 1"));
+    if (view.progressShown() || view.bannerText().isEmpty() || !view.inputLocked()) {
+        return 5;
+    }
+
+    // And one that errored.
+    model.setState(QStringLiteral("error"));
+    model.setStateDetail(QStringLiteral("boom"));
+    if (view.progressShown() || !view.inputLocked()) {
+        return 6;
+    }
+
+    // A workspace that cannot run says that instead, without a row.
+    model.setState(QStringLiteral("exited"));
+    model.setStateDetail(QString::fromUtf8(kEndedByRestart[1]));
+    view.setWorkspaceDown(true);
+    if (view.progressShown() || !view.inputLocked()) {
+        return 7;
     }
     return 0;
 }

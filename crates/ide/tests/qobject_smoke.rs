@@ -1647,6 +1647,7 @@ mod cpp_widgets {
         fn bs_widget_test_transcript_gate_shows_the_cli_auth_failure() -> i32;
         fn bs_widget_test_setup_page_hides_the_rows_it_rebuilds() -> i32;
         fn bs_widget_test_transcript_a_long_system_word_keeps_answers_wrapping() -> i32;
+        fn bs_widget_test_transcript_shows_progress_while_the_agent_comes_back() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1660,7 +1661,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 53] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 54] = [
             // These four build a whole MainWindow, and each begins by pointing
             // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
             // is load-bearing rather than tidy: the state store settles its
@@ -1881,6 +1882,10 @@ mod cpp_widgets {
             (
                 "A long unbroken word in a system line leaves answers wrapping at the pane",
                 bs_widget_test_transcript_a_long_system_word_keeps_answers_wrapping,
+            ),
+            (
+                "A restored agent shows progress, not an error, and the box is shut until it runs",
+                bs_widget_test_transcript_shows_progress_while_the_agent_comes_back,
             ),
         ];
 
