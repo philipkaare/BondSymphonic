@@ -49,12 +49,33 @@ fn failed(e: RpcError) -> ToolOutcome {
     ToolOutcome::Failed(e.message)
 }
 
-/// A `gh` error, with the one way out of the commonest one: the agent cannot
-/// log in to GitHub from its sandbox, but it can tell the user where to.
+/// What `gh` says when it has no usable login. Specific phrases, not "auth":
+/// that also matches "author" and "authorization", which a PR or a permission
+/// error can mention without the login being the problem.
+const NOT_LOGGED_IN: [&str; 5] = [
+    "not logged in",
+    "gh auth login",
+    "authentication",
+    "http 401",
+    "bad credentials",
+];
+
+/// A `gh` error, with the way out of the commonest ones: the agent cannot log
+/// in to GitHub or install software on the host from its sandbox, but it can
+/// tell the user where to.
 fn gh_failed(e: RpcError) -> ToolOutcome {
+    let not_started = e
+        .data
+        .as_ref()
+        .and_then(|d| d["stderr"].as_str())
+        .is_some_and(|s| s.starts_with(gh::GH_NOT_STARTED));
     let mut text = e.message;
     let lower = text.to_lowercase();
-    if lower.contains("auth") || lower.contains("logged in") {
+    if not_started {
+        text.push_str(
+            " — the GitHub CLI (gh) is not installed on the host; ask the user to install it under Settings → Setup.",
+        );
+    } else if NOT_LOGGED_IN.iter().any(|p| lower.contains(p)) {
         text.push_str(
             " — if GitHub says you are not logged in, ask the user to log in under Settings → Setup.",
         );
@@ -73,24 +94,36 @@ fn floor_boundary(s: &str, mut at: usize) -> usize {
 /// The first [`TEXT_CAP`] bytes of `s`: for JSON and prose, where the start
 /// says what the thing is.
 fn cap_head(s: String) -> String {
-    if s.len() <= TEXT_CAP {
+    cap_head_to(s, TEXT_CAP)
+}
+
+fn cap_head_to(s: String, cap: usize) -> String {
+    if s.len() <= cap {
         return s;
     }
-    let cut = floor_boundary(&s, TEXT_CAP);
+    let cut = floor_boundary(&s, cap);
     format!("{}\n… [truncated]", &s[..cut])
 }
 
-/// The last [`TEXT_CAP`] bytes of `s`: for logs, where the failure is at the end.
-fn cap_tail(s: String) -> String {
-    if s.len() <= TEXT_CAP {
+/// The last `cap` bytes of `s`: for logs, where the failure is at the end.
+fn cap_tail_to(s: String, cap: usize) -> String {
+    if s.len() <= cap {
         return s;
     }
-    let mut start = s.len() - TEXT_CAP;
+    let mut start = s.len() - cap;
     while !s.is_char_boundary(start) {
         start += 1;
     }
     format!("[… earlier output truncated]\n{}", &s[start..])
 }
+
+/// How much of a `ci_logs` result the failed log is always given, however
+/// long the run's JSON is: the end of the log is what the agent came for.
+const LOG_FLOOR: usize = 16 * 1024;
+
+/// The run conclusions that have failed steps, and so a `--log-failed` to show.
+/// `cancelled`, `skipped`, `neutral` and `success` have none.
+const FAILED_CONCLUSIONS: [&str; 3] = ["failure", "timed_out", "startup_failure"];
 
 fn invalid(msg: impl Into<String>) -> ToolOutcome {
     ToolOutcome::InvalidArguments(msg.into())
@@ -286,6 +319,25 @@ impl WorkspaceTools {
         Ok((d, ws))
     }
 
+    /// [`pr::push_branch`] on a task of its own, awaited.
+    ///
+    /// A tool call's future is dropped whenever the agent gives up on it —
+    /// MCP `notifications/cancelled`, a client that hangs up, a listener
+    /// stopped by a restart — and dropping `push_branch` between the push and
+    /// its `absorb_objects` would release the repository lock and kill git
+    /// (`kill_on_drop`), leaving `refs/remotes/origin/<branch>` naming objects
+    /// that live only in the workspace's private directory, which destroy
+    /// deletes. A spawned task is not cancelled with its waiter, so the push
+    /// and the copy always finish together. It holds a strong `Arc<Daemon>`
+    /// for that long, bounded by git's own timeouts.
+    async fn push_detached(d: &Arc<Daemon>, ws: &Workspace, force: bool) -> Result<(), Refusal> {
+        let (d, ws) = (Arc::clone(d), ws.clone());
+        tokio::spawn(async move { pr::push_branch(&d, &ws, force).await })
+            .await
+            .map_err(|e| ToolOutcome::Failed(format!("the push task failed: {e}")))?
+            .map_err(failed)
+    }
+
     async fn slug(d: &Daemon, ws: &Workspace) -> Result<String, Refusal> {
         gh::origin_slug(&d.git, &ws.repo_path).await.map_err(failed)
     }
@@ -319,7 +371,7 @@ impl WorkspaceTools {
                 })
             }
             Call::Push { force } => {
-                pr::push_branch(&d, &ws, force).await.map_err(failed)?;
+                Self::push_detached(&d, &ws, force).await?;
                 Ok(format!("Pushed {b} to origin."))
             }
             Call::PrCreate {
@@ -336,7 +388,7 @@ impl WorkspaceTools {
                 // The slug before the push: nothing is published for a
                 // pull request that cannot be opened.
                 let slug = Self::slug(&d, &ws).await?;
-                pr::push_branch(&d, &ws, false).await.map_err(failed)?;
+                Self::push_detached(&d, &ws, false).await?;
                 let base = base.unwrap_or_else(|| ws.base_branch.clone());
                 let mut args = argv([
                     "pr", "create", "--repo", &slug, "--title", &title, "--body", &body, "--head",
@@ -489,8 +541,19 @@ impl WorkspaceTools {
                 .await?;
                 let failure = serde_json::from_str::<Value>(view.trim())
                     .ok()
-                    .is_some_and(|v| v["conclusion"] == "failure");
-                let mut text = cap_head(view);
+                    .is_some_and(|v| {
+                        v["conclusion"]
+                            .as_str()
+                            .is_some_and(|c| FAILED_CONCLUSIONS.contains(&c))
+                    });
+                // One budget for the whole result: the JSON leaves the log at
+                // least LOG_FLOOR, and the log gets whatever the JSON left.
+                let view_cap = if failure {
+                    TEXT_CAP - LOG_FLOOR
+                } else {
+                    TEXT_CAP
+                };
+                let mut text = cap_head_to(view, view_cap);
                 if failure {
                     let log = Self::gh(
                         &ws,
@@ -502,7 +565,8 @@ impl WorkspaceTools {
                         text.push('\n');
                     }
                     text.push_str("\nLog of the failed steps:\n");
-                    text.push_str(&cap_tail(log));
+                    let room = TEXT_CAP.saturating_sub(text.len());
+                    text.push_str(&cap_tail_to(log, room));
                 }
                 Ok(text)
             }
@@ -650,7 +714,7 @@ mod tests {
     #[test]
     fn short_text_is_not_capped() {
         assert_eq!(cap_head("abc".into()), "abc");
-        assert_eq!(cap_tail("abc".into()), "abc");
+        assert_eq!(cap_tail_to("abc".into(), TEXT_CAP), "abc");
     }
 
     #[test]
@@ -660,7 +724,7 @@ mod tests {
         let h = cap_head(s.clone());
         assert!(h.ends_with("\n… [truncated]"));
         assert!(h.len() <= TEXT_CAP + 20);
-        let t = cap_tail(s);
+        let t = cap_tail_to(s, TEXT_CAP);
         assert!(t.starts_with("[… earlier output truncated]\n"));
         assert!(t.len() <= TEXT_CAP + 40);
     }
@@ -703,5 +767,51 @@ mod tests {
             panic!()
         };
         assert!(!t.contains("Setup"));
+        for login in [
+            "HTTP 401: Bad credentials",
+            "To get started with GitHub CLI, please run:  gh auth login",
+            "authentication required",
+        ] {
+            let ToolOutcome::Failed(t) = gh_failed(RpcError::invalid_params(login)) else {
+                panic!()
+            };
+            assert!(t.contains("log in under Settings → Setup"), "{login}");
+        }
+        // "auth" inside other words is not a login problem.
+        for other in [
+            "GraphQL: author is not a collaborator",
+            "Resource not accessible by integration: authorization denied for this action",
+        ] {
+            let ToolOutcome::Failed(t) = gh_failed(RpcError::invalid_params(other)) else {
+                panic!()
+            };
+            assert!(!t.contains("Setup"), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_gh_that_cannot_start_points_at_installing_it() {
+        let e = crate::git::git_error(
+            "gh pr view",
+            None,
+            &format!(
+                "{} gh: No such file or directory (os error 2)",
+                gh::GH_NOT_STARTED
+            ),
+        );
+        let ToolOutcome::Failed(t) = gh_failed(e) else {
+            panic!()
+        };
+        assert!(t.contains("not installed on the host"), "{t}");
+        assert!(t.contains("Settings → Setup"), "{t}");
+        // A `gh` that ran and failed is not "not installed".
+        let ToolOutcome::Failed(t) = gh_failed(crate::git::git_error(
+            "gh pr view",
+            Some(1),
+            "no pull requests found",
+        )) else {
+            panic!()
+        };
+        assert!(!t.contains("not installed"), "{t}");
     }
 }

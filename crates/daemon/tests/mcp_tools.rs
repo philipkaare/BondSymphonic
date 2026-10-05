@@ -346,3 +346,179 @@ async fn push_is_refused_in_place() {
     assert!(err.contains("in-place"), "{err}");
     cancel.cancel();
 }
+
+/// Commits one file in the workspace's worktree the way the agent would: with
+/// the sandbox's git environment, so the commit's objects live only in the
+/// workspace's private object directory.
+async fn commit_in_ws(
+    d: &Arc<bondsymphonic_daemon::daemon::Daemon>,
+    ws: &WorkspaceInfo,
+    msg: &str,
+) {
+    let w = d.workspace(&ws.id).unwrap();
+    let env = bondsymphonic_daemon::workspace::lifecycle::layout_for(d, &w)
+        .await
+        .unwrap()
+        .sandbox_git_env();
+    let wt = Path::new(&ws.worktree_path);
+    std::fs::write(wt.join("work.txt"), "x\n").unwrap();
+    common::commit_all(wt, &env, msg);
+}
+
+/// An agent that gives up on a `git_push` (MCP `notifications/cancelled`, a
+/// hung-up client, a stopped listener) drops the call's future. The push must
+/// still finish and its objects still be copied into the shared store:
+/// otherwise `refs/remotes/origin/<branch>` is left pointing at objects that
+/// live only in the workspace's private directory, which destroy deletes.
+///
+/// The repository's own `pre-push` hook (which `daemon_push_git` runs) holds
+/// the push open long enough to drop the call in the middle of it.
+#[tokio::test]
+async fn a_dropped_git_push_still_pushes_and_absorbs_its_objects() {
+    let (dir, d, ws, origin, cancel) = setup("dropped").await;
+    let repo = dir.path().join("repo");
+    commit_in_ws(&d, &ws, "dropped work").await;
+    let tip = common::git_out(&repo, &["rev-parse", "refs/heads/bs/dropped/work"]);
+    let started = dir.path().join("pre-push-started");
+    common::install_hook(
+        &repo,
+        "pre-push",
+        &format!(
+            "cat > /dev/null\ntouch \"{}\"\nsleep 3\nexit 0",
+            common::sh_path(&started)
+        ),
+    );
+
+    let tools = WorkspaceTools::new(Arc::downgrade(&d), ws.id.clone());
+    {
+        let call = tools.call("git_push", json!({}));
+        tokio::pin!(call);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !started.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pre-push hook never started"
+            );
+            tokio::select! {
+                o = &mut call => panic!("the push finished before it could be dropped: {:?}", text(o)),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+            }
+        }
+        // The call's future is dropped here, mid-push.
+    }
+
+    // The push and the object copy carry on without the caller.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let pushed = common::git_try(&origin, &["rev-parse", "refs/heads/bs/dropped/work"]);
+        let tracking =
+            common::git_try(&repo, &["rev-parse", "refs/remotes/origin/bs/dropped/work"]);
+        // A plain git in the main repository: no alternate, so this reads only
+        // the shared store, the way the user's own git does.
+        let absorbed = common::git_try(&repo, &["rev-list", "--objects", &tip, "^main"]);
+        if pushed.as_deref() == Ok(tip.as_str())
+            && tracking.as_deref() == Ok(tip.as_str())
+            && absorbed.is_ok()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dropped push never completed: origin {pushed:?}, tracking {tracking:?}, \
+             shared store {absorbed:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    common::git_ok(&repo, &["cat-file", "-e", &format!("{tip}^{{commit}}")]);
+    cancel.cancel();
+}
+
+/// The run's JSON and the failed log are capped together, not each on its
+/// own: two separately capped halves made one result of up to twice
+/// `TEXT_CAP`. The end of the log, where the failure is, still survives.
+#[tokio::test]
+async fn ci_logs_caps_the_json_and_the_log_together() {
+    let _g = ENV.lock().await;
+    let Some(py) = python() else { return };
+    let (dir, d, ws, _o, cancel) = setup("cicap").await;
+    use_gh_stub(py, &dir.path().join("gh.log"), false);
+    // Each ~100 KB, under Linux's 128 KiB limit on one environment string.
+    let view = format!(
+        r#"{{"status":"completed","conclusion":"failure","name":"ci","jobs":"{}"}}"#,
+        "j".repeat(100_000)
+    );
+    let long = format!("{}THE END\n", "noise line\n".repeat(9_000));
+    std::env::set_var("GH_STUB_RUN_VIEW", &view);
+    std::env::set_var("GH_STUB_LOG_TEXT", &long);
+    let tools = WorkspaceTools::new(Arc::downgrade(&d), ws.id.clone());
+    let out = text(tools.call("ci_logs", json!({})).await);
+    std::env::remove_var("GH_STUB_RUN_VIEW");
+    std::env::remove_var("GH_STUB_LOG_TEXT");
+    let out = out.unwrap();
+    // The cap, plus at most the two truncation markers' worth of bytes.
+    assert!(
+        out.len() <= bondsymphonic_daemon::mcp::tools::TEXT_CAP + 64,
+        "{}",
+        out.len()
+    );
+    assert!(
+        out.starts_with(r#"{"status":"completed""#),
+        "{}",
+        &out[..80]
+    );
+    assert!(out.contains("Log of the failed steps"));
+    assert!(out.trim_end().ends_with("THE END"));
+    cancel.cancel();
+}
+
+/// Every conclusion that has failed steps gets their log; the ones that do
+/// not, do not.
+#[tokio::test]
+async fn ci_logs_shows_the_failed_log_for_every_failing_conclusion() {
+    let _g = ENV.lock().await;
+    let Some(py) = python() else { return };
+    let (dir, d, ws, _o, cancel) = setup("ciconc").await;
+    use_gh_stub(py, &dir.path().join("gh.log"), false);
+    let tools = WorkspaceTools::new(Arc::downgrade(&d), ws.id.clone());
+    for (conclusion, has_log) in [
+        ("failure", true),
+        ("timed_out", true),
+        ("startup_failure", true),
+        ("success", false),
+        ("cancelled", false),
+        ("skipped", false),
+        ("neutral", false),
+    ] {
+        std::env::set_var(
+            "GH_STUB_RUN_VIEW",
+            format!(r#"{{"status":"completed","conclusion":"{conclusion}","name":"ci"}}"#),
+        );
+        let out = text(tools.call("ci_logs", json!({"run_id": 7})).await);
+        std::env::remove_var("GH_STUB_RUN_VIEW");
+        let out = out.unwrap();
+        assert_eq!(
+            out.contains("Log of the failed steps"),
+            has_log,
+            "{conclusion}: {out}"
+        );
+    }
+    cancel.cancel();
+}
+
+/// A host without the GitHub CLI: the agent is told what is missing and where
+/// the user installs it, not just handed an OS error.
+#[tokio::test]
+async fn a_missing_gh_says_it_is_not_installed() {
+    let _g = ENV.lock().await;
+    let (dir, d, ws, _o, cancel) = setup("nogh").await;
+    std::env::set_var(
+        "BS_GH_BIN",
+        format!("\"{}\"", arg_path(&dir.path().join("no-such-gh"))),
+    );
+    let tools = WorkspaceTools::new(Arc::downgrade(&d), ws.id.clone());
+    // Left pointing at nothing rather than removed: unset, `gh` would mean
+    // the real one, and no test may ever run that.
+    let err = text(tools.call("pr_view", json!({})).await).unwrap_err();
+    assert!(err.contains("not installed on the host"), "{err}");
+    cancel.cancel();
+}

@@ -67,6 +67,10 @@ pub async fn origin_slug(git: &Git, repo: &Path) -> Result<String, RpcError> {
     })
 }
 
+/// How a [`run_gh`] error begins when `gh` could not be started at all, which
+/// on a host without the GitHub CLI is the commonest failure there is.
+pub const GH_NOT_STARTED: &str = "cannot start";
+
 pub struct GhOutput {
     pub stdout: String,
     pub stderr: String,
@@ -91,7 +95,16 @@ pub async fn run_gh(cwd: &Path, args: &[String], describe: &str) -> Result<GhOut
         .kill_on_drop(true);
     let out = match tokio::time::timeout(GH_TIMEOUT, cmd.output()).await {
         Ok(Ok(o)) => o,
-        Ok(Err(e)) => return Err(git_error(describe, None, &e.to_string())),
+        // Worded so a caller can tell "could not start gh at all" (above all:
+        // not installed) from a `gh` that ran and failed: see
+        // `GH_NOT_STARTED`.
+        Ok(Err(e)) => {
+            return Err(git_error(
+                describe,
+                None,
+                &format!("{GH_NOT_STARTED} {program}: {e}"),
+            ))
+        }
         Err(_) => {
             return Err(git_error(
                 describe,
