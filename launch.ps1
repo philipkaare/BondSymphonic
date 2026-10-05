@@ -5,6 +5,9 @@
 #   .\launch.ps1 -Release     release IDE build
 #   .\launch.ps1 -SkipDaemon  reuse the last daemon binary in target\daemon\
 #   .\launch.ps1 -NoSetup     fail instead of installing missing prerequisites
+#   .\launch.ps1 -NoCleanup   keep stale Cargo build caches in the WSL distro
+#   .\launch.ps1 -Compact     also shrink the distro's ext4.vhdx (shuts down ALL WSL
+#                             distros and asks for elevation)
 #
 # Missing prerequisites are installed by the setup scripts: scripts\setup-windows.ps1
 # (elevated; Rust, VS Build Tools, CMake, Ninja, Python, Qt) and scripts\setup-wsl.ps1
@@ -13,7 +16,9 @@ param(
   [switch]$Debug,
   [switch]$SkipDaemon,
   [switch]$Release,
-  [switch]$NoSetup
+  [switch]$NoSetup,
+  [switch]$NoCleanup,
+  [switch]$Compact
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
@@ -53,6 +58,62 @@ function Test-DistroHealthy {
   $ok = ($LASTEXITCODE -eq 0)
   $ErrorActionPreference = $prev
   return $ok
+}
+
+function Get-DistroVhdPath {
+  $entry = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss\*" -ErrorAction SilentlyContinue |
+    Where-Object { $_.DistributionName -eq $Distro } | Select-Object -First 1
+  if (-not $entry -or -not $entry.BasePath) { return $null }
+  $name = if ($entry.VhdFileName) { $entry.VhdFileName } else { "ext4.vhdx" }
+  $path = Join-Path ($entry.BasePath -replace '^\\\\\?\\', '') $name
+  if (Test-Path $path) { return $path } else { return $null }
+}
+
+# Failures here are warnings: the launch carries on with the disk as it was.
+function Compress-DistroVhd {
+  $vhd = Get-DistroVhdPath
+  if (-not $vhd) { Write-Warning "Compact skipped: could not locate the virtual disk of '$Distro'."; return }
+  $before = (Get-Item $vhd).Length
+
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    & wsl -d $Distro -u root -- fstrim -v /
+    if ($LASTEXITCODE -ne 0) { Write-Warning "fstrim failed with exit code $LASTEXITCODE; compacting anyway." }
+
+    Write-Host "Shutting down WSL to compact $vhd ..."
+    & wsl --shutdown
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Compact skipped: wsl --shutdown failed with exit code $LASTEXITCODE"; return }
+
+    $dpScript = Join-Path $env:TEMP "bondsymphonic-compact-vhd.txt"
+    Set-Content -Path $dpScript -Encoding ASCII -Value @(
+      "select vdisk file=`"$vhd`"",
+      "attach vdisk readonly",
+      "compact vdisk",
+      "detach vdisk"
+    )
+    try {
+      if (Test-IsAdmin) {
+        & diskpart /s $dpScript
+        $code = $LASTEXITCODE
+      } else {
+        Write-Host "Running diskpart in an elevated window (accept the UAC prompt) ..."
+        $p = Start-Process -FilePath "diskpart" -Verb RunAs -Wait -PassThru -ArgumentList "/s", "`"$dpScript`""
+        $code = $p.ExitCode
+      }
+    } catch {
+      Write-Warning "Compact failed: $($_.Exception.Message)"
+      return
+    } finally {
+      Remove-Item $dpScript -ErrorAction SilentlyContinue
+    }
+    if ($code -ne 0) { Write-Warning "diskpart failed with exit code $code"; return }
+
+    $after = (Get-Item $vhd).Length
+    Write-Host ("Compacted {0}: {1:N1} GB -> {2:N1} GB" -f (Split-Path $vhd -Leaf), ($before / 1GB), ($after / 1GB))
+  } finally {
+    $ErrorActionPreference = $prev
+  }
 }
 
 # ---- 1. Environment -------------------------------------------------------------
@@ -97,6 +158,32 @@ if (-not (Test-Distro) -or -not (Test-DistroHealthy)) {
   if ($LASTEXITCODE -ne 0) { throw "setup-wsl.ps1 failed with exit code $LASTEXITCODE" }
   if (-not (Test-DistroHealthy)) { throw "Distro '$Distro' still unhealthy after setup." }
 }
+
+# ---- 3a. Reclaim stale Rust build caches ---------------------------------------
+# Keep the profile of the daemon cache that build-daemon.ps1 is about to use. Its
+# other profile, and every other Cargo target directory in the dedicated distro
+# home, is disposable once none of its files have changed for 24 hours; the helper
+# also skips cleanup while Cargo/rustc is active. A failed cleanup never blocks
+# the launch.
+if (-not $NoCleanup) {
+  $keepProfile = if ($Debug) { "debug" } else { "release" }
+  $cleanupScript = Join-Path $scripts "cleanup-wsl-builds.sh"
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  $wslCleanupScript = (& wsl -d $Distro -- wslpath -a ($cleanupScript -replace "\\", "/") | Out-String).Trim()
+  if ($LASTEXITCODE -ne 0 -or -not $wslCleanupScript) {
+    Write-Warning "WSL build-cache cleanup skipped: wslpath failed for $cleanupScript"
+  } else {
+    & wsl -d $Distro -- bash $wslCleanupScript 24 $keepProfile
+    if ($LASTEXITCODE -ne 0) { Write-Warning "WSL build-cache cleanup failed with exit code $LASTEXITCODE" }
+  }
+  $ErrorActionPreference = $prev
+}
+
+# ---- 3b. Compact the distro's virtual disk (-Compact) ---------------------------
+# Space freed inside the distro stays allocated in ext4.vhdx until the file is
+# compacted, which needs every WSL distro stopped and an elevated diskpart.
+if ($Compact) { Compress-DistroVhd }
 
 # ---- 4. Daemon ------------------------------------------------------------------
 if (-not $SkipDaemon) {
