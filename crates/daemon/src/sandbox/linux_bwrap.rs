@@ -173,11 +173,12 @@ async fn on_the_spawner_thread<T: Send + 'static>(
         .map_err(|_| sandbox_error("the sandbox spawn panicked; see the log".to_string()))
 }
 
-/// Where the daemon binary is bound when its own path is hidden inside the
-/// sandbox: under the sandbox's empty `/opt`, beside
-/// `agents::claude::CLAUDE_IN_SANDBOX`, so bwrap can always create the mount
-/// point and nothing a workspace writes can be in the way.
-const DAEMON_IN_SANDBOX: &str = "/opt/bs/daemon";
+// Where the daemon binary is bound when its own path is hidden inside the
+// sandbox: under the sandbox's empty `/opt`, beside
+// `agents::claude::CLAUDE_IN_SANDBOX`, so bwrap can always create the mount
+// point and nothing a workspace writes can be in the way. Defined once, in
+// `crate::mcp`, because the agents' MCP config runs the same path.
+use crate::mcp::DAEMON_IN_SANDBOX;
 
 /// The only environment variable the daemon hands `bwrap` itself: a fixed
 /// lookup path, standard enough to find `bwrap` by name on any distribution.

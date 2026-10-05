@@ -12,8 +12,9 @@ pub const SOCKET_FILE: &str = "mcp.sock";
 /// Where the socket appears inside the sandbox.
 pub const SOCKET_IN_SANDBOX: &str = "/run/bs/mcp.sock";
 
-/// Where the daemon binary appears inside the sandbox. Must agree with
-/// `sandbox::linux_bwrap::DAEMON_IN_SANDBOX`.
+/// Where the daemon binary appears inside the sandbox: the path
+/// `sandbox::linux_bwrap` binds it at, and the command the agents' MCP config
+/// runs as the bridge.
 pub const DAEMON_IN_SANDBOX: &str = "/opt/bs/daemon";
 
 /// The arguments that make the daemon binary act as the stdio-to-socket bridge.

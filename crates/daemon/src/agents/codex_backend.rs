@@ -216,7 +216,7 @@ impl Backend for CodexBackend {
         if !version.contains(TESTED_CODEX_VERSION) {
             tracing::warn!("Codex differs from tested version {TESTED_CODEX_VERSION}");
         }
-        let mut argv = if d.backend.name() == "linux_bwrap" {
+        let mut argv = if d.backend.name() == super::claude::SANDBOXED_BACKEND {
             if !helper_path(Path::new(&host[0])).is_file() {
                 return Err(RpcError::new(
                     ErrorCode::PrereqMissing,
@@ -330,7 +330,7 @@ pub async fn list_models_process(
 /// Config overrides only a sandboxed Codex gets: the bridge to the brokered
 /// git and GitHub tools. Other backends have real credentials and no socket.
 fn sandbox_args(backend: &str) -> Vec<String> {
-    if backend == "linux_bwrap" {
+    if backend == super::claude::SANDBOXED_BACKEND {
         crate::mcp::codex_config()
     } else {
         Vec::new()
@@ -343,7 +343,10 @@ mod sandbox_args_tests {
 
     #[test]
     fn only_the_sandboxed_backend_gets_the_bridge() {
-        assert_eq!(sandbox_args("linux_bwrap"), crate::mcp::codex_config());
+        assert_eq!(
+            sandbox_args(crate::agents::claude::SANDBOXED_BACKEND),
+            crate::mcp::codex_config()
+        );
         assert!(sandbox_args("noop").is_empty());
     }
 }

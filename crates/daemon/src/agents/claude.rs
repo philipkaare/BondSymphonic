@@ -120,7 +120,7 @@ const SIGKILL: i32 = 9;
 
 /// The backend whose sandbox has mounts of its own, and so needs the CLI bound
 /// in rather than found on a path.
-const SANDBOXED_BACKEND: &str = "linux_bwrap";
+pub(crate) const SANDBOXED_BACKEND: &str = "linux_bwrap";
 
 /// Where the daemon binds the host's `claude` inside a bubblewrap sandbox.
 ///
