@@ -439,7 +439,11 @@ async fn push_branch_refuses_a_workspace_branch_turned_into_a_symref() {
         .unwrap()
         .sandbox_git_env();
     let st = std::process::Command::new("git")
-        .args(["symbolic-ref", "refs/heads/bs/sneaky/work", "refs/heads/main"])
+        .args([
+            "symbolic-ref",
+            "refs/heads/bs/sneaky/work",
+            "refs/heads/main",
+        ])
         .current_dir(&ws.worktree_path)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .status()
@@ -450,7 +454,10 @@ async fn push_branch_refuses_a_workspace_branch_turned_into_a_symref() {
         let err = bondsymphonic_daemon::git::pr::push_branch(&daemon, &w, force)
             .await
             .expect_err("a symbolic workspace branch must not be pushed");
-        assert!(err.message.contains("symbolic ref"), "force={force}: {err:?}");
+        assert!(
+            err.message.contains("symbolic ref"),
+            "force={force}: {err:?}"
+        );
         assert_eq!(
             common::git_out(&origin, &["rev-parse", "refs/heads/main"]),
             origin_main,
