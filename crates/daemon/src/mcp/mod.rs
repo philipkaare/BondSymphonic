@@ -1,5 +1,6 @@
 //! Brokered git and GitHub tools for sandboxed agents, served over MCP.
 
+pub mod bridge;
 pub mod protocol;
 pub mod registry;
 pub mod tools;

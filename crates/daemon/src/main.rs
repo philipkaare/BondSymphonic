@@ -1,6 +1,7 @@
 use anyhow::Result;
 use bondsymphonic_daemon::agent_updates;
 use bondsymphonic_daemon::daemon::{Daemon, InstanceLock, InstanceLockError, BUSY_EXIT_CODE};
+use bondsymphonic_daemon::mcp;
 use bondsymphonic_daemon::net;
 use bondsymphonic_daemon::sandbox;
 use bondsymphonic_daemon::server::dispatch::SystemHandler;
@@ -54,6 +55,12 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:3128")]
         listen: String,
     },
+    /// Internal: connect an agent's stdio MCP client to the workspace's tools. Not for direct use.
+    McpBridge {
+        /// The workspace's tools socket, as seen from inside the sandbox.
+        #[arg(long)]
+        socket: PathBuf,
+    },
     /// Internal: forward a socket in the sandbox's run directory to a port on
     /// the sandbox's loopback, so the host can reach a run. Not for direct use.
     Forward {
@@ -85,6 +92,14 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Forward { ref socket, port }) => {
             return tokio::runtime::Runtime::new()?.block_on(net::forward::run(socket, port));
+        }
+        Some(Cmd::McpBridge { ref socket }) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            let result = rt.block_on(mcp::bridge::run(socket));
+            // The stdin read is a blocked thread; dropping the runtime would
+            // wait for it, and the agent may never close stdin.
+            rt.shutdown_background();
+            return result;
         }
         None => {}
     }
