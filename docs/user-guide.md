@@ -743,6 +743,10 @@ The pane replays the whole transcript from the daemon whenever it attaches, so
 an IDE restarted while the daemon kept running finds its tabs where it left
 them.
 
+### What agents can do with git and GitHub
+
+An agent in a sandbox has no GitHub credentials, so BondSymphonic gives it built-in tools that run on your machine instead. Through them an agent can fetch, push its own workspace's branch, open, update and comment on that branch's pull request, read CI status and failed logs, and read issues. Nothing hands the agent your GitHub token, and the tools can only act on the agent's own branch. Read-only tools run without asking; the others follow the agent's permission mode. A plain `git push`, `git fetch` or `gh` typed inside an agent will not work, by design. To use the tools, log in to GitHub under Settings > Setup.
+
 ---
 
 ## When a workspace cannot run

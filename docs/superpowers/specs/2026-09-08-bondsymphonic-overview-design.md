@@ -235,7 +235,9 @@ crate.
   (no credentials in the sandbox, read-only shared refs in a worktree
   workspace), so the daemon also fetches whenever a workspace becomes `Ready`,
   at most once per repository per five minutes, and tells every sandboxed agent
-  so in its instructions.
+  so in its instructions. Agents push, open pull requests and read CI through
+  brokered MCP tools instead; see
+  `2026-10-05-agent-git-tools-design.md`.
 - `workspace.restart {workspace_id}` → `WorkspaceInfo`. Restarts the sandbox of
   a `Ready`, `SandboxDown` or `Error` workspace, re-registering a pruned
   worktree when it safely can. Refused while the workspace is `Creating` or

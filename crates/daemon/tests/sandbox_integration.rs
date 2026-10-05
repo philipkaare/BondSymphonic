@@ -2029,3 +2029,45 @@ async fn a_restarted_bwrap_workspace_stays_ready_when_its_old_sandbox_dies() {
 
     lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
 }
+
+/// The agent tools are reachable from inside a real sandbox: the bridge at
+/// `/opt/bs/daemon mcp-bridge` reaches the daemon's listener through the bound
+/// run dir, and the two ends close when the input does.
+///
+/// Bounded by a timeout rather than a long wait: if the bridge or the server
+/// stopped closing on EOF, this must fail, not hang.
+#[tokio::test]
+async fn the_agent_tools_are_reachable_from_inside_a_bwrap_sandbox() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (daemon, ws, _layout) = bwrap_workspace(dir.path(), &repo, "mcp").await;
+    let handle = daemon.sandbox(&ws.id).unwrap();
+
+    let script = format!(
+        "printf '%s\n' '{init}' '{list}' | {exe} mcp-bridge --socket /run/bs/mcp.sock",
+        init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+        list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        exe = handle.helper_exe().display(),
+    );
+    let (code, out) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run_argv(&handle, vec!["/bin/sh".into(), "-c".into(), script]),
+    )
+    .await
+    .expect("the bridge did not exit after its input closed");
+    assert_eq!(code, 0, "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert!(
+        lines[0].contains(r#""serverInfo":{"name":"bondsymphonic""#),
+        "{}",
+        lines[0]
+    );
+    assert!(lines[1].contains("git_push"), "{}", lines[1]);
+
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+}

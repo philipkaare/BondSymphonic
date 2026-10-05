@@ -54,10 +54,12 @@ read-only, so no new binary is distributed.
 
 ### The listener
 
-`McpRegistry` (new, `crates/daemon/src/mcp/`) mirrors `ProxyRegistry`'s
-lifecycle: `start(workspace_id, socket_path) -> generation`,
-`stop_generation(id, generation)`, `stop(id)`. It is started wherever a proxy
-is started for a sandbox and stopped wherever that proxy is stopped:
+`McpRegistry` (`crates/daemon/src/mcp/registry.rs`) mirrors `ProxyRegistry`'s
+lifecycle but is keyed by socket path: `start(daemon: Weak<Daemon>, id, socket)
+-> Result<(), RpcError>` replaces any listener already on that path, and
+`stop_workspace(id)` stops all of a workspace's listeners. It is started
+wherever a proxy is started for a sandbox and stopped wherever that proxy is
+stopped:
 
 - the workspace sandbox: `<dirs.run(id)>/mcp.sock` (`lifecycle::start_sandbox`,
   teardown, destroy, restart);
@@ -66,12 +68,15 @@ is started for a sandbox and stopped wherever that proxy is stopped:
 
 Both run directories are bound at `/run/bs` inside their sandbox, so the agent
 always connects to `/run/bs/mcp.sock`. The socket file is created `0600`. A
-connection is served for as long as it stays open; stopping a generation closes
-its listener and its open connections.
+connection is served for as long as it stays open and is closed when its reader
+hits EOF; stopping a workspace's listeners closes them and their open
+connections.
 
-The listener needs the daemon to run tools. `Daemon` gains a `Weak<Daemon>` to
-itself (set at construction) that the registry upgrades per call; a call made
-after the daemon is gone answers an error.
+The listener needs the daemon to run tools. `Daemon` holds a `Weak` to itself
+(`Daemon::weak()`, built with `Arc::new_cyclic`) that `start` takes and the
+server upgrades per call; a call made after the daemon is gone answers an
+error. Every tool call also re-checks that the workspace is `Ready`, so a
+listener that briefly outlives its sandbox can do nothing.
 
 ### The protocol
 

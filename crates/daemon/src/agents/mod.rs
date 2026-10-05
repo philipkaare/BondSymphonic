@@ -630,11 +630,6 @@ impl Agent {
     }
 }
 
-/// The state detail a restored agent carries, for an agent that was still
-/// running when the daemon went and for one that had already ended.
-///
-/// Both name the restart, because that is what the IDE has to explain: the tab
-/// is there, the history is there, and the agent behind it is not.
 /// What every sandboxed agent is told about git remotes, appended to its own
 /// instructions (`--append-system-prompt` for Claude Code,
 /// `developerInstructions` for Codex).
@@ -652,6 +647,11 @@ pr_update, pr_comment (this branch's pull request), ci_logs (CI status and faile
 branch) and issue_view. They run on the host as the user and can only act on this workspace's own \
 branch. If a tool says GitHub is not logged in, tell the user to log in under Settings > Setup.";
 
+/// The state detail a restored agent carries, for an agent that was still
+/// running when the daemon went and for one that had already ended.
+///
+/// Both name the restart, because that is what the IDE has to explain: the tab
+/// is there, the history is there, and the agent behind it is not.
 const ENDED_AT_RESTART: &str = "the agent ended when the daemon restarted";
 const ENDED_BEFORE_RESTART: &str = "the agent ended before the daemon restarted";
 
