@@ -642,10 +642,15 @@ impl Agent {
 pub const SANDBOX_GIT_NOTE: &str = "You are running inside a BondSymphonic sandbox that holds no Git or GitHub credentials, so plain \
 `git fetch`, `git pull`, `git push` and `gh` cannot authenticate, and logging in from inside the \
 sandbox does not help. Use the `bondsymphonic` MCP tools instead: git_fetch (update origin/*), \
-git_push (push this workspace's branch; force uses --force-with-lease), pr_create, pr_view, \
-pr_update, pr_comment (this branch's pull request), ci_logs (CI status and failed logs for this \
-branch) and issue_view. They run on the host as the user and can only act on this workspace's own \
-branch. If a tool says GitHub is not logged in, tell the user to log in under Settings > Setup.";
+git_push (push this workspace's branch; force uses --force-with-lease), pr_create and pr_update \
+(open or edit this branch's pull request), pr_view and pr_comment (this branch's pull request by \
+default, or any pull request by number), ci_logs (CI status and failed logs; this branch's newest \
+run by default) and issue_view. They run on the host as the user. Pushing and opening or editing \
+a pull request are limited to this workspace's own branch; reading pull requests, CI runs and \
+issues, and commenting, work across the repository. In an in-place workspace there is no branch \
+of its own to push: pushing and opening pull requests are done by the user from their own \
+checkout. If a tool says GitHub is not logged in, or that the GitHub CLI is not installed, tell \
+the user to fix it under Settings > Setup.";
 
 /// The state detail a restored agent carries, for an agent that was still
 /// running when the daemon went and for one that had already ended.

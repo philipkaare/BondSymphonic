@@ -93,8 +93,25 @@ impl Layout {
     ///
     /// `pre-push` is not decoration: it is how `git-lfs` uploads the large
     /// objects a push needs, and a push that skips it puts pointer files on the
-    /// remote with nothing behind them. A push is also the one daemon-side git
-    /// operation the user explicitly asked for by name, through **Create PR**.
+    /// remote with nothing behind them.
+    ///
+    /// The push is no longer only something the user asks for by name through
+    /// **Create PR**: a sandboxed agent triggers the same push through its
+    /// `git_push` and `pr_create` tools, so the repository's `pre-push` hook
+    /// now runs on the host, outside any sandbox, when an agent decides. That
+    /// is accepted because the hook is the user's own repository configuration
+    /// — `.git/hooks` and `core.hooksPath` live in the main `.git`, which a
+    /// worktree workspace's sandbox cannot write (only its own gitdir, ref and
+    /// reflog directories are read-write, and its `config.worktree` is
+    /// read-only) — and because LFS needs it. In-place workspaces, whose
+    /// sandbox does see the whole `.git`, are refused before any push.
+    ///
+    /// **Residual risk:** the agent chooses *when* the hook runs and what it is
+    /// fed (its own commits, as the push payload), so a `pre-push` hook that
+    /// does something consequential with arbitrary pushed content — runs the
+    /// test suite, say, executing code from the branch — does that on the host
+    /// at the agent's request. That is the same trust the user extends to the
+    /// hook whenever they push an agent's branch themselves.
     pub fn daemon_push_git(&self) -> Git {
         Git::new().with_env(
             "GIT_ALTERNATE_OBJECT_DIRECTORIES",
