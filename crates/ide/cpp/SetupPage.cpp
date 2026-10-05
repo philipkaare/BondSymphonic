@@ -343,6 +343,13 @@ void SetupPage::clearRows() {
     QLayoutItem* item = nullptr;
     while ((item = m_rowsLayout->takeAt(0)) != nullptr) {
         if (QWidget* widget = item->widget()) {
+            // Hidden as well as deleted: the deletion is deferred, and the
+            // Settings dialog runs its own event loop, inside which a deletion
+            // scheduled from outside it never happens. Rebuilt rows -- every
+            // backend toggle rebuilds them -- left the old ones painted on top
+            // of the new, out of any layout: a doubled "System" heading and
+            // half a button sitting over another row.
+            widget->hide();
             widget->deleteLater();
         }
         delete item;
@@ -1170,6 +1177,38 @@ QLabel* rowSaying(const SetupPage& page, const char* prefix) {
 /// runs an event loop to collect them.
 void collectRows() {
     QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+}
+
+/// Rows a rebuild took down stop being drawn at once, before their deferred
+/// delete runs. Inside the Settings dialog's own event loop that delete never
+/// ran, and every rebuild left its rows painted under the new ones: a doubled
+/// "System" heading with half a button over it. No `collectRows` here, which is
+/// the point -- the dialog does not get one either.
+extern "C" std::int32_t bs_widget_test_setup_page_hides_the_rows_it_rebuilds() {
+    AppController controller;
+    SetupPage page(&controller);
+    controller.prereqsChecked(QString::fromUtf8(kMixedPrereqs));
+    page.setBackendSettings(QJsonObject());
+    page.setBackendSettings(QJsonObject());
+    int shownHeadings = 0;
+    int shownInstallButtons = 0;
+    for (QLabel* label : page.findChildren<QLabel*>()) {
+        if (label->text() == QLatin1String("System") && !label->isHidden()) {
+            ++shownHeadings;
+        }
+    }
+    for (QPushButton* button : page.findChildren<QPushButton*>()) {
+        if (button->text() == QLatin1String("Install Claude Code") && !button->isHidden()) {
+            ++shownInstallButtons;
+        }
+    }
+    if (shownHeadings != 1) {
+        return 1;
+    }
+    if (shownInstallButtons != 1) {
+        return 2;
+    }
+    return 0;
 }
 
 /// Before the daemon has answered, the section says it is checking rather than

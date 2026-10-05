@@ -1645,6 +1645,8 @@ mod cpp_widgets {
         fn bs_widget_test_setup_page_says_it_is_checking_first() -> i32;
         fn bs_widget_test_splash_closes_when_the_ide_is_ready() -> i32;
         fn bs_widget_test_transcript_gate_shows_the_cli_auth_failure() -> i32;
+        fn bs_widget_test_setup_page_hides_the_rows_it_rebuilds() -> i32;
+        fn bs_widget_test_transcript_a_long_system_word_keeps_answers_wrapping() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1658,7 +1660,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 51] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 53] = [
             // These four build a whole MainWindow, and each begins by pointing
             // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
             // is load-bearing rather than tidy: the state store settles its
@@ -1871,6 +1873,14 @@ mod cpp_widgets {
             (
                 "The composer gate shows the CLI's own auth failure over the login button",
                 bs_widget_test_transcript_gate_shows_the_cli_auth_failure,
+            ),
+            (
+                "SetupPage stops drawing the rows a rebuild took down",
+                bs_widget_test_setup_page_hides_the_rows_it_rebuilds,
+            ),
+            (
+                "A long unbroken word in a system line leaves answers wrapping at the pane",
+                bs_widget_test_transcript_a_long_system_word_keeps_answers_wrapping,
             ),
         ];
 

@@ -882,6 +882,12 @@ QWidget* TranscriptView::makeFrame(const QJsonObject& item, int index) {
     } else {
         applySmallGrey(label, kind == QStringLiteral("system"));
         label->setTextFormat(Qt::PlainText);
+        // A word-wrapped label is never narrower than its longest word, and a
+        // system line can carry a long unbroken one -- an id, a path, raw data.
+        // That one word used to widen the whole column past the pane, and then
+        // no answer wrapped at the visible edge. An explicit minimum lets the
+        // column stay the pane's width; the word itself is clipped instead.
+        label->setMinimumWidth(1);
     }
     label->setText(bodyText(item));
     return frame;
@@ -1427,6 +1433,39 @@ extern "C" std::int32_t bs_widget_test_transcript_hides_the_small_grey_lines() {
     if (cost == nullptr || !cost->text().contains(QLatin1String("turn 3"))) {
         // Back in its own place, not appended at the foot.
         return 6;
+    }
+    return 0;
+}
+
+/// A system line with one long unbroken word in it must not set the width of
+/// the transcript column. It used to: the word was the label's minimum width,
+/// the column grew past the pane to fit it, and every answer then wrapped at
+/// the column's edge instead of the visible one.
+extern "C" std::int32_t bs_widget_test_transcript_a_long_system_word_keeps_answers_wrapping() {
+    TranscriptModel model;
+    TranscriptView view(&model);
+    view.setShowMeta(true);
+    QJsonObject system;
+    system.insert(QStringLiteral("kind"), QStringLiteral("system"));
+    system.insert(QStringLiteral("text"), QStringLiteral("raw: ") + QString(600, QLatin1Char('x')));
+    view.setTestItems(QStringList{
+        assistantItem(QStringLiteral("an answer that should wrap at the pane"), false),
+        QString::fromUtf8(QJsonDocument(system).toJson(QJsonDocument::Compact)),
+    });
+    model.resetItems();
+    if (view.frameCount() != 2) {
+        return 1;
+    }
+    auto* scroll = view.findChild<QScrollArea*>();
+    if (scroll == nullptr || scroll->widget() == nullptr) {
+        return 2;
+    }
+    const int wordWidth = bodyLabel(view.frameAt(1))->fontMetrics().horizontalAdvance(
+        QString(600, QLatin1Char('x')));
+    // The column may still be as wide as its widest *breakable* content asks;
+    // what it must not be is as wide as the unbroken word.
+    if (scroll->widget()->minimumSizeHint().width() >= wordWidth / 2) {
+        return 3;
     }
     return 0;
 }

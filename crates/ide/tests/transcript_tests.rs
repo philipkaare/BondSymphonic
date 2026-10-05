@@ -285,6 +285,21 @@ fn an_init_system_message_records_the_session_and_summarises_itself() {
     };
     assert!(text.starts_with("raw: "), "{text}");
     assert!(text.chars().count() <= 5 + 200, "{}", text.chars().count());
+
+    // Spaced, so the line wraps between fields instead of being one word as
+    // wide as the whole of its data.
+    let spaced = msg(
+        3,
+        AgentMessageBody::System {
+            subtype: "raw".to_owned(),
+            data: json!({ "a": 1, "b": [2, 3] }),
+        },
+    );
+    assert_eq!(t.apply(&spaced), Applied::Appended(2));
+    let TranscriptItem::System { text } = &t.items[2] else {
+        panic!("expected a system item");
+    };
+    assert_eq!(text, r#"raw: {"a": 1, "b": [2, 3]}"#);
 }
 
 #[test]

@@ -388,7 +388,7 @@ impl Transcript {
             AgentMessageBody::System { subtype, data } if subtype == "codex_turn" => {
                 self.cost_available = false;
                 self.push(TranscriptItem::System {
-                    text: format!("Codex turn: {}", truncate(&compact(data), SYSTEM_DATA_MAX)),
+                    text: format!("Codex turn: {}", truncate(&spaced(data), SYSTEM_DATA_MAX)),
                 })
             }
             AgentMessageBody::System { subtype, data } if subtype == "init" => {
@@ -427,7 +427,7 @@ impl Transcript {
                 })
             }
             AgentMessageBody::System { subtype, data } => self.push(TranscriptItem::System {
-                text: format!("{subtype}: {}", truncate(&compact(data), SYSTEM_DATA_MAX)),
+                text: format!("{subtype}: {}", truncate(&spaced(data), SYSTEM_DATA_MAX)),
             }),
         }
     }
@@ -735,6 +735,50 @@ pub fn tool_summary(name: &str, input: &Value) -> String {
 /// bounded rendering of a system message's data.
 fn compact(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned())
+}
+
+/// One line of JSON with a space after every `,` and `:`, for the system lines
+/// the transcript shows. Compact JSON is a single word as far as word wrap is
+/// concerned, and a word wider than the pane widened the whole transcript
+/// column with it, so no answer wrapped at the visible edge any more.
+fn spaced(value: &Value) -> String {
+    struct Spaced;
+    impl serde_json::ser::Formatter for Spaced {
+        fn begin_array_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            writer: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if first {
+                Ok(())
+            } else {
+                writer.write_all(b", ")
+            }
+        }
+        fn begin_object_key<W: ?Sized + std::io::Write>(
+            &mut self,
+            writer: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if first {
+                Ok(())
+            } else {
+                writer.write_all(b", ")
+            }
+        }
+        fn begin_object_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            writer: &mut W,
+        ) -> std::io::Result<()> {
+            writer.write_all(b": ")
+        }
+    }
+    let mut out = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, Spaced);
+    match serde::Serialize::serialize(value, &mut serializer) {
+        Ok(()) => String::from_utf8(out).unwrap_or_else(|_| compact(value)),
+        Err(_) => compact(value),
+    }
 }
 
 /// The first `max` characters of `text`. Counts characters, not bytes, so a
