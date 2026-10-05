@@ -229,6 +229,12 @@ pub struct Daemon {
     /// [`Daemon::host`]. Built on first use, because most daemons never open a
     /// setup terminal and building it creates directories.
     pub host: tokio::sync::OnceCell<HostHandle>,
+    /// The agent tools' MCP listeners, one per live sandbox. See
+    /// [`crate::mcp::registry`].
+    pub mcp: crate::mcp::registry::McpRegistry,
+    /// The daemon itself, for what it starts that must call back into it
+    /// without keeping it alive (the MCP listeners). Set by `Arc::new_cyclic`.
+    me: std::sync::Weak<Daemon>,
 }
 
 impl Daemon {
@@ -241,7 +247,7 @@ impl Daemon {
         let registry = Registry::load(&dirs.registry_file())?;
         let agents =
             AgentManager::new(events.clone(), dirs.transcripts.clone(), dirs.agents_file());
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|me| Self {
             dirs,
             registry,
             git: Git::new(),
@@ -257,7 +263,14 @@ impl Daemon {
             runs: crate::runs::manager::RunManager::new(events),
             models: crate::models::ModelsCache::new(),
             host: tokio::sync::OnceCell::new(),
+            mcp: Default::default(),
+            me: me.clone(),
         }))
+    }
+
+    /// A weak handle on this daemon: see the `me` field.
+    pub fn weak(&self) -> std::sync::Weak<Daemon> {
+        self.me.clone()
     }
 
     /// The host handle, built on first use and then shared.

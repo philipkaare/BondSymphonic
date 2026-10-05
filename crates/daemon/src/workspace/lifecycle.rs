@@ -272,6 +272,16 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
         )
         .await?;
     log_phase(&ws.id, "start_sandbox", "proxies.start", phase);
+    // Beside the proxy and for the same reason: before the sandbox, so the
+    // socket is there when an agent first looks. A failure costs the agents
+    // their git tools, never the workspace.
+    if let Err(e) = d.mcp.start(
+        d.weak(),
+        &ws.id,
+        &d.dirs.run(&ws.id).join(crate::mcp::SOCKET_FILE),
+    ) {
+        tracing::warn!(ws = %ws.id, "agent tools unavailable: {}", e.message);
+    }
     let phase = Instant::now();
     let started = d.backend.start(&spec).await;
     log_phase(&ws.id, "start_sandbox", "backend.start", phase);
@@ -1210,6 +1220,7 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
     // After the sandbox, so a last request is answered rather than cut off, and
     // before the directories go, since the socket file lives in one of them.
     d.proxies.stop(id);
+    d.mcp.stop_workspace(id);
     // Everything from here on touches the repository: `worktree::remove` deletes
     // the branch and the worktree registration, and `remove_workspace` deletes
     // `objects/<id>` — the private object directory a merge or a push of the
@@ -1533,6 +1544,7 @@ async fn tear_down_sandbox(d: &Daemon, id: &WorkspaceId) {
         let _ = h.shutdown().await;
     }
     d.proxies.stop(id);
+    d.mcp.stop_workspace(id);
 }
 
 /// `workspace.restart`: stops whatever is left of the workspace's sandbox and

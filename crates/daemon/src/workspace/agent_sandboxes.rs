@@ -216,6 +216,15 @@ impl AgentSandboxes {
                 d.events.clone(),
             )
             .await?;
+        // The companion's own socket, in its own run directory: inside, it is
+        // the same `/run/bs/mcp.sock` the workspace sandbox has.
+        if let Err(e) = d.mcp.start(
+            d.weak(),
+            &ws.id,
+            &spec.run_dir.join(crate::mcp::SOCKET_FILE),
+        ) {
+            tracing::warn!(ws = %ws.id, "agent tools unavailable: {}", e.message);
+        }
         let mut startup = Startup {
             proxy: proxy.clone(),
             id: ws.id.clone(),
