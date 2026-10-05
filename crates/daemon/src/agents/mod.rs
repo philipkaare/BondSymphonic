@@ -641,16 +641,16 @@ impl Agent {
 ///
 /// Without it an agent whose `git fetch` fails concludes the machine is not
 /// logged in to GitHub and asks the user to run `gh auth login` -- which would
-/// only log in a sandbox home the daemon throws away, and the user's real login
-/// was never the problem. The sandbox holds no credentials by design; the
-/// daemon fetches on the host instead (`git::fetch`).
-pub const SANDBOX_GIT_NOTE: &str = "You are running inside a BondSymphonic sandbox that \
-holds no Git credentials, so `git fetch`, `git pull` and `git push` to remotes that need \
-authentication will fail or hang, and logging in from inside the sandbox does not help. \
-BondSymphonic fetches `origin` for you on the host when this workspace starts and whenever \
-the user chooses Workspace > Fetch from origin, so `origin/*` refs are as current as that. \
-If you need newer remote commits, ask the user to fetch from origin. Pushing and pull \
-requests are done by the user through BondSymphonic.";
+/// only log in a sandbox home the daemon throws away. The sandbox holds no
+/// credentials by design; the `bondsymphonic` MCP tools (`crate::mcp`) do the
+/// remote work on the host and name what they offer here.
+pub const SANDBOX_GIT_NOTE: &str = "You are running inside a BondSymphonic sandbox that holds no Git or GitHub credentials, so plain \
+`git fetch`, `git pull`, `git push` and `gh` cannot authenticate, and logging in from inside the \
+sandbox does not help. Use the `bondsymphonic` MCP tools instead: git_fetch (update origin/*), \
+git_push (push this workspace's branch; force uses --force-with-lease), pr_create, pr_view, \
+pr_update, pr_comment (this branch's pull request), ci_logs (CI status and failed logs for this \
+branch) and issue_view. They run on the host as the user and can only act on this workspace's own \
+branch. If a tool says GitHub is not logged in, tell the user to log in under Settings > Setup.";
 
 const ENDED_AT_RESTART: &str = "the agent ended when the daemon restarted";
 const ENDED_BEFORE_RESTART: &str = "the agent ended before the daemon restarted";

@@ -229,6 +229,7 @@ impl Backend for CodexBackend {
         };
         let (config, env) = process_config(&d.dirs.root, options.api_key.as_deref());
         argv.extend(config);
+        argv.extend(sandbox_args(d.backend.name()));
         argv.extend(["app-server".into(), "--listen".into(), "stdio://".into()]);
         Ok(PreparedAgent {
             argv,
@@ -324,4 +325,25 @@ pub async fn list_models_process(
     events.abort();
     stderr.abort();
     result
+}
+
+/// Config overrides only a sandboxed Codex gets: the bridge to the brokered
+/// git and GitHub tools. Other backends have real credentials and no socket.
+fn sandbox_args(backend: &str) -> Vec<String> {
+    if backend == "linux_bwrap" {
+        crate::mcp::codex_config()
+    } else {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod sandbox_args_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_sandboxed_backend_gets_the_bridge() {
+        assert_eq!(sandbox_args("linux_bwrap"), crate::mcp::codex_config());
+        assert!(sandbox_args("noop").is_empty());
+    }
 }

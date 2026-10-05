@@ -368,6 +368,12 @@ pub fn claude_argv(options: &AgentStartOptions, backend: &str) -> Result<Vec<Str
     // Only where there is a sandbox to explain: the noop backend is for
     // development and runs the agent with the user's own credentials.
     if backend == SANDBOXED_BACKEND {
+        // Both flags are variadic, so each must be followed by another flag;
+        // `--append-system-prompt` stays last to guarantee that.
+        argv.push("--mcp-config".to_owned());
+        argv.push(crate::mcp::claude_mcp_config());
+        argv.push("--allowedTools".to_owned());
+        argv.push(crate::mcp::claude_allowed_tools());
         argv.push("--append-system-prompt".to_owned());
         argv.push(super::SANDBOX_GIT_NOTE.to_owned());
     }
@@ -1476,6 +1482,14 @@ settings = \"s.json\"
         assert!(!claude_argv(&plain, NOOP)
             .unwrap()
             .contains(&"--append-system-prompt".to_owned()));
+        let pos = |argv: &[String], flag: &str| argv.iter().position(|a| a == flag);
+        let at = pos(&sandboxed, "--mcp-config").expect("--mcp-config");
+        assert_eq!(sandboxed[at + 1], crate::mcp::claude_mcp_config());
+        let at = pos(&sandboxed, "--allowedTools").expect("--allowedTools");
+        assert_eq!(sandboxed[at + 1], crate::mcp::claude_allowed_tools());
+        let noop = claude_argv(&plain, NOOP).unwrap();
+        assert!(pos(&noop, "--mcp-config").is_none());
+        assert!(pos(&noop, "--allowedTools").is_none());
         std::env::set_var("BS_CLAUDE_BIN", "   ");
         assert_eq!(
             claude_argv(&plain, NOOP).unwrap_err().code,
