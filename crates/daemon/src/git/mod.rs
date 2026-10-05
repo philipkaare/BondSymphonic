@@ -1,4 +1,5 @@
 pub mod fetch;
+pub mod gh;
 pub mod merge;
 pub mod pr;
 pub mod repo;
