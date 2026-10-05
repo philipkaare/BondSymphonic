@@ -67,6 +67,18 @@ async fn a_workspace_serves_its_tools_on_its_run_dir_socket_until_destroyed() {
     .await
     .unwrap();
     assert!(!socket.exists(), "destroy removes the socket");
+    // The socket file going says little: it goes with the run directory
+    // anyway. What only `stop_workspace` does is close the connection the
+    // agent already holds, so a tool call cannot reach a destroyed workspace
+    // through it.
+    let eof = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+        .await
+        .expect("destroy must close the open connection, not leave it hanging");
+    assert!(
+        matches!(eof, Ok(None) | Err(_)),
+        "expected end of stream, got {eof:?}"
+    );
+    drop(w);
     cancel.cancel();
 }
 
