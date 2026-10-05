@@ -229,6 +229,13 @@ crate.
 - `workspace.create_pr {workspace_id, title, body, draft}` → `{url}`. Refused
   for an in-place workspace the same way as `workspace.merge`.
 - `workspace.set_allowlist {workspace_id, hosts[]}`
+- `workspace.fetch {workspace_id}` → `{updated, has_origin}`. Runs
+  `git fetch --prune origin` in the workspace's repository on the host, as the
+  user, under the repository lock merges take. Agents cannot fetch themselves
+  (no credentials in the sandbox, read-only shared refs in a worktree
+  workspace), so the daemon also fetches whenever a workspace becomes `Ready`,
+  at most once per repository per five minutes, and tells every sandboxed agent
+  so in its instructions.
 - `workspace.restart {workspace_id}` → `WorkspaceInfo`. Restarts the sandbox of
   a `Ready`, `SandboxDown` or `Error` workspace, re-registering a pruned
   worktree when it safely can. Refused while the workspace is `Creating` or

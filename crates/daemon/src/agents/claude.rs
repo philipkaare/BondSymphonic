@@ -365,6 +365,12 @@ pub fn claude_argv(options: &AgentStartOptions, backend: &str) -> Result<Vec<Str
         argv.push("--permission-mode".to_owned());
         argv.push(mode.to_owned());
     }
+    // Only where there is a sandbox to explain: the noop backend is for
+    // development and runs the agent with the user's own credentials.
+    if backend == SANDBOXED_BACKEND {
+        argv.push("--append-system-prompt".to_owned());
+        argv.push(super::SANDBOX_GIT_NOTE.to_owned());
+    }
     Ok(argv)
 }
 
@@ -1460,6 +1466,16 @@ settings = \"s.json\"
                 "the hook must win on {backend}"
             );
         }
+        // A sandboxed agent is told it cannot fetch, as the last two
+        // arguments; the development backend's agent is not.
+        let sandboxed = claude_argv(&plain, BWRAP).unwrap();
+        assert_eq!(
+            &sandboxed[sandboxed.len() - 2..],
+            ["--append-system-prompt", crate::agents::SANDBOX_GIT_NOTE]
+        );
+        assert!(!claude_argv(&plain, NOOP)
+            .unwrap()
+            .contains(&"--append-system-prompt".to_owned()));
         std::env::set_var("BS_CLAUDE_BIN", "   ");
         assert_eq!(
             claude_argv(&plain, NOOP).unwrap_err().code,

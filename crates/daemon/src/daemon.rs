@@ -386,8 +386,15 @@ impl Daemon {
         id: &WorkspaceId,
         state: WorkspaceState,
     ) -> Result<Workspace, RpcError> {
+        let ready = state == WorkspaceState::Ready;
         let ws = self.registry.update(id, |w| w.state = state).await?;
         self.emit_state(&ws);
+        // Every way a workspace comes up -- created, restored at startup,
+        // restarted -- passes here, and each is a moment its agent is about to
+        // look at `origin/*`, which it has no way to fetch itself.
+        if ready {
+            crate::git::fetch::spawn_auto_fetch(ws.repo_path.clone(), self.dirs.no_hooks());
+        }
         Ok(ws)
     }
 

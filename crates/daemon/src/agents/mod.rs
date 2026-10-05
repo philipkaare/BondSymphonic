@@ -635,6 +635,23 @@ impl Agent {
 ///
 /// Both name the restart, because that is what the IDE has to explain: the tab
 /// is there, the history is there, and the agent behind it is not.
+/// What every sandboxed agent is told about git remotes, appended to its own
+/// instructions (`--append-system-prompt` for Claude Code,
+/// `developerInstructions` for Codex).
+///
+/// Without it an agent whose `git fetch` fails concludes the machine is not
+/// logged in to GitHub and asks the user to run `gh auth login` -- which would
+/// only log in a sandbox home the daemon throws away, and the user's real login
+/// was never the problem. The sandbox holds no credentials by design; the
+/// daemon fetches on the host instead (`git::fetch`).
+pub const SANDBOX_GIT_NOTE: &str = "You are running inside a BondSymphonic sandbox that \
+holds no Git credentials, so `git fetch`, `git pull` and `git push` to remotes that need \
+authentication will fail or hang, and logging in from inside the sandbox does not help. \
+BondSymphonic fetches `origin` for you on the host when this workspace starts and whenever \
+the user chooses Workspace > Fetch from origin, so `origin/*` refs are as current as that. \
+If you need newer remote commits, ask the user to fetch from origin. Pushing and pull \
+requests are done by the user through BondSymphonic.";
+
 const ENDED_AT_RESTART: &str = "the agent ended when the daemon restarted";
 const ENDED_BEFORE_RESTART: &str = "the agent ended before the daemon restarted";
 

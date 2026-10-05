@@ -104,7 +104,9 @@ pub const REPOSITORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// the right answer for one whose cost nobody here knows.
 pub fn default_timeout_for(method: &str) -> Duration {
     match method {
-        "workspace.merge" => MERGE_REQUEST_TIMEOUT,
+        // A fetch is two git commands under the repository's lock, which a
+        // merge of the same repository may be holding.
+        "workspace.merge" | "workspace.fetch" => MERGE_REQUEST_TIMEOUT,
         "workspace.create_pr" => CREATE_PR_REQUEST_TIMEOUT,
         "repo.inspect"
         | "workspace.create"

@@ -172,6 +172,13 @@ pub enum Request {
     WorkspaceCreatePr(WorkspaceCreatePrParams),
     #[serde(rename = "workspace.set_allowlist")]
     WorkspaceSetAllowlist(WorkspaceSetAllowlistParams),
+    /// Fetches the workspace's repository from `origin`, on the host with the
+    /// user's own credentials. Agents cannot fetch: their sandbox holds no
+    /// credentials and the shared `.git` is read-only to them, so this is how
+    /// `origin/*` stays current for them. Additive -- an old daemon answers
+    /// "not implemented" -- so it does not move [`crate::PROTOCOL_VERSION`].
+    #[serde(rename = "workspace.fetch")]
+    WorkspaceFetch(WorkspaceIdParams),
     #[serde(rename = "fs.list_dir")]
     FsListDir(FsPathParams),
     #[serde(rename = "fs.read_file")]
@@ -236,6 +243,7 @@ impl Request {
             WorkspaceMerge(_) => "workspace.merge",
             WorkspaceCreatePr(_) => "workspace.create_pr",
             WorkspaceSetAllowlist(_) => "workspace.set_allowlist",
+            WorkspaceFetch(_) => "workspace.fetch",
             FsListDir(_) => "fs.list_dir",
             FsReadFile(_) => "fs.read_file",
             FsWriteFile(_) => "fs.write_file",
@@ -323,6 +331,9 @@ impl Request {
             WorkspaceSetAllowlist(WorkspaceSetAllowlistParams {
                 workspace_id: ws.clone(),
                 hosts: vec!["*.x.org".into()],
+            }),
+            WorkspaceFetch(WorkspaceIdParams {
+                workspace_id: ws.clone(),
             }),
             FsListDir(FsPathParams {
                 workspace_id: ws.clone(),
@@ -493,6 +504,15 @@ pub struct MergeResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreatePrResult {
     pub url: String,
+}
+/// What `workspace.fetch` did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FetchResult {
+    /// Remote-tracking refs and tags the fetch created, moved or pruned.
+    pub updated: u32,
+    /// False when the repository has no `origin` remote, so there was nothing
+    /// to fetch from.
+    pub has_origin: bool,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ListDirResult {

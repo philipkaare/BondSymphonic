@@ -588,6 +588,8 @@ private:
     /// each is dead while there is not one; `updateWorkspaceStatus` is where
     /// that is decided, because it already runs on every tab change.
     QAction* m_restartAgentAction = nullptr;
+    /// Workspace > Fetch from origin; see `AppController::fetchWorkspace`.
+    QAction* m_fetchAction = nullptr;
     QAction* m_destroyAction = nullptr;
     QAction* m_closeGroupAction = nullptr;
     /// The two that need a *second* tab to go to rather than merely one tab.

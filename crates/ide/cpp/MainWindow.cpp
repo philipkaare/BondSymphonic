@@ -382,6 +382,22 @@ void MainWindow::buildMenus() {
     workspace->addAction(changes->prAction());
     workspace->addAction(changes->discardAction());
     workspace->addSeparator();
+    // The daemon fetches on the host, as the user: an agent cannot, because its
+    // sandbox holds no credentials. Also done whenever a workspace comes up;
+    // this is for "now".
+    m_fetchAction = workspace->addAction("&Fetch from origin", this, [this] {
+        const QString id = activeWorkspaceId();
+        if (id.isEmpty()) {
+            return;
+        }
+        showOperationMessage(QStringLiteral("Fetching \"%1\" from origin")
+                                     .arg(activeTab().value("name").toString()) +
+                                 QChar(0x2026),
+                             QString());
+        m_controller->fetchWorkspace(id);
+    });
+    m_fetchAction->setObjectName(QStringLiteral("WorkspaceFetchAction"));
+    workspace->addSeparator();
     // Both go through the handlers the tab's context menu uses, which read the
     // workspace once and put a named question in front of the user. The menu
     // supplies the name from the same tab it took the id from, so the question
@@ -1035,6 +1051,30 @@ void MainWindow::connectController() {
                      &MainWindow::onDestroyRefused);
     QObject::connect(m_controller, &AppController::workspaceRestartFailed, this,
                      &MainWindow::onWorkspaceRestartFailed);
+    // A fetch is the user's own request, so its answer goes where the other
+    // requests' answers go: the status line, never a box over the window.
+    QObject::connect(m_controller, &AppController::workspaceFetched, this,
+                     [this](const QString& workspaceId, int updated, bool hasOrigin) {
+                         const QString name = m_groupModel->workspaceName(workspaceId);
+                         showOperationMessage(
+                             !hasOrigin ? QStringLiteral("\"%1\" has no origin to fetch from.")
+                                              .arg(name)
+                             : updated == 0
+                                 ? QStringLiteral("Fetched \"%1\": already up to date.").arg(name)
+                                 : QStringLiteral("Fetched \"%1\": %2 ref(s) updated.")
+                                       .arg(name)
+                                       .arg(updated),
+                             QString());
+                     });
+    QObject::connect(m_controller, &AppController::workspaceFetchFailed, this,
+                     [this](const QString& workspaceId, const QString& message) {
+                         // The `operationFailed` behind this is answered here.
+                         noteFailureRouted(message);
+                         showOperationMessage(
+                             QStringLiteral("Fetching \"%1\" failed: %2")
+                                 .arg(m_groupModel->workspaceName(workspaceId), message),
+                             QString());
+                     });
     // A host the workspace's proxy refused. The queue is per workspace and
     // lives in the model, so one blocked while another tab is in front waits
     // there rather than being shown over the wrong workspace.
@@ -2843,6 +2883,7 @@ void MainWindow::updateWorkspaceStatus() {
     // somewhere to go rather than merely something to leave.
     const bool live = !active.isEmpty();
     m_restartAgentAction->setEnabled(live);
+    m_fetchAction->setEnabled(live);
     m_destroyAction->setEnabled(live);
     // The verb follows the workspace: an in-place one is closed, and nothing
     // of the user's goes with it.
@@ -3115,7 +3156,8 @@ extern "C" std::int32_t bs_widget_test_workspace_menu_gathers_the_git_actions() 
                       QStringLiteral("Next agent"), QStringLiteral("Previous agent"),
                       QStringLiteral("Merge"), QStringLiteral("Rebase"), QStringLiteral("Squash"),
                       QStringLiteral("Create PR"), QStringLiteral("Discard"),
-                      QStringLiteral("Destroy workspace"), QStringLiteral("Close group") }) {
+                      QStringLiteral("Fetch from origin"), QStringLiteral("Destroy workspace"),
+                      QStringLiteral("Close group") }) {
         if (!menuHasAction(menu, text)) {
             return 2;
         }
@@ -3131,8 +3173,9 @@ extern "C" std::int32_t bs_widget_test_workspace_menu_gathers_the_git_actions() 
     // offering an action that can only fail.
     for (const QString& text :
          QStringList{ QStringLiteral("Merge"), QStringLiteral("Discard"),
-                      QStringLiteral("Restart agent"), QStringLiteral("Destroy workspace"),
-                      QStringLiteral("Close group"), QStringLiteral("Next agent") }) {
+                      QStringLiteral("Restart agent"), QStringLiteral("Fetch from origin"),
+                      QStringLiteral("Destroy workspace"), QStringLiteral("Close group"),
+                      QStringLiteral("Next agent") }) {
         if (menuActionEnabled(menu, text)) {
             return 4;
         }

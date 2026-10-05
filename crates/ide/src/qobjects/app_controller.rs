@@ -527,6 +527,25 @@ pub mod qobject {
             info_json: QString,
         );
 
+        /// A `fetch_workspace` call finished: `updated` refs moved, or
+        /// `has_origin` false when the repository has no `origin` at all.
+        #[qsignal]
+        fn workspace_fetched(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            updated: i32,
+            has_origin: bool,
+        );
+
+        /// A `fetch_workspace` call failed, with the reason. Emitted alongside
+        /// `operation_failed`, in one step.
+        #[qsignal]
+        fn workspace_fetch_failed(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            message: QString,
+        );
+
         /// `agent.start` succeeded: `workspace_id` is now running `agent_id`.
         /// Emitted before any initial prompt is sent, so the transcript is
         /// attached and subscribed before the first answer arrives.
@@ -735,6 +754,13 @@ pub mod qobject {
         /// was.
         #[qinvokable]
         fn restart_workspace(self: Pin<&mut AppController>, workspace_id: QString);
+
+        /// Fetch the workspace's repository from `origin` on the host
+        /// (`workspace.fetch`), which is the only way its agent sees newer
+        /// remote commits. Answers with `workspace_fetched` or
+        /// `workspace_fetch_failed`.
+        #[qinvokable]
+        fn fetch_workspace(self: Pin<&mut AppController>, workspace_id: QString);
 
         /// Inspect a git repository. Answers with `repo_inspected` or
         /// `operation_failed`.
@@ -1788,6 +1814,17 @@ fn report_workspace_op_failure(
             QString::from(&message),
         );
         q.operation_failed(QString::from(op), QString::from(&message))
+    });
+}
+
+/// Queues `workspace_fetch_failed` and the `operation_failed` behind it, in
+/// one step, like the other typed failures.
+fn report_fetch_failure(qt: &QtHandle, workspace: String, message: String) {
+    tracing::warn!("workspace.fetch failed for {workspace}: {message}");
+    let _ = qt.queue(move |mut q| {
+        q.as_mut()
+            .workspace_fetch_failed(QString::from(&workspace), QString::from(&message));
+        q.operation_failed(QString::from("workspace.fetch"), QString::from(&message))
     });
 }
 
@@ -3073,6 +3110,42 @@ impl qobject::AppController {
                         other => other.to_string(),
                     };
                     report_restart_failure(&qt, id, message, kind);
+                }
+            }
+        });
+    }
+
+    pub fn fetch_workspace(self: Pin<&mut Self>, workspace_id: QString) {
+        let qt = self.qt_thread();
+        let id = workspace_id.to_string();
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_fetch_failure(&qt, id, message.to_owned());
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            let params = WorkspaceIdParams {
+                workspace_id: WorkspaceId(id.clone()),
+            };
+            match shared
+                .client
+                .request::<FetchResult>(Request::WorkspaceFetch(params))
+                .await
+            {
+                Ok(r) => {
+                    let updated = i32::try_from(r.updated).unwrap_or(i32::MAX);
+                    let _ = qt.queue(move |q| {
+                        q.workspace_fetched(QString::from(&id), updated, r.has_origin)
+                    });
+                }
+                Err(e) => {
+                    let message = match e {
+                        ClientError::Rpc(rpc) => rpc.message,
+                        other => other.to_string(),
+                    };
+                    report_fetch_failure(&qt, id, message);
                 }
             }
         });

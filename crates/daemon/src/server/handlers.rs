@@ -118,6 +118,9 @@ impl Handler for WorkspaceHandler {
             Request::WorkspaceMerge(p) => {
                 ok(crate::git::merge::merge(d, &p.workspace_id, p.mode, p.message).await?)
             }
+            // On the host, as the user, for the same reason a merge is: the
+            // sandbox has no credentials and a read-only view of the refs.
+            Request::WorkspaceFetch(p) => ok(crate::git::fetch::fetch(d, &p.workspace_id).await?),
             Request::WorkspaceCreatePr(p) => {
                 ok(
                     crate::git::pr::create_pr(d, &p.workspace_id, &p.title, &p.body, p.draft)
