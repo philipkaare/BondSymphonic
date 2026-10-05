@@ -8,6 +8,7 @@
 use crate::daemon::Daemon;
 use crate::git::git_error;
 use crate::workspace::lifecycle::layout_for;
+use crate::workspace::Workspace;
 use bondsymphonic_proto::{CreatePrResult, RpcError, WorkspaceId, WorkspaceState};
 
 /// Pushes `id`'s branch to `origin` and opens a pull request for it.
@@ -19,60 +20,7 @@ pub async fn create_pr(
     draft: bool,
 ) -> Result<CreatePrResult, RpcError> {
     let ws = d.workspace(id)?;
-    // Before the state check: an in-place workspace has nothing to merge in
-    // any state, and the IDE branches on this reason rather than the prose.
-    if ws.kind == bondsymphonic_proto::WorkspaceKind::InPlace {
-        return Err(crate::workspace::in_place::nothing_to_merge());
-    }
-    // The same gate `merge` applies. Pushing out of a workspace that is still
-    // `Creating`, or one that failed, would publish a half-formed branch.
-    if ws.state != WorkspaceState::Ready {
-        return Err(RpcError::invalid_params(format!(
-            "workspace {} is not ready",
-            ws.id
-        )));
-    }
-    let layout = layout_for(d, &ws).await?;
-    // `daemon_push_git`, not `daemon_git`: the push must still run the
-    // repository's `pre-push` hook, because that is how `git-lfs` uploads the
-    // objects the pushed commits point at. See [`Layout::daemon_push_git`].
-    let git = layout.daemon_push_git();
-    {
-        // The push and the object copy that follows both write the repository's
-        // shared object store, so they take the same per-repository lock a
-        // merge does. Released before `gh` runs: opening a pull request is a
-        // network round trip that touches nothing local, and holding a
-        // repository's merges behind it for two minutes would be its own bug.
-        let lock = crate::git::repo_lock(&ws.repo_path);
-        let _guard = lock.lock().await;
-        // Without `-u`: setting an upstream writes `branch.<name>.remote` and
-        // `branch.<name>.merge` into `.git/config`, and every write of that file
-        // replaces it, which stops any in-place workspace of the same repository
-        // (see [`crate::workspace::in_place::ProtectedSnapshot`]). Nothing here
-        // needs the tracking: `gh pr create` is given `--head` explicitly, and a
-        // later push from the user's own shell is theirs to set up. The objects
-        // being pushed live in the workspace's private object directory;
-        // `daemon_git` is what lets git read them.
-        git.run(&ws.repo_path, &["push", "origin", &ws.branch])
-            .await?;
-        // Daemon design §5.2: the borrowed objects are copied into the shared
-        // store after the push. A push updates `refs/remotes/origin/<branch>`
-        // with or without `-u`, and unlike the local branch that ref is *not*
-        // deleted when the workspace is destroyed — it would be left pointing
-        // into a directory that no longer exists. Everything the branch adds to
-        // the base is what has to be copied, and a failure here is reported
-        // rather than logged: the push has happened, so the caller has to know
-        // the workspace is now holding objects the repository needs.
-        crate::git::absorb_objects(
-            &git,
-            &ws.repo_path,
-            &layout.git_common,
-            &ws.branch,
-            &ws.base_branch,
-        )
-        .await
-        .map_err(|e| crate::git::objects_stranded("push", "pushed", &e.message))?;
-    }
+    push_branch(d, &ws, false).await?;
 
     let mut args: Vec<String> = [
         "pr",
@@ -125,4 +73,73 @@ pub async fn create_pr(
     Ok(CreatePrResult {
         url: url.to_owned(),
     })
+}
+
+/// Pushes the workspace's own branch to `origin`, under the repository lock,
+/// and copies the objects it carries into the shared store.
+///
+/// The one push the daemon makes, for `workspace.create_pr` and for an agent's
+/// `git_push` tool alike: the branch is always `ws.branch`, never one the
+/// caller names. `force` is `--force-with-lease`, for an agent that rebased its
+/// branch; it still refuses to overwrite commits it has not seen.
+pub async fn push_branch(d: &Daemon, ws: &Workspace, force: bool) -> Result<(), RpcError> {
+    // Before the state check: an in-place workspace has nothing to merge in
+    // any state, and the IDE branches on this reason rather than the prose.
+    if ws.kind == bondsymphonic_proto::WorkspaceKind::InPlace {
+        return Err(crate::workspace::in_place::nothing_to_merge());
+    }
+    // The same gate `merge` applies. Pushing out of a workspace that is still
+    // `Creating`, or one that failed, would publish a half-formed branch.
+    if ws.state != WorkspaceState::Ready {
+        return Err(RpcError::invalid_params(format!(
+            "workspace {} is not ready",
+            ws.id
+        )));
+    }
+    let layout = layout_for(d, ws).await?;
+    // `daemon_push_git`, not `daemon_git`: the push must still run the
+    // repository's `pre-push` hook, because that is how `git-lfs` uploads the
+    // objects the pushed commits point at. See [`Layout::daemon_push_git`].
+    let git = layout.daemon_push_git();
+    {
+        // The push and the object copy that follows both write the repository's
+        // shared object store, so they take the same per-repository lock a
+        // merge does. Released before `gh` runs: opening a pull request is a
+        // network round trip that touches nothing local, and holding a
+        // repository's merges behind it for two minutes would be its own bug.
+        let lock = crate::git::repo_lock(&ws.repo_path);
+        let _guard = lock.lock().await;
+        // Without `-u`: setting an upstream writes `branch.<name>.remote` and
+        // `branch.<name>.merge` into `.git/config`, and every write of that file
+        // replaces it, which stops any in-place workspace of the same repository
+        // (see [`crate::workspace::in_place::ProtectedSnapshot`]). Nothing here
+        // needs the tracking: `gh pr create` is given `--head` explicitly, and a
+        // later push from the user's own shell is theirs to set up. The objects
+        // being pushed live in the workspace's private object directory;
+        // `daemon_git` is what lets git read them.
+        let mut args = vec!["push"];
+        if force {
+            args.push("--force-with-lease");
+        }
+        args.extend(["origin", ws.branch.as_str()]);
+        git.run(&ws.repo_path, &args).await?;
+        // Daemon design §5.2: the borrowed objects are copied into the shared
+        // store after the push. A push updates `refs/remotes/origin/<branch>`
+        // with or without `-u`, and unlike the local branch that ref is *not*
+        // deleted when the workspace is destroyed — it would be left pointing
+        // into a directory that no longer exists. Everything the branch adds to
+        // the base is what has to be copied, and a failure here is reported
+        // rather than logged: the push has happened, so the caller has to know
+        // the workspace is now holding objects the repository needs.
+        crate::git::absorb_objects(
+            &git,
+            &ws.repo_path,
+            &layout.git_common,
+            &ws.branch,
+            &ws.base_branch,
+        )
+        .await
+        .map_err(|e| crate::git::objects_stranded("push", "pushed", &e.message))?;
+    }
+    Ok(())
 }

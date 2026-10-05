@@ -344,3 +344,63 @@ async fn create_pr_refuses_a_workspace_that_is_not_ready() {
 
     cancel.cancel();
 }
+
+/// The push half alone, as the agents' `git_push` tool runs it.
+#[tokio::test]
+async fn push_branch_pushes_and_force_with_lease_overwrites_a_rewritten_branch() {
+    let _guard = ENV.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, origin) = init_repo_with_origin(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "pusher").await;
+    commit_in_ws(&daemon, &ws, "a.txt", "first").await;
+
+    let w = daemon.workspace(&ws.id).unwrap();
+    bondsymphonic_daemon::git::pr::push_branch(&daemon, &w, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        common::git_out(
+            &origin,
+            &["log", "-1", "--format=%s", "refs/heads/bs/pusher/work"]
+        ),
+        "first"
+    );
+
+    // Rewrite the branch: amend, so the remote is no longer an ancestor.
+    let env = lifecycle::layout_for(&daemon, &w)
+        .await
+        .unwrap()
+        .sandbox_git_env();
+    let wt = Path::new(&ws.worktree_path);
+    let st = std::process::Command::new("git")
+        .args(["commit", "-q", "--amend", "-m", "rewritten"])
+        .current_dir(wt)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .status()
+        .unwrap();
+    assert!(st.success());
+
+    let plain = bondsymphonic_daemon::git::pr::push_branch(&daemon, &w, false).await;
+    assert_eq!(
+        plain.unwrap_err().code,
+        ErrorCode::GitError,
+        "a non-fast-forward is refused"
+    );
+    bondsymphonic_daemon::git::pr::push_branch(&daemon, &w, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        common::git_out(
+            &origin,
+            &["log", "-1", "--format=%s", "refs/heads/bs/pusher/work"]
+        ),
+        "rewritten"
+    );
+    cancel.cancel();
+}
