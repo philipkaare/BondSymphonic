@@ -38,12 +38,20 @@ if ! id "$USER_NAME" >/dev/null 2>&1; then
   echo "$USER_NAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$USER_NAME
 fi
 
-# Make the user the default for wsl.exe -d bondsymphonic
+# Make the user the default for wsl.exe -d bondsymphonic.
+#
+# The boot command lowers eth0's MTU from 1500. Behind a VPN on the Windows
+# side, full-size packets into the WSL NAT are dropped without an ICMP reply,
+# so connections open and then stall at the first large reply -- GitHub's TLS
+# handshake, so every agent's `git fetch` timed out while Windows was fine.
+# 1400 leaves room for the VPN's encapsulation and costs nothing without one.
+# `|| true`: in mirrored networking the interface may have another name.
 cat > /etc/wsl.conf <<EOF
 [user]
 default=$USER_NAME
 [boot]
 systemd=false
+command=ip link set dev eth0 mtu 1400 || true
 EOF
 
 # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor; bwrap needs them.
