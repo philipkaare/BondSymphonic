@@ -13,7 +13,27 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+/// The longest line accepted, newline included; a longer one closes the connection.
 pub const MAX_LINE: usize = 1 << 20;
+
+type Calls = Arc<parking_lot::Mutex<HashMap<String, tokio::task::AbortHandle>>>;
+
+/// Ends a session when `serve` returns or is dropped mid-await (the listener
+/// being cancelled): aborts every in-flight call and the writer, so the
+/// connection closes instead of lingering until the last call finishes.
+struct SessionGuard {
+    calls: Calls,
+    writer: tokio::task::AbortHandle,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        for (_, h) in self.calls.lock().drain() {
+            h.abort();
+        }
+        self.writer.abort();
+    }
+}
 const VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 pub struct ToolSpec {
@@ -92,7 +112,11 @@ where
             }
         }
     });
-    let calls: Arc<parking_lot::Mutex<HashMap<String, tokio::task::AbortHandle>>> = Arc::default();
+    let calls: Calls = Arc::default();
+    let session = SessionGuard {
+        calls: calls.clone(),
+        writer: writer_task.abort_handle(),
+    };
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::new();
     loop {
@@ -106,7 +130,11 @@ where
             Ok(n) => n,
             Err(_) => break,
         };
-        if n == 0 || buf.len() > MAX_LINE {
+        if buf.len() > MAX_LINE {
+            tracing::warn!("mcp: line over {MAX_LINE} bytes, closing the connection");
+            break;
+        }
+        if n == 0 {
             break;
         }
         let line = String::from_utf8_lossy(&buf);
@@ -169,7 +197,10 @@ where
                     calls2.lock().remove(&key(&id));
                     let _ = out_tx.send(msg);
                 });
-                guard.insert(k, task.abort_handle());
+                // A reused id replaces the older call, which is aborted rather than orphaned.
+                if let Some(old) = guard.insert(k, task.abort_handle()) {
+                    old.abort();
+                }
                 drop(guard);
             }
             (_, Some(id)) => {
@@ -177,11 +208,13 @@ where
             }
         }
     }
+    // Graceful end (reader closed): abort calls, let queued replies flush.
     for (_, h) in calls.lock().drain() {
         h.abort();
     }
     drop(out_tx);
     let _ = writer_task.await;
+    drop(session);
 }
 #[cfg(test)]
 mod tests {
@@ -346,5 +379,31 @@ mod tests {
             r.next_line().await.unwrap().is_none(),
             "the server hangs up"
         );
+    }
+
+    #[tokio::test]
+    async fn closing_the_client_write_half_closes_the_connection() {
+        let (mut w, mut r) = session().await;
+        w.shutdown().await.unwrap();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), r.next_line()).await;
+        assert!(next.unwrap().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_serve_closes_the_connection() {
+        let (mut client_w, server_r) = tokio::io::duplex(1 << 16);
+        let (server_w, client_r) = tokio::io::duplex(1 << 16);
+        let mut r = BufReader::new(client_r).lines();
+        let task = tokio::spawn(serve(server_r, server_w, Arc::new(Fake)));
+        send(&mut client_w, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow","arguments":{}}})).await;
+        send(
+            &mut client_w,
+            json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+        )
+        .await;
+        assert_eq!(recv(&mut r).await["id"], 2);
+        task.abort();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), r.next_line()).await;
+        assert!(next.expect("prompt EOF").unwrap().is_none());
     }
 }
