@@ -1,6 +1,7 @@
 //! Brokered git and GitHub tools for sandboxed agents, served over MCP.
 
 pub mod protocol;
+pub mod tools;
 
 /// The name this server announces to MCP clients.
 pub const SERVER_NAME: &str = "bondsymphonic";
