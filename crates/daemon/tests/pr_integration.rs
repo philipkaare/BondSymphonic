@@ -402,5 +402,62 @@ async fn push_branch_pushes_and_force_with_lease_overwrites_a_rewritten_branch()
         ),
         "rewritten"
     );
+    // The push names its destination explicitly, and git still moves the
+    // remote-tracking ref that `absorb_objects` reasons about.
+    assert_eq!(
+        common::git_out(&repo, &["rev-parse", "refs/remotes/origin/bs/pusher/work"]),
+        common::git_out(&repo, &["rev-parse", "refs/heads/bs/pusher/work"])
+    );
+    cancel.cancel();
+}
+
+/// `refs/heads/bs/<name>/` is read-write inside the sandbox, so an agent can
+/// turn its own branch into a symbolic ref to `main`. A push that names only
+/// the source (`git push origin bs/<name>/work`) resolves the symref and takes
+/// its *target* as the destination: it would publish the user's local `main`
+/// to origin's `main`, and with force rewind it. The push must be refused, and
+/// origin's `main` must not move, with or without force.
+#[tokio::test]
+async fn push_branch_refuses_a_workspace_branch_turned_into_a_symref() {
+    let _guard = ENV.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, origin) = init_repo_with_origin(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "sneaky").await;
+
+    // A commit on the user's local `main` that they have not published: the
+    // thing an agent must not be able to push for them.
+    std::fs::write(repo.join("local.txt"), "mine\n").unwrap();
+    commit_all(&repo, &[], "unpublished local work");
+    let origin_main = common::git_out(&origin, &["rev-parse", "refs/heads/main"]);
+
+    // As the agent would, from inside its worktree with the sandbox's git env.
+    let w = daemon.workspace(&ws.id).unwrap();
+    let env = lifecycle::layout_for(&daemon, &w)
+        .await
+        .unwrap()
+        .sandbox_git_env();
+    let st = std::process::Command::new("git")
+        .args(["symbolic-ref", "refs/heads/bs/sneaky/work", "refs/heads/main"])
+        .current_dir(&ws.worktree_path)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .status()
+        .unwrap();
+    assert!(st.success());
+
+    for force in [false, true] {
+        let err = bondsymphonic_daemon::git::pr::push_branch(&daemon, &w, force)
+            .await
+            .expect_err("a symbolic workspace branch must not be pushed");
+        assert!(err.message.contains("symbolic ref"), "force={force}: {err:?}");
+        assert_eq!(
+            common::git_out(&origin, &["rev-parse", "refs/heads/main"]),
+            origin_main,
+            "force={force}: origin's main moved"
+        );
+        let refs = common::git_out(&origin, &["for-each-ref", "--format=%(refname)"]);
+        assert!(!refs.contains("bs/sneaky/work"), "force={force}: {refs}");
+    }
     cancel.cancel();
 }
