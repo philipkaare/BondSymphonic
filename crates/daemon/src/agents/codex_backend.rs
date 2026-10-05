@@ -104,7 +104,7 @@ pub async fn prerequisites(root: &Path) -> Vec<PrereqStatus> {
             name: "codex".into(),
             ok: available,
             detail: if available {
-                format!("Codex installed; verified version {TESTED_CODEX_VERSION}")
+                format!("Codex installed; adapter tested with {TESTED_CODEX_VERSION}")
             } else {
                 "Codex and matching Code Mode helper required".into()
             },

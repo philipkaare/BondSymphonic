@@ -1,3 +1,4 @@
+pub mod agent_updates;
 pub mod agents;
 pub mod daemon;
 pub mod fs;

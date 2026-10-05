@@ -1,4 +1,5 @@
 use anyhow::Result;
+use bondsymphonic_daemon::agent_updates;
 use bondsymphonic_daemon::daemon::{Daemon, InstanceLock, InstanceLockError, BUSY_EXIT_CODE};
 use bondsymphonic_daemon::net;
 use bondsymphonic_daemon::sandbox;
@@ -28,6 +29,9 @@ struct Args {
     /// Bind to a fixed port instead of an ephemeral one (tests/dev)
     #[arg(long, default_value_t = 0)]
     port: u16,
+    /// Do not update the installed agent CLIs at startup (tests/offline)
+    #[arg(long)]
+    no_agent_update: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -123,6 +127,15 @@ async fn serve(args: Args) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
 
+    // Started as early as the lock allows, so the downloads overlap the rest
+    // of startup; workspace restore waits for them (bounded) further down.
+    let updating = (!args.no_agent_update).then(|| {
+        tokio::spawn(agent_updates::update_all(
+            bondsymphonic_daemon::setup::host_home(),
+            agent_updates::UPDATE_LIMIT,
+        ))
+    });
+
     let backend_name = if args.no_sandbox || !cfg!(target_os = "linux") {
         "noop"
     } else {
@@ -178,7 +191,22 @@ async fn serve(args: Args) -> Result<()> {
     // workspace a client restarts or removes meanwhile is recognised as such.
     let snapshot = bondsymphonic_daemon::workspace::lifecycle::restore_snapshot(&daemon);
     let restoring = daemon.clone();
-    tokio::spawn(async move { restoring.restore_workspaces_from(snapshot).await });
+    // A sandbox binds the agent CLIs that exist when it starts, so restore
+    // waits for the updates -- but not past `RESTORE_WAIT`; an update still
+    // running then carries on and reaches the workspaces on their next restart.
+    tokio::spawn(async move {
+        if let Some(mut updating) = updating {
+            if tokio::time::timeout(agent_updates::RESTORE_WAIT, &mut updating)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "agent CLI updates still running; restoring workspaces without them"
+                );
+            }
+        }
+        restoring.restore_workspaces_from(snapshot).await
+    });
 
     let shutdown = CancellationToken::new();
     // Exit when stdin closes (IDE died) or on ctrl-c.

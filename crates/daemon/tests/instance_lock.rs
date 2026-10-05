@@ -40,6 +40,7 @@ fn spawn(data_dir: &Path) -> Daemon {
             .arg("--data-dir")
             .arg(data_dir)
             .arg("--no-sandbox")
+            .arg("--no-agent-update")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -68,6 +69,7 @@ fn start_and_wait(data_dir: &Path) -> (Option<i32>, String) {
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--no-sandbox")
+        .arg("--no-agent-update")
         // Closed at once, which is the daemon's own "the IDE is gone" signal:
         // a daemon that *did* take the lock exits 0 promptly instead of hanging
         // this test until a timeout.
