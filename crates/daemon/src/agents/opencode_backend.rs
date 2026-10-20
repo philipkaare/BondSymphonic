@@ -199,7 +199,7 @@ pub async fn prerequisites(root: &Path) -> Vec<PrereqStatus> {
 impl Backend for OpenCodeBackend {
     fn descriptor(&self) -> BackendDescriptor {
         BackendDescriptor { id: AgentAdapterKind::OpenCode, label: "OpenCode".into(), permission_modes: vec![BackendChoice { id: "yolo".into(), label: "YOLO (sandboxed)".into() }, BackendChoice { id: "ask".into(), label: "Ask before tools".into() }], default_permission_mode: "ask".into(),
-            permission_note: "OpenCode uses its own sandbox, provider sign-in and configuration. Models use provider/model IDs. Configure local providers in opencode.json; no API key is required for unauthenticated local servers.".into(), credential_label: "OpenAI API key".into(), prerequisite_names: vec!["opencode".into(), "opencode_auth".into(), "opencode_config".into()], setup_actions: vec![SetupAction::InstallOpencode, SetupAction::OpencodeLogin, SetupAction::OpencodeLogout] }
+            permission_note: "OpenCode uses its own sandbox, provider sign-in and configuration. Models use provider/model IDs. Configure providers, local servers included, in the Windows user opencode.json shown in Settings; only servers named there can be reached. No API key is required for unauthenticated local servers.".into(), credential_label: "OpenAI API key".into(), prerequisite_names: vec!["opencode".into(), "opencode_auth".into(), "opencode_config".into()], setup_actions: vec![SetupAction::InstallOpencode, SetupAction::OpencodeLogin, SetupAction::OpencodeLogout] }
     }
     fn binary(&self) -> Option<PathBuf> {
         host_argv().ok().map(|args| PathBuf::from(&args[0]))
@@ -419,5 +419,15 @@ mod tests {
             .descriptor()
             .prerequisite_names
             .contains(&"opencode_config".to_owned()));
+    }
+
+    /// Providers, and the network grants for their servers, come from the
+    /// Windows user's OpenCode config only; a server named in a repository's
+    /// config gets no grant, so the note must not send users there.
+    #[test]
+    fn the_note_points_local_providers_at_the_windows_user_config() {
+        let note = OpenCodeBackend.descriptor().permission_note;
+        assert!(note.contains("Windows user"), "{note}");
+        assert!(!note.to_lowercase().contains("repository config"), "{note}");
     }
 }

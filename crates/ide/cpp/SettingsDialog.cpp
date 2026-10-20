@@ -148,7 +148,7 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
         auto *keyNote = new QLabel(
             id == "codex" ? "A stored API key takes precedence over ChatGPT sign-in. Leave empty "
                             "to keep the stored key."
-                          : id == "opencode" ? "Used for the OpenAI provider. Other providers use OpenCode sign-in or repository configuration. Leave empty to keep the stored key."
+                          : id == "opencode" ? "Used for the OpenAI provider. Other providers use OpenCode sign-in or the Windows user configuration below, which is also what decides which model servers agents can reach. Leave empty to keep the stored key."
                                              : "Used when Claude has no login. Leave empty to keep the stored key.",
             page);
         keyNote->setWordWrap(true);
