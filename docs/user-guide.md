@@ -128,13 +128,34 @@ proxy. A model server running on **Windows** is reached either way:
   allow the port through Windows Firewall. This address can change when
   Windows restarts.
 
-When a server is down or not granted, the agent fails quickly instead of
-waiting: a plain-HTTP request gets a `502` or `403` answer (for a loopback URL
-its text names the endpoint and the reason), and the daemon log has a `configured endpoint did not accept the
-connection` or `network denied` line for it.
+What happens when a model server cannot be used:
 
-Live CLI/provider and WSL sandbox verification is still required; the automated
-ACP lifecycle tests use a protocol peer fixture.
+- **Not granted** (its URL is no longer in the config, or the address and port
+  differ from what the config names): the request gets a `403` at once and the
+  turn ends. For a loopback URL the answer's text names the endpoint and the
+  reason, and the workspace shows a warning that the connection was refused
+  because the server is not in OpenCode's config, rather than an "Allow host"
+  offer, which could not help: edit the OpenCode config instead.
+- **Down** (granted, but nothing is listening, or it does not answer): the
+  request gets a `502`, which OpenCode treats as temporary and keeps retrying
+  without saying so, so the turn does not end on its own. A server started a
+  moment later is picked up. After 60 seconds without a response the chat shows
+  a notice that the model has not answered (with the last error OpenCode
+  logged, if any). Interrupt the agent to stop waiting; any messages you queued
+  behind that turn are not sent, and a notice lists them. For a loopback URL
+  the daemon log has a `configured endpoint did not accept the connection`
+  line.
+- **Answers with an error OpenCode does not retry** (a rejected API key, a
+  model the server does not have): the turn ends without a reply, and a notice says the model returned
+  nothing, with the error OpenCode logged if there is one. Check the provider,
+  model and sign-in in your OpenCode config (`opencode.json`, `opencode auth
+  login`).
+
+Verified live with the real OpenCode CLI (1.14.48) and a mock OpenAI-compatible
+model: BondSymphonic's adapter driving it (replies, tool calls and approvals, a
+rejected API key, an interrupt while it retries), and `opencode run` inside the
+WSL sandbox reaching the mock on the host's loopback through the config's base
+URL. A real local model (Ollama, vLLM) has not been run yet.
 
 ### From a package
 
