@@ -1,0 +1,6 @@
+[
+ {"call":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"bondsymphonic","version":"0.1.0"},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}},"save":"init"},
+ {"call":"session/resume","params":{"sessionId":"ses_ea6780b53ffe5P3yTD7B7idTNm","cwd":"/tmp/ocprobe/work","mcpServers":[]},"save":"r","timeout":60},
+ {"call":"session/prompt","params":{"sessionId":"ses_ea6780b53ffe5P3yTD7B7idTNm","prompt":[{"type":"text","text":"run ls (before set_mode)"}]},"timeout":120},
+ {"wait":1}
+]

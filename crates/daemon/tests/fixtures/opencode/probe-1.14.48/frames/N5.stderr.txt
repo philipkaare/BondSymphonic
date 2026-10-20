@@ -1,0 +1,172 @@
+INFO  2026-10-20T13:43:15 +213ms service=default version=1.14.48 args=["acp","--print-logs"] process_role=main run_id=85b9d4ef-3f5f-4b25-840b-e065e834e6ed opencode
+Performing one time database migration, may take a few minutes...
+INFO  2026-10-20T13:43:15 +2ms service=db path=/tmp/ocprobe/net_N5/data/opencode/opencode.db opening database
+INFO  2026-10-20T13:43:16 +874ms service=db count=19 mode=bundled applying migrations
+INFO  2026-10-20T13:43:16 +21ms service=json-migration storage directory does not exist, skipping migration
+sqlite-migration:done
+Database migration complete.
+INFO  2026-10-20T13:43:16 +41ms service=file init
+INFO  2026-10-20T13:43:16 +190ms service=default creating instance [object Object]
+INFO  2026-10-20T13:43:16 +1ms service=project directory=/tmp/ocprobe/work fromDirectory
+INFO  2026-10-20T13:43:16 +38ms service=default bootstrapping [object Object]
+INFO  2026-10-20T13:43:16 +13ms service=config path=/tmp/ocprobe/net_N5/config/opencode/config.json loading
+INFO  2026-10-20T13:43:16 +1ms service=config path=/tmp/ocprobe/net_N5/config/opencode/opencode.json loading
+INFO  2026-10-20T13:43:16 +1ms service=config path=/tmp/ocprobe/net_N5/config/opencode/opencode.jsonc loading
+INFO  2026-10-20T13:43:16 +132ms service=plugin name=lG loading internal plugin
+INFO  2026-10-20T13:43:16 +0ms service=plugin name=sG loading internal plugin
+INFO  2026-10-20T13:43:16 +0ms service=plugin name=tV loading internal plugin
+INFO  2026-10-20T13:43:16 +1ms service=plugin name=K7 loading internal plugin
+INFO  2026-10-20T13:43:16 +0ms service=plugin name=ZM loading internal plugin
+INFO  2026-10-20T13:43:16 +0ms service=plugin name=QM loading internal plugin
+INFO  2026-10-20T13:43:16 +0ms service=plugin name=XM loading internal plugin
+INFO  2026-10-20T13:43:16 +0ms service=bus type=* subscribing
+INFO  2026-10-20T13:43:16 +1ms service=lsp all LSPs are disabled
+INFO  2026-10-20T13:43:16 +1ms service=bus type=session.updated subscribing
+INFO  2026-10-20T13:43:16 +0ms service=bus type=message.updated subscribing
+INFO  2026-10-20T13:43:16 +0ms service=bus type=message.part.updated subscribing
+INFO  2026-10-20T13:43:16 +0ms service=bus type=session.diff subscribing
+INFO  2026-10-20T13:43:16 +0ms service=bus type=session.deleted subscribing
+INFO  2026-10-20T13:43:16 +1ms service=format all formatters are disabled
+INFO  2026-10-20T13:43:16 +0ms service=format init
+INFO  2026-10-20T13:43:16 +2ms service=file.watcher directory=/tmp/ocprobe/work init
+INFO  2026-10-20T13:43:16 +1ms service=file.watcher directory=/tmp/ocprobe/work platform=linux backend=inotify watcher backend
+INFO  2026-10-20T13:43:16 +2ms service=bus type=command.executed subscribing
+INFO  2026-10-20T13:43:17 +25ms service=server opencode.server.runtime=node-http-server server backend
+INFO  2026-10-20T13:43:17 +28ms service=file init
+INFO  2026-10-20T13:43:17 +36ms service=ripgrep url=https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz downloading ripgrep
+INFO  2026-10-20T13:43:17 +3ms service=vcs branch=master initialized
+INFO  2026-10-20T13:43:17 +0ms service=bus type=file.watcher.updated subscribing
+INFO  2026-10-20T13:43:17 +46ms service=acp-command setup connection
+INFO  2026-10-20T13:43:17 +7ms service=acp-agent protocolVersion=1 initialize
+INFO  2026-10-20T13:43:17 +5ms service=server global event connected
+INFO  2026-10-20T13:43:17 +23ms service=default creating instance [object Object]
+INFO  2026-10-20T13:43:17 +1ms service=project directory=/tmp/ocprobe/work fromDirectory
+INFO  2026-10-20T13:43:17 +30ms service=default bootstrapping [object Object]
+INFO  2026-10-20T13:43:17 +9ms service=config path=/tmp/ocprobe/net_N5/config/opencode/config.json loading
+INFO  2026-10-20T13:43:17 +1ms service=config path=/tmp/ocprobe/net_N5/config/opencode/opencode.json loading
+INFO  2026-10-20T13:43:17 +0ms service=config path=/tmp/ocprobe/net_N5/config/opencode/opencode.jsonc loading
+INFO  2026-10-20T13:43:17 +34ms service=plugin name=lG loading internal plugin
+INFO  2026-10-20T13:43:17 +0ms service=plugin name=sG loading internal plugin
+INFO  2026-10-20T13:43:17 +0ms service=plugin name=tV loading internal plugin
+INFO  2026-10-20T13:43:17 +0ms service=plugin name=K7 loading internal plugin
+INFO  2026-10-20T13:43:17 +0ms service=plugin name=ZM loading internal plugin
+INFO  2026-10-20T13:43:17 +0ms service=plugin name=QM loading internal plugin
+INFO  2026-10-20T13:43:17 +0ms service=plugin name=XM loading internal plugin
+INFO  2026-10-20T13:43:17 +0ms service=bus type=* subscribing
+INFO  2026-10-20T13:43:17 +1ms service=lsp all LSPs are disabled
+INFO  2026-10-20T13:43:17 +0ms service=bus type=session.updated subscribing
+INFO  2026-10-20T13:43:17 +0ms service=bus type=message.updated subscribing
+INFO  2026-10-20T13:43:17 +0ms service=bus type=message.part.updated subscribing
+INFO  2026-10-20T13:43:17 +0ms service=bus type=session.diff subscribing
+INFO  2026-10-20T13:43:17 +0ms service=bus type=session.deleted subscribing
+INFO  2026-10-20T13:43:17 +0ms service=format all formatters are disabled
+INFO  2026-10-20T13:43:17 +0ms service=format init
+INFO  2026-10-20T13:43:17 +1ms service=file.watcher directory=/tmp/ocprobe/work init
+INFO  2026-10-20T13:43:17 +0ms service=file.watcher directory=/tmp/ocprobe/work platform=linux backend=inotify watcher backend
+INFO  2026-10-20T13:43:17 +1ms service=bus type=command.executed subscribing
+INFO  2026-10-20T13:43:17 +158ms service=provider status=started state
+INFO  2026-10-20T13:43:17 +78ms service=provider init
+INFO  2026-10-20T13:43:17 +27ms service=ripgrep url=https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz downloading ripgrep
+INFO  2026-10-20T13:43:17 +2ms service=vcs branch=master initialized
+INFO  2026-10-20T13:43:17 +0ms service=bus type=file.watcher.updated subscribing
+INFO  2026-10-20T13:43:17 +59ms service=provider providerID=opencode found
+INFO  2026-10-20T13:43:17 +0ms service=provider providerID=mock found
+INFO  2026-10-20T13:43:17 +0ms service=provider status=completed duration=166 state
+INFO  2026-10-20T13:43:17 +18ms service=session id=ses_ea672a8a9ffeYiJliEKP6x53Qr slug=silent-knight version=1.14.48 projectID=global directory=/tmp/ocprobe/work path= title=New session - 2026-10-20T13:43:17.591Z time={"created":1792503797591,"updated":1792503797591} created
+INFO  2026-10-20T13:43:17 +2ms service=bus type=session.created publishing
+INFO  2026-10-20T13:43:17 +1ms service=bus type=session.updated publishing
+INFO  2026-10-20T13:43:17 +2ms service=acp-session-manager state={"id":"ses_ea672a8a9ffeYiJliEKP6x53Qr","cwd":"/tmp/ocprobe/work","mcpServers":[],"createdAt":"2026-10-20T13:43:17.596Z","model":{"providerID":"mock","modelID":"m1"}} creating_session
+INFO  2026-10-20T13:43:17 +0ms service=acp-agent sessionId=ses_ea672a8a9ffeYiJliEKP6x53Qr mcpServers=0 creating_session
+INFO  2026-10-20T13:43:17 +46ms service=skill count=0 init
+INFO  2026-10-20T13:43:17 +11ms service=acp-agent parts=[{"type":"text","text":"NOTOOL hi"}] parts
+INFO  2026-10-20T13:43:17 +17ms service=bus type=session.next.agent.switched publishing
+INFO  2026-10-20T13:43:17 +2ms service=bus type=session.next.model.switched publishing
+INFO  2026-10-20T13:43:17 +5ms service=bus type=message.updated publishing
+INFO  2026-10-20T13:43:17 +1ms service=provider status=started state
+INFO  2026-10-20T13:43:17 +2ms service=bus type=message.part.updated publishing
+INFO  2026-10-20T13:43:17 +2ms service=bus type=session.updated publishing
+INFO  2026-10-20T13:43:17 +48ms service=provider init
+INFO  2026-10-20T13:43:17 +10ms service=bus type=session.status publishing
+INFO  2026-10-20T13:43:17 +0ms service=session.prompt session.id=ses_ea672a8a9ffeYiJliEKP6x53Qr step=0 loop
+INFO  2026-10-20T13:43:17 +3ms service=bus type=message.updated publishing
+INFO  2026-10-20T13:43:17 +49ms service=acp-agent event={"sessionID":"ses_ea672a8a9ffeYiJliEKP6x53Qr","part":{"type":"text","text":"NOTOOL hi","messageID":"msg_1598d57a40010SLVRmHGgJ3iyS","sessionID":"ses_ea672a8a9ffeYiJliEKP6x53Qr","id":"prt_1598d57a9001LENJkLW3UwyKpR"},"time":1792503797679} message part updated
+INFO  2026-10-20T13:43:17 +7ms service=llm providerID=mock modelID=m1 session.id=ses_ea672a8a9ffeYiJliEKP6x53Qr small=true agent=title mode=primary stream
+INFO  2026-10-20T13:43:17 +1ms service=provider status=started providerID=mock getSDK
+INFO  2026-10-20T13:43:17 +0ms service=provider providerID=mock pkg=@ai-sdk/openai-compatible using bundled provider
+INFO  2026-10-20T13:43:17 +3ms service=provider status=completed duration=3 providerID=mock getSDK
+INFO  2026-10-20T13:43:17 +44ms service=bus type=session.updated publishing
+INFO  2026-10-20T13:43:17 +22ms service=provider providerID=opencode found
+INFO  2026-10-20T13:43:17 +0ms service=provider providerID=mock found
+INFO  2026-10-20T13:43:17 +0ms service=provider status=completed duration=191 state
+INFO  2026-10-20T13:43:17 +17ms service=snapshot initialized
+INFO  2026-10-20T13:43:17 +19ms service=snapshot hash=4b825dc642cb6eb9a060e54bf8d69288fbee4904 cwd=/tmp/ocprobe/work git=/tmp/ocprobe/net_N5/data/opencode/snapshot/global/c3b2e4d803399c9abdb84f84797ac106f7130bbe tracking
+INFO  2026-10-20T13:43:17 +2ms service=session.prompt status=started resolveTools
+INFO  2026-10-20T13:43:17 +4ms service=shell-tool shell=/bin/bash shell tool using shell
+INFO  2026-10-20T13:43:17 +3ms service=tool.registry status=started invalid
+INFO  2026-10-20T13:43:17 +1ms service=tool.registry status=completed duration=1 invalid
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=started bash
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=completed duration=0 bash
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=started read
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=completed duration=0 read
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=started glob
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=completed duration=0 glob
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=started grep
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=completed duration=0 grep
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=started edit
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=completed duration=0 edit
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=started write
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=completed duration=0 write
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=started task
+INFO  2026-10-20T13:43:17 +1ms service=tool.registry status=completed duration=1 task
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=started webfetch
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=completed duration=0 webfetch
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=started todowrite
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=completed duration=0 todowrite
+INFO  2026-10-20T13:43:17 +0ms service=tool.registry status=started skill
+INFO  2026-10-20T13:43:17 +1ms service=tool.registry status=completed duration=1 skill
+INFO  2026-10-20T13:43:17 +4ms service=session.prompt status=completed duration=14 resolveTools
+INFO  2026-10-20T13:43:17 +15ms service=session.processor session.id=ses_ea672a8a9ffeYiJliEKP6x53Qr messageID=msg_1598d57ee001JSbXgxKmKeXfD6 process
+INFO  2026-10-20T13:43:17 +0ms service=llm providerID=mock modelID=m1 session.id=ses_ea672a8a9ffeYiJliEKP6x53Qr small=false agent=bondsymphonic_ws_probe_launch_abc123 mode=primary stream
+INFO  2026-10-20T13:43:17 +4ms service=bus type=session.updated publishing
+INFO  2026-10-20T13:43:17 +11ms service=bus type=session.status publishing
+INFO  2026-10-20T13:43:17 +1ms service=storage index=0 running migration
+INFO  2026-10-20T13:43:17 +4ms service=storage index=1 running migration
+INFO  2026-10-20T13:43:17 +17ms service=bus type=message.part.updated publishing
+INFO  2026-10-20T13:43:17 +1ms service=bus type=message.part.updated publishing
+INFO  2026-10-20T13:43:17 +1ms service=bus type=message.part.delta publishing
+INFO  2026-10-20T13:43:17 +1ms service=bus type=message.part.updated publishing
+INFO  2026-10-20T13:43:17 +6ms service=acp-agent event={"sessionID":"ses_ea672a8a9ffeYiJliEKP6x53Qr","part":{"id":"prt_1598d58d4001COubReQCFd93fB","messageID":"msg_1598d57ee001JSbXgxKmKeXfD6","sessionID":"ses_ea672a8a9ffeYiJliEKP6x53Qr","snapshot":"4b825dc642cb6eb9a060e54bf8d69288fbee4904","type":"step-start"},"time":1792503797972} message part updated
+INFO  2026-10-20T13:43:17 +1ms service=acp-agent event={"sessionID":"ses_ea672a8a9ffeYiJliEKP6x53Qr","part":{"id":"prt_1598d58d5001ITksXHJe0CRbXI","messageID":"msg_1598d57ee001JSbXgxKmKeXfD6","sessionID":"ses_ea672a8a9ffeYiJliEKP6x53Qr","type":"text","text":"","time":{"start":1792503797974}},"time":1792503797974} message part updated
+INFO  2026-10-20T13:43:17 +2ms service=bus type=session.diff publishing
+INFO  2026-10-20T13:43:17 +1ms service=bus type=message.updated publishing
+INFO  2026-10-20T13:43:17 +6ms service=acp-agent event={"sessionID":"ses_ea672a8a9ffeYiJliEKP6x53Qr","part":{"id":"prt_1598d58d5001ITksXHJe0CRbXI","messageID":"msg_1598d57ee001JSbXgxKmKeXfD6","sessionID":"ses_ea672a8a9ffeYiJliEKP6x53Qr","type":"text","text":"DONE","time":{"start":1792503797974,"end":1792503797975}},"time":1792503797975} message part updated
+INFO  2026-10-20T13:43:18 +24ms service=snapshot hash=4b825dc642cb6eb9a060e54bf8d69288fbee4904 cwd=/tmp/ocprobe/work git=/tmp/ocprobe/net_N5/data/opencode/snapshot/global/c3b2e4d803399c9abdb84f84797ac106f7130bbe tracking
+INFO  2026-10-20T13:43:18 +2ms service=bus type=message.part.updated publishing
+INFO  2026-10-20T13:43:18 +1ms service=bus type=message.updated publishing
+INFO  2026-10-20T13:43:18 +10ms service=acp-agent event={"sessionID":"ses_ea672a8a9ffeYiJliEKP6x53Qr","part":{"id":"prt_1598d5900001nZnTnVvZQM4EKR","reason":"stop","snapshot":"4b825dc642cb6eb9a060e54bf8d69288fbee4904","messageID":"msg_1598d57ee001JSbXgxKmKeXfD6","sessionID":"ses_ea672a8a9ffeYiJliEKP6x53Qr","type":"step-finish","tokens":{"total":8,"input":5,"output":3,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0},"time":1792503798017} message part updated
+INFO  2026-10-20T13:43:18 +36ms service=bus type=message.updated publishing
+INFO  2026-10-20T13:43:18 +0ms service=bus type=session.status publishing
+INFO  2026-10-20T13:43:18 +0ms service=session.prompt session.id=ses_ea672a8a9ffeYiJliEKP6x53Qr step=1 loop
+INFO  2026-10-20T13:43:18 +1ms service=session.prompt session.id=ses_ea672a8a9ffeYiJliEKP6x53Qr exiting loop
+INFO  2026-10-20T13:43:18 +2ms service=bus type=session.status publishing
+INFO  2026-10-20T13:43:18 +0ms service=bus type=session.idle publishing
+INFO  2026-10-20T13:43:18 +324ms service=bus type=session.updated publishing
+INFO  2026-10-20T13:43:18 +2ms service=bus type=session.diff publishing
+INFO  2026-10-20T13:43:18 +16ms service=bus type=message.updated publishing
+INFO  2026-10-20T13:43:19 +955ms service=default disposing instance [object Object]
+INFO  2026-10-20T13:43:19 +2ms service=bus type=* unsubscribing
+INFO  2026-10-20T13:43:19 +0ms service=bus type=session.updated unsubscribing
+INFO  2026-10-20T13:43:19 +1ms service=bus type=message.updated unsubscribing
+INFO  2026-10-20T13:43:19 +0ms service=bus type=message.part.updated unsubscribing
+INFO  2026-10-20T13:43:19 +0ms service=bus type=session.diff unsubscribing
+INFO  2026-10-20T13:43:19 +0ms service=bus type=session.deleted unsubscribing
+INFO  2026-10-20T13:43:19 +0ms service=bus type=command.executed unsubscribing
+INFO  2026-10-20T13:43:19 +0ms service=bus type=file.watcher.updated unsubscribing
+INFO  2026-10-20T13:43:19 +2ms service=bus type=* unsubscribing
+INFO  2026-10-20T13:43:19 +0ms service=bus type=session.updated unsubscribing
+INFO  2026-10-20T13:43:19 +0ms service=bus type=message.updated unsubscribing
+INFO  2026-10-20T13:43:19 +0ms service=bus type=message.part.updated unsubscribing
+INFO  2026-10-20T13:43:19 +0ms service=bus type=session.diff unsubscribing
+INFO  2026-10-20T13:43:19 +0ms service=bus type=session.deleted unsubscribing
+INFO  2026-10-20T13:43:19 +0ms service=bus type=command.executed unsubscribing
+INFO  2026-10-20T13:43:19 +1ms service=bus type=file.watcher.updated unsubscribing

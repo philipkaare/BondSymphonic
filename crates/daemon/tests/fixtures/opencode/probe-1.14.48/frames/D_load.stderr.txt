@@ -1,0 +1,16 @@
+Error handling request {
+  jsonrpc: "2.0",
+  id: 4,
+  method: "session/load",
+  params: {
+    sessionId: "ses_doesnotexist000000000000",
+    cwd: "/tmp/ocprobe/work",
+    mcpServers: [],
+  },
+} {
+  code: -32603,
+  message: "Internal error",
+  data: {
+    details: "Session not found: ses_doesnotexist000000000000",
+  },
+}

@@ -1,0 +1,8 @@
+[
+ {"call":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"bondsymphonic","version":"0.1.0"},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}},"save":"init"},
+ {"call":"session/load","params":{"sessionId":"ses_ea6795a7dffeOhvNexBH0QusUl","cwd":"/tmp/ocprobe/work","mcpServers":[]},"save":"r","timeout":60},
+ {"call":"session/set_mode","params":{"sessionId":"ses_ea6795a7dffeOhvNexBH0QusUl","modeId":"bondsymphonic_ws_probe_launch_abc123"}},
+ {"call":"session/load","params":{"sessionId":"ses_doesnotexist000000000000","cwd":"/tmp/ocprobe/work","mcpServers":[]},"timeout":30},
+ {"call":"session/prompt","params":{"sessionId":"ses_ea6795a7dffeOhvNexBH0QusUl","prompt":[{"type":"text","text":"NOTOOL say DONE"}]},"timeout":120},
+ {"wait":1}
+]

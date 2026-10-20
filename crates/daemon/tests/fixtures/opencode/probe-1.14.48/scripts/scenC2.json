@@ -1,0 +1,8 @@
+[
+ {"call":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"bondsymphonic","version":"0.1.0"},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}},"save":"init"},
+ {"call":"session/new","params":{"cwd":"/tmp/ocprobe/work","mcpServers":[]},"save":"s1","timeout":60},
+ {"call":"session/set_mode","params":{"sessionId":"$s1.sessionId","modeId":"bondsymphonic_ws_probe_launch_abc123"}},
+ {"call":"session/set_config_option","params":{"sessionId":"$s1.sessionId","configId":"model","value":"mock/m1"}},
+ {"call":"session/prompt","params":{"sessionId":"$s1.sessionId","prompt":[{"type":"text","text":"Run ls -la with bash, then say DONE."}]},"timeout":180},
+ {"call":"session/prompt","params":{"sessionId":"$s1.sessionId","prompt":[{"type":"text","text":"NOTOOL say DONE"}]},"timeout":120},
+ {"wait":2}]

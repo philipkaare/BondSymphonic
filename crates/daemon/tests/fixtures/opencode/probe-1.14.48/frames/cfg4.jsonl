@@ -1,0 +1,4 @@
+{"t": 0.005, "dir": "c->a", "frame": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1, "clientInfo": {"name": "bondsymphonic", "version": "0.1.0"}, "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false}}}}
+{"t": 1.232, "dir": "a->c", "frame": {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true, "mcpCapabilities": {"http": true, "sse": true}, "promptCapabilities": {"embeddedContext": true, "image": true}, "sessionCapabilities": {"close": {}, "fork": {}, "list": {}, "resume": {}}}, "authMethods": [{"description": "Run `opencode auth login` in the terminal", "name": "Login with opencode", "id": "opencode-login"}], "agentInfo": {"name": "OpenCode", "version": "1.14.48"}}}}
+{"t": 1.287, "dir": "eof", "frame": null}
+{"t": 1.301, "dir": "exit", "frame": 0}

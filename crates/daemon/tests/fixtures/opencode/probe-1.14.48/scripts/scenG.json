@@ -1,0 +1,6 @@
+[
+ {"call":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"bondsymphonic","version":"0.1.0"},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}},"save":"init"},
+ {"call":"session/new","params":{"cwd":"/tmp/ocprobe/work","mcpServers":[]},"save":"s1","timeout":60},
+ {"call":"session/prompt","params":{"sessionId":"$s1.sessionId","prompt":[{"type":"text","text":"NOTOOL hi"}]},"timeout":120},
+ {"wait":1}
+]

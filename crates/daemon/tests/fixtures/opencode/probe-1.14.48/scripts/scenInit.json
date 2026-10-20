@@ -1,0 +1,1 @@
+[{"call":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"bondsymphonic","version":"0.1.0"},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}},"save":"init","timeout":30}]

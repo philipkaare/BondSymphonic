@@ -1,0 +1,4 @@
+{"t": 0.006, "dir": "c->a", "frame": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1, "clientInfo": {"name": "bondsymphonic", "version": "0.1.0"}, "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false}}}}
+{"t": 1.652, "dir": "eof", "frame": null}
+{"t": 1.654, "dir": "note", "frame": "timeout waiting for id 1"}
+{"t": 1.656, "dir": "exit", "frame": 1}

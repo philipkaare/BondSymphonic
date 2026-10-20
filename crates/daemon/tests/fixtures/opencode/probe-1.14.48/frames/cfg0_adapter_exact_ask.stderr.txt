@@ -1,0 +1,4 @@
+[91m[1mError: [0mConfiguration is invalid at OPENCODE_CONFIG_CONTENT
+↳ Expected PermissionActionConfig, got "a" agent.bondsymphonic_ws_probe_launch_abc123.permission.0
+↳ Expected PermissionActionConfig, got "s" agent.bondsymphonic_ws_probe_launch_abc123.permission.1
+↳ Expected PermissionActionConfig, got "k" agent.bondsymphonic_ws_probe_launch_abc123.permission.2

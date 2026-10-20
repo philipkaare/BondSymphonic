@@ -1,0 +1,15 @@
+Error handling request {
+  jsonrpc: "2.0",
+  id: 5,
+  method: "session/set_mode",
+  params: {
+    sessionId: "ses_ea67b4510ffeABV7H0MsJk4BGA",
+    modeId: "no_such_agent",
+  },
+} {
+  code: -32603,
+  message: "Internal error",
+  data: {
+    details: "Agent not found: no_such_agent",
+  },
+}

@@ -1,0 +1,15 @@
+[
+ {"call":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"bondsymphonic","version":"0.1.0"},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}},"save":"init"},
+ {"call":"session/new","params":{"cwd":"/tmp/ocprobe/work","mcpServers":[]},"save":"s1","timeout":60},
+ {"call":"session/new","params":{"cwd":"/tmp/ocprobe/work","mcpServers":[{"name":"catsrv","command":"/usr/bin/cat","args":[],"env":[]}]},"save":"s2","timeout":60},
+ {"call":"session/set_mode","params":{"sessionId":"$s1.sessionId","modeId":"bondsymphonic_ws_probe_launch_abc123"}},
+ {"call":"session/set_mode","params":{"sessionId":"$s1.sessionId","modeId":"no_such_agent"}},
+ {"call":"session/set_config_option","params":{"sessionId":"$s1.sessionId","configId":"model","value":"nosuch/model"}},
+ {"call":"session/set_model","params":{"sessionId":"$s1.sessionId","modelId":"nosuch/model"}},
+ {"call":"session/prompt","params":{"sessionId":"$s1.sessionId","prompt":[{"type":"text","text":"Say the word hello and nothing else."}]},"timeout":90},
+ {"send":"session/prompt","params":{"sessionId":"$s2.sessionId","prompt":[{"type":"text","text":"Count slowly from 1 to 50, one number per line."}]},"save":"p2","after":0.5},
+ {"notify":"session/cancel","params":{"sessionId":"$s2.sessionId"}},
+ {"await":"p2","timeout":30},
+ {"call":"session/list","params":{}},
+ {"wait":2}
+]
