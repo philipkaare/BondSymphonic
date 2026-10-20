@@ -375,7 +375,8 @@ fn native_config_source_fifo_is_refused_without_waiting_for_a_writer() {
             .unwrap();
         writer.write_all(b"{}").unwrap();
         drop(writer);
-        receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Only unblocking matters here; the refresh's own result is not.
+        let _ = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
     }
     worker.join().unwrap();
     assert!(
