@@ -203,14 +203,84 @@ fn ipv6_literal(text: &str) -> Option<Ipv6Addr> {
     bare.parse().ok()
 }
 
+/// One exact destination: this host on this port, and nothing else.
+///
+/// A backend's own configuration names the model servers it talks to - a local
+/// Ollama, a vLLM box on the LAN - and those are granted to that backend's
+/// companion sandbox alone, as origins rather than as host patterns. Unlike a
+/// pattern, an origin may resolve to a private address: the user wrote it into
+/// their own config on the host, which no repository can do. The scheme is not
+/// kept, because the proxy never sees one for a tunnel; the port is what tells
+/// `http://h:8000` from `https://h`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Origin {
+    host: String,
+    port: u16,
+}
+
+impl Origin {
+    /// `host` (normalised as [`normalize_host`] does) on `port`, or `None` for
+    /// something that is not a hostname or an address, or for port 0.
+    pub fn new(host: &str, port: u16) -> Option<Origin> {
+        let host = normalize_host(host);
+        (port != 0 && crate::net::proxy::is_valid_host(&host)).then_some(Origin { host, port })
+    }
+
+    /// The origin of an `http://` or `https://` URL: userinfo dropped, the
+    /// scheme's port when none is written, an IPv6 literal without its
+    /// brackets. `None` for any other scheme and for anything that does not
+    /// parse - a `{env:...}` placeholder among them.
+    pub fn from_url(url: &str) -> Option<Origin> {
+        let (scheme, rest) = url.trim().split_once("://")?;
+        let default_port = match scheme.to_ascii_lowercase().as_str() {
+            "http" => 80,
+            "https" => 443,
+            _ => return None,
+        };
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let (host, port) = crate::net::http::split_authority(authority, default_port)?;
+        Origin::new(&host, port)
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Whether the origin is this machine's own loopback: `localhost`, or an
+    /// address in `127.0.0.0/8` or `::1`. Inside a sandbox such a URL names
+    /// the sandbox's own loopback, so it has to be carried out to the host.
+    pub fn is_loopback(&self) -> bool {
+        self.host == "localhost"
+            || self
+                .host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    }
+
+    /// `host:port`, with an IPv6 address in brackets: what a `CONNECT` names
+    /// and what a socket address parses from.
+    pub fn authority(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
 /// The set of patterns one workspace may reach, in the order they were
-/// configured.
+/// configured, and the exact origins its backend's configuration adds.
 ///
 /// Matching walks the list. At a dozen or so entries that beats any index, and
 /// it keeps the order the user wrote, so a denial can quote the list back.
 #[derive(Clone, Debug, Default)]
 pub struct Allowlist {
     patterns: Vec<HostPattern>,
+    origins: Vec<Origin>,
 }
 
 impl Allowlist {
@@ -228,7 +298,30 @@ impl Allowlist {
                 Err(e) => tracing::warn!(entry = %item, error = %e, "ignoring allowlist entry"),
             }
         }
-        Allowlist { patterns }
+        Allowlist {
+            patterns,
+            origins: Vec::new(),
+        }
+    }
+
+    /// The same list, plus exactly these origins. See [`Origin`].
+    pub fn with_origins(mut self, origins: Vec<Origin>) -> Allowlist {
+        self.origins = origins;
+        self
+    }
+
+    /// Whether `host` on `port` is one of the granted origins, which may then
+    /// be reached at whatever address it resolves to.
+    pub fn allows_origin(&self, host: &str, port: u16) -> bool {
+        let host = normalize_host(host);
+        self.origins
+            .iter()
+            .any(|o| o.port == port && o.host == host)
+    }
+
+    /// The granted origins, in the order they were given.
+    pub fn origins(&self) -> &[Origin] {
+        &self.origins
     }
 
     /// Whether any pattern covers `host`.
@@ -487,5 +580,88 @@ mod tests {
         for bad in ["host:80", "[::1]:8080", "[example.com]", "[", "[]", "::1]"] {
             assert!(HostPattern::parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// A provider's base URL becomes one origin: the path, userinfo and query
+    /// go, the port defaults by scheme, and an IPv6 literal loses its brackets
+    /// but keeps its address.
+    #[test]
+    fn an_origin_is_the_host_and_port_of_a_url_and_nothing_else() {
+        let o = |url: &str| Origin::from_url(url).map(|o| (o.host().to_string(), o.port()));
+        let pair = |h: &str, p: u16| Some((h.to_string(), p));
+        assert_eq!(o("http://localhost:11434/v1"), pair("localhost", 11434));
+        assert_eq!(o("HTTP://LocalHost:11434"), pair("localhost", 11434));
+        assert_eq!(
+            o("http://192.168.1.20:8000/v1/"),
+            pair("192.168.1.20", 8000)
+        );
+        assert_eq!(o("https://llm.lan/api/v1?x=1"), pair("llm.lan", 443));
+        assert_eq!(o("http://box.lan"), pair("box.lan", 80));
+        assert_eq!(o("http://u:p@box.lan:9/v1"), pair("box.lan", 9));
+        assert_eq!(o("http://[::1]:8000/v1"), pair("::1", 8000));
+        assert_eq!(o("https://[fd00:0::5]/v1"), pair("fd00::5", 443));
+        for bad in [
+            "{env:OLLAMA_URL}",
+            "ftp://box.lan/",
+            "unix:///run/x.sock",
+            "http://",
+            "http://box.lan:0/",
+            "http://box.lan:99999/",
+            "http://bad host/",
+            "localhost:11434",
+        ] {
+            assert_eq!(Origin::from_url(bad), None, "{bad}");
+        }
+        let v6 = Origin::from_url("http://[::1]:8000/v1").unwrap();
+        assert_eq!(v6.authority(), "[::1]:8000");
+        assert_eq!(
+            Origin::from_url("http://localhost:11434")
+                .unwrap()
+                .authority(),
+            "localhost:11434"
+        );
+    }
+
+    #[test]
+    fn loopback_origins_are_the_ones_a_sandbox_would_dial_itself() {
+        for url in [
+            "http://localhost:1",
+            "http://127.0.0.1:1",
+            "http://127.0.0.2:1",
+            "http://[::1]:1",
+        ] {
+            assert!(Origin::from_url(url).unwrap().is_loopback(), "{url}");
+        }
+        for url in [
+            "http://192.168.1.20:1",
+            "http://10.0.0.1:1",
+            "http://host.lan:1",
+            "https://api.openai.com",
+        ] {
+            assert!(!Origin::from_url(url).unwrap().is_loopback(), "{url}");
+        }
+    }
+
+    /// An origin grant is the host and the port: neither another port on the
+    /// same host nor another spelling of a host that resolves to the same
+    /// place is the same grant.
+    #[test]
+    fn an_origin_grant_covers_exactly_its_host_and_port() {
+        let list = Allowlist::from_strings(&[]).with_origins(vec![
+            Origin::from_url("http://localhost:11434/v1").unwrap(),
+            Origin::from_url("http://[::1]:8000").unwrap(),
+        ]);
+        assert!(list.allows_origin("localhost", 11434));
+        assert!(list.allows_origin("LOCALHOST.", 11434));
+        assert!(list.allows_origin("[::1]", 8000));
+        assert!(list.allows_origin("0:0::1", 8000));
+        assert!(!list.allows_origin("localhost", 11435));
+        assert!(!list.allows_origin("127.0.0.1", 11434));
+        assert!(!list.allows_origin("::1", 11434));
+        // An origin is not a host pattern, and a host pattern is not an origin.
+        assert!(!list.allows("localhost"));
+        assert!(list.to_strings().is_empty());
+        let patterns = Allowlist::from_strings(&["localhost".to_string()]);
+        assert!(!patterns.allows_origin("localhost", 11434));
     }
 }

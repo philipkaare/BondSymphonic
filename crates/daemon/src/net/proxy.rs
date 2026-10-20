@@ -704,9 +704,15 @@ async fn open_upstream(
     port: u16,
 ) -> std::io::Result<Option<tokio::net::TcpStream>> {
     use tokio::io::AsyncWriteExt;
-    // The guard is a temporary of this statement alone: an `RwLock` read held
+    // The guard is a temporary of this block alone: an `RwLock` read held
     // across the awaits below would block every `set_allowlist` behind a tunnel.
-    let allowed = ctx.allow.read().allows(host);
+    // An origin a backend's own config names is checked with its port, and may
+    // be private: see `Origin`.
+    let (allowed, granted) = {
+        let allow = ctx.allow.read();
+        let granted = allow.allows_origin(host, port);
+        (granted || allow.allows(host), granted)
+    };
     if !allowed {
         refuse(client, ctx, host, denied_response(host), "network denied").await;
         return Ok(None);
@@ -736,14 +742,18 @@ async fn open_upstream(
     };
     // A private destination is refused whatever name led to it, unless the
     // allowlist entry is that literal address: a repository can add a *name* to
-    // the list at creation, but only a person writes `127.0.0.1` down.
+    // the list at creation, but only a person writes `127.0.0.1` down. An
+    // origin grant is the other thing only a person writes: it comes from the
+    // backend's own config on the host, never from the repository.
     let reachable: Vec<std::net::SocketAddr> = {
         let allow = ctx.allow.read();
         resolved
             .iter()
             .copied()
             .filter(|a| {
-                !is_private_addr(&a.ip()) || allow.allows_literal_addr(&canonical_ip(a.ip()))
+                granted
+                    || !is_private_addr(&a.ip())
+                    || allow.allows_literal_addr(&canonical_ip(a.ip()))
             })
             .collect()
     };
@@ -780,6 +790,11 @@ async fn open_upstream(
     match connected {
         Some(upstream) => Ok(Some(upstream)),
         None => {
+            // A model server the user configured being down is worth a line
+            // at the default level: it is the likeliest reason an agent fails.
+            if granted {
+                tracing::warn!(ws = %ctx.workspace, host = %host, port, "configured endpoint did not accept the connection");
+            }
             let _ = client.write_all(&bad_gateway()).await;
             Ok(None)
         }

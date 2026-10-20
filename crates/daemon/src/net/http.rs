@@ -169,7 +169,7 @@ fn strip_http_scheme(target: &str) -> Option<&str> {
 
 /// Splits `host`, `host:port`, `[v6]` or `[v6]:port` — with any userinfo
 /// dropped — into a bare host and a port.
-fn split_authority(auth: &str, default_port: u16) -> Option<(String, u16)> {
+pub(super) fn split_authority(auth: &str, default_port: u16) -> Option<(String, u16)> {
     // Userinfo is part of the URI, not of the host being reached.
     let auth = auth.rsplit_once('@').map_or(auth, |(_, h)| h);
     if let Some(rest) = auth.strip_prefix('[') {
