@@ -427,10 +427,21 @@ pub fn command_for(spec: &LaunchSpec) -> Result<(String, Vec<String>)> {
         quoted_distro_path(&spec.daemon_path_in_wsl),
         single_quoted(&spec.log_level)
     );
+    // A folder the distro cannot reach (a network path) must not stop the
+    // daemon -- most users never enable OpenCode. The daemon is told why
+    // instead, so it reports the `opencode_config` prerequisite rather than
+    // quietly reading the distro user's own config.
     if let Some(root) = &spec.opencode_config_root {
-        let path =
-            wsl_path(root, &spec.distro).map_err(|why| anyhow!("OpenCode config folder: {why}"))?;
-        inner = format!("BS_OPENCODE_CONFIG_ROOT={} {inner}", single_quoted(&path));
+        inner = match wsl_path(root, &spec.distro) {
+            Ok(path) => format!("BS_OPENCODE_CONFIG_ROOT={} {inner}", single_quoted(&path)),
+            Err(why) => {
+                tracing::warn!("OpenCode config folder: {why}");
+                format!(
+                    "BS_OPENCODE_CONFIG_UNMAPPED={} {inner}",
+                    single_quoted(&why)
+                )
+            }
+        };
     }
     if cfg!(windows) {
         Ok((
@@ -1064,7 +1075,11 @@ mod tests {
     }
 
     #[test]
-    fn inaccessible_unc_config_is_reported_instead_of_using_another_user() {
+    fn inaccessible_unc_config_still_launches_and_reports_instead_of_using_another_user() {
+        // A config folder WSL cannot reach must not keep the daemon from
+        // starting -- most users never enable OpenCode. Nor may the daemon fall
+        // back to the distro user's own config: it is told why the Windows one
+        // is missing, and reports that as the `opencode_config` prerequisite.
         let spec = LaunchSpec {
             distro: "bondsymphonic".into(),
             daemon_path_in_wsl: "/opt/daemon".into(),
@@ -1072,7 +1087,17 @@ mod tests {
             log_level: "info".into(),
             opencode_config_root: Some(PathBuf::from(r"\\server\private\opencode-config")),
         };
-        let error = command_for(&spec).unwrap_err().to_string();
-        assert!(error.contains("OpenCode config folder"), "{error}");
+        let (_, args) = command_for(&spec).expect("the daemon must still launch");
+        let line = args.last().unwrap();
+        assert!(!line.contains("BS_OPENCODE_CONFIG_ROOT="), "{line}");
+        assert!(line.starts_with("BS_OPENCODE_CONFIG_UNMAPPED='"), "{line}");
+        assert!(
+            line.contains("server"),
+            "the reason names the folder: {line}"
+        );
+        assert!(
+            line.ends_with("exec '/opt/daemon' --log-level 'info'"),
+            "{line}"
+        );
     }
 }
