@@ -535,9 +535,14 @@ async fn refuse(
     host: &str,
     body: Vec<u8>,
     why: &str,
+    tunnel: bool,
 ) {
     use tokio::io::AsyncWriteExt;
-    if ctx.denials.admit(&ctx.workspace, host) {
+    if tunnel {
+        // No "Allow host" offer: the endpoint is missing from the backend's
+        // config, which the workspace allowlist cannot fix.
+        tracing::warn!(ws = %ctx.workspace, host = %host, "{why}: endpoint not in the agent's config");
+    } else if ctx.denials.admit(&ctx.workspace, host) {
         tracing::warn!(ws = %ctx.workspace, host = %host, "{why}");
         // Published before the refusal is written, so a client that reacts to
         // the 403 by asking the daemon something cannot outrun its own event.
@@ -611,7 +616,13 @@ async fn serve(mut client: tokio::net::UnixStream, ctx: &ConnCtx) -> std::io::Re
             let _ = client.write_all(&bad_request()).await;
             return Ok(());
         }
-        let Some(mut upstream) = open_upstream(&mut client, ctx, &host, port).await? else {
+        // Marked by the in-sandbox tunnel; see `shim::TUNNEL_HEADER`.
+        let tunnel = head.method.eq_ignore_ascii_case("CONNECT")
+            && head
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case(crate::net::shim::TUNNEL_HEADER));
+        let Some(mut upstream) = open_upstream(&mut client, ctx, &host, port, tunnel).await? else {
             // Refused or unreachable; the answer has been written and says
             // `Connection: close`.
             return Ok(());
@@ -702,6 +713,7 @@ async fn open_upstream(
     ctx: &ConnCtx,
     host: &str,
     port: u16,
+    tunnel: bool,
 ) -> std::io::Result<Option<tokio::net::TcpStream>> {
     use tokio::io::AsyncWriteExt;
     // The guard is a temporary of this block alone: an `RwLock` read held
@@ -714,7 +726,15 @@ async fn open_upstream(
         (granted || allow.allows(host), granted)
     };
     if !allowed {
-        refuse(client, ctx, host, denied_response(host), "network denied").await;
+        refuse(
+            client,
+            ctx,
+            host,
+            denied_response(host),
+            "network denied",
+            tunnel,
+        )
+        .await;
         return Ok(None);
     }
     // Resolved here rather than inside `connect`, because what the allowlist
@@ -764,6 +784,7 @@ async fn open_upstream(
             host,
             private_response(host),
             "network denied: private destination",
+            tunnel,
         )
         .await;
         return Ok(None);

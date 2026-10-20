@@ -59,6 +59,12 @@ pub async fn run(_socket: &Path, _listen: &str) -> anyhow::Result<()> {
 /// Printed on stdout once a tunnel's listeners are up.
 pub const TUNNEL_READY_LINE: &str = "bs-proxy-tunnel listening";
 
+/// Marks a tunnel's `CONNECT`, so the proxy does not offer "Allow host" for a
+/// refusal: the endpoint is missing from the backend's config, and the
+/// workspace allowlist cannot fix that. The sandbox can send it too, which
+/// only silences its own denial notices.
+pub const TUNNEL_HEADER: &str = "X-BondSymphonic-Tunnel";
+
 /// How long the proxy has to answer a tunnel's `CONNECT`. Longer than the
 /// proxy's own resolve and connect budgets, so its answer always arrives first.
 #[cfg(unix)]
@@ -120,7 +126,12 @@ async fn carry(mut tcp: tokio::net::TcpStream, socket: std::path::PathBuf, targe
     let answer = async {
         let mut daemon = tokio::net::UnixStream::connect(&socket).await?;
         daemon
-            .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+            .write_all(
+                format!(
+                    "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{TUNNEL_HEADER}: 1\r\n\r\n"
+                )
+                .as_bytes(),
+            )
             .await?;
         // Byte by byte up to the blank line, so nothing of the tunnel's payload
         // is read here; a refusal's body is never needed.

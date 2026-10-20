@@ -728,3 +728,68 @@ async fn live_opencode_run_reaches_a_host_loopback_model_server() {
     daemon.agent_sandboxes.stop_workspace(&info.id).await;
     lifecycle::destroy(&daemon, &info.id, false).await.unwrap();
 }
+
+/// A tunnel refusal is an OpenCode endpoint the config no longer names, so
+/// "Allow host localhost" would be the wrong advice: no denial notice is
+/// published for it. An ordinary refusal on the same proxy still is.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_tunnel_does_not_offer_to_allow_the_host() {
+    use bondsymphonic_daemon::net::{allowlist::Allowlist, proxy::ProxyRegistry, shim};
+    use bondsymphonic_daemon::server::broadcast::EventBus;
+    use bondsymphonic_proto::{ServerMessage, WorkspaceId};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("proxy.sock");
+    let id = WorkspaceId("ws_quiet".into());
+    let events = EventBus::new(100);
+    let mut rx = events.subscribe();
+    let proxy = ProxyRegistry::default();
+    proxy
+        .start(&id, &sock, Allowlist::from_strings(&[]), events)
+        .await
+        .unwrap();
+    let port = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    };
+    {
+        let sock = sock.clone();
+        let listen = vec![format!("127.0.0.1:{port}")];
+        tokio::spawn(async move { shim::tunnel(&sock, &listen, "localhost:9").await });
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut s = loop {
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(s) => break s,
+            Err(_) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "tunnel never listened"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    };
+    s.write_all(b"GET /v1/models HTTP/1.1\r\nHost: localhost:9\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).await.unwrap();
+    let reply = String::from_utf8_lossy(&out);
+    assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
+
+    // The control: a plain CONNECT for another host is still reported.
+    let mut c = tokio::net::UnixStream::connect(&sock).await.unwrap();
+    c.write_all(b"CONNECT other.example:443 HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    c.read_to_end(&mut out).await.unwrap();
+    let mut denied = Vec::new();
+    while let Ok(ServerMessage::Event { event, .. }) = rx.try_recv() {
+        denied.extend(event.denied_host().map(str::to_string));
+    }
+    assert_eq!(denied, vec!["other.example".to_string()]);
+    proxy.stop(&id);
+}
