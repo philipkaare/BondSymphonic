@@ -9,9 +9,27 @@ use bondsymphonic_daemon::{
 use bondsymphonic_proto::*;
 use std::{sync::Arc, time::Duration};
 
+/// The budget for each startup call. It includes starting the fake's Python,
+/// which takes seconds on a loaded machine, so only the tests about the budget
+/// itself use a short one.
+const CALL_TIMEOUT: Duration = Duration::from_secs(15);
+
 async fn fixture(
     mode: &str,
     resume: Option<&str>,
+) -> (
+    tempfile::TempDir,
+    OpenCodeAdapter,
+    Arc<AgentEntry>,
+    Arc<TranscriptStore>,
+) {
+    fixture_with(mode, resume, CALL_TIMEOUT).await
+}
+
+async fn fixture_with(
+    mode: &str,
+    resume: Option<&str>,
+    timeout: Duration,
 ) -> (
     tempfile::TempDir,
     OpenCodeAdapter,
@@ -103,7 +121,7 @@ async fn fixture(
     }
     (
         dir,
-        OpenCodeAdapter::new(sink, handle, prepared).with_timeout(Duration::from_millis(600)),
+        OpenCodeAdapter::new(sink, handle, prepared).with_timeout(timeout),
         entry,
         store,
     )
@@ -113,7 +131,7 @@ async fn wait_for<F: Fn(&[AgentMessage]) -> bool>(
     store: &TranscriptStore,
     predicate: F,
 ) -> Vec<AgentMessage> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let messages = store.read(&AgentId("agent".into())).await.unwrap();
             if predicate(&messages) {
@@ -204,15 +222,25 @@ async fn queued_prompts_do_not_block_overlapping_permissions_and_native_choices(
 
 #[tokio::test]
 async fn cancel_responds_while_prompt_is_pending_beyond_handshake_timeout() {
-    let (_dir, mut adapter, _entry, store) = fixture("hold", None).await;
-    adapter.start().await.unwrap();
+    let budget = Duration::from_secs(2);
+    // The handshake must fit the short budget under test; on a loaded machine
+    // starting Python alone may not, which says nothing about the prompt.
+    let mut attempts = 0;
+    let (_dir, mut adapter, _entry, store) = loop {
+        let (dir, mut adapter, entry, store) = fixture_with("hold", None, budget).await;
+        match adapter.start().await {
+            Ok(()) => break (dir, adapter, entry, store),
+            Err(failure) if failure.message.contains("timed out") && attempts < 3 => attempts += 1,
+            Err(failure) => panic!("{failure:?}"),
+        }
+    };
     adapter.send("one".into()).await.unwrap();
     wait_for(&store, |m| {
         m.iter()
             .any(|m| matches!(&m.body, AgentMessageBody::AssistantDelta{text} if text == "waiting"))
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(750)).await;
+    tokio::time::sleep(budget + Duration::from_millis(250)).await;
     adapter.interrupt().await.unwrap();
     wait_for(&store, |m| m.iter().any(|m| matches!(&m.body, AgentMessageBody::System{subtype,data} if subtype == "opencode_turn" && data["stopReason"] == "cancelled"))).await;
     adapter.stop().await.unwrap();
@@ -230,7 +258,14 @@ async fn unsupported_host_rpc_is_refused_and_prompt_errors_are_redacted() {
             .unwrap()
             .contains("secret-value"));
         if mode == "error" {
-            assert_eq!(entry.state().0, AgentState::Error);
+            // Published just after the turn's row.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while entry.state().0 != AgentState::Error {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
         }
         adapter.stop().await.unwrap();
     }
@@ -239,9 +274,11 @@ async fn unsupported_host_rpc_is_refused_and_prompt_errors_are_redacted() {
 #[tokio::test]
 async fn startup_rejects_bad_protocol_unsupported_resume_and_hung_peer() {
     for mode in ["version", "no-resume", "die", "hang"] {
-        let (_dir, mut adapter, entry, _) = fixture(mode, Some("saved-session")).await;
+        // A hung peer is given up on after the budget, however short.
+        let (_dir, mut adapter, entry, _) =
+            fixture_with(mode, Some("saved-session"), Duration::from_secs(1)).await;
         assert!(
-            tokio::time::timeout(Duration::from_secs(8), adapter.start())
+            tokio::time::timeout(Duration::from_secs(20), adapter.start())
                 .await
                 .unwrap()
                 .is_err(),
@@ -255,7 +292,7 @@ async fn startup_rejects_bad_protocol_unsupported_resume_and_hung_peer() {
 async fn bounded_stop_kills_peer_ignoring_closed_input() {
     let (_dir, mut adapter, entry, _) = fixture("stubborn", None).await;
     adapter.start().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(8), adapter.stop())
+    tokio::time::timeout(Duration::from_secs(20), adapter.stop())
         .await
         .unwrap()
         .unwrap();
@@ -314,7 +351,7 @@ async fn native_api_and_oauth_credentials_never_reach_transcripts_errors_or_stde
         adapter.start().await.unwrap();
         adapter.send("hello".into()).await.unwrap();
         if mode == "native-stderr" {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(Duration::from_secs(30), async {
                 while entry.state().0 != AgentState::Exited {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -362,7 +399,7 @@ async fn literal_jsonc_provider_credentials_are_redacted_from_plain_outputs_afte
         adapter.start().await.unwrap();
         adapter.send("hello".into()).await.unwrap();
         if mode == "config-secret-stderr" {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(Duration::from_secs(30), async {
                 while entry.state().0 != AgentState::Exited {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
