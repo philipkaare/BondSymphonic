@@ -55,6 +55,19 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:3128")]
         listen: String,
     },
+    /// Internal: carry connections to an address inside the sandbox out to
+    /// one origin through the proxy socket. Not for direct use.
+    ProxyTunnel {
+        /// The sandbox's proxy socket, as seen from inside the sandbox.
+        #[arg(long)]
+        socket: PathBuf,
+        /// Address to listen on inside the sandbox; may be repeated.
+        #[arg(long, required = true)]
+        listen: Vec<String>,
+        /// The `host:port` the proxy is asked to `CONNECT` to.
+        #[arg(long)]
+        target: String,
+    },
     /// Internal: connect an agent's stdio MCP client to the workspace's tools. Not for direct use.
     McpBridge {
         /// The workspace's tools socket, as seen from inside the sandbox.
@@ -89,6 +102,14 @@ fn main() -> Result<()> {
             ref listen,
         }) => {
             return tokio::runtime::Runtime::new()?.block_on(net::shim::run(socket, listen));
+        }
+        Some(Cmd::ProxyTunnel {
+            ref socket,
+            ref listen,
+            ref target,
+        }) => {
+            return tokio::runtime::Runtime::new()?
+                .block_on(net::shim::tunnel(socket, listen, target));
         }
         Some(Cmd::Forward { ref socket, port }) => {
             return tokio::runtime::Runtime::new()?.block_on(net::forward::run(socket, port));
