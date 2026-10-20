@@ -474,3 +474,109 @@ pub fn copy_login(host: &Path, state: &Path) -> io::Result<()> {
         None => target.remove("auth.json"),
     }
 }
+
+/// The origins of every provider base URL in the mirrored config under
+/// `config_home` (an `XDG_CONFIG_HOME`): `provider.<id>.options.baseURL`, and
+/// `provider.<id>.api`, which OpenCode falls back to. Sorted, each once.
+///
+/// These are the model servers the user pointed OpenCode at, and they are what
+/// its companion sandbox is granted beyond the workspace allowlist. A file that
+/// does not parse grants nothing, and is logged; OpenCode itself will refuse
+/// it with a better message. A URL that is not a literal `http(s)://` URL --
+/// an `{env:...}` substitution -- grants nothing either.
+pub fn provider_origins(config_home: &Path) -> Vec<crate::net::allowlist::Origin> {
+    let dir = config_home.join("opencode");
+    let mut out = Vec::new();
+    for name in CONFIGS {
+        let path = dir.join(name);
+        let bytes = match read_regular_file(&path, CONFIG_READ_LIMIT, false) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "OpenCode config not read for provider endpoints: {e}");
+                continue;
+            }
+        };
+        let text = strip_jsonc(&String::from_utf8_lossy(&bytes));
+        let value: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "OpenCode config is not JSON; its providers get no network grant: {e}");
+                continue;
+            }
+        };
+        let Some(providers) = value.get("provider").and_then(|p| p.as_object()) else {
+            continue;
+        };
+        for (id, provider) in providers {
+            let urls = [provider.pointer("/options/baseURL"), provider.get("api")];
+            for url in urls.into_iter().flatten().filter_map(|u| u.as_str()) {
+                match crate::net::allowlist::Origin::from_url(url) {
+                    Some(origin) => out.push(origin),
+                    None => tracing::warn!(
+                        provider = %id,
+                        "OpenCode provider URL is not a literal http(s) URL; it gets no network grant"
+                    ),
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// JSONC as plain JSON: `//` and `/* */` comments and trailing commas removed,
+/// strings left exactly as they are.
+fn strip_jsonc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            match c {
+                '\\' => out.extend(chars.next()),
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match (c, chars.peek()) {
+            ('"', _) => {
+                in_string = true;
+                out.push(c);
+            }
+            ('/', Some('/')) => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut last = ' ';
+                for c in chars.by_ref() {
+                    if last == '*' && c == '/' {
+                        break;
+                    }
+                    last = c;
+                }
+                out.push(' ');
+            }
+            (']' | '}', _) => {
+                // A comma with only whitespace between it and the closer is a
+                // trailing comma; comments are already gone from `out`.
+                let kept = out.trim_end().len();
+                if out[..kept].ends_with(',') {
+                    out.truncate(kept - 1);
+                }
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}

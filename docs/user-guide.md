@@ -98,10 +98,41 @@ old `opencode-home`, which is no longer used, and cannot resume them. The
 companion sandbox has its own home, cache, runtime and proxy; other backends
 cannot mount OpenCode's login or sessions.
 
-Local model servers require a route reachable from the sandbox. Its `localhost`
-is separate from the Windows and WSL hosts; entering a host loopback URL alone
-does not establish that route. Dedicated local-provider settings and endpoint
-forwarding from the earlier OpenCode design are not included in this integration.
+#### Local and LAN model servers
+
+Point a provider at a model server with `provider.<id>.options.baseURL` in your
+OpenCode config, for example `http://localhost:11434/v1` for Ollama or
+`http://192.168.1.20:8000/v1` for a vLLM box. Each new agent reads the base URLs
+from the refreshed config and lets the OpenCode sandbox reach exactly those
+origins (scheme, host and port), including addresses on a private network.
+Nothing else is opened: Claude and Codex in the same workspace gain nothing,
+another port on the same host stays closed, and the workspace allowlist is
+unchanged. Remove a provider (or change its URL) and the next agent start
+refuses new connections to the old origin. Only literal `http://` and
+`https://` URLs count; a `{env:...}` substitution is not followed and that
+provider gets no route. A path prefix and an IPv6 address such as
+`http://[::1]:8000/v1` work as written.
+
+`localhost`, `127.0.0.1` and `::1` in a base URL mean the loopback of the WSL
+distribution the daemon runs in, not the sandbox's own: BondSymphonic listens
+on that address and port inside the sandbox and carries each connection out to
+the same address on the WSL side. Do not use port 3128, which is the sandbox's
+proxy. A model server running on **Windows** is reached either way:
+
+- With WSL **mirrored** networking (`networkingMode=mirrored` under `[wsl2]` in
+  `%USERPROFILE%\.wslconfig`, then `wsl --shutdown`), Windows' `localhost` is
+  WSL's `localhost`, so `http://localhost:11434/v1` works unchanged.
+- Otherwise, put the Windows host's address in the base URL, as WSL sees it
+  (`ip route show default` inside WSL prints it as the gateway), make the
+  server listen on more than loopback (for Ollama, `OLLAMA_HOST=0.0.0.0`) and
+  allow the port through Windows Firewall. This address can change when
+  Windows restarts.
+
+When a server is down or not granted, the agent fails quickly instead of
+waiting: a plain-HTTP request gets a `502` or `403` answer (for a loopback URL
+its text names the endpoint and the reason), and the daemon log has a `configured endpoint did not accept the
+connection` or `network denied` line for it.
+
 Live CLI/provider and WSL sandbox verification is still required; the automated
 ACP lifecycle tests use a protocol peer fixture.
 

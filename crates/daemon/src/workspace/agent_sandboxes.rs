@@ -6,7 +6,10 @@ use super::{
 use crate::{
     agents::backend::Backend,
     daemon::Daemon,
-    net::{allowlist::Allowlist, proxy::ProxyRegistry},
+    net::{
+        allowlist::{Allowlist, Origin},
+        proxy::ProxyRegistry,
+    },
     sandbox::{SandboxCommand, SandboxHandle, SandboxSpec},
 };
 use bondsymphonic_proto::{AgentAdapterKind, RpcError, WorkspaceId, WorkspaceKind, WorkspaceState};
@@ -108,12 +111,62 @@ pub fn companion_allowlist(ws: &Workspace, extra: &[String]) -> Allowlist {
     Allowlist::from_strings(&hosts)
 }
 
+/// The exact origins a companion is granted beyond its allowlist: the model
+/// servers named in OpenCode's mirrored config, for OpenCode, and nothing for
+/// any other backend. Read afresh at each start, after `prepare` refreshed the
+/// mirror, so an edit to the config is what the next agent gets.
+pub fn companion_grants(d: &Daemon, kind: AgentAdapterKind) -> Vec<Origin> {
+    if kind != AgentAdapterKind::OpenCode {
+        return Vec::new();
+    }
+    crate::agents::opencode_config::provider_origins(
+        &crate::agents::opencode_backend::opencode_home(&d.dirs.root).join("config"),
+    )
+}
+
+/// Where inside the sandbox each loopback grant is listened for, so a client
+/// that dials it there -- directly, as `NO_PROXY` tells it to -- is carried
+/// to the host's loopback instead. `localhost` is both families' loopback.
+/// An address is claimed once, by the first grant naming it, and never the
+/// proxy shim's own.
+pub fn tunnel_listens(grants: &[Origin]) -> Vec<(Origin, Vec<String>)> {
+    let mut claimed: Vec<String> = vec![lifecycle::PROXY_LISTEN.to_string()];
+    let mut out = Vec::new();
+    for origin in grants.iter().filter(|o| o.is_loopback()) {
+        let port = origin.port();
+        let addrs = if origin.host() == "localhost" {
+            vec![format!("127.0.0.1:{port}"), format!("[::1]:{port}")]
+        } else {
+            vec![origin.authority()]
+        };
+        let addrs: Vec<String> = addrs
+            .into_iter()
+            .filter(|addr| {
+                let free = !claimed.contains(addr);
+                if !free {
+                    tracing::warn!(endpoint = %origin.authority(), "{addr} is already taken in the sandbox; not tunnelled");
+                }
+                free
+            })
+            .collect();
+        if addrs.is_empty() {
+            continue;
+        }
+        claimed.extend(addrs.iter().cloned());
+        out.push((origin.clone(), addrs));
+    }
+    out
+}
+
 struct Entry {
     handle: Arc<dyn SandboxHandle>,
     base: Arc<dyn SandboxHandle>,
     proxy: Arc<ProxyRegistry>,
     generation: u64,
     extra_hosts: Vec<String>,
+    grants: Vec<Origin>,
+    /// The running tunnel for each loopback grant, by what ends it.
+    tunnels: HashMap<Origin, Box<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Default)]
@@ -187,13 +240,28 @@ impl AgentSandboxes {
         {
             return Err(RpcError::invalid_params("workspace sandbox is stopping"));
         }
-        if let Some(entry) = state.live.get(&key) {
+        let grants = companion_grants(d, kind);
+        if let Some(entry) = state.live.get_mut(&key) {
             if Arc::ptr_eq(&entry.base, &base)
                 && !entry
                     .handle
                     .died()
                     .is_some_and(|died| *died.borrow() || died.has_changed().is_err())
             {
+                // The config may have changed since this sandbox started: an
+                // origin no longer named is refused from the next connection
+                // on, and a new one is reachable before the agent starts.
+                if entry.grants != grants {
+                    entry.proxy.set_allowlist(
+                        &ws.id,
+                        companion_allowlist(ws, &entry.extra_hosts).with_origins(grants.clone()),
+                    );
+                    entry.grants = grants;
+                    if d.backend.name() == "linux_bwrap" {
+                        sync_tunnels(&ws.id, &entry.handle, &entry.grants, &mut entry.tunnels)
+                            .await;
+                    }
+                }
                 return Ok(entry.handle.clone());
             }
         }
@@ -225,7 +293,7 @@ impl AgentSandboxes {
             .start(
                 &ws.id,
                 &spec.run_dir.join(lifecycle::PROXY_SOCKET_FILE),
-                companion_allowlist(ws, &extra),
+                companion_allowlist(ws, &extra).with_origins(grants.clone()),
                 d.events.clone(),
             )
             .await?;
@@ -247,8 +315,10 @@ impl AgentSandboxes {
         };
         let handle = d.backend.start(&spec).await?;
         startup.handle = Some(handle.clone());
+        let mut tunnels = HashMap::new();
         if d.backend.name() == "linux_bwrap" {
             start_shim(&ws.id, &handle).await?;
+            sync_tunnels(&ws.id, &handle, &grants, &mut tunnels).await;
         }
         let current = d.sandbox(&ws.id)?;
         if !Arc::ptr_eq(&base, &current) || d.workspace(&ws.id)?.state != WorkspaceState::Ready {
@@ -265,6 +335,8 @@ impl AgentSandboxes {
                 proxy,
                 generation,
                 extra_hosts: extra,
+                grants,
+                tunnels,
             },
         );
         startup.committed = true;
@@ -338,9 +410,10 @@ impl AgentSandboxes {
         let state = self.inner.lock().await;
         for (key, entry) in &state.live {
             if key.workspace_id == ws.id {
-                entry
-                    .proxy
-                    .set_allowlist(&ws.id, companion_allowlist(ws, &entry.extra_hosts));
+                entry.proxy.set_allowlist(
+                    &ws.id,
+                    companion_allowlist(ws, &entry.extra_hosts).with_origins(entry.grants.clone()),
+                );
             }
         }
     }
@@ -409,4 +482,83 @@ async fn start_shim(id: &WorkspaceId, handle: &Arc<dyn SandboxHandle>) -> Result
         let _ = sandbox.shutdown().await;
     });
     Ok(())
+}
+
+/// Brings the sandbox's tunnels in line with `grants`: ends the tunnel of
+/// every loopback origin no longer granted, and starts one for each new one.
+/// A tunnel that will not start is logged and left out; the agent then fails
+/// to connect to that server, which says more than refusing the start would.
+async fn sync_tunnels(
+    id: &WorkspaceId,
+    handle: &Arc<dyn SandboxHandle>,
+    grants: &[Origin],
+    tunnels: &mut HashMap<Origin, Box<dyn Fn() + Send + Sync>>,
+) {
+    let wanted = tunnel_listens(grants);
+    tunnels.retain(|origin, kill| {
+        let keep = wanted.iter().any(|(o, _)| o == origin);
+        if !keep {
+            kill();
+        }
+        keep
+    });
+    for (origin, listen) in wanted {
+        if tunnels.contains_key(&origin) {
+            continue;
+        }
+        match start_tunnel(id, handle, &origin, &listen).await {
+            Ok(kill) => {
+                tunnels.insert(origin, kill);
+            }
+            Err(e) => {
+                tracing::warn!(ws = %id, endpoint = %origin.authority(), "endpoint tunnel did not start: {}", e.message)
+            }
+        }
+    }
+}
+
+async fn start_tunnel(
+    id: &WorkspaceId,
+    handle: &Arc<dyn SandboxHandle>,
+    origin: &Origin,
+    listen: &[String],
+) -> Result<Box<dyn Fn() + Send + Sync>, RpcError> {
+    let mut argv = vec![
+        handle.helper_exe().display().to_string(),
+        "proxy-tunnel".into(),
+        "--socket".into(),
+        lifecycle::PROXY_SOCKET_IN_SANDBOX.into(),
+        "--target".into(),
+        origin.authority(),
+    ];
+    for addr in listen {
+        argv.extend(["--listen".into(), addr.clone()]);
+    }
+    let mut child = handle
+        .spawn(SandboxCommand {
+            argv,
+            env: vec![],
+            cwd: None,
+            pty: None,
+        })
+        .await?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        (child.killer)();
+        return Err(RpcError::internal("endpoint tunnel has no pipes"));
+    };
+    let mut helper =
+        crate::util::ready_line::Helper::new("proxy-tunnel", id.as_str(), stdout, stderr);
+    if !helper
+        .ready(crate::net::shim::TUNNEL_READY_LINE, Duration::from_secs(10))
+        .await
+    {
+        (child.killer)();
+        helper.drain().await;
+        return Err(RpcError::internal("endpoint tunnel did not become ready"));
+    }
+    tokio::spawn(async move {
+        helper.drain().await;
+        let _ = child.exit.await;
+    });
+    Ok(child.killer)
 }
