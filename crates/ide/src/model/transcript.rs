@@ -401,6 +401,23 @@ impl Transcript {
                     ),
                 })
             }
+            // Sentences the OpenCode adapter writes for the user: an empty
+            // turn, a silent model, messages an interrupt discarded.
+            AgentMessageBody::System { subtype, data } if subtype == "opencode_notice" => self
+                .push(TranscriptItem::System {
+                    text: data
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                }),
+            // One stretch of the model's reasoning, coalesced by the adapter.
+            AgentMessageBody::System { subtype, data } if subtype == "opencode_reasoning" => {
+                let text = data.get("text").and_then(Value::as_str).unwrap_or_default();
+                self.push(TranscriptItem::System {
+                    text: format!("thinking: {}", truncate(text, SYSTEM_DATA_MAX)),
+                })
+            }
             AgentMessageBody::System { subtype, data } if subtype == "init" => {
                 let session = data
                     .get("session_id")
@@ -543,14 +560,13 @@ impl Transcript {
     /// finished, says the question is settled without naming it. A
     /// `request_id` that names some *other* request leaves the bar alone.
     pub fn answer_permission(&mut self, request_id: &str) {
-        // Codex may run other tools while a parallel approval is outstanding.
-        // Only an explicit reply or the final state settles those requests.
+        // Codex and OpenCode may run other tools while a parallel approval is
+        // outstanding. Only an explicit reply or the final state settles
+        // those requests.
         if request_id.is_empty() {
-            if self
-                .pending
-                .as_ref()
-                .is_some_and(|p| p.request_id.starts_with("codex:"))
-            {
+            if self.pending.as_ref().is_some_and(|p| {
+                p.request_id.starts_with("codex:") || p.request_id.starts_with("opencode:")
+            }) {
                 return;
             }
             self.queued_permissions.clear();

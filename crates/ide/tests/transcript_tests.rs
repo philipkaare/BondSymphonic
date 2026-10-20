@@ -986,3 +986,55 @@ fn a_plain_restart_changes_nothing_but_the_session() {
     assert_eq!(value["permission_mode"], "acceptEdits");
     assert_eq!(value["resume_session"], "sess_1");
 }
+
+/// OpenCode's adapter notices are sentences for the user, and its reasoning
+/// is one bounded row, neither shown as raw JSON.
+#[test]
+fn opencode_notices_and_reasoning_read_as_text() {
+    let mut t = Transcript::default();
+    t.apply(&msg(
+        1,
+        AgentMessageBody::System {
+            subtype: "opencode_notice".into(),
+            data: json!({"text":"The model returned nothing."}),
+        },
+    ));
+    t.apply(&msg(
+        2,
+        AgentMessageBody::System {
+            subtype: "opencode_reasoning".into(),
+            data: json!({"text":"x".repeat(1000)}),
+        },
+    ));
+    assert_eq!(
+        t.items[0],
+        TranscriptItem::System {
+            text: "The model returned nothing.".into()
+        }
+    );
+    let TranscriptItem::System { text } = &t.items[1] else {
+        panic!("{:?}", t.items[1]);
+    };
+    assert!(text.starts_with("thinking: xxx"), "{text}");
+    assert!(text.chars().count() < 300, "{text}");
+}
+
+/// OpenCode runs tools in parallel too: a tool starting while another call
+/// waits for approval must not take that approval's bar down.
+#[test]
+fn opencode_tool_running_beside_a_pending_approval_leaves_it_answerable() {
+    let mut t = Transcript::default();
+    t.set_state(AgentState::WaitingPermission, None);
+    t.apply(&request(1, "opencode:0"));
+    t.apply(&msg(
+        2,
+        AgentMessageBody::ToolUse {
+            id: "call_2".into(),
+            name: "read".into(),
+            input: json!({"filePath":"a"}),
+        },
+    ));
+    assert_eq!(t.pending.as_ref().unwrap().request_id, "opencode:0");
+    t.apply(&reply(3, "opencode:0", "allow"));
+    assert!(t.pending.is_none());
+}
