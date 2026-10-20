@@ -745,8 +745,15 @@ async fn a_refused_tunnel_does_not_offer_to_allow_the_host() {
     let events = EventBus::new(100);
     let mut rx = events.subscribe();
     let proxy = ProxyRegistry::default();
+    // The companion's proxy: it holds the grants of OpenCode's config.
+    let grants = vec![Origin::new("localhost", 1).unwrap()];
     proxy
-        .start(&id, &sock, Allowlist::from_strings(&[]), events)
+        .start(
+            &id,
+            &sock,
+            Allowlist::from_strings(&[]).with_origins(grants),
+            events,
+        )
         .await
         .unwrap();
     let port = {
@@ -792,4 +799,79 @@ async fn a_refused_tunnel_does_not_offer_to_allow_the_host() {
     }
     assert_eq!(denied, vec!["other.example".to_string()]);
     proxy.stop(&id);
+}
+
+/// Sends `CONNECT host:port` carrying the tunnel's marker straight to the proxy
+/// at `sock`, as anything in a sandbox could, and returns the events it caused.
+#[cfg(unix)]
+async fn marked_connect(
+    allow: bondsymphonic_daemon::net::allowlist::Allowlist,
+    target: &str,
+) -> Vec<bondsymphonic_proto::Event> {
+    use bondsymphonic_daemon::net::{proxy::ProxyRegistry, shim};
+    use bondsymphonic_daemon::server::broadcast::EventBus;
+    use bondsymphonic_proto::{ServerMessage, WorkspaceId};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("proxy.sock");
+    let id = WorkspaceId("ws_marked".into());
+    let events = EventBus::new(100);
+    let mut rx = events.subscribe();
+    let proxy = ProxyRegistry::default();
+    proxy.start(&id, &sock, allow, events).await.unwrap();
+    let mut c = tokio::net::UnixStream::connect(&sock).await.unwrap();
+    c.write_all(
+        format!(
+            "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{}: 1\r\n\r\n",
+            shim::TUNNEL_HEADER
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut out = Vec::new();
+    c.read_to_end(&mut out).await.unwrap();
+    let reply = String::from_utf8_lossy(&out);
+    assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
+    proxy.stop(&id);
+    let mut seen = vec![];
+    while let Ok(ServerMessage::Event { event, .. }) = rx.try_recv() {
+        seen.push(event);
+    }
+    seen
+}
+
+/// The tunnel's marker is something any sandbox can write. On a proxy that
+/// holds no origin grants - a Claude or Codex sandbox's, or a workspace's -
+/// it is ignored, and the denial is reported with its "Allow host" offer.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_tunnel_marker_does_not_hide_a_denial_on_a_proxy_without_grants() {
+    use bondsymphonic_daemon::net::allowlist::Allowlist;
+    let events = marked_connect(Allowlist::from_strings(&[]), "exfil.example:443").await;
+    let denied: Vec<_> = events.iter().filter_map(|e| e.denied_host()).collect();
+    assert_eq!(denied, vec!["exfil.example"]);
+}
+
+/// On the companion's proxy the marker drops the "Allow host" offer, which
+/// could not help, but the refusal is still published, as a workspace warning
+/// naming the host, so a marked probe is never silent.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_marked_refusal_on_a_granting_proxy_still_leaves_a_notice() {
+    use bondsymphonic_daemon::net::allowlist::Allowlist;
+    use bondsymphonic_proto::{Event, LogLevel};
+    let allow =
+        Allowlist::from_strings(&[]).with_origins(vec![Origin::new("localhost", 11434).unwrap()]);
+    let events = marked_connect(allow, "exfil.example:443").await;
+    assert!(
+        events.iter().all(|e| e.denied_host().is_none()),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e,
+            Event::DaemonLog { level: LogLevel::Warn, message, .. }
+                if message.contains("exfil.example") && message.contains('\n'))),
+        "{events:?}"
+    );
 }

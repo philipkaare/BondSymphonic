@@ -540,8 +540,27 @@ async fn refuse(
     use tokio::io::AsyncWriteExt;
     if tunnel {
         // No "Allow host" offer: the endpoint is missing from the backend's
-        // config, which the workspace allowlist cannot fix.
-        tracing::warn!(ws = %ctx.workspace, host = %host, "{why}: endpoint not in the agent's config");
+        // config, which the workspace allowlist cannot fix. Still published,
+        // as a warning kept against the workspace (it has a second line): the
+        // sandbox can send the marker itself, and a probe it marks must not
+        // go unseen.
+        if ctx.denials.admit(&ctx.workspace, host) {
+            tracing::warn!(ws = %ctx.workspace, host = %host, "{why}: endpoint not in the agent's config");
+            ctx.events.publish(
+                Some(ctx.workspace.clone()),
+                Event::DaemonLog {
+                    level: bondsymphonic_proto::LogLevel::Warn,
+                    message: format!(
+                        "The agent's connection to {host} was refused\n\
+                         {host} is not a model server in the agent's own config, \
+                         and only the servers it names can be reached this way."
+                    ),
+                    host: None,
+                },
+            );
+        } else {
+            tracing::debug!(ws = %ctx.workspace, host = %host, "{why}: endpoint not in the agent's config (already reported)");
+        }
     } else if ctx.denials.admit(&ctx.workspace, host) {
         tracing::warn!(ws = %ctx.workspace, host = %host, "{why}");
         // Published before the refusal is written, so a client that reacts to
@@ -616,12 +635,17 @@ async fn serve(mut client: tokio::net::UnixStream, ctx: &ConnCtx) -> std::io::Re
             let _ = client.write_all(&bad_request()).await;
             return Ok(());
         }
-        // Marked by the in-sandbox tunnel; see `shim::TUNNEL_HEADER`.
+        // Marked by the in-sandbox tunnel; see `shim::TUNNEL_HEADER`. Anything
+        // in a sandbox can write the marker, so it counts only on a proxy that
+        // holds origin grants: the companion of a backend whose own config
+        // names its model servers, where the tunnels are. Anywhere else a
+        // marked probe is reported like any other.
         let tunnel = head.method.eq_ignore_ascii_case("CONNECT")
             && head
                 .headers
                 .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case(crate::net::shim::TUNNEL_HEADER));
+                .any(|(k, _)| k.eq_ignore_ascii_case(crate::net::shim::TUNNEL_HEADER))
+            && !ctx.allow.read().origins().is_empty();
         let Some(mut upstream) = open_upstream(&mut client, ctx, &host, port, tunnel).await? else {
             // Refused or unreachable; the answer has been written and says
             // `Connection: close`.

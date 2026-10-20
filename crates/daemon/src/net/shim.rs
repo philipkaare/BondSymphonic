@@ -61,8 +61,9 @@ pub const TUNNEL_READY_LINE: &str = "bs-proxy-tunnel listening";
 
 /// Marks a tunnel's `CONNECT`, so the proxy does not offer "Allow host" for a
 /// refusal: the endpoint is missing from the backend's config, and the
-/// workspace allowlist cannot fix that. The sandbox can send it too, which
-/// only silences its own denial notices.
+/// workspace allowlist cannot fix that. The sandbox can send it too, so the
+/// proxy honours it only where it holds origin grants, and even there still
+/// publishes the refusal, as a workspace warning without the offer.
 pub const TUNNEL_HEADER: &str = "X-BondSymphonic-Tunnel";
 
 /// How long the proxy has to answer a tunnel's `CONNECT`. Longer than the
