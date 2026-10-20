@@ -2341,6 +2341,44 @@ fn start_options_with_default(options_json: &str, default_mode: &str) -> AgentSt
     options
 }
 
+pub struct StartAgentFailure {
+    pub message: String,
+    pub workspace_removed: bool,
+}
+
+/// Only a newly created workspace belongs to the agent-start transaction.
+pub async fn start_agent_request(
+    client: &DaemonClient,
+    params: AgentStartParams,
+    rollback_new_workspace: bool,
+) -> Result<AgentStartResult, StartAgentFailure> {
+    let workspace_id = params.workspace_id.clone();
+    match client.request(Request::AgentStart(params)).await {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let mut failure = StartAgentFailure {
+                message: error.to_string(),
+                workspace_removed: false,
+            };
+            if rollback_new_workspace {
+                match client
+                    .request_raw(Request::WorkspaceDestroy(WorkspaceDestroyParams {
+                        workspace_id,
+                        force: false,
+                    }))
+                    .await
+                {
+                    Ok(_) => failure.workspace_removed = true,
+                    Err(cleanup) => failure.message.push_str(&format!(
+                        "; the new workspace could not be removed: {cleanup}"
+                    )),
+                }
+            }
+            Err(failure)
+        }
+    }
+}
+
 /// Starts a Claude agent, announces it, and sends the initial prompt if there
 /// is one. Announcing first is what lets the transcript attach and subscribe
 /// before the agent's first message arrives; anything said in between is
@@ -2352,22 +2390,24 @@ async fn start_agent_and_prompt(
     adapter: AgentAdapterKind,
     options: AgentStartOptions,
     initial_prompt: String,
+    rollback_new_workspace: bool,
 ) {
     let params = AgentStartParams {
         workspace_id: workspace.clone(),
         adapter,
         options,
     };
-    let agent_id = match shared
-        .client
-        .request::<AgentStartResult>(Request::AgentStart(params))
-        .await
-    {
+    let agent_id = match start_agent_request(&shared.client, params, rollback_new_workspace).await {
         Ok(res) => res.agent_id,
         Err(e) => {
-            let detail = e.to_string();
+            let detail = e.message.clone();
             let _ = qt.queue(move |mut q| q.as_mut().note_backend_auth_error(adapter, &detail));
-            report_workspace_op_failure(&qt, workspace.to_string(), "agent.start", e.to_string());
+            report_workspace_op_failure(&qt, workspace.to_string(), "agent.start", e.message);
+            if e.workspace_removed {
+                let id = workspace.to_string();
+                note_state(|state| state.forget_workspace(&id));
+                let _ = qt.queue(move |q| q.workspace_destroyed(QString::from(&id)));
+            }
             return;
         }
     };
@@ -2892,7 +2932,7 @@ impl qobject::AppController {
                 )
             });
             if let Some((adapter, options, prompt)) = agent {
-                start_agent_and_prompt(shared, qt, id, adapter, options, prompt).await;
+                start_agent_and_prompt(shared, qt, id, adapter, options, prompt, true).await;
             }
         });
     }
@@ -3003,6 +3043,7 @@ impl qobject::AppController {
             adapter,
             options,
             String::new(),
+            false,
         ));
     }
 
