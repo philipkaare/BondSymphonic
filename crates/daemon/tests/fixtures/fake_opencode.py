@@ -122,7 +122,7 @@ for line in sys.stdin:
             assert native["model"] == "local/existing" and native["mcp"]["existing"]["enabled"]
             agent = config["agent"][internal]
             expected = "ask" if mode == "permission-ask" else "allow"
-            assert agent["mode"] == "primary" and agent["permission"] == expected
+            assert agent["mode"] == "primary" and agent["permission"] == {"*": expected}
             update({"sessionUpdate": "assistant_message_chunk", "content": {"type": "text", "text": expected + "-checked"}})
             complete()
         elif mode == "error":

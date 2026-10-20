@@ -198,6 +198,11 @@ impl Backend for OpenCodeBackend {
             "chatgpt.com",
             "openrouter.ai",
             "generativelanguage.googleapis.com",
+            // First run downloads ripgrep from GitHub releases; the npm
+            // registry is contacted as well (probe 2026-10-20).
+            "github.com",
+            "release-assets.githubusercontent.com",
+            "registry.npmjs.org",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -248,19 +253,21 @@ impl Backend for OpenCodeBackend {
             env.push(("BS_OPENCODE_SANDBOX".into(), "1".into()));
         }
         let agent_name = format!("bondsymphonic_{}_{}", ws.id, crate::ids::new_id("launch_"));
+        let native = if mode == "yolo" { "allow" } else { "ask" };
         env.push((
             "OPENCODE_CONFIG_CONTENT".into(),
             // Native per-agent permissions are appended after global rules.
             // A fresh workspace-scoped name also avoids inherited rules on a
-            // prior private agent; native parsing normalizes string rules to
-            // wildcard objects before merging config sources.
+            // prior private agent. An agent's permission must be the wildcard
+            // object: 1.14.48 rejects a bare string there and exits before
+            // `initialize` (docs/superpowers/plans/notes/2026-10-20-opencode-probe.md).
             json!({
-                "permission": if mode == "yolo" { "allow" } else { "ask" },
+                "permission": native,
                 "default_agent": agent_name,
                 "agent": {agent_name: {
                     "mode":"primary", "hidden":false, "disable":false,
                     "description":"BondSymphonic workspace agent",
-                    "permission":if mode == "yolo" { "allow" } else { "ask" },
+                    "permission": {"*": native},
                 }},
             })
             .to_string(),

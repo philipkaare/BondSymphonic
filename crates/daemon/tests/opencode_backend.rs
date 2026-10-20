@@ -564,6 +564,15 @@ async fn selected_permissions_use_a_private_primary_agent_despite_native_build_o
                 .is_some_and(|name| name.starts_with("bondsymphonic_ws_")),
             "permission selection must use its own primary agent"
         );
+        // OpenCode 1.14.48 exits before `initialize` when an agent's
+        // permission is a bare string (docs/superpowers/plans/notes/
+        // 2026-10-20-opencode-probe.md); only the object form is accepted.
+        let native = if mode == "ask" { "ask" } else { "allow" };
+        let agent = launch["default_agent"].as_str().unwrap();
+        assert_eq!(
+            launch["agent"][agent]["permission"],
+            serde_json::json!({"*": native})
+        );
         let entry = Arc::new(AgentEntry::new(info.id.clone(), AgentAdapterKind::OpenCode));
         let store = Arc::new(TranscriptStore::new(
             dir.path().join(format!("transcripts-{mode}")),
