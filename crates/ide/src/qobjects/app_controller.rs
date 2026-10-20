@@ -850,6 +850,8 @@ pub mod qobject {
         #[qinvokable]
         fn backend_settings_json(self: &AppController) -> QString;
         #[qinvokable]
+        fn opencode_config_directory(self: &AppController) -> QString;
+        #[qinvokable]
         fn save_backend_settings(self: Pin<&mut AppController>, json: QString) -> bool;
         #[qinvokable]
         fn backend_api_key_set(self: &AppController, backend: QString) -> bool;
@@ -1503,6 +1505,9 @@ fn parse_setup_action(action: &str) -> Option<SetupAction> {
         "codex_login" => Some(SetupAction::CodexLogin),
         "codex_logout" => Some(SetupAction::CodexLogout),
         "install_codex" => Some(SetupAction::InstallCodex),
+        "opencode_login" => Some(SetupAction::OpencodeLogin),
+        "opencode_logout" => Some(SetupAction::OpencodeLogout),
+        "install_opencode" => Some(SetupAction::InstallOpencode),
         "claude_login" => Some(SetupAction::ClaudeLogin),
         "gh_login" => Some(SetupAction::GhLogin),
         "install_claude" => Some(SetupAction::InstallClaude),
@@ -1563,6 +1568,9 @@ fn publish_connection_loss(qt: &QtHandle, losing: ConnectionState) {
         q.as_mut().rust_mut().codex_auth_failure = None;
         q.as_mut().rust_mut().codex_auth_ok = false;
         q.as_mut().rust_mut().codex_login_pty = None;
+        q.as_mut().rust_mut().opencode_login_pty = None;
+        q.as_mut().rust_mut().opencode_auth_failure = None;
+        q.as_mut().rust_mut().opencode_auth_ok = false;
         q.as_mut().rust_mut().agent_backends.clear();
         q.as_mut().rust_mut().pending_backend_errors.clear();
         q.as_mut().backend_settings_changed();
@@ -1659,6 +1667,9 @@ pub struct AppControllerRust {
     codex_login_pty: Option<PtyId>,
     codex_auth_failure: Option<String>,
     codex_auth_ok: bool,
+    opencode_login_pty: Option<PtyId>,
+    opencode_auth_failure: Option<String>,
+    opencode_auth_ok: bool,
     agent_backends: std::collections::HashMap<String, AgentAdapterKind>,
     pending_backend_errors: std::collections::VecDeque<(String, String)>,
     /// Whether a prerequisite answer should open Settings on Setup, and
@@ -1670,6 +1681,8 @@ impl AppControllerRust {
     fn credentials_changed(&mut self, kind: AgentAdapterKind) {
         if kind == AgentAdapterKind::Codex {
             self.codex_auth_failure = None;
+        } else if kind == AgentAdapterKind::OpenCode {
+            self.opencode_auth_failure = None;
         }
     }
 }
@@ -1699,6 +1712,9 @@ impl Default for AppControllerRust {
             codex_login_pty: None,
             codex_auth_failure: None,
             codex_auth_ok: false,
+            opencode_login_pty: None,
+            opencode_auth_failure: None,
+            opencode_auth_ok: false,
             agent_backends: Default::default(),
             pending_backend_errors: Default::default(),
             setup_prompt: SetupPrompt::default(),
@@ -2030,6 +2046,15 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
                         q.as_mut().rust_mut().login_pty = None;
                         q.as_mut().set_claude_auth_override(None);
                     }
+                    if q.as_ref().rust().opencode_login_pty.as_ref() == Some(&pty_id) {
+                        q.as_mut().rust_mut().opencode_login_pty = None;
+                        q.as_mut().rust_mut().opencode_auth_failure = None;
+                        q.as_mut().rust_mut().opencode_auth_ok = false;
+                        model_generations().lock().unwrap().begin("prereqs");
+                        q.as_mut().recheck_prereqs();
+                        q.as_mut().refresh_backend_models(QString::from("opencode"));
+                        q.as_mut().backend_settings_changed();
+                    }
                     if q.as_ref().rust().codex_login_pty.as_ref() == Some(&pty_id) {
                         q.as_mut().rust_mut().codex_login_pty = None;
                         q.as_mut().rust_mut().codex_auth_failure = None;
@@ -2134,7 +2159,7 @@ async fn check_prereqs(client: DaemonClient, qt: QtHandle) {
 /// the caller retries. A list full of failing prerequisites is an answer.
 fn prerequisite_enabled(name: &str) -> bool {
     let settings = Settings::load();
-    for id in ["claude", "codex"] {
+    for id in ["claude", "codex", "opencode"] {
         if name == id || name.starts_with(&format!("{id}_")) {
             return settings.backends.get(id).is_some_and(|s| s.enabled);
         }
@@ -2860,6 +2885,11 @@ impl qobject::AppController {
             daemon_path_in_wsl: settings.daemon_path.clone(),
             local_daemon_binary: Settings::local_daemon_binary(),
             log_level: settings.log_level.clone(),
+            opencode_config_root: if cfg!(windows) {
+                launcher::user_opencode_config_root()
+            } else {
+                None
+            },
         };
         // The slot the reconnect loop empties and refills. Kept on the
         // controller as well, so a later Exit action reaches the daemon that
@@ -3400,11 +3430,22 @@ impl qobject::AppController {
                     .then(|| res.pty_id.clone());
                     let _ = qt.queue(move |mut q| {
                         if matches!(action, SetupAction::CodexLogin | SetupAction::CodexLogout) {
-                            q.as_mut().rust_mut().codex_login_pty = Some(res.pty_id);
+                            q.as_mut().rust_mut().codex_login_pty = Some(res.pty_id.clone());
                             q.as_mut().rust_mut().codex_auth_ok = false;
                             model_generations().lock().unwrap().begin("prereqs");
                             q.as_mut()
                                 .invalidate_backend_models(AgentAdapterKind::Codex);
+                            q.as_mut().backend_settings_changed();
+                        }
+                        if matches!(
+                            action,
+                            SetupAction::OpencodeLogin | SetupAction::OpencodeLogout
+                        ) {
+                            q.as_mut().rust_mut().opencode_login_pty = Some(res.pty_id);
+                            q.as_mut().rust_mut().opencode_auth_ok = false;
+                            model_generations().lock().unwrap().begin("prereqs");
+                            q.as_mut()
+                                .invalidate_backend_models(AgentAdapterKind::OpenCode);
                             q.as_mut().backend_settings_changed();
                         }
                         if let Some(pty) = login {
@@ -3486,6 +3527,28 @@ impl qobject::AppController {
             serde_json::from_str::<Capabilities>(&self.rust().capabilities.to_string()),
             serde_json::from_str::<Vec<PrereqStatus>>(&answer.json),
         ) {
+            let descriptors = self.backend_descriptors();
+            let credentials: Vec<_> = descriptors
+                .iter()
+                .filter(|descriptor| {
+                    crate::qobjects::settings::backend_api_key(descriptor.id).is_some()
+                })
+                .map(|descriptor| descriptor.id)
+                .collect();
+            if let Ok(mut settings) = Settings::try_load() {
+                if backends::enable_authenticated_backends(
+                    &mut settings,
+                    &descriptors,
+                    &items,
+                    &credentials,
+                ) {
+                    if let Err(error) = settings.save() {
+                        tracing::warn!(
+                            "authenticated harness settings could not be saved: {error}"
+                        );
+                    }
+                }
+            }
             for descriptor in &caps.backends {
                 let name = backends::word(descriptor.id);
                 if let Some(item) = items.iter().find(|item| item.name == name) {
@@ -3508,6 +3571,12 @@ impl qobject::AppController {
                     .unwrap_or_default()
                     .iter()
                     .any(|item| item.name == "codex_auth" && item.ok);
+            }
+            if rust.opencode_login_pty.is_none() {
+                rust.opencode_auth_ok = serde_json::from_str::<Vec<PrereqStatus>>(&answer.json)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|item| item.name == "opencode_auth" && item.ok);
             }
             rust.setup_prompt.checked(answer.blocked);
         }
@@ -3580,6 +3649,14 @@ impl qobject::AppController {
         )
     }
 
+    pub fn opencode_config_directory(&self) -> QString {
+        QString::from(
+            launcher::user_opencode_config_root()
+                .map(|root| root.join("opencode").display().to_string())
+                .unwrap_or_default(),
+        )
+    }
+
     pub fn save_backend_settings(mut self: Pin<&mut Self>, json: QString) -> bool {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&json.to_string()) else {
             return false;
@@ -3620,6 +3697,10 @@ impl qobject::AppController {
         if id == "claude" {
             return self.rust().claude_logged_in;
         }
+        if id == "opencode" {
+            // OpenCode also supports local and free providers without a login.
+            return self.rust().opencode_auth_failure.is_none();
+        }
         if id != "codex" || self.rust().codex_auth_failure.is_some() {
             return false;
         }
@@ -3629,6 +3710,14 @@ impl qobject::AppController {
     pub fn backend_auth_failure(&self, backend: QString) -> QString {
         if backend.to_string() == "claude" {
             return self.rust().claude_auth_failure.clone();
+        }
+        if backend.to_string() == "opencode" {
+            return QString::from(
+                self.rust()
+                    .opencode_auth_failure
+                    .as_deref()
+                    .unwrap_or_default(),
+            );
         }
         QString::from(
             self.rust()
@@ -3661,7 +3750,7 @@ impl qobject::AppController {
             if let Some(sentence) = auth_failure_in(detail) {
                 self.as_mut().set_claude_auth_override(Some(sentence));
             }
-        } else if kind == AgentAdapterKind::Codex {
+        } else if matches!(kind, AgentAdapterKind::Codex | AgentAdapterKind::OpenCode) {
             let lower = detail.to_ascii_lowercase();
             if [
                 "unauthorized",
@@ -3669,12 +3758,17 @@ impl qobject::AppController {
                 "invalid api key",
                 "invalid_api_key",
                 "codex_auth_failed",
+                "opencode_auth_failed",
                 "not logged in",
             ]
             .iter()
             .any(|s| lower.contains(s))
             {
-                self.as_mut().rust_mut().codex_auth_failure=Some("Codex authentication failed. Sign in again or replace its API key in Settings.".into());
+                if kind == AgentAdapterKind::OpenCode {
+                    self.as_mut().rust_mut().opencode_auth_failure = Some("OpenCode authentication failed. Sign in again or replace its API key in Settings.".into());
+                } else {
+                    self.as_mut().rust_mut().codex_auth_failure = Some("Codex authentication failed. Sign in again or replace its API key in Settings.".into());
+                }
                 self.backend_settings_changed();
             }
         }
@@ -3686,6 +3780,16 @@ impl qobject::AppController {
         };
         if !crate::qobjects::settings::set_backend_api_key(kind, &key.to_string()) {
             return false;
+        }
+        if let Ok(mut settings) = Settings::try_load() {
+            let entry = settings
+                .backends
+                .entry(backends::word(kind).into())
+                .or_default();
+            entry.enabled = true;
+            if let Err(error) = settings.save() {
+                tracing::warn!("authenticated harness settings could not be saved: {error}");
+            }
         }
         self.as_mut().invalidate_backend_models(kind);
         self.as_mut().rust_mut().credentials_changed(kind);

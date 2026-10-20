@@ -402,7 +402,7 @@ void TranscriptView::setBackend(const QString &backend) {
     if (m_backend == backend)
         return;
     m_backend = backend;
-    m_loginButton->setText(backend == "codex" ? "Sign in to Codex…" : "Log in to Claude Code…");
+    m_loginButton->setText(backend == "codex" ? "Sign in to Codex…" : backend == "opencode" ? "Sign in to OpenCode…" : "Log in to Claude Code…");
     applyOptionsToChoices();
     refreshGate();
 }
@@ -583,13 +583,13 @@ void TranscriptView::refreshGate() {
         // sentence in that window went to Settings to log in again, found the
         // page empty and quit. There is nothing to fix yet, so no button.
         m_gateText->setText(QStringLiteral("Checking whether %1 is logged in")
-                                .arg(m_backend == "codex" ? "Codex" : "Claude Code") +
+                                .arg(m_backend == "codex" ? "Codex" : m_backend == "opencode" ? "OpenCode" : "Claude Code") +
                             QChar(kEllipsis));
         m_loginButton->hide();
         return;
     }
     m_gateText->setText(QStringLiteral("%1 is not logged in, so this agent cannot answer yet.")
-                            .arg(m_backend == "codex" ? "Codex" : "Claude Code"));
+                            .arg(m_backend == "codex" ? "Codex" : m_backend == "opencode" ? "OpenCode" : "Claude Code"));
     m_loginButton->show();
 }
 
@@ -787,7 +787,8 @@ void TranscriptView::applyOptionsToChoices() {
         m_permissionChoice,
         mode.isEmpty()
             ? (m_backend == "codex" ? QStringLiteral("never")
-                                    : QString::fromUtf8(agentchoices::defaultPermissionMode()))
+               : m_backend == "opencode" ? QStringLiteral("ask")
+                                        : QString::fromUtf8(agentchoices::defaultPermissionMode()))
             : mode,
         m_backend);
     m_applyingOptions = false;

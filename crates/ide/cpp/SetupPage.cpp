@@ -357,6 +357,10 @@ void SetupPage::clearRows() {
 }
 
 QString SetupPage::actionFor(const QString& name) {
+    if (name == "opencode")
+        return "install_opencode";
+    if (name == "opencode_auth")
+        return "opencode_login";
     if (name == "codex")
         return "install_codex";
     if (name == "codex_auth")
@@ -379,6 +383,8 @@ QString SetupPage::actionFor(const QString& name) {
 }
 
 QString SetupPage::logoutActionFor(const QString& name) {
+    if (name == "opencode_auth")
+        return "opencode_logout";
     if (name == "codex_auth")
         return "codex_logout";
     if (name == QLatin1String("claude_auth")) {
@@ -408,6 +414,12 @@ QString SetupPage::tokenActionFor(const QString& name, bool ok, const QString& d
 }
 
 QString SetupPage::buttonTextFor(const QString& action) {
+    if (action == "install_opencode")
+        return "Install OpenCode";
+    if (action == "opencode_login")
+        return "Sign in to OpenCode";
+    if (action == "opencode_logout")
+        return "Sign out of OpenCode";
     if (action == "install_codex")
         return "Install Codex";
     if (action == "codex_login")

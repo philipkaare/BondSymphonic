@@ -68,6 +68,38 @@ fn codex_completion_preserves_session_without_fabricating_a_cost_row() {
         .any(|item| matches!(item, TranscriptItem::Result { .. })));
 }
 
+#[test]
+fn opencode_completion_preserves_session_and_duration_without_fabricating_cost() {
+    let mut transcript = Transcript::default();
+    transcript.apply(&msg(
+        1,
+        AgentMessageBody::System {
+            subtype: "opencode_turn".into(),
+            data: json!({"status":"completed","cost_available":false,"usage":{"input_tokens":42}}),
+        },
+    ));
+    transcript.apply(&msg(
+        2,
+        AgentMessageBody::Result {
+            cost_usd: 0.0,
+            duration_ms: 123,
+            num_turns: 1,
+            session_id: "opencode-session".into(),
+        },
+    ));
+    assert_eq!(transcript.session_id.as_deref(), Some("opencode-session"));
+    assert_eq!(transcript.turns, 1);
+    assert!(!transcript.cost_available);
+    assert!(!transcript
+        .items
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::Result { .. })));
+    assert!(transcript.items.iter().any(
+        |item| matches!(item, TranscriptItem::System { text } if text == "turn completed in 123 ms")
+    ));
+    assert!(transcript.items.iter().any(|item| matches!(item, TranscriptItem::System { text } if text.starts_with("OpenCode turn:") && text.contains("input_tokens"))));
+}
+
 /// Partial messages arrive as deltas and are then repeated in full. One
 /// assistant bubble must come out of that, not three.
 #[test]

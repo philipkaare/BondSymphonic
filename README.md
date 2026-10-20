@@ -28,9 +28,9 @@ Design: `docs/superpowers/specs/`. Plans: `docs/superpowers/plans/`.
   a data-dir instance lock, the daemon suite matched to its spec, an IDE job in CI,
   `package.ps1`, and this guide.
 
-Agent backends: Claude Code and Codex, plus a plain terminal. Enable Codex under
-Settings > Agents, install it there, then sign in to ChatGPT or store an OpenAI
-API key. Each backend has its own sandbox, proxy, credentials and defaults.
+Agent backends: Claude Code, Codex and OpenCode, plus a plain terminal. Install
+and sign in under Settings > Agents; an authenticated harness is enabled
+automatically. Each backend has its own sandbox, proxy, credentials and defaults.
 See [agent backend setup](docs/user-guide.md#agent-backends).
 Known limits are listed per area in the [user guide](docs/user-guide.md).
 
@@ -89,7 +89,7 @@ WSL2 itself is the one prerequisite the package cannot install for you. If `wsl 
 does not answer, run `wsl --install` in an elevated PowerShell and reboot first.
 
 `bondsymphonic-ide.exe --version` prints the build and the daemon protocol it speaks, for
-example `bondsymphonic-ide 0.1.0 (protocol 1)`. It answers before any window or daemon is
+example `bondsymphonic-ide 0.1.0 (protocol 3)`. It answers before any window or daemon is
 started, so it is the quickest check that a package unzipped correctly — it still needs the
 Qt and CRT DLLs beside it, which the exe imports at load time, but it needs no display, no
 platform plugin and no WSL.

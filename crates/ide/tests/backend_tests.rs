@@ -8,6 +8,89 @@ use bondsymphonic_ide::{
 use bondsymphonic_proto::AgentAdapterKind;
 
 #[test]
+fn discovering_authentication_enables_the_backend_without_resetting_its_defaults() {
+    use bondsymphonic_ide::model::backends::enable_authenticated_backends;
+    use bondsymphonic_proto::PrereqStatus;
+    let mut settings = Settings::default();
+    settings.backends.get_mut("codex").unwrap().default_model = "chosen".into();
+    let mut descriptor = legacy_descriptors().remove(0);
+    descriptor.id = AgentAdapterKind::Codex;
+    descriptor.prerequisite_names = vec!["codex".into(), "codex_auth".into()];
+    let auth = |ok| PrereqStatus {
+        name: "codex_auth".into(),
+        ok,
+        detail: String::new(),
+        fix_hint: None,
+    };
+    assert!(!enable_authenticated_backends(
+        &mut settings,
+        &[descriptor.clone()],
+        &[auth(false)],
+        &[]
+    ));
+    assert!(!settings.backends["codex"].enabled);
+    assert!(enable_authenticated_backends(
+        &mut settings,
+        &[descriptor.clone()],
+        &[auth(true)],
+        &[]
+    ));
+    assert!(settings.backends["codex"].enabled);
+    assert_eq!(settings.backends["codex"].default_model, "chosen");
+    assert!(!enable_authenticated_backends(
+        &mut settings,
+        &[descriptor.clone()],
+        &[auth(true)],
+        &[]
+    ));
+    settings.backends.get_mut("codex").unwrap().enabled = false;
+    assert!(enable_authenticated_backends(
+        &mut settings,
+        &[descriptor],
+        &[auth(false)],
+        &[AgentAdapterKind::Codex]
+    ));
+}
+
+#[test]
+fn opencode_uses_its_own_settings_credentials_and_authentication() {
+    use bondsymphonic_ide::model::backends::{
+        enable_authenticated_backends, parse, permission_reply, word,
+    };
+    use bondsymphonic_proto::{PermissionDecision, PrereqStatus};
+    let mut settings = Settings::default();
+    assert!(!settings.backends["opencode"].enabled);
+    assert_eq!(settings.backends["opencode"].default_permission_mode, "ask");
+    assert_eq!(parse("opencode"), Some(AgentAdapterKind::OpenCode));
+    assert_eq!(word(AgentAdapterKind::OpenCode), "opencode");
+    assert_eq!(
+        credential_name(AgentAdapterKind::OpenCode),
+        Some("opencode_api_key")
+    );
+    assert_eq!(
+        permission_reply(AgentAdapterKind::OpenCode, true, true),
+        (PermissionDecision::AllowForSession, false)
+    );
+    let mut descriptor = legacy_descriptors().remove(0);
+    descriptor.id = AgentAdapterKind::OpenCode;
+    descriptor.default_permission_mode = "ask".into();
+    descriptor.prerequisite_names = vec!["opencode".into(), "opencode_auth".into()];
+    assert!(enable_authenticated_backends(
+        &mut settings,
+        &[descriptor],
+        &[PrereqStatus {
+            name: "opencode_auth".into(),
+            ok: true,
+            detail: String::new(),
+            fix_hint: None,
+        }],
+        &[]
+    ));
+    assert!(settings.backends["opencode"].enabled);
+    assert!(!settings.backends["codex"].enabled);
+}
+
+#[test]
 fn legacy_modes_migrate_without_escalating_and_explicit_backend_settings_win() {
     let legacy = Settings::from_json(r#"{"default_permission_mode":"default"}"#).unwrap();
     assert_eq!(legacy.backends["claude"].default_permission_mode, "manual");

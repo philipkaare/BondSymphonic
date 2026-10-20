@@ -5,6 +5,7 @@
 //! The [`AgentManager`] that owns processes lives alongside this; what is here
 //! is the part that has no process in it, so it can be tested on its own.
 
+pub mod acp;
 pub mod adapter;
 pub mod backend;
 pub mod claude;
@@ -15,6 +16,10 @@ pub mod codex_backend;
 pub mod codex_rpc;
 pub mod codex_stream;
 pub mod credentials;
+pub mod opencode;
+pub mod opencode_backend;
+pub mod opencode_config;
+pub mod opencode_stream;
 pub mod persist;
 pub mod token;
 pub mod token_scan;

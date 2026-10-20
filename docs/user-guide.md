@@ -14,7 +14,8 @@ version; `docs/superpowers/specs/` is the design behind it.
 ### Agent backends
 
 **Settings > Agents** has a tab for each backend the connected daemon supports.
-Claude is enabled initially; Codex is disabled until you enable it. Each tab has
+Claude is enabled initially; Codex and OpenCode start disabled. A discovered
+sign-in or a stored API key enables its harness automatically. Each tab has
 Enabled, installation/sign-in actions, Default model, Default permissions, and a
 write-only API-key field. Keys are stored separately in Windows Credential
 Manager. An empty field keeps the stored key; Remove key deletes that backend's
@@ -55,6 +56,39 @@ Existing settings migrate on read: Claude's old default permission mode moves
 into its backend entry, with `default` still becoming `manual`. An existing
 backend entry wins over the old field. A daemon without backend descriptors
 continues to expose Claude only; update the daemon before starting Codex.
+
+For OpenCode, press **Install OpenCode**, then **Sign in to OpenCode** to choose
+and authenticate a provider in the Setup terminal. The installer pins **1.14.48**.
+Models use IDs such as `openai/gpt-5`; the editable model list supports manual IDs.
+OpenCode offers **Ask before tools** and **YOLO (sandboxed)**, streams answers and
+tool results into the transcript, supports approvals and cancellation, and keeps
+the native session ID for resume. Its Windows-stored API key is separate from
+Codex's and applies to the OpenAI provider.
+
+OpenCode reuses your Windows user's regular configuration. **Settings > Agents
+> OpenCode** shows the source folder and has an **Open config folder** button.
+Normally this is `%USERPROFILE%\.config\opencode`; an absolute Windows
+`XDG_CONFIG_HOME` selects `<XDG_CONFIG_HOME>\opencode` instead. Edit `opencode.json`
+or `opencode.jsonc` there (legacy `config.json` is also supported), then restart
+the agent. New agents and model discovery refresh the files automatically,
+preserving JSONC comments and reflecting removed files. The daemon reads the
+Windows files through WSL and writes its own snapshots, leaving source files
+untouched. Read failures appear as configuration errors.
+
+Authenticate providers through BondSymphonic's **Sign in to OpenCode** action;
+credentials and sessions are stored separately from the Windows desktop app in
+the daemon's `opencode-home`. An existing daemon-user `auth.json` is imported
+once; refreshing config does not undo a sign-out. Repository configuration
+continues to apply alongside these global configuration files. The
+companion sandbox has its own home, cache, runtime and proxy; other backends
+cannot mount OpenCode's login and session directory.
+
+Local model servers require a route reachable from the sandbox. Its `localhost`
+is separate from the Windows and WSL hosts; entering a host loopback URL alone
+does not establish that route. Dedicated local-provider settings and endpoint
+forwarding from the earlier OpenCode design are not included in this integration.
+Live CLI/provider and WSL sandbox verification is still required; the automated
+ACP lifecycle tests use a protocol peer fixture.
 
 ### From a package
 
@@ -112,7 +146,7 @@ To check that a package unzipped intact:
 
 ```powershell
 C:\Tools\BondSymphonic\bondsymphonic-ide.exe --version
-# bondsymphonic-ide 0.1.0 (protocol 2)
+# bondsymphonic-ide 0.1.0 (protocol 3)
 ```
 
 It answers before a window or a daemon is started, so it needs no display, no Qt
@@ -1074,8 +1108,8 @@ it installs the daemon binary it ships with before every launch, so a mismatch
 means that binary is itself from a different build. Fix it by making the pair
 match: reinstall the package, or rebuild the daemon with
 `.\scripts\build-daemon.ps1` from the same checkout as the IDE. An IDE and a
-daemon are shipped as a pair. This IDE speaks protocol **2** (the version that
-added working directly in a checkout, below); a daemon still on protocol 1
+daemon are shipped as a pair. This IDE speaks protocol **3** (which adds the
+OpenCode backend); a daemon still on protocol 1 or 2
 answers this way rather than silently ignoring a request it has never heard of.
 
 **Reading the logs.** The IDE writes its log stream to

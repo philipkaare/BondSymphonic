@@ -22,6 +22,7 @@ fn backend_name(kind: AgentAdapterKind) -> &'static str {
     match kind {
         AgentAdapterKind::Claude => "claude",
         AgentAdapterKind::Codex => "codex",
+        AgentAdapterKind::OpenCode => "opencode",
         AgentAdapterKind::Terminal => "terminal",
     }
 }
@@ -79,6 +80,10 @@ async fn build_spec(
     }
     if kind == AgentAdapterKind::Codex {
         let home = d.dirs.root.join("codex-home");
+        spec.rw_binds.push((home.clone(), home));
+    }
+    if kind == AgentAdapterKind::OpenCode {
+        let home = crate::agents::opencode_backend::opencode_home(&d.dirs.root);
         spec.rw_binds.push((home.clone(), home));
     }
     Ok((spec, protection))
@@ -200,6 +205,7 @@ impl AgentSandboxes {
         for (host, _) in &spec.rw_binds {
             if host.starts_with(d.dirs.root.join("agent-caches"))
                 || host == &d.dirs.root.join("codex-home")
+                || host == &crate::agents::opencode_backend::opencode_home(&d.dirs.root)
             {
                 tokio::fs::create_dir_all(host)
                     .await

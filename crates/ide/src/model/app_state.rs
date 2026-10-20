@@ -407,6 +407,7 @@ pub fn adapter_name(kind: AgentAdapterKind) -> &'static str {
     match kind {
         AgentAdapterKind::Claude => "claude",
         AgentAdapterKind::Codex => "codex",
+        AgentAdapterKind::OpenCode => "opencode",
         AgentAdapterKind::Terminal => "terminal",
     }
 }
@@ -417,6 +418,7 @@ pub fn adapter_from_name(name: &str) -> AgentAdapterKind {
     match name.trim().to_ascii_lowercase().as_str() {
         "terminal" => AgentAdapterKind::Terminal,
         "codex" => AgentAdapterKind::Codex,
+        "opencode" => AgentAdapterKind::OpenCode,
         _ => AgentAdapterKind::Claude,
     }
 }

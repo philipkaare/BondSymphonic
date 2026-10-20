@@ -18,6 +18,7 @@ pub fn default_settings() -> BTreeMap<String, BackendSettings> {
     [
         ("claude", true, "bypassPermissions"),
         ("codex", false, "never"),
+        ("opencode", false, "ask"),
     ]
     .into_iter()
     .map(|(id, enabled, mode)| {
@@ -36,6 +37,7 @@ pub fn word(kind: AgentAdapterKind) -> &'static str {
     match kind {
         AgentAdapterKind::Claude => "claude",
         AgentAdapterKind::Codex => "codex",
+        AgentAdapterKind::OpenCode => "opencode",
         AgentAdapterKind::Terminal => "terminal",
     }
 }
@@ -43,6 +45,7 @@ pub fn parse(word: &str) -> Option<AgentAdapterKind> {
     match word {
         "claude" => Some(AgentAdapterKind::Claude),
         "codex" => Some(AgentAdapterKind::Codex),
+        "opencode" => Some(AgentAdapterKind::OpenCode),
         "terminal" => Some(AgentAdapterKind::Terminal),
         _ => None,
     }
@@ -51,6 +54,7 @@ pub fn credential_name(kind: AgentAdapterKind) -> Option<&'static str> {
     match kind {
         AgentAdapterKind::Claude => Some("anthropic_api_key"),
         AgentAdapterKind::Codex => Some("openai_api_key"),
+        AgentAdapterKind::OpenCode => Some("opencode_api_key"),
         AgentAdapterKind::Terminal => None,
     }
 }
@@ -64,7 +68,7 @@ pub fn permission_reply(
     if !allow {
         return (PermissionDecision::Deny, false);
     }
-    if kind == AgentAdapterKind::Codex && session {
+    if matches!(kind, AgentAdapterKind::Codex | AgentAdapterKind::OpenCode) && session {
         return (PermissionDecision::AllowForSession, false);
     }
     (
@@ -85,6 +89,37 @@ pub fn select_default_backend(
         .find(|d| word(d.id) == settings.default_backend)
         .or_else(|| descriptors.iter().find(enabled))
         .map(|d| d.id)
+}
+
+/// Reconciles discovered authentication with the harnesses available to the UI.
+pub fn enable_authenticated_backends(
+    settings: &mut Settings,
+    descriptors: &[BackendDescriptor],
+    items: &[bondsymphonic_proto::PrereqStatus],
+    credential_backends: &[AgentAdapterKind],
+) -> bool {
+    let mut changed = false;
+    for descriptor in descriptors {
+        let authenticated = credential_backends.contains(&descriptor.id)
+            || descriptor.prerequisite_names.iter().any(|name| {
+                name.ends_with("_auth") && items.iter().any(|item| &item.name == name && item.ok)
+            });
+        if !authenticated {
+            continue;
+        }
+        let entry = settings
+            .backends
+            .entry(word(descriptor.id).into())
+            .or_insert_with(|| BackendSettings {
+                default_permission_mode: descriptor.default_permission_mode.clone(),
+                ..Default::default()
+            });
+        if !entry.enabled {
+            entry.enabled = true;
+            changed = true;
+        }
+    }
+    changed
 }
 
 pub fn start_options_with_defaults(

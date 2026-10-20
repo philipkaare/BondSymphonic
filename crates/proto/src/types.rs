@@ -17,6 +17,8 @@ pub struct Capabilities {
 pub enum AgentAdapterKind {
     Claude,
     Codex,
+    #[serde(rename = "opencode")]
+    OpenCode,
     Terminal,
 }
 
@@ -84,6 +86,9 @@ pub enum SetupAction {
     InstallCodex,
     CodexLogin,
     CodexLogout,
+    InstallOpencode,
+    OpencodeLogin,
+    OpencodeLogout,
 }
 
 /// What `repo.inspect` knows about a path the user picked.

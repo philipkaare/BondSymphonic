@@ -690,6 +690,37 @@ async fn hello_with_another_protocol_version_is_refused_and_the_socket_closes() 
     cancel.cancel();
 }
 
+/// An IDE from before OpenCode cannot decode that backend's enum variant. Reject
+/// its Hello before returning capabilities so it receives the actionable error.
+#[tokio::test]
+async fn version_two_ide_is_refused_before_opencode_capabilities_are_sent() {
+    let (port, token, cancel, _h) = start().await;
+    let (mut r, mut w) = connect(port).await;
+    send(
+        &mut w,
+        1,
+        Request::Hello(HelloParams {
+            token,
+            client_version: "0.1.0".into(),
+            protocol_version: Some(2),
+        }),
+    )
+    .await;
+    match recv(&mut r).await.unwrap() {
+        ServerMessage::Response {
+            error: Some(error),
+            result,
+            ..
+        } => {
+            assert!(result.is_none());
+            assert_eq!(protocol_mismatch_versions(&error), Some((3, 2)));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(recv(&mut r).await.is_none());
+    cancel.cancel();
+}
+
 /// A `hello` with no `protocol_version` at all is a client built before the
 /// field existed, which speaks version 1. This daemon speaks 2 -- in-place
 /// workspaces -- so it is refused with both numbers, like any other mismatch,

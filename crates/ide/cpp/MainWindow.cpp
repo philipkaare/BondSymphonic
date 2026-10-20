@@ -996,7 +996,7 @@ void MainWindow::connectController() {
                          // already on its way, and the tab is shown before that
                          // answers. The pane has to know, or it offers a Start
                          // button for a start that is already running.
-                         if (adapter == QLatin1String("claude")) {
+                         if (adapter != QLatin1String("terminal")) {
                              m_agentArea->setStarting(workspaceId, true);
                          }
                          // The repository the user actually created something
@@ -1207,10 +1207,14 @@ void MainWindow::connectController() {
                          m_agentArea->refillModels();
                      });
     QObject::connect(m_controller, &AppController::backendSettingsChanged, this, [this] {
-        agentchoices::setDescriptors(
-            QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array());
-        m_agentArea->setBackendAuth("codex", m_controller->backendLoggedIn("codex"),
-                                    m_controller->backendAuthFailure("codex"));
+        const QJsonArray descriptors =
+            QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array();
+        agentchoices::setDescriptors(descriptors);
+        for (const QJsonValue &descriptor : descriptors) {
+            const QString backend = descriptor.toObject().value("id").toString();
+            m_agentArea->setBackendAuth(backend, m_controller->backendLoggedIn(backend),
+                                      m_controller->backendAuthFailure(backend));
+        }
     });
     if (menuTest().contains(QLatin1String("backend-auth"))) {
         auto logout = std::make_shared<bool>(false);
@@ -2828,7 +2832,8 @@ void MainWindow::rebindCost() {
 }
 
 void MainWindow::updateCostLabel() {
-    if (activeTab().value("adapter").toString() == "codex") {
+    const QString backend = activeTab().value("adapter").toString();
+    if (backend == "codex" || backend == "opencode") {
         m_costLabel->setText("Cost unavailable");
         return;
     }

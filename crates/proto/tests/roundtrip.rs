@@ -635,8 +635,8 @@ mod in_place_protocol {
     use bondsymphonic_proto::*;
 
     #[test]
-    fn the_protocol_is_version_two_and_a_silent_peer_is_version_one() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+    fn the_protocol_is_version_three_and_a_silent_peer_is_version_one() {
+        assert_eq!(PROTOCOL_VERSION, 3);
         assert_eq!(peer_protocol_version(None), 1);
     }
 

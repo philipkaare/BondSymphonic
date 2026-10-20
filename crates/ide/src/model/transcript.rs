@@ -385,10 +385,20 @@ impl Transcript {
                     num_turns: *num_turns,
                 })
             }
-            AgentMessageBody::System { subtype, data } if subtype == "codex_turn" => {
+            AgentMessageBody::System { subtype, data }
+                if matches!(subtype.as_str(), "codex_turn" | "opencode_turn") =>
+            {
                 self.cost_available = false;
+                let backend = if subtype == "opencode_turn" {
+                    "OpenCode"
+                } else {
+                    "Codex"
+                };
                 self.push(TranscriptItem::System {
-                    text: format!("Codex turn: {}", truncate(&spaced(data), SYSTEM_DATA_MAX)),
+                    text: format!(
+                        "{backend} turn: {}",
+                        truncate(&spaced(data), SYSTEM_DATA_MAX)
+                    ),
                 })
             }
             AgentMessageBody::System { subtype, data } if subtype == "init" => {

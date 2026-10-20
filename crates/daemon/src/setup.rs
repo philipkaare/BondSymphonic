@@ -25,7 +25,7 @@ pub const HOST_BACKEND: &str = "noop";
 
 /// Every action, for callers that need to enumerate them (tests, and any future
 /// listing of what the daemon can fix).
-pub const ALL_ACTIONS: [SetupAction; 10] = [
+pub const ALL_ACTIONS: [SetupAction; 13] = [
     SetupAction::ClaudeLogin,
     SetupAction::GhLogin,
     SetupAction::InstallClaude,
@@ -36,6 +36,9 @@ pub const ALL_ACTIONS: [SetupAction; 10] = [
     SetupAction::InstallCodex,
     SetupAction::CodexLogin,
     SetupAction::CodexLogout,
+    SetupAction::InstallOpencode,
+    SetupAction::OpencodeLogin,
+    SetupAction::OpencodeLogout,
 ];
 
 /// The command each action runs. The whole table is literal: an action selects
@@ -50,6 +53,13 @@ pub fn setup_argv(action: SetupAction) -> Vec<String> {
             "curl -fsSL https://claude.ai/install.sh | bash",
         ],
         SetupAction::InstallGh => &["sudo", "apt-get", "install", "-y", "gh"],
+        SetupAction::InstallOpencode => &[
+            "bash",
+            "-lc",
+            include_str!("../../../scripts/install-opencode.sh"),
+        ],
+        SetupAction::OpencodeLogin => &["opencode", "auth", "login"],
+        SetupAction::OpencodeLogout => &["opencode", "auth", "logout"],
         // Logging out is as interactive as logging in -- `gh auth logout` asks
         // which host to forget and then asks again whether it means it -- so
         // both run in the same terminal the logins do rather than being fired
@@ -90,6 +100,12 @@ pub fn setup_env(root: &Path, action: SetupAction) -> Vec<(String, String)> {
                 .display()
                 .to_string(),
         )],
+        SetupAction::OpencodeLogin | SetupAction::OpencodeLogout => {
+            if let Err(error) = crate::agents::opencode_backend::ensure_native_home(root) {
+                tracing::warn!("OpenCode configuration could not be refreshed for setup: {error}");
+            }
+            crate::agents::opencode_backend::process_env(root, None)
+        }
         _ => vec![],
     }
 }
@@ -223,7 +239,7 @@ mod tests {
         for action in ALL_ACTIONS {
             let argv = setup_argv(action);
             assert!(
-                ["claude", "codex", "gh", "bash", "sudo"].contains(&argv[0].as_str()),
+                ["claude", "codex", "opencode", "gh", "bash", "sudo"].contains(&argv[0].as_str()),
                 "{action:?} runs an unexpected program: {argv:?}"
             );
         }

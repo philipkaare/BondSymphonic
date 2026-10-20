@@ -7,6 +7,8 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
+#include <QDesktopServices>
+#include <QDir>
 #include <QFormLayout>
 #include <QFrame>
 #include <QGroupBox>
@@ -21,6 +23,8 @@
 #include <QJsonArray>
 #include <QTabWidget>
 #include <QSignalBlocker>
+#include <QTemporaryDir>
+#include <QUrl>
 
 namespace {
 
@@ -144,14 +148,61 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
         auto *keyNote = new QLabel(
             id == "codex" ? "A stored API key takes precedence over ChatGPT sign-in. Leave empty "
                             "to keep the stored key."
-                          : "Used when Claude has no login. Leave empty to keep the stored key.",
+                          : id == "opencode" ? "Used for the OpenAI provider. Other providers use OpenCode sign-in or repository configuration. Leave empty to keep the stored key."
+                                             : "Used when Claude has no login. Leave empty to keep the stored key.",
             page);
         keyNote->setWordWrap(true);
         backendForm->addRow(keyNote);
+        if (id == "opencode") {
+            const QString configDirectory = m_controller->opencodeConfigDirectory();
+            auto *configPath = new QLabel(configDirectory, page);
+            configPath->setObjectName(QStringLiteral("OpenCodeConfigDirectory"));
+            configPath->setTextFormat(Qt::PlainText);
+            configPath->setTextInteractionFlags(Qt::TextSelectableByMouse);
+            configPath->setWordWrap(true);
+            backendForm->addRow("Windows user configuration:", configPath);
+            auto *configHelp = new QLabel(
+                "Edit opencode.json or opencode.jsonc in this folder (legacy config.json is also supported). Changes apply to "
+                "newly started agents; restart an existing agent to use the updated configuration.",
+                page);
+            configHelp->setObjectName(QStringLiteral("OpenCodeConfigHelp"));
+            configHelp->setWordWrap(true);
+            backendForm->addRow(configHelp);
+            auto *openConfigFolder = new QPushButton("Open config folder", page);
+            openConfigFolder->setObjectName(QStringLiteral("OpenCodeOpenConfigFolder"));
+            backendForm->addRow(openConfigFolder);
+            QObject::connect(openConfigFolder, &QPushButton::clicked, this,
+                             [this, configDirectory] {
+                if (configDirectory.isEmpty() || !QDir().mkpath(configDirectory)) {
+                    QMessageBox::warning(this, "Settings",
+                                         "The OpenCode config folder could not be created.");
+                    return;
+                }
+                if (!QDesktopServices::openUrl(QUrl::fromLocalFile(configDirectory))) {
+                    QMessageBox::warning(this, "Settings",
+                                         "The OpenCode config folder could not be opened.");
+                }
+            });
+        }
         const QString label = descriptor.value("label").toString(id);
         m_backends.insert(id, {label, enabled, key, remove, model, mode});
         tabs->addTab(page, label);
         QObject::connect(enabled, &QCheckBox::toggled, this, [this] { refreshDefaults(); });
+        QObject::connect(m_controller, &AppController::backendSettingsChanged, this,
+                         [this, id, enabled, refreshKey,
+                          persistedEnabled = settings.value("enabled").toBool()]() mutable {
+                             const auto saved = QJsonDocument::fromJson(
+                                 m_controller->backendSettingsJson().toUtf8()).object()
+                                                    .value("backends").toObject()
+                                                    .value(id).toObject();
+                             const bool nowEnabled = saved.value("enabled").toBool();
+                             // Authentication can finish while Settings is open. Follow
+                             // the saved transition without replacing unsaved model edits
+                             // or resetting a checkbox on every model-list notification.
+                             if (nowEnabled && !persistedEnabled) enabled->setChecked(true);
+                             persistedEnabled = nowEnabled;
+                             refreshKey();
+                         });
         QObject::connect(m_controller, &AppController::backendModelsChecked, this,
                          [id, model](const QString &backend, const QString &, qint64) {
                              if (backend == id) {
@@ -235,12 +286,16 @@ void SettingsDialog::accept() {
         entry.insert("enabled", it->enabled->isChecked());
         entry.insert("default_model", agentchoices::modelComboSelection(it->model));
         entry.insert("default_permission_mode", it->mode->currentData().toString());
-        entries.insert(it.key(), entry);
         const QString key = it->key->text().trimmed();
         if (!key.isEmpty() && !m_controller->setBackendApiKey(it.key(), key)) {
             QMessageBox::warning(this, "Settings", "The API key could not be stored.");
             return;
         }
+        if (!key.isEmpty()) {
+            it->enabled->setChecked(true);
+            entry.insert("enabled", true);
+        }
+        entries.insert(it.key(), entry);
         it->key->clear();
     }
     m_settings.insert("backends", entries);
@@ -339,6 +394,44 @@ extern "C" std::int32_t bs_widget_test_settings_offers_the_one_permission_list()
     if (agentchoices::modelComboSelection(model) != "typed-codex-model")
         return 25;
     agentchoices::resetModelsForTest();
+    descriptors.append(QJsonObject{{"id", "opencode"}, {"label", "OpenCode"},
+        {"default_permission_mode", "ask"},
+        {"permission_modes", QJsonArray{QJsonObject{{"id", "ask"}, {"label", "Ask"}},
+                                         QJsonObject{{"id", "yolo"}, {"label", "YOLO"}}}},
+        {"setup_actions", QJsonArray{"install_opencode", "opencode_login", "opencode_logout"}},
+        {"credential_label", "OpenAI API key"}});
+    QTemporaryDir settingsDir;
+    if (!settingsDir.isValid()) return 26;
+    const auto priorPath = qgetenv("BS_SETTINGS_PATH");
+    struct RestorePath {
+        QByteArray value;
+        ~RestorePath() { if (value.isNull()) qunsetenv("BS_SETTINGS_PATH"); else qputenv("BS_SETTINGS_PATH", value); }
+    } restorePath{priorPath};
+    qputenv("BS_SETTINGS_PATH", (settingsDir.path() + "/settings.json").toUtf8());
+    if (!controller.saveBackendSettings(QStringLiteral(R"({"backends":{"opencode":{"enabled":false,"default_permission_mode":"ask"}},"default_backend":"claude"})")))
+        return 27;
+    SettingsDialog three(&controller, nullptr, descriptors);
+    auto *openCodeEnabled = three.findChild<QCheckBox *>("BackendEnabled_opencode");
+    auto *openCodeModel = three.findChild<QComboBox *>("BackendModel_opencode");
+    auto *openCodeKey = three.findChild<QLineEdit *>("BackendKey_opencode");
+    if (!openCodeEnabled || openCodeEnabled->isChecked() || !openCodeModel ||
+        !openCodeKey || openCodeKey->echoMode() != QLineEdit::Password) return 28;
+    // Users need the config source for this Windows account, with a folder
+    // action available only on the OpenCode tab. Do not launch Explorer here.
+    auto *configDirectory = three.findChild<QLabel *>("OpenCodeConfigDirectory");
+    auto *openConfigFolder = three.findChild<QPushButton *>("OpenCodeOpenConfigFolder");
+    auto *configHelp = three.findChild<QLabel *>("OpenCodeConfigHelp");
+    if (!configDirectory || configDirectory->text().isEmpty() ||
+        configDirectory->text() != controller.opencodeConfigDirectory() ||
+        !openConfigFolder || !configHelp ||
+        !configHelp->text().contains("restart", Qt::CaseInsensitive)) return 32;
+    if (both.findChild<QPushButton *>("OpenCodeOpenConfigFolder")) return 33;
+    openCodeModel->setEditText("local/my-model");
+    if (!controller.saveBackendSettings(QStringLiteral(R"({"backends":{"opencode":{"enabled":true,"default_permission_mode":"ask"}},"default_backend":"claude"})")))
+        return 29;
+    if (!openCodeEnabled->isChecked() || agentchoices::modelComboSelection(openCodeModel) != "local/my-model")
+        return 30;
+    if (three.findChild<QComboBox *>("DefaultBackend")->findData("opencode") < 0) return 31;
     return 0;
 }
 

@@ -45,6 +45,7 @@ impl Handler for WorkspaceHandler {
                 )
                 .await;
                 items.extend(crate::agents::codex_backend::prerequisites(&d.dirs.root).await);
+                items.extend(crate::agents::opencode_backend::prerequisites(&d.dirs.root).await);
                 ok(CheckPrereqsResult { items })
             }
             // The daemon fetches on the agent's own credentials (or the

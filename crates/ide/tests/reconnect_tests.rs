@@ -548,13 +548,7 @@ fn wait_for(child: &mut std::process::Child, limit: Duration) -> Option<std::pro
 // the session, so the loop stops and says which two pieces do not match.
 // ---------------------------------------------------------------------------
 
-/// What the status bar must say when the pair does not match, and the text
-/// that must never appear beside it. The hint is part of it: the IDE stops
-/// here rather than trying to repair anything, so the sentence has to say what
-/// the user does next.
-const MISMATCH_TEXT: &str =
-    "daemon: protocol mismatch (daemon 3, IDE 2) \u{2014} rebuild the daemon \
-     (scripts\\build-daemon.ps1) or reinstall the package";
+/// Text that must never appear beside a protocol mismatch.
 const RECONNECTING_PREFIX: &str = "daemon: reconnecting (attempt";
 /// The mismatch is decided by the handshake, so a cold Qt start is all this
 /// waits for.
@@ -571,6 +565,14 @@ fn a_protocol_mismatch_stops_the_connection_loop_instead_of_backing_off() {
         .build()
         .expect("tokio runtime");
     let (addr, journal) = rt.block_on(fake_daemon_speaking_the_next_protocol());
+    // The fake speaks the next version. Keep the numbers tied to that fixture
+    // while asserting the full recovery hint the user must see.
+    let mismatch_text = format!(
+        "daemon: protocol mismatch (daemon {}, IDE {}) \u{2014} rebuild the daemon \
+         (scripts\\build-daemon.ps1) or reinstall the package",
+        PROTOCOL_VERSION + 1,
+        PROTOCOL_VERSION,
+    );
 
     let config = std::env::temp_dir().join(format!("bs-mismatch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&config);
@@ -601,7 +603,7 @@ fn a_protocol_mismatch_stops_the_connection_loop_instead_of_backing_off() {
     // supervisor logs the same sentence it puts in the status bar, which is the
     // only way to read the bar from outside an offscreen process -- then given
     // a moment to prove nothing follows, and stopped.
-    let saw = wait_for_text(&mut child, &out, &err, MISMATCH_TEXT, MISMATCH_LIMIT);
+    let saw = wait_for_text(&mut child, &out, &err, &mismatch_text, MISMATCH_LIMIT);
     std::thread::sleep(Duration::from_secs(2));
     let _ = child.kill();
     let _ = child.wait();
@@ -611,7 +613,7 @@ fn a_protocol_mismatch_stops_the_connection_loop_instead_of_backing_off() {
 
     assert!(
         saw,
-        "the status bar never said {MISMATCH_TEXT:?} within {MISMATCH_LIMIT:?}\n{context}"
+        "the status bar never said {mismatch_text:?} within {MISMATCH_LIMIT:?}\n{context}"
     );
     assert!(
         !logs.contains("panicked at"),

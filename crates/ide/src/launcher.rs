@@ -19,6 +19,24 @@ pub struct LaunchSpec {
     /// differs from the installed one, it is copied into the distro first.
     pub local_daemon_binary: Option<PathBuf>,
     pub log_level: String,
+    /// Native Windows XDG config root, forwarded through the WSL path mapper.
+    pub opencode_config_root: Option<PathBuf>,
+}
+
+/// The same native XDG config root OpenCode uses for the desktop user.
+pub fn user_opencode_config_root() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()));
+    let xdg = std::env::var_os("XDG_CONFIG_HOME");
+    resolve_user_config_root(home.as_deref(), xdg.as_deref())
+}
+
+fn resolve_user_config_root(home: Option<&Path>, xdg: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    xdg.filter(|path| Path::new(path).is_absolute())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| home.join(".config")))
 }
 
 pub struct DaemonProcess {
@@ -398,19 +416,24 @@ pub fn windows_path_to_wsl(p: &Path) -> Option<String> {
 }
 
 /// The shell wrapper lets `~` expand and picks up the user's PATH from .bashrc.
-pub fn command_for(spec: &LaunchSpec) -> (String, Vec<String>) {
+pub fn command_for(spec: &LaunchSpec) -> Result<(String, Vec<String>)> {
     // Both halves quoted. The line travels to `bash -lc` as one string, so a
     // daemon installed under a path with a space in it -- which is what
     // `C:\Program Files` becomes the moment a package is unzipped where Windows
     // suggests -- would otherwise start the first half of its own path with the
     // second half as a stray argument.
-    let inner = format!(
+    let mut inner = format!(
         "exec {} --log-level {}",
         quoted_distro_path(&spec.daemon_path_in_wsl),
         single_quoted(&spec.log_level)
     );
+    if let Some(root) = &spec.opencode_config_root {
+        let path =
+            wsl_path(root, &spec.distro).map_err(|why| anyhow!("OpenCode config folder: {why}"))?;
+        inner = format!("BS_OPENCODE_CONFIG_ROOT={} {inner}", single_quoted(&path));
+    }
     if cfg!(windows) {
-        (
+        Ok((
             "wsl.exe".into(),
             vec![
                 "-d".into(),
@@ -420,9 +443,9 @@ pub fn command_for(spec: &LaunchSpec) -> (String, Vec<String>) {
                 "-lc".into(),
                 inner,
             ],
-        )
+        ))
     } else {
-        ("bash".into(), vec!["-lc".into(), inner])
+        Ok(("bash".into(), vec!["-lc".into(), inner]))
     }
 }
 
@@ -531,7 +554,7 @@ pub(crate) async fn install_daemon(spec: &LaunchSpec) -> Result<()> {
 
 pub async fn launch(spec: &LaunchSpec) -> Result<DaemonProcess> {
     install_daemon(spec).await?;
-    let (prog, args) = command_for(spec);
+    let (prog, args) = command_for(spec)?;
     let mut child = Command::new(&prog)
         .args(&args)
         .stdin(Stdio::piped())
@@ -968,8 +991,9 @@ mod tests {
             daemon_path_in_wsl: "~/.bondsymphonic/bin/bondsymphonic-daemon".into(),
             local_daemon_binary: None,
             log_level: "debug".into(),
+            opencode_config_root: None,
         };
-        let (prog, args) = command_for(&spec);
+        let (prog, args) = command_for(&spec).unwrap();
         assert_eq!(prog, "wsl.exe");
         assert_eq!(
             args,
@@ -996,11 +1020,59 @@ mod tests {
             daemon_path_in_wsl: "/opt/my dir/daemon".into(),
             local_daemon_binary: None,
             log_level: "debug".into(),
+            opencode_config_root: None,
         };
-        let (_prog, args) = command_for(&spec);
+        let (_prog, args) = command_for(&spec).unwrap();
         assert_eq!(
             args.last().map(String::as_str),
             Some("exec '/opt/my dir/daemon' --log-level 'debug'")
         );
+    }
+
+    #[test]
+    fn forwards_windows_opencode_configuration_as_a_quoted_wsl_path() {
+        let spec = LaunchSpec {
+            distro: "bondsymphonic".into(),
+            daemon_path_in_wsl: "/opt/daemon".into(),
+            local_daemon_binary: None,
+            log_level: "info".into(),
+            opencode_config_root: Some(PathBuf::from(r"C:\Users\O'Neil Smith\.config")),
+        };
+        let (_, args) = command_for(&spec).unwrap();
+        assert_eq!(args.last().unwrap(), "BS_OPENCODE_CONFIG_ROOT='/mnt/c/Users/O'\\''Neil Smith/.config' exec '/opt/daemon' --log-level 'info'");
+    }
+
+    #[test]
+    fn windows_user_config_root_respects_absolute_xdg_override() {
+        let home = Path::new(r"C:\Users\desktop-user");
+        let xdg = std::ffi::OsStr::new(r"D:\OpenCode config");
+        assert_eq!(
+            resolve_user_config_root(Some(home), Some(xdg)),
+            Some(PathBuf::from(xdg))
+        );
+        for invalid in ["", "relative-config"] {
+            assert_eq!(
+                resolve_user_config_root(Some(home), Some(std::ffi::OsStr::new(invalid))),
+                Some(home.join(".config"))
+            );
+        }
+        assert_eq!(
+            resolve_user_config_root(Some(home), None),
+            Some(home.join(".config"))
+        );
+        assert_eq!(resolve_user_config_root(None, None), None);
+    }
+
+    #[test]
+    fn inaccessible_unc_config_is_reported_instead_of_using_another_user() {
+        let spec = LaunchSpec {
+            distro: "bondsymphonic".into(),
+            daemon_path_in_wsl: "/opt/daemon".into(),
+            local_daemon_binary: None,
+            log_level: "info".into(),
+            opencode_config_root: Some(PathBuf::from(r"\\server\private\opencode-config")),
+        };
+        let error = command_for(&spec).unwrap_err().to_string();
+        assert!(error.contains("OpenCode config folder"), "{error}");
     }
 }
