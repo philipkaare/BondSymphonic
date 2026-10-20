@@ -1152,7 +1152,7 @@ void MainWindow::connectController() {
                              return;
                          }
                          m_groupModel->setTabOptions(workspaceId, optionsJson);
-                         m_agentArea->setStarting(workspaceId, true);
+                         m_agentArea->setStarting(workspaceId, true, true);
                          m_controller->startAgent(workspaceId, optionsJson);
                      });
     // The small grey lines are a setting, so a pane built at any point after
@@ -1911,7 +1911,7 @@ void MainWindow::armAutoRestart(const QString& workspaceId, const QString& previ
         // change, a reconnect, a second selection -- can ask for a second agent
         // while this one is on its way.
         m_autoStarting.insert(workspaceId);
-        m_agentArea->setStarting(workspaceId, true);
+        m_agentArea->setStarting(workspaceId, true, !opening);
         // The transcript's options when there is one, for the same reason the
         // Restart button uses them: they carry the session id, so the
         // conversation the user is looking at continues instead of being
@@ -2236,7 +2236,7 @@ void MainWindow::resumeAgentAfterRestart(const QString& workspaceId) {
         m_autoRestartBarred.remove(workspaceId);
         m_autoRestartedAt.remove(workspaceId);
         m_autoStarting.insert(workspaceId);
-        m_agentArea->setStarting(workspaceId, true);
+        m_agentArea->setStarting(workspaceId, true, true);
         // The transcript's options when it has them, for the same reason a
         // Restart uses them: they carry the session to resume.
         TranscriptModel* model = m_agentArea->transcriptModel(workspaceId);
@@ -2291,7 +2291,7 @@ void MainWindow::onStartAgentRequested(const QString& workspaceId) {
         m_agentArea->setStarting(workspaceId, false);
         return;
     }
-    m_agentArea->setStarting(workspaceId, true);
+    m_agentArea->setStarting(workspaceId, true, !tab.value("agent_id").toString().isEmpty());
     // The user pressing Restart with the failure in front of them is the one
     // thing that lifts the bar on automatic starts: they have decided this is
     // worth another try, which is precisely the decision the bar was refusing to

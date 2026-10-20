@@ -56,7 +56,7 @@ public:
     /// shut for as long: a second restart asked for while the first is in
     /// flight would race it, and the winner would be whichever process came up
     /// last.
-    void setStarting(bool starting);
+    void setStarting(bool starting, bool restarting = false);
 
     /// Whether the workspace behind this pane cannot run -- its sandbox is
     /// down or never started. The prompt box says so instead of offering to
@@ -319,6 +319,7 @@ private:
     QList<QWidget*> m_notices;
     /// See [`setStarting`].
     bool m_starting = false;
+    bool m_restarting = false;
     /// See [`setWorkspaceDown`].
     bool m_workspaceDown = false;
     /// See [`setClaudeLoggedIn`]. True until told otherwise, so a view built

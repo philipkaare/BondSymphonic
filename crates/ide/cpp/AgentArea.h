@@ -87,7 +87,7 @@ public:
     /// transcript pane can say "starting" rather than offering a Start button.
     /// Remembered even for a workspace whose pane does not exist yet, because a
     /// Claude workspace is created before its tab is first shown.
-    void setStarting(const QString& workspaceId, bool starting);
+    void setStarting(const QString& workspaceId, bool starting, bool restarting = false);
 
     /// Whether Claude Code is logged in, per the daemon's `claude_auth`
     /// prerequisite. Applied to every transcript pane, now and as each one is
@@ -277,6 +277,7 @@ private:
     /// Workspaces with an `agent.start` in flight, kept here rather than only
     /// on the pane because the start begins before the pane exists.
     QSet<QString> m_starting;
+    QSet<QString> m_restarting;
     /// See [`setShowMeta`]. True until the window says otherwise, which is the
     /// setting's own default.
     bool m_showMeta = true;

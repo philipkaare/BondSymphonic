@@ -593,12 +593,13 @@ void TranscriptView::refreshGate() {
     m_loginButton->show();
 }
 
-void TranscriptView::setStarting(bool starting) {
+void TranscriptView::setStarting(bool starting, bool restarting) {
     const QString agentId = m_model.isNull() ? QString() : m_model->getAgentId();
-    if (m_starting == starting && (!starting || m_startFromAgentId == agentId)) {
+    if (m_starting == starting && m_restarting == restarting && (!starting || m_startFromAgentId == agentId)) {
         return;
     }
     m_starting = starting;
+    m_restarting = starting && restarting;
     if (starting) {
         m_startFromAgentId = agentId;
     }
@@ -650,7 +651,7 @@ void TranscriptView::onStateChanged() {
     // The box is shut whenever there is no running agent to read it: text
     // typed into it then would be sent nowhere.
     if (m_starting) {
-        m_input->setBusy(true, QStringLiteral("starting the agent") + QChar(kEllipsis));
+        m_input->setBusy(true, (m_restarting ? QStringLiteral("restarting the agent") : QStringLiteral("starting the agent")) + QChar(kEllipsis));
     } else if (m_workspaceDown) {
         // Before "no agent": both are true, and only this one says what to do.
         m_input->setBusy(true, QStringLiteral("this workspace is not running; see Retry above"));
@@ -659,7 +660,7 @@ void TranscriptView::onStateChanged() {
     } else if (busy) {
         m_input->setBusy(true, QStringLiteral("replaying history") + QChar(kEllipsis));
     } else if (comingBack) {
-        m_input->setBusy(true, QStringLiteral("restarting the agent") + QChar(kEllipsis));
+        m_input->setBusy(true, QStringLiteral("starting the agent") + QChar(kEllipsis));
     } else if (exited) {
         m_input->setBusy(true, QStringLiteral("the agent is not running"));
     } else if (state == QString::fromUtf8(kStateError)) {
@@ -667,8 +668,8 @@ void TranscriptView::onStateChanged() {
     } else {
         m_input->setBusy(working);
     }
-    m_progressText->setText(m_starting ? QStringLiteral("Starting the agent") + QChar(kEllipsis)
-                                       : QStringLiteral("Restarting the agent") + QChar(kEllipsis));
+    m_progressText->setText((m_starting && m_restarting ? QStringLiteral("Restarting the agent")
+                                                     : QStringLiteral("Starting the agent")) + QChar(kEllipsis));
     m_progress->setVisible(comingBack);
     m_interrupt->setEnabled(!noAgent && !m_starting && !busy && working);
     // Shut only while a start is already in flight or the history is still
@@ -1526,7 +1527,7 @@ extern "C" std::int32_t bs_widget_test_transcript_shows_progress_while_the_agent
     if (!view.progressShown() || !view.bannerText().isEmpty() || !view.inputLocked()) {
         return 1;
     }
-    if (!view.progressText().startsWith(QLatin1String("Restarting"))) {
+    if (!view.progressText().startsWith(QLatin1String("Starting"))) {
         return 2;
     }
 
@@ -1535,6 +1536,11 @@ extern "C" std::int32_t bs_widget_test_transcript_shows_progress_while_the_agent
     if (!view.progressShown() || !view.progressText().startsWith(QLatin1String("Starting")) ||
         !view.inputLocked()) {
         return 3;
+    }
+    view.setStarting(true, true);
+    if (!view.progressShown() || !view.progressText().startsWith(QLatin1String("Restarting")) ||
+        !view.inputLocked()) {
+        return 9;
     }
 
     // The new agent answers: no row, an open box.

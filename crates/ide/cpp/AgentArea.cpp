@@ -234,7 +234,7 @@ void AgentArea::applyWelcome(const QString& workspaceId, TranscriptView* view) {
                      tab.value(QStringLiteral("worktree_path")).toString());
 }
 
-void AgentArea::setStarting(const QString& workspaceId, bool starting) {
+void AgentArea::setStarting(const QString& workspaceId, bool starting, bool restarting) {
     if (workspaceId.isEmpty()) {
         return;
     }
@@ -244,7 +244,12 @@ void AgentArea::setStarting(const QString& workspaceId, bool starting) {
         m_starting.remove(workspaceId);
     }
     if (TranscriptView* view = m_transcripts.value(workspaceId)) {
-        view->setStarting(starting);
+        view->setStarting(starting, restarting);
+    }
+    if (starting && restarting) {
+        m_restarting.insert(workspaceId);
+    } else {
+        m_restarting.remove(workspaceId);
     }
 }
 
@@ -288,7 +293,7 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
                          });
         // A start that began before this pane existed -- which is every
         // workspace created with an agent, since the tab is shown first.
-        view->setStarting(m_starting.contains(workspaceId));
+        view->setStarting(m_starting.contains(workspaceId), m_restarting.contains(workspaceId));
         // Built with the gate the area already knows about, rather than with a
         // composer that is taken away a moment later.
         view->setClaudeLoggedIn(m_claudeLoggedIn);
@@ -368,6 +373,7 @@ void AgentArea::removeWorkspace(const QString& workspaceId) {
     m_problems.remove(workspaceId);
     m_attached.remove(workspaceId);
     m_starting.remove(workspaceId);
+    m_restarting.remove(workspaceId);
     m_banners.remove(workspaceId);
     m_pendingBanners.remove(workspaceId);
     // The page owns the banner and the pane; taking it out of the stack takes
