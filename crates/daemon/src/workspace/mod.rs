@@ -170,6 +170,8 @@ impl DataDirs {
             self.root.join("agent-homes/opencode").join(id.as_str()),
             self.root.join("agent-run/opencode").join(id.as_str()),
             self.root.join("agent-caches/opencode").join(id.as_str()),
+            // The workspace's OpenCode sessions and its copy of the login.
+            self.root.join("agent-xdg/opencode").join(id.as_str()),
         ] {
             let _ = std::fs::remove_dir_all(p);
         }

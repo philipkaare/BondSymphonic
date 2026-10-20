@@ -42,7 +42,8 @@ pub const ALL_ACTIONS: [SetupAction; 13] = [
 ];
 
 /// The command each action runs. The whole table is literal: an action selects
-/// a row, it never contributes to one.
+/// a row, it never contributes to one. (OpenCode's rows name the CLI by the
+/// path the daemon resolved, which no client has a say in either.)
 pub fn setup_argv(action: SetupAction) -> Vec<String> {
     let argv: &[&str] = match action {
         SetupAction::ClaudeLogin => &["claude", "auth", "login"],
@@ -58,8 +59,8 @@ pub fn setup_argv(action: SetupAction) -> Vec<String> {
             "-lc",
             include_str!("../../../scripts/install-opencode.sh"),
         ],
-        SetupAction::OpencodeLogin => &["opencode", "auth", "login"],
-        SetupAction::OpencodeLogout => &["opencode", "auth", "logout"],
+        SetupAction::OpencodeLogin => return opencode_argv(&["auth", "login"]),
+        SetupAction::OpencodeLogout => return opencode_argv(&["auth", "logout"]),
         // Logging out is as interactive as logging in -- `gh auth logout` asks
         // which host to forget and then asks again whether it means it -- so
         // both run in the same terminal the logins do rather than being fired
@@ -92,6 +93,23 @@ pub fn setup_argv(action: SetupAction) -> Vec<String> {
     argv.iter().map(|s| (*s).to_string()).collect()
 }
 
+/// The OpenCode CLI the daemon itself resolved, the same one model discovery
+/// runs, never a bare `opencode` from `PATH` -- which under WSL can be a
+/// Windows build on `/mnt/c`. Not installed, it is the path the installer
+/// puts it at, so the terminal says that file is missing.
+fn opencode_argv(args: &[&str]) -> Vec<String> {
+    let mut argv = crate::agents::opencode_backend::host_argv().unwrap_or_else(|_| {
+        vec![host_home()
+            .join(".local")
+            .join("bin")
+            .join("opencode")
+            .display()
+            .to_string()]
+    });
+    argv.extend(args.iter().map(|s| (*s).to_string()));
+    argv
+}
+
 pub fn setup_env(root: &Path, action: SetupAction) -> Vec<(String, String)> {
     match action {
         SetupAction::CodexLogin | SetupAction::CodexLogout => vec![(
@@ -104,7 +122,7 @@ pub fn setup_env(root: &Path, action: SetupAction) -> Vec<(String, String)> {
             if let Err(error) = crate::agents::opencode_backend::ensure_native_home(root) {
                 tracing::warn!("OpenCode configuration could not be refreshed for setup: {error}");
             }
-            crate::agents::opencode_backend::process_env(root, None)
+            crate::agents::opencode_backend::host_env(root, None)
         }
         _ => vec![],
     }
@@ -238,11 +256,45 @@ mod tests {
     fn every_action_runs_one_of_the_four_known_programs() {
         for action in ALL_ACTIONS {
             let argv = setup_argv(action);
+            let opencode = Path::new(&argv[0]).file_name() == Some("opencode".as_ref());
             assert!(
-                ["claude", "codex", "opencode", "gh", "bash", "sudo"].contains(&argv[0].as_str()),
+                opencode || ["claude", "codex", "gh", "bash", "sudo"].contains(&argv[0].as_str()),
                 "{action:?} runs an unexpected program: {argv:?}"
             );
         }
+    }
+
+    /// OpenCode's sign-in runs with no sandbox around it, so it is the CLI the
+    /// daemon resolved itself -- never whatever `opencode` is first on `PATH`,
+    /// which under WSL can be a Windows build on `/mnt/c`.
+    #[test]
+    fn opencode_sign_in_runs_the_resolved_cli_not_one_from_path() {
+        if std::env::var_os("BS_OPENCODE_BIN").is_some() {
+            return;
+        }
+        for (action, verb) in [
+            (SetupAction::OpencodeLogin, "login"),
+            (SetupAction::OpencodeLogout, "logout"),
+        ] {
+            let argv = setup_argv(action);
+            assert!(Path::new(&argv[0]).is_absolute(), "{argv:?}");
+            assert_eq!(argv[1..], ["auth", verb]);
+        }
+    }
+
+    /// The sign-in terminal uses the host-owned OpenCode home, and never loads
+    /// configuration or plugins from whatever directory it starts in.
+    #[test]
+    fn opencode_sign_in_uses_the_host_home_without_project_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = setup_env(dir.path(), SetupAction::OpencodeLogin);
+        let home = crate::agents::opencode_backend::opencode_home(dir.path());
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "XDG_CONFIG_HOME" && Path::new(v) == home.join("config")));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "OPENCODE_DISABLE_PROJECT_CONFIG" && v == "1"));
     }
 
     #[test]

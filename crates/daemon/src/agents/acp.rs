@@ -21,12 +21,31 @@ use tokio::{
 type Answer = Result<Value, RpcError>;
 
 /// Native credentials can live in auth.json or provider JSON/JSONC config,
-/// without entering process env. Refresh before consuming outputs and retain
-/// old values after rotations.
+/// without entering process env. Read once per launch; before consuming an
+/// output each file is only stat'ed, and read again only when that changed (a
+/// provider rotating its token mid-launch), so streaming does not read files
+/// per frame. Old values are retained after rotations.
 pub struct AcpSecrets {
     auth: Option<PathBuf>,
     config: Vec<PathBuf>,
     known: Mutex<HashSet<String>>,
+    stamps: Mutex<HashMap<PathBuf, Stamp>>,
+    reads: AtomicU64,
+}
+
+type Stamp = Option<(u64, Option<std::time::SystemTime>, u64)>;
+
+/// Size, mtime and inode without following a link or opening the file, so an
+/// agent-replaced FIFO is noticed as a change and never waited on, and a
+/// rename-into-place counts as a change even within one mtime tick.
+fn stamp(path: &std::path::Path) -> Stamp {
+    std::fs::symlink_metadata(path).ok().map(|m| {
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&m);
+        #[cfg(not(unix))]
+        let inode = 0;
+        (m.len(), m.modified().ok(), inode)
+    })
 }
 fn secret_field(key: &str) -> bool {
     matches!(
@@ -194,18 +213,31 @@ impl AcpSecrets {
             auth,
             config,
             known: Mutex::new(known),
+            stamps: Mutex::new(HashMap::new()),
+            reads: AtomicU64::new(0),
         };
         source.refresh();
         source
     }
-    fn refresh(&self) {
+    fn files(&self) -> impl Iterator<Item = (&PathBuf, usize)> {
         // Auth retains its existing 1 MiB bound. Accepted mirrored configs
         // must also fit the credential scan, including late literal keys.
-        for (path, limit) in self.auth.iter().map(|path| (path, 1024 * 1024)).chain(
+        self.auth.iter().map(|path| (path, 1024 * 1024)).chain(
             self.config
                 .iter()
                 .map(|path| (path, super::opencode_config::CONFIG_READ_LIMIT)),
-        ) {
+        )
+    }
+    /// Reads each file whose stamp differs from the one last read.
+    fn refresh(&self) {
+        let mut stamps = self.stamps.lock();
+        for (path, limit) in self.files() {
+            let now = stamp(path);
+            if stamps.get(path) == Some(&now) {
+                continue;
+            }
+            stamps.insert(path.clone(), now);
+            self.reads.fetch_add(1, Ordering::Relaxed);
             let Ok(bytes) = super::opencode_config::read_regular_file(path, limit, false) else {
                 continue;
             };
@@ -456,5 +488,84 @@ impl Drop for AcpRpc {
     fn drop(&mut self) {
         self.calls.lock().fail("OpenCode connection closed");
         self.reader.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secrets(dir: &std::path::Path) -> AcpSecrets {
+        std::fs::create_dir_all(dir.join("data/opencode")).unwrap();
+        std::fs::create_dir_all(dir.join("config/opencode")).unwrap();
+        std::fs::write(
+            dir.join("data/opencode/auth.json"),
+            r#"{"p":{"key":"old-auth"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config/opencode/opencode.json"),
+            r#"{"provider":{"p":{"options":{"apiKey":"old-config"}}}}"#,
+        )
+        .unwrap();
+        AcpSecrets::new(
+            &[
+                (
+                    "XDG_DATA_HOME".into(),
+                    dir.join("data").display().to_string(),
+                ),
+                (
+                    "XDG_CONFIG_HOME".into(),
+                    dir.join("config").display().to_string(),
+                ),
+            ],
+            None,
+        )
+    }
+
+    fn redacted(secrets: &AcpSecrets, text: &str) -> String {
+        let mut frame = json!({ "message": text });
+        secrets.redact(&mut frame);
+        frame["message"].as_str().unwrap().to_owned()
+    }
+
+    /// Streaming delivers hundreds of frames a second: a frame whose files
+    /// are unchanged is redacted from memory, without reading any of them.
+    #[test]
+    fn unchanged_files_are_not_read_per_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = secrets(dir.path());
+        let initial = secrets.reads.load(Ordering::Relaxed);
+        for _ in 0..100 {
+            assert_eq!(
+                redacted(&secrets, "old-auth old-config"),
+                "[redacted] [redacted]"
+            );
+        }
+        assert_eq!(secrets.reads.load(Ordering::Relaxed), initial);
+    }
+
+    /// A token the agent's own provider rotated mid-launch is caught at the
+    /// next frame, and the rotated-out one stays known.
+    #[test]
+    fn a_changed_file_is_read_again_before_the_next_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = secrets(dir.path());
+        let initial = secrets.reads.load(Ordering::Relaxed);
+        std::fs::write(
+            dir.path().join("data/opencode/auth.json"),
+            r#"{"p":{"key":"new-auth-token"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config/opencode/opencode.json"),
+            "{ // edited\n \"apiKey\": \"new-config\" }",
+        )
+        .unwrap();
+        assert_eq!(
+            redacted(&secrets, "new-auth-token old-auth new-config old-config"),
+            "[redacted] [redacted] [redacted] [redacted]"
+        );
+        assert_eq!(secrets.reads.load(Ordering::Relaxed), initial + 2);
     }
 }

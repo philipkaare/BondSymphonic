@@ -2,7 +2,7 @@ mod common;
 use bondsymphonic_daemon::agents::backend::Backend;
 use bondsymphonic_daemon::agents::{
     backend,
-    opencode_backend::{has_login, opencode_home, process_env, OpenCodeBackend},
+    opencode_backend::{has_login, host_env, opencode_home, OpenCodeBackend},
 };
 use bondsymphonic_proto::{AgentAdapterKind, SetupAction};
 static PROCESS_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -45,6 +45,8 @@ fn registered_with_native_setup_and_permissions() {
 
 #[test]
 fn credentials_and_state_are_backend_private() {
+    use bondsymphonic_daemon::agents::opencode_backend::{sandbox_env, workspace_state};
+    use bondsymphonic_proto::WorkspaceId;
     let dir = tempfile::tempdir().unwrap();
     assert!(!has_login(dir.path()));
     let home = opencode_home(dir.path());
@@ -56,16 +58,46 @@ fn credentials_and_state_are_backend_private() {
     }
     std::fs::write(&path, r#"{"openai":{"type":"api","key":"sentinel"}}"#).unwrap();
     assert!(has_login(dir.path()));
-    let env = process_env(dir.path(), Some("secret"));
+    let value = |env: &[(String, String)], key: &str| {
+        env.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| std::path::PathBuf::from(v))
+    };
+    // Host-run commands (model discovery, sign-in) use the host-owned home
+    // and never load configuration from whatever directory they start in.
+    let host = host_env(dir.path(), Some("secret"));
+    assert!(host
+        .iter()
+        .any(|(k, v)| k == "OPENAI_API_KEY" && v == "secret"));
+    assert_eq!(value(&host, "XDG_DATA_HOME"), Some(home.join("data")));
+    assert!(host
+        .iter()
+        .any(|(k, v)| k == "OPENCODE_DISABLE_PROJECT_CONFIG" && v == "1"));
+    assert!(!host
+        .iter()
+        .any(|(k, _)| k == "CODEX_HOME" || k == "ANTHROPIC_API_KEY"));
+    // A sandboxed agent reads the host config but keeps its data, state and
+    // cache in its own workspace's directory, never in the host home.
+    let first = WorkspaceId("ws_first".into());
+    let second = WorkspaceId("ws_second".into());
+    let env = sandbox_env(dir.path(), &first, Some("secret"));
+    assert_eq!(value(&env, "XDG_CONFIG_HOME"), Some(home.join("config")));
+    for key in ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] {
+        let path = value(&env, key).unwrap();
+        assert!(
+            path.starts_with(workspace_state(dir.path(), &first)),
+            "{key}"
+        );
+        assert!(!path.starts_with(&home), "{key}");
+        assert_ne!(
+            Some(path),
+            value(&sandbox_env(dir.path(), &second, None), key),
+            "{key}"
+        );
+    }
     assert!(env
         .iter()
         .any(|(k, v)| k == "OPENAI_API_KEY" && v == "secret"));
-    assert!(env
-        .iter()
-        .any(|(k, v)| k == "XDG_DATA_HOME" && v == &home.join("data").display().to_string()));
-    assert!(!env
-        .iter()
-        .any(|(k, _)| k == "CODEX_HOME" || k == "ANTHROPIC_API_KEY"));
 }
 
 #[test]
@@ -358,6 +390,7 @@ fn native_config_source_fifo_is_refused_without_waiting_for_a_writer() {
 
 #[tokio::test]
 async fn companion_state_is_isolated_and_removed_with_workspace() {
+    use bondsymphonic_daemon::agents::opencode_backend::workspace_state;
     use bondsymphonic_daemon::{
         daemon::Daemon,
         sandbox::noop::NoopBackend,
@@ -394,8 +427,24 @@ async fn companion_state_is_isolated_and_removed_with_workspace() {
     assert!(spec
         .home
         .ends_with(format!("agent-homes/opencode/{}", info.id)));
-    let shared = opencode_home(&daemon.dirs.root);
-    assert!(spec.rw_binds.contains(&(shared.clone(), shared.clone())));
+    // The host-owned home is the config and login of processes that run
+    // outside every sandbox: nothing writable may reach into it or contain it.
+    let host = opencode_home(&daemon.dirs.root);
+    for (path, target) in &spec.rw_binds {
+        for bound in [path, target] {
+            assert!(
+                !bound.starts_with(&host) && !host.starts_with(bound),
+                "{bound:?} is bound writable over the host OpenCode home"
+            );
+        }
+    }
+    let config = host.join("config");
+    assert!(spec.ro_binds.contains(&(config.clone(), config)));
+    // Sessions live in the workspace's own state directory, bound at its own
+    // path, and outside the agent's home so the agent cannot swap it for a link.
+    let state = workspace_state(&daemon.dirs.root, &info.id);
+    assert!(spec.rw_binds.contains(&(state.clone(), state.clone())));
+    assert!(!state.starts_with(&spec.home));
     assert!(!spec
         .rw_binds
         .iter()
@@ -403,6 +452,7 @@ async fn companion_state_is_isolated_and_removed_with_workspace() {
     for path in [
         &spec.home,
         &spec.run_dir,
+        &state.join("data/opencode/storage"),
         &daemon
             .dirs
             .root
@@ -414,6 +464,7 @@ async fn companion_state_is_isolated_and_removed_with_workspace() {
     lifecycle::destroy(&daemon, &info.id, false).await.unwrap();
     assert!(!spec.home.exists());
     assert!(!spec.run_dir.exists());
+    assert!(!state.exists(), "the workspace's sessions outlived it");
     assert!(repo.join("README.md").exists());
 }
 
@@ -625,4 +676,141 @@ async fn config_read_errors_stop_prepare_and_model_discovery_with_actionable_err
         assert!(error.message.contains("opencode.json"));
     }
     lifecycle::destroy(&daemon, &info.id, false).await.unwrap();
+}
+
+#[tokio::test]
+async fn each_launch_copies_the_host_login_into_the_workspace_and_never_back() {
+    use bondsymphonic_daemon::{
+        agents::opencode_backend::workspace_state,
+        daemon::Daemon,
+        sandbox::backend_for,
+        server::broadcast::EventBus,
+        workspace::{lifecycle, DataDirs},
+    };
+    use bondsymphonic_proto::*;
+    let _environment = PROCESS_ENV.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let _config_source = EnvScope::set("BS_OPENCODE_CONFIG_ROOT", &dir.path().join("regular"));
+    let _binary = EnvScope::set("BS_OPENCODE_BIN", &dir.path().join("opencode"));
+    let repo = common::init_repo(dir.path());
+    let daemon = |root: &std::path::Path| {
+        Daemon::new(
+            DataDirs::new(root.to_path_buf()),
+            backend_for("noop"),
+            EventBus::new(100),
+        )
+        .unwrap()
+    };
+    let root = dir.path().join("data");
+    let first = daemon(&root);
+    let info = lifecycle::create(
+        &first,
+        WorkspaceCreateParams {
+            repo_path: repo.display().to_string(),
+            base_branch: "main".into(),
+            name: "login".into(),
+            in_place: true,
+            init_if_missing: false,
+        },
+    )
+    .await
+    .unwrap();
+    let host_auth = opencode_home(&root).join("data/opencode/auth.json");
+    std::fs::create_dir_all(host_auth.parent().unwrap()).unwrap();
+    std::fs::write(&host_auth, r#"{"openai":{"type":"api","key":"host-key"}}"#).unwrap();
+    let options: AgentStartOptions = serde_json::from_value(serde_json::json!({})).unwrap();
+    let workspace = first.workspace(&info.id).unwrap();
+    let prepared = OpenCodeBackend
+        .prepare(&first, &workspace, &options)
+        .await
+        .unwrap();
+    let data = |env: &[(String, String)]| {
+        std::path::PathBuf::from(&env.iter().find(|(k, _)| k == "XDG_DATA_HOME").unwrap().1)
+    };
+    let copy = data(&prepared.env).join("opencode/auth.json");
+    assert!(copy.starts_with(workspace_state(&root, &info.id)));
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        std::fs::read(&host_auth).unwrap()
+    );
+    // What the workspace writes stays in the workspace: the host login is
+    // data the host-run CLI trusts, so a sandbox never writes it.
+    std::fs::write(
+        &copy,
+        r#"{"https://example.invalid":{"type":"wellknown","key":"X","token":"planted"}}"#,
+    )
+    .unwrap();
+    assert!(std::fs::read_to_string(&host_auth)
+        .unwrap()
+        .contains("host-key"));
+    // A restarted daemon resumes in the same state directory, where the
+    // sessions are, and the next launch takes the host login again.
+    drop(first);
+    let second = daemon(&root);
+    let workspace = second.workspace(&info.id).unwrap();
+    let again = OpenCodeBackend
+        .prepare(&second, &workspace, &options)
+        .await
+        .unwrap();
+    assert_eq!(data(&again.env), data(&prepared.env));
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        std::fs::read(&host_auth).unwrap()
+    );
+    // Signing out on the host signs every next launch out too.
+    std::fs::remove_file(&host_auth).unwrap();
+    OpenCodeBackend
+        .prepare(&second, &workspace, &options)
+        .await
+        .unwrap();
+    assert!(!copy.exists());
+    lifecycle::destroy(&second, &info.id, false).await.unwrap();
+}
+
+#[test]
+fn the_config_mirror_is_usable_read_only() {
+    use bondsymphonic_daemon::agents::opencode_backend::seed_native_files;
+    // OpenCode 1.14.48 exits at startup when it cannot create `.gitignore` in
+    // its config directory; with one present it runs from a read-only mount.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("managed");
+    seed_native_files(&root, &dir.path().join("none"), &dir.path().join("data")).unwrap();
+    let ignore = opencode_home(&root).join("config/opencode/.gitignore");
+    assert!(ignore.is_file());
+    std::fs::write(&ignore, b"mine").unwrap();
+    seed_native_files(&root, &dir.path().join("none"), &dir.path().join("data")).unwrap();
+    assert_eq!(std::fs::read(&ignore).unwrap(), b"mine");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_login_copy_never_follows_a_link_the_workspace_planted() {
+    use bondsymphonic_daemon::agents::opencode_config::copy_login;
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let host = dir.path().join("host");
+    std::fs::create_dir_all(host.join("data/opencode")).unwrap();
+    std::fs::write(host.join("data/opencode/auth.json"), b"{\"a\":1}").unwrap();
+    let victim = dir.path().join("victim");
+    std::fs::create_dir(&victim).unwrap();
+    std::fs::write(victim.join("auth.json"), b"user-file").unwrap();
+    for point in ["data", "data/opencode", "data/opencode/auth.json"] {
+        let state = dir.path().join(point.replace('/', "-"));
+        let link = state.join(point);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(
+            if point.ends_with(".json") {
+                victim.join("auth.json")
+            } else {
+                victim.clone()
+            },
+            &link,
+        )
+        .unwrap();
+        assert!(copy_login(&host, &state).is_err(), "{point}");
+        assert_eq!(
+            std::fs::read(victim.join("auth.json")).unwrap(),
+            b"user-file"
+        );
+    }
 }

@@ -8,6 +8,17 @@ const CONFIGS: [&str; 3] = ["config.json", "opencode.json", "opencode.jsonc"];
 pub(crate) const CONFIG_READ_LIMIT: usize = 8 * 1024 * 1024;
 const MANIFEST: &str = ".native-config-mirrors.json";
 pub const USER_CONFIG_ROOT_ENV: &str = "BS_OPENCODE_CONFIG_ROOT";
+/// The host-owned OpenCode home under the daemon's data root. Not the earlier
+/// `opencode-home`: that one was bound writable into every sandbox, so
+/// nothing in it is trusted, and a host-run `opencode` loads config, plugins
+/// and well-known remote config from its home.
+pub const HOST_HOME_DIR: &str = "opencode-host";
+const AUTH_READ_LIMIT: usize = 1024 * 1024;
+/// What OpenCode 1.14.48 writes into each config directory it loads. It exits
+/// at startup when it cannot create the file, and does not rewrite one that
+/// exists, so the mirror carries it for sandboxes that see the config read-only.
+const CONFIG_GITIGNORE: &[u8] =
+    b"node_modules\npackage.json\npackage-lock.json\nbun.lock\n.gitignore";
 
 /// The desktop's Windows-user source wins over the daemon user's XDG source.
 /// Empty and relative values do not qualify as XDG base directories.
@@ -364,7 +375,7 @@ fn source(path: &Path) -> io::Result<Option<Vec<u8>>> {
 pub fn seed_native_files(root: &Path, config: &Path, data: &Path) -> io::Result<()> {
     static IMPORT: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     let _guard = IMPORT.lock();
-    let home = ManagedDir::root(root)?.child("opencode-home")?;
+    let home = ManagedDir::root(root)?.child(HOST_HOME_DIR)?;
     let already_imported = home.exists(".native-imported")?;
     let manifest = home.read(MANIFEST)?;
     let mut mirrored = match &manifest {
@@ -420,6 +431,9 @@ pub fn seed_native_files(root: &Path, config: &Path, data: &Path) -> io::Result<
             mirrored.remove(name);
         }
     }
+    if !target.exists(".gitignore")? {
+        target.write(".gitignore", CONFIG_GITIGNORE)?;
+    }
     // Keep the auth marker independent from config refresh. Logging out must
     // never resurrect the host's original provider login.
     if !already_imported {
@@ -433,4 +447,30 @@ pub fn seed_native_files(root: &Path, config: &Path, data: &Path) -> io::Result<
     }
     let bytes = serde_json::to_vec(&mirrored).map_err(io::Error::other)?;
     home.write(MANIFEST, &bytes)
+}
+
+/// Gives one sandbox the host's provider login: `<host>/data/opencode/auth.json`
+/// copied to `<state>/data/opencode/auth.json`, or that copy removed when the
+/// host has none (signed out).
+///
+/// A copy, not a bind of the host file: a sandbox that could write the host
+/// login could add a `wellknown` entry, which makes the next host-run
+/// `opencode` fetch remote config -- plugins included -- and run it outside
+/// every sandbox. The cost is that a token the provider rotates inside the
+/// sandbox is not written back; the next launch starts from the host login.
+///
+/// `state` itself is a bind source the sandbox cannot replace, but everything
+/// under it is the sandbox's, so the walk down refuses links.
+pub fn copy_login(host: &Path, state: &Path) -> io::Result<()> {
+    let source = host.join("data/opencode/auth.json");
+    let bytes = match read_regular_file(&source, AUTH_READ_LIMIT, false) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(context(&source, e)),
+    };
+    let target = ManagedDir::root(state)?.child("data")?.child("opencode")?;
+    match bytes {
+        Some(bytes) => target.write("auth.json", &bytes),
+        None => target.remove("auth.json"),
+    }
 }

@@ -22,8 +22,23 @@ use tokio::io::AsyncReadExt;
 
 pub const PINNED_OPENCODE_VERSION: &str = "1.14.48";
 pub struct OpenCodeBackend;
+
+/// The host-owned OpenCode home: the mirrored config and the provider login
+/// that `opencode auth login` writes. Host-run commands (model discovery,
+/// sign-in) use it as their XDG home. A sandbox sees only its `config`, and
+/// only read-only; nothing a sandbox writes ever lands in here.
 pub fn opencode_home(root: &Path) -> PathBuf {
-    root.join("opencode-home")
+    root.join(super::opencode_config::HOST_HOME_DIR)
+}
+
+/// One workspace's OpenCode data, state and cache -- its sessions among them.
+/// Bound read-write into that workspace's OpenCode sandbox at its own path, so
+/// the same paths work with and without a sandbox and a restarted daemon finds
+/// the sessions again. A sibling of the agent's home rather than a child: a
+/// child of a writable home could be swapped for a link before the next bind.
+/// Removed with the workspace.
+pub fn workspace_state(root: &Path, ws: &WorkspaceId) -> PathBuf {
+    root.join("agent-xdg/opencode").join(ws.as_str())
 }
 
 pub use super::opencode_config::seed_native_files;
@@ -40,21 +55,41 @@ pub fn ensure_native_home(root: &Path) -> std::io::Result<()> {
     seed_native_files(root, &config, &data)
 }
 
-pub fn process_env(root: &Path, api_key: Option<&str>) -> Vec<(String, String)> {
-    let home = opencode_home(root);
-    let mut env = [
-        ("XDG_CONFIG_HOME", "config"),
-        ("XDG_DATA_HOME", "data"),
-        ("XDG_CACHE_HOME", "cache"),
-        ("XDG_STATE_HOME", "state"),
-    ]
-    .into_iter()
-    .map(|(key, sub)| (key.into(), home.join(sub).display().to_string()))
-    .collect::<Vec<_>>();
+fn xdg_env(config: &Path, rest: &Path, api_key: Option<&str>) -> Vec<(String, String)> {
+    let mut env = vec![("XDG_CONFIG_HOME".into(), config.display().to_string())];
+    env.extend(
+        [
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_STATE_HOME", "state"),
+        ]
+        .into_iter()
+        .map(|(key, sub)| (key.into(), rest.join(sub).display().to_string())),
+    );
     if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
         env.push(("OPENAI_API_KEY".into(), key.into()));
     }
     env
+}
+
+/// The environment of an `opencode` the daemon runs on the host, outside
+/// every sandbox. Project config is off: such a command starts in no
+/// workspace, and must not load `.opencode` plugins from wherever it starts.
+pub fn host_env(root: &Path, api_key: Option<&str>) -> Vec<(String, String)> {
+    let home = opencode_home(root);
+    let mut env = xdg_env(&home.join("config"), &home, api_key);
+    env.push(("OPENCODE_DISABLE_PROJECT_CONFIG".into(), "1".into()));
+    env
+}
+
+/// The environment of a workspace's OpenCode agent: the host's config, the
+/// workspace's own data, state and cache.
+pub fn sandbox_env(root: &Path, ws: &WorkspaceId, api_key: Option<&str>) -> Vec<(String, String)> {
+    xdg_env(
+        &opencode_home(root).join("config"),
+        &workspace_state(root, ws),
+        api_key,
+    )
 }
 
 pub fn has_login(root: &Path) -> bool {
@@ -198,7 +233,17 @@ impl Backend for OpenCodeBackend {
             host_argv()?
         };
         argv.push("acp".into());
-        let mut env = process_env(&d.dirs.root, options.api_key.as_deref());
+        super::opencode_config::copy_login(
+            &opencode_home(&d.dirs.root),
+            &workspace_state(&d.dirs.root, &ws.id),
+        )
+        .map_err(|error| {
+            RpcError::new(
+                ErrorCode::IoError,
+                format!("OpenCode sign-in could not be given to the workspace: {error}"),
+            )
+        })?;
+        let mut env = sandbox_env(&d.dirs.root, &ws.id, options.api_key.as_deref());
         if d.backend.name() == super::claude::SANDBOXED_BACKEND {
             env.push(("BS_OPENCODE_SANDBOX".into(), "1".into()));
         }
@@ -253,7 +298,7 @@ impl Backend for OpenCodeBackend {
             .handle
             .spawn(SandboxCommand {
                 argv,
-                env: process_env(&d.dirs.root, api_key),
+                env: host_env(&d.dirs.root, api_key),
                 cwd: Some(host.home.clone()),
                 pty: None,
             })

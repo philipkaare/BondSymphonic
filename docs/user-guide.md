@@ -59,7 +59,9 @@ backend entry wins over the old field. A daemon without backend descriptors
 continues to expose Claude only; update the daemon before starting Codex.
 
 For OpenCode, press **Install OpenCode**, then **Sign in to OpenCode** to choose
-and authenticate a provider in the Setup terminal. The installer pins **1.14.48**.
+and authenticate a provider in the Setup terminal. The installer pins **1.14.48**,
+and each daemon start holds the copy it installed at that version instead of
+upgrading it.
 Models use IDs such as `openai/gpt-5`; the editable model list supports manual IDs.
 OpenCode offers **Ask before tools** and **YOLO (sandboxed)**, streams answers and
 tool results into the transcript, supports approvals and cancellation, and keeps
@@ -77,12 +79,24 @@ Windows files through WSL and writes its own snapshots, leaving source files
 untouched. Read failures appear as configuration errors.
 
 Authenticate providers through BondSymphonic's **Sign in to OpenCode** action;
-credentials and sessions are stored separately from the Windows desktop app in
-the daemon's `opencode-home`. An existing daemon-user `auth.json` is imported
-once; refreshing config does not undo a sign-out. Repository configuration
-continues to apply alongside these global configuration files. The
+the login is stored separately from the Windows desktop app in the daemon's
+`opencode-host` directory, beside the configuration snapshots. An existing
+daemon-user `auth.json` is imported once; refreshing config does not undo a
+sign-out. Repository configuration continues to apply alongside these global
+configuration files inside the sandbox; model discovery and the sign-in terminal
+run outside it and ignore repository configuration.
+
+Agents never write to `opencode-host`. The sandbox sees its configuration
+read-only, so your config and plugins apply but cannot be changed from inside.
+Each agent start copies the current login into the workspace; a token the
+provider refreshes during a run stays in that workspace and is not written back,
+and signing out applies to the next start. Sessions, logs and cache live in the
+workspace's own `agent-xdg/opencode/<workspace>` directory: they survive agent
+and daemon restarts, so resume works, are private to the workspace, and are
+deleted with it. Agents started before this layout keep their sessions in the
+old `opencode-home`, which is no longer used, and cannot resume them. The
 companion sandbox has its own home, cache, runtime and proxy; other backends
-cannot mount OpenCode's login and session directory.
+cannot mount OpenCode's login or sessions.
 
 Local model servers require a route reachable from the sandbox. Its `localhost`
 is separate from the Windows and WSL hosts; entering a host loopback URL alone

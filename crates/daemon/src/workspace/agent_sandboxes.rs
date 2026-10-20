@@ -83,8 +83,13 @@ async fn build_spec(
         spec.rw_binds.push((home.clone(), home));
     }
     if kind == AgentAdapterKind::OpenCode {
-        let home = crate::agents::opencode_backend::opencode_home(&d.dirs.root);
-        spec.rw_binds.push((home.clone(), home));
+        // The host's OpenCode home is what host-run `opencode` loads config
+        // and plugins from: the sandbox gets its config read-only and nothing
+        // else of it. Sessions and the copied login are the workspace's own.
+        let config = crate::agents::opencode_backend::opencode_home(&d.dirs.root).join("config");
+        spec.ro_binds.push((config.clone(), config));
+        let state = crate::agents::opencode_backend::workspace_state(&d.dirs.root, &ws.id);
+        spec.rw_binds.push((state.clone(), state));
     }
     Ok((spec, protection))
 }
@@ -202,10 +207,12 @@ impl AgentSandboxes {
                 .await
                 .map_err(|e| RpcError::io(&e))?;
         }
-        for (host, _) in &spec.rw_binds {
+        let opencode = crate::agents::opencode_backend::opencode_home(&d.dirs.root);
+        for (host, _) in spec.rw_binds.iter().chain(&spec.ro_binds) {
             if host.starts_with(d.dirs.root.join("agent-caches"))
+                || host.starts_with(d.dirs.root.join("agent-xdg"))
                 || host == &d.dirs.root.join("codex-home")
-                || host == &crate::agents::opencode_backend::opencode_home(&d.dirs.root)
+                || host == &opencode.join("config")
             {
                 tokio::fs::create_dir_all(host)
                     .await
