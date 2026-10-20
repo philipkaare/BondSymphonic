@@ -143,7 +143,7 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
 
     // Where the agent works. A worktree is the default: it is the choice that
     // keeps the agent's work off the user's own branch.
-    auto* modes = new QWidget(this);
+    auto* modes = m_modes = new QWidget(this);
     auto* modesLayout = new QVBoxLayout(modes);
     modesLayout->setContentsMargins(0, 0, 0, 0);
     m_worktreeMode = new QRadioButton(QStringLiteral("Work in a new worktree"), modes);
@@ -206,7 +206,7 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     QSizePolicy busyPolicy = m_branchBusy->sizePolicy();
     busyPolicy.setRetainSizeWhenHidden(true);
     m_branchBusy->setSizePolicy(busyPolicy);
-    auto* branchRow = new QVBoxLayout();
+    auto* branchRow = m_branchRow = new QVBoxLayout();
     branchRow->setContentsMargins(0, 0, 0, 0);
     // Flush against the combo rather than the layout's ordinary gap: touching
     // it, the strip reads as the combo still filling itself in; a few pixels
@@ -468,11 +468,12 @@ QString NewAgentDialog::runConfig() const {
 bool NewAgentDialog::initIfMissing() const { return m_initIfMissing; }
 
 bool NewAgentDialog::inPlace() const {
-    return m_inPlaceMode->isChecked() && inPlaceAvailable();
+    return !m_inspectPending && !m_inspectFailed &&
+           (m_initIfMissing || (m_inPlaceMode->isChecked() && inPlaceAvailable()));
 }
 
 bool NewAgentDialog::inPlaceAvailable() const {
-    return m_inPlaceRefusal.isEmpty() && !m_inspectPending && !m_inspectFailed;
+    return !m_initIfMissing && m_inPlaceRefusal.isEmpty() && !m_inspectPending && !m_inspectFailed;
 }
 
 QString NewAgentDialog::group() const {
@@ -748,6 +749,13 @@ void NewAgentDialog::onAdapterChanged() {
 }
 
 void NewAgentDialog::updateModeState() {
+    // A plain folder is initialised and used directly. Keep the radio choice
+    // intact underneath so returning to a repository restores the preference.
+    m_form->setRowVisible(m_modes, !m_initIfMissing);
+    m_form->setRowVisible(m_branchRow, !m_initIfMissing);
+    // Showing a form row also shows its children, including a busy strip
+    // that updateBranchState already hid after the inspection settled.
+    m_branchBusy->setVisible(m_inspectPending && !m_initIfMissing);
     m_inPlaceMode->setEnabled(m_inPlaceRefusal.isEmpty());
     m_inPlaceMode->setToolTip(m_inPlaceRefusal);
     if (!m_inPlaceRefusal.isEmpty() && m_inPlaceMode->isChecked()) {
@@ -755,8 +763,8 @@ void NewAgentDialog::updateModeState() {
         // the create with the same sentence.
         m_worktreeMode->setChecked(true);
     }
-    const bool inPlace = m_inPlaceMode->isChecked();
-    m_form->setRowVisible(m_inPlaceHelp, inPlace);
+    const bool inPlace = m_initIfMissing || m_inPlaceMode->isChecked();
+    m_form->setRowVisible(m_inPlaceHelp, inPlace && !m_initIfMissing);
     m_form->setRowVisible(m_driveNote, inPlace && onAWindowsDrive(repoPath()));
     // Not "inside the working tree" any more: the daemon reports every hooks
     // path in this repository the agent can write, and a `core.hooksPath`
@@ -1263,6 +1271,71 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_offers_the_checkout_itse
     if (warning->isHidden() || !warning->text().contains(QLatin1String(".git/my-hooks")) ||
         warning->text().contains(QLatin1String("inside the working tree"))) {
         return 10;
+    }
+    return 0;
+}
+
+/// A plain folder starts the agent there, with no execution-mode choice, and
+/// returning to a repository restores the user's previous choice.
+extern "C" std::int32_t bs_widget_test_new_agent_dialog_initialises_non_git_folders_in_place() {
+    AppController controller;
+    GroupModel model;
+    NewAgentDialog dialog(&controller, &model, QString::fromUtf8(kDialogRepo));
+    auto* worktree = dialog.findChild<QRadioButton*>(QStringLiteral("NewAgentWorktreeMode"));
+    auto* inPlace = dialog.findChild<QRadioButton*>(QStringLiteral("NewAgentInPlaceMode"));
+    auto* branch = dialog.findChild<QComboBox*>(QStringLiteral("NewAgentBaseBranch"));
+    auto* path = dialog.findChild<QLineEdit*>(QStringLiteral("NewAgentRepoPath"));
+    if (worktree == nullptr || inPlace == nullptr || branch == nullptr || path == nullptr) {
+        return 1;
+    }
+    const auto inspect = [&](const char* selected, const QString& json) {
+        path->setText(QString::fromUtf8(selected));
+        path->editingFinished();
+        controller.repoInspected(QString::fromUtf8(selected), json);
+    };
+    const QString git = QStringLiteral(R"({"is_repo":true,"branches":["main","feature"],)"
+                                       R"("default_branch":"main","head_branch":"feature"})");
+    const QString folder = QStringLiteral(R"({"is_repo":false,"exists":true,)"
+                                          R"("branches":["main"],"default_branch":"main"})");
+    controller.repoInspected(QString::fromUtf8(kDialogRepo), git);
+    worktree->setChecked(true);
+    branch->setCurrentText(QStringLiteral("feature"));
+    inspect(kOtherRepo, folder);
+    if (!dialog.initIfMissing() || !dialog.inPlace() || dialog.inPlaceAvailable() ||
+        !dialog.baseBranch().isEmpty() || dialog.repoPath() != QLatin1String(kOtherRepo)) {
+        return 2;
+    }
+    if (worktree->isVisibleTo(&dialog) || inPlace->isVisibleTo(&dialog) ||
+        branch->isVisibleTo(&dialog)) {
+        return 3;
+    }
+    bool notice = false;
+    for (const QLabel* label : dialog.findChildren<QLabel*>()) {
+        notice |= label->isVisibleTo(&dialog) &&
+                  label->text().contains(QLatin1String("initialised"));
+        if (label->isVisibleTo(&dialog) && label->text() == QLatin1String("Work in:")) {
+            return 4;
+        }
+    }
+    if (!notice || !createEnabled(dialog)) {
+        return 5;
+    }
+    inspect(kDialogRepo, git);
+    if (dialog.initIfMissing() || dialog.inPlace() || !dialog.inPlaceAvailable() ||
+        !worktree->isVisibleTo(&dialog) || !inPlace->isVisibleTo(&dialog) ||
+        !branch->isVisibleTo(&dialog) || branch->currentText() != QLatin1String("feature")) {
+        return 6;
+    }
+    inPlace->setChecked(true);
+    inspect(kOtherRepo, folder);
+    inspect(kDialogRepo, git);
+    if (!dialog.inPlace() || !inPlace->isChecked()) {
+        return 7;
+    }
+    inspect(kOtherRepo, QStringLiteral(R"({"is_repo":false,"exists":false,)"
+                                      R"("branches":["main"],"default_branch":"main"})"));
+    if (!dialog.initIfMissing() || !dialog.inPlace() || worktree->isVisibleTo(&dialog)) {
+        return 8;
     }
     return 0;
 }

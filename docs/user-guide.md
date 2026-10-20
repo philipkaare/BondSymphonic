@@ -368,7 +368,9 @@ so under the path: "This folder is not a git repository. It will be initialised
 with an empty first commit when the agent is created." A folder that does not
 exist at all says "This folder does not exist; it will be created and
 initialised." Pressing **Create** is what agrees to it; there is nothing to
-tick.
+tick. The worktree/direct choices and branch selector are hidden for these
+folders; the agent runs directly in the selected folder. Switching back to an
+existing repository restores the workspace choices and your previous selection.
 
 If the repository's `bondsymphonic.toml` extends the network allowlist, the
 dialog says so before you click **Create** — "This repository adds 2 hosts to

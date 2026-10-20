@@ -1633,6 +1633,7 @@ mod cpp_widgets {
         fn bs_widget_test_banner_offers_retry_for_a_workspace_that_cannot_run() -> i32;
         fn bs_widget_test_agent_area_holds_a_workspace_problem() -> i32;
         fn bs_widget_test_new_agent_dialog_offers_the_checkout_itself() -> i32;
+        fn bs_widget_test_new_agent_dialog_initialises_non_git_folders_in_place() -> i32;
         fn bs_widget_test_changes_toolbar_hides_git_actions_in_place() -> i32;
         fn bs_widget_test_banner_says_close_for_an_in_place_workspace() -> i32;
         fn bs_widget_test_banner_shows_what_the_daemon_said_changed() -> i32;
@@ -1661,7 +1662,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 54] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 55] = [
             // These four build a whole MainWindow, and each begins by pointing
             // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
             // is load-bearing rather than tidy: the state store settles its
@@ -1826,6 +1827,10 @@ mod cpp_widgets {
             (
                 "NewAgentDialog offers the checkout itself, and says what that means",
                 bs_widget_test_new_agent_dialog_offers_the_checkout_itself,
+            ),
+            (
+                "NewAgentDialog initialises non-Git folders and runs the agent there",
+                bs_widget_test_new_agent_dialog_initialises_non_git_folders_in_place,
             ),
             (
                 "ChangesToolbar hides the git actions for an in-place workspace",

@@ -14,6 +14,7 @@ class QPlainTextEdit;
 class QProgressBar;
 class QRadioButton;
 class QToolButton;
+class QVBoxLayout;
 
 /// Collects everything a new workspace needs: which repository and base branch
 /// to fork, what to call the agent, which adapter runs in it, and which group
@@ -79,11 +80,11 @@ public:
     bool initIfMissing() const;
 
     /// Whether the agent is to work directly in the checkout rather than in a
-    /// new worktree. Only ever true when the choice was available.
+    /// new worktree. Automatic for a folder that will be initialised.
     bool inPlace() const;
-    /// Whether the last inspection allowed working in place at all. The window
-    /// remembers the choice only then, so a linked worktree that forced a
-    /// worktree does not overwrite what the user prefers.
+    /// Whether the last inspection offered a choice to work in place. The window
+    /// remembers the choice only then, so automatic modes do not overwrite
+    /// what the user prefers for existing repositories.
     bool inPlaceAvailable() const;
 
 private:
@@ -153,6 +154,8 @@ private:
     QString m_branchChoice;
     QRadioButton* m_worktreeMode = nullptr;
     QRadioButton* m_inPlaceMode = nullptr;
+    QWidget* m_modes = nullptr;
+    QVBoxLayout* m_branchRow = nullptr;
     /// What working in place means, under the choice while it is selected.
     QLabel* m_inPlaceHelp = nullptr;
     /// How the checkout's git files are protected on a Windows drive, where
