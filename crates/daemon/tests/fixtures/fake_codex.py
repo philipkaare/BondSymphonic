@@ -41,6 +41,8 @@ for line in sys.stdin:
         else:
             ident = "other-account" if mode == "models-other" else "second" if p.get("cursor") else "first"
             emit({"id":m["id"],"result":{"data":[] if mode == "models-empty" else [{"id":ident,"displayName":ident}],"nextCursor":"page2" if mode == "models" and not p.get("cursor") else None}})
+    elif method == "thread/resume" and mode == "norollout":
+        emit({"id": m["id"], "error": {"code": -32600, "message": "no rollout found for thread id " + p["threadId"]}})
     elif method in ("thread/start", "thread/resume"):
         assert initialized
         thread = p.get("threadId", "new-thread")

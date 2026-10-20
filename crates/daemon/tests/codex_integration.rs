@@ -92,6 +92,39 @@ async fn starts_resumes_steers_interrupts_and_stops() {
         .any(|m| matches!(&m.body, AgentMessageBody::AssistantText {text} if text == "steered")));
 }
 
+/// Codex writes a thread's rollout only once its first turn starts, and
+/// `thread/resume` of a thread without one fails with "no rollout found". So
+/// a new thread is not offered as the session to resume until it has a turn.
+#[tokio::test]
+async fn a_new_thread_is_reported_as_the_session_only_once_a_turn_starts() {
+    let (_dir, mut adapter, entry, _) = fixture("approval", None).await;
+    adapter.start().await.unwrap();
+    assert_eq!(entry.session_id.lock().as_deref(), None);
+    adapter.send("first".into()).await.unwrap();
+    wait_state(&entry, AgentState::WaitingPermission).await;
+    assert_eq!(entry.session_id.lock().as_deref(), Some("new-thread"));
+    adapter.stop().await.unwrap();
+}
+
+/// A thread Codex never saved has no history to lose, so resuming one starts
+/// a new thread instead of failing the agent.
+#[tokio::test]
+async fn resuming_a_thread_codex_never_saved_starts_a_new_one() {
+    let (_dir, mut adapter, entry, _) = fixture("norollout", Some("unsaved".into())).await;
+    adapter.start().await.unwrap();
+    assert_eq!(entry.session_id.lock().as_deref(), None);
+    adapter.send("first".into()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while entry.session_id.lock().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(entry.session_id.lock().as_deref(), Some("new-thread"));
+    adapter.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn approves_raw_string_ids_once_and_rejects_unknown_ids() {
     let (_dir, mut adapter, entry, _) = fixture("approval", None).await;

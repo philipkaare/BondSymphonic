@@ -108,18 +108,39 @@ impl CodexAdapter {
         {
             params["model"] = json!(model);
         }
-        let method = if let Some(session) = &self.prepared.options.resume_session {
-            params["threadId"] = json!(session);
-            "thread/resume"
-        } else {
-            "thread/start"
+        let mut resuming = false;
+        let mut result = None;
+        if let Some(session) = &self.prepared.options.resume_session {
+            let mut resume = params.clone();
+            resume["threadId"] = json!(session);
+            match rpc.call("thread/resume", resume).await {
+                Ok(answer) => {
+                    resuming = true;
+                    result = Some(answer);
+                }
+                // A thread that never had a turn was never saved, so there is
+                // no history to lose: start a new one rather than fail.
+                Err(e) if e.message.contains("no rollout found") => {
+                    tracing::warn!("Codex thread {session} was never saved; starting a new one");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let result = match result {
+            Some(result) => result,
+            None => rpc.call("thread/start", params).await?,
         };
-        let result = rpc.call(method, params).await?;
         self.thread = text(&result["thread"], "id").into();
         if self.thread.is_empty() {
             return Err(error("Codex did not return a thread ID"));
         }
-        self.sink.session_id(self.thread.clone()).await;
+        // Codex writes a new thread's rollout only when its first turn starts,
+        // and `thread/resume` of a thread without one fails ("no rollout found
+        // for thread id"). So a new thread is reported as the session on
+        // `turn/started`, not here.
+        if resuming {
+            self.sink.session_id(self.thread.clone()).await;
+        }
         Ok(())
     }
 }
@@ -185,6 +206,11 @@ impl AgentAdapter for CodexAdapter {
                         state.lock().active = Some(text(&p["turn"], "id").into());
                         sink.publish_state(AgentState::Working, None);
                         changed.notify_waiters();
+                        // A new thread becomes resumable here; see `initialize`.
+                        let thread = text(p, "threadId");
+                        if !thread.is_empty() {
+                            sink.session_id(thread.into()).await;
+                        }
                     }
                     "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
                         state
