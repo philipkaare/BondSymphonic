@@ -13,6 +13,189 @@ use common::{create_ws, start_daemon, Client};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Exercises startup failures after the in-place protection and listeners
+/// have been installed, without depending on a broken host sandbox setup.
+struct FailingStart {
+    fail: std::sync::atomic::AtomicBool,
+    attempted: parking_lot::Mutex<Vec<WorkspaceId>>,
+}
+
+#[async_trait::async_trait]
+impl bondsymphonic_daemon::sandbox::SandboxBackend for FailingStart {
+    fn name(&self) -> &'static str {
+        "noop"
+    }
+
+    async fn check(&self) -> Vec<PrereqStatus> {
+        vec![]
+    }
+
+    async fn start(
+        &self,
+        spec: &bondsymphonic_daemon::sandbox::SandboxSpec,
+    ) -> Result<Arc<dyn SandboxHandle>, RpcError> {
+        self.attempted.lock().push(spec.id.clone());
+        if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(RpcError::internal("test sandbox startup failed"));
+        }
+        bondsymphonic_daemon::sandbox::SandboxBackend::start(
+            &bondsymphonic_daemon::sandbox::noop::NoopBackend,
+            spec,
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn failed_sandbox_create_releases_checkout_and_preserves_user_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    std::fs::write(repo.join("README.md"), "my unfinished edit\n").unwrap();
+    std::fs::write(repo.join("untracked.txt"), "mine\n").unwrap();
+    let before = repo_state(&repo);
+    let backend = Arc::new(FailingStart {
+        fail: std::sync::atomic::AtomicBool::new(true),
+        attempted: parking_lot::Mutex::new(vec![]),
+    });
+    let data = dir.path().join("data");
+    let bus = EventBus::new(64);
+    let mut events = bus.subscribe();
+    let daemon = Daemon::new(DataDirs::new(&data), backend.clone(), bus).unwrap();
+
+    let error = lifecycle::create(&daemon, params(&repo, "retry-me"))
+        .await
+        .expect_err("sandbox startup failure must fail workspace creation");
+    assert_eq!(error.message, "test sandbox startup failed");
+    let failed = backend.attempted.lock()[0].clone();
+    let mut states = vec![];
+    while let Ok(message) = events.try_recv() {
+        if let ServerMessage::Event {
+            workspace_id: Some(id),
+            event: Event::WorkspaceStateChanged { info },
+        } = message
+        {
+            if id == failed {
+                states.push(info.state);
+            }
+        }
+    }
+    assert_eq!(
+        states,
+        vec![
+            WorkspaceState::Creating,
+            WorkspaceState::Error("sandbox failed: test sandbox startup failed".into()),
+            WorkspaceState::Destroying,
+        ]
+    );
+    assert!(daemon.registry.list().is_empty());
+    assert!(daemon.sandbox(&failed).is_err());
+    for path in [
+        daemon.dirs.home(&failed),
+        daemon.dirs.cache(&failed),
+        daemon.dirs.run(&failed),
+        daemon.dirs.in_place_record(&failed),
+    ] {
+        assert!(!path.exists(), "{} survived", path.display());
+    }
+    assert_eq!(repo_state(&repo), before);
+    // Reloading the persisted registry must not bring the failed entry back.
+    let reloaded =
+        Daemon::new(DataDirs::new(&data), backend_for("noop"), EventBus::new(64)).unwrap();
+    assert!(reloaded.registry.list().is_empty());
+    let retry = lifecycle::create(&daemon, params(&repo, "retry-me"))
+        .await
+        .unwrap();
+    assert_eq!(retry.state, WorkspaceState::Ready);
+    lifecycle::destroy(&daemon, &retry.id, false).await.unwrap();
+    assert_eq!(repo_state(&repo), before);
+}
+
+#[tokio::test]
+async fn failed_sandbox_create_releases_worktree_and_name_for_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    std::fs::write(repo.join("README.md"), "my unfinished edit\n").unwrap();
+    std::fs::write(repo.join("untracked.txt"), "mine\n").unwrap();
+    let content = std::fs::read(repo.join("README.md")).unwrap();
+    let refs = common::git_out(&repo, &["for-each-ref"]);
+    let backend = Arc::new(FailingStart {
+        fail: std::sync::atomic::AtomicBool::new(true),
+        attempted: parking_lot::Mutex::new(vec![]),
+    });
+    let daemon = Daemon::new(
+        DataDirs::new(dir.path().join("data")),
+        backend.clone(),
+        EventBus::new(64),
+    )
+    .unwrap();
+    let request = WorkspaceCreateParams {
+        in_place: false,
+        base_branch: "main".into(),
+        ..params(&repo, "retry-worktree")
+    };
+
+    assert!(lifecycle::create(&daemon, request.clone()).await.is_err());
+    let failed = backend.attempted.lock()[0].clone();
+    assert!(daemon.registry.list().is_empty());
+    assert!(daemon.sandbox(&failed).is_err());
+    for path in [
+        daemon.dirs.worktree(&failed),
+        daemon.dirs.objects(&failed),
+        daemon.dirs.home(&failed),
+        daemon.dirs.cache(&failed),
+        daemon.dirs.run(&failed),
+    ] {
+        assert!(!path.exists(), "{} survived", path.display());
+    }
+    assert_eq!(common::git_out(&repo, &["for-each-ref"]), refs);
+    assert_eq!(
+        common::git_out(&repo, &["worktree", "list", "--porcelain"])
+            .matches("worktree ")
+            .count(),
+        1
+    );
+    assert_eq!(std::fs::read(repo.join("README.md")).unwrap(), content);
+    assert_eq!(
+        std::fs::read_to_string(repo.join("untracked.txt")).unwrap(),
+        "mine\n"
+    );
+    let retry = lifecycle::create(&daemon, request).await.unwrap();
+    assert_eq!(retry.state, WorkspaceState::Ready);
+    lifecycle::destroy(&daemon, &retry.id, false).await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_restart_keeps_an_existing_checkout_registered_for_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let backend = Arc::new(FailingStart {
+        fail: std::sync::atomic::AtomicBool::new(false),
+        attempted: parking_lot::Mutex::new(vec![]),
+    });
+    let daemon = Daemon::new(
+        DataDirs::new(dir.path().join("data")),
+        backend.clone(),
+        EventBus::new(64),
+    )
+    .unwrap();
+    let ws = lifecycle::create(&daemon, params(&repo, "keep-me"))
+        .await
+        .unwrap();
+    backend
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(lifecycle::restart(&daemon, &ws.id).await.is_err());
+    assert!(matches!(
+        daemon.registry.get(&ws.id).unwrap().state,
+        WorkspaceState::Error(_)
+    ));
+    assert_eq!(
+        lifecycle::restart(&daemon, &ws.id).await.unwrap().state,
+        WorkspaceState::Ready
+    );
+    lifecycle::destroy(&daemon, &ws.id, false).await.unwrap();
+}
+
 fn params(repo: &Path, name: &str) -> WorkspaceCreateParams {
     WorkspaceCreateParams {
         repo_path: repo.to_string_lossy().into(),

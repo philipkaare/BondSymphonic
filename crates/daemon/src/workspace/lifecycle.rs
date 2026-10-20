@@ -794,17 +794,32 @@ pub async fn create(d: &Arc<Daemon>, p: WorkspaceCreateParams) -> Result<Workspa
     // protection breach found while the shim is still coming up then waits
     // for `Ready` to be written, rather than being overwritten by it.
     let gate = gate(&ws.id);
-    let _count = gate.lock().await;
+    let count = gate.lock().await;
     match start_sandbox(d, &ws).await {
         Ok(()) => Ok(d.workspace_info(&d.set_state(&ws.id, WorkspaceState::Ready).await?)),
         Err(e) => {
-            let ws = d
+            let _ = d
                 .set_state(
                     &ws.id,
                     WorkspaceState::Error(format!("sandbox failed: {}", e.message)),
                 )
-                .await?;
-            Ok(d.workspace_info(&ws))
+                .await;
+            // Creation has not delivered a usable workspace. Release its
+            // reservation and everything startup installed, including the
+            // in-place git protection record. Normal restarts deliberately
+            // retain their workspace on failure; only this creation rolls
+            // back. Destroy takes the same gate, so release it first.
+            drop(count);
+            if let Err(cleanup) = destroy(d, &ws.id, false).await {
+                return Err(RpcError::new(
+                    e.code,
+                    format!(
+                        "{}; could not clean up failed workspace {}: {}",
+                        e.message, ws.name, cleanup.message
+                    ),
+                ));
+            }
+            Err(e)
         }
     }
 }
