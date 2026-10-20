@@ -4,7 +4,8 @@
 //! ("model not supported"), and nothing else ever updates one: the setup
 //! actions only install what is missing. So every daemon start updates each
 //! CLI that is installed -- whichever way the daemon was launched -- and never
-//! installs one that is not, which stays the user's choice in Setup.
+//! installs one that is not, which stays the user's choice in Setup. OpenCode
+//! is the exception to "latest": it is held at the version its installer pins.
 //!
 //! Updates run on the host, outside every sandbox, for the reason `setup.rs`
 //! gives for its installs: they write to the user's real home and reach the
@@ -28,6 +29,10 @@ pub const RESTORE_WAIT: Duration = Duration::from_secs(30);
 /// The Codex installer, which installs the latest release and does nothing
 /// when that release is already installed -- so it doubles as the updater.
 const CODEX_INSTALL_SCRIPT: &str = include_str!("../../../scripts/install-codex.sh");
+
+/// The OpenCode installer, pinned to
+/// [`PINNED_OPENCODE_VERSION`](crate::agents::opencode_backend::PINNED_OPENCODE_VERSION).
+const OPENCODE_INSTALL_SCRIPT: &str = include_str!("../../../scripts/install-opencode.sh");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Update {
@@ -57,15 +62,14 @@ pub fn planned(home: &Path) -> Vec<Update> {
             argv: vec!["bash".into(), "-c".into(), CODEX_INSTALL_SCRIPT.into()],
         });
     }
-    // OpenCode's own installer uses ~/.opencode/bin; ~/.local/bin is where a
-    // user who moved it, or a future BondSymphonic installer, puts it.
-    if let Some(opencode) = installed(&[
-        home.join(".opencode").join("bin").join("opencode"),
-        local_bin.join("opencode"),
-    ]) {
+    // OpenCode is pinned rather than kept on its latest release: its "update"
+    // is the pinned installer, which leaves an install at the pin alone.
+    // Only BondSymphonic's own copy in ~/.local/bin; one that OpenCode's
+    // installer left in ~/.opencode/bin alone is the user's.
+    if installed(&[local_bin.join("opencode")]).is_some() {
         updates.push(Update {
             name: "opencode",
-            argv: vec![opencode.display().to_string(), "upgrade".into()],
+            argv: vec!["bash".into(), "-c".into(), OPENCODE_INSTALL_SCRIPT.into()],
         });
     }
     updates
@@ -145,9 +149,10 @@ mod tests {
     fn each_installed_cli_gets_its_own_update() {
         let home = tempfile::tempdir().unwrap();
         let h = home.path();
-        touch(&h.join(".local/bin/claude"));
-        touch(&h.join(".local/bin/codex"));
-        touch(&h.join(".opencode/bin/opencode"));
+        let local_bin = h.join(".local").join("bin");
+        touch(&local_bin.join("claude"));
+        touch(&local_bin.join("codex"));
+        touch(&local_bin.join("opencode"));
 
         let updates = planned(h);
         let names: Vec<_> = updates.iter().map(|u| u.name).collect();
@@ -155,34 +160,42 @@ mod tests {
         assert_eq!(
             updates[0].argv,
             [
-                h.join(".local/bin/claude").display().to_string(),
+                local_bin.join("claude").display().to_string(),
                 "update".into()
             ]
         );
         assert_eq!(updates[1].argv[..2], ["bash", "-c"]);
         assert!(updates[1].argv[2].contains("releases/latest"));
-        assert_eq!(
-            updates[2].argv,
-            [
-                h.join(".opencode/bin/opencode").display().to_string(),
-                "upgrade".into()
-            ]
-        );
+        assert_eq!(updates[2].argv[..2], ["bash", "-c"]);
+        assert!(updates[2].argv[2].contains("opencode.ai/install"));
     }
 
+    /// OpenCode is pinned: its update is the pinned installer, which leaves an
+    /// install at the pin alone, never `opencode upgrade` to the latest.
     #[test]
-    fn opencode_in_local_bin_is_found_too() {
+    fn opencode_follows_the_pin_and_never_self_upgrades() {
         let home = tempfile::tempdir().unwrap();
-        touch(&home.path().join(".local/bin/opencode"));
+        touch(&home.path().join(".local").join("bin").join("opencode"));
         let updates = planned(home.path());
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].name, "opencode");
+        assert!(!updates[0].argv.iter().any(|a| a == "upgrade"));
+        let pin = crate::agents::opencode_backend::PINNED_OPENCODE_VERSION;
+        assert!(updates[0].argv[2].contains(&format!("pinned={pin}\n")));
+    }
+
+    /// OpenCode's own installer's copy is the user's, not BondSymphonic's.
+    #[test]
+    fn a_user_installed_opencode_is_left_alone() {
+        let home = tempfile::tempdir().unwrap();
+        touch(&home.path().join(".opencode").join("bin").join("opencode"));
+        assert!(planned(home.path()).is_empty());
     }
 
     #[test]
     fn a_directory_is_not_an_installed_cli() {
         let home = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(home.path().join(".local/bin/claude")).unwrap();
+        std::fs::create_dir_all(home.path().join(".local").join("bin").join("claude")).unwrap();
         assert!(planned(home.path()).is_empty());
     }
 
