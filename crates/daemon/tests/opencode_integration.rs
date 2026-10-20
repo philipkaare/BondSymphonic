@@ -518,3 +518,16 @@ fn accepted_large_jsonc_configs_have_late_literal_keys_redacted() {
     secrets.redact(&mut output);
     assert_eq!(output["message"], "provider diagnostic [redacted]");
 }
+
+#[tokio::test]
+async fn invalid_utf8_on_stderr_does_not_stall_the_peer() {
+    let (_dir, mut adapter, _entry, store) = fixture("bad-stderr", None).await;
+    adapter.start().await.unwrap();
+    adapter.send("hello".into()).await.unwrap();
+    wait_for(&store, |m| {
+        m.iter()
+            .any(|m| matches!(m.body, AgentMessageBody::Result { .. }))
+    })
+    .await;
+    adapter.stop().await.unwrap();
+}

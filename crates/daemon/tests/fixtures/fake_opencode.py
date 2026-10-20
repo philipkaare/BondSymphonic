@@ -234,6 +234,13 @@ for line in sys.stdin:
         elif mode == "unsupported":
             emit({"id": "host-fs", "method": "fs/write_text_file", "params": {"sessionId": session, "path": "HOST-PWNED", "content": "bad"}})
             emit({"id": "host-terminal", "method": "terminal/create", "params": {"sessionId": session, "command": "echo bad"}})
+        elif mode == "bad-stderr":
+            # More than a pipe holds, after bytes that are not UTF-8: a reader
+            # that stops at them leaves this write blocked for ever.
+            sys.stderr.buffer.write(b"\xff\xfe not utf-8\n" + b"x" * 300000 + b"\n")
+            sys.stderr.flush()
+            chunk("still here")
+            complete()
         elif mode == "hold":
             chunk("waiting")
         else:
