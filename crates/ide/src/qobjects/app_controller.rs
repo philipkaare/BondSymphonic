@@ -2371,7 +2371,11 @@ pub struct StartAgentFailure {
     pub workspace_removed: bool,
 }
 
-/// Only a newly created workspace belongs to the agent-start transaction.
+/// Only a newly created workspace belongs to the agent-start transaction, and
+/// only an error the daemon itself returned rolls it back. A timeout or a lost
+/// connection says nothing about the start: the daemon may still be bringing
+/// the agent up, and a `workspace.destroy` sent now would queue behind that
+/// start and then tear down the workspace and the agent it just started.
 pub async fn start_agent_request(
     client: &DaemonClient,
     params: AgentStartParams,
@@ -2381,11 +2385,17 @@ pub async fn start_agent_request(
     match client.request(Request::AgentStart(params)).await {
         Ok(result) => Ok(result),
         Err(error) => {
+            let refused = matches!(error, ClientError::Rpc(_));
             let mut failure = StartAgentFailure {
                 message: error.to_string(),
                 workspace_removed: false,
             };
-            if rollback_new_workspace {
+            if rollback_new_workspace && !refused {
+                failure.message.push_str(
+                    "; the new workspace was kept because the daemon may still be starting the agent",
+                );
+            }
+            if rollback_new_workspace && refused {
                 match client
                     .request_raw(Request::WorkspaceDestroy(WorkspaceDestroyParams {
                         workspace_id,

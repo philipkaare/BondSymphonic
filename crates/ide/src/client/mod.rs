@@ -112,7 +112,11 @@ pub fn default_timeout_for(method: &str) -> Duration {
         | "workspace.create"
         | "workspace.restart"
         | "workspace.changes"
-        | "repo.detect_run_configs" => REPOSITORY_REQUEST_TIMEOUT,
+        | "repo.detect_run_configs"
+        // A first OpenCode start brings up a companion sandbox, proxy, shim
+        // and tunnels, reads the Windows config over a cold `/mnt/c` and runs
+        // several ACP handshakes with 30 s budgets of their own.
+        | "agent.start" => REPOSITORY_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
 }
