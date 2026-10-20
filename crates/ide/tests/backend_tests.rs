@@ -236,3 +236,87 @@ fn choosing_cli_default_does_not_reapply_the_configured_default_model() {
         Some("")
     );
 }
+
+#[test]
+fn a_backend_switched_in_settings_keeps_that_choice_through_sign_in_and_stored_keys() {
+    use bondsymphonic_ide::model::backends::{
+        enable_authenticated_backends, enable_for_stored_key, save_backend_entry,
+    };
+    use bondsymphonic_proto::PrereqStatus;
+    let mut descriptor = legacy_descriptors().remove(0);
+    descriptor.id = AgentAdapterKind::OpenCode;
+    descriptor.prerequisite_names = vec!["opencode".into(), "opencode_auth".into()];
+    let signed_in = [PrereqStatus {
+        name: "opencode_auth".into(),
+        ok: true,
+        detail: String::new(),
+        fix_hint: None,
+    }];
+    let refresh = |settings: &mut Settings| {
+        enable_authenticated_backends(settings, &[descriptor.clone()], &signed_in, &[])
+    };
+    let entry = |enabled| BackendSettings {
+        enabled,
+        default_model: String::new(),
+        default_permission_mode: "ask".into(),
+    };
+
+    // Never touched: the first sign-in turns it on.
+    let mut settings = Settings::default();
+    assert!(refresh(&mut settings));
+    assert!(settings.backends["opencode"].enabled);
+
+    // Switched off in Settings: later refreshes and keys leave it off.
+    save_backend_entry(&mut settings, "opencode", entry(false));
+    assert!(!refresh(&mut settings));
+    assert!(!enable_for_stored_key(
+        &mut settings,
+        AgentAdapterKind::OpenCode
+    ));
+    assert!(!enable_authenticated_backends(
+        &mut settings,
+        &[descriptor.clone()],
+        &[],
+        &[AgentAdapterKind::OpenCode]
+    ));
+    assert!(!settings.backends["opencode"].enabled);
+
+    // The choice survives a round trip through settings.json.
+    let mut reloaded = Settings::from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
+    assert!(!refresh(&mut reloaded));
+    assert!(!reloaded.backends["opencode"].enabled);
+
+    // Switched back on, it stays on; saving it unchanged is not a new choice.
+    save_backend_entry(&mut reloaded, "opencode", entry(true));
+    assert!(reloaded.backends["opencode"].enabled);
+    assert!(!refresh(&mut reloaded));
+
+    // Saving the dialog without touching a backend does not record a choice,
+    // so a never-touched backend is still enabled by its first stored key.
+    let mut untouched = Settings::default();
+    save_backend_entry(&mut untouched, "codex", entry(false));
+    assert!(enable_for_stored_key(
+        &mut untouched,
+        AgentAdapterKind::Codex
+    ));
+    assert!(untouched.backends["codex"].enabled);
+
+    // A Claude user who switched Claude off is not switched back on by sign-in.
+    let mut claude = descriptor.clone();
+    claude.id = AgentAdapterKind::Claude;
+    claude.prerequisite_names = vec!["claude".into(), "claude_auth".into()];
+    let mut settings = Settings::default();
+    save_backend_entry(&mut settings, "claude", entry(false));
+    assert!(!enable_authenticated_backends(
+        &mut settings,
+        &[claude],
+        &[PrereqStatus {
+            name: "claude_auth".into(),
+            ok: true,
+            detail: String::new(),
+            fix_hint: None,
+        }],
+        &[AgentAdapterKind::Claude]
+    ));
+    assert!(!settings.backends["claude"].enabled);
+}

@@ -206,6 +206,9 @@ pub struct Settings {
     /// reading the key back out just to find out whether there is one.
     pub api_key_set: bool,
     pub backends: std::collections::BTreeMap<String, crate::model::backends::BackendSettings>,
+    /// Backends the user has switched on or off in Settings. Signing in or
+    /// storing a key enables a backend automatically only until then.
+    pub backends_chosen: std::collections::BTreeSet<String>,
     pub default_backend: String,
     /// The permission mode a new Claude agent starts on, as the New Agent
     /// dialog's initial combo value.
@@ -232,6 +235,7 @@ impl Default for Settings {
             log_level: "info".into(),
             api_key_set: false,
             backends: crate::model::backends::default_settings(),
+            backends_chosen: Default::default(),
             default_backend: "claude".into(),
             default_permission_mode: DEFAULT_PERMISSION_MODE.into(),
             theme: DEFAULT_THEME.into(),

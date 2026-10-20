@@ -104,12 +104,13 @@ pub fn enable_authenticated_backends(
             || descriptor.prerequisite_names.iter().any(|name| {
                 name.ends_with("_auth") && items.iter().any(|item| &item.name == name && item.ok)
             });
-        if !authenticated {
+        let id = word(descriptor.id);
+        if !authenticated || settings.backends_chosen.contains(id) {
             continue;
         }
         let entry = settings
             .backends
-            .entry(word(descriptor.id).into())
+            .entry(id.into())
             .or_insert_with(|| BackendSettings {
                 default_permission_mode: descriptor.default_permission_mode.clone(),
                 ..Default::default()
@@ -120,6 +121,27 @@ pub fn enable_authenticated_backends(
         }
     }
     changed
+}
+
+/// Enables a backend whose API key was just stored, unless the user has
+/// already switched it on or off in Settings.
+pub fn enable_for_stored_key(settings: &mut Settings, kind: AgentAdapterKind) -> bool {
+    let id = word(kind);
+    if settings.backends_chosen.contains(id) {
+        return false;
+    }
+    let entry = settings.backends.entry(id.into()).or_default();
+    !std::mem::replace(&mut entry.enabled, true)
+}
+
+/// Stores a backend's settings as the Settings dialog saved them. Changing
+/// `enabled` there is the user's choice, which automatic enabling never undoes.
+pub fn save_backend_entry(settings: &mut Settings, id: &str, entry: BackendSettings) {
+    let was_enabled = settings.backends.get(id).is_some_and(|s| s.enabled);
+    if entry.enabled != was_enabled {
+        settings.backends_chosen.insert(id.into());
+    }
+    settings.backends.insert(id.into(), entry);
 }
 
 pub fn start_options_with_defaults(

@@ -30,7 +30,8 @@ Design: `docs/superpowers/specs/`. Plans: `docs/superpowers/plans/`.
 
 Agent backends: Claude Code, Codex and OpenCode, plus a plain terminal. Install
 and sign in under Settings > Agents; an authenticated harness is enabled
-automatically. Each backend has its own sandbox, proxy, credentials and defaults.
+automatically unless you have switched it off there. Each backend has its own
+sandbox, proxy, credentials and defaults.
 See [agent backend setup](docs/user-guide.md#agent-backends).
 Known limits are listed per area in the [user guide](docs/user-guide.md).
 

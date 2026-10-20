@@ -3670,7 +3670,7 @@ impl qobject::AppController {
                 else {
                     return false;
                 };
-                settings.backends.insert(id.clone(), entry);
+                backends::save_backend_entry(&mut settings, id, entry);
             }
         }
         if let Some(id) = value.get("default_backend").and_then(|v| v.as_str()) {
@@ -3782,13 +3782,10 @@ impl qobject::AppController {
             return false;
         }
         if let Ok(mut settings) = Settings::try_load() {
-            let entry = settings
-                .backends
-                .entry(backends::word(kind).into())
-                .or_default();
-            entry.enabled = true;
-            if let Err(error) = settings.save() {
-                tracing::warn!("authenticated harness settings could not be saved: {error}");
+            if backends::enable_for_stored_key(&mut settings, kind) {
+                if let Err(error) = settings.save() {
+                    tracing::warn!("authenticated harness settings could not be saved: {error}");
+                }
             }
         }
         self.as_mut().invalidate_backend_models(kind);

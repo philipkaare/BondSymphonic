@@ -283,7 +283,6 @@ void SettingsDialog::accept() {
     auto entries = m_settings.value("backends").toObject();
     for (auto it = m_backends.cbegin(); it != m_backends.cend(); ++it) {
         auto entry = entries.value(it.key()).toObject();
-        entry.insert("enabled", it->enabled->isChecked());
         entry.insert("default_model", agentchoices::modelComboSelection(it->model));
         entry.insert("default_permission_mode", it->mode->currentData().toString());
         const QString key = it->key->text().trimmed();
@@ -291,10 +290,9 @@ void SettingsDialog::accept() {
             QMessageBox::warning(this, "Settings", "The API key could not be stored.");
             return;
         }
-        if (!key.isEmpty()) {
-            it->enabled->setChecked(true);
-            entry.insert("enabled", true);
-        }
+        // Read after the key is stored: the controller ticks the box when the key
+        // enables a backend the user has not switched off.
+        entry.insert("enabled", it->enabled->isChecked());
         entries.insert(it.key(), entry);
         it->key->clear();
     }

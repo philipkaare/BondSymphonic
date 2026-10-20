@@ -15,7 +15,8 @@ version; `docs/superpowers/specs/` is the design behind it.
 
 **Settings > Agents** has a tab for each backend the connected daemon supports.
 Claude is enabled initially; Codex and OpenCode start disabled. A discovered
-sign-in or a stored API key enables its harness automatically. Each tab has
+sign-in or a stored API key enables its harness automatically, until you switch
+that harness on or off yourself; from then on your choice stays. Each tab has
 Enabled, installation/sign-in actions, Default model, Default permissions, and a
 write-only API-key field. Keys are stored separately in Windows Credential
 Manager. An empty field keeps the stored key; Remove key deletes that backend's
