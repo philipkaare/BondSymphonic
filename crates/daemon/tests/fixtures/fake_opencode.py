@@ -1,4 +1,10 @@
-"""Deterministic ACP peer. All wire envelopes and approval choices are checked."""
+"""Deterministic ACP peer. All wire envelopes and approval choices are checked.
+
+Frame shapes follow OpenCode 1.14.48 as recorded in opencode/probe-1.14.48:
+text is `agent_message_chunk`, a tool call's input arrives after its first
+`tool_call`, results are `{output, metadata}` or `{error}`, permission options
+are `once`/`always`/`reject`, and a cancelled prompt ends with `end_turn`.
+`replay:<scenario>` plays a recorded scenario instead."""
 import json
 import sys
 import time
@@ -24,11 +30,94 @@ def update(value):
     emit({"method": "session/update", "params": {"sessionId": session, "update": value}})
 
 
+def chunk(text):
+    update({"sessionUpdate": "agent_message_chunk", "messageId": "msg_fake", "content": {"type": "text", "text": text}})
+
+
+def tool(ident, title, raw_input):
+    """A tool call as OpenCode starts one: no input at first, then the input."""
+    update({"sessionUpdate": "tool_call", "toolCallId": ident, "title": title, "kind": "execute", "status": "pending", "locations": [], "rawInput": {}})
+    update({"sessionUpdate": "tool_call_update", "toolCallId": ident, "status": "in_progress", "kind": "execute", "title": title, "locations": [], "rawInput": raw_input})
+
+
 def complete():
     global prompt
-    update({"sessionUpdate": "assistant_message_chunk", "content": {"type": "text", "text": "finished"}})
-    answer(prompt, {"stopReason": "end_turn", "usage": {"inputTokens": 5, "outputTokens": 3}})
+    chunk("finished")
+    answer(prompt, {"stopReason": "end_turn", "usage": {"totalTokens": 8, "inputTokens": 5, "outputTokens": 3}, "_meta": {}})
     prompt = None
+
+
+def replay(scenario):
+    """Answers each request with what OpenCode answered the same request in a
+    recorded scenario. Where the recorded client sent a cancel or answered a
+    permission, waits for ours; a prompt recorded without an answer (a provider
+    retrying forever) hangs until cancelled. The scenario's WARN/ERROR log lines
+    are written to stderr before its first prompt is answered."""
+    base = Path(__file__).parent / "opencode" / "probe-1.14.48" / "frames"
+    records = [json.loads(line) for line in (base / (scenario + ".jsonl")).read_text(encoding="utf-8").splitlines()]
+    frames = [(r["dir"], r["frame"]) for r in records if r["dir"] in ("c->a", "a->c")]
+    log = base / (scenario + ".stderr.txt")
+    warnings, keep = [], False
+    for line in log.read_text(encoding="utf-8").splitlines() if log.exists() else []:
+        if line[:5] in ("ERROR", "WARN ", "INFO ", "DEBUG"):
+            keep = line.startswith(("ERROR", "WARN"))
+        if keep:
+            warnings.append(line)
+    used, backlog, hanging = set(), [], None
+
+    def read():
+        if backlog:
+            return backlog.pop(0)
+        line = sys.stdin.readline()
+        if not line:
+            sys.exit(0)
+        return json.loads(line)
+
+    def await_client(expected):
+        while True:
+            got = read()
+            if expected.get("method") and got.get("method") == expected["method"]:
+                return
+            if "method" not in expected and "method" not in got and got.get("id") == expected.get("id"):
+                return
+            backlog.append(got)
+
+    while True:
+        request = read()
+        method = request.get("method")
+        if method == "session/cancel":
+            if hanging is not None:
+                answer({"id": hanging}, {"stopReason": "end_turn", "usage": {"totalTokens": 0, "inputTokens": 0, "outputTokens": 0}, "_meta": {}})
+                hanging = None
+            continue
+        if method is None or "id" not in request:
+            continue
+        start = next((i for i, (d, f) in enumerate(frames) if i not in used and d == "c->a" and f.get("method") == method and "id" in f), None)
+        if start is None:
+            answer(request, {})
+            continue
+        used.add(start)
+        if method == "session/prompt" and warnings:
+            print("\n".join(warnings), file=sys.stderr, flush=True)
+            warnings.clear()
+            time.sleep(0.2)
+        recorded, answered = frames[start][1]["id"], False
+        for direction, frame in frames[start + 1:]:
+            if direction == "a->c":
+                if "method" in frame:
+                    print(json.dumps(frame), flush=True)
+                elif frame.get("id") == recorded:
+                    print(json.dumps(dict(frame, id=request["id"])), flush=True)
+                    answered = True
+                    break
+            elif "method" not in frame or "id" not in frame:
+                await_client(frame)
+        if not answered:
+            hanging = request["id"]
+
+
+if mode.startswith("replay:"):
+    replay(mode.split(":", 1)[1])
 
 
 for line in sys.stdin:
@@ -54,8 +143,9 @@ for line in sys.stdin:
             assert p["mcpServers"] == []
         session = p.get("sessionId", "new-session")
         if method == "session/load":
-            update({"sessionUpdate": "assistant_message_chunk", "content": {"type": "text", "text": "replayed"}})
-        result = {"configOptions": [{"id": "model", "category": "model"}]} if mode != "legacy" else {"models": {"currentModelId": "provider/default"}}
+            update({"sessionUpdate": "user_message_chunk", "messageId": "msg_old_user", "content": {"type": "text", "text": "old prompt"}})
+            update({"sessionUpdate": "agent_message_chunk", "messageId": "msg_old", "content": {"type": "text", "text": "replayed"}})
+        result = {"configOptions": [{"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "provider/default", "options": []}]} if mode != "legacy" else {"models": {"currentModelId": "provider/default"}}
         if method == "session/new":
             result["sessionId"] = session
         if mode == "resume-cap":
@@ -84,7 +174,7 @@ for line in sys.stdin:
             assert all(secret not in os.environ.values() for secret in secrets), "config credentials must not become environment values"
             text = "provider diagnostics " + " ".join(secrets)
             if mode == "config-secret-tool":
-                update({"sessionUpdate":"tool_call_update","toolCallId":"provider-diagnostic","status":"completed","rawOutput":text})
+                update({"sessionUpdate":"tool_call_update","toolCallId":"provider-diagnostic","status":"completed","rawOutput":{"output":text,"metadata":{"output":text}}})
                 complete()
             elif mode == "config-secret-error":
                 emit({"id":request["id"],"error":{"code":-32000,"message":text}})
@@ -101,10 +191,11 @@ for line in sys.stdin:
             values = old_values + [rotated["api"]["key"], rotated["oauth"]["access"], rotated["oauth"]["refresh"]]
             assert all(value not in os.environ.values() for value in values), "native credentials must not become process env"
             if mode == "native-tool":
-                update({"sessionUpdate": "tool_call", "toolCallId": "auth-file", "title": "cat auth.json", "rawInput": {}})
-                update({"sessionUpdate": "tool_call_update", "toolCallId": "auth-file", "status": "completed", "rawOutput": json.dumps(rotated) + " old=" + " ".join(old_values)})
+                tool("auth-file", "bash", {"command": "cat auth.json"})
+                update({"sessionUpdate": "tool_call_update", "toolCallId": "auth-file", "status": "completed", "rawOutput": {"output": json.dumps(rotated) + " old=" + " ".join(old_values), "metadata": {}}})
                 # Tokens seen in nested JSON may precede the native auth-file write.
-                update({"sessionUpdate": "tool_call_update", "toolCallId": "nested-auth", "status": "completed", "rawOutput": {"nested": {"key": "not-yet-written-key", "access": "not-yet-written-access", "refresh": "not-yet-written-refresh"}}})
+                nested = {"nested": {"key": "not-yet-written-key", "access": "not-yet-written-access", "refresh": "not-yet-written-refresh"}}
+                update({"sessionUpdate": "tool_call_update", "toolCallId": "nested-auth", "status": "completed", "rawOutput": {"output": json.dumps(nested), "metadata": nested}})
                 complete()
             elif mode == "native-error":
                 emit({"id": request["id"], "error": {"code": -32000, "message": "auth_required " + " ".join(values)}})
@@ -123,18 +214,20 @@ for line in sys.stdin:
             agent = config["agent"][internal]
             expected = "ask" if mode == "permission-ask" else "allow"
             assert agent["mode"] == "primary" and agent["permission"] == {"*": expected}
-            update({"sessionUpdate": "assistant_message_chunk", "content": {"type": "text", "text": expected + "-checked"}})
+            chunk(expected + "-checked")
             complete()
         elif mode == "error":
             emit({"id": request["id"], "error": {"code": -32000, "message": "auth_required secret-value"}})
             prompt = None
         elif mode in ("approval", "queue") and not answered:
-            options = [{"optionId": "once-choice", "kind": "allow_once"},
-                       {"optionId": "session-choice", "kind": "allow_always"},
-                       {"optionId": "deny-choice", "kind": "reject_once"}]
+            options = [{"optionId": "once", "kind": "allow_once", "name": "Allow once"},
+                       {"optionId": "always", "kind": "allow_always", "name": "Always allow"},
+                       {"optionId": "reject", "kind": "reject_once", "name": "Reject"}]
+            # A peer request may reuse the prompt's own ID; it must not answer it.
             for ident in ("first", request["id"]):
+                tool("call_" + str(ident), "bash", {"command": "echo " + str(ident)})
                 emit({"id": ident, "method": "session/request_permission", "params": {
-                    "sessionId": session, "toolCall": {"toolCallId": str(ident), "title": "shell", "rawInput": {"command": "echo hi"}},
+                    "sessionId": session, "toolCall": {"toolCallId": "call_" + str(ident), "status": "pending", "title": "bash", "rawInput": {}, "kind": "execute", "locations": []},
                     "options": options}})
         elif mode == "foreign":
             emit({"id": "foreign-permission", "method": "session/request_permission", "params": {"sessionId": "other-session", "toolCall": {}, "options": []}})
@@ -142,16 +235,19 @@ for line in sys.stdin:
             emit({"id": "host-fs", "method": "fs/write_text_file", "params": {"sessionId": session, "path": "HOST-PWNED", "content": "bad"}})
             emit({"id": "host-terminal", "method": "terminal/create", "params": {"sessionId": session, "command": "echo bad"}})
         elif mode == "hold":
-            update({"sessionUpdate": "assistant_message_chunk", "content": {"type": "text", "text": "waiting"}})
+            chunk("waiting")
         else:
-            update({"sessionUpdate": "tool_call", "toolCallId": "tool", "title": "shell", "kind": "execute", "status": "in_progress", "rawInput": {"command": "echo hi"}})
-            update({"sessionUpdate": "tool_call_update", "toolCallId": "tool", "status": "completed", "rawOutput": "hi"})
-            update({"sessionUpdate": "assistant_message_chunk", "content": {"type": "text", "text": p["prompt"][0]["text"]}})
+            tool("tool", "bash", {"command": "echo hi"})
+            update({"sessionUpdate": "tool_call_update", "toolCallId": "tool", "status": "completed", "kind": "execute", "title": "Print hi", "rawInput": {"command": "echo hi"}, "rawOutput": {"output": "hi", "metadata": {"output": "hi", "exit": 0}}})
+            chunk(p["prompt"][0]["text"])
             complete()
     elif method == "session/cancel":
         assert "id" not in request
         if prompt:
-            answer(prompt, {"stopReason": "cancelled"})
+            # OpenCode keeps streaming briefly after a cancel, then reports an
+            # ordinary end of turn.
+            chunk(" late")
+            answer(prompt, {"stopReason": "end_turn", "usage": {"totalTokens": 0, "inputTokens": 0, "outputTokens": 0}, "_meta": {}})
             prompt = None
     elif method is None:
         if mode == "foreign":
@@ -165,7 +261,7 @@ for line in sys.stdin:
         else:
             outcome = request["result"]["outcome"]
             assert outcome["outcome"] == "selected"
-            expected = "session-choice" if request["id"] == "first" else "deny-choice"
+            expected = "always" if request["id"] == "first" else "reject"
             assert outcome["optionId"] == expected
             answered.append(request["id"])
             if len(answered) == 2:

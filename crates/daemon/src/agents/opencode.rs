@@ -1,4 +1,15 @@
 //! One OpenCode ACP process per agent; prompts run outside the manager lock.
+//!
+//! What OpenCode 1.14.48 does that shapes this (recorded in
+//! `tests/fixtures/opencode/probe-1.14.48`):
+//!
+//! * `session/cancel` ends the prompt with an ordinary `end_turn`, and text may
+//!   still stream in between, so a cancelled turn is known only by our having
+//!   cancelled it.
+//! * A provider failure is never a JSON-RPC error. A rejected key, an unusable
+//!   model or a refused tier ends the prompt with an empty `end_turn`; a 500 or
+//!   a refused connection is retried for ever and the prompt never answers.
+//!   The cause appears only in OpenCode's log, which is printed to stderr.
 use super::{
     acp::{error, AcpRpc, AcpSecrets, Incoming},
     adapter::AgentAdapter,
@@ -13,32 +24,63 @@ use bondsymphonic_proto::{AgentMessageBody, AgentState, PermissionDecision, RpcE
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    sync::mpsc,
+    sync::Notify,
     task::JoinHandle,
 };
+
+/// How long a turn may go without a frame from OpenCode before the user is
+/// told. OpenCode retries a failing provider without a word, but a large local
+/// model can also be silent this long while it loads, so the turn is flagged
+/// rather than ended: only the user knows which it is.
+const STALL_AFTER: Duration = Duration::from_secs(60);
+/// How long an empty turn waits for its cause on stderr, a separate pipe that
+/// can trail the prompt's answer.
+const LOG_GRACE: Duration = Duration::from_millis(250);
+const QUEUE_LIMIT: usize = 64;
 
 struct Approval {
     id: Value,
     options: Vec<Value>,
 }
-#[derive(Default)]
 struct TurnState {
     active: bool,
+    /// Set when we cancel the active turn; OpenCode does not say so itself.
+    cancelled: bool,
     approvals: HashMap<String, Approval>,
+    /// The last frame OpenCode sent this session, or the user's last answer.
+    activity: Instant,
+    stalled: bool,
+    /// The last provider failure OpenCode logged during this turn.
+    provider_error: Option<String>,
 }
-struct Prompt {
-    text: String,
-    generation: u64,
+impl Default for TurnState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            cancelled: false,
+            approvals: HashMap::new(),
+            activity: Instant::now(),
+            stalled: false,
+            provider_error: None,
+        }
+    }
 }
+/// Messages waiting for the turn in flight to end.
+#[derive(Default)]
+struct Prompts {
+    queue: Mutex<VecDeque<String>>,
+    ready: Notify,
+}
+type Stream = Arc<tokio::sync::Mutex<OpenCodeStream>>;
 pub struct OpenCodeAdapter {
     sink: AgentSink,
     handle: Arc<dyn SandboxHandle>,
@@ -46,16 +88,19 @@ pub struct OpenCodeAdapter {
     rpc: Option<Arc<AcpRpc>>,
     session: String,
     state: Arc<Mutex<TurnState>>,
-    generation: Arc<AtomicU64>,
+    /// Held while transcript rows are written, so a row from one task never
+    /// lands inside text another is streaming.
+    stream: Stream,
     dispatch: Arc<tokio::sync::Mutex<()>>,
     replaying: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
     stopping: Arc<AtomicBool>,
-    prompts: Option<mpsc::Sender<Prompt>>,
+    prompts: Option<Arc<Prompts>>,
     killer: Option<Arc<dyn Fn() + Send + Sync>>,
     monitor: Option<JoinHandle<()>>,
     worker: Option<JoinHandle<()>>,
     timeout: Duration,
+    stall_after: Duration,
     secrets: Arc<AcpSecrets>,
 }
 async fn finish(sink: &AgentSink, exited: &AtomicBool, detail: Option<String>) {
@@ -64,6 +109,145 @@ async fn finish(sink: &AgentSink, exited: &AtomicBool, detail: Option<String>) {
     }
     let _ = tokio::time::timeout(Duration::from_secs(3), sink.ended()).await;
     sink.publish_state(AgentState::Exited, detail);
+}
+fn notice(text: impl Into<String>) -> AgentMessageBody {
+    AgentMessageBody::System {
+        subtype: "opencode_notice".into(),
+        data: json!({"text":text.into()}),
+    }
+}
+/// Writes `bodies` after finalising any text still streaming.
+async fn put(sink: &AgentSink, stream: &Stream, bodies: Vec<AgentMessageBody>) {
+    let mut stream = stream.lock().await;
+    for body in stream.flush().into_iter().chain(bodies) {
+        sink.message(body).await;
+    }
+}
+fn no_tokens(usage: &Value) -> bool {
+    usage.as_object().is_none_or(|fields| {
+        fields
+            .values()
+            .all(|value| value.as_f64().is_none_or(|n| n == 0.0))
+    })
+}
+fn empty_turn_text(cause: Option<&str>) -> String {
+    let cause = cause
+        .map(|cause| format!(" OpenCode logged: {cause}."))
+        .unwrap_or_default();
+    format!("The model returned nothing.{cause} Check the provider, model and sign-in in your OpenCode configuration (opencode.json, `opencode auth login`); OpenCode's log has the details.")
+}
+fn stall_text(silent: Duration, cause: Option<&str>) -> String {
+    let cause = cause
+        .map(|cause| format!(" The last error it logged: {cause}."))
+        .unwrap_or_default();
+    format!("No response from the model for {} s. OpenCode keeps retrying a provider that fails, without reporting it.{cause} A large local model may still be loading; interrupt to stop waiting.", silent.as_secs().max(1))
+}
+fn discarded_text(discarded: &[String]) -> String {
+    let quoted = discarded
+        .iter()
+        .map(|text| {
+            let short: String = text.chars().take(60).collect();
+            let more = if short.len() < text.len() { "…" } else { "" };
+            format!("“{short}{more}”")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    match discarded.len() {
+        1 => format!("Interrupted: 1 queued message was not sent: {quoted}"),
+        n => format!("Interrupted: {n} queued messages were not sent: {quoted}"),
+    }
+}
+
+/// The cause in one of OpenCode's `ERROR` log lines about a model request,
+/// without the request body the line also carries. `None` for anything else.
+pub fn provider_error(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("ERROR")?;
+    let (head, error) = rest.split_once(" error=")?;
+    let field = |key: &str| {
+        head.split_whitespace()
+            .find_map(|word| word.strip_prefix(key))
+    };
+    // Title generation fails for the same reason, after the turn's own call.
+    if !matches!(field("service="), Some("llm" | "session.processor"))
+        || field("agent=") == Some("title")
+    {
+        return None;
+    }
+    let cause = if error.starts_with('{') {
+        let value = serde_json::Deserializer::from_str(error)
+            .into_iter::<Value>()
+            .next()?
+            .ok()?;
+        describe(&value["error"])
+    } else {
+        error
+            .split(" stack=")
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    let model = match (field("providerID="), field("modelID=")) {
+        (Some(provider), Some(model)) => format!("{provider}/{model}: "),
+        _ => String::new(),
+    };
+    Some(format!("{model}{cause}").chars().take(400).collect())
+}
+fn describe(error: &Value) -> String {
+    // A retry error wraps every attempt; the last says why it gave up.
+    if let Some(last) = error["errors"].as_array().and_then(|e| e.last()) {
+        return describe(last);
+    }
+    let mut parts = vec![];
+    if let Some(status) = error["statusCode"].as_u64() {
+        parts.push(format!("HTTP {status}"));
+    }
+    if let Some(code) = error["cause"]["code"].as_str() {
+        parts.push(code.to_owned());
+    }
+    if let Some(message) = error["data"]["error"]["message"]
+        .as_str()
+        .or(error["message"].as_str())
+    {
+        parts.push(message.to_owned());
+    }
+    if let Some(url) = error["url"].as_str() {
+        parts.push(format!("from {url}"));
+    }
+    if parts.is_empty() {
+        parts.push(text(error, "name").to_owned());
+    }
+    parts.join(" ")
+}
+
+/// Waits for a prompt's answer, telling the user once per silence when
+/// OpenCode has gone quiet while nobody is being asked anything.
+async fn wait_reporting_stalls(
+    answer: impl std::future::Future<Output = Result<Value, RpcError>>,
+    state: &Mutex<TurnState>,
+    sink: &AgentSink,
+    stream: &Stream,
+    stall_after: Duration,
+) -> Result<Value, RpcError> {
+    tokio::pin!(answer);
+    let check = (stall_after / 4).max(Duration::from_millis(10));
+    loop {
+        tokio::select! {
+            answer = &mut answer => return answer,
+            _ = tokio::time::sleep(check) => {
+                let stalled = {
+                    let mut current = state.lock();
+                    let silent = current.activity.elapsed();
+                    let stalled = current.approvals.is_empty() && !current.stalled && silent >= stall_after;
+                    current.stalled |= stalled;
+                    stalled.then(|| stall_text(silent, current.provider_error.as_deref()))
+                };
+                if let Some(text) = stalled {
+                    put(sink, stream, vec![notice(text)]).await;
+                }
+            }
+        }
+    }
 }
 impl OpenCodeAdapter {
     pub fn new(sink: AgentSink, handle: Arc<dyn SandboxHandle>, prepared: PreparedAgent) -> Self {
@@ -78,7 +262,7 @@ impl OpenCodeAdapter {
             rpc: None,
             session: String::new(),
             state: Arc::new(Mutex::new(TurnState::default())),
-            generation: Arc::new(AtomicU64::new(0)),
+            stream: Stream::default(),
             dispatch: Arc::new(tokio::sync::Mutex::new(())),
             replaying: Arc::new(AtomicBool::new(true)),
             exited: Arc::new(AtomicBool::new(false)),
@@ -88,11 +272,16 @@ impl OpenCodeAdapter {
             monitor: None,
             worker: None,
             timeout: Duration::from_secs(30),
+            stall_after: STALL_AFTER,
             secrets,
         }
     }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+    pub fn with_stall_after(mut self, stall_after: Duration) -> Self {
+        self.stall_after = stall_after;
         self
     }
     fn rpc(&self) -> Result<Arc<AcpRpc>, RpcError> {
@@ -202,57 +391,99 @@ impl OpenCodeAdapter {
         Ok(())
     }
     fn start_worker(&mut self) {
-        let (sender, mut receiver) = mpsc::channel::<Prompt>(64);
-        self.prompts = Some(sender);
+        let prompts = Arc::new(Prompts::default());
+        self.prompts = Some(prompts.clone());
         let rpc = self.rpc.as_ref().unwrap().clone();
         let sink = self.sink.clone();
         let session = self.session.clone();
         let state = self.state.clone();
-        let generation = self.generation.clone();
+        let stream = self.stream.clone();
         let dispatch = self.dispatch.clone();
         let exited = self.exited.clone();
+        let stall_after = self.stall_after;
         self.worker = Some(tokio::spawn(async move {
-            while let Some(prompt) = receiver.recv().await {
+            loop {
                 if exited.load(Ordering::SeqCst) {
                     break;
                 }
-                let started = std::time::Instant::now();
-                // Serialize only the prompt's write with cancellation, so a
-                // cancel cannot run just before the prompt it meant to stop.
+                let started = Instant::now();
+                // Take and write a prompt under the lock cancellation holds, so
+                // an interrupt either stops this prompt or discards it unsent.
                 let dispatched = {
                     let _dispatch = dispatch.lock().await;
-                    if prompt.generation != generation.load(Ordering::SeqCst) {
+                    let Some(text) = prompts.queue.lock().pop_front() else {
+                        drop(_dispatch);
+                        prompts.ready.notified().await;
                         continue;
+                    };
+                    {
+                        // Active before the write: the turn's first frame can
+                        // follow it at once.
+                        let mut current = state.lock();
+                        current.active = true;
+                        current.cancelled = false;
+                        current.stalled = false;
+                        current.provider_error = None;
+                        current.activity = Instant::now();
+                        sink.publish_state(
+                            if current.approvals.is_empty() {
+                                AgentState::Working
+                            } else {
+                                AgentState::WaitingPermission
+                            },
+                            None,
+                        );
                     }
-                    let pending = rpc.start_prompt(json!({"sessionId":session,"prompt":[{"type":"text","text":prompt.text}]})).await;
-                    let mut current = state.lock();
-                    current.active = true;
-                    sink.publish_state(
-                        if current.approvals.is_empty() {
-                            AgentState::Working
-                        } else {
-                            AgentState::WaitingPermission
-                        },
-                        None,
-                    );
-                    pending
+                    rpc.start_prompt(
+                        json!({"sessionId":session,"prompt":[{"type":"text","text":text}]}),
+                    )
+                    .await
                 };
                 let result = match dispatched {
-                    Ok(pending) => pending.wait().await,
+                    Ok(pending) => {
+                        wait_reporting_stalls(pending.wait(), &state, &sink, &stream, stall_after)
+                            .await
+                    }
                     Err(failure) => Err(failure),
                 };
                 if exited.load(Ordering::SeqCst) {
                     break;
                 }
-                {
+                let produced = {
+                    // Under the stream lock, so a frame after the answer is
+                    // either part of this turn or seen as late.
+                    let mut stream = stream.lock().await;
+                    state.lock().active = false;
+                    let (bodies, produced) = stream.finish_turn();
+                    for body in bodies {
+                        sink.message(body).await;
+                    }
+                    produced
+                };
+                let (cancelled, mut cause) = {
                     let mut current = state.lock();
-                    current.active = false;
                     current.approvals.clear();
-                }
-                let (data, detail) = match result {
+                    (current.cancelled, current.provider_error.take())
+                };
+                let (mut data, detail) = match result {
                     Ok(value) => (value, None),
                     Err(failure) => (json!({"error":failure.message}), Some(failure.message)),
                 };
+                if detail.is_none() && cancelled {
+                    data["reportedStopReason"] = data["stopReason"].clone();
+                    data["stopReason"] = json!("cancelled");
+                } else if detail.is_none()
+                    && !produced
+                    && data["stopReason"] == "end_turn"
+                    && no_tokens(&data["usage"])
+                {
+                    if cause.is_none() {
+                        tokio::time::sleep(LOG_GRACE).await;
+                        cause = state.lock().provider_error.take();
+                    }
+                    sink.message(notice(empty_turn_text(cause.as_deref())))
+                        .await;
+                }
                 sink.message(AgentMessageBody::System {
                     subtype: "opencode_turn".into(),
                     data,
@@ -287,10 +518,16 @@ impl AgentAdapter for OpenCodeAdapter {
         if self.rpc.is_some() {
             return Err(error("OpenCode already started"));
         }
+        let mut argv = self.prepared.argv.clone();
+        // A provider failure reaches us only as a log line. WARN keeps those
+        // and leaves out the per-request INFO lines.
+        if argv.iter().any(|arg| arg == "acp") && !argv.iter().any(|arg| arg == "--print-logs") {
+            argv.extend(["--print-logs", "--log-level", "WARN"].map(String::from));
+        }
         let mut child = self
             .handle
             .spawn(SandboxCommand {
-                argv: self.prepared.argv.clone(),
+                argv,
                 env: self.prepared.env.clone(),
                 cwd: Some(self.prepared.cwd.clone()),
                 pty: None,
@@ -308,18 +545,36 @@ impl AgentAdapter for OpenCodeAdapter {
         let tail = Arc::new(Mutex::new(String::new()));
         let stderr_tail = tail.clone();
         let stderr_secrets = secrets.clone();
+        let stderr_state = self.state.clone();
         let mut stderr_task = tokio::spawn(async move {
             if let Some(stderr) = child.stderr.take() {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let mut value = json!(line);
+                // Lossy: a reader that stopped at invalid UTF-8 would leave
+                // OpenCode blocked on a full pipe.
+                let mut reader = BufReader::new(stderr);
+                let mut bytes = Vec::new();
+                while matches!(reader.read_until(b'\n', &mut bytes).await, Ok(n) if n > 0) {
+                    let line = String::from_utf8_lossy(&bytes).trim_end().to_owned();
+                    bytes.clear();
+                    // A stack trace's frames say nothing to the user.
+                    if line.starts_with(char::is_whitespace) && line.trim_start().starts_with("at ")
+                    {
+                        continue;
+                    }
+                    // Only the cause: the whole line repeats the request,
+                    // conversation included.
+                    let cause = provider_error(&line);
+                    let mut value = json!(cause.as_deref().unwrap_or(&line));
                     stderr_secrets.redact(&mut value);
-                    *stderr_tail.lock() = value
+                    let shown: String = value
                         .as_str()
                         .unwrap_or_default()
                         .chars()
                         .take(2000)
                         .collect();
+                    if cause.is_some() {
+                        stderr_state.lock().provider_error = Some(shown.clone());
+                    }
+                    *stderr_tail.lock() = shown;
                 }
             }
         });
@@ -327,10 +582,10 @@ impl AgentAdapter for OpenCodeAdapter {
         self.rpc = Some(rpc.clone());
         let sink = self.sink.clone();
         let state = self.state.clone();
+        let stream = self.stream.clone();
         let replaying = self.replaying.clone();
         let event_rpc = rpc.clone();
         let mut pump = tokio::spawn(async move {
-            let mut stream = OpenCodeStream::default();
             while let Some(incoming) = events.recv().await {
                 let frame = match incoming {
                     Incoming::Barrier(ready) => {
@@ -364,19 +619,33 @@ impl AgentAdapter for OpenCodeAdapter {
                             .await;
                         continue;
                     }
+                    if !replaying.load(Ordering::SeqCst) {
+                        let mut current = state.lock();
+                        current.activity = Instant::now();
+                        current.stalled = false;
+                    }
                 }
                 match text(&frame, "method") {
                     "session/update" => {
-                        if !replaying.load(Ordering::SeqCst) {
-                            for body in stream.ingest(p["update"].clone()) {
-                                sink.message(body).await;
-                            }
+                        if replaying.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        let mut stream = stream.lock().await;
+                        // OpenCode streams on briefly after a cancel; what
+                        // comes after the answer belongs to a finished turn.
+                        if !state.lock().active {
+                            continue;
+                        }
+                        for body in stream.ingest(p["update"].clone()) {
+                            sink.message(body).await;
                         }
                     }
                     "session/request_permission" if frame.get("id").is_some() => {
                         let id = frame["id"].clone();
                         let options = p["options"].as_array().cloned().unwrap_or_default();
                         let request_id = approval_id(&id);
+                        let mut stream = stream.lock().await;
+                        let (tool_name, input) = stream.permission(&p["toolCall"]);
                         {
                             let mut current = state.lock();
                             current.approvals.insert(
@@ -388,10 +657,13 @@ impl AgentAdapter for OpenCodeAdapter {
                             );
                             sink.publish_state(AgentState::WaitingPermission, None);
                         }
+                        for body in stream.flush() {
+                            sink.message(body).await;
+                        }
                         sink.message(AgentMessageBody::PermissionRequest {
                             request_id,
-                            tool_name: text(&p["toolCall"], "title").into(),
-                            input: p["toolCall"].clone(),
+                            tool_name,
+                            input,
                             suggestions: options,
                         })
                         .await;
@@ -440,21 +712,22 @@ impl AgentAdapter for OpenCodeAdapter {
     }
     async fn send(&mut self, text: String) -> Result<(), RpcError> {
         self.rpc()?;
-        let sender = self
+        let prompts = self
             .prompts
-            .as_ref()
+            .clone()
             .ok_or_else(|| error("OpenCode agent has not initialized"))?;
-        // Never wait for queue capacity under the lock approvals also need.
-        let permit = sender
-            .try_reserve()
-            .map_err(|_| error("OpenCode prompt queue is full or closed"))?;
-        self.sink
-            .message(AgentMessageBody::UserText { text: text.clone() })
-            .await;
-        permit.send(Prompt {
-            text,
-            generation: self.generation.load(Ordering::SeqCst),
-        });
+        if prompts.queue.lock().len() >= QUEUE_LIMIT {
+            return Err(error("OpenCode prompt queue is full"));
+        }
+        // After the text streaming now, not inside its bubble.
+        put(
+            &self.sink,
+            &self.stream,
+            vec![AgentMessageBody::UserText { text: text.clone() }],
+        )
+        .await;
+        prompts.queue.lock().push_back(text);
+        prompts.ready.notify_one();
         Ok(())
     }
     async fn permission_reply(
@@ -492,6 +765,9 @@ impl AgentAdapter for OpenCodeAdapter {
                 .to_owned();
             let id = approval.id.clone();
             current.approvals.remove(&request_id);
+            // Waiting on the user was not OpenCode's silence.
+            current.activity = Instant::now();
+            current.stalled = false;
             self.sink.publish_state(
                 if current.approvals.is_empty() {
                     AgentState::Working
@@ -502,35 +778,55 @@ impl AgentAdapter for OpenCodeAdapter {
             );
             (id, option)
         };
-        self.sink
-            .message(AgentMessageBody::System {
+        put(
+            &self.sink,
+            &self.stream,
+            vec![AgentMessageBody::System {
                 subtype: "permission_reply".into(),
                 data: json!({"request_id":request_id,"decision":decision}),
-            })
-            .await;
+            }],
+        )
+        .await;
         rpc.reply(
             id,
             json!({"outcome":{"outcome":"selected","optionId":option}}),
         )
         .await
     }
+    /// Cancels the turn in flight and discards the messages queued behind it,
+    /// saying so: like a Codex turn, which takes in what is sent during it and
+    /// is interrupted with it.
     async fn interrupt(&mut self) -> Result<(), RpcError> {
         let rpc = self.rpc()?;
         let _dispatch = self.dispatch.lock().await;
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        let approvals: Vec<Approval> = self
-            .state
-            .lock()
-            .approvals
-            .drain()
-            .map(|(_, a)| a)
-            .collect();
+        let discarded: Vec<String> = self
+            .prompts
+            .as_ref()
+            .map(|prompts| prompts.queue.lock().drain(..).collect())
+            .unwrap_or_default();
+        let approvals: Vec<Approval> = {
+            let mut current = self.state.lock();
+            current.cancelled |= current.active;
+            let approvals: Vec<Approval> = current.approvals.drain().map(|(_, a)| a).collect();
+            if current.active && !approvals.is_empty() {
+                self.sink.publish_state(AgentState::Working, None);
+            }
+            approvals
+        };
         rpc.notify("session/cancel", json!({"sessionId":self.session}))
             .await?;
         for approval in approvals {
             let _ = rpc
                 .reply(approval.id, json!({"outcome":{"outcome":"cancelled"}}))
                 .await;
+        }
+        if !discarded.is_empty() {
+            put(
+                &self.sink,
+                &self.stream,
+                vec![notice(discarded_text(&discarded))],
+            )
+            .await;
         }
         Ok(())
     }
@@ -576,5 +872,69 @@ impl Drop for OpenCodeAdapter {
                 kill();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn logged(scenario: &str) -> Vec<String> {
+        let path = format!(
+            "{}/tests/fixtures/opencode/probe-1.14.48/frames/{scenario}.stderr.txt",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(provider_error)
+            .collect()
+    }
+
+    /// The causes OpenCode 1.14.48 logged for each recorded provider failure,
+    /// reduced to one line without the request it repeats.
+    #[test]
+    fn recorded_provider_failures_are_reduced_to_their_cause() {
+        assert_eq!(
+            logged("G401"),
+            [
+                "mock/m1: HTTP 401 Incorrect API key provided from http://127.0.0.1:18080/v1/chat/completions",
+                "Incorrect API key provided"
+            ]
+        );
+        assert_eq!(
+            logged("B").last().unwrap(),
+            "OpenCode 1.18.0 or newer is required to use the free tier"
+        );
+        assert!(logged("G500").iter().all(|cause| cause
+            == "mock/m1: HTTP 500 Incorrect API key provided from http://127.0.0.1:18080/v1/chat/completions"));
+        assert!(logged("Grefused").iter().all(|cause| cause
+            == "mock/m1: ConnectionRefused from http://127.0.0.1:9/v1/chat/completions"));
+        assert!(logged("Grefused")
+            .iter()
+            .all(|cause| !cause.contains("You are")));
+    }
+
+    #[test]
+    fn other_lines_are_not_provider_errors() {
+        for line in [
+            "INFO  2026-10-20T13:37:49 +17ms service=session.processor process",
+            "ERROR 2026-10-20T13:34:16 +23ms service=mcp key=catsrv error=MCP error -32601: Method not found local mcp startup failed",
+            "WARN  2026-10-20T13:38:53 +27582ms service=snapshot exitCode=128 stderr=fatal: gc is already running",
+            "Error handling request {",
+        ] {
+            assert_eq!(provider_error(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn usage_without_tokens_is_empty() {
+        assert!(no_tokens(&Value::Null));
+        assert!(no_tokens(
+            &json!({"totalTokens":0,"inputTokens":0,"outputTokens":0})
+        ));
+        assert!(!no_tokens(
+            &json!({"totalTokens":8,"inputTokens":5,"outputTokens":3})
+        ));
     }
 }
