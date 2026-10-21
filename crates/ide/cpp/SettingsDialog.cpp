@@ -11,6 +11,7 @@
 #include <QDir>
 #include <QFormLayout>
 #include <QFrame>
+#include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -183,6 +184,7 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
                              [this, configDirectory] {
                 openOpenCodeConfigFolder(this, configDirectory);
             });
+            backendForm->addRow(buildOpenCodeProviders(page));
         }
         const QString label = descriptor.value("label").toString(id);
         m_backends.insert(id, {label, enabled, key, remove, model, mode});
@@ -277,6 +279,176 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
 
     QObject::connect(buttons, &QDialogButtonBox::accepted, this, &SettingsDialog::accept);
     QObject::connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+}
+
+namespace {
+
+/// What every "Test connection" button says about itself: what the test
+/// stands for, and that it is run from the daemon rather than in a sandbox.
+const char* const kProviderTestTip =
+    "Asks whether a sandboxed OpenCode agent would reach this server. The daemon resolves and "
+    "connects to the baseURL's origin exactly as the sandbox's proxy does for a granted origin "
+    "(localhost means the WSL distribution's own loopback), then fetches <baseURL>/models with "
+    "the API key the agent would send. It runs from the daemon, not inside a sandbox, so no "
+    "agent needs to be running.";
+
+QLabel* plainLabel(const QString& text, QWidget* parent) {
+    auto* label = new QLabel(text, parent);
+    label->setTextFormat(Qt::PlainText);
+    label->setWordWrap(true);
+    return label;
+}
+
+} // namespace
+
+QWidget* SettingsDialog::buildOpenCodeProviders(QWidget* parent) {
+    m_openCodeProviders = new QWidget(parent);
+    m_openCodeProviders->setObjectName(QStringLiteral("OpenCodeProviders"));
+    m_openCodeProviders->hide();
+    auto* layout = new QVBoxLayout(m_openCodeProviders);
+    layout->setContentsMargins(0, 0, 0, 0);
+    auto* header = new QHBoxLayout();
+    auto* heading = plainLabel(QStringLiteral("Model servers in this config"), m_openCodeProviders);
+    QFont headingFont = heading->font();
+    headingFont.setBold(true);
+    heading->setFont(headingFont);
+    header->addWidget(heading, 1);
+    auto* reload = new QPushButton(QStringLiteral("Reload"), m_openCodeProviders);
+    reload->setObjectName(QStringLiteral("OpenCodeProvidersReload"));
+    reload->setToolTip(QStringLiteral("Read the OpenCode config again."));
+    header->addWidget(reload);
+    layout->addLayout(header);
+    m_openCodeProvidersNote = plainLabel(QString(), m_openCodeProviders);
+    m_openCodeProvidersNote->hide();
+    layout->addWidget(m_openCodeProvidersNote);
+    m_openCodeProviderRows = new QWidget(m_openCodeProviders);
+    m_openCodeProviderRows->setLayout(new QVBoxLayout());
+    m_openCodeProviderRows->layout()->setContentsMargins(0, 0, 0, 0);
+    layout->addWidget(m_openCodeProviderRows);
+
+    QObject::connect(reload, &QPushButton::clicked, this,
+                     [this] { m_controller->refreshOpencodeProviders(); });
+    QObject::connect(m_controller, &AppController::opencodeProvidersListed, this,
+                     [this](const QString& json) { showOpenCodeProviders(json); });
+    QObject::connect(m_controller, &AppController::opencodeProviderTested, this,
+                     [this](const QString& provider, const QString& json) {
+                         showOpenCodeProviderTest(provider, json);
+                     });
+    // A daemon that does not offer the list is not asked, and the section
+    // stays hidden.
+    m_controller->refreshOpencodeProviders();
+    return m_openCodeProviders;
+}
+
+void SettingsDialog::showOpenCodeProviders(const QString& json) {
+    if (m_openCodeProviders == nullptr) {
+        return;
+    }
+    m_openCodeProviders->show();
+    // Deleted now rather than later: nothing of a row is on the stack here,
+    // and a stale button must not answer `findChild` in the meantime.
+    for (QWidget* row : m_openCodeProviderRows->findChildren<QWidget*>(
+             QString(), Qt::FindDirectChildrenOnly)) {
+        delete row;
+    }
+    m_providerRows.clear();
+    const auto answer = QJsonDocument::fromJson(json.toUtf8()).object();
+    QStringList notes;
+    if (answer.contains(QStringLiteral("error"))) {
+        notes << QStringLiteral("The model servers could not be listed: ") +
+                     answer.value(QStringLiteral("error")).toString();
+    }
+    for (const auto& warning : answer.value(QStringLiteral("warnings")).toArray()) {
+        notes << warning.toString();
+    }
+    const auto providers = answer.value(QStringLiteral("providers")).toArray();
+    if (!answer.contains(QStringLiteral("error")) && providers.isEmpty()) {
+        notes << QStringLiteral("No providers are configured; OpenCode uses its built-in ones.");
+    }
+    m_openCodeProvidersNote->setText(notes.join(QLatin1Char('\n')));
+    m_openCodeProvidersNote->setVisible(!notes.isEmpty());
+
+    for (const auto& value : providers) {
+        const auto p = value.toObject();
+        const QString id = p.value(QStringLiteral("id")).toString();
+        const QString name = p.value(QStringLiteral("name")).toString();
+        const QString baseUrl = p.value(QStringLiteral("base_url")).toString();
+        const int models = p.value(QStringLiteral("model_count")).toInt();
+        const QString route = p.value(QStringLiteral("sandbox_route")).toString();
+        const QString note = p.value(QStringLiteral("route_note")).toString();
+
+        auto* row = new QFrame(m_openCodeProviderRows);
+        row->setFrameShape(QFrame::StyledPanel);
+        auto* rowLayout = new QGridLayout(row);
+        auto* title = plainLabel(name.isEmpty() || name == id
+                                     ? id
+                                     : QStringLiteral("%1 (%2)").arg(id, name),
+                                 row);
+        QFont bold = title->font();
+        bold.setBold(true);
+        title->setFont(bold);
+        rowLayout->addWidget(title, 0, 0);
+        auto* test = new QPushButton(QStringLiteral("Test connection"), row);
+        test->setObjectName(QStringLiteral("OpenCodeTest_") + id);
+        test->setToolTip(QString::fromLatin1(kProviderTestTip));
+        rowLayout->addWidget(test, 0, 1, 2, 1, Qt::AlignTop);
+        QStringList facts;
+        facts << (baseUrl.isEmpty() ? QStringLiteral("No baseURL") : baseUrl);
+        facts << (models == 1 ? QStringLiteral("1 model configured")
+                              : QStringLiteral("%1 models configured").arg(models));
+        auto* detail = plainLabel(facts.join(QStringLiteral(" · ")), row);
+        detail->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        rowLayout->addWidget(detail, 1, 0);
+        int next = 2;
+        if (!note.isEmpty()) {
+            rowLayout->addWidget(plainLabel(note, row), next++, 0, 1, 2);
+        }
+        auto* result = plainLabel(QString(), row);
+        result->setObjectName(QStringLiteral("OpenCodeTestResult_") + id);
+        result->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        rowLayout->addWidget(result, next, 0, 1, 2);
+        rowLayout->setColumnStretch(0, 1);
+        m_openCodeProviderRows->layout()->addWidget(row);
+
+        if (route == QLatin1String("no_base_url")) {
+            test->setEnabled(false);
+            test->setToolTip(QStringLiteral(
+                "This provider names no baseURL, so there is no model server of yours to test."));
+        }
+        m_providerRows.insert(id, {test, result});
+        QObject::connect(test, &QPushButton::clicked, this, [this, id, test, result] {
+            test->setEnabled(false);
+            test->setText(QStringLiteral("Testing…"));
+            result->setText(QStringLiteral("Testing…"));
+            result->setToolTip(QString());
+            if (!m_controller->testOpencodeProvider(id)) {
+                test->setEnabled(true);
+                test->setText(QStringLiteral("Test connection"));
+                result->setText(QStringLiteral("Not connected to the daemon; try again once it is."));
+            }
+        });
+    }
+}
+
+void SettingsDialog::showOpenCodeProviderTest(const QString& provider, const QString& json) {
+    const auto it = m_providerRows.constFind(provider);
+    if (it == m_providerRows.constEnd()) {
+        return;
+    }
+    const auto answer = QJsonDocument::fromJson(json.toUtf8()).object();
+    it->test->setEnabled(true);
+    it->test->setText(QStringLiteral("Test connection"));
+    it->result->setText(answer.value(QStringLiteral("message")).toString());
+    QStringList tip;
+    const QString url = answer.value(QStringLiteral("url")).toString();
+    if (!url.isEmpty()) {
+        tip << QStringLiteral("Fetched %1").arg(url);
+    }
+    const QString key = answer.value(QStringLiteral("key_source")).toString();
+    tip << (key.isEmpty() ? QStringLiteral("No API key was sent.")
+                          : QStringLiteral("API key from %1.").arg(key));
+    tip << QStringLiteral("Took %1 ms.").arg(answer.value(QStringLiteral("elapsed_ms")).toInt());
+    it->result->setToolTip(tip.join(QLatin1Char('\n')));
 }
 
 void SettingsDialog::revealSetup() {
@@ -639,6 +811,85 @@ extern "C" std::int32_t bs_widget_test_settings_follows_a_backend_switched_off()
         return 5;
     if (enabled->isChecked()) return 6;
     if (dialog.findChild<QComboBox*>("DefaultBackend")->findData("codex") >= 0) return 7;
+    return 0;
+}
+
+/// The OpenCode tab lists the model servers in the config and tests each one.
+/// Hidden until the daemon answers, which a daemon that does not offer the
+/// methods never does; each row has its own button and its own answer.
+extern "C" std::int32_t bs_widget_test_settings_lists_and_tests_opencode_servers() {
+    AppController controller;
+    const QJsonArray descriptors{QJsonObject{{"id", "opencode"},
+                                             {"label", "OpenCode"},
+                                             {"default_permission_mode", "ask"},
+                                             {"setup_actions", QJsonArray{"install_opencode"}},
+                                             {"credential_label", "OpenAI API key"}}};
+    SettingsDialog dialog(&controller, nullptr, descriptors);
+    auto* box = dialog.findChild<QWidget*>(QStringLiteral("OpenCodeProviders"));
+    // No hello yet, so nothing says the daemon offers the list.
+    if (box == nullptr || !box->isHidden() || controller.opencodeProvidersSupported()) return 1;
+
+    controller.opencodeProvidersListed(QStringLiteral(
+        R"({"providers":[)"
+        R"({"id":"ollama","name":"Ollama","base_url":"http://localhost:11434/v1","model_count":2,)"
+        R"("sandbox_route":"tunnelled","route_note":"Loopback: carried to localhost:11434"},)"
+        R"({"id":"envy","base_url":"{env:URL}","model_count":0,"sandbox_route":"not_granted",)"
+        R"("route_note":"Not a literal http:// or https:// URL"},)"
+        R"({"id":"openai","sandbox_route":"no_base_url","route_note":"No baseURL"}],)"
+        R"("warnings":["config.json is not valid JSON"]})"));
+    if (box->isHidden()) return 2;
+    auto* test = dialog.findChild<QPushButton*>(QStringLiteral("OpenCodeTest_ollama"));
+    auto* result = dialog.findChild<QLabel*>(QStringLiteral("OpenCodeTestResult_ollama"));
+    auto* envy = dialog.findChild<QPushButton*>(QStringLiteral("OpenCodeTest_envy"));
+    auto* builtin = dialog.findChild<QPushButton*>(QStringLiteral("OpenCodeTest_openai"));
+    if (!test || !result || !envy || !builtin) return 3;
+    // The tooltip says where the test runs and what it stands for.
+    if (!test->toolTip().contains("daemon") || !test->toolTip().contains("sandbox")) return 4;
+    // Nothing to test without a baseURL.
+    if (builtin->isEnabled() || !test->isEnabled()) return 5;
+    bool sawUrl = false, sawCount = false, sawNote = false, sawWarning = false;
+    for (QLabel* label : box->findChildren<QLabel*>()) {
+        sawUrl |= label->text().contains("http://localhost:11434/v1");
+        sawCount |= label->text().contains("2 models");
+        sawNote |= label->text().contains("Not a literal");
+        sawWarning |= label->text().contains("config.json is not valid JSON");
+        if (label->textFormat() != Qt::PlainText) return 6;
+    }
+    if (!sawUrl || !sawCount || !sawNote || !sawWarning) return 7;
+
+    // Not connected: the click says so at once and leaves the button live.
+    test->click();
+    if (!test->isEnabled() || result->text().isEmpty()) return 8;
+
+    controller.opencodeProviderTested(
+        QStringLiteral("ollama"),
+        QStringLiteral(R"({"outcome":"reachable","message":"Reachable: 2 models (llama3, qwen).",)"
+                       R"("url":"http://localhost:11434/v1/models","status":200,"model_count":2,)"
+                       R"("model_ids":["llama3","qwen"],"elapsed_ms":40})"));
+    if (result->text() != QLatin1String("Reachable: 2 models (llama3, qwen).")) return 9;
+    if (!result->toolTip().contains("http://localhost:11434/v1/models")) return 10;
+    // Another row's answer stays under that row.
+    controller.opencodeProviderTested(
+        QStringLiteral("envy"),
+        QStringLiteral(R"({"outcome":"not_granted","message":"Not reachable from sandboxes."})"));
+    if (result->text() != QLatin1String("Reachable: 2 models (llama3, qwen).")) return 11;
+
+    // A new listing replaces the rows.
+    controller.opencodeProvidersListed(QStringLiteral(
+        R"({"providers":[{"id":"lan","base_url":"http://192.168.1.20:8000/v1","model_count":1,)"
+        R"("sandbox_route":"granted"}]})"));
+    if (dialog.findChild<QPushButton*>(QStringLiteral("OpenCodeTest_ollama")) != nullptr ||
+        dialog.findChild<QPushButton*>(QStringLiteral("OpenCodeTest_lan")) == nullptr)
+        return 12;
+    // An answer for a row that is gone is dropped.
+    controller.opencodeProviderTested(QStringLiteral("ollama"),
+                                      QStringLiteral(R"({"outcome":"refused","message":"x"})"));
+    // The daemon could not list them: said, not hidden.
+    controller.opencodeProvidersListed(QStringLiteral(R"({"error":"config unreadable"})"));
+    bool sawError = false;
+    for (QLabel* label : box->findChildren<QLabel*>())
+        sawError |= label->text().contains("config unreadable");
+    if (!sawError || box->isHidden()) return 13;
     return 0;
 }
 

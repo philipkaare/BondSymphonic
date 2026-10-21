@@ -8,6 +8,7 @@ class AppController;
 class SetupPage;
 class QCheckBox;
 class QComboBox;
+class QLabel;
 class QLineEdit;
 class QPushButton;
 class QScrollArea;
@@ -83,4 +84,21 @@ private:
     /// The interface and code text sizes, in points.
     QSpinBox* m_uiFontSize = nullptr;
     QSpinBox* m_codeFontSize = nullptr;
+
+    /// The OpenCode tab's list of model servers: built empty and hidden, and
+    /// shown when the daemon answers `opencode.list_providers` -- which a
+    /// daemon that does not offer it is never asked, so there it stays hidden.
+    QWidget* buildOpenCodeProviders(QWidget* parent);
+    /// Rebuilds the rows from an `OpenCodeProvidersResult` (or `{"error"}`).
+    void showOpenCodeProviders(const QString& json);
+    /// Puts one connection test's answer under its provider's row.
+    void showOpenCodeProviderTest(const QString& provider, const QString& json);
+    struct ProviderRow {
+        QPushButton* test;
+        QLabel* result;
+    };
+    QWidget* m_openCodeProviders = nullptr;
+    QWidget* m_openCodeProviderRows = nullptr;
+    QLabel* m_openCodeProvidersNote = nullptr;
+    QMap<QString, ProviderRow> m_providerRows;
 };

@@ -945,6 +945,37 @@ pub mod qobject {
             generation: i64,
         );
 
+        /// Whether the daemon answers `opencode.list_providers` and
+        /// `opencode.test_provider`. False before `hello` and against a
+        /// daemon that predates them, where Settings hides the list.
+        #[qinvokable]
+        fn opencode_providers_supported(self: &AppController) -> bool;
+
+        /// Asks the daemon for the providers in the OpenCode config. The
+        /// answer arrives as `opencode_providers_listed`. False, and no
+        /// signal, when the daemon does not offer it or is not connected.
+        #[qinvokable]
+        fn refresh_opencode_providers(self: Pin<&mut AppController>) -> bool;
+
+        /// An `OpenCodeProvidersResult` as JSON, or `{"error": "..."}`.
+        #[qsignal]
+        fn opencode_providers_listed(self: Pin<&mut AppController>, json: QString);
+
+        /// Tests one provider's server from the daemon, with the stored
+        /// OpenCode key. The answer arrives as `opencode_provider_tested`;
+        /// false, and no signal, when there is no daemon to ask.
+        #[qinvokable]
+        fn test_opencode_provider(self: Pin<&mut AppController>, provider: QString) -> bool;
+
+        /// An `OpenCodeProviderTest` as JSON. A request the daemon could not
+        /// answer arrives as one too, with outcome `failed`.
+        #[qsignal]
+        fn opencode_provider_tested(
+            self: Pin<&mut AppController>,
+            provider: QString,
+            json: QString,
+        );
+
         /// Stores the Anthropic API key in the Windows credential store,
         /// replacing any previous one. Returns whether it was stored.
         ///
@@ -4140,6 +4171,69 @@ impl qobject::AppController {
         ));
     }
 
+    pub fn opencode_providers_supported(&self) -> bool {
+        opencode_providers_offered(&self.rust().capabilities.to_string())
+    }
+
+    pub fn refresh_opencode_providers(self: Pin<&mut Self>) -> bool {
+        if !self.opencode_providers_supported() {
+            return false;
+        }
+        let Ok(shared) = require_connection() else {
+            return false;
+        };
+        let qt = self.qt_thread();
+        let connection = connection_generation();
+        runtime().spawn(async move {
+            let json = match shared
+                .client
+                .request::<OpenCodeProvidersResult>(Request::OpenCodeListProviders {})
+                .await
+            {
+                Ok(result) => serde_json::to_string(&result).unwrap_or_default(),
+                Err(e) => {
+                    tracing::warn!("opencode.list_providers failed: {e}");
+                    serde_json::json!({ "error": e.to_string() }).to_string()
+                }
+            };
+            let _ = qt.queue(move |q| {
+                if connection_generation() == connection {
+                    q.opencode_providers_listed(QString::from(&json));
+                }
+            });
+        });
+        true
+    }
+
+    pub fn test_opencode_provider(self: Pin<&mut Self>, provider: QString) -> bool {
+        if !self.opencode_providers_supported() {
+            return false;
+        }
+        let Ok(shared) = require_connection() else {
+            return false;
+        };
+        let qt = self.qt_thread();
+        let provider_id = provider.to_string();
+        runtime().spawn(async move {
+            // The key goes no further than the request; the answer never
+            // carries it back.
+            let params = OpenCodeTestProviderParams {
+                provider_id: provider_id.clone(),
+                api_key: crate::qobjects::settings::backend_api_key(AgentAdapterKind::OpenCode),
+            };
+            let result = shared
+                .client
+                .request::<OpenCodeProviderTest>(Request::OpenCodeTestProvider(params))
+                .await
+                .unwrap_or_else(|e| provider_test_failure(&e.to_string()));
+            let json = serde_json::to_string(&result).unwrap_or_default();
+            let _ = qt.queue(move |q| {
+                q.opencode_provider_tested(QString::from(&provider_id), QString::from(&json));
+            });
+        });
+        true
+    }
+
     pub fn set_api_key(mut self: Pin<&mut Self>, key: QString) -> bool {
         // `key` is moved straight into the credential store and dropped. It is
         // deliberately not logged, not stored on this object, and not echoed
@@ -4781,12 +4875,52 @@ impl qobject::AppController {
     }
 }
 
+/// Whether the capabilities `hello` answered with (as JSON) offer the
+/// OpenCode provider methods. Nothing yet, or a daemon that predates them,
+/// is no.
+fn opencode_providers_offered(capabilities: &str) -> bool {
+    serde_json::from_str::<Capabilities>(capabilities).is_ok_and(|c| c.opencode_providers)
+}
+
+/// A connection test the daemon could not run, in the shape of one it did.
+fn provider_test_failure(why: &str) -> OpenCodeProviderTest {
+    OpenCodeProviderTest {
+        outcome: ProviderTestOutcome::Failed,
+        message: format!("The daemon could not run the test: {why}"),
+        url: None,
+        status: None,
+        model_count: None,
+        model_ids: Vec::new(),
+        key_source: None,
+        elapsed_ms: 0,
+    }
+}
+
 /// What `workspaceSummarized` carries when the daemon could not be asked. The
 /// -1 is the "unknown" the Discard confirmation branches on.
 const UNKNOWN_SUMMARY: &str = r#"{"dirty":false,"changed_files":-1}"#;
 
 #[cfg(test)]
 mod tests {
+    /// Settings shows the model-server list only for a daemon that says it
+    /// answers the methods behind it.
+    #[test]
+    fn the_provider_list_is_offered_only_by_a_daemon_that_says_so() {
+        assert!(!super::opencode_providers_offered(""));
+        assert!(!super::opencode_providers_offered(
+            r#"{"sandbox_backend":"linux_bwrap","git_protect":true,"adapters":["claude"]}"#
+        ));
+        assert!(super::opencode_providers_offered(
+            r#"{"sandbox_backend":"linux_bwrap","git_protect":true,"adapters":[],"opencode_providers":true}"#
+        ));
+        let failed = super::provider_test_failure("connection lost");
+        assert_eq!(
+            failed.outcome,
+            bondsymphonic_proto::ProviderTestOutcome::Failed
+        );
+        assert!(failed.message.contains("connection lost"));
+    }
+
     #[test]
     fn changing_codex_credentials_retires_only_the_codex_failure_override() {
         let mut state = super::AppControllerRust {

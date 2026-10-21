@@ -1664,6 +1664,7 @@ mod cpp_widgets {
         fn bs_widget_test_main_window_raises_agent_failures_on_the_banner() -> i32;
         fn bs_widget_test_transcript_names_the_start_phase() -> i32;
         fn bs_widget_test_transcript_notices_and_queued_messages_offer_actions() -> i32;
+        fn bs_widget_test_settings_lists_and_tests_opencode_servers() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1677,7 +1678,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 69] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 70] = [
             // These four build a whole MainWindow, and each begins by pointing
             // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
             // is load-bearing rather than tidy: the state store settles its
@@ -1962,6 +1963,10 @@ mod cpp_widgets {
             (
                 "Notices and queued messages offer their buttons; reported tokens replace a cost",
                 bs_widget_test_transcript_notices_and_queued_messages_offer_actions,
+            ),
+            (
+                "Settings lists the OpenCode model servers and tests each one",
+                bs_widget_test_settings_lists_and_tests_opencode_servers,
             ),
         ];
 
