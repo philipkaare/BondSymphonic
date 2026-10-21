@@ -7,7 +7,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::client::router::EventRouter;
-use crate::client::{ClientError, DaemonClient};
+use crate::client::{ClientError, DaemonClient, LatestOnly};
 use crate::launcher::{self, LaunchSpec};
 use crate::model::app_state::{compose_status, ConnectionState, Workspaces};
 use crate::model::backends;
@@ -49,6 +49,16 @@ static SHARED: OnceLock<std::sync::Mutex<Option<Shared>>> = OnceLock::new();
 static MODEL_GENERATIONS: OnceLock<std::sync::Mutex<backends::ReplyGenerations>> = OnceLock::new();
 fn model_generations() -> &'static std::sync::Mutex<backends::ReplyGenerations> {
     MODEL_GENERATIONS.get_or_init(Default::default)
+}
+
+/// The one `repo.inspect` whose answer is still wanted. Each inspection
+/// supersedes the last and the New Agent dialog's Stop cancels the current
+/// one, so an answer for a folder the dialog has moved off -- or for a dialog
+/// that was closed and opened again on the same folder -- is dropped here
+/// rather than delivered as though it answered the newest question.
+static INSPECTIONS: OnceLock<LatestOnly> = OnceLock::new();
+fn inspections() -> &'static LatestOnly {
+    INSPECTIONS.get_or_init(Default::default)
 }
 
 /// Set once the connection has ended, so an operation attempted afterwards can
@@ -763,9 +773,16 @@ pub mod qobject {
         fn fetch_workspace(self: Pin<&mut AppController>, workspace_id: QString);
 
         /// Inspect a git repository. Answers with `repo_inspected` or
-        /// `operation_failed`.
+        /// `operation_failed`. Supersedes any inspection still out: only the
+        /// newest is ever answered.
         #[qinvokable]
         fn inspect_repo(self: Pin<&mut AppController>, path: QString);
+
+        /// Stop waiting for the inspection still out. Its answer, when the
+        /// daemon sends it, is dropped; the daemon itself is not stopped,
+        /// since the protocol has no way to ask.
+        #[qinvokable]
+        fn cancel_inspect_repo(self: Pin<&mut AppController>);
 
         /// Ask the daemon which run configurations a repository (or a
         /// workspace's worktree) offers. Answers with `run_configs_detected`
@@ -3285,6 +3302,7 @@ impl qobject::AppController {
     pub fn inspect_repo(self: Pin<&mut Self>, path: QString) {
         let qt = self.qt_thread();
         let path = path.to_string();
+        let ticket = inspections().begin();
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(message) => {
@@ -3294,20 +3312,29 @@ impl qobject::AppController {
         };
         runtime().spawn(async move {
             let params = RepoPathParams { path: path.clone() };
-            match shared
+            // Checked again on the Qt thread, where Stop runs: an answer that
+            // is already queued when the user presses it is dropped too.
+            let still_wanted = ticket.handle();
+            let request = shared
                 .client
-                .request::<RepoInfo>(Request::RepoInspect(params))
-                .await
-            {
-                Ok(info) => {
+                .request::<RepoInfo>(Request::RepoInspect(params));
+            match ticket.run(request).await {
+                None => tracing::debug!("repo.inspect for {path} superseded; answer dropped"),
+                Some(Ok(info)) => {
                     let json = serde_json::to_string(&info).unwrap_or_default();
                     let _ = qt.queue(move |q| {
-                        q.repo_inspected(QString::from(&path), QString::from(&json))
+                        if still_wanted.is_current() {
+                            q.repo_inspected(QString::from(&path), QString::from(&json))
+                        }
                     });
                 }
-                Err(e) => report_inspect_failure(&qt, path, e.to_string()),
+                Some(Err(e)) => report_inspect_failure(&qt, path, e.to_string()),
             }
         });
+    }
+
+    pub fn cancel_inspect_repo(self: Pin<&mut Self>) {
+        inspections().cancel();
     }
 
     pub fn detect_run_configs(self: Pin<&mut Self>, path: QString) {

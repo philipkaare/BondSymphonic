@@ -12,6 +12,7 @@ class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
 class QProgressBar;
+class QPushButton;
 class QRadioButton;
 class QToolButton;
 class QVBoxLayout;
@@ -38,6 +39,9 @@ public:
     /// dialog that is already on screen.
     NewAgentDialog(AppController* controller, GroupModel* model, const QString& initialPath,
                    QWidget* parent = nullptr);
+    /// Stops waiting for an inspection still out, so its answer cannot reach
+    /// the next New Agent dialog as though it answered that one.
+    ~NewAgentDialog() override;
 
     /// The repository the dialog will open on: the most recently used one, or
     /// empty when there is none. Static because the window has to name that
@@ -95,6 +99,12 @@ private:
     /// the user has actually worked in.
     void buildRecentMenu();
     void inspectRepo();
+    /// Stop beside "Reading repository…": gives up on the inspection still out
+    /// and leaves the dialog as a failed read does -- Create refused, and the
+    /// path field, Recent and Browse all a retry or a move to another folder.
+    /// The daemon goes on reading (the protocol has no way to stop it); its
+    /// answer is dropped when it comes.
+    void stopReading();
     void onRepoInspected(const QString& path, const QString& infoJson);
     void onRunConfigsDetected(const QString& path, const QString& json);
     /// A `repo.inspect` that did not answer, from the typed signal that carries
@@ -200,6 +210,8 @@ private:
     QLineEdit* m_newGroup = nullptr;
     QLabel* m_newGroupLabel = nullptr;
     QLabel* m_status = nullptr;
+    /// Beside the status line while an inspection is out, and nowhere else.
+    QPushButton* m_stopReading = nullptr;
     QDialogButtonBox* m_buttons = nullptr;
     /// The distro path of the inspection in flight, so a late answer for a path
     /// the user has since edited away from is ignored.
@@ -212,6 +224,9 @@ private:
     /// daemon could not read the repository, so nothing in the branch combo
     /// is known to exist.
     bool m_inspectFailed = false;
+    /// Whether the failure is the user's own Stop rather than the daemon's, so
+    /// the branch row says the branches were not read rather than could not be.
+    bool m_inspectStopped = false;
     /// See `initIfMissing`. Recomputed from every inspection, so it cannot
     /// survive a move to a path that is a repository.
     bool m_initIfMissing = false;

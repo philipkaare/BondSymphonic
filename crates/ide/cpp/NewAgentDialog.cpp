@@ -352,7 +352,23 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     // markup and come out mangled or half-swallowed.
     m_status->setTextFormat(Qt::PlainText);
     m_status->setWordWrap(true);
-    outer->addWidget(m_status);
+    // Stop sits on the status line because that is where "Reading repository…"
+    // is, and the read is the thing it stops. The dialog's own Cancel closes
+    // everything; this only gives up on the read and leaves the form usable.
+    m_stopReading = new QPushButton(QStringLiteral("Stop"), this);
+    m_stopReading->setObjectName(QStringLiteral("NewAgentStopReading"));
+    m_stopReading->setToolTip(QStringLiteral("Stop waiting for this repository to be read"));
+    m_stopReading->setAutoDefault(false);
+    // Its space is kept, like the busy strip's: the form above must not shift
+    // when the read settles and the button goes.
+    QSizePolicy stopPolicy = m_stopReading->sizePolicy();
+    stopPolicy.setRetainSizeWhenHidden(true);
+    m_stopReading->setSizePolicy(stopPolicy);
+    m_stopReading->hide();
+    auto* statusRow = new QHBoxLayout();
+    statusRow->addWidget(m_status, 1);
+    statusRow->addWidget(m_stopReading, 0, Qt::AlignTop);
+    outer->addLayout(statusRow);
 
     m_buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     m_buttons->button(QDialogButtonBox::Ok)->setText("Create");
@@ -360,6 +376,7 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
 
     QObject::connect(m_name, &QLineEdit::textChanged, this, &NewAgentDialog::updateNameHint);
     QObject::connect(browseButton, &QPushButton::clicked, this, &NewAgentDialog::browse);
+    QObject::connect(m_stopReading, &QPushButton::clicked, this, &NewAgentDialog::stopReading);
     QObject::connect(m_repoPath, &QLineEdit::editingFinished, this, &NewAgentDialog::inspectRepo);
     QObject::connect(m_repoPath, &QLineEdit::textChanged, this, &NewAgentDialog::updateOkEnabled);
     QObject::connect(m_baseBranch, &QComboBox::currentTextChanged, this, &NewAgentDialog::updateOkEnabled);
@@ -402,6 +419,12 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     }
     updateModeState();
     updateOkEnabled();
+}
+
+NewAgentDialog::~NewAgentDialog() {
+    if (m_inspectPending) {
+        m_controller->cancelInspectRepo();
+    }
 }
 
 void NewAgentDialog::setGroup(const QString& name) {
@@ -534,6 +557,7 @@ void NewAgentDialog::inspectRepo() {
     }
     m_inspectPending = true;
     m_inspectFailed = false;
+    m_inspectStopped = false;
     // What the last inspection said about working in place was about the last
     // repository, like the notes below.
     m_inPlaceRefusal.clear();
@@ -548,6 +572,7 @@ void NewAgentDialog::inspectRepo() {
     m_repoState->hide();
     m_initIfMissing = false;
     m_status->setText(QStringLiteral("Reading repository %1…").arg(path));
+    m_stopReading->show();
     updateBranchState();
     updateModeState();
     updateOkEnabled();
@@ -555,6 +580,25 @@ void NewAgentDialog::inspectRepo() {
     // Alongside, not after: the two answers are independent and the run
     // configurations are not worth another round trip's delay.
     m_controller->detectRunConfigs(path);
+}
+
+void NewAgentDialog::stopReading() {
+    if (!m_inspectPending) {
+        return;
+    }
+    m_controller->cancelInspectRepo();
+    // The path stays, as after a failure: `inspectRepo` takes the same path
+    // again as a retry while `m_inspectFailed` is up.
+    m_inspectPending = false;
+    m_inspectFailed = true;
+    m_inspectStopped = true;
+    m_stopReading->hide();
+    m_status->setText(QStringLiteral("Stopped reading %1. Choose another folder, or press Enter "
+                                     "in the path to try again.")
+                          .arg(m_pendingPath));
+    updateBranchState();
+    updateModeState();
+    updateOkEnabled();
 }
 
 void NewAgentDialog::updateBranchState() {
@@ -571,18 +615,23 @@ void NewAgentDialog::updateBranchState() {
     if (m_inspectFailed) {
         m_baseBranch->setEnabled(false);
         m_baseBranch->clear();
-        m_baseBranch->addItem(QStringLiteral("Could not read branches"));
+        m_baseBranch->addItem(m_inspectStopped ? QStringLiteral("Branches not read")
+                                               : QStringLiteral("Could not read branches"));
         return;
     }
     m_baseBranch->setEnabled(true);
 }
 
 void NewAgentDialog::onRepoInspected(const QString& path, const QString& infoJson) {
-    if (path != m_pendingPath) {
+    // Not an answer for a path this dialog has moved off, and not one for a
+    // read the user stopped. The controller drops a stopped read's answer
+    // already; this is the same rule said here too.
+    if (path != m_pendingPath || m_inspectStopped) {
         return;
     }
     m_inspectPending = false;
     m_inspectFailed = false;
+    m_stopReading->hide();
     // Before the combo is filled, not after: this is what takes the loading
     // item back out, and a branch list added on top of it would be one entry
     // longer than the repository has branches.
@@ -700,12 +749,17 @@ void NewAgentDialog::onRepoInspectFailed(const QString& path, const QString& mes
         // out over an answer about somewhere else.
         return;
     }
+    if (m_inspectStopped) {
+        // A read the user stopped: the status line already says so.
+        return;
+    }
     // The path is kept, not cleared: an inspection that failed is still the
     // one this dialog is showing, and `updateOkEnabled` refuses Create while
     // it stands. `inspectRepo` lets the same path be asked about again once
     // this flag is up, so Enter, Recent or Browse are all a retry.
     m_inspectPending = false;
     m_inspectFailed = true;
+    m_stopReading->hide();
     m_status->setText(message);
     updateBranchState();
     updateModeState();
@@ -1394,6 +1448,74 @@ extern "C" std::int32_t bs_widget_test_new_agent_dialog_says_how_a_windows_drive
     inPlace->setChecked(true);
     if (note->isHidden()) {
         return 8;
+    }
+    return 0;
+}
+
+/// Reading a repository on `/mnt/c` can take minutes, and the dialog offers a
+/// Stop beside "Reading repository…" for it. Stop leaves the dialog usable --
+/// another folder can be picked, the same one retried, or the dialog closed --
+/// and the answer the daemon sends afterwards changes nothing.
+extern "C" std::int32_t bs_widget_test_new_agent_dialog_stops_reading_a_repository() {
+    AppController controller;
+    GroupModel model;
+    NewAgentDialog dialog(&controller, &model, QString::fromUtf8(kDialogRepo));
+    auto* stop = dialog.findChild<QPushButton*>(QStringLiteral("NewAgentStopReading"));
+    auto* path = dialog.findChild<QLineEdit*>(QStringLiteral("NewAgentRepoPath"));
+    auto* combo = dialog.findChild<QComboBox*>(QStringLiteral("NewAgentBaseBranch"));
+    auto* busy = dialog.findChild<QProgressBar*>(QStringLiteral("NewAgentBranchBusy"));
+    auto* buttons = dialog.findChild<QDialogButtonBox*>();
+    if (stop == nullptr || path == nullptr || combo == nullptr || busy == nullptr ||
+        buttons == nullptr) {
+        return 1;
+    }
+
+    // Reading, so Stop is on offer, and so is closing the dialog.
+    if (!isReading(dialog) || stop->isHidden() || !stop->isEnabled()) {
+        return 2;
+    }
+    if (!buttons->button(QDialogButtonBox::Cancel)->isEnabled()) {
+        return 3;
+    }
+
+    stop->click();
+    if (isReading(dialog) || !stop->isHidden() || !busy->isHidden()) {
+        return 4;
+    }
+    const QLabel* status = statusLabel(dialog);
+    if (status == nullptr || !status->text().startsWith(QLatin1String("Stopped reading"))) {
+        return 5;
+    }
+    // Nothing is known about the folder, so Create stays refused, while the
+    // path is still the user's to change.
+    if (createEnabled(dialog) || !path->isEnabled() || combo->isEnabled() ||
+        !combo->currentText().contains(QLatin1String("not read"))) {
+        return 6;
+    }
+
+    // The daemon answers anyway. The controller drops that answer itself; the
+    // dialog would not act on it either.
+    controller.repoInspected(
+        QString::fromUtf8(kDialogRepo),
+        QStringLiteral(R"({"is_repo":true,"branches":["main"],"default_branch":"main"})"));
+    if (combo->isEnabled() || createEnabled(dialog)) {
+        return 7;
+    }
+    controller.repoInspectFailed(QString::fromUtf8(kDialogRepo), QStringLiteral("late"));
+    if (status->text() == QLatin1String("late")) {
+        return 8;
+    }
+
+    // Enter in the path is a retry, the same as after a failure.
+    emit path->editingFinished();
+    if (!isReading(dialog) || stop->isHidden()) {
+        return 9;
+    }
+    controller.repoInspected(
+        QString::fromUtf8(kDialogRepo),
+        QStringLiteral(R"({"is_repo":true,"branches":["main"],"default_branch":"main"})"));
+    if (!stop->isHidden() || !combo->isEnabled() || combo->currentText() != QLatin1String("main")) {
+        return 10;
     }
     return 0;
 }

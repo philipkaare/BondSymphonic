@@ -1659,6 +1659,7 @@ mod cpp_widgets {
         fn bs_widget_test_settings_offers_the_text_sizes() -> i32;
         fn bs_widget_test_settings_follows_a_backend_switched_off() -> i32;
         fn bs_widget_test_setup_page_holds_sign_out_without_its_cli() -> i32;
+        fn bs_widget_test_new_agent_dialog_stops_reading_a_repository() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1672,7 +1673,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 65] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 66] = [
             // These four build a whole MainWindow, and each begins by pointing
             // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
             // is load-bearing rather than tidy: the state store settles its
@@ -1941,6 +1942,10 @@ mod cpp_widgets {
             (
                 "SetupPage holds sign-out and the token dead while their CLI is missing",
                 bs_widget_test_setup_page_holds_sign_out_without_its_cli,
+            ),
+            (
+                "New Agent dialog stops reading a repository",
+                bs_widget_test_new_agent_dialog_stops_reading_a_repository,
             ),
         ];
 
