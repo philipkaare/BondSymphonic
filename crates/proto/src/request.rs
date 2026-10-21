@@ -107,6 +107,11 @@ params!(AgentSendParams {
 });
 params!(AgentPermissionReplyParams { agent_id: AgentId, request_id: String, decision: PermissionDecision, updated_input: Option<Value>, message: Option<String> });
 params!(AgentIdParams { agent_id: AgentId });
+params!(AgentQueuedPromptParams {
+    agent_id: AgentId,
+    prompt_id: String,
+    action: QueuedPromptAction
+});
 params!(PtyOpenParams { workspace_id: WorkspaceId, cols: u16, rows: u16, command: Option<String> });
 params!(PtyWriteParams {
     pty_id: PtyId,
@@ -233,6 +238,12 @@ pub enum Request {
     /// so it does not move [`crate::PROTOCOL_VERSION`].
     #[serde(rename = "system.list_models")]
     SystemListModels(ListModelsParams),
+    /// Sends a queued message now, or discards it. Only an agent that has put
+    /// a [`QueuedPrompt`] in its transcript has anything to name, so an older
+    /// daemon -- which answers "not implemented" -- is never asked. Additive;
+    /// it does not move [`crate::PROTOCOL_VERSION`].
+    #[serde(rename = "agent.queued_prompt")]
+    AgentQueuedPrompt(AgentQueuedPromptParams),
 }
 
 impl Request {
@@ -275,6 +286,7 @@ impl Request {
             RunStop(_) => "run.stop",
             RunList(_) => "run.list",
             SystemListModels(_) => "system.list_models",
+            AgentQueuedPrompt(_) => "agent.queued_prompt",
         }
     }
 
@@ -429,6 +441,11 @@ impl Request {
             SystemListModels(ListModelsParams {
                 adapter: None,
                 api_key: None,
+            }),
+            AgentQueuedPrompt(AgentQueuedPromptParams {
+                agent_id: ag.clone(),
+                prompt_id: "q1".into(),
+                action: QueuedPromptAction::Discard,
             }),
         ]
     }

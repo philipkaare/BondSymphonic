@@ -457,6 +457,198 @@ pub enum AgentMessageBody {
     },
 }
 
+/// The `System` subtype an adapter writes a sentence for the user under. The
+/// name predates the other backends: only the OpenCode adapter writes these
+/// today, and the IDE matches on this spelling.
+pub const NOTICE_SUBTYPE: &str = "opencode_notice";
+/// The `System` subtype for a message the user sent that is waiting for the
+/// turn in flight. Its data is a [`QueuedPrompt`].
+pub const PROMPT_QUEUED_SUBTYPE: &str = "prompt_queued";
+/// The `System` subtype saying what became of a queued message. Its data is a
+/// [`DequeuedPrompt`]; one that was sent is followed by its `UserText`.
+pub const PROMPT_DEQUEUED_SUBTYPE: &str = "prompt_dequeued";
+
+/// A sentence an adapter writes for the user, the `data` of a
+/// [`NOTICE_SUBTYPE`] message, with what the user can do about it.
+///
+/// Additive in both directions: a daemon that predates the structure wrote
+/// `{text}` alone, which reads as [`NoticeKind::Other`] with no actions, and
+/// an IDE that predates it reads `text` and ignores the rest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentNotice {
+    pub text: String,
+    #[serde(default)]
+    pub kind: NoticeKind,
+    /// The buttons the IDE offers beside the sentence, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<NoticeAction>,
+    /// The agent's own log lines up to the notice, newest last, redacted:
+    /// what "Show log" shows. The daemon and the agent run in WSL, where a
+    /// Windows client cannot reliably open the agent's log files, so the lines
+    /// travel with the notice and survive a reconnect with the transcript.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeKind {
+    /// The model answered a prompt with nothing at all: a rejected key, an
+    /// unusable model.
+    EmptyTurn,
+    /// The turn has been silent long enough that the user should know.
+    Stall,
+    /// Queued messages were thrown away: a second interrupt, or a stop.
+    QueueDiscarded,
+    /// A notice with no kind, from an older daemon, or of a kind this build
+    /// does not know.
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeAction {
+    /// Open the folder holding the backend's user configuration.
+    OpenConfigFolder,
+    /// Show [`AgentNotice::log`].
+    ShowLog,
+    /// Interrupt the turn, while it is still running.
+    Interrupt,
+    /// An action this build does not know; shown as nothing.
+    #[serde(other)]
+    Unknown,
+}
+
+impl AgentNotice {
+    pub fn into_message(self) -> AgentMessageBody {
+        AgentMessageBody::System {
+            subtype: NOTICE_SUBTYPE.into(),
+            data: serde_json::to_value(self).unwrap_or_default(),
+        }
+    }
+
+    pub fn from_message(body: &AgentMessageBody) -> Option<Self> {
+        system_data(body, NOTICE_SUBTYPE)
+    }
+}
+
+/// A message waiting for the turn in flight, as [`PROMPT_QUEUED_SUBTYPE`]
+/// carries it. `id` is what `agent.queued_prompt` names it by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedPrompt {
+    pub id: String,
+    pub text: String,
+}
+
+/// What became of a queued message; see [`PROMPT_DEQUEUED_SUBTYPE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DequeuedPrompt {
+    pub id: String,
+    pub outcome: DequeueOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DequeueOutcome {
+    Sent,
+    Discarded,
+}
+
+/// What the user asked for a queued message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedPromptAction {
+    /// Interrupt the turn in flight and send this message next.
+    SendNow,
+    /// Never send it.
+    Discard,
+}
+
+impl QueuedPrompt {
+    pub fn into_message(self) -> AgentMessageBody {
+        AgentMessageBody::System {
+            subtype: PROMPT_QUEUED_SUBTYPE.into(),
+            data: serde_json::to_value(self).unwrap_or_default(),
+        }
+    }
+
+    pub fn from_message(body: &AgentMessageBody) -> Option<Self> {
+        system_data(body, PROMPT_QUEUED_SUBTYPE)
+    }
+}
+
+impl DequeuedPrompt {
+    pub fn into_message(self) -> AgentMessageBody {
+        AgentMessageBody::System {
+            subtype: PROMPT_DEQUEUED_SUBTYPE.into(),
+            data: serde_json::to_value(self).unwrap_or_default(),
+        }
+    }
+
+    pub fn from_message(body: &AgentMessageBody) -> Option<Self> {
+        system_data(body, PROMPT_DEQUEUED_SUBTYPE)
+    }
+}
+
+/// The tokens a backend reported for one turn, normalised. Every field is
+/// what the backend said, or absent: nothing here is estimated.
+///
+/// It travels as `turn_usage` in the `codex_turn` / `opencode_turn` row that
+/// precedes the turn's `Result`, rather than on `Result` itself, so the shape
+/// of `Result` -- and every client that builds or matches one -- is unchanged.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct TurnUsage {
+    /// Input tokens the turn used. Codex: the whole turn. OpenCode: its
+    /// final model call, which is what OpenCode reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Tokens in the model's context after the turn, and the window's size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// What the backend says the session has cost so far, in US dollars.
+    /// Only ever a price the backend reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_cost_usd: Option<f64>,
+}
+
+/// The key [`TurnUsage`] travels under in a turn row's data.
+pub const TURN_USAGE_KEY: &str = "turn_usage";
+
+impl TurnUsage {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The usage on a `codex_turn` or `opencode_turn` row, if it carries any.
+    pub fn from_turn_row(body: &AgentMessageBody) -> Option<Self> {
+        match body {
+            AgentMessageBody::System { subtype, data }
+                if matches!(subtype.as_str(), "codex_turn" | "opencode_turn") =>
+            {
+                serde_json::from_value::<Self>(data.get(TURN_USAGE_KEY)?.clone())
+                    .ok()
+                    .filter(|usage| !usage.is_empty())
+            }
+            _ => None,
+        }
+    }
+}
+
+fn system_data<T: serde::de::DeserializeOwned>(body: &AgentMessageBody, want: &str) -> Option<T> {
+    match body {
+        AgentMessageBody::System { subtype, data } if subtype == want => {
+            serde_json::from_value(data.clone()).ok()
+        }
+        _ => None,
+    }
+}
+
 /// One model as the Anthropic Models API describes it, trimmed to what the
 /// model dropdown needs: `system.list_models`' `parse_models` reads these
 /// three fields out of a much larger object and ignores the rest.

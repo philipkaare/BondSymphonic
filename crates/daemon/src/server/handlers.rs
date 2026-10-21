@@ -132,6 +132,7 @@ impl Handler for WorkspaceHandler {
             Request::AgentSend(p) => ok(d.agents.send(p).await?),
             Request::AgentPermissionReply(p) => ok(d.agents.permission_reply(p).await?),
             Request::AgentInterrupt(p) => ok(d.agents.interrupt(p).await?),
+            Request::AgentQueuedPrompt(p) => ok(d.agents.queued_prompt(p).await?),
             Request::AgentStop(p) => ok(d.agents.stop(p).await?),
             Request::AgentHistory(p) => ok(d.agents.history(p).await?),
             Request::RunStart(p) => ok(d.runs.start(d, p).await?),

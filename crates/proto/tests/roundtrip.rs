@@ -816,3 +816,108 @@ mod agent_start_progress {
         assert_eq!(back, new);
     }
 }
+
+/// Actionable OpenCode notices, queued prompts and token usage, 2026-10-21:
+/// all additive, so a daemon and an IDE of either vintage still read each
+/// other.
+mod notices_queue_usage {
+    use bondsymphonic_proto::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_notice_carries_its_kind_actions_and_log_and_an_old_one_is_plain_text() {
+        let notice = AgentNotice {
+            text: "No response".into(),
+            kind: NoticeKind::Stall,
+            actions: vec![NoticeAction::Interrupt, NoticeAction::ShowLog],
+            log: vec!["ERROR provider".into()],
+        };
+        let wire = serde_json::to_value(&notice).unwrap();
+        assert_eq!(
+            wire,
+            json!({"text":"No response","kind":"stall","actions":["interrupt","show_log"],"log":["ERROR provider"]})
+        );
+        assert_eq!(serde_json::from_value::<AgentNotice>(wire).unwrap(), notice);
+        // What a daemon before this change wrote.
+        let old: AgentNotice = serde_json::from_value(json!({"text":"x"})).unwrap();
+        assert_eq!(old.kind, NoticeKind::Other);
+        assert!(old.actions.is_empty() && old.log.is_empty());
+        // A kind or an action from a newer daemon is not an error.
+        let newer: AgentNotice = serde_json::from_value(
+            json!({"text":"x","kind":"brand_new","actions":["open_config_folder","teleport"]}),
+        )
+        .unwrap();
+        assert_eq!(newer.kind, NoticeKind::Other);
+        assert_eq!(
+            newer.actions,
+            vec![NoticeAction::OpenConfigFolder, NoticeAction::Unknown]
+        );
+        let body = notice.clone().into_message();
+        assert!(
+            matches!(&body, AgentMessageBody::System { subtype, .. } if subtype == NOTICE_SUBTYPE)
+        );
+        assert_eq!(AgentNotice::from_message(&body), Some(notice));
+    }
+
+    #[test]
+    fn queued_prompts_and_their_outcomes_round_trip() {
+        let queued = QueuedPrompt {
+            id: "q1".into(),
+            text: "two".into(),
+        };
+        let body = queued.clone().into_message();
+        assert_eq!(QueuedPrompt::from_message(&body), Some(queued));
+        let done = DequeuedPrompt {
+            id: "q1".into(),
+            outcome: DequeueOutcome::Discarded,
+        };
+        let wire = serde_json::to_value(done.clone().into_message()).unwrap();
+        assert_eq!(
+            wire,
+            json!({"type":"system","subtype":"prompt_dequeued","data":{"id":"q1","outcome":"discarded"}})
+        );
+        let back: AgentMessageBody = serde_json::from_value(wire).unwrap();
+        assert_eq!(DequeuedPrompt::from_message(&back), Some(done));
+        let request: Request = serde_json::from_value(json!({
+            "method":"agent.queued_prompt",
+            "params":{"agent_id":"ag_1","prompt_id":"q1","action":"send_now"}
+        }))
+        .unwrap();
+        assert_eq!(request.method_name(), "agent.queued_prompt");
+        assert!(matches!(
+            request,
+            Request::AgentQueuedPrompt(AgentQueuedPromptParams {
+                action: QueuedPromptAction::SendNow,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn turn_usage_leaves_out_what_the_backend_did_not_report() {
+        let usage = TurnUsage {
+            input_tokens: Some(5),
+            output_tokens: Some(3),
+            ..TurnUsage::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            json!({"input_tokens":5,"output_tokens":3})
+        );
+        let empty: TurnUsage = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty, TurnUsage::default());
+        assert!(empty.is_empty());
+        assert!(!usage.is_empty());
+        // Read off the row a Codex or OpenCode turn ends with.
+        let row = AgentMessageBody::System {
+            subtype: "opencode_turn".into(),
+            data: json!({"stopReason":"end_turn","turn_usage":{"input_tokens":5,"output_tokens":3}}),
+        };
+        assert_eq!(TurnUsage::from_turn_row(&row), Some(usage));
+        let old_row = AgentMessageBody::System {
+            subtype: "codex_turn".into(),
+            data: json!({"status":"completed","usage":{"total":{}}}),
+        };
+        assert_eq!(TurnUsage::from_turn_row(&old_row), None);
+    }
+}

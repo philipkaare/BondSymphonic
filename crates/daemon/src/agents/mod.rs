@@ -1042,6 +1042,18 @@ impl AgentManager {
         Ok(Empty {})
     }
 
+    /// Sends a queued message now, or discards it.
+    pub async fn queued_prompt(&self, p: AgentQueuedPromptParams) -> Result<Empty, RpcError> {
+        let agent = self.get(&p.agent_id)?;
+        agent
+            .adapter(&p.agent_id)?
+            .lock()
+            .await
+            .queued_prompt(p.prompt_id, p.action)
+            .await?;
+        Ok(Empty {})
+    }
+
     /// Ends the process but keeps the agent, so its transcript is still
     /// readable. Only the workspace going away removes it (see
     /// [`stop_all_in`](AgentManager::stop_all_in)).
