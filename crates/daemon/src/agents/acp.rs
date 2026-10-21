@@ -827,11 +827,13 @@ mod tests {
                     )
                 })
                 .collect();
-            std::fs::write(&path, Value::Object(keys).to_string()).unwrap();
-            // A new size defeats an mtime that did not tick between writes.
+            // Each round's file a size no earlier round left behind: the
+            // rewrite is in place, so within one mtime tick (milliseconds) the
+            // size is the only thing that says the content changed. Rounds
+            // 10..19 serialise to the same length, so the padding varies.
             std::fs::write(
                 &path,
-                format!("{} ", std::fs::read_to_string(&path).unwrap()),
+                format!("{}{}", Value::Object(keys), " ".repeat(round + 1)),
             )
             .unwrap();
             redacted(&secrets, "x");
