@@ -318,7 +318,9 @@ fn choose_key(p: &ConfiguredProvider, auth_json: &Path, stored: Option<&str>) ->
             return Key {
                 value: None,
                 source: None,
-                note: Some("The config's apiKey is a substitution this test does not follow.".into()),
+                note: Some(
+                    "The config's apiKey is a substitution this test does not follow.".into(),
+                ),
             };
         }
         return Key {
@@ -372,7 +374,14 @@ pub async fn test_provider(
     provider_id: &str,
     stored_key: Option<&str>,
 ) -> OpenCodeProviderTest {
-    test_provider_with(config_home, auth_json, provider_id, stored_key, RESPONSE_TIMEOUT).await
+    test_provider_with(
+        config_home,
+        auth_json,
+        provider_id,
+        stored_key,
+        RESPONSE_TIMEOUT,
+    )
+    .await
 }
 
 /// [`test_provider`] with the answer's deadline given, so a test of a server
@@ -385,7 +394,14 @@ pub async fn test_provider_with(
     response_timeout: Duration,
 ) -> OpenCodeProviderTest {
     let started = Instant::now();
-    let mut result = probe(config_home, auth_json, provider_id, stored_key, response_timeout).await;
+    let mut result = probe(
+        config_home,
+        auth_json,
+        provider_id,
+        stored_key,
+        response_timeout,
+    )
+    .await;
     result.elapsed_ms = started.elapsed().as_millis() as u64;
     result
 }
@@ -530,7 +546,11 @@ async fn test_url(
             )
         }
     };
-    let fetched = if url.trim_start().to_ascii_lowercase().starts_with("https://") {
+    let fetched = if url
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("https://")
+    {
         let addr = stream.peer_addr().ok();
         drop(stream);
         match addr {
@@ -588,7 +608,9 @@ async fn test_url(
         return out;
     }
     out.message = match status {
-        401 | 403 => format!("Reachable, but the server refused the request (HTTP {status}): an API key problem."),
+        401 | 403 => format!(
+            "Reachable, but the server refused the request (HTTP {status}): an API key problem."
+        ),
         404 => format!(
             "Reachable, but there is no model list at {url} (HTTP 404): check the baseURL's \
              path prefix, such as /v1."
@@ -664,7 +686,14 @@ fn parse_response(bytes: &[u8]) -> Option<(u16, Vec<u8>)> {
         })
     });
     let body = &bytes[end + 4..];
-    Some((status, if chunked { dechunk(body) } else { body.to_vec() }))
+    Some((
+        status,
+        if chunked {
+            dechunk(body)
+        } else {
+            body.to_vec()
+        },
+    ))
 }
 
 /// A chunked body's data, as far as it goes.
@@ -709,14 +738,19 @@ async fn curl_get(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     if key.is_some_and(|k| k.contains(['\r', '\n'])) || url.contains(['\r', '\n']) {
-        return Err(Fetch::Other("the URL or API key contains a line break".into()));
+        return Err(Fetch::Other(
+            "the URL or API key contains a line break".into(),
+        ));
     }
     let mut config = format!(
         "url = \"{}\"\nheader = \"Accept: application/json\"\n",
         quote(url)
     );
     if let Some(key) = key {
-        config.push_str(&format!("header = \"Authorization: Bearer {}\"\n", quote(key)));
+        config.push_str(&format!(
+            "header = \"Authorization: Bearer {}\"\n",
+            quote(key)
+        ));
     }
     let ip = match addr.ip() {
         std::net::IpAddr::V6(v6) => format!("[{v6}]"),
@@ -874,15 +908,28 @@ mod tests {
         let listed = list_providers(dir.path());
         let ids: Vec<_> = listed.providers.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["envy", "lan", "legacy", "ollama", "openai"]);
-        let by = |id: &str| listed.providers.iter().find(|p| p.id == id).unwrap().clone();
+        let by = |id: &str| {
+            listed
+                .providers
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .clone()
+        };
         let ollama = by("ollama");
         assert_eq!(ollama.name.as_deref(), Some("Ollama"));
-        assert_eq!(ollama.base_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert_eq!(
+            ollama.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
         // Merged over config.json's entry: three models in all.
         assert_eq!(ollama.model_count, 3);
         assert_eq!(ollama.sandbox_route, SandboxRoute::Tunnelled);
         assert_eq!(by("lan").sandbox_route, SandboxRoute::Granted);
-        assert_eq!(by("lan").base_url.as_deref(), Some("http://192.168.1.20:8000/v1"));
+        assert_eq!(
+            by("lan").base_url.as_deref(),
+            Some("http://192.168.1.20:8000/v1")
+        );
         assert_eq!(by("legacy").sandbox_route, SandboxRoute::Granted);
         assert_eq!(by("envy").sandbox_route, SandboxRoute::NotGranted);
         assert!(by("envy").route_note.unwrap().contains("{env:"));
@@ -914,8 +961,10 @@ mod tests {
         let mut routed: Vec<Origin> = listed
             .providers
             .iter()
-            .filter(|p| p.sandbox_route == SandboxRoute::Granted
-                || p.sandbox_route == SandboxRoute::Tunnelled)
+            .filter(|p| {
+                p.sandbox_route == SandboxRoute::Granted
+                    || p.sandbox_route == SandboxRoute::Tunnelled
+            })
             .map(|p| Origin::from_url(p.base_url.as_deref().unwrap()).unwrap())
             .collect();
         routed.sort();
@@ -934,7 +983,8 @@ mod tests {
     #[tokio::test]
     async fn a_server_that_lists_models_is_reachable() {
         // Chunked, split mid-token, as a streaming server sends it.
-        let body = r#"{"data":[{"id":"a"},{"id":"b"},{"id":"c"},{"id":"d"},{"id":"e"},{"id":"f"}]}"#;
+        let body =
+            r#"{"data":[{"id":"a"},{"id":"b"},{"id":"c"},{"id":"d"},{"id":"e"},{"id":"f"}]}"#;
         let (one, two) = body.split_at(13);
         let (port, seen) = server(&format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n\
@@ -947,7 +997,12 @@ mod tests {
             r#"{{"provider":{{"local":{{"options":{{"baseURL":"http://127.0.0.1:{port}/v1/"}}}}}}}}"#
         ));
         let result = test(&dir, "local").await;
-        assert_eq!(result.outcome, ProviderTestOutcome::Reachable, "{}", result.message);
+        assert_eq!(
+            result.outcome,
+            ProviderTestOutcome::Reachable,
+            "{}",
+            result.message
+        );
         assert_eq!(result.status, Some(200));
         assert_eq!(result.model_count, Some(6));
         assert_eq!(result.model_ids, ["a", "b", "c", "d", "e"]);
@@ -957,7 +1012,10 @@ mod tests {
             Some(format!("http://127.0.0.1:{port}/v1/models").as_str())
         );
         let request = seen.lock().unwrap()[0].clone();
-        assert!(request.starts_with("GET /v1/models HTTP/1.1\r\n"), "{request}");
+        assert!(
+            request.starts_with("GET /v1/models HTTP/1.1\r\n"),
+            "{request}"
+        );
         assert!(request.contains(&format!("Host: 127.0.0.1:{port}\r\n")));
         assert!(!request.to_ascii_lowercase().contains("authorization"));
         assert_eq!(result.key_source, None);
@@ -965,8 +1023,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_key_and_a_wrong_prefix_are_told_apart() {
-        let (port, seen) =
-            server("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n").await;
+        let (port, seen) = server("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n").await;
         let dir = config(&format!(
             r#"{{"provider":{{"k":{{"options":{{"baseURL":"http://127.0.0.1:{port}","apiKey":"sk-config"}}}}}}}}"#
         ));
@@ -990,7 +1047,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_key_is_the_one_a_sandboxed_agent_would_send() {
-        let (port, seen) = server("HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"data\":[]}").await;
+        let (port, seen) =
+            server("HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"data\":[]}").await;
         let url = format!("http://127.0.0.1:{port}/v1");
         // `{env:OPENAI_API_KEY}` is the stored key; any other variable is not
         // in the sandbox, so nothing is sent and the result says why.
@@ -1037,7 +1095,12 @@ mod tests {
             r#"{{"provider":{{"down":{{"options":{{"baseURL":"http://127.0.0.1:{port}/v1"}}}}}}}}"#
         ));
         let result = test(&dir, "down").await;
-        assert_eq!(result.outcome, ProviderTestOutcome::Refused, "{}", result.message);
+        assert_eq!(
+            result.outcome,
+            ProviderTestOutcome::Refused,
+            "{}",
+            result.message
+        );
         assert!(result.message.contains("mirrored"), "{}", result.message);
     }
 
@@ -1048,7 +1111,12 @@ mod tests {
             r#"{{"provider":{{"slow":{{"options":{{"baseURL":"http://127.0.0.1:{port}/v1"}}}}}}}}"#
         ));
         let result = test(&dir, "slow").await;
-        assert_eq!(result.outcome, ProviderTestOutcome::Timeout, "{}", result.message);
+        assert_eq!(
+            result.outcome,
+            ProviderTestOutcome::Timeout,
+            "{}",
+            result.message
+        );
     }
 
     #[tokio::test]
@@ -1057,7 +1125,12 @@ mod tests {
             r#"{"provider":{"gone":{"options":{"baseURL":"http://no-such-host.invalid:8000/v1"}}}}"#,
         );
         let result = test(&dir, "gone").await;
-        assert_eq!(result.outcome, ProviderTestOutcome::DnsFailure, "{}", result.message);
+        assert_eq!(
+            result.outcome,
+            ProviderTestOutcome::DnsFailure,
+            "{}",
+            result.message
+        );
     }
 
     #[tokio::test]
@@ -1075,7 +1148,13 @@ mod tests {
             assert!(result.message.starts_with("Not reachable from sandboxes"));
             assert_eq!(result.url, None);
         }
-        assert_eq!(test(&dir, "builtin").await.outcome, ProviderTestOutcome::Failed);
-        assert_eq!(test(&dir, "missing").await.outcome, ProviderTestOutcome::Failed);
+        assert_eq!(
+            test(&dir, "builtin").await.outcome,
+            ProviderTestOutcome::Failed
+        );
+        assert_eq!(
+            test(&dir, "missing").await.outcome,
+            ProviderTestOutcome::Failed
+        );
     }
 }

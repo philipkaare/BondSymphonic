@@ -802,9 +802,7 @@ pub fn reachable_addrs(
         .iter()
         .copied()
         .filter(|a| {
-            granted
-                || !is_private_addr(&a.ip())
-                || allow.allows_literal_addr(&canonical_ip(a.ip()))
+            granted || !is_private_addr(&a.ip()) || allow.allows_literal_addr(&canonical_ip(a.ip()))
         })
         .collect()
 }
