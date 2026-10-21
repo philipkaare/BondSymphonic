@@ -677,6 +677,36 @@ pub mod qobject {
             message: QString,
         );
 
+        /// An `agent.*` request for `workspace_id` failed, described for the
+        /// agent pane's banner: `failure_json` is a
+        /// `model::agent_failure::AgentFailure`, with the options a Retry or
+        /// a Start fresh sends. Emitted first, in the same step as the
+        /// `workspaceOpFailed` and `operationFailed` for the same failure, so
+        /// the window can tell a failure the banner took from one it did not.
+        #[qsignal]
+        fn agent_operation_failed(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            failure_json: QString,
+        );
+
+        /// An `agent.start` in `workspace_id` reached `phase` (one of
+        /// `bondsymphonic_proto::start_phase`); `label` is the daemon's
+        /// sentence for it, without an ellipsis. Only from a daemon that
+        /// sends `agent.start_progress`; an older one sends none.
+        #[qsignal]
+        fn agent_start_progress(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            phase: QString,
+            label: QString,
+        );
+
+        /// The folder this IDE writes its log to -- the daemon's lines
+        /// included -- or empty when there is none.
+        #[qinvokable]
+        fn log_folder(self: &AppController) -> QString;
+
         /// The IDE is talking to a daemon again after a connection loss, and
         /// has already *attempted* `system.check_prereqs` and `workspace.list`:
         /// this is emitted after both have answered, whether they succeeded or
@@ -1937,6 +1967,34 @@ fn report_workspace_op_failure(
     });
 }
 
+/// The same for a failed `agent.*` request, which also goes to the agent
+/// pane's banner: `agent_operation_failed` with the failure described, then
+/// the two signals [`report_workspace_op_failure`] sends. `options_json` is
+/// what an `agent.start` was sent with, for the banner's Retry.
+///
+/// One queue call, as above.
+fn report_agent_failure(
+    qt: &QtHandle,
+    workspace: String,
+    op: &'static str,
+    message: String,
+    options_json: Option<String>,
+) {
+    tracing::warn!("{op} failed for {workspace}: {message}");
+    let failure = crate::model::agent_failure::describe(op, &message, options_json.as_deref());
+    let json = failure.to_json();
+    let _ = qt.queue(move |mut q| {
+        q.as_mut()
+            .agent_operation_failed(QString::from(&workspace), QString::from(&json));
+        q.as_mut().workspace_op_failed(
+            QString::from(&workspace),
+            QString::from(op),
+            QString::from(&message),
+        );
+        q.operation_failed(QString::from(op), QString::from(&message))
+    });
+}
+
 /// Queues `workspace_fetch_failed` and the `operation_failed` behind it, in
 /// one step, like the other typed failures.
 fn report_fetch_failure(qt: &QtHandle, workspace: String, message: String) {
@@ -2117,6 +2175,17 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
             Event::WorkspaceStateChanged { info } => {
                 let json = serde_json::to_string(&info).unwrap_or_default();
                 let _ = qt.queue(move |q| q.workspace_changed(QString::from(&json)));
+            }
+            Event::AgentStartProgress { phase, label, .. } => {
+                if let Some(id) = ws.map(|id| id.to_string()) {
+                    let _ = qt.queue(move |q| {
+                        q.agent_start_progress(
+                            QString::from(&id),
+                            QString::from(&phase),
+                            QString::from(&label),
+                        )
+                    });
+                }
             }
             // Routed to the transcript model by id above; this arm is what
             // moves the tab's own indicator, which no transcript owns.
@@ -2552,12 +2621,14 @@ pub async fn start_agent_request(
 /// is one. Announcing first is what lets the transcript attach and subscribe
 /// before the agent's first message arrives; anything said in between is
 /// replayed out of the router's early buffer.
+#[allow(clippy::too_many_arguments)]
 async fn start_agent_and_prompt(
     shared: Shared,
     qt: QtHandle,
     workspace: WorkspaceId,
     adapter: AgentAdapterKind,
     options: AgentStartOptions,
+    options_json: String,
     initial_prompt: String,
     rollback_new_workspace: bool,
 ) {
@@ -2571,7 +2642,19 @@ async fn start_agent_and_prompt(
         Err(e) => {
             let detail = e.message.clone();
             let _ = qt.queue(move |mut q| q.as_mut().note_backend_auth_error(adapter, &detail));
-            report_workspace_op_failure(&qt, workspace.to_string(), "agent.start", e.message);
+            if e.workspace_removed {
+                // No pane is left to hold a banner: the window reports this one
+                // the way it always has.
+                report_workspace_op_failure(&qt, workspace.to_string(), "agent.start", e.message);
+            } else {
+                report_agent_failure(
+                    &qt,
+                    workspace.to_string(),
+                    "agent.start",
+                    e.message,
+                    Some(options_json),
+                );
+            }
             if e.workspace_removed {
                 let id = workspace.to_string();
                 note_state(|state| state.forget_workspace(&id));
@@ -2594,7 +2677,13 @@ async fn start_agent_and_prompt(
         text: initial_prompt,
     };
     if let Err(e) = shared.client.request_raw(Request::AgentSend(params)).await {
-        report_workspace_op_failure(&qt, workspace.to_string(), "agent.send", e.to_string());
+        report_agent_failure(
+            &qt,
+            workspace.to_string(),
+            "agent.send",
+            e.to_string(),
+            None,
+        );
     }
 }
 
@@ -3092,6 +3181,7 @@ impl qobject::AppController {
             note_workspace_created(&group_for_state, &info.id.0, &repo_for_state);
             let json = serde_json::to_string(&info).unwrap_or_default();
             let id = info.id.clone();
+            let start_options = echo.options_json.clone();
             // The tab appears as soon as the workspace exists, so a slow
             // `agent.start` happens in front of the user rather than behind a
             // dialog that has not closed yet.
@@ -3106,7 +3196,17 @@ impl qobject::AppController {
                 )
             });
             if let Some((adapter, options, prompt)) = agent {
-                start_agent_and_prompt(shared, qt, id, adapter, options, prompt, true).await;
+                start_agent_and_prompt(
+                    shared,
+                    qt,
+                    id,
+                    adapter,
+                    options,
+                    start_options,
+                    prompt,
+                    true,
+                )
+                .await;
             }
         });
     }
@@ -3188,10 +3288,17 @@ impl qobject::AppController {
     pub fn start_agent(self: Pin<&mut Self>, workspace_id: QString, options_json: QString) {
         let qt = self.qt_thread();
         let workspace = WorkspaceId(workspace_id.to_string());
-        let (adapter, options) = match self.resolved_start(&options_json.to_string()) {
+        let options_json = options_json.to_string();
+        let (adapter, options) = match self.resolved_start(&options_json) {
             Ok(start) => start,
             Err(message) => {
-                report_workspace_op_failure(&qt, workspace.to_string(), "agent.start", message);
+                report_agent_failure(
+                    &qt,
+                    workspace.to_string(),
+                    "agent.start",
+                    message,
+                    Some(options_json),
+                );
                 return;
             }
         };
@@ -3201,11 +3308,12 @@ impl qobject::AppController {
             // the pane that is showing "starting the agent" is this
             // workspace's, and it is the one that has to stop saying so.
             Err(message) => {
-                report_workspace_op_failure(
+                report_agent_failure(
                     &qt,
                     workspace.to_string(),
                     "agent.start",
                     message.to_owned(),
+                    Some(options_json),
                 );
                 return;
             }
@@ -3216,6 +3324,7 @@ impl qobject::AppController {
             workspace,
             adapter,
             options,
+            options_json,
             String::new(),
             false,
         ));
@@ -3804,6 +3913,15 @@ impl qobject::AppController {
         }
         options.api_key = crate::qobjects::settings::backend_api_key(kind);
         Ok((kind, options))
+    }
+
+    pub fn log_folder(&self) -> QString {
+        let base = directories::BaseDirs::new();
+        let dir = crate::logfile::resolve_dir(
+            std::env::var_os(crate::logfile::DIR_ENV),
+            base.as_ref().map(|d| d.data_local_dir()),
+        );
+        QString::from(&dir.map(|d| d.display().to_string()).unwrap_or_default())
     }
 
     pub fn backend_descriptors_json(&self) -> QString {

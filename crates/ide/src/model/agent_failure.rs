@@ -98,7 +98,10 @@ const AGENT_NAMES: &[&str] = &["Claude Code", "Claude", "Codex", "OpenCode"];
 pub fn describe(op: &str, message: &str, options_json: Option<&str>) -> AgentFailure {
     let technical = message.trim().to_owned();
     let mut text = technical.as_str();
-    if let Some(rest) = text.strip_prefix(op).and_then(|r| r.strip_prefix(" failed: ")) {
+    if let Some(rest) = text
+        .strip_prefix(op)
+        .and_then(|r| r.strip_prefix(" failed: "))
+    {
         text = rest;
     }
     let (code, body) = split_code(text);
@@ -214,9 +217,7 @@ pub fn describe(op: &str, message: &str, options_json: Option<&str>) -> AgentFai
             kind,
             FailureKind::Agent | FailureKind::Protocol | FailureKind::Unknown | FailureKind::Gone
         );
-    let retry = !ide_daemon_mismatch
-        && kind != FailureKind::Gone
-        && op != "agent.history";
+    let retry = !ide_daemon_mismatch && kind != FailureKind::Gone && op != "agent.history";
     AgentFailure {
         op: op.to_owned(),
         kind,
@@ -289,10 +290,7 @@ fn title_for(op: &str) -> &'static str {
 fn split_code(text: &str) -> (Option<&'static str>, &str) {
     let rest = text.strip_prefix("rpc: ").unwrap_or(text);
     for code in CODES {
-        if let Some(body) = rest
-            .strip_prefix(code)
-            .and_then(|r| r.strip_prefix(": "))
-        {
+        if let Some(body) = rest.strip_prefix(code).and_then(|r| r.strip_prefix(": ")) {
             return (Some(code), body.trim());
         }
     }
@@ -302,10 +300,7 @@ fn split_code(text: &str) -> (Option<&'static str>, &str) {
 /// `Codex: <what it said>` into the agent's name and what it said.
 fn split_agent(body: &str) -> (Option<&'static str>, Option<&str>) {
     for name in AGENT_NAMES {
-        if let Some(said) = body
-            .strip_prefix(name)
-            .and_then(|r| r.strip_prefix(": "))
-        {
+        if let Some(said) = body.strip_prefix(name).and_then(|r| r.strip_prefix(": ")) {
             return (Some(name), Some(said.trim()));
         }
         // "Claude Code is not logged in": the name, without a colon.

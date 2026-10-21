@@ -1661,6 +1661,8 @@ mod cpp_widgets {
         fn bs_widget_test_settings_follows_a_backend_switched_off() -> i32;
         fn bs_widget_test_setup_page_holds_sign_out_without_its_cli() -> i32;
         fn bs_widget_test_new_agent_dialog_stops_reading_a_repository() -> i32;
+        fn bs_widget_test_main_window_raises_agent_failures_on_the_banner() -> i32;
+        fn bs_widget_test_transcript_names_the_start_phase() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1674,7 +1676,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 66] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 68] = [
             // These four build a whole MainWindow, and each begins by pointing
             // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
             // is load-bearing rather than tidy: the state store settles its
@@ -1947,6 +1949,14 @@ mod cpp_widgets {
             (
                 "New Agent dialog stops reading a repository",
                 bs_widget_test_new_agent_dialog_stops_reading_a_repository,
+            ),
+            (
+                "A failed agent start goes on the banner, not in a box",
+                bs_widget_test_main_window_raises_agent_failures_on_the_banner,
+            ),
+            (
+                "A start in flight names the phase the daemon says it is in",
+                bs_widget_test_transcript_names_the_start_phase,
             ),
         ];
 

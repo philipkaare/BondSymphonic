@@ -7,7 +7,14 @@ use bondsymphonic_ide::model::agent_failure::{describe, fresh_start_options, Fai
 
 /// No protocol vocabulary in what the user reads first.
 fn assert_plain(text: &str) {
-    for word in ["rpc:", "Conflict:", "AgentError", "InvalidParams", "{\"code\"", "-32600"] {
+    for word in [
+        "rpc:",
+        "Conflict:",
+        "AgentError",
+        "InvalidParams",
+        "{\"code\"",
+        "-32600",
+    ] {
         assert!(!text.contains(word), "{word:?} leaked into {text:?}");
     }
 }
@@ -44,7 +51,11 @@ fn a_json_rpc_error_from_the_agent_is_unwrapped_and_read_as_a_protocol_mismatch(
     assert_plain(&f.title);
     assert_plain(&f.detail);
     assert!(f.detail.contains("Codex"), "{}", f.detail);
-    assert!(f.detail.contains("Invalid request: unknown field `foo`"), "{}", f.detail);
+    assert!(
+        f.detail.contains("Invalid request: unknown field `foo`"),
+        "{}",
+        f.detail
+    );
     assert_eq!(f.technical, raw);
     assert!(f.open_log);
 }
@@ -57,7 +68,11 @@ fn a_missing_prerequisite_passes_the_daemons_instruction_through() {
         None,
     );
     assert_eq!(f.kind, FailureKind::Prereq);
-    assert!(f.detail.contains("Install OpenCode in Settings > Agents"), "{}", f.detail);
+    assert!(
+        f.detail.contains("Install OpenCode in Settings > Agents"),
+        "{}",
+        f.detail
+    );
     assert_plain(&f.detail);
     assert!(f.retry);
 }
@@ -111,7 +126,11 @@ fn a_sandbox_that_is_down_or_not_ready_reads_as_the_sandbox() {
 
 #[test]
 fn a_protocol_mismatch_between_ide_and_daemon_is_not_retried() {
-    let f = describe("agent.start", "daemon speaks protocol 4, this IDE speaks 3", None);
+    let f = describe(
+        "agent.start",
+        "daemon speaks protocol 4, this IDE speaks 3",
+        None,
+    );
     assert_eq!(f.kind, FailureKind::Protocol);
     assert!(!f.retry);
     assert!(f.detail.to_lowercase().contains("update"), "{}", f.detail);
@@ -143,7 +162,11 @@ fn a_failed_resume_offers_a_fresh_start_without_the_session() {
     );
     assert!(!busy.start_fresh);
     // And a start that resumed nothing has nothing to start fresh from.
-    let plain = describe("agent.start", "rpc: AgentError: boom", Some(r#"{"model":"opus"}"#));
+    let plain = describe(
+        "agent.start",
+        "rpc: AgentError: boom",
+        Some(r#"{"model":"opus"}"#),
+    );
     assert!(!plain.start_fresh);
 }
 
@@ -158,7 +181,11 @@ fn an_unknown_error_keeps_its_sentence_and_offers_the_log() {
 
 #[test]
 fn transcript_requests_are_named_for_what_the_user_did() {
-    let f = describe("agent.send", "agent.send failed: rpc: NotFound: agent ag_1", None);
+    let f = describe(
+        "agent.send",
+        "agent.send failed: rpc: NotFound: agent ag_1",
+        None,
+    );
     assert_eq!(f.op, "agent.send");
     assert_eq!(f.kind, FailureKind::Gone);
     assert!(f.title.contains("message"), "{}", f.title);

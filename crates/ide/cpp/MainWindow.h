@@ -188,6 +188,16 @@ private:
                              const QString& message);
     /// The catch-all: a failure with no family of its own.
     void onOperationFailed(const QString& op, const QString& message);
+    /// A failed `agent.*` request, already put into words: raised on the
+    /// workspace's banner instead of a box. `failureJson` is an
+    /// `AgentFailure`; it is also what the banner's Retry and Start fresh
+    /// read their options from.
+    void showAgentFailure(const QString& workspaceId, const QString& failureJson);
+    /// The banner's Retry and Start fresh, for the failure on show.
+    void onAgentFailureRetry(const QString& workspaceId);
+    void onAgentStartFresh(const QString& workspaceId);
+    /// Opens the folder the IDE's log -- the daemon's lines included -- is in.
+    void openLogFolder();
     /// Puts `message` in front of the user, parented so a modal New Agent
     /// dialog can still be closed. The one place a failure becomes a box.
     void reportFailure(const QString& op, const QString& message);
@@ -526,6 +536,13 @@ private:
     /// `onAgentExited`, so the agent coming back -- or its sandbox turning
     /// out to be what stopped it -- can take exactly that down.
     QSet<QString> m_agentStopped;
+    /// The failed agent request each workspace's banner is showing, as the
+    /// `AgentFailure` JSON it was raised with. See [`showAgentFailure`].
+    QHash<QString, QString> m_agentFailures;
+    /// Workspaces whose `agentOperationFailed` has just been raised on the
+    /// banner, so the `workspaceOpFailed` the controller sends right after it
+    /// for the same failure does not also put up a box. Consumed by it.
+    QSet<QString> m_agentFailureRouted;
     /// A Retry that failed. See `AppController::workspaceRestartFailed`.
     void onWorkspaceRestartFailed(const QString& workspaceId, const QString& message, int kind);
     /// Starts `workspaceId`'s agent again after its sandbox came back, if it

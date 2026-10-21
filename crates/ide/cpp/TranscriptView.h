@@ -58,6 +58,11 @@ public:
     /// last.
     void setStarting(bool starting, bool restarting = false);
 
+    /// What the start in flight is doing, in the daemon's words ("Starting
+    /// the sandbox"), or empty for the plain "Starting the agent". Shown on
+    /// the progress row while [`setStarting`] says a start is in flight.
+    void setStartProgress(const QString& label);
+
     /// Whether the workspace behind this pane cannot run -- its sandbox is
     /// down or never started. The prompt box says so instead of offering to
     /// talk to an agent, and the two dropdowns are shut: choosing a model
@@ -324,6 +329,8 @@ private:
     /// See [`setStarting`].
     bool m_starting = false;
     bool m_restarting = false;
+    /// See [`setStartProgress`].
+    QString m_startProgress;
     /// See [`setWorkspaceDown`].
     bool m_workspaceDown = false;
     /// See [`setClaudeLoggedIn`]. True until told otherwise, so a view built
@@ -342,8 +349,6 @@ private:
     /// the scroll position before every append, so a user who has scrolled up
     /// to read is left where they are.
     bool m_stickToBottom = true;
-    /// The last `errorOccurred` message, cleared when the user sends again.
-    QString m_requestError;
     /// The frames one or more `itemChanged` have landed on since the last
     /// flush. A streamed answer puts the same index in here hundreds of times
     /// and is read back once.

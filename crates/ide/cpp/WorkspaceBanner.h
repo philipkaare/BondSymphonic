@@ -29,6 +29,15 @@ public:
     /// empty box.
     void showError(const QString& title, const QString& detail, const QString& stderrText);
 
+    /// Fills the banner in with a failed agent request -- a start, a prompt, a
+    /// permission answer -- already put into words by
+    /// `model::agent_failure`, and shows it. `technical` is the error as it
+    /// arrived, behind the Details disclosure. The three flags say which of
+    /// Retry, Start fresh and Open log the failure gets; they last until the
+    /// next `showError`, `showAgentFailure` or `reset`.
+    void showAgentFailure(const QString& title, const QString& detail, const QString& technical,
+                          bool retry, bool startFresh, bool openLog);
+
     /// Empties the banner and hides it, without emitting `dismissed`.
     void reset();
 
@@ -96,6 +105,18 @@ signals:
     /// asks for confirmation; this widget removes nothing.
     void removeRequested();
 
+    /// The user pressed Retry on a failed agent request. The banner has
+    /// already taken itself down: the request going out again is what the
+    /// pane shows next, and a second failure raises it again.
+    void failureRetryRequested();
+
+    /// The user pressed Start fresh: start the agent again without resuming
+    /// the conversation whose resume failed. Taken down like a Retry.
+    void startFreshRequested();
+
+    /// The user pressed Open log. The banner stays up.
+    void openLogRequested();
+
 protected:
     /// A palette change is the theme moving under the banner. Its red is mixed
     /// into the pane's own background, so it has to be mixed again rather than
@@ -131,6 +152,17 @@ private:
     /// See [`showWorkspaceProblem`]. Hidden unless the workspace cannot run.
     QPushButton* m_retry = nullptr;
     QPushButton* m_remove = nullptr;
+    /// See [`showAgentFailure`]. Hidden unless the failure on show is an
+    /// agent request that offers them.
+    QPushButton* m_failureRetry = nullptr;
+    QPushButton* m_startFresh = nullptr;
+    QPushButton* m_openLog = nullptr;
+    /// Whether the failure on show came from `showAgentFailure`, and which of
+    /// its actions it offers.
+    bool m_agentFailure = false;
+    bool m_offerRetry = false;
+    bool m_offerFresh = false;
+    bool m_offerLog = false;
     /// The latest failure, kept whole so a workspace problem can sit over it
     /// and hand the banner back.
     QString m_errorTitle;

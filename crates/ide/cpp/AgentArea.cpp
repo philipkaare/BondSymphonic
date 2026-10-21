@@ -92,11 +92,21 @@ QWidget* AgentArea::makePage(const QString& workspaceId, QWidget* body) {
                      [this, workspaceId] { emit retryWorkspaceRequested(workspaceId); });
     QObject::connect(banner, &WorkspaceBanner::removeRequested, this,
                      [this, workspaceId] { emit removeWorkspaceRequested(workspaceId); });
+    QObject::connect(banner, &WorkspaceBanner::failureRetryRequested, this,
+                     [this, workspaceId] { emit agentFailureRetryRequested(workspaceId); });
+    QObject::connect(banner, &WorkspaceBanner::startFreshRequested, this,
+                     [this, workspaceId] { emit agentStartFreshRequested(workspaceId); });
+    QObject::connect(banner, &WorkspaceBanner::openLogRequested, this,
+                     &AgentArea::openLogRequested);
     // A failure reported before this pane existed: raise it now, which is the
     // first moment the user could have seen it.
     if (m_pendingBanners.contains(workspaceId)) {
         const PendingBanner pending = m_pendingBanners.take(workspaceId);
-        banner->showError(pending.title, pending.detail, pending.stderrText);
+        if (pending.failureJson.isEmpty()) {
+            banner->showError(pending.title, pending.detail, pending.stderrText);
+        } else {
+            raiseAgentFailure(banner, pending.failureJson);
+        }
     }
     // And whatever was said about the agent while this pane did not exist. An
     // agent that died before its tab was ever opened is exactly the one that
@@ -183,6 +193,40 @@ void AgentArea::showBanner(const QString& workspaceId, const QString& title,
     m_pendingBanners.insert(workspaceId, { title, detail, stderrText });
 }
 
+void AgentArea::showAgentFailure(const QString& workspaceId, const QString& failureJson) {
+    if (workspaceId.isEmpty() || failureJson.isEmpty()) {
+        return;
+    }
+    if (WorkspaceBanner* banner = m_banners.value(workspaceId)) {
+        raiseAgentFailure(banner, failureJson);
+        applyRestartOffer(workspaceId);
+        return;
+    }
+    PendingBanner pending{ QString(), QString(), QString() };
+    pending.failureJson = failureJson;
+    m_pendingBanners.insert(workspaceId, pending);
+}
+
+void AgentArea::raiseAgentFailure(WorkspaceBanner* banner, const QString& failureJson) {
+    const QJsonObject failure = QJsonDocument::fromJson(failureJson.toUtf8()).object();
+    banner->showAgentFailure(failure.value(QStringLiteral("title")).toString(),
+                             failure.value(QStringLiteral("detail")).toString(),
+                             failure.value(QStringLiteral("technical")).toString(),
+                             failure.value(QStringLiteral("retry")).toBool(),
+                             failure.value(QStringLiteral("start_fresh")).toBool(),
+                             failure.value(QStringLiteral("open_log")).toBool());
+}
+
+void AgentArea::setStartProgress(const QString& workspaceId, const QString& label) {
+    if (workspaceId.isEmpty()) {
+        return;
+    }
+    m_startProgress.insert(workspaceId, label);
+    if (TranscriptView* view = m_transcripts.value(workspaceId)) {
+        view->setStartProgress(label);
+    }
+}
+
 void AgentArea::setRestartOffered(const QString& workspaceId, bool offered) {
     if (workspaceId.isEmpty()) {
         return;
@@ -244,6 +288,12 @@ void AgentArea::setStarting(const QString& workspaceId, bool starting, bool rest
     } else {
         m_starting.remove(workspaceId);
     }
+    // Each start reports its own phases; what the last one reached says
+    // nothing about this one, nor about a pane that is no longer starting.
+    m_startProgress.remove(workspaceId);
+    if (TranscriptView* view = m_transcripts.value(workspaceId)) {
+        view->setStartProgress(QString());
+    }
     if (TranscriptView* view = m_transcripts.value(workspaceId)) {
         view->setStarting(starting, restarting);
     }
@@ -292,9 +342,16 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
                          [this, workspaceId](const QString& optionsJson) {
                              emit agentOptionsChanged(workspaceId, optionsJson);
                          });
+        // A prompt, a permission answer or a stop that failed goes to the
+        // banner over the pane, by way of the window, as a failed start does.
+        QObject::connect(model, &TranscriptModel::requestFailed, this,
+                         [this, workspaceId](const QString& failureJson) {
+                             emit agentRequestFailed(workspaceId, failureJson);
+                         });
         // A start that began before this pane existed -- which is every
         // workspace created with an agent, since the tab is shown first.
         view->setStarting(m_starting.contains(workspaceId), m_restarting.contains(workspaceId));
+        view->setStartProgress(m_startProgress.value(workspaceId));
         // Built with the gate the area already knows about, rather than with a
         // composer that is taken away a moment later.
         view->setClaudeLoggedIn(m_claudeLoggedIn);

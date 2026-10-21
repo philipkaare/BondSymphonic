@@ -351,12 +351,10 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
                      &TranscriptView::onPermissionRequested);
     QObject::connect(model, &TranscriptModel::permissionCleared, this,
                      [this] { m_permission->clear(); });
-    QObject::connect(model, &TranscriptModel::errorOccurred, this, [this](const QString& message) {
-        // News about a failed request, never about the transcript: the frames
-        // are left exactly as they are.
-        m_requestError = message;
-        refreshBanner();
-    });
+    // A failed request is not this view's to report: the model's
+    // `requestFailed` goes to the banner over the pane, which puts it in
+    // plain words and offers to send it again. The frames are left exactly as
+    // they are either way.
     QObject::connect(model, &TranscriptModel::busyChanged, this, &TranscriptView::onBusyChanged);
     QObject::connect(model, &TranscriptModel::stateChanged, this, &TranscriptView::onStateChanged);
     // Attaching is what opens the box: until the id lands there is no agent to
@@ -371,9 +369,6 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
         if (m_model.isNull()) {
             return;
         }
-        // A new prompt supersedes whatever the last request complained about.
-        m_requestError.clear();
-        refreshBanner();
         m_model->send(text);
     });
     QObject::connect(m_permission, &PermissionBar::allowed, this, [this](bool always) {
@@ -455,9 +450,6 @@ void TranscriptView::rebuild() {
     // so a bar left up from a previous attach would answer for a request nobody
     // is waiting on. Re-reading the property here shows or hides it either way.
     onPermissionRequested();
-    // The last failed request belonged to the transcript that has just been
-    // replaced.
-    m_requestError.clear();
     refreshBanner();
     updateWelcome();
 }
@@ -607,7 +599,17 @@ void TranscriptView::setStarting(bool starting, bool restarting) {
     m_restarting = starting && restarting;
     if (starting) {
         m_startFromAgentId = agentId;
+    } else {
+        m_startProgress.clear();
     }
+    onStateChanged();
+}
+
+void TranscriptView::setStartProgress(const QString& label) {
+    if (m_startProgress == label) {
+        return;
+    }
+    m_startProgress = label;
     onStateChanged();
 }
 
@@ -673,8 +675,14 @@ void TranscriptView::onStateChanged() {
     } else {
         m_input->setBusy(working);
     }
-    m_progressText->setText((m_starting && m_restarting ? QStringLiteral("Restarting the agent")
-                                                     : QStringLiteral("Starting the agent")) + QChar(kEllipsis));
+    // The daemon's own words for the phase the start is in, once it has said
+    // any: a first Codex or OpenCode start can take tens of seconds, and
+    // "Starting the sandbox" says what they are spent on.
+    m_progressText->setText((m_starting && !m_startProgress.isEmpty()
+                                 ? m_startProgress
+                                 : m_starting && m_restarting ? QStringLiteral("Restarting the agent")
+                                                              : QStringLiteral("Starting the agent")) +
+                            QChar(kEllipsis));
     m_progress->setVisible(comingBack);
     m_interrupt->setEnabled(!noAgent && !m_starting && !busy && working);
     // Shut only while a start is already in flight or the history is still
@@ -873,8 +881,8 @@ void TranscriptView::announceSwitch() {
 }
 
 void TranscriptView::refreshBanner() {
-    QString text = m_requestError;
-    if (text.isEmpty() && !m_model.isNull()) {
+    QString text;
+    if (!m_model.isNull()) {
         const QString state = m_model->getState();
         const QString detail = m_model->getStateDetail();
         if (state == QString::fromUtf8(kStateError)) {
@@ -1936,6 +1944,32 @@ extern "C" std::int32_t bs_widget_test_transcript_shows_a_blocked_host_inline() 
     model.resetItems();
     if (button() != nullptr || text().contains(QChar(kTimes))) {
         return 8;
+    }
+    return 0;
+}
+
+/// A start in flight says which phase it is in once the daemon has said, and
+/// the next start begins from the plain "Starting the agent" again.
+extern "C" std::int32_t bs_widget_test_transcript_names_the_start_phase() {
+    TranscriptModel model;
+    TranscriptView view(&model);
+    view.setStarting(true);
+    if (!view.progressShown() || !view.progressText().startsWith(QLatin1String("Starting the agent"))) {
+        return 1;
+    }
+    view.setStartProgress(QStringLiteral("Starting the sandbox"));
+    if (!view.progressShown() ||
+        view.progressText() != QStringLiteral("Starting the sandbox") + QChar(kEllipsis)) {
+        return 2;
+    }
+    view.setStartProgress(QStringLiteral("Preparing OpenCode"));
+    if (!view.progressText().startsWith(QLatin1String("Preparing OpenCode"))) {
+        return 3;
+    }
+    view.setStarting(false);
+    view.setStarting(true);
+    if (!view.progressText().startsWith(QLatin1String("Starting the agent"))) {
+        return 4;
     }
     return 0;
 }

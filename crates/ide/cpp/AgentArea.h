@@ -56,6 +56,21 @@ signals:
     /// answers by opening Settings on its Setup section.
     void loginRequested();
 
+    /// A request `workspaceId`'s transcript made -- a prompt, a permission
+    /// answer, an interrupt or a stop -- failed. `failureJson` is the
+    /// `AgentFailure` describing it. The window raises it with
+    /// [`showAgentFailure`], as it does a failed start, so both mark the tab.
+    void agentRequestFailed(const QString& workspaceId, const QString& failureJson);
+
+    /// `workspaceId`'s banner asked for its failed agent request to be sent
+    /// again, or for the agent to be started without resuming the
+    /// conversation. The window knows which request that was.
+    void agentFailureRetryRequested(const QString& workspaceId);
+    void agentStartFreshRequested(const QString& workspaceId);
+
+    /// A banner's Open log was pressed.
+    void openLogRequested();
+
 public:
     /// What the placeholder page says while nothing is showing.
     void setPlaceholderText(const QString& text);
@@ -141,6 +156,17 @@ public:
     void showBanner(const QString& workspaceId, const QString& title, const QString& detail,
                     const QString& stderrText);
 
+    /// Raises a failed agent request on `workspaceId`'s banner: `failureJson`
+    /// is the `AgentFailure` the controller or the transcript described it
+    /// with, and says which of Retry, Start fresh and Open log it gets. Held
+    /// for a pane that does not exist yet, like [`showBanner`].
+    void showAgentFailure(const QString& workspaceId, const QString& failureJson);
+
+    /// What the `agent.start` in flight for `workspaceId` is doing, in the
+    /// daemon's words ("Starting the sandbox"). Shown on the pane's progress
+    /// row while it says it is starting, and forgotten when the start ends.
+    void setStartProgress(const QString& workspaceId, const QString& label);
+
     /// Takes it down again, without emitting `bannerDismissed`. What a
     /// successful operation on that workspace does to the banner its last
     /// failure left.
@@ -219,6 +245,9 @@ private:
     /// rather than with whatever the last `showError` left behind.
     void applyRestartOffer(const QString& workspaceId);
 
+    /// Puts the `AgentFailure` in `failureJson` on `banner`.
+    static void raiseAgentFailure(WorkspaceBanner* banner, const QString& failureJson);
+
     /// A failure raised for a workspace whose pane did not exist yet, held
     /// until it does. Three strings and nothing about the agent: whether a
     /// restart is offered is [`setRestartOffered`]'s business and outlives any
@@ -227,6 +256,9 @@ private:
         QString title;
         QString detail;
         QString stderrText;
+        /// Set for a failed agent request, which is raised from this instead
+        /// of the three strings above.
+        QString failureJson = QString();
     };
 
     /// Puts the remembered workspace problem, and whether a Retry is in
@@ -278,6 +310,9 @@ private:
     /// on the pane because the start begins before the pane exists.
     QSet<QString> m_starting;
     QSet<QString> m_restarting;
+    /// See [`setStartProgress`]: the latest phase of each start in flight,
+    /// kept for a pane built while the start is still going.
+    QHash<QString, QString> m_startProgress;
     /// See [`setShowMeta`]. True until the window says otherwise, which is the
     /// setting's own default.
     bool m_showMeta = true;

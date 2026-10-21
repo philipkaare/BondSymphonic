@@ -107,6 +107,29 @@ WorkspaceBanner::WorkspaceBanner(QWidget* parent) : QFrame(parent) {
     m_remove->hide();
     head->addWidget(m_remove, 0, Qt::AlignTop);
 
+    // A failed agent request's three, in the order a user would try them:
+    // the same again, the same without the conversation that would not
+    // resume, and the log when neither is the answer.
+    m_failureRetry = new QPushButton(QStringLiteral("Retry"), this);
+    m_failureRetry->setObjectName(QStringLiteral("WorkspaceBannerFailureRetryButton"));
+    m_failureRetry->setToolTip(QStringLiteral("Send the same request again"));
+    m_failureRetry->hide();
+    head->addWidget(m_failureRetry, 0, Qt::AlignTop);
+
+    m_startFresh = new QPushButton(QStringLiteral("Start fresh"), this);
+    m_startFresh->setObjectName(QStringLiteral("WorkspaceBannerStartFreshButton"));
+    m_startFresh->setToolTip(QStringLiteral(
+        "Start the agent with a new conversation instead of resuming the one that failed. "
+        "The transcript so far stays on screen."));
+    m_startFresh->hide();
+    head->addWidget(m_startFresh, 0, Qt::AlignTop);
+
+    m_openLog = new QPushButton(QStringLiteral("Open log"), this);
+    m_openLog->setObjectName(QStringLiteral("WorkspaceBannerOpenLogButton"));
+    m_openLog->setToolTip(QStringLiteral("Open the folder with the IDE and daemon log"));
+    m_openLog->hide();
+    head->addWidget(m_openLog, 0, Qt::AlignTop);
+
     m_dismiss = new QPushButton(QStringLiteral("Dismiss"), this);
     m_dismiss->setObjectName(QStringLiteral("WorkspaceBannerDismissButton"));
     head->addWidget(m_dismiss, 0, Qt::AlignTop);
@@ -136,8 +159,36 @@ WorkspaceBanner::WorkspaceBanner(QWidget* parent) : QFrame(parent) {
     // workspace coming back or failing again, and a removal by the pane going.
     QObject::connect(m_retry, &QPushButton::clicked, this, [this] { emit retryRequested(); });
     QObject::connect(m_remove, &QPushButton::clicked, this, [this] { emit removeRequested(); });
+    // Unlike the agent's Restart, these take the failure down at once: the
+    // request goes out again and the pane says so (a start shows its
+    // progress), and a second failure raises a new banner. Leaving the old
+    // one up would read as the retry having failed already.
+    QObject::connect(m_failureRetry, &QPushButton::clicked, this, [this] {
+        reset();
+        emit failureRetryRequested();
+    });
+    QObject::connect(m_startFresh, &QPushButton::clicked, this, [this] {
+        reset();
+        emit startFreshRequested();
+    });
+    QObject::connect(m_openLog, &QPushButton::clicked, this, [this] { emit openLogRequested(); });
 
     QFrame::hide();
+}
+
+void WorkspaceBanner::showAgentFailure(const QString& title, const QString& detail,
+                                       const QString& technical, bool retry, bool startFresh,
+                                       bool openLog) {
+    m_errorTitle = title;
+    m_errorDetail = detail;
+    m_errorStderr = technical;
+    m_error = true;
+    m_agentFailure = true;
+    m_offerRetry = retry;
+    m_offerFresh = startFresh;
+    m_offerLog = openLog;
+    render();
+    setExpanded(false);
 }
 
 void WorkspaceBanner::showError(const QString& title, const QString& detail,
@@ -146,6 +197,10 @@ void WorkspaceBanner::showError(const QString& title, const QString& detail,
     m_errorDetail = detail;
     m_errorStderr = stderrText;
     m_error = true;
+    // A git failure replaces an agent request's, and none of its actions
+    // belong to it.
+    m_agentFailure = false;
+    m_offerRetry = m_offerFresh = m_offerLog = false;
     render();
     // Every raise starts folded: the sentence is the news, and a wall of git
     // output unfolding by itself would push the pane down each time.
@@ -158,6 +213,8 @@ void WorkspaceBanner::reset() {
     m_errorStderr.clear();
     m_error = false;
     m_restartOffered = false;
+    m_agentFailure = false;
+    m_offerRetry = m_offerFresh = m_offerLog = false;
     render();
     setExpanded(false);
 }
@@ -228,9 +285,9 @@ void WorkspaceBanner::render() {
     const QString folded = m_problem ? m_problemChanged : m_errorStderr;
     m_stderr->setPlainText(folded);
     m_disclose->setVisible(!folded.isEmpty());
-    m_disclose->setToolTip(m_problem
-                               ? QStringLiteral("Show what changed in this repository's git files")
-                               : QStringLiteral("Show what git printed"));
+    m_disclose->setToolTip(m_problem ? QStringLiteral("Show what changed in this repository's git files")
+                           : m_agentFailure ? QStringLiteral("Show the error as the daemon reported it")
+                                            : QStringLiteral("Show what git printed"));
     if (folded.isEmpty()) {
         m_stderr->hide();
     }
@@ -238,7 +295,12 @@ void WorkspaceBanner::render() {
     // The agent's Restart needs a sandbox to restart it in, so a workspace that
     // cannot run offers the sandbox's Retry instead. The offer itself is kept
     // and comes back with the sandbox.
-    m_restart->setVisible(m_restartOffered && !m_problem);
+    //
+    // Nor beside a failed start's own Retry, which is the same request with
+    // the same options: two buttons for one act would make the user wonder
+    // which one is the right one.
+    m_restart->setVisible(m_restartOffered && !m_problem &&
+                          !(m_error && m_agentFailure && m_offerRetry));
     // Nothing to dismiss: the problem goes when the workspace comes back, and
     // a banner the user could wave away would leave a pane that does nothing.
     m_dismiss->setVisible(!m_problem);
@@ -248,6 +310,12 @@ void WorkspaceBanner::render() {
     m_remove->setEnabled(!m_retrying);
     m_retry->setText(m_retrying ? QStringLiteral("Retrying") + QChar(0x2026)
                                 : QStringLiteral("Retry"));
+    // A failed agent request's own actions, under a workspace problem like
+    // the agent's Restart: there is no sandbox for them to act in.
+    const bool agentFailure = m_error && m_agentFailure && !m_problem;
+    m_failureRetry->setVisible(agentFailure && m_offerRetry);
+    m_startFresh->setVisible(agentFailure && m_offerFresh);
+    m_openLog->setVisible(agentFailure && m_offerLog);
     setVisible(m_problem || m_error);
 }
 

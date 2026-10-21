@@ -1151,6 +1151,16 @@ void MainWindow::connectController() {
                          m_agentArea->setStarting(workspaceId, false);
                          m_groupModel->setAgent(workspaceId, agentId);
                          m_agentArea->setAgent(workspaceId, agentId);
+                         // A start that failed earlier has now worked, so
+                         // its banner has nothing left to say.
+                         const QJsonObject failure =
+                             QJsonDocument::fromJson(m_agentFailures.value(workspaceId).toUtf8())
+                                 .object();
+                         if (failure.value(QStringLiteral("op")).toString() ==
+                             QLatin1String("agent.start")) {
+                             m_agentFailures.remove(workspaceId);
+                             clearWorkspaceError(workspaceId);
+                         }
                          // The other half of the fact `onAgentExited` raises:
                          // this workspace has a live agent again, so there is
                          // nothing left to restart. Without this a workspace
@@ -1315,7 +1325,30 @@ void MainWindow::connectController() {
     QObject::connect(m_agentArea, &AgentArea::bannerDismissed, this,
                      [this](const QString& workspaceId) {
                          m_agentStopped.remove(workspaceId);
+                         m_agentFailures.remove(workspaceId);
                          m_groupModel->clearWorkspaceError(workspaceId);
+                     });
+    // A failed agent request goes on the workspace's banner in plain words,
+    // with what can be done about it, rather than in a box with the
+    // protocol's text. The start's own failure arrives from the controller,
+    // the transcript's (a prompt, a permission answer, a stop) from its pane.
+    QObject::connect(m_controller, &AppController::agentOperationFailed, this,
+                     [this](const QString& workspaceId, const QString& failureJson) {
+                         m_agentFailureRouted.insert(workspaceId);
+                         showAgentFailure(workspaceId, failureJson);
+                     });
+    QObject::connect(m_agentArea, &AgentArea::agentRequestFailed, this,
+                     &MainWindow::showAgentFailure);
+    QObject::connect(m_agentArea, &AgentArea::agentFailureRetryRequested, this,
+                     &MainWindow::onAgentFailureRetry);
+    QObject::connect(m_agentArea, &AgentArea::agentStartFreshRequested, this,
+                     &MainWindow::onAgentStartFresh);
+    QObject::connect(m_agentArea, &AgentArea::openLogRequested, this,
+                     &MainWindow::openLogFolder);
+    // What a slow start is doing, on the pane that is waiting for it.
+    QObject::connect(m_controller, &AppController::agentStartProgress, this,
+                     [this](const QString& workspaceId, const QString&, const QString& label) {
+                         m_agentArea->setStartProgress(workspaceId, label);
                      });
     QObject::connect(m_controller, &AppController::agentStateChanged, this,
                      [this](const QString& agentId, const QString& state, const QString& detail) {
@@ -2676,7 +2709,75 @@ void MainWindow::onWorkspaceOpFailed(const QString& workspaceId, const QString& 
         // not the crashed *agent* that bar is for.
         m_autoRestartedAt.remove(workspaceId);
     }
-    reportFailure(op, message);
+    // Raised on the workspace's banner a moment ago, by the
+    // `agentOperationFailed` sent in the same step. A failure that was not --
+    // a start whose new workspace was rolled back, so there is no pane left to
+    // hold a banner -- still gets the box.
+    if (m_agentFailureRouted.remove(workspaceId)) {
+        return;
+    }
+    // Deferred, not shown here: a box runs its own event loop, which expires
+    // the routed-failure record before the `operationFailed` behind this one
+    // is delivered, and that one then put up a second box for the same
+    // failure.
+    QTimer::singleShot(0, this, [this, op, message] { reportFailure(op, message); });
+}
+
+void MainWindow::showAgentFailure(const QString& workspaceId, const QString& failureJson) {
+    if (workspaceId.isEmpty() || failureJson.isEmpty()) {
+        return;
+    }
+    const QJsonObject failure = QJsonDocument::fromJson(failureJson.toUtf8()).object();
+    const QString title = failure.value(QStringLiteral("title")).toString();
+    const QString detail = failure.value(QStringLiteral("detail")).toString();
+    // As `showWorkspaceError` does for a git failure: the banner on the pane,
+    // and the tab's red glyph for when the pane is not the one in front.
+    m_agentStopped.remove(workspaceId);
+    m_agentFailures.insert(workspaceId, failureJson);
+    m_agentArea->showAgentFailure(workspaceId, failureJson);
+    m_groupModel->setWorkspaceError(workspaceId,
+                                    detail.isEmpty() ? title : title + QLatin1Char('\n') + detail);
+}
+
+void MainWindow::onAgentFailureRetry(const QString& workspaceId) {
+    const QJsonObject failure =
+        QJsonDocument::fromJson(m_agentFailures.take(workspaceId).toUtf8()).object();
+    m_groupModel->clearWorkspaceError(workspaceId);
+    if (failure.value(QStringLiteral("op")).toString() == QLatin1String("agent.start")) {
+        // The options the start that failed was sent with, so a retry is the
+        // same request again -- a resume still resumes.
+        const QString options = failure.value(QStringLiteral("retry_options")).toString();
+        m_agentArea->setStarting(workspaceId, true);
+        m_controller->startAgent(workspaceId, options);
+        return;
+    }
+    // A prompt, a permission answer, an interrupt or a stop: the transcript
+    // kept the request and sends it again.
+    if (TranscriptModel* model = m_agentArea->transcriptModel(workspaceId)) {
+        model->retryFailed();
+    }
+}
+
+void MainWindow::onAgentStartFresh(const QString& workspaceId) {
+    const QJsonObject failure =
+        QJsonDocument::fromJson(m_agentFailures.take(workspaceId).toUtf8()).object();
+    m_groupModel->clearWorkspaceError(workspaceId);
+    const QString options = failure.value(QStringLiteral("fresh_options")).toString();
+    // Without the session that would not resume. The tab keeps that too, so a
+    // later restart does not try the same session again.
+    m_groupModel->setTabOptions(workspaceId, options);
+    m_agentArea->setOptionsJson(workspaceId, options);
+    m_agentArea->setStarting(workspaceId, true);
+    m_controller->startAgent(workspaceId, options);
+}
+
+void MainWindow::openLogFolder() {
+    const QString folder = m_controller->logFolder();
+    if (folder.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("This IDE is not writing a log file."), 5000);
+        return;
+    }
+    QDesktopServices::openUrl(QUrl::fromLocalFile(folder));
 }
 
 void MainWindow::onOperationFailed(const QString& op, const QString& message) {
@@ -3389,6 +3490,108 @@ extern "C" std::int32_t bs_widget_test_text_sizes_reach_every_widget() {
     }
     theme::applyFonts(*qApp, uiBefore, codeBefore);
     return failure;
+}
+
+/// A failed `agent.start` is raised on the workspace's banner in plain words,
+/// with its actions, and no box goes up; a start failure the banner did not
+/// take (a rolled-back new workspace) still gets the box.
+///
+/// A box would block in its own event loop, so a zero timer armed before each
+/// emit closes whatever modal is up and counts it.
+extern "C" std::int32_t bs_widget_test_main_window_raises_agent_failures_on_the_banner() {
+    useThrowawayState();
+    WindowFixture fixture;
+    const QString ws = QStringLiteral("ws_fail");
+    int boxes = 0;
+    // Repeating, so a second box -- the failure reported twice -- is closed
+    // and counted too rather than left blocking the suite.
+    QTimer catcher;
+    catcher.setInterval(0);
+    // Counted once each: the timer can fire again before a closed box's own
+    // event loop has returned.
+    QSet<QWidget*> seen;
+    QObject::connect(&catcher, &QTimer::timeout, [&boxes, &seen] {
+        if (QWidget* modal = QApplication::activeModalWidget()) {
+            if (!seen.contains(modal)) {
+                seen.insert(modal);
+                ++boxes;
+            }
+            modal->close();
+        }
+    });
+    auto armBoxCatcher = [&catcher] { catcher.start(); };
+    const QString failure = QStringLiteral(
+        R"({"op":"agent.start","kind":"busy","title":"The agent didn't start.",)"
+        R"("detail":"This workspace is busy with another start or operation.",)"
+        R"("technical":"rpc: Conflict: another operation is running in this workspace",)"
+        R"("retry":true,"start_fresh":true,"open_log":true,"retry_options":"{}",)"
+        R"("fresh_options":"{}"})");
+    const QString raw = QStringLiteral("rpc: Conflict: another operation is running in this workspace");
+
+    // The controller's order: the described failure, then the two plain ones.
+    armBoxCatcher();
+    emit fixture.controller.agentOperationFailed(ws, failure);
+    emit fixture.controller.workspaceOpFailed(ws, QStringLiteral("agent.start"), raw);
+    emit fixture.controller.operationFailed(QStringLiteral("agent.start"), raw);
+    QCoreApplication::processEvents();
+    if (boxes != 0) {
+        return 1;
+    }
+
+    // The pane is built when the tab is first shown, and the held failure is
+    // raised on it then.
+    WorkspaceBanner* banner = nullptr;
+    for (AgentArea* area : fixture.window.findChildren<AgentArea*>()) {
+        area->showWorkspace(ws, QStringLiteral("claude"), QString());
+        WorkspaceBanner* candidate = area->banner(ws);
+        if (candidate != nullptr && !candidate->isHidden()) {
+            banner = candidate;
+        }
+    }
+    if (banner == nullptr) {
+        return 2;
+    }
+    auto* title = banner->findChild<QLabel*>(QStringLiteral("WorkspaceBannerTitle"));
+    auto* detail = banner->findChild<QLabel*>(QStringLiteral("WorkspaceBannerDetail"));
+    auto* stderrBox = banner->findChild<QPlainTextEdit*>(QStringLiteral("WorkspaceBannerStderr"));
+    auto* disclose = banner->findChild<QToolButton*>(QStringLiteral("WorkspaceBannerDetailsButton"));
+    if (title == nullptr || title->text() != QStringLiteral("The agent didn't start.") ||
+        detail == nullptr || detail->text().contains(QLatin1String("rpc:"))) {
+        return 3;
+    }
+    if (disclose == nullptr || disclose->isHidden() || stderrBox == nullptr ||
+        stderrBox->toPlainText() != raw) {
+        return 4;
+    }
+    auto button = [banner](const char* name) {
+        return banner->findChild<QPushButton*>(QString::fromLatin1(name));
+    };
+    QPushButton* retry = button("WorkspaceBannerFailureRetryButton");
+    QPushButton* fresh = button("WorkspaceBannerStartFreshButton");
+    QPushButton* log = button("WorkspaceBannerOpenLogButton");
+    QPushButton* dismiss = button("WorkspaceBannerDismissButton");
+    if (retry == nullptr || retry->isHidden() || fresh == nullptr || fresh->isHidden() ||
+        log == nullptr || log->isHidden() || dismiss == nullptr || dismiss->isHidden()) {
+        return 5;
+    }
+    // Dismissable, and it says nothing more once dismissed.
+    dismiss->click();
+    if (!banner->isHidden()) {
+        return 6;
+    }
+
+    // A start failure nothing raised on a banner is still reported.
+    armBoxCatcher();
+    emit fixture.controller.workspaceOpFailed(ws, QStringLiteral("agent.start"), raw);
+    emit fixture.controller.operationFailed(QStringLiteral("agent.start"), raw);
+    QCoreApplication::processEvents();
+    // Once: the box used to be raised by the typed failure and again by the
+    // `operationFailed` behind it.
+    QCoreApplication::processEvents();
+    if (boxes != 1) {
+        return 70 + boxes;
+    }
+    return 0;
 }
 
 #endif // BS_WIDGET_TESTS

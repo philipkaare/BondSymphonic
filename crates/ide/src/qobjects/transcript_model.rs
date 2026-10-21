@@ -84,6 +84,18 @@ pub mod qobject {
         #[qsignal]
         fn error_occurred(self: Pin<&mut TranscriptModel>, message: QString);
 
+        /// The same failure, described for the pane's banner:
+        /// `failure_json` is a `model::agent_failure::AgentFailure`. Emitted
+        /// right after `errorOccurred`, for every failure it reports.
+        #[qsignal]
+        fn request_failed(self: Pin<&mut TranscriptModel>, failure_json: QString);
+
+        /// Sends the request whose failure was reported last again: the
+        /// prompt, the permission answer, the interrupt or the stop. Does
+        /// nothing when the last failure was not one that can be repeated.
+        #[qinvokable]
+        fn retry_failed(self: Pin<&mut TranscriptModel>);
+
         /// Points this model at an agent: subscribes, replays
         /// `agent.history`, then follows the live stream. Re-attaching drops
         /// the previous agent's subscription and clears the transcript. An
@@ -244,6 +256,21 @@ pub struct TranscriptModelRust {
     /// Bumped on every `attach`, so a reply for an earlier agent that lands
     /// late is dropped instead of being folded into the new transcript.
     generation: u64,
+    /// The request the last reported failure was for, so the banner's Retry
+    /// can send it again. Replaced by every failure.
+    last_failed: Option<Repeatable>,
+}
+
+/// A request [`TranscriptModel::retry_failed`] can send again.
+#[derive(Clone)]
+enum Repeatable {
+    Send(String),
+    Reply {
+        request_id: String,
+        decision: PermissionDecision,
+        message: Option<String>,
+    },
+    Request(fn(AgentIdParams) -> Request, &'static str),
 }
 
 impl Default for TranscriptModelRust {
@@ -265,6 +292,7 @@ impl Default for TranscriptModelRust {
             reconnect_task: None,
             unsubscribe: None,
             generation: 0,
+            last_failed: None,
         }
     }
 }
@@ -326,7 +354,7 @@ async fn replay_and_follow(
                 if q.as_ref().rust().generation != generation {
                     return;
                 }
-                q.fail(&message);
+                q.fail_request("agent.history", &message, None);
             });
             None
         }
@@ -441,7 +469,7 @@ impl qobject::TranscriptModel {
             Err(message) => {
                 self.as_mut().set_busy(false);
                 self.as_mut().reset_items();
-                self.fail(message);
+                self.fail_request("agent.history", message, None);
                 return;
             }
         };
@@ -471,7 +499,8 @@ impl qobject::TranscriptModel {
         if text.trim().is_empty() {
             return;
         }
-        let Some((shared, agent, qt)) = self.connection() else {
+        let again = Repeatable::Send(text.clone());
+        let Some((shared, agent, qt)) = self.connection("agent.send", &again) else {
             return;
         };
         runtime().spawn(async move {
@@ -480,7 +509,7 @@ impl qobject::TranscriptModel {
                 text,
             };
             if let Err(e) = shared.client.request_raw(Request::AgentSend(params)).await {
-                report(&qt, format!("agent.send failed: {e}"));
+                report(&qt, "agent.send", format!("agent.send failed: {e}"), again);
             }
         });
     }
@@ -807,7 +836,12 @@ impl qobject::TranscriptModel {
         decision: PermissionDecision,
         message: Option<String>,
     ) {
-        let Some((shared, agent, qt)) = self.connection() else {
+        let again = Repeatable::Reply {
+            request_id: request_id.clone(),
+            decision,
+            message: message.clone(),
+        };
+        let Some((shared, agent, qt)) = self.connection("agent.permission_reply", &again) else {
             return;
         };
         runtime().spawn(async move {
@@ -823,7 +857,12 @@ impl qobject::TranscriptModel {
                 .request_raw(Request::AgentPermissionReply(params))
                 .await
             {
-                report(&qt, format!("agent.permission_reply failed: {e}"));
+                report(
+                    &qt,
+                    "agent.permission_reply",
+                    format!("agent.permission_reply failed: {e}"),
+                    again,
+                );
             }
         });
     }
@@ -831,13 +870,14 @@ impl qobject::TranscriptModel {
     /// Issues one of the fire-and-forget `agent.*` requests that take nothing
     /// but the agent id. The answer is the state change the daemon broadcasts.
     fn agent_request(self: Pin<&mut Self>, build: fn(AgentIdParams) -> Request, op: &'static str) {
-        let Some((shared, agent, qt)) = self.connection() else {
+        let again = Repeatable::Request(build, op);
+        let Some((shared, agent, qt)) = self.connection(op, &again) else {
             return;
         };
         runtime().spawn(async move {
             let params = AgentIdParams { agent_id: agent };
             if let Err(e) = shared.client.request_raw(build(params)).await {
-                report(&qt, format!("{op} failed: {e}"));
+                report(&qt, op, format!("{op} failed: {e}"), again);
             }
         });
     }
@@ -845,7 +885,11 @@ impl qobject::TranscriptModel {
     /// The three things every request needs, or `None` after raising the
     /// reason it cannot be made. `None` without an error when no agent is
     /// attached: an empty tab is not a failure.
-    fn connection(mut self: Pin<&mut Self>) -> Option<(Shared, AgentId, QtHandle)> {
+    fn connection(
+        mut self: Pin<&mut Self>,
+        op: &'static str,
+        again: &Repeatable,
+    ) -> Option<(Shared, AgentId, QtHandle)> {
         let agent = self.as_ref().agent_id().to_string();
         if agent.is_empty() {
             return None;
@@ -856,7 +900,7 @@ impl qobject::TranscriptModel {
                 Some((shared, AgentId(agent), qt))
             }
             Err(message) => {
-                self.as_mut().fail(message);
+                self.as_mut().fail_request(op, message, Some(again.clone()));
                 None
             }
         }
@@ -894,10 +938,29 @@ impl qobject::TranscriptModel {
         self.as_mut().attach(workspace, agent);
     }
 
-    /// Raises a failure on the view. The transcript is never changed by one:
-    /// an error is news about the request, not about the conversation.
-    fn fail(self: Pin<&mut Self>, message: &str) {
-        self.error_occurred(QString::from(message));
+    /// Raises a failure of `op` on the view, and keeps `again` for Retry. The
+    /// transcript is never changed by one: an error is news about the
+    /// request, not about the conversation.
+    fn fail_request(mut self: Pin<&mut Self>, op: &str, message: &str, again: Option<Repeatable>) {
+        self.as_mut().rust_mut().last_failed = again;
+        self.as_mut().error_occurred(QString::from(message));
+        let failure = crate::model::agent_failure::describe(op, message, None);
+        self.request_failed(QString::from(&failure.to_json()));
+    }
+
+    pub fn retry_failed(mut self: Pin<&mut Self>) {
+        let Some(again) = self.as_mut().rust_mut().last_failed.take() else {
+            return;
+        };
+        match again {
+            Repeatable::Send(text) => self.send(QString::from(&text)),
+            Repeatable::Reply {
+                request_id,
+                decision,
+                message,
+            } => self.send_permission_reply(request_id, decision, message),
+            Repeatable::Request(build, op) => self.agent_request(build, op),
+        }
     }
 }
 
@@ -1045,8 +1108,9 @@ fn index_of(i: usize) -> i32 {
     i32::try_from(i).unwrap_or(i32::MAX)
 }
 
-/// Surfaces a tokio-side failure on the model's `errorOccurred` signal.
-fn report(qt: &QtHandle, message: String) {
+/// Surfaces a tokio-side failure of `op` on the model's `errorOccurred` and
+/// `requestFailed` signals, keeping `again` for the banner's Retry.
+fn report(qt: &QtHandle, op: &'static str, message: String, again: Repeatable) {
     tracing::warn!("{message}");
-    let _ = qt.queue(move |q| q.fail(&message));
+    let _ = qt.queue(move |q| q.fail_request(op, &message, Some(again)));
 }

@@ -797,10 +797,9 @@ mod agent_start_progress {
     #[test]
     fn hello_features_are_optional_in_both_directions() {
         // A client that predates the field.
-        let old: HelloParams = serde_json::from_str(
-            r#"{"token":"t","client_version":"0.1.0","protocol_version":3}"#,
-        )
-        .unwrap();
+        let old: HelloParams =
+            serde_json::from_str(r#"{"token":"t","client_version":"0.1.0","protocol_version":3}"#)
+                .unwrap();
         assert!(old.features.is_empty());
         // And one that has nothing to ask for sends nothing, so an older
         // daemon sees the hello it always saw.
