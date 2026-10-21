@@ -150,6 +150,26 @@ params!(ListModelsParams {
     api_key: Option<String>
 });
 
+/// `opencode.test_provider`: which provider of the Windows user's OpenCode
+/// config to test, and the OpenCode key the IDE stores, which is what a
+/// sandboxed agent gets as `OPENAI_API_KEY`. Written out rather than with
+/// `params!` so `Debug` cannot print the key.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenCodeTestProviderParams {
+    pub provider_id: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for OpenCodeTestProviderParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenCodeTestProviderParams")
+            .field("provider_id", &self.provider_id)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Request {
@@ -244,6 +264,16 @@ pub enum Request {
     /// it does not move [`crate::PROTOCOL_VERSION`].
     #[serde(rename = "agent.queued_prompt")]
     AgentQueuedPrompt(AgentQueuedPromptParams),
+    /// The providers in the Windows user's OpenCode config, with how a
+    /// sandboxed agent would reach each `baseURL`. Additive and gated on
+    /// [`crate::Capabilities::opencode_providers`].
+    #[serde(rename = "opencode.list_providers")]
+    OpenCodeListProviders {},
+    /// Whether a sandboxed OpenCode agent would reach one provider's server:
+    /// resolved and connected the way the companion proxy does it, then
+    /// `GET <baseURL>/models`. Gated like `opencode.list_providers`.
+    #[serde(rename = "opencode.test_provider")]
+    OpenCodeTestProvider(OpenCodeTestProviderParams),
 }
 
 impl Request {
@@ -287,6 +317,8 @@ impl Request {
             RunList(_) => "run.list",
             SystemListModels(_) => "system.list_models",
             AgentQueuedPrompt(_) => "agent.queued_prompt",
+            OpenCodeListProviders {} => "opencode.list_providers",
+            OpenCodeTestProvider(_) => "opencode.test_provider",
         }
     }
 
@@ -447,6 +479,11 @@ impl Request {
                 prompt_id: "q1".into(),
                 action: QueuedPromptAction::Discard,
             }),
+            OpenCodeListProviders {},
+            OpenCodeTestProvider(OpenCodeTestProviderParams {
+                provider_id: "ollama".into(),
+                api_key: None,
+            }),
         ]
     }
 }
@@ -600,6 +637,15 @@ pub struct RunListResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ListModelsResult {
     pub models: Vec<ModelInfo>,
+}
+/// What `opencode.list_providers` answers: every provider in the Windows
+/// user's OpenCode config, sorted by id, and one line per config file that
+/// could not be read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenCodeProvidersResult {
+    pub providers: Vec<OpenCodeProvider>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 /// For methods with no meaningful result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

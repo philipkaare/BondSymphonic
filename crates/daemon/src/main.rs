@@ -193,6 +193,7 @@ async fn serve(args: Args) -> Result<()> {
         adapters: bondsymphonic_daemon::agents::backend::runnable_adapters(
             &bondsymphonic_daemon::agents::backend::known_backends(),
         ),
+        opencode_providers: true,
     };
 
     let server = Server::bind(ServerConfig {

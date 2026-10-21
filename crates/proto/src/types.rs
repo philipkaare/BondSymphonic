@@ -10,6 +10,11 @@ pub struct Capabilities {
     pub adapters: Vec<AgentAdapterKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backends: Vec<BackendDescriptor>,
+    /// The daemon answers `opencode.list_providers` and
+    /// `opencode.test_provider`. A daemon that predates them sends nothing,
+    /// which reads as `false`, and Settings then hides the model-server list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opencode_providers: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -666,4 +671,89 @@ pub enum LogLevel {
     Info,
     Warn,
     Error,
+}
+
+/// How a sandboxed OpenCode agent would reach a provider's `baseURL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxRoute {
+    /// The origin is granted on the companion's proxy.
+    Granted,
+    /// A loopback origin: granted, and carried by the in-sandbox tunnel to the
+    /// loopback of the WSL distribution the daemon runs in.
+    Tunnelled,
+    /// No route: not a literal `http(s)://` URL, or a loopback port the
+    /// sandbox cannot listen on for it.
+    NotGranted,
+    /// The provider names no `baseURL`; OpenCode uses its built-in endpoint,
+    /// which the workspace allowlist decides about.
+    NoBaseUrl,
+    /// A route a newer daemon knows and this build does not.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One provider from the Windows user's OpenCode config, as Settings lists it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenCodeProvider {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// As written in the config, `{env:...}` and all.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// How many entries the config's `models` object has.
+    #[serde(default)]
+    pub model_count: u32,
+    pub sandbox_route: SandboxRoute,
+    /// Why there is no route, or which address a tunnel carries it to.
+    #[serde(default)]
+    pub route_note: Option<String>,
+}
+
+/// What a connection test found. The daemon's `message` says it in words;
+/// the outcome is for the IDE to colour it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTestOutcome {
+    /// Answered `GET <baseURL>/models` with a 2xx.
+    Reachable,
+    /// Connected, and answered with an HTTP error status.
+    HttpError,
+    /// Nothing listens at that address and port.
+    Refused,
+    /// The name, the connection or the answer took too long.
+    Timeout,
+    /// The host name does not resolve.
+    DnsFailure,
+    /// A sandbox would get no route to it at all.
+    NotGranted,
+    /// Anything else: unknown provider, no `baseURL`, a broken answer.
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
+/// The answer to `opencode.test_provider`. Never carries the API key; at most
+/// where it came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenCodeProviderTest {
+    pub outcome: ProviderTestOutcome,
+    pub message: String,
+    /// The URL that was fetched.
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub status: Option<u16>,
+    #[serde(default)]
+    pub model_count: Option<u32>,
+    /// The first few model ids the server listed.
+    #[serde(default)]
+    pub model_ids: Vec<String>,
+    /// Where the key sent came from ("config", "OpenCode sign-in", "stored
+    /// key"), or `None` when the request carried no key.
+    #[serde(default)]
+    pub key_source: Option<String>,
+    #[serde(default)]
+    pub elapsed_ms: u64,
 }

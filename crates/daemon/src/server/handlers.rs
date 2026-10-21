@@ -29,6 +29,7 @@ impl Handler for WorkspaceHandler {
             let backends = crate::agents::backend::known_backends();
             hello.capabilities.adapters = crate::agents::backend::runnable_adapters(&backends);
             hello.capabilities.backends = backends.iter().map(|b| b.descriptor()).collect();
+            hello.capabilities.opencode_providers = true;
             return ok(hello);
         }
         if !ctx.is_authenticated() {

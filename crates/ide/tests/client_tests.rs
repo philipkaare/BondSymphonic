@@ -33,6 +33,7 @@ async fn fake_daemon(token: &'static str) -> std::net::SocketAddr {
                             daemon_version: "9.9.9".into(),
                             capabilities: Capabilities {
                                 backends: vec![],
+                                opencode_providers: false,
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
                                 adapters: vec![],
@@ -104,6 +105,7 @@ async fn fake_daemon_signaling_eof(
                             daemon_version: "9.9.9".into(),
                             capabilities: Capabilities {
                                 backends: vec![],
+                                opencode_providers: false,
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
                                 adapters: vec![],
@@ -148,6 +150,7 @@ async fn fake_daemon_delayed_prereqs(token: &'static str) -> std::net::SocketAdd
                             daemon_version: "9.9.9".into(),
                             capabilities: Capabilities {
                                 backends: vec![],
+                                opencode_providers: false,
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
                                 adapters: vec![],
@@ -306,6 +309,7 @@ async fn fake_daemon_silent_after_hello(token: &'static str) -> std::net::Socket
                             daemon_version: "9.9.9".into(),
                             capabilities: Capabilities {
                                 backends: vec![],
+                                opencode_providers: false,
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
                                 adapters: vec![],
@@ -354,6 +358,7 @@ async fn fake_daemon_flooding_events(token: &'static str) -> std::net::SocketAdd
                             daemon_version: "9.9.9".into(),
                             capabilities: Capabilities {
                                 backends: vec![],
+                                opencode_providers: false,
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
                                 adapters: vec![],
@@ -633,6 +638,7 @@ async fn fake_daemon_speaking(token: &'static str, answer: MismatchAnswer) -> st
                             daemon_version: "9.9.9".into(),
                             capabilities: Capabilities {
                                 backends: vec![],
+                                opencode_providers: false,
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
                                 adapters: vec![],
@@ -763,6 +769,7 @@ mod review_fixes_task_7 {
                                 daemon_version: "9.9.9".into(),
                                 capabilities: Capabilities {
                                     backends: vec![],
+                                    opencode_providers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![],
