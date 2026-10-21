@@ -4262,6 +4262,7 @@ mod in_place_breach_detail {
                                         level: LogLevel::Warn,
                                         message: format!("{SENTENCE}\n{DIFF}"),
                                         host: None,
+                                        backend: None,
                                     },
                                 ));
                                 after.push(ServerMessage::event(

@@ -856,6 +856,7 @@ fn a_denial_log_maps_onto_a_workspace_and_a_host() {
         level: LogLevel::Warn,
         message: "something else went wrong".into(),
         host: None,
+        backend: None,
     };
     assert_eq!(
         network_denial(&Some(WorkspaceId("ws_1".into())), &chatter),

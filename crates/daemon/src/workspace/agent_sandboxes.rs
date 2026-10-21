@@ -105,6 +105,12 @@ pub async fn companion_spec(
     Ok(build_spec(d, ws, backend).await?.0)
 }
 
+/// The proxies for one backend's companion sandboxes, which say whose they are
+/// on every denial so the IDE can show it in that backend's transcript.
+pub fn companion_proxy(kind: AgentAdapterKind) -> ProxyRegistry {
+    ProxyRegistry::for_backend(kind)
+}
+
 pub fn companion_allowlist(ws: &Workspace, extra: &[String]) -> Allowlist {
     let mut hosts = ws.allowlist.clone();
     hosts.extend_from_slice(extra);
@@ -287,7 +293,11 @@ impl AgentSandboxes {
                     .map_err(|e| RpcError::io(&e))?;
             }
         }
-        let proxy = state.proxies.entry(kind).or_default().clone();
+        let proxy = state
+            .proxies
+            .entry(kind)
+            .or_insert_with(|| Arc::new(companion_proxy(kind)))
+            .clone();
         let extra = backend.extra_hosts();
         let generation = proxy
             .start(

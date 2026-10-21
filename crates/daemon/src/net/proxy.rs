@@ -63,7 +63,7 @@ use crate::net::http::{
 use crate::server::broadcast::EventBus;
 #[cfg(unix)]
 use bondsymphonic_proto::Event;
-use bondsymphonic_proto::{RpcError, WorkspaceId};
+use bondsymphonic_proto::{AgentAdapterKind, RpcError, WorkspaceId};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -300,6 +300,12 @@ pub struct ProxyRegistry {
     /// path reads it, and that path needs a Unix socket.
     #[cfg_attr(not(unix), allow(dead_code))]
     denials: Arc<DenialGate>,
+    /// Whose sandbox these proxies serve, carried on every notice they
+    /// publish so the IDE can show a denial beside the agent that tried:
+    /// `Claude` for the workspaces' own sandboxes (shared with terminals and
+    /// runs), the backend for a companion's. `None` publishes the notice
+    /// without attribution.
+    backend: Option<AgentAdapterKind>,
 }
 
 /// What one connection needs to decide where it may go and to say so.
@@ -312,9 +318,24 @@ struct ConnCtx {
     /// Shared with every other workspace's connections, so one host denied in a
     /// loop is one notice per [`DENIAL_INTERVAL`] rather than one per request.
     denials: Arc<DenialGate>,
+    /// See [`ProxyRegistry::backend`].
+    backend: Option<AgentAdapterKind>,
 }
 
 impl ProxyRegistry {
+    /// The proxies of one kind of sandbox; see [`ProxyRegistry::backend`].
+    pub fn for_backend(backend: AgentAdapterKind) -> Self {
+        Self {
+            backend: Some(backend),
+            ..Self::default()
+        }
+    }
+
+    /// Whose sandbox these proxies serve, as their notices say.
+    pub fn backend(&self) -> Option<AgentAdapterKind> {
+        self.backend
+    }
+
     /// Starts (or, for a workspace that already has one, refreshes) the proxy
     /// listening on `socket`.
     ///
@@ -387,6 +408,7 @@ impl ProxyRegistry {
             events,
             workspace: id.clone(),
             denials: self.denials.clone(),
+            backend: self.backend,
         };
         tokio::spawn(accept_loop(listener, ctx, cancel.clone()));
         entries.insert(
@@ -546,17 +568,12 @@ async fn refuse(
         // go unseen.
         if ctx.denials.admit(&ctx.workspace, host) {
             tracing::warn!(ws = %ctx.workspace, host = %host, "{why}: endpoint not in the agent's config");
+            // Only a granting proxy honours the marker, and only OpenCode's
+            // companion holds grants, so that is whose agent this was.
+            let backend = ctx.backend.unwrap_or(AgentAdapterKind::OpenCode);
             ctx.events.publish(
                 Some(ctx.workspace.clone()),
-                Event::DaemonLog {
-                    level: bondsymphonic_proto::LogLevel::Warn,
-                    message: format!(
-                        "The agent's connection to {host} was refused\n\
-                         {host} is not a model server in the agent's own config, \
-                         and only the servers it names can be reached this way."
-                    ),
-                    host: None,
-                },
+                Event::tunnel_refused(host, backend),
             );
         } else {
             tracing::debug!(ws = %ctx.workspace, host = %host, "{why}: endpoint not in the agent's config (already reported)");
@@ -565,8 +582,11 @@ async fn refuse(
         tracing::warn!(ws = %ctx.workspace, host = %host, "{why}");
         // Published before the refusal is written, so a client that reacts to
         // the 403 by asking the daemon something cannot outrun its own event.
-        ctx.events
-            .publish(Some(ctx.workspace.clone()), Event::network_denied(host));
+        let denial = match ctx.backend {
+            Some(backend) => Event::network_denied_by(host, backend),
+            None => Event::network_denied(host),
+        };
+        ctx.events.publish(Some(ctx.workspace.clone()), denial);
     } else {
         tracing::debug!(ws = %ctx.workspace, host = %host, "{why} (already reported)");
     }

@@ -258,7 +258,11 @@ impl Daemon {
             ptys: PtyManager::new(events.clone()),
             watchers: Watchers::default(),
             agents,
-            proxies: crate::net::proxy::ProxyRegistry::default(),
+            // The workspace sandbox is where Claude agents run, so its
+            // denials are theirs as far as anything can tell.
+            proxies: crate::net::proxy::ProxyRegistry::for_backend(
+                bondsymphonic_proto::AgentAdapterKind::Claude,
+            ),
             agent_sandboxes: Default::default(),
             runs: crate::runs::manager::RunManager::new(events),
             models: crate::models::ModelsCache::new(),

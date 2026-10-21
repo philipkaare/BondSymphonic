@@ -119,6 +119,7 @@ fn event_envelope_and_kinds() {
         level: LogLevel::Warn,
         message: "denied".into(),
         host: Some("evil.example".into()),
+        backend: None,
     };
     assert_eq!(serde_json::to_value(&log).unwrap()["kind"], "daemon.log");
 }
@@ -178,6 +179,7 @@ fn the_drop_notice_round_trips_through_the_wire_form() {
             level: LogLevel::Warn,
             message: "sandbox is down".into(),
             host: None,
+            backend: None,
         }
         .dropped_event_count(),
         None
@@ -187,6 +189,7 @@ fn the_drop_notice_round_trips_through_the_wire_form() {
             level: LogLevel::Info,
             message: format!("{EVENT_DROP_PREFIX}5"),
             host: None,
+            backend: None,
         }
         .dropped_event_count(),
         None
@@ -224,6 +227,7 @@ fn the_network_denial_round_trips_through_the_wire_form() {
             level: LogLevel::Warn,
             message: "sandbox is down".into(),
             host: Some("evil.example".into()),
+            backend: None,
         }
         .denied_host(),
         None
@@ -233,6 +237,7 @@ fn the_network_denial_round_trips_through_the_wire_form() {
             level: LogLevel::Info,
             message: format!("{NETWORK_DENIED_PREFIX}evil.example"),
             host: Some("evil.example".into()),
+            backend: None,
         }
         .denied_host(),
         None
@@ -689,4 +694,55 @@ mod in_place_protocol {
         assert_eq!(info.in_place_refusal, None);
         assert_eq!(info.hooks_path_in_tree, None);
     }
+}
+
+/// A denial names the sandbox it came from, so the IDE can put it in the
+/// transcript of the agent that tried rather than in a toast nobody connects
+/// with it. The field is additive in both directions: an older daemon's
+/// denial still reads (as one from nobody in particular), and a denial with no
+/// attribution puts nothing on the wire an older IDE would trip over.
+#[test]
+fn a_network_denial_carries_its_backend_and_stays_compatible() {
+    let ev = Event::network_denied_by("evil.example", AgentAdapterKind::OpenCode);
+    let v = serde_json::to_value(&ev).unwrap();
+    assert_eq!(v["backend"], "opencode");
+    let back: Event = serde_json::from_value(v).unwrap();
+    assert_eq!(back, ev);
+    assert_eq!(back.denied_host(), Some("evil.example"));
+    assert_eq!(back.denial_backend(), Some(AgentAdapterKind::OpenCode));
+
+    // An older daemon's denial: no field, no attribution, still a denial.
+    let old: Event = serde_json::from_str(
+        r#"{"kind":"daemon.log","level":"warn","message":"network denied: evil.example","host":"evil.example"}"#,
+    )
+    .unwrap();
+    assert_eq!(old.denied_host(), Some("evil.example"));
+    assert_eq!(old.denial_backend(), None);
+    let json = serde_json::to_string(&Event::network_denied("evil.example")).unwrap();
+    assert!(!json.contains("backend"), "{json}");
+
+    // The tunnel refusal keeps its two-line wording and offers nothing to
+    // allow, but now says which host and which backend, so the IDE can show it
+    // beside the agent too.
+    let tunnel = Event::tunnel_refused("ollama.lan", AgentAdapterKind::OpenCode);
+    let json = serde_json::to_string(&tunnel).unwrap();
+    let back: Event = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.denied_host(), None);
+    assert_eq!(back.refused_tunnel_host(), Some("ollama.lan"));
+    assert_eq!(back.denial_backend(), Some(AgentAdapterKind::OpenCode));
+    match &back {
+        Event::DaemonLog { level, message, .. } => {
+            assert_eq!(*level, LogLevel::Warn);
+            assert_eq!(
+                message,
+                "The agent's connection to ollama.lan was refused\n\
+                 ollama.lan is not a model server in the agent's own config, \
+                 and only the servers it names can be reached this way."
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // Neither recogniser mistakes the other notice, or a plain warning.
+    assert_eq!(ev.refused_tunnel_host(), None);
+    assert_eq!(Event::events_dropped(1).denial_backend(), None);
 }

@@ -102,6 +102,7 @@ fn report_no_network(d: &Daemon, id: &WorkspaceId, detail: &str) {
             level: LogLevel::Warn,
             message: format!("this workspace has no network: {detail}"),
             host: None,
+            backend: None,
         },
     );
 }
@@ -647,6 +648,7 @@ fn watch_protection(
                     format!("{sentence}\n{diff}")
                 },
                 host: None,
+                backend: None,
             },
         );
         *count += 1;
@@ -1329,6 +1331,7 @@ fn report_repaired(d: &Daemon, ws: &Workspace) {
                 ws.branch
             ),
             host: None,
+            backend: None,
         },
     );
 }
@@ -1778,6 +1781,7 @@ mod tests {
                         level,
                         message,
                         host,
+                        ..
                     },
             } => {
                 assert_eq!(workspace_id, Some(ws.id.clone()));

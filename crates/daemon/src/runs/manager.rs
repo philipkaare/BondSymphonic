@@ -1088,6 +1088,7 @@ async fn bridge_into(
                     level: LogLevel::Warn,
                     message: format!("port {port} cannot be reached in this workspace: {detail}"),
                     host: None,
+                    backend: None,
                 },
             );
             return Err(RpcError::new(ErrorCode::SandboxError, detail));

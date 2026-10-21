@@ -47,6 +47,7 @@ async fn fake_daemon(token: &'static str) -> std::net::SocketAddr {
                             level: LogLevel::Info,
                             message: "welcome".into(),
                             host: None,
+                            backend: None,
                         },
                     )
                 }
@@ -779,6 +780,7 @@ mod review_fixes_task_7 {
                                 level: LogLevel::Info,
                                 message: "after the bad line".into(),
                                 host: None,
+                                backend: None,
                             },
                         )));
                         out.push_str(&codec::encode(&ServerMessage::ok(

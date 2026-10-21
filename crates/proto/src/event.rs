@@ -11,6 +11,13 @@ pub enum Event {
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<String>,
+        /// Whose sandbox a network notice is about: the backend whose
+        /// companion sandbox's proxy refused the connection, or `claude` for
+        /// the workspace's own sandbox, which Claude agents share with the
+        /// workspace's terminals and runs. Absent on anything else, and on
+        /// every notice from a daemon older than the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend: Option<AgentAdapterKind>,
     },
     #[serde(rename = "workspace.state")]
     /// Boxed because `WorkspaceInfo` is much the largest payload in the
@@ -74,6 +81,12 @@ pub const EVENT_DROP_PREFIX: &str = "events dropped: ";
 /// offering "Allow host" cannot drift away from the line the daemon sends.
 pub const NETWORK_DENIED_PREFIX: &str = "network denied: ";
 
+/// Prefix of the warning the daemon sends when an OpenCode companion's proxy
+/// refused one of its model-server tunnels: a host the workspace allowlist
+/// cannot fix, so the notice offers nothing to allow. Built by
+/// [`Event::tunnel_refused`] and recognised by [`Event::refused_tunnel_host`].
+pub const TUNNEL_REFUSED_PREFIX: &str = "The agent's connection to ";
+
 impl Event {
     /// The warn-level `daemon.log` event announcing that `count` events were
     /// discarded for a lagging client.
@@ -82,6 +95,7 @@ impl Event {
             level: LogLevel::Warn,
             message: format!("{EVENT_DROP_PREFIX}{count}"),
             host: None,
+            backend: None,
         }
     }
 
@@ -110,6 +124,64 @@ impl Event {
             level: LogLevel::Warn,
             message: format!("{NETWORK_DENIED_PREFIX}{host}"),
             host: Some(host.into()),
+            backend: None,
+        }
+    }
+
+    /// The same denial, saying whose sandbox asked: what lets the IDE show it
+    /// in that agent's transcript rather than only as a toast.
+    pub fn network_denied_by(host: &str, backend: AgentAdapterKind) -> Event {
+        Event::DaemonLog {
+            level: LogLevel::Warn,
+            message: format!("{NETWORK_DENIED_PREFIX}{host}"),
+            host: Some(host.into()),
+            backend: Some(backend),
+        }
+    }
+
+    /// The warning for a model-server tunnel the companion's proxy refused.
+    ///
+    /// Two lines on purpose: the IDE keeps a multi-line warning against the
+    /// workspace. It carries the host and the backend so the IDE can also show
+    /// it beside the agent, but it is not a denial -- [`Event::denied_host`]
+    /// answers `None` for it -- because the workspace allowlist cannot fix a
+    /// server missing from the backend's own config.
+    pub fn tunnel_refused(host: &str, backend: AgentAdapterKind) -> Event {
+        Event::DaemonLog {
+            level: LogLevel::Warn,
+            message: format!(
+                "{TUNNEL_REFUSED_PREFIX}{host} was refused\n\
+                 {host} is not a model server in the agent's own config, \
+                 and only the servers it names can be reached this way."
+            ),
+            host: Some(host.into()),
+            backend: Some(backend),
+        }
+    }
+
+    /// The host of a [`Event::tunnel_refused`] warning, or `None` for anything
+    /// else.
+    pub fn refused_tunnel_host(&self) -> Option<&str> {
+        match self {
+            Event::DaemonLog {
+                level: LogLevel::Warn,
+                message,
+                host,
+                ..
+            } if message.starts_with(TUNNEL_REFUSED_PREFIX) => host.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Whose sandbox a network notice came from, when the daemon said.
+    pub fn denial_backend(&self) -> Option<AgentAdapterKind> {
+        match self {
+            Event::DaemonLog { backend, .. }
+                if self.denied_host().is_some() || self.refused_tunnel_host().is_some() =>
+            {
+                *backend
+            }
+            _ => None,
         }
     }
 
@@ -121,6 +193,7 @@ impl Event {
                 level: LogLevel::Warn,
                 message,
                 host,
+                ..
             } if message.starts_with(NETWORK_DENIED_PREFIX) => host.as_deref(),
             _ => None,
         }
@@ -133,6 +206,7 @@ impl Event {
                 level: LogLevel::Info,
                 message: "m".into(),
                 host: None,
+                backend: None,
             },
             WorkspaceStateChanged {
                 info: Box::new(WorkspaceInfo {
@@ -193,6 +267,8 @@ impl Event {
                 detail: Some("exited with status 1".into()),
             },
             Event::network_denied("evil.example"),
+            Event::network_denied_by("evil.example", AgentAdapterKind::Codex),
+            Event::tunnel_refused("ollama.lan", AgentAdapterKind::OpenCode),
             FsChanged {
                 paths: vec!["a.rs".into()],
             },

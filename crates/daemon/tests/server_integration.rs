@@ -206,6 +206,7 @@ async fn events_are_broadcast_to_authenticated_clients() {
             level: LogLevel::Info,
             message: "hi".into(),
             host: None,
+            backend: None,
         },
     );
     match recv(&mut r).await.unwrap() {
@@ -360,6 +361,7 @@ async fn an_event_published_after_a_reply_is_queued_is_written_after_it() {
             level: LogLevel::Info,
             message,
             host: None,
+            backend: None,
         }
     }
 
@@ -482,6 +484,7 @@ async fn a_lagging_client_is_told_how_many_events_it_missed() {
                 level: LogLevel::Info,
                 message: format!("m{i}"),
                 host: None,
+                backend: None,
             },
         );
     }
@@ -545,6 +548,7 @@ async fn a_lag_that_happens_during_the_pre_reply_flush_is_still_reported() {
             level: LogLevel::Info,
             message,
             host: None,
+            backend: None,
         }
     }
 
