@@ -127,8 +127,10 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
         auto *remove = new QPushButton("Remove key", page);
         const auto refreshKey = [this, id, key, remove] {
             const bool stored = m_controller->backendApiKeySet(id);
+            // Not "use sign-in": there may be no sign-in. The note under the
+            // field says how a key and a sign-in combine.
             key->setPlaceholderText(stored ? "Stored in Windows Credential Manager"
-                                           : "Leave empty to use sign-in");
+                                           : "No key stored (optional)");
             remove->setEnabled(stored);
         };
         refreshKey();
@@ -195,7 +197,9 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
                              // Authentication can finish while Settings is open. Follow
                              // the saved transition without replacing unsaved model edits
                              // or resetting a checkbox on every model-list notification.
-                             if (nowEnabled && !persistedEnabled) enabled->setChecked(true);
+                             // Switched off too: an uninstall turns a backend off while
+                             // this dialog may be open, and OK would save it back on.
+                             if (nowEnabled != persistedEnabled) enabled->setChecked(nowEnabled);
                              persistedEnabled = nowEnabled;
                              refreshKey();
                          });
@@ -599,6 +603,41 @@ extern "C" std::int32_t bs_widget_test_settings_offers_the_text_sizes() {
     }
     theme::applyFonts(*qApp, uiBefore, codeBefore);
     return failure;
+}
+
+/// The key field does not promise a sign-in that may not be there, and a
+/// backend the IDE switches off while Settings is open -- its CLI was just
+/// uninstalled -- is unticked here too, so OK does not save it back on.
+extern "C" std::int32_t bs_widget_test_settings_follows_a_backend_switched_off() {
+    AppController controller;
+    QTemporaryDir settingsDir;
+    if (!settingsDir.isValid()) return 1;
+    const auto priorPath = qgetenv("BS_SETTINGS_PATH");
+    struct RestorePath {
+        QByteArray value;
+        ~RestorePath() { if (value.isNull()) qunsetenv("BS_SETTINGS_PATH"); else qputenv("BS_SETTINGS_PATH", value); }
+    } restorePath{priorPath};
+    qputenv("BS_SETTINGS_PATH", (settingsDir.path() + "/settings.json").toUtf8());
+    if (!controller.saveBackendSettings(QStringLiteral(
+            R"({"backends":{"codex":{"enabled":true,"default_permission_mode":"never"}},"default_backend":"codex"})")))
+        return 2;
+    const QJsonArray descriptors{QJsonObject{{"id", "codex"},
+                                             {"label", "Codex"},
+                                             {"default_permission_mode", "never"},
+                                             {"prerequisite_names", QJsonArray{"codex", "codex_auth"}},
+                                             {"setup_actions", QJsonArray{"install_codex"}},
+                                             {"credential_label", "OpenAI API key"}}};
+    SettingsDialog dialog(&controller, nullptr, descriptors);
+    auto* enabled = dialog.findChild<QCheckBox*>("BackendEnabled_codex");
+    auto* key = dialog.findChild<QLineEdit*>("BackendKey_codex");
+    if (!enabled || !key || !enabled->isChecked()) return 3;
+    if (key->placeholderText().contains("sign-in", Qt::CaseInsensitive)) return 4;
+    if (!controller.saveBackendSettings(QStringLiteral(
+            R"({"backends":{"codex":{"enabled":false,"default_permission_mode":"never"}},"default_backend":"codex"})")))
+        return 5;
+    if (enabled->isChecked()) return 6;
+    if (dialog.findChild<QComboBox*>("DefaultBackend")->findData("codex") >= 0) return 7;
+    return 0;
 }
 
 #endif // BS_WIDGET_TESTS
