@@ -1079,9 +1079,6 @@ impl AgentManager {
         found.into_iter().map(|(_, summary)| summary).collect()
     }
 
-    /// The same agents as [`records_of`](AgentManager::records_of), by id alone
-    /// and in the same order. `WorkspaceInfo` carries both, so a client older
-    /// than the records field still reads the list it has always read.
     /// How many agents of `kind` have a live process: started by this daemon
     /// and not yet exited. A restored agent has no process and does not count.
     pub fn running(&self, kind: AgentAdapterKind) -> usize {
@@ -1096,6 +1093,9 @@ impl AgentManager {
             .count()
     }
 
+    /// The same agents as [`records_of`](AgentManager::records_of), by id alone
+    /// and in the same order. `WorkspaceInfo` carries both, so a client older
+    /// than the records field still reads the list it has always read.
     pub fn agents_of(&self, ws: &WorkspaceId) -> Vec<AgentId> {
         self.records_of(ws).into_iter().map(|a| a.id).collect()
     }

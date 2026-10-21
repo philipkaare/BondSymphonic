@@ -158,6 +158,17 @@ impl Handler for WorkspaceHandler {
                         .with_data(serde_json::json!({"reason": "agents_running"})));
                     }
                 }
+                if let Some(kind) = crate::setup::required_cli(p.action) {
+                    if crate::agents::backend::backend_for(kind)?
+                        .binary()
+                        .is_none()
+                    {
+                        return Err(RpcError::new(
+                            ErrorCode::PrereqMissing,
+                            format!("{kind:?} is not installed; install it first"),
+                        ));
+                    }
+                }
                 // For a logout this removes the long-lived token even if the
                 // terminal below then fails to open. Acceptable: the user sees
                 // that error and can press the button again, and removing the

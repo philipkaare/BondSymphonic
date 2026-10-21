@@ -593,6 +593,9 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
         // a switched account, a token the provider revoked -- and `auth login`
         // will not overwrite a session that is already there. Without this the
         // only way out was a terminal outside the IDE.
+        // A sign-in outlives an uninstall -- the check reads files the CLI
+        // left behind -- but the logout and the token both run that CLI.
+        const QString missing = missingCliFor(name);
         const QString logout = logoutActionFor(name);
         if (!logout.isEmpty()) {
             QPushButton* button = addActionButton(logout);
@@ -602,6 +605,7 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
             // pull the eye away from the rows that are not fine. The tooltip
             // is where it says what it will actually run.
             button->setToolTip(logoutTooltipFor(logout));
+            blockFor(button, missing);
         }
         // The other passing row with an undo: a CLI BondSymphonic installed,
         // offered only when the daemon says it can take it away again.
@@ -615,6 +619,7 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
             QPushButton* button = addActionButton(token);
             button->setObjectName(kTokenButtonName);
             button->setToolTip(kTokenButtonTooltip);
+            blockFor(button, missing);
         }
         m_rowsLayout->addWidget(row);
         return;
@@ -791,7 +796,8 @@ void SetupPage::refreshBackendActions() {
             const bool signedIn = known && auth != m_items.constEnd() && auth->value("ok").toBool();
             const QString action =
                 signedIn ? logoutActionFor(buttons.auth) : actionFor(buttons.auth);
-            const QString missing = signedIn ? QString() : missingCliFor(buttons.auth);
+            // Signed in or not: a sign-out runs the CLI as much as a sign-in.
+            const QString missing = missingCliFor(buttons.auth);
             point(buttons.signIn, buttons, action, missing,
                   signedIn ? logoutTooltipFor(action) : QString());
             const QString token =
@@ -1690,6 +1696,50 @@ extern "C" std::int32_t bs_widget_test_setup_page_names_the_action_and_holds_rec
     controller.prereqsChecked(QString::fromUtf8(kClaudeReady));
     if (!recheck->isEnabled()) {
         return 9;
+    }
+    return 0;
+}
+
+/// A sign-in outlives an uninstall -- the auth checks read files the CLI left
+/// behind -- but signing out, or minting a token, runs the CLI that is gone.
+/// So with the CLI missing every sign-in button is dead, saying why, on the
+/// rows and on a backend tab alike, whether the sign-in passes or not.
+extern "C" std::int32_t bs_widget_test_setup_page_holds_sign_out_without_its_cli() {
+    AppController controller;
+    SetupPage page(&controller);
+    page.setPtyCloser([](const QString&) {});
+    page.setBackendSettings(
+        QJsonObject{{QStringLiteral("claude"), QJsonObject{{QStringLiteral("enabled"), true}}}});
+    QWidget tab;
+    page.backendActions(
+        QJsonObject{{"id", "codex"},
+                    {"prerequisite_names", QJsonArray{"codex", "codex_auth"}},
+                    {"setup_actions",
+                     QJsonArray{"install_codex", "uninstall_codex", "codex_login", "codex_logout"}}},
+        &tab);
+    controller.prereqsChecked(QStringLiteral(
+        R"([{"name":"claude","ok":false,"detail":"not found"},)"
+        R"({"name":"claude_auth","ok":true,"detail":"OAuth credentials present"},)"
+        R"({"name":"codex","ok":false,"detail":"missing"},{"name":"codex_auth","ok":true,"detail":"signed in"}])"));
+    collectRows();
+    QPushButton* logout = shownButtonSaying(page, "Log out of Claude Code");
+    QPushButton* token = shownButtonSaying(page, "Set up long-lived token");
+    if (logout == nullptr || logout->isEnabled() || !logout->toolTip().contains("Install")) {
+        return 1;
+    }
+    if (token == nullptr || token->isEnabled() || !token->toolTip().contains("Install")) {
+        return 2;
+    }
+    auto* signOut = tab.findChild<QPushButton*>("BackendAuth_codex");
+    if (signOut == nullptr || signOut->text() != QLatin1String("Sign out of Codex") ||
+        signOut->isEnabled() || !signOut->toolTip().contains("Install")) {
+        return 3;
+    }
+    // Installed again: live again.
+    controller.prereqsChecked(QStringLiteral(
+        R"([{"name":"codex","ok":true,"detail":"installed"},{"name":"codex_auth","ok":true,"detail":"signed in"}])"));
+    if (!signOut->isEnabled()) {
+        return 4;
     }
     return 0;
 }

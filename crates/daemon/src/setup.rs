@@ -144,6 +144,24 @@ pub fn uninstalled_backend(action: SetupAction) -> Option<AgentAdapterKind> {
     }
 }
 
+/// The backend whose CLI `action` runs, for the sign-ins, sign-outs and the
+/// token terminal. With that CLI uninstalled the terminal could only say it
+/// is missing -- after a Claude logout had already removed the long-lived
+/// token in [`before_setup`], which would be half a logout -- so
+/// `system.setup_pty` refuses them first.
+pub fn required_cli(action: SetupAction) -> Option<AgentAdapterKind> {
+    match action {
+        SetupAction::ClaudeLogin | SetupAction::ClaudeLogout | SetupAction::ClaudeSetupToken => {
+            Some(AgentAdapterKind::Claude)
+        }
+        SetupAction::CodexLogin | SetupAction::CodexLogout => Some(AgentAdapterKind::Codex),
+        SetupAction::OpencodeLogin | SetupAction::OpencodeLogout => {
+            Some(AgentAdapterKind::OpenCode)
+        }
+        _ => None,
+    }
+}
+
 pub fn setup_env(root: &Path, action: SetupAction) -> Vec<(String, String)> {
     match action {
         SetupAction::CodexLogin | SetupAction::CodexLogout => vec![(
@@ -381,6 +399,26 @@ mod tests {
                     assert!(!line.contains(forbidden), "{action:?}: {line}");
                 }
             }
+        }
+    }
+
+    /// The sign-ins, sign-outs and the token terminal run their backend's own
+    /// CLI, so each names that backend; installs, uninstalls and GitHub's
+    /// actions (whose CLI is not a backend's) do not.
+    #[test]
+    fn each_session_action_needs_its_own_backends_cli() {
+        for action in ALL_ACTIONS {
+            let expected = match action {
+                SetupAction::ClaudeLogin
+                | SetupAction::ClaudeLogout
+                | SetupAction::ClaudeSetupToken => Some(AgentAdapterKind::Claude),
+                SetupAction::CodexLogin | SetupAction::CodexLogout => Some(AgentAdapterKind::Codex),
+                SetupAction::OpencodeLogin | SetupAction::OpencodeLogout => {
+                    Some(AgentAdapterKind::OpenCode)
+                }
+                _ => None,
+            };
+            assert_eq!(required_cli(action), expected, "{action:?}");
         }
     }
 

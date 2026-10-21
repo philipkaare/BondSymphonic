@@ -136,9 +136,10 @@ fn cli_missing(id: &str, items: &[bondsymphonic_proto::PrereqStatus]) -> bool {
 
 /// Switches `kind` off after its CLI was uninstalled, once the answer confirms
 /// the CLI is gone. Left on, it would stay the default for agents that cannot
-/// start. The user's on/off choice is not recorded: the program went away, the
-/// user did not change their mind, so a reinstall with the kept sign-in brings
-/// the backend back the way a first sign-in would.
+/// start. Any earlier on/off choice is forgotten as well: the program went
+/// away, the user did not change their mind, and a recorded choice would stop
+/// a reinstall with the kept sign-in from bringing the backend back the way a
+/// first sign-in does.
 pub fn disable_uninstalled_backend(
     settings: &mut Settings,
     kind: AgentAdapterKind,
@@ -148,10 +149,12 @@ pub fn disable_uninstalled_backend(
     if !cli_missing(id, items) {
         return false;
     }
-    settings
+    let forgot = settings.backends_chosen.remove(id);
+    let switched_off = settings
         .backends
         .get_mut(id)
-        .is_some_and(|entry| std::mem::replace(&mut entry.enabled, false))
+        .is_some_and(|entry| std::mem::replace(&mut entry.enabled, false));
+    switched_off || forgot
 }
 
 /// Enables a backend whose API key was just stored, unless the user has

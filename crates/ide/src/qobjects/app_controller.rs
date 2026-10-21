@@ -1510,9 +1510,6 @@ pub fn network_denial(ws: &Option<WorkspaceId>, ev: &Event) -> Option<(String, S
     Some((workspace.0.clone(), host.to_owned()))
 }
 
-/// The seven setup terminals, by the names the UI and the daemon both use.
-/// Anything else is refused here rather than sent on: the enum is the whole
-/// point of `system.setup_pty`, and a typo should fail loudly and locally.
 /// The backend an `uninstall_*` action removes the CLI of.
 fn uninstalled_backend(action: SetupAction) -> Option<AgentAdapterKind> {
     match action {
@@ -1523,6 +1520,9 @@ fn uninstalled_backend(action: SetupAction) -> Option<AgentAdapterKind> {
     }
 }
 
+/// The setup terminals, by the names the UI and the daemon both use.
+/// Anything else is refused here rather than sent on: the enum is the whole
+/// point of `system.setup_pty`, and a typo should fail loudly and locally.
 fn parse_setup_action(action: &str) -> Option<SetupAction> {
     match action {
         "codex_login" => Some(SetupAction::CodexLogin),

@@ -400,3 +400,42 @@ fn an_uninstalled_backend_is_switched_off_once_its_cli_is_gone() {
         &[row("codex", false)]
     ));
 }
+
+/// Uninstall then reinstall brings a backend back even when the user had once
+/// ticked or unticked it: switching it off for the uninstall forgets that
+/// choice, so the kept sign-in enables it again once the CLI is back.
+#[test]
+fn a_reinstalled_backend_comes_back_even_after_an_explicit_choice() {
+    use bondsymphonic_ide::model::backends::{
+        disable_uninstalled_backend, enable_authenticated_backends, save_backend_entry,
+    };
+    use bondsymphonic_proto::PrereqStatus;
+    let row = |name: &str, ok| PrereqStatus {
+        name: name.into(),
+        ok,
+        detail: String::new(),
+        fix_hint: None,
+    };
+    let mut descriptor = legacy_descriptors().remove(0);
+    descriptor.id = AgentAdapterKind::Codex;
+    descriptor.prerequisite_names = vec!["codex".into(), "codex_auth".into()];
+    let mut settings = Settings::default();
+    let mut entry = settings.backends["codex"].clone();
+    entry.enabled = true;
+    save_backend_entry(&mut settings, "codex", entry);
+    assert!(settings.backends_chosen.contains("codex"));
+
+    assert!(disable_uninstalled_backend(
+        &mut settings,
+        AgentAdapterKind::Codex,
+        &[row("codex", false), row("codex_auth", true)]
+    ));
+    assert!(!settings.backends_chosen.contains("codex"));
+    assert!(enable_authenticated_backends(
+        &mut settings,
+        &[descriptor],
+        &[row("codex", true), row("codex_auth", true)],
+        &[]
+    ));
+    assert!(settings.backends["codex"].enabled);
+}
