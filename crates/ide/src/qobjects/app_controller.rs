@@ -933,6 +933,19 @@ pub mod qobject {
         #[qinvokable]
         fn set_show_agent_meta(self: &AppController, show: bool);
 
+        /// The interface's text size in points, from `settings.json`.
+        #[qinvokable]
+        fn ui_font_size(self: &AppController) -> i32;
+
+        /// The code font's size in points, from `settings.json`.
+        #[qinvokable]
+        fn code_font_size(self: &AppController) -> i32;
+
+        /// Records both text sizes, each brought into the range the IDE lays
+        /// out.
+        #[qinvokable]
+        fn set_font_sizes(self: &AppController, ui: i32, code: i32);
+
         /// Someone in Rust asked the window to open a file in an editor tab.
         #[qsignal]
         fn open_file_requested(self: Pin<&mut AppController>, workspace_id: QString, path: QString);
@@ -3994,6 +4007,35 @@ impl qobject::AppController {
         settings.show_agent_meta = show;
         if let Err(e) = settings.save() {
             tracing::warn!("the transcript's small grey lines could not be saved: {e}");
+        }
+    }
+
+    pub fn ui_font_size(&self) -> i32 {
+        Settings::load().ui_font_size as i32
+    }
+
+    pub fn code_font_size(&self) -> i32 {
+        Settings::load().code_font_size as i32
+    }
+
+    pub fn set_font_sizes(&self, ui: i32, code: i32) {
+        let ui = crate::qobjects::settings::clamp_font_size(ui.max(0) as u32);
+        let code = crate::qobjects::settings::clamp_font_size(code.max(0) as u32);
+        // `try_load` for the same reason [`Self::set_theme`] uses it.
+        let mut settings = match Settings::try_load() {
+            Ok(settings) => settings,
+            Err(e) => {
+                tracing::warn!("the text sizes were not recorded: {e}");
+                return;
+            }
+        };
+        if settings.ui_font_size == ui && settings.code_font_size == code {
+            return;
+        }
+        settings.ui_font_size = ui;
+        settings.code_font_size = code;
+        if let Err(e) = settings.save() {
+            tracing::warn!("the text sizes could not be saved: {e}");
         }
     }
 

@@ -2960,8 +2960,13 @@ void MainWindow::noteAgentAttention(const QString& agentId, const QString& state
 //
 // See the note in `EditorArea.cpp`: the checks live beside the widget and
 // answer a code. `bs_widget_test_begin` must have run first.
+#include "TerminalWidget.h"
+#include "ToolCard.h"
+#include "TranscriptView.h"
 #include <QDir>
 #include <QFile>
+#include <QFontMetrics>
+#include <QFontMetricsF>
 #include <cstdint>
 
 namespace {
@@ -3290,6 +3295,78 @@ extern "C" std::int32_t bs_widget_test_run_menu_drives_the_run_panel() {
         return 9;
     }
     return 0;
+}
+
+/// The two text sizes reach every widget on screen, and nothing keeps its own.
+///
+/// The interface size is the application font, so a widget that never set one
+/// follows it for free. The ones that do set one -- every code pane, the small
+/// grey lines, a bold label -- are the ones that used to stay where they were
+/// built, so the whole window is walked after a change and every font in it
+/// must be one of the three sizes the IDE means: the interface's, the code
+/// font's, or the small fraction of the interface's the grey lines wear.
+extern "C" std::int32_t bs_widget_test_text_sizes_reach_every_widget() {
+    useThrowawayState();
+    const int uiBefore = QApplication::font().pointSize();
+    const int codeBefore = theme::codePointSizeSlot();
+    WindowFixture fixture;
+    MainWindow& window = fixture.window;
+    // What the window holds only once an agent runs: a tool call's card, a
+    // transcript and a terminal.
+    ToolCard card(QJsonObject{ { QStringLiteral("name"), QStringLiteral("Bash") },
+                               { QStringLiteral("input_json"), QStringLiteral(R"({"a":1})") },
+                               { QStringLiteral("result"), QStringLiteral("ok") } },
+                  &window);
+    TranscriptView transcript(nullptr, &window);
+    TerminalSession session;
+    TerminalWidget terminal(&session, &window);
+    CodeView code(&window);
+
+    constexpr int kUi = 15;
+    constexpr int kCode = 17;
+    theme::applyFonts(*qApp, kUi, kCode);
+
+    std::int32_t failure = 0;
+    for (QWidget* widget : window.findChildren<QWidget*>()) {
+        // A text pane draws in its document's font, not its viewport's -- and a
+        // viewport that was never shown is only told about a font when it is
+        // polished, which nothing here does. The document is the check.
+        if (widget->objectName() == QLatin1String("qt_scrollarea_viewport")) {
+            continue;
+        }
+        if (auto* pane = qobject_cast<QPlainTextEdit*>(widget);
+            pane != nullptr && pane->document()->defaultFont().pointSize() != pane->font().pointSize()) {
+            std::fprintf(stderr, "a text pane named \"%s\" draws at %d pt in a %d pt widget\n",
+                         qPrintable(pane->objectName()), pane->document()->defaultFont().pointSize(),
+                         pane->font().pointSize());
+            failure = 1;
+        }
+        const qreal size = widget->font().pointSizeF();
+        if (qFuzzyCompare(size, kUi) || qFuzzyCompare(size, kCode) ||
+            qFuzzyCompare(size, kUi * theme::kSmallTextScale)) {
+            continue;
+        }
+        const QWidget* parent = widget->parentWidget();
+        std::fprintf(stderr, "a %s named \"%s\" in a %s named \"%s\" is at %.2f pt, not %d or %d\n",
+                     widget->metaObject()->className(), qPrintable(widget->objectName()),
+                     parent != nullptr ? parent->metaObject()->className() : "nothing",
+                     parent != nullptr ? qPrintable(parent->objectName()) : "", size, kUi, kCode);
+        failure = 1;
+    }
+    if (failure == 0) {
+        // The widgets that measure themselves in the font measured again.
+        const QFontMetrics codeMetrics(theme::codeFont());
+        if (code.font().pointSize() != kCode) {
+            failure = 2;
+        } else if (terminal.sizeHint().width() != 80 * codeMetrics.horizontalAdvance(QLatin1Char('M'))) {
+            failure = 3;
+        } else if (!qFuzzyCompare(code.tabStopDistance(),
+                                  4 * QFontMetricsF(code.font()).horizontalAdvance(QLatin1Char('M')))) {
+            failure = 4;
+        }
+    }
+    theme::applyFonts(*qApp, uiBefore, codeBefore);
+    return failure;
 }
 
 #endif // BS_WIDGET_TESTS

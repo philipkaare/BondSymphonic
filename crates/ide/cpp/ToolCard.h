@@ -3,6 +3,7 @@
 #include <QJsonObject>
 #include <QString>
 
+class QEvent;
 class QLabel;
 class QPlainTextEdit;
 class QResizeEvent;
@@ -37,6 +38,8 @@ protected:
     /// Re-elides the summary, which has no width of its own to elide against
     /// until the card is laid out.
     void resizeEvent(QResizeEvent* event) override;
+    /// Re-sizes the panes and re-elides the summary for a new text size.
+    void changeEvent(QEvent* event) override;
 
 private:
     /// Fills one of the two body panes and sizes it to what it holds. A pane

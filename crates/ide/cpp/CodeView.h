@@ -81,6 +81,8 @@ private:
     friend class LineNumberArea;
 
     void paintGutter(QPaintEvent* event);
+    /// Sets the tab stops to four `M`s of the current font.
+    void applyTabStops();
     /// Re-measures the gutter and moves it over the viewport margin.
     void updateGutterGeometry();
     void updateExtraSelections();

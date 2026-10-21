@@ -763,3 +763,51 @@ fn the_small_grey_lines_round_trip_and_default_to_shown() {
 
     std::env::remove_var(SETTINGS_PATH_ENV);
 }
+
+/// The two text sizes are settings like any other, and a file written before
+/// they existed reads back as the new, slightly bigger defaults -- the IDE used
+/// Qt's 9 pt interface text and a 10 pt code font -- rather than as zero. A
+/// hand-edited size outside what the IDE can lay out reads as the nearest one
+/// it can.
+#[test]
+fn the_text_sizes_round_trip_default_bigger_and_stay_in_bounds() {
+    use bondsymphonic_ide::qobjects::settings::{
+        Settings, DEFAULT_CODE_FONT_SIZE, DEFAULT_UI_FONT_SIZE, LEGACY_SETTINGS_PATH_ENV,
+        MAX_FONT_SIZE, MIN_FONT_SIZE, SETTINGS_PATH_ENV, STATE_PATH_ENV,
+    };
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = temp_dir("font-sizes");
+    let path = dir.join("settings.json");
+    std::fs::write(&path, r#"{"distro":"bondsymphonic"}"#).expect("settings");
+    std::env::set_var(SETTINGS_PATH_ENV, &path);
+    std::env::remove_var(LEGACY_SETTINGS_PATH_ENV);
+    std::env::remove_var(STATE_PATH_ENV);
+
+    assert_eq!((DEFAULT_UI_FONT_SIZE, DEFAULT_CODE_FONT_SIZE), (10, 11));
+    assert_eq!((MIN_FONT_SIZE, MAX_FONT_SIZE), (8, 24));
+    let mut settings = Settings::load();
+    assert_eq!(settings.ui_font_size, DEFAULT_UI_FONT_SIZE);
+    assert_eq!(settings.code_font_size, DEFAULT_CODE_FONT_SIZE);
+    assert_eq!(Settings::default().ui_font_size, DEFAULT_UI_FONT_SIZE);
+    assert_eq!(Settings::default().code_font_size, DEFAULT_CODE_FONT_SIZE);
+
+    settings.ui_font_size = 13;
+    settings.code_font_size = 15;
+    settings.save().expect("settings save");
+    let back = Settings::load();
+    assert_eq!((back.ui_font_size, back.code_font_size), (13, 15));
+
+    std::fs::write(
+        &path,
+        r#"{"distro":"bondsymphonic","ui_font_size":2,"code_font_size":99}"#,
+    )
+    .expect("settings");
+    let clamped = Settings::load();
+    assert_eq!(
+        (clamped.ui_font_size, clamped.code_font_size),
+        (MIN_FONT_SIZE, MAX_FONT_SIZE)
+    );
+
+    std::env::remove_var(SETTINGS_PATH_ENV);
+}

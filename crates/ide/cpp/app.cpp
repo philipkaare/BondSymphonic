@@ -36,6 +36,9 @@ std::int32_t run_app() {
     // is what reads the settings file; before the window, so nothing is ever
     // built against a palette it is about to be told to stop wearing.
     theme::apply(app, theme::choiceFromName(controller->theme()));
+    // The text sizes for the same reason: a widget measures itself in the font
+    // it is built with.
+    theme::applyFonts(app, controller->uiFontSize(), controller->codeFontSize());
     // "Follow system" means following it as it changes, not as it was at
     // startup: Windows flips at dusk and the application is often older than
     // that. A window on either of the two explicit choices hears the flip and

@@ -3,8 +3,8 @@
 #include "Theme.h"
 #include <QChar>
 #include <QColor>
+#include <QEvent>
 #include <QFont>
-#include <QFontDatabase>
 #include <QFontMetrics>
 #include <QHBoxLayout>
 #include <QJsonDocument>
@@ -51,10 +51,7 @@ QString prettyJson(const QString& compact) {
 /// A read-only monospace pane for a tool's input or output.
 QPlainTextEdit* makePane(QWidget* parent) {
     auto* pane = new QPlainTextEdit(parent);
-    QFont font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
-    font.setStyleHint(QFont::Monospace);
-    font.setFixedPitch(true);
-    pane->setFont(font);
+    theme::useCodeFont(pane);
     pane->setReadOnly(true);
     pane->setLineWrapMode(QPlainTextEdit::NoWrap);
     return pane;
@@ -77,9 +74,7 @@ int paneHeight(const QPlainTextEdit* pane) {
 /// A caption above a body pane, in the small grey the transcript uses.
 QLabel* makeCaption(const QString& text, QWidget* parent) {
     auto* label = new QLabel(text, parent);
-    QFont font = label->font();
-    font.setPointSizeF(font.pointSizeF() * 0.85);
-    label->setFont(font);
+    theme::useScaledFont(label, theme::kSmallTextScale);
     label->setEnabled(false);
     return label;
 }
@@ -188,6 +183,17 @@ bool ToolCard::isCollapsed() const { return m_collapsed; }
 void ToolCard::resizeEvent(QResizeEvent* event) {
     QFrame::resizeEvent(event);
     elideSummary();
+}
+
+void ToolCard::changeEvent(QEvent* event) {
+    QFrame::changeEvent(event);
+    // A new text size: each pane was sized to its lines in the old code font,
+    // and the summary elided in the old interface font.
+    if (event->type() == QEvent::FontChange && m_result != nullptr) {
+        m_input->setFixedHeight(paneHeight(m_input));
+        m_result->setFixedHeight(paneHeight(m_result));
+        elideSummary();
+    }
 }
 
 void ToolCard::fillPane(QPlainTextEdit* pane, QLabel* caption, const QString& text, bool visible) {

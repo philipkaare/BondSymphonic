@@ -48,9 +48,6 @@ constexpr char16_t kMiddleDot = 0x00B7;
 /// mojibake, with no compiler warning because each byte happens to map.
 constexpr char16_t kEllipsis = 0x2026;
 
-/// How much smaller than the pane's font the result and system lines are.
-constexpr qreal kSmallTextScale = 0.85;
-
 /// How long changed frames are collected before they are repainted.
 ///
 /// Long enough that a fast stream costs twenty repaints a second rather than
@@ -108,9 +105,9 @@ QFrame* makeTextFrame(const QString& kind, QWidget* parent) {
 /// The one grey the small lines share.
 void applySmallGrey(QLabel* label, bool italic) {
     QFont font = label->font();
-    font.setPointSizeF(font.pointSizeF() * kSmallTextScale);
     font.setItalic(italic);
     label->setFont(font);
+    theme::useScaledFont(label, theme::kSmallTextScale);
     label->setEnabled(false);
 }
 

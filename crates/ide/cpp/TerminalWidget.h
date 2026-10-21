@@ -151,6 +151,8 @@ private:
     /// what the terminal answers a program that asks about either. The palette
     /// follows the desktop, so this is not a constant and cannot be one.
     void applyAppearance();
+    /// Takes the code font at its current size and measures a cell in it.
+    void measureFont();
 
     QPointer<TerminalSession> m_session;
     /// Never null: the constructor installs the session paste.
@@ -162,7 +164,7 @@ private:
     /// How many parses there have been. Test seam; see `rowsParseCount`.
     int m_parsedRowsCount = 0;
     QFont m_font;
-    /// Cell metrics, cached from `QFontMetrics` once in the constructor.
+    /// Cell metrics, cached from `QFontMetrics` by `measureFont`.
     int m_charWidth = 8;
     int m_lineHeight = 16;
     int m_ascent = 12;

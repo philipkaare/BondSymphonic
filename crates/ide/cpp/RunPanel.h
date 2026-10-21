@@ -8,6 +8,7 @@ class AppController;
 class QAction;
 class QActionGroup;
 class QComboBox;
+class QEvent;
 class QFrame;
 class QLabel;
 class QPlainTextEdit;
@@ -96,8 +97,14 @@ signals:
     /// actions from before the signal have been deleted.
     void configurationsChanged();
 
+protected:
+    void changeEvent(QEvent* event) override;
+
 private:
     void buildTopRow(QVBoxLayout* outer);
+    /// Fixes the status glyph's width at two of its widest glyph, so the row
+    /// does not shift as it changes.
+    void sizeGlyph();
     /// Builds the actions above. First, before the buttons: each of them binds
     /// to the action it is the face of.
     void buildActions();

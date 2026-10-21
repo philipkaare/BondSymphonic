@@ -1,7 +1,6 @@
 #include "CodeView.h"
+#include "Theme.h"
 #include <QEvent>
-#include <QFont>
-#include <QFontDatabase>
 #include <QFontMetrics>
 #include <QFontMetricsF>
 #include <QLatin1Char>
@@ -51,15 +50,8 @@ void LineNumberArea::paintEvent(QPaintEvent* event) {
 CodeView::CodeView(QWidget* parent) : QPlainTextEdit(parent) {
     m_provider = [](int block) { return QString::number(block + 1); };
 
-    QFont font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
-    font.setPointSize(10);
-    font.setStyleHint(QFont::Monospace);
-    font.setFixedPitch(true);
-    setFont(font);
-    // Fractional: a tab stop rounded to whole pixels drifts away from the
-    // character grid over a deeply indented line.
-    const QFontMetricsF metrics(font);
-    setTabStopDistance(kTabWidthInChars * metrics.horizontalAdvance(QLatin1Char('M')));
+    theme::useCodeFont(this);
+    applyTabStops();
     setLineWrapMode(QPlainTextEdit::NoWrap);
 
     m_gutter = new LineNumberArea(this);
@@ -101,10 +93,24 @@ void CodeView::setRowTints(const QVector<QColor>& perBlock) {
 
 bool CodeView::event(QEvent* event) {
     const bool handled = QPlainTextEdit::event(event);
+    // A new code size: the tab stops and the gutter are both measured in the
+    // font. Not before the gutter is built: the constructor's own `setFont`
+    // arrives here too.
+    if (event->type() == QEvent::FontChange && m_gutter != nullptr) {
+        applyTabStops();
+        updateGutterGeometry();
+    }
     if (event->type() == QEvent::ReadOnlyChange) {
         updateExtraSelections();
     }
     return handled;
+}
+
+void CodeView::applyTabStops() {
+    // Fractional: a tab stop rounded to whole pixels drifts away from the
+    // character grid over a deeply indented line.
+    const QFontMetricsF metrics(font());
+    setTabStopDistance(kTabWidthInChars * metrics.horizontalAdvance(QLatin1Char('M')));
 }
 
 int CodeView::gutterWidth() const {

@@ -8,8 +8,7 @@
 #include <QClipboard>
 #include <QComboBox>
 #include <QDesktopServices>
-#include <QFont>
-#include <QFontDatabase>
+#include <QEvent>
 #include <QFrame>
 #include <QGuiApplication>
 #include <QHBoxLayout>
@@ -217,7 +216,7 @@ void RunPanel::buildTopRow(QVBoxLayout* outer) {
     row->addWidget(m_stop, 0);
 
     m_glyph = new QLabel(kGlyphIdle, this);
-    m_glyph->setFixedWidth(m_glyph->fontMetrics().horizontalAdvance(kGlyphFailed) * 2);
+    sizeGlyph();
     m_glyph->setAlignment(Qt::AlignCenter);
     row->addWidget(m_glyph, 0);
 
@@ -297,6 +296,18 @@ void RunPanel::buildToast(QVBoxLayout* outer) {
     QObject::connect(m_dismiss, &QPushButton::clicked, this, &RunPanel::onDismissClicked);
 }
 
+void RunPanel::sizeGlyph() {
+    m_glyph->setFixedWidth(m_glyph->fontMetrics().horizontalAdvance(kGlyphFailed) * 2);
+}
+
+void RunPanel::changeEvent(QEvent* event) {
+    QWidget::changeEvent(event);
+    // A new text size: the glyph's box was measured in the old one.
+    if (event->type() == QEvent::FontChange && m_glyph != nullptr) {
+        sizeGlyph();
+    }
+}
+
 void RunPanel::buildLog(QVBoxLayout* outer) {
     m_log = new QPlainTextEdit(this);
     m_log->setObjectName("RunLog");
@@ -305,10 +316,7 @@ void RunPanel::buildLog(QVBoxLayout* outer) {
     // Long lines scroll rather than wrap: a stack trace or a bundler's progress
     // line reads as one line, and a wrapped one hides how many there were.
     m_log->setLineWrapMode(QPlainTextEdit::NoWrap);
-    QFont font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
-    font.setStyleHint(QFont::Monospace);
-    font.setFixedPitch(true);
-    m_log->setFont(font);
+    theme::useCodeFont(m_log);
     m_log->setPlaceholderText("No output yet.");
     outer->addWidget(m_log, 1);
 }

@@ -6,7 +6,6 @@
 #include <QColor>
 #include <QContextMenuEvent>
 #include <QEvent>
-#include <QFontDatabase>
 #include <QFontMetrics>
 #include <QGuiApplication>
 #include <QImage>
@@ -149,14 +148,7 @@ bool isModifierKey(const QKeyEvent* event) {
 
 TerminalWidget::TerminalWidget(TerminalSession* session, QWidget* parent)
     : QWidget(parent), m_session(session) {
-    m_font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
-    m_font.setPointSize(10);
-    m_font.setStyleHint(QFont::Monospace);
-    m_font.setFixedPitch(true);
-    const QFontMetrics metrics(m_font);
-    m_charWidth = qMax(1, metrics.horizontalAdvance(QStringLiteral("M")));
-    m_lineHeight = qMax(1, metrics.lineSpacing());
-    m_ascent = metrics.ascent();
+    measureFont();
 
     m_paste = [this](const QString& text) {
         if (m_session) {
@@ -264,6 +256,16 @@ void TerminalWidget::paste(const QString& text) {
     emit pasted(static_cast<int>(text.size()));
 }
 
+void TerminalWidget::measureFont() {
+    // The code font, held privately rather than set on the widget: the reopen
+    // button is a child, and should keep the interface's font.
+    m_font = theme::codeFont();
+    const QFontMetrics metrics(m_font);
+    m_charWidth = qMax(1, metrics.horizontalAdvance(QStringLiteral("M")));
+    m_lineHeight = qMax(1, metrics.lineSpacing());
+    m_ascent = metrics.ascent();
+}
+
 void TerminalWidget::applyAppearance() {
     if (!m_session) {
         return;
@@ -282,6 +284,21 @@ void TerminalWidget::changeEvent(QEvent* event) {
     // with it.
     if (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange) {
         applyAppearance();
+    }
+    // A new code size: the cells are a different size, so the grid that fits
+    // the widget is a different grid, and the program is told both.
+    if (event->type() == QEvent::FontChange) {
+        const int charWidth = m_charWidth;
+        const int lineHeight = m_lineHeight;
+        measureFont();
+        if (m_charWidth != charWidth || m_lineHeight != lineHeight) {
+            applyAppearance();
+            if (!m_pendingOpen) {
+                applySize();
+            }
+            updateGeometry();
+            update();
+        }
     }
 }
 

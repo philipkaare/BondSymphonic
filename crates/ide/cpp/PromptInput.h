@@ -3,6 +3,7 @@
 #include <QPlainTextEdit>
 #include <QString>
 
+class QEvent;
 class QKeyEvent;
 
 /// The box a prompt is typed into, at the foot of a transcript.
@@ -35,8 +36,11 @@ Q_SIGNALS:
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
+    void changeEvent(QEvent* event) override;
 
 private:
+    /// Caps the box at `kVisibleLines` of the current font.
+    void applyHeight();
     /// Applies `m_busy` to the placeholder wording and its colour.
     void refreshPlaceholder();
 

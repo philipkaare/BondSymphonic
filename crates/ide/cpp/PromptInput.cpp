@@ -1,4 +1,5 @@
 #include "PromptInput.h"
+#include <QEvent>
 #include <QFontMetrics>
 #include <QKeyEvent>
 #include <QPalette>
@@ -21,13 +22,25 @@ PromptInput::PromptInput(QWidget* parent) : QPlainTextEdit(parent) {
     setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     setLineWrapMode(QPlainTextEdit::WidgetWidth);
     setTabChangesFocus(true);
+    applyHeight();
+    m_idlePlaceholderColor = palette().color(QPalette::PlaceholderText);
+    refreshPlaceholder();
+}
+
+void PromptInput::applyHeight() {
     // A few lines tall and no taller: the transcript above is what the pane is
     // for, and a box that grew with the text would eat it.
     const QFontMetrics metrics(font());
     const int frame = 2 * static_cast<int>(frameWidth()) + 2 * static_cast<int>(document()->documentMargin());
     setMaximumHeight(kVisibleLines * metrics.lineSpacing() + frame);
-    m_idlePlaceholderColor = palette().color(QPalette::PlaceholderText);
-    refreshPlaceholder();
+}
+
+void PromptInput::changeEvent(QEvent* event) {
+    QPlainTextEdit::changeEvent(event);
+    // A new text size: three lines are a different height.
+    if (event->type() == QEvent::FontChange) {
+        applyHeight();
+    }
 }
 
 void PromptInput::setBusy(bool busy, const QString& message) {

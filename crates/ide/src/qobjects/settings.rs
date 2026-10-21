@@ -194,6 +194,35 @@ fn default_show_agent_meta() -> bool {
     DEFAULT_SHOW_AGENT_META
 }
 
+/// The interface's text size, in points, for a settings file that predates
+/// the choice. One point above the 9 pt Qt hands a Windows application, which
+/// is what the IDE wore before there was a setting.
+pub const DEFAULT_UI_FONT_SIZE: u32 = 10;
+
+/// The code font's size, in points -- the editor, diffs, terminals, run output
+/// and a tool call's input and output. One point above the 10 pt the editor
+/// and the terminal were hard-coded to.
+pub const DEFAULT_CODE_FONT_SIZE: u32 = 11;
+
+/// The smallest and largest text size the IDE lays out. Below 8 pt the
+/// transcript's small grey lines stop being legible; above 24 pt a terminal no
+/// longer fits eighty columns on a laptop screen.
+pub const MIN_FONT_SIZE: u32 = 8;
+pub const MAX_FONT_SIZE: u32 = 24;
+
+/// A size the IDE can lay out: the nearest one to `size`.
+pub fn clamp_font_size(size: u32) -> u32 {
+    size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+}
+
+fn default_ui_font_size() -> u32 {
+    DEFAULT_UI_FONT_SIZE
+}
+
+fn default_code_font_size() -> u32 {
+    DEFAULT_CODE_FONT_SIZE
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -225,6 +254,14 @@ pub struct Settings {
     /// while you are learning what an agent costs, and noise for ever after.
     #[serde(default = "default_show_agent_meta")]
     pub show_agent_meta: bool,
+    /// The point size of the interface's own text: menus, labels, the
+    /// transcript. Two sizes rather than one because code is read differently,
+    /// and a user who wants bigger code rarely wants bigger menus with it.
+    #[serde(default = "default_ui_font_size")]
+    pub ui_font_size: u32,
+    /// The point size of the fixed-pitch font everything code-shaped is set in.
+    #[serde(default = "default_code_font_size")]
+    pub code_font_size: u32,
 }
 
 impl Default for Settings {
@@ -240,6 +277,8 @@ impl Default for Settings {
             default_permission_mode: DEFAULT_PERMISSION_MODE.into(),
             theme: DEFAULT_THEME.into(),
             show_agent_meta: DEFAULT_SHOW_AGENT_META,
+            ui_font_size: DEFAULT_UI_FONT_SIZE,
+            code_font_size: DEFAULT_CODE_FONT_SIZE,
         }
     }
 }
@@ -278,6 +317,11 @@ impl Settings {
             claude.default_permission_mode = DOCUMENTED_ASK_MODE.into();
         }
         settings.default_permission_mode = claude.default_permission_mode.clone();
+        // A hand edit is the only way a size gets out of bounds, and the
+        // nearest size the IDE can lay out is a better answer to it than a
+        // settings file moved aside.
+        settings.ui_font_size = clamp_font_size(settings.ui_font_size);
+        settings.code_font_size = clamp_font_size(settings.code_font_size);
         Ok(settings)
     }
 

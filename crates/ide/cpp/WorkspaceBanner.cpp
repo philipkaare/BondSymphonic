@@ -4,7 +4,6 @@
 #include <QChar>
 #include <QCoreApplication>
 #include <QFont>
-#include <QFontDatabase>
 #include <QFontMetrics>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -117,9 +116,7 @@ WorkspaceBanner::WorkspaceBanner(QWidget* parent) : QFrame(parent) {
     m_stderr->setObjectName(QStringLiteral("WorkspaceBannerStderr"));
     m_stderr->setReadOnly(true);
     m_stderr->setLineWrapMode(QPlainTextEdit::NoWrap);
-    QFont mono = QFontDatabase::systemFont(QFontDatabase::FixedFont);
-    mono.setStyleHint(QFont::Monospace);
-    m_stderr->setFont(mono);
+    theme::useCodeFont(m_stderr);
     m_stderr->hide();
     outer->addWidget(m_stderr);
 
@@ -283,6 +280,10 @@ void WorkspaceBanner::changeEvent(QEvent* event) {
     QFrame::changeEvent(event);
     if (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange) {
         applyWash();
+    }
+    // A new text size: an open stderr pane was sized in rows of the old font.
+    if (event->type() == QEvent::FontChange && m_stderr != nullptr && !m_stderr->isHidden()) {
+        setExpanded(true);
     }
 }
 

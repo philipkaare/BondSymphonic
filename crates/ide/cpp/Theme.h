@@ -3,9 +3,12 @@
 #include <QColor>
 #include <QCoreApplication>
 #include <QEvent>
+#include <QFont>
+#include <QFontDatabase>
 #include <QPalette>
 #include <QString>
 #include <QStyleHints>
+#include <QVariant>
 #include <QWidget>
 #include <QWidgetList>
 
@@ -198,6 +201,114 @@ inline void apply(QApplication& app, Choice choice) {
     const bool dark = QApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
     app.setPalette(explicitPalette(dark));
     announcePaletteChange();
+}
+
+// --- text sizes ----------------------------------------------------------------
+//
+// Two sizes, both settings: the interface's own text, which is the application
+// font and reaches every widget that does not set a size of its own, and the
+// code font, which everything code-shaped wears. A widget that sizes its text
+// any other way -- a fraction of the interface size, or the code font -- says
+// so through `useCodeFont` or `useScaledFont`, and is then re-sized by
+// `applyFonts` with everything else. A widget that caches metrics from its font
+// redoes them on `QEvent::FontChange`, which `applyFonts` sends to every widget.
+
+/// The bounds and defaults `settings.rs` holds as `MIN_FONT_SIZE`,
+/// `MAX_FONT_SIZE`, `DEFAULT_UI_FONT_SIZE` and `DEFAULT_CODE_FONT_SIZE`. The
+/// defaults are only what a widget built before `applyFonts` (a test's) wears;
+/// the application applies the stored sizes before it builds a window.
+inline constexpr int kMinFontPointSize = 8;
+inline constexpr int kMaxFontPointSize = 24;
+inline constexpr int kDefaultUiPointSize = 10;
+inline constexpr int kDefaultCodePointSize = 11;
+
+/// How much smaller than the interface's text the small grey lines are: a
+/// transcript's result and system lines, a tool card's captions.
+inline constexpr qreal kSmallTextScale = 0.85;
+
+/// The dynamic properties a widget's text size is recorded under.
+inline constexpr char kCodeFontProperty[] = "bsCodeFont";
+inline constexpr char kFontScaleProperty[] = "bsFontScale";
+
+/// The code font's size in points, as last applied.
+inline int& codePointSizeSlot() {
+    static int size = kDefaultCodePointSize;
+    return size;
+}
+
+/// The fixed-pitch font at the chosen size.
+inline QFont codeFont() {
+    QFont font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+    font.setStyleHint(QFont::Monospace);
+    font.setFixedPitch(true);
+    font.setPointSize(codePointSizeSlot());
+    return font;
+}
+
+/// Dresses `widget` in the code font, and keeps it there when the size moves.
+inline void useCodeFont(QWidget* widget) {
+    widget->setProperty(kCodeFontProperty, true);
+    widget->setFont(codeFont());
+}
+
+/// Sizes `widget`'s text at `scale` times the interface's, and keeps it at that
+/// fraction when the size moves. Whatever else the widget's font says -- italic,
+/// bold -- is left alone.
+inline void useScaledFont(QWidget* widget, qreal scale) {
+    widget->setProperty(kFontScaleProperty, scale);
+    QFont font = widget->font();
+    font.setPointSizeF(QApplication::font().pointSizeF() * scale);
+    widget->setFont(font);
+}
+
+/// A size the IDE can lay out: the nearest one to `points`.
+inline int boundedPointSize(int points) {
+    return qBound(kMinFontPointSize, points, kMaxFontPointSize);
+}
+
+/// Sets both text sizes and re-sizes every widget already on screen.
+///
+/// The application font alone would not: it reaches only the widgets that never
+/// set a font, so the code panes and the small grey lines would stay at the old
+/// size, and a widget that measured its rows once would go on measuring them in
+/// the old font. So the two kinds of tagged widget are re-dressed by hand, and
+/// every widget is then sent `QEvent::FontChange`, for the same reason
+/// `announcePaletteChange` sends its event.
+inline void applyFonts(QApplication& app, int uiPoints, int codePoints) {
+    uiPoints = boundedPointSize(uiPoints);
+    codePoints = boundedPointSize(codePoints);
+    codePointSizeSlot() = codePoints;
+    QFont ui = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
+    ui.setPointSize(uiPoints);
+    app.setFont(ui);
+    const QWidgetList widgets = QApplication::allWidgets();
+    // `setFont` tells the widgets itself only once the event loop is running,
+    // and then only the top-level ones. Said to every widget here, so the
+    // sizes are in place before the loop has started too -- which is when a
+    // test, and the IDE's own startup, applies them.
+    // After the tagged widgets have their new sizes, so what a child inherits
+    // is the new size rather than the one its parent is about to lose.
+    for (QWidget* widget : widgets) {
+        if (widget->property(kCodeFontProperty).toBool()) {
+            QFont font = widget->font();
+            font.setPointSize(codePoints);
+            widget->setFont(font);
+        }
+        const QVariant scale = widget->property(kFontScaleProperty);
+        if (scale.isValid()) {
+            QFont font = widget->font();
+            font.setPointSizeF(uiPoints * scale.toReal());
+            widget->setFont(font);
+        }
+    }
+    QEvent appFontChanged(QEvent::ApplicationFontChange);
+    for (QWidget* widget : widgets) {
+        QCoreApplication::sendEvent(widget, &appFontChanged);
+    }
+    QEvent changed(QEvent::FontChange);
+    for (QWidget* widget : widgets) {
+        QCoreApplication::sendEvent(widget, &changed);
+    }
 }
 
 } // namespace theme
