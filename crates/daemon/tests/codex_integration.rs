@@ -249,3 +249,45 @@ async fn unsupported_server_requests_are_rejected_without_stalling_the_turn() {
         AgentMessageBody::System { data, .. } if data["method"] == "item/tool/requestUserInput")));
     adapter.stop().await.unwrap();
 }
+
+/// Codex's cumulative `thread/tokenUsage/updated` reaches the transcript as
+/// each turn's own tokens and the context it left, on the turn row before the
+/// `Result`; no cost is invented.
+#[tokio::test]
+async fn each_turn_row_carries_that_turns_tokens_and_context() {
+    let (_dir, mut adapter, _entry, store) = fixture("usage", None).await;
+    adapter.start().await.unwrap();
+    let mut usages = vec![];
+    for (n, prompt) in ["first", "second"].into_iter().enumerate() {
+        adapter.send(prompt.into()).await.unwrap();
+        let messages = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let messages = store.read(&AgentId("agent".into())).await.unwrap();
+                if messages
+                    .iter()
+                    .filter(|m| matches!(m.body, AgentMessageBody::Result { .. }))
+                    .count()
+                    > n
+                {
+                    return messages;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        usages = messages
+            .iter()
+            .filter_map(|m| TurnUsage::from_turn_row(&m.body))
+            .collect::<Vec<_>>();
+    }
+    assert_eq!(usages.len(), 2, "{usages:?}");
+    for usage in &usages {
+        assert_eq!(usage.input_tokens, Some(1200));
+        assert_eq!(usage.output_tokens, Some(30));
+        assert_eq!(usage.context_window, Some(258400));
+        assert_eq!(usage.session_cost_usd, None);
+    }
+    assert_eq!(usages[1].context_tokens, Some(2460));
+    adapter.stop().await.unwrap();
+}

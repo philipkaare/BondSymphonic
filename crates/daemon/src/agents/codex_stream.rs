@@ -1,13 +1,27 @@
 //! Transcript mapping for the pinned Codex app-server protocol.
-use bondsymphonic_proto::AgentMessageBody;
+use bondsymphonic_proto::{AgentMessageBody, TurnUsage, TURN_USAGE_KEY};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Default)]
 pub struct CodexStream {
     output: HashMap<String, String>,
     started: HashSet<String>,
     usage: Value,
+    /// The thread's cumulative input and output tokens when the last turn
+    /// ended, which a turn's own tokens are counted from. `None` while that
+    /// is unknown: a resumed thread's totals include turns from before.
+    baseline: Option<(u64, u64)>,
+}
+
+impl Default for CodexStream {
+    fn default() -> Self {
+        Self {
+            output: HashMap::new(),
+            started: HashSet::new(),
+            usage: Value::Null,
+            baseline: Some((0, 0)),
+        }
+    }
 }
 
 pub fn text<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -52,6 +66,46 @@ pub fn redact(value: &mut Value, secrets: &[String]) {
 }
 
 impl CodexStream {
+    /// A stream for a resumed thread, whose first turn's own tokens cannot be
+    /// told apart from the thread's earlier ones.
+    pub fn resumed() -> Self {
+        Self {
+            baseline: None,
+            ..Self::default()
+        }
+    }
+
+    /// The turn's usage from the last `thread/tokenUsage/updated`, and the
+    /// baseline moved past it. `None` when Codex reported nothing this turn.
+    fn turn_usage(&mut self) -> Option<TurnUsage> {
+        let usage = std::mem::take(&mut self.usage);
+        if usage.is_null() {
+            return None;
+        }
+        let total = &usage["total"];
+        let totals = total["inputTokens"]
+            .as_u64()
+            .zip(total["outputTokens"].as_u64());
+        let (input_tokens, output_tokens) = match (self.baseline, totals) {
+            (Some((input, output)), Some((total_in, total_out))) => (
+                Some(total_in.saturating_sub(input)),
+                Some(total_out.saturating_sub(output)),
+            ),
+            _ => (None, None),
+        };
+        if totals.is_some() {
+            self.baseline = totals;
+        }
+        let turn = TurnUsage {
+            input_tokens,
+            output_tokens,
+            context_tokens: usage["last"]["totalTokens"].as_u64(),
+            context_window: usage["modelContextWindow"].as_u64(),
+            session_cost_usd: None,
+        };
+        (!turn.is_empty()).then_some(turn)
+    }
+
     pub fn ingest(&mut self, mut message: Value) -> Vec<AgentMessageBody> {
         redact(&mut message, &[]);
         let method = text(&message, "method");
@@ -139,9 +193,14 @@ impl CodexStream {
             }
             "thread/tokenUsage/updated" => self.usage = p["tokenUsage"].clone(),
             "turn/completed" => {
+                let raw = self.usage.clone();
+                let mut data = json!({"status":p["turn"]["status"], "error":p["turn"]["error"], "usage":raw, "cost_available":false});
+                if let Some(usage) = self.turn_usage() {
+                    data[TURN_USAGE_KEY] = json!(usage);
+                }
                 bodies.push(AgentMessageBody::System {
                     subtype: "codex_turn".into(),
-                    data: json!({"status":p["turn"]["status"], "error":p["turn"]["error"], "usage":self.usage, "cost_available":false}),
+                    data,
                 });
                 bodies.push(AgentMessageBody::Result {
                     cost_usd: 0.0,
@@ -151,7 +210,6 @@ impl CodexStream {
                 });
                 self.output.clear();
                 self.started.clear();
-                self.usage = Value::Null;
             }
             "" | "turn/started" | "thread/started" | "thread/status/changed" => {}
             m if m.starts_with("item/reasoning/")

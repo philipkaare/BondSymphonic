@@ -51,6 +51,13 @@ for line in sys.stdin:
         turn += 1
         emit({"id": m["id"], "result": {"turn": {"id": str(turn)}}})
         event("turn/started", {"threadId": thread, "turn": {"id": str(turn)}})
+        if mode == "usage":
+            # Cumulative for the thread, as Codex reports it.
+            event("thread/tokenUsage/updated", {"threadId": thread, "turnId": str(turn), "tokenUsage": {
+                "total": {"totalTokens": 1230 * turn, "inputTokens": 1200 * turn, "cachedInputTokens": 0, "outputTokens": 30 * turn, "reasoningOutputTokens": 0},
+                "last": {"totalTokens": 1230 * turn, "inputTokens": 1200 * turn, "cachedInputTokens": 0, "outputTokens": 30 * turn, "reasoningOutputTokens": 0},
+                "modelContextWindow": 258400}})
+            event("turn/completed", {"threadId": thread, "turn": {"id": str(turn), "status": "completed"}})
         if mode == "unsupported":
             emit({"id": "unsupported-request", "method": "item/tool/requestUserInput",
                   "params": {"threadId": thread, "turnId": str(turn)}})

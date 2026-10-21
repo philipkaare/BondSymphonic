@@ -197,8 +197,15 @@ impl AgentAdapter for CodexAdapter {
         let changed = self.changed.clone();
         let sink = self.sink.clone();
         let event_rpc = rpc.clone();
+        // A resumed thread's token totals include turns this process never
+        // saw, so its first turn's own count is left unknown.
+        let resumed = self.prepared.options.resume_session.is_some();
         let mut pump = tokio::spawn(async move {
-            let mut stream = CodexStream::default();
+            let mut stream = if resumed {
+                CodexStream::resumed()
+            } else {
+                CodexStream::default()
+            };
             while let Some(frame) = events.recv().await {
                 let p = &frame["params"];
                 match text(&frame, "method") {
