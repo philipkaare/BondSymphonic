@@ -10,7 +10,7 @@
 //! * Results are `rawOutput: {output, metadata}` or `{error}`.
 //! * Tool call IDs are only unique within a turn.
 use super::codex_stream::{redact, text};
-use bondsymphonic_proto::AgentMessageBody;
+use bondsymphonic_proto::{AgentMessageBody, TurnUsage};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -28,6 +28,9 @@ pub struct OpenCodeStream {
     unknown: HashSet<String>,
     /// Whether this turn produced anything the user can see.
     produced: bool,
+    /// The last `usage_update` of this turn: the context in use, its size
+    /// and the session's cost.
+    usage: Option<Value>,
 }
 
 pub fn approval_id(id: &Value) -> String {
@@ -120,12 +123,16 @@ impl OpenCodeStream {
                 out
             }
             "tool_call" | "tool_call_update" => self.tool(update),
+            // Not a row: it is folded into the turn's usage when it ends.
+            "usage_update" => {
+                self.usage = Some(update);
+                vec![]
+            }
             // Bookkeeping, replayed history and plans: none of it is the
             // conversation, and most of it arrives once per step.
             "available_commands_update"
             | "current_mode_update"
             | "config_option_update"
-            | "usage_update"
             | "user_message_chunk"
             | "plan" => vec![],
             _ if self.unknown.insert(kind.clone()) => {
@@ -231,6 +238,28 @@ impl OpenCodeStream {
         let mut out = self.flush_thought();
         out.extend(self.flush_text());
         out
+    }
+
+    /// The turn's usage: the tokens OpenCode's prompt result reports
+    /// (`result_usage`, its final model call's) and the last `usage_update`
+    /// seen this turn. Call before [`finish_turn`](Self::finish_turn), which
+    /// forgets the update.
+    ///
+    /// A cost of 0 is left out: OpenCode reports 0 for a model it has no price
+    /// for, which is not the same as a free one.
+    pub fn turn_usage(&self, result_usage: &Value) -> Option<TurnUsage> {
+        let update = self.usage.as_ref().unwrap_or(&Value::Null);
+        let cost = &update["cost"];
+        let usage = TurnUsage {
+            input_tokens: result_usage["inputTokens"].as_u64(),
+            output_tokens: result_usage["outputTokens"].as_u64(),
+            context_tokens: update["used"].as_u64(),
+            context_window: update["size"].as_u64().filter(|size| *size > 0),
+            session_cost_usd: cost["amount"]
+                .as_f64()
+                .filter(|amount| *amount > 0.0 && text(cost, "currency") == "USD"),
+        };
+        (!usage.is_empty()).then_some(usage)
     }
 
     /// Ends the turn: what is still open, and whether the turn produced

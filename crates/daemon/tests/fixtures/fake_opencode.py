@@ -243,6 +243,12 @@ for line in sys.stdin:
             complete()
         elif mode == "hold":
             chunk("waiting")
+        elif mode == "usage":
+            # OpenCode 1.14.48 reports cost 0 for a model it has no price for.
+            priced = p["prompt"][0]["text"] == "priced"
+            update({"sessionUpdate": "usage_update", "used": 1200 if priced else 1300, "size": 200000,
+                    "cost": {"amount": 0.0123 if priced else 0, "currency": "USD"}})
+            complete()
         else:
             tool("tool", "bash", {"command": "echo hi"})
             update({"sessionUpdate": "tool_call_update", "toolCallId": "tool", "status": "completed", "kind": "execute", "title": "Print hi", "rawInput": {"command": "echo hi"}, "rawOutput": {"output": "hi", "metadata": {"output": "hi", "exit": 0}}})

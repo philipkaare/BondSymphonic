@@ -10,6 +10,14 @@
 //!   model or a refused tier ends the prompt with an empty `end_turn`; a 500 or
 //!   a refused connection is retried for ever and the prompt never answers.
 //!   The cause appears only in OpenCode's log, which is printed to stderr.
+//!
+//! Messages sent while a turn runs are queued here, not by OpenCode, and are
+//! shown as queued until they are sent. An interrupt keeps them -- as Claude
+//! Code does with input that arrives during a turn -- and they go out in order
+//! once the interrupted turn has ended. An interrupt that finds messages an
+//! earlier interrupt already kept discards them, so pressing it twice stops
+//! everything; stopping the agent discards them too. Codex differs by nature:
+//! what is sent during its turn is steered into that turn and ends with it.
 use super::{
     acp::{error, AcpRpc, AcpSecrets, Incoming},
     adapter::AgentAdapter,
@@ -20,13 +28,16 @@ use super::{
 };
 use crate::sandbox::{SandboxCommand, SandboxHandle};
 use async_trait::async_trait;
-use bondsymphonic_proto::{AgentMessageBody, AgentState, PermissionDecision, RpcError};
+use bondsymphonic_proto::{
+    AgentMessageBody, AgentNotice, AgentState, DequeueOutcome, DequeuedPrompt, NoticeAction,
+    NoticeKind, PermissionDecision, QueuedPrompt, QueuedPromptAction, RpcError, TURN_USAGE_KEY,
+};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -46,6 +57,10 @@ const STALL_AFTER: Duration = Duration::from_secs(60);
 /// can trail the prompt's answer.
 const LOG_GRACE: Duration = Duration::from_millis(250);
 const QUEUE_LIMIT: usize = 64;
+/// How many of OpenCode's log lines a notice carries, and how long each may
+/// be. At `--log-level WARN` a turn rarely prints more than a few.
+const LOG_LINES: usize = 100;
+const LOG_LINE_CHARS: usize = 500;
 
 struct Approval {
     id: Value,
@@ -74,13 +89,25 @@ impl Default for TurnState {
         }
     }
 }
-/// Messages waiting for the turn in flight to end.
+/// A message waiting for the turn in flight to end.
+struct Queued {
+    id: String,
+    text: String,
+    /// Whether the transcript shows it as queued, so that sending it is
+    /// announced. A message sent to an idle agent goes straight out.
+    announced: bool,
+    /// Whether an interrupt has already kept it; the next one discards it.
+    kept: bool,
+}
 #[derive(Default)]
 struct Prompts {
-    queue: Mutex<VecDeque<String>>,
+    queue: Mutex<VecDeque<Queued>>,
     ready: Notify,
+    next_id: AtomicU64,
 }
 type Stream = Arc<tokio::sync::Mutex<OpenCodeStream>>;
+/// OpenCode's last log lines, newest last, reduced and redacted.
+type Log = Arc<Mutex<VecDeque<String>>>;
 pub struct OpenCodeAdapter {
     sink: AgentSink,
     handle: Arc<dyn SandboxHandle>,
@@ -102,6 +129,7 @@ pub struct OpenCodeAdapter {
     timeout: Duration,
     stall_after: Duration,
     secrets: Arc<AcpSecrets>,
+    log: Log,
 }
 async fn finish(sink: &AgentSink, exited: &AtomicBool, detail: Option<String>) {
     if exited.swap(true, Ordering::SeqCst) {
@@ -110,11 +138,71 @@ async fn finish(sink: &AgentSink, exited: &AtomicBool, detail: Option<String>) {
     let _ = tokio::time::timeout(Duration::from_secs(3), sink.ended()).await;
     sink.publish_state(AgentState::Exited, detail);
 }
-fn notice(text: impl Into<String>) -> AgentMessageBody {
-    AgentMessageBody::System {
-        subtype: "opencode_notice".into(),
-        data: json!({"text":text.into()}),
+fn notice(
+    kind: NoticeKind,
+    text: impl Into<String>,
+    actions: Vec<NoticeAction>,
+    log: &Log,
+) -> AgentMessageBody {
+    let log = if actions.contains(&NoticeAction::ShowLog) {
+        log.lock().iter().cloned().collect()
+    } else {
+        vec![]
+    };
+    AgentNotice {
+        text: text.into(),
+        kind,
+        actions,
+        log,
     }
+    .into_message()
+}
+/// What OpenCode's empty answer usually means is a configuration problem.
+fn empty_turn_notice(cause: Option<&str>, log: &Log) -> AgentMessageBody {
+    notice(
+        NoticeKind::EmptyTurn,
+        empty_turn_text(cause),
+        vec![NoticeAction::OpenConfigFolder, NoticeAction::ShowLog],
+        log,
+    )
+}
+fn stall_notice(silent: Duration, cause: Option<&str>, log: &Log) -> AgentMessageBody {
+    notice(
+        NoticeKind::Stall,
+        stall_text(silent, cause),
+        vec![
+            NoticeAction::Interrupt,
+            NoticeAction::ShowLog,
+            NoticeAction::OpenConfigFolder,
+        ],
+        log,
+    )
+}
+/// The rows saying `discarded` will never be sent: one per message the
+/// transcript shows as queued, and one notice naming them all.
+fn discarded_rows(why: &str, discarded: &[Queued], log: &Log) -> Vec<AgentMessageBody> {
+    if discarded.is_empty() {
+        return vec![];
+    }
+    let mut rows: Vec<AgentMessageBody> = discarded
+        .iter()
+        .filter(|queued| queued.announced)
+        .map(|queued| {
+            DequeuedPrompt {
+                id: queued.id.clone(),
+                outcome: DequeueOutcome::Discarded,
+            }
+            .into_message()
+        })
+        .collect();
+    let texts: Vec<String> = discarded.iter().map(|q| q.text.clone()).collect();
+    rows.push(notice(
+        NoticeKind::QueueDiscarded,
+        discarded_text(why, &texts),
+        vec![],
+        log,
+    ));
+    rows
 }
 /// Writes `bodies` after finalising any text still streaming.
 async fn put(sink: &AgentSink, stream: &Stream, bodies: Vec<AgentMessageBody>) {
@@ -142,7 +230,7 @@ fn stall_text(silent: Duration, cause: Option<&str>) -> String {
         .unwrap_or_default();
     format!("No response from the model for {} s. OpenCode keeps retrying a provider that fails, without reporting it.{cause} A large local model may still be loading; interrupt to stop waiting.", silent.as_secs().max(1))
 }
-fn discarded_text(discarded: &[String]) -> String {
+fn discarded_text(why: &str, discarded: &[String]) -> String {
     let quoted = discarded
         .iter()
         .map(|text| {
@@ -153,8 +241,8 @@ fn discarded_text(discarded: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     match discarded.len() {
-        1 => format!("Interrupted: 1 queued message was not sent: {quoted}"),
-        n => format!("Interrupted: {n} queued messages were not sent: {quoted}"),
+        1 => format!("{why}: 1 queued message was not sent: {quoted}"),
+        n => format!("{why}: {n} queued messages were not sent: {quoted}"),
     }
 }
 
@@ -227,6 +315,7 @@ async fn wait_reporting_stalls(
     state: &Mutex<TurnState>,
     sink: &AgentSink,
     stream: &Stream,
+    log: &Log,
     stall_after: Duration,
 ) -> Result<Value, RpcError> {
     tokio::pin!(answer);
@@ -240,10 +329,10 @@ async fn wait_reporting_stalls(
                     let silent = current.activity.elapsed();
                     let stalled = current.approvals.is_empty() && !current.stalled && silent >= stall_after;
                     current.stalled |= stalled;
-                    stalled.then(|| stall_text(silent, current.provider_error.as_deref()))
+                    stalled.then(|| (silent, current.provider_error.clone()))
                 };
-                if let Some(text) = stalled {
-                    put(sink, stream, vec![notice(text)]).await;
+                if let Some((silent, cause)) = stalled {
+                    put(sink, stream, vec![stall_notice(silent, cause.as_deref(), log)]).await;
                 }
             }
         }
@@ -274,6 +363,7 @@ impl OpenCodeAdapter {
             timeout: Duration::from_secs(30),
             stall_after: STALL_AFTER,
             secrets,
+            log: Log::default(),
         }
     }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -390,6 +480,27 @@ impl OpenCodeAdapter {
         }
         Ok(())
     }
+    /// Cancels the turn in flight, if any, answering its open approvals as
+    /// cancelled. Called with the dispatch lock held.
+    async fn cancel_turn(&self, rpc: &AcpRpc) -> Result<(), RpcError> {
+        let approvals: Vec<Approval> = {
+            let mut current = self.state.lock();
+            current.cancelled |= current.active;
+            let approvals: Vec<Approval> = current.approvals.drain().map(|(_, a)| a).collect();
+            if current.active && !approvals.is_empty() {
+                self.sink.publish_state(AgentState::Working, None);
+            }
+            approvals
+        };
+        rpc.notify("session/cancel", json!({"sessionId":self.session}))
+            .await?;
+        for approval in approvals {
+            let _ = rpc
+                .reply(approval.id, json!({"outcome":{"outcome":"cancelled"}}))
+                .await;
+        }
+        Ok(())
+    }
     fn start_worker(&mut self) {
         let prompts = Arc::new(Prompts::default());
         self.prompts = Some(prompts.clone());
@@ -401,6 +512,7 @@ impl OpenCodeAdapter {
         let dispatch = self.dispatch.clone();
         let exited = self.exited.clone();
         let stall_after = self.stall_after;
+        let log = self.log.clone();
         self.worker = Some(tokio::spawn(async move {
             loop {
                 if exited.load(Ordering::SeqCst) {
@@ -408,14 +520,33 @@ impl OpenCodeAdapter {
                 }
                 let started = Instant::now();
                 // Take and write a prompt under the lock cancellation holds, so
-                // an interrupt either stops this prompt or discards it unsent.
+                // an interrupt either stops this prompt or finds it queued.
                 let dispatched = {
                     let _dispatch = dispatch.lock().await;
-                    let Some(text) = prompts.queue.lock().pop_front() else {
+                    let Some(queued) = prompts.queue.lock().pop_front() else {
                         drop(_dispatch);
                         prompts.ready.notified().await;
                         continue;
                     };
+                    if queued.announced {
+                        // Only now is it the user's turn in the conversation.
+                        put(
+                            &sink,
+                            &stream,
+                            vec![
+                                DequeuedPrompt {
+                                    id: queued.id,
+                                    outcome: DequeueOutcome::Sent,
+                                }
+                                .into_message(),
+                                AgentMessageBody::UserText {
+                                    text: queued.text.clone(),
+                                },
+                            ],
+                        )
+                        .await;
+                    }
+                    let text = queued.text;
                     {
                         // Active before the write: the turn's first frame can
                         // follow it at once.
@@ -441,24 +572,35 @@ impl OpenCodeAdapter {
                 };
                 let result = match dispatched {
                     Ok(pending) => {
-                        wait_reporting_stalls(pending.wait(), &state, &sink, &stream, stall_after)
-                            .await
+                        wait_reporting_stalls(
+                            pending.wait(),
+                            &state,
+                            &sink,
+                            &stream,
+                            &log,
+                            stall_after,
+                        )
+                        .await
                     }
                     Err(failure) => Err(failure),
                 };
                 if exited.load(Ordering::SeqCst) {
                     break;
                 }
-                let produced = {
+                let (produced, usage) = {
                     // Under the stream lock, so a frame after the answer is
                     // either part of this turn or seen as late.
                     let mut stream = stream.lock().await;
                     state.lock().active = false;
+                    let usage = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|answer| stream.turn_usage(&answer["usage"]));
                     let (bodies, produced) = stream.finish_turn();
                     for body in bodies {
                         sink.message(body).await;
                     }
-                    produced
+                    (produced, usage)
                 };
                 let (cancelled, mut cause) = {
                     let mut current = state.lock();
@@ -481,8 +623,11 @@ impl OpenCodeAdapter {
                         tokio::time::sleep(LOG_GRACE).await;
                         cause = state.lock().provider_error.take();
                     }
-                    sink.message(notice(empty_turn_text(cause.as_deref())))
+                    sink.message(empty_turn_notice(cause.as_deref(), &log))
                         .await;
+                }
+                if let Some(usage) = usage {
+                    data[TURN_USAGE_KEY] = json!(usage);
                 }
                 sink.message(AgentMessageBody::System {
                     subtype: "opencode_turn".into(),
@@ -546,6 +691,7 @@ impl AgentAdapter for OpenCodeAdapter {
         let stderr_tail = tail.clone();
         let stderr_secrets = secrets.clone();
         let stderr_state = self.state.clone();
+        let stderr_log = self.log.clone();
         let mut stderr_task = tokio::spawn(async move {
             if let Some(stderr) = child.stderr.take() {
                 // Lossy: a reader that stopped at invalid UTF-8 would leave
@@ -573,6 +719,13 @@ impl AgentAdapter for OpenCodeAdapter {
                         .collect();
                     if cause.is_some() {
                         stderr_state.lock().provider_error = Some(shown.clone());
+                    }
+                    if !shown.trim().is_empty() {
+                        let mut log = stderr_log.lock();
+                        if log.len() == LOG_LINES {
+                            log.pop_front();
+                        }
+                        log.push_back(shown.chars().take(LOG_LINE_CHARS).collect());
                     }
                     *stderr_tail.lock() = shown;
                 }
@@ -719,14 +872,28 @@ impl AgentAdapter for OpenCodeAdapter {
         if prompts.queue.lock().len() >= QUEUE_LIMIT {
             return Err(error("OpenCode prompt queue is full"));
         }
+        // Under the lock the worker dispatches under, so "will this wait?"
+        // cannot change before the message is queued.
+        let _dispatch = self.dispatch.lock().await;
+        let waits = self.state.lock().active || !prompts.queue.lock().is_empty();
+        let id = format!("q{}", prompts.next_id.fetch_add(1, Ordering::SeqCst) + 1);
         // After the text streaming now, not inside its bubble.
-        put(
-            &self.sink,
-            &self.stream,
-            vec![AgentMessageBody::UserText { text: text.clone() }],
-        )
-        .await;
-        prompts.queue.lock().push_back(text);
+        let row = if waits {
+            QueuedPrompt {
+                id: id.clone(),
+                text: text.clone(),
+            }
+            .into_message()
+        } else {
+            AgentMessageBody::UserText { text: text.clone() }
+        };
+        put(&self.sink, &self.stream, vec![row]).await;
+        prompts.queue.lock().push_back(Queued {
+            id,
+            text,
+            announced: waits,
+            kept: false,
+        });
         prompts.ready.notify_one();
         Ok(())
     }
@@ -793,46 +960,95 @@ impl AgentAdapter for OpenCodeAdapter {
         )
         .await
     }
-    /// Cancels the turn in flight and discards the messages queued behind it,
-    /// saying so: like a Codex turn, which takes in what is sent during it and
-    /// is interrupted with it.
+    /// Cancels the turn in flight. The messages queued behind it are kept and
+    /// sent once it has ended, except those an earlier interrupt already
+    /// kept, which are discarded, saying so. See the module comment.
     async fn interrupt(&mut self) -> Result<(), RpcError> {
         let rpc = self.rpc()?;
         let _dispatch = self.dispatch.lock().await;
-        let discarded: Vec<String> = self
-            .prompts
-            .as_ref()
-            .map(|prompts| prompts.queue.lock().drain(..).collect())
-            .unwrap_or_default();
-        let approvals: Vec<Approval> = {
-            let mut current = self.state.lock();
-            current.cancelled |= current.active;
-            let approvals: Vec<Approval> = current.approvals.drain().map(|(_, a)| a).collect();
-            if current.active && !approvals.is_empty() {
-                self.sink.publish_state(AgentState::Working, None);
+        let discarded: Vec<Queued> = match &self.prompts {
+            Some(prompts) => {
+                let mut queue = prompts.queue.lock();
+                let (discarded, kept): (Vec<Queued>, Vec<Queued>) =
+                    queue.drain(..).partition(|queued| queued.kept);
+                queue.extend(kept.into_iter().map(|queued| Queued {
+                    kept: true,
+                    ..queued
+                }));
+                discarded
             }
-            approvals
+            None => vec![],
         };
-        rpc.notify("session/cancel", json!({"sessionId":self.session}))
-            .await?;
-        for approval in approvals {
-            let _ = rpc
-                .reply(approval.id, json!({"outcome":{"outcome":"cancelled"}}))
+        self.cancel_turn(&rpc).await?;
+        put(
+            &self.sink,
+            &self.stream,
+            discarded_rows("Interrupted again", &discarded, &self.log),
+        )
+        .await;
+        Ok(())
+    }
+    async fn queued_prompt(
+        &mut self,
+        prompt_id: String,
+        action: QueuedPromptAction,
+    ) -> Result<(), RpcError> {
+        let rpc = self.rpc()?;
+        let prompts = self
+            .prompts
+            .clone()
+            .ok_or_else(|| error("OpenCode agent has not initialized"))?;
+        let _dispatch = self.dispatch.lock().await;
+        let queued = {
+            let mut queue = prompts.queue.lock();
+            let at = queue
+                .iter()
+                .position(|queued| queued.id == prompt_id)
+                .ok_or_else(|| {
+                    RpcError::invalid_params("That message was already sent or discarded")
+                })?;
+            queue.remove(at).expect("position is in range")
+        };
+        match action {
+            QueuedPromptAction::Discard => {
+                put(
+                    &self.sink,
+                    &self.stream,
+                    vec![DequeuedPrompt {
+                        id: queued.id,
+                        outcome: DequeueOutcome::Discarded,
+                    }
+                    .into_message()],
+                )
                 .await;
-        }
-        if !discarded.is_empty() {
-            put(
-                &self.sink,
-                &self.stream,
-                vec![notice(discarded_text(&discarded))],
-            )
-            .await;
+            }
+            QueuedPromptAction::SendNow => {
+                // Ahead of everything else, and not discarded by the next
+                // interrupt: the user has just asked for it.
+                prompts.queue.lock().push_front(Queued {
+                    kept: false,
+                    ..queued
+                });
+                self.cancel_turn(&rpc).await?;
+                prompts.ready.notify_one();
+            }
         }
         Ok(())
     }
     async fn stop(&mut self) -> Result<(), RpcError> {
         self.stopping.store(true, Ordering::SeqCst);
-        self.prompts.take();
+        if let Some(prompts) = self.prompts.take() {
+            let _dispatch = self.dispatch.lock().await;
+            let discarded: Vec<Queued> = prompts.queue.lock().drain(..).collect();
+            if !self.exited.load(Ordering::SeqCst) {
+                put(
+                    &self.sink,
+                    &self.stream,
+                    discarded_rows("Stopped", &discarded, &self.log),
+                )
+                .await;
+            }
+        }
         if let Some(worker) = self.worker.take() {
             worker.abort();
         }

@@ -23,7 +23,9 @@ pub trait AgentAdapter: Send {
         _prompt_id: String,
         _action: QueuedPromptAction,
     ) -> Result<(), RpcError> {
-        Err(RpcError::invalid_params("this agent has no queued messages"))
+        Err(RpcError::invalid_params(
+            "this agent has no queued messages",
+        ))
     }
     async fn stop(&mut self) -> Result<(), RpcError>;
 }

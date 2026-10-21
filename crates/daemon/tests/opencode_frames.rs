@@ -311,19 +311,17 @@ async fn recorded_endless_retry_is_flagged_and_can_be_interrupted() {
     f.adapter.stop().await.unwrap();
 }
 
-/// Messages sent while a turn runs wait for it. Interrupting discards them,
-/// says so, and a message sent afterwards still runs. A message sent while
-/// text is streaming lands after that text, which is finalised first.
+/// Messages sent while a turn runs wait for it, shown as queued rather than
+/// as sent. Interrupting keeps them and sends them in order once the
+/// interrupted turn has ended; an interrupt that finds them still queued
+/// discards them and says so. A message sent while text is streaming lands
+/// after that text, which is finalised first.
 #[tokio::test]
-async fn interrupt_discards_queued_messages_visibly() {
+async fn interrupt_keeps_queued_messages_and_a_second_discards_them() {
     let mut f = fixture("hold").await;
     f.adapter.start().await.unwrap();
     f.adapter.send("one".into()).await.unwrap();
-    f.wait_for(|m| {
-        m.iter()
-            .any(|m| matches!(m, AgentMessageBody::AssistantDelta { text } if text == "waiting"))
-    })
-    .await;
+    f.wait_for(|m| waiting(m) == 1).await;
     f.adapter.send("two".into()).await.unwrap();
     f.adapter.send("three".into()).await.unwrap();
     let messages = f.messages().await;
@@ -331,31 +329,232 @@ async fn interrupt_discards_queued_messages_visibly() {
         .iter()
         .position(|m| matches!(m, AgentMessageBody::AssistantText { text } if text == "waiting"))
         .expect("the streaming text is finalised before the next message");
+    let queued = queued(&messages);
+    assert_eq!(
+        queued.iter().map(|q| q.text.as_str()).collect::<Vec<_>>(),
+        ["two", "three"]
+    );
     let two = messages
         .iter()
-        .position(|m| matches!(m, AgentMessageBody::UserText { text } if text == "two"))
+        .position(|m| QueuedPrompt::from_message(m).is_some())
         .unwrap();
     assert!(finalised < two);
+    assert_eq!(user_texts(&messages), ["one"], "not sent yet");
     f.adapter.interrupt().await.unwrap();
-    let messages = f.results(1).await;
-    let notices = notices(&messages);
-    assert_eq!(notices.len(), 1, "{notices:?}");
-    assert!(
-        notices[0].contains("2 queued messages were not sent"),
-        "{notices:?}"
-    );
+    // "two" is sent once "one" has ended, and runs.
+    let messages = f.wait_for(|m| waiting(m) == 2).await;
     assert_eq!(turn_rows(&messages)[0]["stopReason"], "cancelled");
-    // The fake asserts it never sees overlapping prompts, and `hold` never
-    // answers by itself, so a second Result means "four" ran on its own.
-    f.adapter.send("four".into()).await.unwrap();
-    f.wait_for(|m| {
-        m.iter()
-            .filter(|m| matches!(m, AgentMessageBody::AssistantDelta { text } if text == "waiting"))
-            .count()
-            == 2
-    })
-    .await;
+    assert_eq!(user_texts(&messages), ["one", "two"]);
+    assert_eq!(
+        dequeued(&messages),
+        [(queued[0].id.clone(), DequeueOutcome::Sent)]
+    );
+    assert_eq!(notices(&messages), Vec::<String>::new());
+    // The second interrupt finds "three" still queued: discarded, visibly.
     f.adapter.interrupt().await.unwrap();
-    f.results(2).await;
+    let messages = f.results(2).await;
+    assert_eq!(turn_rows(&messages)[1]["stopReason"], "cancelled");
+    assert_eq!(
+        dequeued(&messages)[1],
+        (queued[1].id.clone(), DequeueOutcome::Discarded)
+    );
+    let notice = structured(&messages).pop().unwrap();
+    assert_eq!(notice.kind, NoticeKind::QueueDiscarded);
+    assert!(notice.text.contains("“three”"), "{}", notice.text);
+    // The fake asserts it never sees overlapping prompts, and `hold` never
+    // answers by itself, so another "waiting" means "four" ran on its own.
+    f.adapter.send("four".into()).await.unwrap();
+    f.wait_for(|m| waiting(m) == 3).await;
+    assert_eq!(user_texts(&f.messages().await), ["one", "two", "four"]);
+    f.adapter.interrupt().await.unwrap();
+    f.results(3).await;
+    f.adapter.stop().await.unwrap();
+}
+
+fn waiting(messages: &[AgentMessageBody]) -> usize {
+    messages
+        .iter()
+        .filter(|m| matches!(m, AgentMessageBody::AssistantDelta { text } if text == "waiting"))
+        .count()
+}
+
+fn user_texts(messages: &[AgentMessageBody]) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessageBody::UserText { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn queued(messages: &[AgentMessageBody]) -> Vec<QueuedPrompt> {
+    messages
+        .iter()
+        .filter_map(QueuedPrompt::from_message)
+        .collect()
+}
+
+fn dequeued(messages: &[AgentMessageBody]) -> Vec<(String, DequeueOutcome)> {
+    messages
+        .iter()
+        .filter_map(DequeuedPrompt::from_message)
+        .map(|d| (d.id, d.outcome))
+        .collect()
+}
+
+fn structured(messages: &[AgentMessageBody]) -> Vec<AgentNotice> {
+    messages
+        .iter()
+        .filter_map(AgentNotice::from_message)
+        .collect()
+}
+
+/// G401: the empty turn's notice offers the config folder and the log, and
+/// the log it carries is OpenCode's, reduced and redacted like the cause.
+#[tokio::test]
+async fn recorded_empty_turn_notice_offers_the_config_folder_and_the_log() {
+    let mut f = fixture("replay:G401").await;
+    f.adapter.start().await.unwrap();
+    f.adapter.send("hi".into()).await.unwrap();
+    let messages = f.results(1).await;
+    let notice = structured(&messages).pop().unwrap();
+    assert_eq!(notice.kind, NoticeKind::EmptyTurn);
+    assert_eq!(
+        notice.actions,
+        [NoticeAction::OpenConfigFolder, NoticeAction::ShowLog]
+    );
+    assert!(
+        notice
+            .log
+            .iter()
+            .any(|line| line.contains("Incorrect API key provided")),
+        "{:?}",
+        notice.log
+    );
+    assert!(
+        notice
+            .log
+            .iter()
+            .all(|line| !line.contains("You are opencode")),
+        "the logged request body leaked: {:?}",
+        notice.log
+    );
+    f.adapter.stop().await.unwrap();
+}
+
+/// G500: the stall notice offers to interrupt, and the log behind it.
+#[tokio::test]
+async fn recorded_stall_notice_offers_interrupt_and_the_log() {
+    let mut f = fixture("replay:G500").await;
+    f.adapter.start().await.unwrap();
+    f.adapter.send("hi".into()).await.unwrap();
+    let messages = f.wait_for(|m| !structured(m).is_empty()).await;
+    let notice = structured(&messages).pop().unwrap();
+    assert_eq!(notice.kind, NoticeKind::Stall);
+    assert_eq!(notice.actions[0], NoticeAction::Interrupt);
+    assert!(notice.actions.contains(&NoticeAction::ShowLog));
+    assert!(notice.actions.contains(&NoticeAction::OpenConfigFolder));
+    assert!(notice.log.iter().any(|line| line.contains("HTTP 500")));
+    f.adapter.interrupt().await.unwrap();
+    f.results(1).await;
+    f.adapter.stop().await.unwrap();
+}
+
+/// "Send now" interrupts the turn and sends that message ahead of the ones
+/// queued before it; "Discard" drops one. Neither touches a message that is
+/// no longer queued.
+#[tokio::test]
+async fn a_queued_message_can_be_sent_now_or_discarded() {
+    let mut f = fixture("hold").await;
+    f.adapter.start().await.unwrap();
+    f.adapter.send("one".into()).await.unwrap();
+    f.wait_for(|m| waiting(m) == 1).await;
+    for text in ["two", "three", "four"] {
+        f.adapter.send(text.into()).await.unwrap();
+    }
+    let ids: Vec<String> = queued(&f.messages().await)
+        .into_iter()
+        .map(|q| q.id)
+        .collect();
+    f.adapter
+        .queued_prompt(ids[2].clone(), QueuedPromptAction::Discard)
+        .await
+        .unwrap();
+    f.adapter
+        .queued_prompt(ids[1].clone(), QueuedPromptAction::SendNow)
+        .await
+        .unwrap();
+    let messages = f.wait_for(|m| waiting(m) == 2).await;
+    assert_eq!(turn_rows(&messages)[0]["stopReason"], "cancelled");
+    assert_eq!(user_texts(&messages), ["one", "three"]);
+    assert_eq!(
+        dequeued(&messages),
+        [
+            (ids[2].clone(), DequeueOutcome::Discarded),
+            (ids[1].clone(), DequeueOutcome::Sent)
+        ]
+    );
+    for id in [&ids[1], &ids[2]] {
+        assert!(f
+            .adapter
+            .queued_prompt(id.clone(), QueuedPromptAction::Discard)
+            .await
+            .is_err());
+    }
+    // "two" is still queued behind "three", and runs after it.
+    f.adapter.interrupt().await.unwrap();
+    f.wait_for(|m| waiting(m) == 3).await;
+    assert_eq!(user_texts(&f.messages().await), ["one", "three", "two"]);
+    f.adapter.interrupt().await.unwrap();
+    f.results(3).await;
+    f.adapter.stop().await.unwrap();
+}
+
+/// Stopping the agent discards what is queued, visibly, before it exits.
+#[tokio::test]
+async fn stop_discards_queued_messages_visibly() {
+    let mut f = fixture("hold").await;
+    f.adapter.start().await.unwrap();
+    f.adapter.send("one".into()).await.unwrap();
+    f.wait_for(|m| waiting(m) == 1).await;
+    f.adapter.send("two".into()).await.unwrap();
+    f.adapter.stop().await.unwrap();
+    let messages = f.messages().await;
+    let id = queued(&messages)[0].id.clone();
+    assert_eq!(dequeued(&messages), [(id, DequeueOutcome::Discarded)]);
+    let notice = structured(&messages).pop().unwrap();
+    assert_eq!(notice.kind, NoticeKind::QueueDiscarded);
+    assert!(notice.text.contains("“two”"), "{}", notice.text);
+    assert_eq!(f.entry.state().0, AgentState::Exited);
+}
+
+/// OpenCode's prompt result reports the turn's tokens; a `usage_update`
+/// adds the context in use, its size and the session's cost when OpenCode
+/// knows a price. A zero cost is a model without a price, not a free one.
+#[tokio::test]
+async fn turn_rows_carry_opencodes_usage_and_only_a_real_cost() {
+    let mut f = fixture("usage").await;
+    f.adapter.start().await.unwrap();
+    f.adapter.send("priced".into()).await.unwrap();
+    f.results(1).await;
+    f.adapter.send("unpriced".into()).await.unwrap();
+    let messages = f.results(2).await;
+    let usages: Vec<TurnUsage> = messages
+        .iter()
+        .filter_map(TurnUsage::from_turn_row)
+        .collect();
+    assert_eq!(
+        usages[0],
+        TurnUsage {
+            input_tokens: Some(5),
+            output_tokens: Some(3),
+            context_tokens: Some(1200),
+            context_window: Some(200000),
+            session_cost_usd: Some(0.0123),
+        }
+    );
+    assert_eq!(usages[1].session_cost_usd, None);
+    assert_eq!(usages[1].context_tokens, Some(1300));
     f.adapter.stop().await.unwrap();
 }
