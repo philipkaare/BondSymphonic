@@ -13,6 +13,7 @@
 /// nothing to say to each other.
 pub const DEFAULT_DISTRO: &str = "bondsymphonic";
 
+pub mod agent_failure;
 pub mod app_state;
 pub mod backends;
 pub mod diff;
