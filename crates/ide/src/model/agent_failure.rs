@@ -280,6 +280,13 @@ pub fn fresh_start_options(options_json: &str) -> String {
     options.to_string()
 }
 
+/// Whether a failed request lost a race rather than failed: Send now or
+/// Discard on a queued message the agent had just sent or dropped. The row the
+/// daemon writes for that settles the item, so nothing is raised.
+pub fn is_settled_race(err: &crate::client::ClientError) -> bool {
+    matches!(err, crate::client::ClientError::Rpc(e) if bondsymphonic_proto::is_queued_prompt_settled(e))
+}
+
 fn resumes_a_session(options_json: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(options_json)
         .ok()

@@ -622,12 +622,14 @@ impl qobject::TranscriptModel {
                 prompt_id,
                 action,
             };
-            if let Err(e) = shared
+            match shared
                 .client
                 .request_raw(Request::AgentQueuedPrompt(params))
                 .await
             {
-                report(&qt, op, format!("{op} failed: {e}"), again);
+                Err(e) if crate::model::agent_failure::is_settled_race(&e) => {}
+                Err(e) => report(&qt, op, format!("{op} failed: {e}"), again),
+                Ok(_) => {}
             }
         });
     }

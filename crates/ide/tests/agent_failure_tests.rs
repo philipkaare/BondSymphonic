@@ -259,3 +259,22 @@ fn a_timed_out_start_or_send_offers_no_retry_and_says_it_may_still_complete() {
         assert_plain(&f.detail);
     }
 }
+
+/// Send now or Discard on a message the agent has just taken off the queue is
+/// a race the user lost by a moment: the transcript's own row settles it, and
+/// no banner goes up. Any other failure of the request still does.
+#[test]
+fn a_queued_message_already_settled_is_not_a_failure() {
+    use bondsymphonic_ide::client::ClientError;
+    use bondsymphonic_ide::model::agent_failure::is_settled_race;
+    use bondsymphonic_proto::RpcError;
+
+    assert!(is_settled_race(&ClientError::Rpc(
+        RpcError::queued_prompt_settled()
+    )));
+    assert!(!is_settled_race(&ClientError::Rpc(
+        RpcError::invalid_params("no such agent")
+    )));
+    assert!(!is_settled_race(&ClientError::Timeout));
+    assert!(!is_settled_race(&ClientError::Disconnected));
+}
