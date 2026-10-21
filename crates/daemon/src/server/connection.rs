@@ -71,6 +71,7 @@ pub async fn serve_connection(
         events: events.clone(),
         shutdown: shutdown.clone(),
         disconnected: CancellationToken::new(),
+        features: Default::default(),
     });
 
     // Reader task: owns the read half and forwards whole lines over an mpsc.
@@ -202,7 +203,7 @@ pub async fn serve_connection(
             ev = event_rx.recv() => {
                 match ev {
                     Ok(msg) => {
-                        if ctx.is_authenticated() && out_tx.send(codec::encode(&msg)).await.is_err() {
+                        if ctx.forwards(&msg) && out_tx.send(codec::encode(&msg)).await.is_err() {
                             break;
                         }
                     }
@@ -328,7 +329,7 @@ async fn forward_events(
     for _ in 0..max {
         match event_rx.try_recv() {
             Ok(msg) => {
-                if ctx.is_authenticated() && out_tx.send(codec::encode(&msg)).await.is_err() {
+                if ctx.forwards(&msg) && out_tx.send(codec::encode(&msg)).await.is_err() {
                     return None;
                 }
             }

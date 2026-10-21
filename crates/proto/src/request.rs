@@ -23,8 +23,21 @@ params!(HelloParams {
     /// `None` is a client built before the field existed, which speaks version
     /// 1; [`crate::peer_protocol_version`] is the one place that is decided.
     #[serde(default)]
-    protocol_version: Option<u32>
+    protocol_version: Option<u32>,
+    /// Optional events this client wants, such as
+    /// [`crate::FEATURE_AGENT_START_PROGRESS`]. Empty is a client that
+    /// predates the field, and is left off the wire so an older daemon sees
+    /// the `hello` it always saw.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    features: Vec<String>
 });
+
+impl HelloParams {
+    /// Whether this client asked for `feature`.
+    pub fn wants(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+}
 params!(SetupPtyParams {
     action: SetupAction,
     cols: u16,
@@ -277,6 +290,7 @@ impl Request {
                 token: "t".into(),
                 client_version: "0.1.0".into(),
                 protocol_version: Some(crate::PROTOCOL_VERSION),
+                features: vec![crate::FEATURE_AGENT_START_PROGRESS.into()],
             }),
             SystemCheckPrereqs {},
             SystemShutdown {},

@@ -66,6 +66,7 @@ async fn hello_with_good_token_returns_version() {
             token,
             client_version: "0.1.0".into(),
             protocol_version: Some(PROTOCOL_VERSION),
+            features: vec![],
         }),
     )
     .await;
@@ -97,6 +98,7 @@ async fn bad_token_gets_unauthorized_and_disconnect() {
             token: "nope".into(),
             client_version: "0.1.0".into(),
             protocol_version: Some(PROTOCOL_VERSION),
+            features: vec![],
         }),
     )
     .await;
@@ -137,6 +139,7 @@ async fn unimplemented_method_returns_internal_error() {
             token,
             client_version: "0.1.0".into(),
             protocol_version: Some(PROTOCOL_VERSION),
+            features: vec![],
         }),
     )
     .await;
@@ -167,6 +170,7 @@ async fn shutdown_request_stops_server() {
             token,
             client_version: "0.1.0".into(),
             protocol_version: Some(PROTOCOL_VERSION),
+            features: vec![],
         }),
     )
     .await;
@@ -196,6 +200,7 @@ async fn events_are_broadcast_to_authenticated_clients() {
             token,
             client_version: "0.1.0".into(),
             protocol_version: Some(PROTOCOL_VERSION),
+            features: vec![],
         }),
     )
     .await;
@@ -240,6 +245,7 @@ async fn server_survives_aborted_connection_and_accepts_next() {
             token,
             client_version: "0.1.0".into(),
             protocol_version: Some(PROTOCOL_VERSION),
+            features: vec![],
         }),
     )
     .await;
@@ -291,6 +297,7 @@ async fn a_slow_request_does_not_block_a_fast_one() {
             token,
             client_version: "0.1.0".into(),
             protocol_version: Some(PROTOCOL_VERSION),
+            features: vec![],
         }),
     )
     .await;
@@ -413,6 +420,7 @@ async fn an_event_published_after_a_reply_is_queued_is_written_after_it() {
             token,
             client_version: "0.1.0".into(),
             protocol_version: Some(PROTOCOL_VERSION),
+            features: vec![],
         }),
     )
     .await;
@@ -472,6 +480,7 @@ async fn a_lagging_client_is_told_how_many_events_it_missed() {
             token,
             client_version: "0.1.0".into(),
             protocol_version: Some(PROTOCOL_VERSION),
+            features: vec![],
         }),
     )
     .await;
@@ -594,6 +603,7 @@ async fn a_lag_that_happens_during_the_pre_reply_flush_is_still_reported() {
             token,
             client_version: "0.1.0".into(),
             protocol_version: Some(PROTOCOL_VERSION),
+            features: vec![],
         }),
     )
     .await;
@@ -672,6 +682,7 @@ async fn hello_with_another_protocol_version_is_refused_and_the_socket_closes() 
             token,
             client_version: "0.1.0".into(),
             protocol_version: Some(99),
+            features: vec![],
         }),
     )
     .await;
@@ -707,6 +718,7 @@ async fn version_two_ide_is_refused_before_opencode_capabilities_are_sent() {
             token,
             client_version: "0.1.0".into(),
             protocol_version: Some(2),
+            features: vec![],
         }),
     )
     .await;
@@ -768,6 +780,7 @@ async fn hello_with_protocol_version_one_is_refused() {
             token,
             client_version: "0.1.0".into(),
             protocol_version: Some(1),
+            features: vec![],
         }),
     )
     .await;
@@ -825,6 +838,7 @@ async fn a_panicking_handler_is_answered_with_an_internal_error_and_the_connecti
             token,
             client_version: "0.1.0".into(),
             protocol_version: Some(PROTOCOL_VERSION),
+            features: vec![],
         }),
     )
     .await;

@@ -516,6 +516,7 @@ fn hello_carries_the_protocol_version_in_both_directions() {
         token: "t".into(),
         client_version: "0.1.0".into(),
         protocol_version: Some(PROTOCOL_VERSION),
+        features: vec![],
     };
     let v = serde_json::to_value(&params).unwrap();
     assert_eq!(v["protocol_version"], PROTOCOL_VERSION);
@@ -745,4 +746,74 @@ fn a_network_denial_carries_its_backend_and_stays_compatible() {
     // Neither recogniser mistakes the other notice, or a plain warning.
     assert_eq!(ev.refused_tunnel_host(), None);
     assert_eq!(Event::events_dropped(1).denial_backend(), None);
+}
+
+/// `agent.start_progress` is additive: a client opts in through `hello`, and
+/// the event names its phase and a label the IDE can show as it stands.
+mod agent_start_progress {
+    use bondsymphonic_proto::*;
+
+    #[test]
+    fn the_progress_event_round_trips_in_its_envelope() {
+        let msg = ServerMessage::event(
+            Some("ws_1".into()),
+            Event::AgentStartProgress {
+                adapter: AgentAdapterKind::OpenCode,
+                phase: start_phase::SANDBOX.into(),
+                label: "Starting the sandbox".into(),
+            },
+        );
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["workspace_id"], "ws_1");
+        assert_eq!(v["event"]["kind"], "agent.start_progress");
+        assert_eq!(v["event"]["adapter"], "opencode");
+        assert_eq!(v["event"]["phase"], "sandbox");
+        assert_eq!(v["event"]["label"], "Starting the sandbox");
+        let back: ServerMessage = serde_json::from_value(v).unwrap();
+        assert_eq!(back, msg);
+        assert!(Event::examples()
+            .iter()
+            .any(|e| matches!(e, Event::AgentStartProgress { .. })));
+    }
+
+    #[test]
+    fn only_the_progress_event_needs_the_opt_in() {
+        let progress = Event::AgentStartProgress {
+            adapter: AgentAdapterKind::Codex,
+            phase: start_phase::LAUNCH.into(),
+            label: String::new(),
+        };
+        assert_eq!(
+            progress.opt_in_feature(),
+            Some(FEATURE_AGENT_START_PROGRESS)
+        );
+        for ev in Event::examples() {
+            if !matches!(ev, Event::AgentStartProgress { .. }) {
+                assert_eq!(ev.opt_in_feature(), None, "{ev:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hello_features_are_optional_in_both_directions() {
+        // A client that predates the field.
+        let old: HelloParams = serde_json::from_str(
+            r#"{"token":"t","client_version":"0.1.0","protocol_version":3}"#,
+        )
+        .unwrap();
+        assert!(old.features.is_empty());
+        // And one that has nothing to ask for sends nothing, so an older
+        // daemon sees the hello it always saw.
+        let v = serde_json::to_value(&old).unwrap();
+        assert!(v.get("features").is_none(), "{v}");
+        let new = HelloParams {
+            features: vec![FEATURE_AGENT_START_PROGRESS.into()],
+            ..old
+        };
+        let v = serde_json::to_value(&new).unwrap();
+        assert_eq!(v["features"][0], "agent.start_progress");
+        assert!(new.wants(FEATURE_AGENT_START_PROGRESS));
+        let back: HelloParams = serde_json::from_value(v).unwrap();
+        assert_eq!(back, new);
+    }
 }

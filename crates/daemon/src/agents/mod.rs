@@ -676,6 +676,18 @@ const ENDED_BEFORE_RESTART: &str = "the agent ended before the daemon restarted"
 /// an agent when the answer is to try again in a second.
 pub const REASON_AGENT_STARTING: &str = "agent_starting";
 
+/// What the IDE shows while an `agent.start` for `backend` is in `phase`:
+/// a sentence without its ellipsis, which the pane adds.
+pub fn start_label(backend: &str, phase: &str) -> String {
+    match phase {
+        start_phase::PREPARE => format!("Preparing {backend}"),
+        start_phase::SANDBOX => "Starting the sandbox".to_owned(),
+        start_phase::LAUNCH => format!("Starting {backend}"),
+        start_phase::RESUME => "Loading the session".to_owned(),
+        other => format!("Starting {backend} ({other})"),
+    }
+}
+
 /// Every agent the daemon is running, and the requests that reach them.
 ///
 /// The manager owns the list, not the workspace registry: an agent is a live
@@ -900,7 +912,24 @@ impl AgentManager {
             .with_data(serde_json::json!({ "reason": REASON_AGENT_STARTING }))
         })?;
         log_phase(&ws.id, "agent.start", "gate", phase);
+        // Said as each phase begins, to the clients that asked: a first Codex
+        // or OpenCode start can take tens of seconds, and "starting" alone
+        // does not say what it is waiting on. A broadcast send never blocks,
+        // so the start pays nothing for a slow client.
+        let name = backend.descriptor().label;
+        let progress = |phase: &str| {
+            self.events.publish(
+                Some(ws.id.clone()),
+                Event::AgentStartProgress {
+                    adapter: p.adapter,
+                    phase: phase.into(),
+                    label: start_label(&name, phase),
+                },
+            )
+        };
+        progress(start_phase::PREPARE);
         let prepared = backend.prepare(d, &ws, &p.options).await?;
+        progress(start_phase::SANDBOX);
         let phase = Instant::now();
         let handle = d.agent_sandboxes.ensure(d, &ws, backend.as_ref()).await?;
         log_phase(&ws.id, "agent.start", "sandbox", phase);
@@ -938,6 +967,7 @@ impl AgentManager {
         // flag, no login -- has a record for `ended()` to close, instead of
         // coming back as one the daemon claims to have lost at restart.
         let started_with = StartedWith::from_options(&p.options);
+        let started_with_resume = p.options.resume_session.is_some();
         let record = AgentRecord {
             agent_id: id.clone(),
             workspace_id: ws.id.clone(),
@@ -954,6 +984,11 @@ impl AgentManager {
         // Registered only once it is really running, so a failed start leaves
         // no agent behind for the IDE to find -- and no record either, since
         // nothing ever ran under this id.
+        progress(if started_with_resume {
+            start_phase::RESUME
+        } else {
+            start_phase::LAUNCH
+        });
         let phase = Instant::now();
         let spawned = adapter.start().await;
         log_phase(&ws.id, "agent.start", "adapter.start", phase);

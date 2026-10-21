@@ -274,6 +274,10 @@ impl DaemonClient {
                 token: token.into(),
                 client_version: client_version.into(),
                 protocol_version: Some(PROTOCOL_VERSION),
+                // The start-progress events drive the agent pane's "Starting
+                // the sandbox..." line. A daemon that predates them ignores
+                // the field, and the pane says "Starting the agent" as before.
+                features: vec![FEATURE_AGENT_START_PROGRESS.into()],
             }))
             .await
         {

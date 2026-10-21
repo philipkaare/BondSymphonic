@@ -1943,3 +1943,88 @@ async fn a_slow_session_id_write_does_not_cost_the_exit_its_reason() {
         stop.took
     );
 }
+
+/// The phases of an `agent.start`, in the order the daemon goes through them,
+/// published for the start's workspace before the reply -- so the IDE can say
+/// what a slow first start is waiting on. A resumed start names its last phase
+/// differently, and a client that never asked for the events gets none.
+#[tokio::test]
+async fn an_agent_start_reports_its_phases_in_order() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    use_fake_claude(py, "simple_turn.ndjson");
+    let (port, token, _d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let mut old = Client::connect_with_features(port, &token, vec![]).await;
+    let ws = create_ws(&mut c, &repo, "progress").await;
+    c.drain_events();
+
+    let fresh = start_agent(&mut c, &ws.id).await;
+    let progress = |events: Vec<(Option<WorkspaceId>, Event)>| -> Vec<(String, String)> {
+        events
+            .into_iter()
+            .filter_map(|(scope, ev)| match ev {
+                Event::AgentStartProgress {
+                    adapter,
+                    phase,
+                    label,
+                } => {
+                    assert_eq!(scope.as_ref(), Some(&ws.id), "unscoped progress: {phase}");
+                    assert_eq!(adapter, AgentAdapterKind::Claude);
+                    Some((phase, label))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let phases = progress(c.drain_events());
+    let names: Vec<&str> = phases.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            start_phase::PREPARE,
+            start_phase::SANDBOX,
+            start_phase::LAUNCH
+        ],
+        "{phases:?}"
+    );
+    assert!(phases.iter().all(|(_, l)| !l.is_empty()), "{phases:?}");
+
+    // Resuming a conversation says so in its last phase.
+    let mut resumed = options();
+    resumed.resume_session = Some("sess-1".into());
+    let again = c
+        .call(Request::AgentStart(AgentStartParams {
+            workspace_id: ws.id.clone(),
+            adapter: AgentAdapterKind::Claude,
+            options: resumed,
+        }))
+        .await
+        .unwrap();
+    let again: AgentStartResult = serde_json::from_value(again).unwrap();
+    let phases = progress(c.drain_events());
+    assert_eq!(
+        phases.last().map(|(p, _)| p.as_str()),
+        Some(start_phase::RESUME),
+        "{phases:?}"
+    );
+
+    // The client that predates the event saw none of it.
+    let _ = old.call(Request::WorkspaceList {}).await;
+    let seen: Vec<_> = old
+        .drain_events()
+        .into_iter()
+        .filter(|(_, ev)| matches!(ev, Event::AgentStartProgress { .. }))
+        .collect();
+    assert!(seen.is_empty(), "{seen:?}");
+
+    for agent_id in [fresh, again.agent_id] {
+        let _ = c.call(Request::AgentStop(AgentIdParams { agent_id })).await;
+    }
+    cancel.cancel();
+}

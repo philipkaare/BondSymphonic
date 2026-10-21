@@ -59,6 +59,39 @@ pub enum Event {
     },
     #[serde(rename = "fs.changed")]
     FsChanged { paths: Vec<String> },
+    /// An `agent.start` in the envelope's workspace reached `phase`. There is
+    /// no agent id yet -- the start has not answered -- and none is needed:
+    /// the daemon runs one start per workspace at a time.
+    ///
+    /// Sent only to a client that asked for it in `hello`
+    /// ([`FEATURE_AGENT_START_PROGRESS`]); an older IDE never sees one.
+    /// `phase` is one of [`start_phase`] and `label` the sentence to show for
+    /// it, so a phase this IDE has not heard of still reads properly.
+    #[serde(rename = "agent.start_progress")]
+    AgentStartProgress {
+        adapter: AgentAdapterKind,
+        phase: String,
+        #[serde(default)]
+        label: String,
+    },
+}
+
+/// The `hello` feature that turns [`Event::AgentStartProgress`] on for a
+/// connection.
+pub const FEATURE_AGENT_START_PROGRESS: &str = "agent.start_progress";
+
+/// The phases an `agent.start` reports, in the order it reaches them. Wire
+/// values: the IDE may key on them, though it shows the event's own label.
+pub mod start_phase {
+    /// The backend writes the agent's home and checks its CLI.
+    pub const PREPARE: &str = "prepare";
+    /// The agent's sandbox is made ready (a companion sandbox, for Codex and
+    /// OpenCode, the first time).
+    pub const SANDBOX: &str = "sandbox";
+    /// The agent process is spawned and its protocol handshake done.
+    pub const LAUNCH: &str = "launch";
+    /// The same, resuming an earlier conversation.
+    pub const RESUME: &str = "resume";
 }
 
 /// Prefix of the `daemon.log` message the daemon sends when a client's event
@@ -199,6 +232,15 @@ impl Event {
         }
     }
 
+    /// The `hello` feature a client must have asked for to be sent this
+    /// event, or `None` for the events every client gets.
+    pub fn opt_in_feature(&self) -> Option<&'static str> {
+        match self {
+            Event::AgentStartProgress { .. } => Some(FEATURE_AGENT_START_PROGRESS),
+            _ => None,
+        }
+    }
+
     pub fn examples() -> Vec<Event> {
         use Event::*;
         vec![
@@ -271,6 +313,11 @@ impl Event {
             Event::tunnel_refused("ollama.lan", AgentAdapterKind::OpenCode),
             FsChanged {
                 paths: vec!["a.rs".into()],
+            },
+            AgentStartProgress {
+                adapter: AgentAdapterKind::OpenCode,
+                phase: start_phase::PREPARE.into(),
+                label: "Preparing OpenCode".into(),
             },
         ]
     }

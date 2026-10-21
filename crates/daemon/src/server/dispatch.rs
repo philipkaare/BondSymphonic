@@ -18,11 +18,34 @@ pub struct ConnCtx {
     /// something on the peer's behalf which must not outlive the peer — a host setup
     /// terminal, say — ties it to this.
     pub disconnected: CancellationToken,
+    /// The optional events this client asked for in `hello`
+    /// (`HelloParams::features`). Empty until then, and for a client that
+    /// predates them: such a client is never sent an event it cannot decode.
+    pub features: Arc<std::sync::RwLock<Vec<String>>>,
 }
 
 impl ConnCtx {
     pub fn is_authenticated(&self) -> bool {
         self.authenticated.load(Ordering::SeqCst)
+    }
+
+    /// Whether `msg` goes out on this connection: nothing before `hello`, and
+    /// an opt-in event only to a client that asked for it.
+    pub fn forwards(&self, msg: &ServerMessage) -> bool {
+        if !self.is_authenticated() {
+            return false;
+        }
+        let ServerMessage::Event { event, .. } = msg else {
+            return true;
+        };
+        match event.opt_in_feature() {
+            None => true,
+            Some(feature) => self
+                .features
+                .read()
+                .map(|f| f.iter().any(|w| w == feature))
+                .unwrap_or(false),
+        }
     }
 }
 
@@ -62,6 +85,9 @@ impl Handler for SystemHandler {
                     "refused a client speaking another protocol version"
                 );
                 return Err(RpcError::protocol_mismatch(PROTOCOL_VERSION, client));
+            }
+            if let Ok(mut features) = ctx.features.write() {
+                features.clone_from(&p.features);
             }
             ctx.authenticated.store(true, Ordering::SeqCst);
             return ok(HelloResult {

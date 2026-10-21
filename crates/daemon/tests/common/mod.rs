@@ -208,7 +208,15 @@ pub struct Client {
 }
 
 impl Client {
+    /// Connects and says `hello`, asking for every optional event the way the
+    /// IDE does.
     pub async fn connect(port: u16, token: &str) -> Client {
+        Self::connect_with_features(port, token, vec![FEATURE_AGENT_START_PROGRESS.into()]).await
+    }
+
+    /// [`connect`](Client::connect), asking `hello` for exactly `features`:
+    /// an empty list is a client that predates every optional event.
+    pub async fn connect_with_features(port: u16, token: &str, features: Vec<String>) -> Client {
         let s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let (r, w) = s.into_split();
         let mut c = Client {
@@ -222,6 +230,7 @@ impl Client {
                 token: token.into(),
                 client_version: "t".into(),
                 protocol_version: Some(PROTOCOL_VERSION),
+                features,
             }))
             .await
             .unwrap();
