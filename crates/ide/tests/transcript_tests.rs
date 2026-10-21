@@ -1038,3 +1038,271 @@ fn opencode_tool_running_beside_a_pending_approval_leaves_it_answerable() {
     t.apply(&reply(3, "opencode:0", "allow"));
     assert!(t.pending.is_none());
 }
+
+/// Actionable notices, queued messages and token usage (2026-10-21).
+mod notices_queue_usage {
+    use super::msg;
+    use bondsymphonic_ide::model::transcript::{Applied, LiveEvent, Transcript, TranscriptItem};
+    use bondsymphonic_proto::{
+        AgentMessageBody, AgentNotice, AgentState, DequeueOutcome, DequeuedPrompt, NoticeAction,
+        NoticeKind, QueuedPrompt,
+    };
+    use serde_json::json;
+
+    fn stall(seq: u64) -> bondsymphonic_proto::AgentMessage {
+        msg(
+            seq,
+            AgentNotice {
+                text: "No response from the model for 60 s.".into(),
+                kind: NoticeKind::Stall,
+                actions: vec![
+                    NoticeAction::Interrupt,
+                    NoticeAction::ShowLog,
+                    NoticeAction::Unknown,
+                ],
+                log: vec!["ERROR HTTP 500".into()],
+            }
+            .into_message(),
+        )
+    }
+
+    fn queued(seq: u64, id: &str, text: &str) -> bondsymphonic_proto::AgentMessage {
+        msg(
+            seq,
+            QueuedPrompt {
+                id: id.into(),
+                text: text.into(),
+            }
+            .into_message(),
+        )
+    }
+
+    fn dequeued(seq: u64, id: &str, outcome: DequeueOutcome) -> bondsymphonic_proto::AgentMessage {
+        msg(
+            seq,
+            DequeuedPrompt {
+                id: id.into(),
+                outcome,
+            }
+            .into_message(),
+        )
+    }
+
+    fn turn_row(
+        seq: u64,
+        subtype: &str,
+        usage: serde_json::Value,
+    ) -> bondsymphonic_proto::AgentMessage {
+        msg(
+            seq,
+            AgentMessageBody::System {
+                subtype: subtype.into(),
+                data: json!({"stopReason":"end_turn","turn_usage":usage}),
+            },
+        )
+    }
+
+    fn result(seq: u64) -> bondsymphonic_proto::AgentMessage {
+        msg(
+            seq,
+            AgentMessageBody::Result {
+                cost_usd: 0.0,
+                duration_ms: 1200,
+                num_turns: 1,
+                session_id: "s".into(),
+            },
+        )
+    }
+
+    /// A structured notice is a row with buttons, the actions this build
+    /// knows and the log behind it; Interrupt is offered only while the turn
+    /// it is about is still running.
+    #[test]
+    fn a_stall_notice_offers_interrupt_until_its_turn_ends() {
+        let mut t = Transcript::default();
+        t.set_state(AgentState::Working, None);
+        assert_eq!(t.apply(&stall(1)), Applied::Appended(0));
+        assert_eq!(
+            t.items[0],
+            TranscriptItem::Notice {
+                text: "No response from the model for 60 s.".into(),
+                notice_kind: "stall".into(),
+                actions: vec!["interrupt".into(), "show_log".into()],
+                log: vec!["ERROR HTTP 500".into()],
+                live: true,
+            }
+        );
+        assert!(t.take_changed().is_empty());
+        t.apply(&turn_row(2, "opencode_turn", json!({})));
+        t.apply(&result(3));
+        assert!(matches!(
+            &t.items[0],
+            TranscriptItem::Notice { live: false, .. }
+        ));
+        assert_eq!(t.take_changed(), vec![0]);
+        assert!(t.take_changed().is_empty(), "taken once");
+        // An empty-turn notice has no Interrupt and is never live.
+        t.apply(&msg(
+            4,
+            AgentNotice {
+                text: "The model returned nothing.".into(),
+                kind: NoticeKind::EmptyTurn,
+                actions: vec![NoticeAction::OpenConfigFolder, NoticeAction::ShowLog],
+                log: vec![],
+            }
+            .into_message(),
+        ));
+        assert!(matches!(
+            t.items.last(),
+            Some(TranscriptItem::Notice { live: false, notice_kind, actions, .. })
+                if notice_kind == "empty_turn" && actions == &["open_config_folder", "show_log"]
+        ));
+    }
+
+    /// A stall notice whose agent stops working without a result -- it exited,
+    /// or failed -- no longer offers Interrupt either.
+    #[test]
+    fn a_stall_notice_is_settled_when_the_agent_stops_working() {
+        let mut t = Transcript::default();
+        t.set_state(AgentState::Working, None);
+        t.apply(&stall(1));
+        t.set_state(AgentState::Error, Some("boom".into()));
+        assert!(matches!(
+            &t.items[0],
+            TranscriptItem::Notice { live: false, .. }
+        ));
+        assert_eq!(t.take_changed(), vec![0]);
+    }
+
+    /// A queued message is pending until the daemon says it was sent or
+    /// discarded. A sent one is followed by its own `UserText`.
+    #[test]
+    fn queued_messages_are_pending_until_sent_or_discarded() {
+        let mut t = Transcript::default();
+        t.set_state(AgentState::Working, None);
+        assert_eq!(t.apply(&queued(1, "q1", "two")), Applied::Appended(0));
+        t.apply(&queued(2, "q2", "three"));
+        assert_eq!(
+            t.items[0],
+            TranscriptItem::Queued {
+                id: "q1".into(),
+                text: "two".into(),
+                status: "pending".into(),
+            }
+        );
+        assert_eq!(
+            t.apply(&dequeued(3, "q1", DequeueOutcome::Sent)),
+            Applied::Changed(0)
+        );
+        assert!(matches!(&t.items[0], TranscriptItem::Queued { status, .. } if status == "sent"));
+        assert_eq!(
+            t.apply(&dequeued(4, "q2", DequeueOutcome::Discarded)),
+            Applied::Changed(1)
+        );
+        assert!(
+            matches!(&t.items[1], TranscriptItem::Queued { status, .. } if status == "discarded")
+        );
+        assert_eq!(
+            t.apply(&dequeued(5, "q9", DequeueOutcome::Sent)),
+            Applied::Nothing
+        );
+    }
+
+    /// An agent that exits never sends what it had queued; nothing it left
+    /// behind offers a button that can only fail. A replay of such an agent
+    /// ends the same way.
+    #[test]
+    fn an_exit_settles_queued_messages_live_and_replayed() {
+        let mut t = Transcript::default();
+        t.set_state(AgentState::Working, None);
+        t.apply(&stall(1));
+        t.apply(&queued(2, "q1", "two"));
+        t.set_state(AgentState::Exited, None);
+        assert!(matches!(&t.items[1], TranscriptItem::Queued { status, .. } if status == "unsent"));
+        assert_eq!(t.take_changed(), vec![0, 1]);
+
+        let mut replayed = Transcript::default();
+        replayed.set_state_from_history(AgentState::Exited, None);
+        replayed.replay(&[stall(1), queued(2, "q1", "two")], &[]);
+        assert!(matches!(
+            &replayed.items[0],
+            TranscriptItem::Notice { live: false, .. }
+        ));
+        assert!(
+            matches!(&replayed.items[1], TranscriptItem::Queued { status, .. } if status == "unsent")
+        );
+        // A replay is followed by a full rebuild, so it reports nothing.
+        assert!(replayed.take_changed().is_empty());
+
+        let mut running = Transcript::default();
+        running.set_state_from_history(AgentState::Working, None);
+        running.replay(&[stall(1)], &[LiveEvent::Message(queued(2, "q1", "two"))]);
+        assert!(matches!(
+            &running.items[0],
+            TranscriptItem::Notice { live: true, .. }
+        ));
+        assert!(
+            matches!(&running.items[1], TranscriptItem::Queued { status, .. } if status == "pending")
+        );
+    }
+
+    /// Codex and OpenCode turns show the tokens their backend reported, and
+    /// the context it says is in use; the cost only when it reported one.
+    #[test]
+    fn reported_usage_is_shown_on_the_result_and_in_the_summary() {
+        let mut t = Transcript::default();
+        assert_eq!(t.usage_summary(), "");
+        t.apply(&turn_row(
+            1,
+            "codex_turn",
+            json!({"input_tokens":15932,"output_tokens":87,"context_tokens":16019,"context_window":258400}),
+        ));
+        t.apply(&result(2));
+        let line = "15.9k in \u{b7} 87 out \u{b7} context 6% of 258k";
+        assert!(
+            matches!(t.items.last(), Some(TranscriptItem::Result { usage: Some(usage), .. }) if usage == line),
+            "{:?}",
+            t.items.last()
+        );
+        assert_eq!(t.usage_summary(), line);
+        assert!(!t.cost_available);
+        t.apply(&turn_row(
+            3,
+            "opencode_turn",
+            json!({"input_tokens":5,"output_tokens":3,"session_cost_usd":0.0123}),
+        ));
+        t.apply(&result(4));
+        assert_eq!(t.usage_summary(), "5 in \u{b7} 3 out \u{b7} $0.0123");
+        // A turn that reported nothing leaves the last summary in place and
+        // is shown as it always was.
+        t.apply(&msg(
+            5,
+            AgentMessageBody::System {
+                subtype: "opencode_turn".into(),
+                data: json!({"stopReason":"end_turn"}),
+            },
+        ));
+        t.apply(&result(6));
+        assert!(
+            matches!(t.items.last(), Some(TranscriptItem::System { text }) if text == "turn completed in 1200 ms")
+        );
+        assert_eq!(t.usage_summary(), "5 in \u{b7} 3 out \u{b7} $0.0123");
+    }
+
+    /// A notice from a daemon that predates the structure is still a plain
+    /// line, exactly as before.
+    #[test]
+    fn an_unstructured_notice_stays_a_system_line() {
+        let mut t = Transcript::default();
+        t.apply(&msg(
+            1,
+            AgentMessageBody::System {
+                subtype: "opencode_notice".into(),
+                data: json!({"text":"Interrupted: 1 queued message was not sent"}),
+            },
+        ));
+        assert!(
+            matches!(&t.items[0], TranscriptItem::System { text } if text.starts_with("Interrupted"))
+        );
+    }
+}

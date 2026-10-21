@@ -22,7 +22,8 @@
 //! This module must never import Qt types.
 
 use bondsymphonic_proto::{
-    AgentAdapterKind, AgentMessage, AgentMessageBody, AgentState, PermissionDecision,
+    AgentAdapterKind, AgentMessage, AgentMessageBody, AgentNotice, AgentState, DequeueOutcome,
+    DequeuedPrompt, NoticeAction, NoticeKind, PermissionDecision, QueuedPrompt, TurnUsage,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -77,9 +78,33 @@ pub enum TranscriptItem {
         cost_usd: f64,
         duration_ms: u64,
         num_turns: u32,
+        /// The tokens the backend reported for the turn, as the line shows
+        /// them, for a backend that reports tokens rather than a cost. The
+        /// view then shows this instead of `cost_usd`, which is not a price.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<String>,
     },
     System {
         text: String,
+    },
+    /// A sentence the adapter wrote for the user, with buttons: `actions` are
+    /// the [`NoticeAction`] words this build knows, `log` what "Show log"
+    /// shows. `live` is true while the turn the notice is about is still
+    /// running, which is when its Interrupt button means anything.
+    Notice {
+        text: String,
+        notice_kind: String,
+        actions: Vec<String>,
+        log: Vec<String>,
+        live: bool,
+    },
+    /// A message waiting behind the turn in flight. `status` is `pending`
+    /// (offer Send now / Discard), `sent` (its `UserText` follows; nothing to
+    /// show here), `discarded`, or `unsent` (the agent ended first).
+    Queued {
+        id: String,
+        text: String,
+        status: String,
     },
     /// The fold: `count` older items held out of the list, and the label the
     /// view paints on the button that puts them back. Only ever the first item,
@@ -289,6 +314,15 @@ pub struct Transcript {
     /// numbers its first message `0` does not have it swallowed by the
     /// duplicate check.
     last_seq: Option<u64>,
+    /// The usage on the turn row just applied, for the `Result` after it.
+    turn_usage: Option<TurnUsage>,
+    /// The last turn's reported usage, and the last session cost a backend
+    /// reported: what [`usage_summary`](Transcript::usage_summary) says.
+    last_usage: Option<TurnUsage>,
+    session_cost: Option<f64>,
+    /// Items changed as a side effect of the last call, besides what it
+    /// returned; see [`take_changed`](Transcript::take_changed).
+    changed: Vec<usize>,
 }
 
 impl Default for Transcript {
@@ -306,6 +340,10 @@ impl Default for Transcript {
             pending: None,
             queued_permissions: VecDeque::new(),
             last_seq: None,
+            turn_usage: None,
+            last_usage: None,
+            session_cost: None,
+            changed: Vec::new(),
         }
     }
 }
@@ -427,6 +465,21 @@ impl Transcript {
                 self.cost_usd += cost_usd;
                 self.turns += num_turns;
                 self.session_id = Some(session_id.clone());
+                // Nothing is running any more for a notice to interrupt.
+                self.settle_notices();
+                if let Some(usage) = self.turn_usage.take() {
+                    if usage.session_cost_usd.is_some() {
+                        self.session_cost = usage.session_cost_usd;
+                    }
+                    let line = usage_line(&usage, self.session_cost);
+                    self.last_usage = Some(usage);
+                    return self.push(TranscriptItem::Result {
+                        cost_usd: *cost_usd,
+                        duration_ms: *duration_ms,
+                        num_turns: *num_turns,
+                        usage: Some(line),
+                    });
+                }
                 if !self.cost_available {
                     return self.push(TranscriptItem::System {
                         text: format!("turn completed in {duration_ms} ms"),
@@ -436,11 +489,13 @@ impl Transcript {
                     cost_usd: *cost_usd,
                     duration_ms: *duration_ms,
                     num_turns: *num_turns,
+                    usage: None,
                 })
             }
             AgentMessageBody::System { subtype, data }
                 if matches!(subtype.as_str(), "codex_turn" | "opencode_turn") =>
             {
+                self.turn_usage = TurnUsage::from_turn_row(&msg.body);
                 self.cost_available = false;
                 let backend = if subtype == "opencode_turn" {
                     "OpenCode"
@@ -455,15 +510,57 @@ impl Transcript {
                 })
             }
             // Sentences the OpenCode adapter writes for the user: an empty
-            // turn, a silent model, messages an interrupt discarded.
-            AgentMessageBody::System { subtype, data } if subtype == "opencode_notice" => self
-                .push(TranscriptItem::System {
-                    text: data
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                }),
+            // turn, a silent model, messages an interrupt discarded. One with
+            // nothing to offer -- all a daemon before the structure wrote --
+            // is a plain line.
+            AgentMessageBody::System { subtype, data } if subtype == "opencode_notice" => {
+                match AgentNotice::from_message(&msg.body) {
+                    Some(notice)
+                        if notice.kind != NoticeKind::Other || !notice.actions.is_empty() =>
+                    {
+                        self.push(notice_item(notice))
+                    }
+                    _ => self.push(TranscriptItem::System {
+                        text: data
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    }),
+                }
+            }
+            AgentMessageBody::System { subtype, .. }
+                if subtype == bondsymphonic_proto::PROMPT_QUEUED_SUBTYPE =>
+            {
+                match QueuedPrompt::from_message(&msg.body) {
+                    Some(queued) => self.push(TranscriptItem::Queued {
+                        id: queued.id,
+                        text: queued.text,
+                        status: "pending".into(),
+                    }),
+                    None => Applied::Nothing,
+                }
+            }
+            AgentMessageBody::System { subtype, .. }
+                if subtype == bondsymphonic_proto::PROMPT_DEQUEUED_SUBTYPE =>
+            {
+                let Some(done) = DequeuedPrompt::from_message(&msg.body) else {
+                    return Applied::Nothing;
+                };
+                let status = match done.outcome {
+                    DequeueOutcome::Sent => "sent",
+                    DequeueOutcome::Discarded => "discarded",
+                };
+                match self.find_pending_queued(&done.id) {
+                    Some(i) => {
+                        if let TranscriptItem::Queued { status: s, .. } = &mut self.items[i] {
+                            *s = status.into();
+                        }
+                        Applied::Changed(i)
+                    }
+                    None => Applied::Nothing,
+                }
+            }
             // One stretch of the model's reasoning, coalesced by the adapter.
             AgentMessageBody::System { subtype, data } if subtype == "opencode_reasoning" => {
                 let text = data.get("text").and_then(Value::as_str).unwrap_or_default();
@@ -532,6 +629,75 @@ impl Transcript {
             self.queued_permissions.clear();
         }
         self.record_state(state, detail);
+        self.settle_for_state();
+    }
+
+    /// The indices of items changed as a side effect of the calls since the
+    /// last time this was asked -- a notice that can no longer interrupt, a
+    /// queued message the agent will never send -- for the view to repaint.
+    /// [`apply`](Transcript::apply) reports only the item the message itself
+    /// made or changed.
+    pub fn take_changed(&mut self) -> Vec<usize> {
+        let mut changed = std::mem::take(&mut self.changed);
+        changed.sort_unstable();
+        changed.dedup();
+        changed
+    }
+
+    /// What the backend last reported about tokens and cost, for the status
+    /// bar, or empty when it has reported nothing.
+    pub fn usage_summary(&self) -> String {
+        match &self.last_usage {
+            Some(usage) => usage_line(usage, self.session_cost),
+            None => self
+                .session_cost
+                .map(|cost| format!("${cost:.4}"))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Takes away what the state makes meaningless: Interrupt on a notice once
+    /// nothing is running, and the buttons on queued messages once the agent
+    /// has ended and will never send them.
+    fn settle_for_state(&mut self) {
+        let running = matches!(
+            self.state,
+            TabAgentState::Known(AgentState::Working | AgentState::WaitingPermission)
+        );
+        if !running && self.state != TabAgentState::Unknown {
+            self.settle_notices();
+        }
+        if self.state.is(AgentState::Exited) {
+            for (i, item) in self.items.iter_mut().enumerate() {
+                if let TranscriptItem::Queued { status, .. } = item {
+                    if status == "pending" {
+                        *status = "unsent".into();
+                        self.changed.push(i);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Marks every notice that offered Interrupt as no longer able to.
+    fn settle_notices(&mut self) {
+        for (i, item) in self.items.iter_mut().enumerate() {
+            if let TranscriptItem::Notice {
+                live: live @ true, ..
+            } = item
+            {
+                *live = false;
+                self.changed.push(i);
+            }
+        }
+    }
+
+    /// The queued message `id` that is still waiting, searched from the end.
+    fn find_pending_queued(&self, id: &str) -> Option<usize> {
+        self.items.iter().rposition(|item| {
+            matches!(item, TranscriptItem::Queued { id: existing, status, .. }
+                if existing == id && status == "pending")
+        })
     }
 
     /// The state `agent.history` came back with, applied before the fold in
@@ -603,6 +769,10 @@ impl Transcript {
             self.pending = None;
             self.queued_permissions.clear();
         }
+        // The same last word for notices and queued messages. The caller
+        // rebuilds the whole view after a replay, so nothing is reported.
+        self.settle_for_state();
+        self.changed.clear();
         applied
     }
 
@@ -888,6 +1058,73 @@ impl Transcript {
             }
         }
         changed
+    }
+}
+
+/// The row for a structured notice: the actions this build knows, in the
+/// daemon's order, and Interrupt's turn still running when it arrives.
+fn notice_item(notice: AgentNotice) -> TranscriptItem {
+    fn word(value: &impl Serialize) -> String {
+        serde_json::to_value(value)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default()
+    }
+    let actions: Vec<String> = notice
+        .actions
+        .iter()
+        .filter(|action| **action != NoticeAction::Unknown)
+        .map(word)
+        .collect();
+    TranscriptItem::Notice {
+        live: notice.actions.contains(&NoticeAction::Interrupt),
+        notice_kind: word(&notice.kind),
+        text: notice.text,
+        actions,
+        log: notice.log,
+    }
+}
+
+/// "15.9k in · 87 out · context 6% of 258k · $0.0123": what a backend
+/// reported for a turn, and the session's cost when it reported one. Only
+/// what was reported is shown.
+fn usage_line(usage: &TurnUsage, session_cost: Option<f64>) -> String {
+    let mut parts = vec![];
+    if let Some(input) = usage.input_tokens {
+        parts.push(format!("{} in", count(input)));
+    }
+    if let Some(output) = usage.output_tokens {
+        parts.push(format!("{} out", count(output)));
+    }
+    match (usage.context_tokens, usage.context_window) {
+        (Some(used), Some(window)) if window > 0 => parts.push(format!(
+            "context {}% of {}",
+            (used as f64 * 100.0 / window as f64).round() as u64,
+            count(window)
+        )),
+        (Some(used), _) => parts.push(format!("context {}", count(used))),
+        _ => {}
+    }
+    if let Some(cost) = session_cost {
+        parts.push(format!("${cost:.4}"));
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// A token count as people read one: 87, 15.9k, 258k, 1.2M.
+fn count(n: u64) -> String {
+    let short = |value: f64, unit: &str| {
+        let text = if value < 100.0 {
+            format!("{value:.1}")
+        } else {
+            format!("{value:.0}")
+        };
+        format!("{}{unit}", text.trim_end_matches(".0"))
+    };
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => short(n as f64 / 1_000.0, "k"),
+        _ => short(n as f64 / 1_000_000.0, "M"),
     }
 }
 
