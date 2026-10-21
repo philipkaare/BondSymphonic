@@ -125,12 +125,23 @@ pub fn describe(op: &str, message: &str, options_json: Option<&str>) -> AgentFai
                 .to_owned(),
         )
     } else if code.is_none() && lower.ends_with("request timed out") {
-        (
-            FailureKind::Timeout,
-            "The daemon didn't answer in time. The agent may still be starting: retry in a \
-             moment, or open the log to see what it is waiting on."
-                .to_owned(),
-        )
+        let detail = match op {
+            "agent.start" => {
+                "The daemon didn't answer in time, and the agent may still be starting. Check \
+                 the pane before starting it again; if nothing changes, reconnect or open the \
+                 log to see what it is waiting on."
+            }
+            "agent.send" => {
+                "The daemon didn't answer in time, and your message may still reach the agent. \
+                 Check the pane before sending it again; if nothing changes, reconnect or open \
+                 the log."
+            }
+            _ => {
+                "The daemon didn't answer in time. Retry in a moment, or open the log to see \
+                 what it is waiting on."
+            }
+        };
+        (FailureKind::Timeout, detail.to_owned())
     } else if code.is_none()
         && (lower == "disconnected"
             || lower.starts_with("io: ")
@@ -217,7 +228,14 @@ pub fn describe(op: &str, message: &str, options_json: Option<&str>) -> AgentFai
             kind,
             FailureKind::Agent | FailureKind::Protocol | FailureKind::Unknown | FailureKind::Gone
         );
-    let retry = !ide_daemon_mismatch && kind != FailureKind::Gone && op != "agent.history";
+    // A start or a message that timed out may still complete in the daemon;
+    // repeating it would start a second agent or send the prompt twice.
+    let may_still_complete =
+        kind == FailureKind::Timeout && matches!(op, "agent.start" | "agent.send");
+    let retry = !ide_daemon_mismatch
+        && kind != FailureKind::Gone
+        && op != "agent.history"
+        && !may_still_complete;
     AgentFailure {
         op: op.to_owned(),
         kind,

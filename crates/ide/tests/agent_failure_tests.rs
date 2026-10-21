@@ -93,7 +93,7 @@ fn a_sign_in_failure_points_at_setup() {
 
 #[test]
 fn a_timeout_and_a_lost_connection_are_retryable_and_point_at_the_log() {
-    let f = describe("agent.start", "request timed out", None);
+    let f = describe("agent.interrupt", "request timed out", None);
     assert_eq!(f.kind, FailureKind::Timeout);
     assert!(f.retry && f.open_log);
 
@@ -209,10 +209,10 @@ fn transcript_requests_are_named_for_what_the_user_did() {
 
 #[test]
 fn the_view_crosses_to_cpp_as_json() {
-    let f = describe("agent.start", "request timed out", Some("{}"));
+    let f = describe("agent.start", "rpc: SandboxError: bwrap exited", Some("{}"));
     let v: serde_json::Value = serde_json::from_str(&f.to_json()).unwrap();
     assert_eq!(v["op"], "agent.start");
-    assert_eq!(v["kind"], "timeout");
+    assert_eq!(v["kind"], "sandbox");
     assert_eq!(v["retry"], true);
     assert_eq!(v["start_fresh"], false);
     assert_eq!(v["open_log"], true);
@@ -241,4 +241,21 @@ fn a_failed_queued_message_action_says_what_did_not_happen() {
     assert_eq!(f.title, "The queued message couldn't be changed.");
     assert_plain(&f.title);
     assert_plain(&f.detail);
+}
+
+/// A start or a message the daemon did not answer in time may still go
+/// through: Retry would start a second agent or send the prompt twice, so the
+/// pane offers none and says to look before trying again.
+#[test]
+fn a_timed_out_start_or_send_offers_no_retry_and_says_it_may_still_complete() {
+    for op in ["agent.start", "agent.send"] {
+        let f = describe(op, "request timed out", Some("{}"));
+        assert_eq!(f.kind, FailureKind::Timeout, "{op}");
+        assert!(!f.retry, "{op}");
+        assert!(f.open_log, "{op}");
+        assert!(f.detail.contains("may still"), "{op}: {}", f.detail);
+        assert!(f.detail.contains("reconnect"), "{op}: {}", f.detail);
+        assert!(!f.detail.contains("retry"), "{op}: {}", f.detail);
+        assert_plain(&f.detail);
+    }
 }
