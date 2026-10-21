@@ -147,6 +147,7 @@ fn connects_and_quits_against_a_fake_daemon(exe: &PathBuf) {
         .env("BS_SMOKE_SCRIPT", SCRIPT)
         .env("BS_SETTINGS_PATH", config.join("settings.json"))
         .env("BS_STATE_PATH", config.join("state.json"))
+        .env("BS_LOG_DIR", config.join("logs"))
         .env("BS_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

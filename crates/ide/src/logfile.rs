@@ -32,6 +32,12 @@ pub const FILTER_ENV: &str = "BS_LOG";
 /// output, which is what the IDE did before the file existed.
 pub const FILE_ENV: &str = "BS_LOG_FILE";
 
+/// Set and non-empty, the directory the log files go to instead of the
+/// per-user one. A test hook like `BS_STATE_PATH`: every launch rotates the
+/// previous launch's `ide.log` out, so a test that launched the IDE against the
+/// real folder threw away the user's own last launch log.
+pub const DIR_ENV: &str = "BS_LOG_DIR";
+
 /// This launch's log.
 pub const CURRENT: &str = "ide.log";
 
@@ -44,6 +50,19 @@ pub const PREVIOUS: &str = "ide.1.log";
 /// about this machine, and nothing is gained by syncing it to another.
 pub fn log_dir(data_local_dir: &Path) -> PathBuf {
     data_local_dir.join("BondSymphonic").join("logs")
+}
+
+/// The directory to log to: `override_dir` (the value of [`DIR_ENV`]) when it
+/// is set and non-empty, otherwise [`log_dir`] under `data_local_dir`, and
+/// `None` when there is neither.
+pub fn resolve_dir(
+    override_dir: Option<std::ffi::OsString>,
+    data_local_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    match override_dir {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => data_local_dir.map(log_dir),
+    }
 }
 
 /// The path this launch writes to, under `dir`.
@@ -135,13 +154,19 @@ pub fn subscriber(
 
 /// Installs the global subscriber for this process: [`FILTER_ENV`] as the
 /// filter, the console, and unless [`FILE_ENV`] turns it off, the file under
-/// the per-user local data directory. A file that cannot be opened is one
+/// [`DIR_ENV`] or else the per-user local data directory. A file that cannot be opened is one
 /// warning on the console and otherwise ignored; the IDE never fails to start
 /// over its own log.
 pub fn init() {
     let filter = EnvFilter::new(std::env::var(FILTER_ENV).unwrap_or_else(|_| "info".into()));
     let dir = file_enabled()
-        .then(|| directories::BaseDirs::new().map(|d| log_dir(d.data_local_dir())))
+        .then(|| {
+            let base = directories::BaseDirs::new();
+            resolve_dir(
+                std::env::var_os(DIR_ENV),
+                base.as_ref().map(|d| d.data_local_dir()),
+            )
+        })
         .flatten();
     let (subscriber, outcome) = subscriber(filter, dir.as_deref());
     subscriber.init();
@@ -183,6 +208,23 @@ mod tests {
             PathBuf::from(r"C:\Users\someone\AppData\Local\BondSymphonic\logs")
         );
         assert_eq!(log_path(&log_dir(base)), log_dir(base).join("ide.log"));
+    }
+
+    #[test]
+    fn the_dir_override_wins_over_the_local_data_dir() {
+        let base = Path::new(r"C:\Users\someone\AppData\Local");
+        let elsewhere = std::ffi::OsString::from(r"C:\Temp\bs-test-logs");
+        assert_eq!(
+            resolve_dir(Some(elsewhere), Some(base)),
+            Some(PathBuf::from(r"C:\Temp\bs-test-logs"))
+        );
+        // Unset or empty, the per-user folder as before.
+        assert_eq!(resolve_dir(None, Some(base)), Some(log_dir(base)));
+        assert_eq!(
+            resolve_dir(Some(std::ffi::OsString::new()), Some(base)),
+            Some(log_dir(base))
+        );
+        assert_eq!(resolve_dir(None, None), None);
     }
 
     #[test]

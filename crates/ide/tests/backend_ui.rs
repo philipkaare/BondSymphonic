@@ -81,6 +81,7 @@ fn check_backend_auth(early: bool) {
         .env("BS_MENU_TEST", "backend-auth")
         .env("BS_SETTINGS_PATH", config.join("settings.json"))
         .env("BS_STATE_PATH", config.join("state.json"))
+        .env("BS_LOG_DIR", config.join("logs"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -1410,8 +1410,13 @@ nothing when unset, which is every ordinary run.
 - **`BS_PACKAGED_EXE`**: the built `dist\BondSymphonic\bondsymphonic-ide.exe`
   that `crates/ide/tests/packaged_smoke.rs` exercises. Unset, that test skips.
 - **`BS_LOG`**: the `tracing` filter for the IDE's own log stream, which also
-- **`BS_LOG_FILE`**: `0` or empty turns off `%LOCALAPPDATA%\BondSymphonic\logs\ide.log`; unset, the file is written and rotated on every launch.
   carries the daemon's.
+- **`BS_LOG_FILE`**: `0` or empty turns off `%LOCALAPPDATA%\BondSymphonic\logs\ide.log`; unset, the file is written and rotated on every launch.
+- **`BS_LOG_DIR`**: the directory `ide.log` and `ide.1.log` go to instead of
+  `%LOCALAPPDATA%\BondSymphonic\logs`. Every launch rotates the previous log
+  out, so every test that launches the IDE points this at a directory of its
+  own, beside `BS_STATE_PATH`, and never rotates away the developer's real
+  launch log; `crates/ide/tests/log_isolation.rs` checks that each one does.
 
 One more hook belongs to the fake daemons in the tests rather than to the IDE: a
 request whose method is `system.test_drop` makes them close the connection
