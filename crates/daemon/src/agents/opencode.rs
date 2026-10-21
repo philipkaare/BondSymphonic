@@ -1008,9 +1008,7 @@ impl AgentAdapter for OpenCodeAdapter {
             let at = queue
                 .iter()
                 .position(|queued| queued.id == prompt_id)
-                .ok_or_else(|| {
-                    RpcError::invalid_params("That message was already sent or discarded")
-                })?;
+                .ok_or_else(RpcError::queued_prompt_settled)?;
             queue.remove(at).expect("position is in range")
         };
         match action {

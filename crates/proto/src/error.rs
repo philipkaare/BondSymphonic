@@ -69,6 +69,27 @@ impl RpcError {
             "client": client,
         }))
     }
+
+    /// The answer to `agent.queued_prompt` for a message that is no longer
+    /// queued: the worker sent it, or it was discarded, just before the
+    /// request arrived. A race the user lost by a moment, not a failure, so it
+    /// is marked for the client to let pass.
+    pub fn queued_prompt_settled() -> Self {
+        Self::invalid_params("That message was already sent or discarded")
+            .with_data(serde_json::json!({ "reason": QUEUED_PROMPT_SETTLED_REASON }))
+    }
+}
+
+/// The `data.reason` a [`RpcError::queued_prompt_settled`] carries.
+pub const QUEUED_PROMPT_SETTLED_REASON: &str = "queued_prompt_settled";
+
+/// Whether `err` is a [`RpcError::queued_prompt_settled`].
+pub fn is_queued_prompt_settled(err: &RpcError) -> bool {
+    err.data
+        .as_ref()
+        .and_then(|data| data.get("reason"))
+        .and_then(Value::as_str)
+        == Some(QUEUED_PROMPT_SETTLED_REASON)
 }
 
 /// The `data.reason` a [`RpcError::protocol_mismatch`] carries. Written by the

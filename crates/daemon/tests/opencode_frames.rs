@@ -498,12 +498,15 @@ async fn a_queued_message_can_be_sent_now_or_discarded() {
             (ids[1].clone(), DequeueOutcome::Sent)
         ]
     );
+    // Already settled: refused, and marked as the race it is rather than a
+    // failure for the IDE to raise.
     for id in [&ids[1], &ids[2]] {
-        assert!(f
+        let refused = f
             .adapter
             .queued_prompt(id.clone(), QueuedPromptAction::Discard)
             .await
-            .is_err());
+            .unwrap_err();
+        assert!(is_queued_prompt_settled(&refused), "{refused:?}");
     }
     // "two" is still queued behind "three", and runs after it.
     f.adapter.interrupt().await.unwrap();

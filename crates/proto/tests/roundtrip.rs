@@ -921,3 +921,24 @@ mod notices_queue_usage {
         assert_eq!(TurnUsage::from_turn_row(&old_row), None);
     }
 }
+
+/// Send now or Discard on a queued message the worker has just taken is a
+/// race, not a failure: the refusal says so in `data.reason`, which survives
+/// the wire, so the IDE can let it pass without parsing the message.
+#[test]
+fn a_settled_queued_prompt_is_recognisable_after_the_wire() {
+    let err = RpcError::queued_prompt_settled();
+    assert_eq!(err.code, ErrorCode::InvalidParams);
+    let back: RpcError = serde_json::from_str(&serde_json::to_string(&err).unwrap()).unwrap();
+    assert_eq!(
+        back.data.as_ref().unwrap()["reason"],
+        QUEUED_PROMPT_SETTLED_REASON
+    );
+    assert!(is_queued_prompt_settled(&back));
+    assert!(!is_queued_prompt_settled(&RpcError::invalid_params(
+        "That message was already sent or discarded"
+    )));
+    assert!(!is_queued_prompt_settled(&RpcError::protocol_mismatch(
+        4, 3
+    )));
+}
