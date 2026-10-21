@@ -5975,3 +5975,267 @@ mod claude_auth_override {
         info
     }
 }
+
+/// A workspace created with an agent gets exactly one `agent.start`.
+///
+/// `createWorkspaceWithAgentAndRun` raises the tab as soon as `workspace.create`
+/// answers and starts the agent behind it. The workspace's `Ready` event can
+/// reach the window after that tab exists and before the start has answered,
+/// and every workspace change asks the window to start an agent in each ready
+/// tab that has none -- which this tab, for the length of the start, is. The
+/// second `agent.start` it sent was refused by the daemon with "another
+/// operation is running in this workspace", and shown to the user as a failure
+/// of an agent that was in fact starting; had the two arrived the other way
+/// round, the refused one would have been the creation's own, whose failure
+/// removes the workspace the other had just started an agent in.
+///
+/// The fake daemon publishes `Ready` just after the create's reply and holds
+/// the start's reply for a second and a half, so the window sees the event with
+/// the start in flight every time rather than on an unlucky day.
+mod one_start_per_create {
+    use super::*;
+
+    const SCRIPT: &str = "create_agent,wait,quit";
+    const WORKSPACE: &str = "ws_once1";
+    const AGENT: &str = "ag_once1";
+    const READY_DELAY: Duration = Duration::from_millis(100);
+    const START_DELAY: Duration = Duration::from_millis(1_500);
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+    type Journal = Arc<Mutex<Vec<String>>>;
+
+    #[test]
+    fn a_workspace_created_with_an_agent_is_sent_one_agent_start() {
+        if bondsymphonic_ide::testing::skip_without_qt("one agent.start per create") {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (addr, journal) = rt.block_on(fake_daemon());
+
+        // Never the developer's real settings or session file.
+        let config = std::env::temp_dir().join(format!("bs-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("config dir");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", SCRIPT)
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", config.join("state.json"))
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let seen = journal.lock().expect("journal mutex").clone();
+        let context = format!("requests: {seen:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(
+            status.success(),
+            "the IDE exited with {status}, expected 0\n{context}"
+        );
+        assert!(
+            seen.iter().any(|m| m == "workspace.create"),
+            "the window never created the workspace, so this run proves nothing\n{context}"
+        );
+        let starts = seen.iter().filter(|m| *m == "agent.start").count();
+        assert_eq!(
+            starts, 1,
+            "one create with an agent must send exactly one agent.start\n{context}"
+        );
+        assert!(
+            !seen.iter().any(|m| m == "workspace.destroy"),
+            "the new workspace was rolled back\n{context}"
+        );
+
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let recorded = journal.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let (r, w) = stream.into_split();
+                    let w = Arc::new(tokio::sync::Mutex::new(w));
+                    let mut r = BufReader::new(r);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match r.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        let ClientMessage::Request { id, request } =
+                            codec::decode(line.trim_end()).expect("decode");
+                        recorded
+                            .lock()
+                            .expect("journal mutex")
+                            .push(request.method_name().to_owned());
+                        // What goes out after the reply, and how long after.
+                        let mut later: Vec<ServerMessage> = Vec::new();
+                        let mut delay = Duration::ZERO;
+                        let reply = match request {
+                            Request::Hello(p) if p.token == TOKEN => Some(ServerMessage::ok(
+                                id,
+                                &HelloResult {
+                                    daemon_version: "0.0.0-fake".into(),
+                                    capabilities: Capabilities {
+                                        backends: vec![],
+                                        sandbox_backend: "noop".into(),
+                                        git_protect: false,
+                                        adapters: vec![
+                                            AgentAdapterKind::Claude,
+                                            AgentAdapterKind::Terminal,
+                                        ],
+                                    },
+                                    protocol_version: Some(PROTOCOL_VERSION),
+                                },
+                            )),
+                            Request::Hello(_) => {
+                                Some(ServerMessage::err(id, RpcError::unauthorized()))
+                            }
+                            Request::SystemCheckPrereqs {} => Some(ServerMessage::ok(
+                                id,
+                                &CheckPrereqsResult {
+                                    items: vec![PrereqStatus {
+                                        name: "claude_auth".into(),
+                                        ok: true,
+                                        detail: "logged in to Claude".into(),
+                                        fix_hint: None,
+                                    }],
+                                },
+                            )),
+                            Request::WorkspaceList {} => Some(ServerMessage::ok(
+                                id,
+                                &WorkspaceListResult { workspaces: vec![] },
+                            )),
+                            // Answered `Ready`, as the real daemon does, and
+                            // then the `Ready` event its `set_state` published
+                            // -- arriving, as it can, after the reply.
+                            Request::WorkspaceCreate(p) => {
+                                let ready = super::workspace(
+                                    WORKSPACE,
+                                    &p.name,
+                                    WorkspaceState::Ready,
+                                    &[],
+                                );
+                                delay = READY_DELAY;
+                                later.push(ServerMessage::event(
+                                    Some(WorkspaceId(WORKSPACE.to_owned())),
+                                    Event::WorkspaceStateChanged {
+                                        info: Box::new(ready.clone()),
+                                    },
+                                ));
+                                Some(ServerMessage::ok(id, &ready))
+                            }
+                            // A start that takes its time, the way one that
+                            // copies credentials and spawns a CLI does: the
+                            // reply goes out later, and nothing goes out now.
+                            Request::AgentStart(_) => {
+                                delay = START_DELAY;
+                                later.push(ServerMessage::ok(
+                                    id,
+                                    &AgentStartResult {
+                                        agent_id: AgentId(AGENT.to_owned()),
+                                    },
+                                ));
+                                None
+                            }
+                            Request::AgentHistory(_) => Some(ServerMessage::ok(
+                                id,
+                                &HistoryResult {
+                                    messages: vec![],
+                                    state: AgentState::Idle,
+                                    detail: None,
+                                },
+                            )),
+                            Request::WorkspaceDestroy(_) => Some(ServerMessage::ok(id, &Empty {})),
+                            Request::FsListDir(_) => {
+                                Some(ServerMessage::ok(id, &ListDirResult { entries: vec![] }))
+                            }
+                            Request::FsWatch(_) => Some(ServerMessage::ok(id, &Empty {})),
+                            Request::WorkspaceChanges(_) => {
+                                Some(ServerMessage::ok(id, &ChangesResult { files: vec![] }))
+                            }
+                            Request::WorkspaceStatus(_) => Some(ServerMessage::ok(
+                                id,
+                                &WorkspaceStatusResult { entries: vec![] },
+                            )),
+                            Request::RepoDetectRunConfigs(_) => Some(ServerMessage::ok(
+                                id,
+                                &DetectRunConfigsResult {
+                                    configs: vec![],
+                                    network_allow: vec![],
+                                    warnings: vec![],
+                                },
+                            )),
+                            Request::RunList(_) => {
+                                Some(ServerMessage::ok(id, &RunListResult { runs: vec![] }))
+                            }
+                            other => Some(ServerMessage::err(
+                                id,
+                                RpcError::internal(format!(
+                                    "not implemented: {}",
+                                    other.method_name()
+                                )),
+                            )),
+                        };
+                        if let Some(reply) = reply {
+                            if w.lock()
+                                .await
+                                .write_all(codec::encode(&reply).as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        if later.is_empty() {
+                            continue;
+                        }
+                        let w = w.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let mut w = w.lock().await;
+                            for message in later {
+                                if w.write_all(codec::encode(&message).as_bytes())
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        });
+
+        (addr, journal)
+    }
+}

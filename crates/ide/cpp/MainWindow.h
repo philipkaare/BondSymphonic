@@ -433,7 +433,8 @@ private:
     bool m_seamSelecting = false;
     int m_seamSelects = 0;
 
-    /// Workspaces whose automatic `agent.start` is still in flight.
+    /// Workspaces whose automatic `agent.start` is still in flight, or whose
+    /// creation's own start is (booked on `workspaceCreated`).
     ///
     /// [`startAgentsThatHaveNone`] runs on every workspace change, because a
     /// sandbox that was not up on the first pass usually is on a later one. A

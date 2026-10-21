@@ -996,7 +996,22 @@ void MainWindow::connectController() {
                          // already on its way, and the tab is shown before that
                          // answers. The pane has to know, or it offers a Start
                          // button for a start that is already running.
+                         //
+                         // And the window has to know too. The tab has no
+                         // agent until that start answers, and the `Ready`
+                         // event can arrive in between -- after the create's
+                         // reply, since events and answers travel apart --
+                         // where `startAgentsThatHaveNone` saw a ready tab
+                         // without an agent and sent a second `agent.start`.
+                         // The daemon refused it ("another operation is running
+                         // in this workspace") and the user was told the agent
+                         // had failed to start while it was starting; the other
+                         // way round, the refused start was the creation's own,
+                         // whose failure removes the new workspace. Booked like
+                         // any start the window sends, and cleared the same
+                         // way: `agentStarted` or an `agent.start` failure.
                          if (adapter != QLatin1String("terminal")) {
+                             m_autoStarting.insert(workspaceId);
                              m_agentArea->setStarting(workspaceId, true);
                          }
                          // The repository the user actually created something

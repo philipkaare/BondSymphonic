@@ -268,6 +268,7 @@ pub(crate) async fn run(steps: Vec<String>, mut client: DaemonClient, qt: QtHand
             "pr" => pr(&qt, workspace.as_ref()).await,
             "destroy" => destroy(&client, &qt, workspace.take()).await,
             "reconnect" => reconnect(&client).await.map(|fresh| client = fresh),
+            "create_agent" => create_agent(&qt, &repo).await,
             "wait" => {
                 tokio::time::sleep(WAIT_SETTLE).await;
                 Ok(())
@@ -286,6 +287,30 @@ pub(crate) async fn run(steps: Vec<String>, mut client: DaemonClient, qt: QtHand
 /// a terminal pane for one and a transcript pane for the other.
 const TERMINAL_ADAPTER: &str = "terminal";
 const CLAUDE_ADAPTER: &str = "claude";
+
+/// Creates a Claude workspace the way the New Agent dialog does: through
+/// `createWorkspaceWithAgentAndRun`, so the window's own agent start follows
+/// the create. Unlike `create_claude`, nothing here starts the agent; whatever
+/// `agent.start` reaches the daemon is the window's doing.
+async fn create_agent(qt: &QtHandle, repo: &str) -> Result<(), String> {
+    let repo = repo.to_owned();
+    qt.queue(move |q| {
+        q.create_workspace_with_agent_and_run(
+            QString::from(&repo),
+            QString::from(BASE_BRANCH),
+            QString::from("smoke-agent"),
+            QString::from(GROUP),
+            QString::from(r#"{"adapter":"claude"}"#),
+            QString::from(""),
+            QString::from(""),
+            false,
+            false,
+        )
+    })
+    .map_err(|_| "the Qt thread is gone".to_owned())?;
+    tokio::time::sleep(CREATE_SETTLE).await;
+    Ok(())
+}
 
 /// Opt-in live check using the actual controller, pane and daemon. Its caller
 /// must supply a disposable repository and daemon data directory.
