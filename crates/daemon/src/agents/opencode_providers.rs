@@ -652,21 +652,54 @@ async fn http_get(
         request.push_str(&format!("Authorization: Bearer {key}\r\n"));
     }
     request.push_str("\r\n");
-    let exchange = async {
-        stream.write_all(request.as_bytes()).await?;
-        let mut bytes = Vec::new();
-        (&mut stream)
-            .take(BODY_LIMIT as u64)
-            .read_to_end(&mut bytes)
-            .await?;
-        Ok::<_, std::io::Error>(bytes)
-    };
-    let bytes = match tokio::time::timeout(timeout, exchange).await {
-        Ok(Ok(bytes)) => bytes,
+    let deadline = tokio::time::Instant::now() + timeout;
+    match tokio::time::timeout_at(deadline, stream.write_all(request.as_bytes())).await {
+        Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(Fetch::Other(e.to_string())),
         Err(_) => return Err(Fetch::Timeout),
-    };
+    }
+    // Read until the response is whole, not until the server hangs up: one
+    // that keeps the connection open despite `Connection: close` has still
+    // answered. Out of time with the head in hand is an answer too.
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while !response_complete(&bytes) && bytes.len() < BODY_LIMIT {
+        match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => bytes.extend_from_slice(&chunk[..n]),
+            Ok(Err(_)) | Err(_) if head_end(&bytes).is_some() => break,
+            Ok(Err(e)) => return Err(Fetch::Other(e.to_string())),
+            Err(_) => return Err(Fetch::Timeout),
+        }
+    }
     parse_response(&bytes).ok_or_else(|| Fetch::Other("the answer is not HTTP".into()))
+}
+
+/// Where a response's head ends, once it has.
+fn head_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Whether `bytes` hold a whole response: its `Content-Length` worth of body,
+/// or a chunked body's last chunk. Without either it ends at the hang-up.
+fn response_complete(bytes: &[u8]) -> bool {
+    let Some(end) = head_end(bytes) else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+    let body = &bytes[end + 4..];
+    let header = |name: &str| {
+        head.split("\r\n").skip(1).find_map(|line| {
+            let (n, v) = line.split_once(':')?;
+            (n.trim() == name).then(|| v.trim().to_owned())
+        })
+    };
+    if header("transfer-encoding").is_some_and(|v| v.contains("chunked")) {
+        return body.ends_with(b"0\r\n\r\n");
+    }
+    header("content-length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|len| body.len() >= len)
 }
 
 /// The status and body of a whole HTTP/1.x response.
@@ -869,6 +902,10 @@ mod tests {
                         return;
                     }
                     let _ = s.write_all(response.as_bytes()).await;
+                    if response.contains("keep-alive") {
+                        // Holds the connection open after answering.
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
                 });
             }
         });
@@ -1156,5 +1193,26 @@ mod tests {
             test(&dir, "missing").await.outcome,
             ProviderTestOutcome::Failed
         );
+    }
+
+    /// A server that keeps the connection open after a whole answer has
+    /// answered; waiting for it to hang up would call that a timeout.
+    #[tokio::test]
+    async fn a_whole_answer_on_a_kept_alive_connection_is_an_answer() {
+        let (port, _) = server(
+            "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 21\r\n\r\n{\"data\":[{\"id\":\"m\"}]}",
+        )
+        .await;
+        let dir = config(&format!(
+            r#"{{"provider":{{"k":{{"options":{{"baseURL":"http://127.0.0.1:{port}/v1"}}}}}}}}"#
+        ));
+        let result = test(&dir, "k").await;
+        assert_eq!(
+            result.outcome,
+            ProviderTestOutcome::Reachable,
+            "{}",
+            result.message
+        );
+        assert_eq!(result.model_ids, ["m"]);
     }
 }
