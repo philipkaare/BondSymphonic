@@ -346,6 +346,42 @@ fn report(qt: &QtHandle, message: String) {
     let _ = qt.queue(move |q| q.error_occurred(QString::from(&message)));
 }
 
+/// Adds `host` to `workspace`'s allowlist: what both the toast's "Allow host"
+/// and a transcript's inline "Allow" do. The error is the sentence to show.
+///
+/// The daemon's own list is read at the moment of the click: an allowlist
+/// edited elsewhere (the repo's `bondsymphonic.toml` at creation, another
+/// window) must be extended, not replaced by a stale copy that would silently
+/// un-allow hosts.
+pub async fn add_host_to_allowlist(
+    shared: &Shared,
+    workspace: &str,
+    host: &str,
+) -> Result<(), String> {
+    let params = WorkspaceIdParams {
+        workspace_id: WorkspaceId(workspace.to_owned()),
+    };
+    let mut hosts = shared
+        .client
+        .request::<WorkspaceInfo>(Request::WorkspaceGet(params))
+        .await
+        .map_err(|e| format!("workspace.get failed: {e}"))?
+        .allowlist;
+    if !hosts.iter().any(|h| h == host) {
+        hosts.push(host.to_owned());
+    }
+    let params = WorkspaceSetAllowlistParams {
+        workspace_id: WorkspaceId(workspace.to_owned()),
+        hosts,
+    };
+    shared
+        .client
+        .request_raw(Request::WorkspaceSetAllowlist(params))
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("workspace.set_allowlist failed: {e}"))
+}
+
 /// Detects the configurations of `worktree` and lists `workspace`'s runs, then
 /// applies both in one closure so the combo and the run list never disagree.
 ///
@@ -608,51 +644,16 @@ impl qobject::RunPanelModel {
         let qt = self.as_ref().qt_thread();
         self.as_mut().begin_request();
         runtime().spawn(async move {
-            // The daemon's own list, read at the moment of the click: an
-            // allowlist edited elsewhere (the repo's `bondsymphonic.toml` at
-            // creation, another window) must be extended, not replaced by a
-            // stale copy that would silently un-allow hosts.
-            let params = WorkspaceIdParams {
-                workspace_id: WorkspaceId(workspace.clone()),
-            };
-            let mut hosts = match shared
-                .client
-                .request::<WorkspaceInfo>(Request::WorkspaceGet(params))
-                .await
-            {
-                Ok(info) => info.allowlist,
-                Err(e) => {
-                    let message = format!("workspace.get failed: {e}");
-                    let host = host.clone();
-                    let _ = qt.queue(move |mut q| {
-                        q.as_mut().end_request();
-                        q.deny_failed(&host, &message);
-                    });
-                    return;
-                }
-            };
-            if !hosts.iter().any(|h| h == &host) {
-                hosts.push(host.clone());
-            }
-            let params = WorkspaceSetAllowlistParams {
-                workspace_id: WorkspaceId(workspace.clone()),
-                hosts,
-            };
-            match shared
-                .client
-                .request_raw(Request::WorkspaceSetAllowlist(params))
-                .await
-            {
+            match add_host_to_allowlist(&shared, &workspace, &host).await {
                 // The toast comes down only once the host really is allowed;
                 // a failed call leaves it up so the user can try again.
-                Ok(_) => {
+                Ok(()) => {
                     let _ = qt.queue(move |mut q| {
                         q.as_mut().end_request();
                         q.clear_denial(&workspace, &host);
                     });
                 }
-                Err(e) => {
-                    let message = format!("workspace.set_allowlist failed: {e}");
+                Err(message) => {
                     let _ = qt.queue(move |mut q| {
                         q.as_mut().end_request();
                         q.deny_failed(&host, &message);

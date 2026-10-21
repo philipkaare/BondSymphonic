@@ -592,6 +592,25 @@ pub mod qobject {
         #[qsignal]
         fn network_denied(self: Pin<&mut AppController>, workspace_id: QString, host: QString);
 
+        /// A network notice the daemon attributed to `backend`'s sandbox
+        /// (`claude` for the workspace's own): an allowlist denial when
+        /// `allowable`, or a refused model-server tunnel, with `text` the
+        /// sentence to show. The window puts it in that workspace's
+        /// transcript when the pane runs that backend's agent
+        /// (`TranscriptModel::noteNetworkDenied`) and, for a denial nobody's
+        /// transcript took, falls back to the Run panel's toast.
+        /// Unattributed denials, from an older daemon, still arrive as
+        /// `networkDenied` alone.
+        #[qsignal]
+        fn agent_network_notice(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            host: QString,
+            backend: QString,
+            allowable: bool,
+            text: QString,
+        );
+
         /// The daemon dropped `count` events because a consumer fell behind.
         #[qsignal]
         fn output_dropped(self: Pin<&mut AppController>, count: i64);
@@ -1537,6 +1556,34 @@ fn uninstalled_backend(action: SetupAction) -> Option<AgentAdapterKind> {
     }
 }
 
+/// The workspace and inline notice for a network event: an allowlist denial
+/// (which "Allow" can fix) or an OpenCode companion's refused model-server
+/// tunnel (which it cannot, and which keeps the daemon's own wording). `None`
+/// for anything else, or for one with no workspace to put it against.
+pub fn network_notice(
+    ws: &Option<WorkspaceId>,
+    ev: &Event,
+) -> Option<(String, crate::model::transcript::NetworkNotice)> {
+    use crate::model::transcript::NetworkNotice;
+    let workspace = ws.as_ref()?.0.clone();
+    if let Some(host) = ev.denied_host() {
+        return Some((workspace, NetworkNotice::denied(host, ev.denial_backend())));
+    }
+    let host = ev.refused_tunnel_host()?;
+    let Event::DaemonLog { message, .. } = ev else {
+        return None;
+    };
+    Some((
+        workspace,
+        NetworkNotice {
+            host: host.to_owned(),
+            backend: ev.denial_backend(),
+            allowable: false,
+            text: message.clone(),
+        },
+    ))
+}
+
 /// The setup terminals, by the names the UI and the daemon both use.
 /// Anything else is refused here rather than sent on: the enum is the whole
 /// point of `system.setup_pty`, and a typo should fail loudly and locally.
@@ -2040,11 +2087,31 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
             continue;
         }
         // A workspace's proxy refused a connection. Recognised through the
-        // proto helper the daemon builds the notice with, like the drop notice
-        // above; the line is still logged by the `daemon.log` arm below.
-        if let Some((workspace, host)) = network_denial(&ws, &ev) {
-            let _ = qt
-                .queue(move |q| q.network_denied(QString::from(&workspace), QString::from(&host)));
+        // proto helpers the daemon builds the notices with, like the drop
+        // notice above; the line is still logged by the `daemon.log` arm
+        // below. One the daemon attributed goes to the window to find the
+        // agent's transcript; one it did not (an older daemon) is the toast's.
+        if let Some((workspace, notice)) = network_notice(&ws, &ev) {
+            match notice.backend {
+                Some(backend) => {
+                    let backend = crate::model::app_state::adapter_name(backend);
+                    let _ = qt.queue(move |q| {
+                        q.agent_network_notice(
+                            QString::from(&workspace),
+                            QString::from(&notice.host),
+                            QString::from(backend),
+                            notice.allowable,
+                            QString::from(&notice.text),
+                        )
+                    });
+                }
+                None if notice.allowable => {
+                    let _ = qt.queue(move |q| {
+                        q.network_denied(QString::from(&workspace), QString::from(&notice.host))
+                    });
+                }
+                None => {}
+            }
         }
         match ev {
             Event::WorkspaceStateChanged { info } => {

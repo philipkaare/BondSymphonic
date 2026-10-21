@@ -21,7 +21,9 @@
 //!
 //! This module must never import Qt types.
 
-use bondsymphonic_proto::{AgentMessage, AgentMessageBody, AgentState, PermissionDecision};
+use bondsymphonic_proto::{
+    AgentAdapterKind, AgentMessage, AgentMessageBody, AgentState, PermissionDecision,
+};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeSet, VecDeque};
@@ -86,6 +88,57 @@ pub enum TranscriptItem {
         count: usize,
         text: String,
     },
+    /// A connection the workspace's proxy refused while this agent was
+    /// working, shown where the user is looking rather than in a toast.
+    /// `count` is how many notices for `host` this turn has had (the daemon
+    /// already coalesces to one per host per few seconds). `allowable` is
+    /// whether "Allow" can fix it: a refused model-server tunnel cannot.
+    NetworkDenied {
+        host: String,
+        count: u32,
+        allowable: bool,
+        text: String,
+        status: DenialStatus,
+        /// Why the last "Allow" failed, or empty.
+        error: String,
+    },
+}
+
+/// Where an inline denial's "Allow" has got to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DenialStatus {
+    Blocked,
+    Allowing,
+    Allowed,
+    Failed,
+}
+
+/// A network notice from the daemon, as a transcript takes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetworkNotice {
+    pub host: String,
+    /// Whose sandbox the proxy serves, or `None` from an older daemon.
+    pub backend: Option<AgentAdapterKind>,
+    /// Whether adding the host to the workspace allowlist would let it
+    /// through.
+    pub allowable: bool,
+    /// The sentence the item shows.
+    pub text: String,
+}
+
+impl NetworkNotice {
+    /// An ordinary allowlist denial of `host`.
+    pub fn denied(host: &str, backend: Option<AgentAdapterKind>) -> Self {
+        Self {
+            host: host.to_owned(),
+            backend,
+            allowable: true,
+            text: format!(
+                "Blocked a connection to {host}: it is not on this workspace's allowlist."
+            ),
+        }
+    }
 }
 
 /// The daemon's snake_case spelling of an agent state.
@@ -718,6 +771,123 @@ impl Transcript {
     /// without reading the block out of `items`.
     pub fn earlier_count(&self) -> usize {
         self.earlier.len()
+    }
+
+    /// Whether a network notice from `backend`'s sandbox belongs in this
+    /// transcript, whose pane runs a `pane` agent.
+    ///
+    /// The proxy knows whose sandbox asked, not which process: the agent of
+    /// that backend in that workspace is the best attribution there is, and
+    /// only while it is there to have asked. An exited agent made nothing,
+    /// and an unattributed notice (an older daemon) could be anyone's; both
+    /// are left to the toast. `attached` is whether the pane has an agent.
+    pub fn takes_denial(
+        &self,
+        pane: AgentAdapterKind,
+        attached: bool,
+        backend: Option<AgentAdapterKind>,
+    ) -> bool {
+        attached
+            && backend == Some(pane)
+            && !self.state.is(AgentState::Exited)
+            && !self.state.is(AgentState::Error)
+    }
+
+    /// Shows a network notice, folding it into this turn's item for the same
+    /// host when there is one still waiting for an answer.
+    ///
+    /// The daemon coalesces to one notice per host every few seconds; a
+    /// package install that retries for a minute would still be a column of
+    /// identical lines, so a turn holds one item per host and counts.
+    pub fn note_network_denied(&mut self, notice: &NetworkNotice) -> Applied {
+        // Back to the start of the turn: the user's prompt, or the result
+        // that ended the turn before (a denial between turns is its own).
+        let mut open = None;
+        for (i, item) in self.items.iter().enumerate().rev() {
+            match item {
+                TranscriptItem::User { .. } | TranscriptItem::Result { .. } => break,
+                TranscriptItem::NetworkDenied {
+                    host,
+                    allowable,
+                    status: DenialStatus::Blocked | DenialStatus::Failed,
+                    ..
+                } if host == &notice.host && *allowable == notice.allowable => {
+                    open = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some(i) = open {
+            if let TranscriptItem::NetworkDenied { count, .. } = &mut self.items[i] {
+                *count = count.saturating_add(1);
+            }
+            return Applied::Changed(i);
+        }
+        self.push(TranscriptItem::NetworkDenied {
+            host: notice.host.clone(),
+            count: 1,
+            allowable: notice.allowable,
+            text: notice.text.clone(),
+            status: DenialStatus::Blocked,
+            error: String::new(),
+        })
+    }
+
+    /// Marks item `i` as being allowed and hands back its host, or `None` when
+    /// it is not a denial that "Allow" can act on right now.
+    pub fn begin_allow(&mut self, i: usize) -> Option<String> {
+        match self.items.get_mut(i) {
+            Some(TranscriptItem::NetworkDenied {
+                host,
+                allowable: true,
+                status: status @ (DenialStatus::Blocked | DenialStatus::Failed),
+                error,
+                ..
+            }) => {
+                *status = DenialStatus::Allowing;
+                error.clear();
+                Some(host.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Settles an "Allow" for `host`: on success every unsettled item for it
+    /// says it is allowed, wherever in the conversation it is; on failure the
+    /// one being allowed says why and offers the button again. Returns the
+    /// indices that changed.
+    pub fn finish_allow(&mut self, host: &str, result: Result<(), String>) -> Vec<usize> {
+        let mut changed = Vec::new();
+        for (i, item) in self.items.iter_mut().enumerate() {
+            let TranscriptItem::NetworkDenied {
+                host: h,
+                allowable: true,
+                status,
+                error,
+                ..
+            } = item
+            else {
+                continue;
+            };
+            if h != host {
+                continue;
+            }
+            match &result {
+                Ok(()) if *status != DenialStatus::Allowed => {
+                    *status = DenialStatus::Allowed;
+                    error.clear();
+                    changed.push(i);
+                }
+                Err(message) if *status == DenialStatus::Allowing => {
+                    *status = DenialStatus::Failed;
+                    error.clone_from(message);
+                    changed.push(i);
+                }
+                _ => {}
+            }
+        }
+        changed
     }
 }
 

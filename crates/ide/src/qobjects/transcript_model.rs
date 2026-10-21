@@ -18,8 +18,10 @@
 //! been told to always allow is answered by this model without ever reaching
 //! the permission bar.
 
-use crate::model::transcript::{Applied, LiveEvent, Transcript};
+use crate::model::app_state::adapter_from_name;
+use crate::model::transcript::{Applied, LiveEvent, NetworkNotice, Transcript};
 use crate::qobjects::app_controller::{on_reconnect, require_connection, runtime, Shared};
+use crate::qobjects::run_panel::add_host_to_allowlist;
 use bondsymphonic_proto::{
     AgentId, AgentIdParams, AgentMessage, AgentPermissionReplyParams, AgentSendParams, Event,
     HistoryResult, PermissionDecision, Request,
@@ -167,6 +169,29 @@ pub mod qobject {
         /// earlier" block's button calls.
         #[qinvokable]
         fn expand_earlier(self: Pin<&mut TranscriptModel>) -> bool;
+
+        /// Shows a network notice from `backend`'s sandbox in this
+        /// transcript, whose pane runs a `pane_adapter` agent, coalesced with
+        /// this turn's item for the same host. False, changing nothing, when
+        /// the notice is not this agent's to show (see
+        /// `Transcript::takes_denial`); the caller then falls back to the
+        /// toast.
+        #[qinvokable]
+        fn note_network_denied(
+            self: Pin<&mut TranscriptModel>,
+            host: QString,
+            backend: QString,
+            allowable: bool,
+            text: QString,
+            pane_adapter: QString,
+        ) -> bool;
+
+        /// The inline "Allow for this workspace" on item `index`: adds its
+        /// host to the workspace allowlist, as the toast's "Allow host" does,
+        /// and moves every item for that host to allowed (or the one clicked
+        /// to failed, with the reason).
+        #[qinvokable]
+        fn allow_denied_host(self: Pin<&mut TranscriptModel>, index: i32);
     }
 
     impl cxx_qt::Threading for TranscriptModel {}
@@ -584,6 +609,103 @@ impl qobject::TranscriptModel {
             .set_collapsed(i, collapsed)
         {
             self.item_changed(index);
+        }
+    }
+
+    pub fn note_network_denied(
+        mut self: Pin<&mut Self>,
+        host: QString,
+        backend: QString,
+        allowable: bool,
+        text: QString,
+        pane_adapter: QString,
+    ) -> bool {
+        let host = host.to_string();
+        let backend = backend.to_string();
+        if host.is_empty() || backend.is_empty() {
+            return false;
+        }
+        let pane = adapter_from_name(&pane_adapter.to_string());
+        let attached = !self.as_ref().agent_id().to_string().is_empty();
+        let notice = NetworkNotice {
+            host,
+            backend: Some(adapter_from_name(&backend)),
+            allowable,
+            text: text.to_string(),
+        };
+        if !self
+            .as_ref()
+            .rust()
+            .transcript
+            .takes_denial(pane, attached, notice.backend)
+        {
+            return false;
+        }
+        let applied = self
+            .as_mut()
+            .rust_mut()
+            .transcript
+            .note_network_denied(&notice);
+        self.announce(applied);
+        true
+    }
+
+    pub fn allow_denied_host(mut self: Pin<&mut Self>, index: i32) {
+        let Ok(i) = usize::try_from(index) else {
+            return;
+        };
+        let workspace = self.as_ref().workspace_id().to_string();
+        if workspace.is_empty() {
+            return;
+        }
+        let Some(host) = self.as_mut().rust_mut().transcript.begin_allow(i) else {
+            return;
+        };
+        self.as_mut().item_changed(index);
+        let generation = self.as_ref().rust().generation;
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                let message = message.to_owned();
+                self.settle_allow(&host, Err(message));
+                return;
+            }
+        };
+        let qt = self.as_ref().qt_thread();
+        runtime().spawn(async move {
+            let result = add_host_to_allowlist(&shared, &workspace, &host).await;
+            let _ = qt.queue(move |q| {
+                // A re-attach rebuilt the transcript: the item is gone.
+                if q.as_ref().rust().generation != generation {
+                    return;
+                }
+                q.settle_allow(&host, result);
+            });
+        });
+    }
+
+    /// Applies the answer to an inline "Allow" and repaints what it changed.
+    fn settle_allow(mut self: Pin<&mut Self>, host: &str, result: Result<(), String>) {
+        if let Err(message) = &result {
+            tracing::warn!("transcript: allow {host}: {message}");
+        }
+        let changed = self
+            .as_mut()
+            .rust_mut()
+            .transcript
+            .finish_allow(host, result);
+        for i in changed {
+            self.as_mut().item_changed(index_of(i));
+        }
+    }
+
+    /// Raises the signal for one change to the item list.
+    fn announce(self: Pin<&mut Self>, applied: Applied) {
+        match applied {
+            Applied::Appended(i) => self.item_appended(index_of(i)),
+            Applied::Changed(i) => self.item_changed(index_of(i)),
+            Applied::Reset => self.reset_items(),
+            Applied::Nothing => {}
         }
     }
 

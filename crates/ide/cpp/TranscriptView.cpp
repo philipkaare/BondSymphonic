@@ -64,6 +64,14 @@ constexpr int kCoalesceMs = 50;
 const char* kKindResult = "result";
 const char* kKindSystem = "system";
 
+/// A host the proxy blocked while this agent was working. See
+/// `TranscriptItem::NetworkDenied`.
+const char* kKindNetworkDenied = "network_denied";
+
+/// MULTIPLICATION SIGN, for a host blocked more than once. A code point for
+/// the same reason as the middle dot above.
+constexpr char16_t kTimes = 0x00D7;
+
 const char* kStateWorking = "working";
 const char* kStateError = "error";
 const char* kStateExited = "exited";
@@ -916,6 +924,9 @@ QWidget* TranscriptView::makeFrame(const QJsonObject& item, int index) {
         });
         return frame;
     }
+    if (kind == QString::fromUtf8(kKindNetworkDenied)) {
+        return makeDenialFrame(item, index);
+    }
     if (kind == QStringLiteral("tool_use")) {
         auto* card = new ToolCard(item, m_scroll->widget());
         QObject::connect(card, &ToolCard::collapsedChanged, this, [this, index](bool collapsed) {
@@ -957,6 +968,70 @@ QWidget* TranscriptView::makeFrame(const QJsonObject& item, int index) {
     return frame;
 }
 
+QWidget* TranscriptView::makeDenialFrame(const QJsonObject& item, int index) {
+    const QString host = item.value(QStringLiteral("host")).toString();
+    const QString status = item.value(QStringLiteral("status")).toString();
+    const bool allowable = item.value(QStringLiteral("allowable")).toBool();
+    const bool allowed = status == QLatin1String("allowed");
+    const int count = item.value(QStringLiteral("count")).toInt();
+
+    auto* frame = new QFrame(m_scroll->widget());
+    frame->setObjectName(QStringLiteral("TranscriptNetworkDenied"));
+    frame->setProperty(kKindProperty, QString::fromUtf8(kKindNetworkDenied));
+    frame->setFrameShape(QFrame::StyledPanel);
+    frame->setAutoFillBackground(true);
+    QPalette framePalette = frame->palette();
+    // Amber while it is in the way, green once it no longer is: the colour
+    // is the first thing that says whether this still needs an answer.
+    framePalette.setColor(QPalette::Window,
+                          codeview::wash(palette().base().color(),
+                                         allowed ? theme::added() : theme::changed(),
+                                         codeview::kWashAmount));
+    frame->setPalette(framePalette);
+    auto* layout = new QHBoxLayout(frame);
+    layout->setContentsMargins(6, 4, 6, 4);
+
+    QString text = item.value(QStringLiteral("text")).toString();
+    if (count > 1) {
+        text += QStringLiteral(" (") + QChar(kTimes) + QString::number(count) + QStringLiteral(")");
+    }
+    if (allowed) {
+        text += QStringLiteral("\nAllowed for this workspace. The agent can reach %1 on its next try.")
+                    .arg(host);
+    } else if (status == QLatin1String("failed")) {
+        text += QStringLiteral("\nCould not allow it: %1")
+                    .arg(item.value(QStringLiteral("error")).toString());
+    }
+    auto* label = new QLabel(text, frame);
+    label->setObjectName(QString::fromUtf8(kBodyName));
+    label->setTextFormat(Qt::PlainText);
+    label->setWordWrap(true);
+    label->setMinimumWidth(1);
+    label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    layout->addWidget(label, 1);
+
+    if (allowable && !allowed) {
+        const bool allowing = status == QLatin1String("allowing");
+        auto* button = new QPushButton(
+            allowing ? QStringLiteral("Allowing") + QChar(kEllipsis)
+                     : status == QLatin1String("failed") ? QStringLiteral("Try again")
+                                                         : QStringLiteral("Allow for this workspace"),
+            frame);
+        button->setObjectName(QStringLiteral("TranscriptAllowHost"));
+        button->setToolTip(
+            QStringLiteral("Add %1 to this workspace's network allowlist").arg(host));
+        button->setEnabled(!allowing);
+        layout->addWidget(button, 0, Qt::AlignTop);
+        QObject::connect(button, &QPushButton::clicked, this, [this, index] {
+            if (!m_model.isNull()) {
+                // Answers with `itemChanged`, which rebuilds this frame.
+                m_model->allowDeniedHost(index);
+            }
+        });
+    }
+    return frame;
+}
+
 void TranscriptView::updateFrame(int index, const QJsonObject& item) {
     if (index < 0 || index >= m_frames.size()) {
         return;
@@ -981,7 +1056,8 @@ void TranscriptView::updateFrame(int index, const QJsonObject& item) {
             card->update(item);
             return;
         }
-    } else if (frame->property(kKindProperty).toString() == kind) {
+    } else if (frame->property(kKindProperty).toString() == kind &&
+               kind != QString::fromUtf8(kKindNetworkDenied)) {
         QLabel* label = bodyLabel(frame);
         if (label != nullptr) {
             if (kind == QStringLiteral("assistant")) {
@@ -997,9 +1073,12 @@ void TranscriptView::updateFrame(int index, const QJsonObject& item) {
             return;
         }
     }
-    // The item is no longer the kind this frame was built for. Nothing in the
-    // model does that today, but a frame showing the wrong item is worse than
-    // one rebuilt for nothing.
+    // The item is no longer the kind this frame was built for, or is a blocked
+    // host whose count or status moved: that frame is a label and a button
+    // whose shape depends on the status, and it changes a handful of times at
+    // most, so it is rebuilt rather than patched. Nothing else in the model
+    // changes kind today, but a frame showing the wrong item is worse than one
+    // rebuilt for nothing.
     QWidget* replacement = makeFrame(item, index);
     if (replacement == nullptr) {
         // It has become one of the two kinds the meta setting is hiding. The
@@ -1775,6 +1854,88 @@ extern "C" std::int32_t bs_widget_test_transcript_gate_shows_the_cli_auth_failur
     view.setClaudeLoggedIn(true);
     if (!gate->isHidden()) {
         return 9;
+    }
+    return 0;
+}
+
+namespace {
+
+/// One blocked-host item as the model serialises it.
+QString denialItem(const QString& status, int count, bool allowable) {
+    QJsonObject item;
+    item.insert(QStringLiteral("kind"), QStringLiteral("network_denied"));
+    item.insert(QStringLiteral("host"), QStringLiteral("blocked.example"));
+    item.insert(QStringLiteral("count"), count);
+    item.insert(QStringLiteral("allowable"), allowable);
+    item.insert(QStringLiteral("text"),
+                QStringLiteral("Blocked a connection to blocked.example"));
+    item.insert(QStringLiteral("status"), status);
+    item.insert(QStringLiteral("error"), QStringLiteral("daemon said no"));
+    return QString::fromUtf8(QJsonDocument(item).toJson(QJsonDocument::Compact));
+}
+
+} // namespace
+
+/// A host the proxy blocked is a line in the agent's own transcript with its
+/// own Allow button, and the line says where allowing it got to: blocked (with
+/// how many times), allowing, failed with the reason, and allowed with no
+/// button left. A refused tunnel is shown the same way but never offers Allow.
+extern "C" std::int32_t bs_widget_test_transcript_shows_a_blocked_host_inline() {
+    TranscriptModel model;
+    TranscriptView view(&model);
+    view.resize(480, 320);
+    const auto button = [&view]() -> QPushButton* {
+        QWidget* frame = view.frameAt(0);
+        return frame == nullptr
+                   ? nullptr
+                   : frame->findChild<QPushButton*>(QStringLiteral("TranscriptAllowHost"));
+    };
+    const auto text = [&view]() -> QString {
+        QLabel* label = bodyLabel(view.frameAt(0));
+        return label == nullptr ? QString() : label->text();
+    };
+
+    view.setTestItems(QStringList{ denialItem(QStringLiteral("blocked"), 3, true) });
+    model.resetItems();
+    if (view.frameCount() != 1 || button() == nullptr) {
+        return 1;
+    }
+    if (!button()->isEnabled() || button()->text() != QLatin1String("Allow for this workspace")) {
+        return 2;
+    }
+    if (!text().contains(QChar(kTimes) + QStringLiteral("3"))) {
+        return 3;
+    }
+
+    // Changes repaint in place, through the same coalesced path as any item.
+    view.setTestItems(QStringList{ denialItem(QStringLiteral("allowing"), 3, true) });
+    model.itemChanged(0);
+    settle();
+    if (button() == nullptr || button()->isEnabled()) {
+        return 4;
+    }
+
+    view.setTestItems(QStringList{ denialItem(QStringLiteral("failed"), 3, true) });
+    model.itemChanged(0);
+    settle();
+    if (button() == nullptr || !button()->isEnabled() || !text().contains("daemon said no")) {
+        return 5;
+    }
+
+    view.setTestItems(QStringList{ denialItem(QStringLiteral("allowed"), 3, true) });
+    model.itemChanged(0);
+    settle();
+    if (view.frameCount() != 1 || button() != nullptr) {
+        return 6;
+    }
+    if (!text().contains(QLatin1String("Allowed for this workspace"))) {
+        return 7;
+    }
+
+    view.setTestItems(QStringList{ denialItem(QStringLiteral("blocked"), 1, false) });
+    model.resetItems();
+    if (button() != nullptr || text().contains(QChar(kTimes))) {
+        return 8;
     }
     return 0;
 }

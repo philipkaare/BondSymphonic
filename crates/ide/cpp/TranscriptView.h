@@ -220,6 +220,10 @@ private:
     /// Builds the frame for one item, connecting a tool card's toggle back to
     /// the model at `index`.
     QWidget* makeFrame(const QJsonObject& item, int index);
+    /// The frame for a host the proxy blocked: the sentence, how many times,
+    /// and the "Allow for this workspace" button or where allowing it got to.
+    /// Rebuilt rather than repainted when the item changes.
+    QWidget* makeDenialFrame(const QJsonObject& item, int index);
     /// Repaints the frame at `index`, or replaces it if the item is no longer
     /// the kind that frame was built for.
     void updateFrame(int index, const QJsonObject& item);

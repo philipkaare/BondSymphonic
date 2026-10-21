@@ -1095,6 +1095,28 @@ void MainWindow::connectController() {
     // there rather than being shown over the wrong workspace.
     QObject::connect(m_controller, &AppController::networkDenied, m_runModel,
                      &RunPanelModel::noteDenied);
+    // A notice the daemon could attribute goes where the agent that asked is:
+    // its own transcript, coalesced per host per turn, with an inline Allow.
+    // The toast is the fallback, for a denial no transcript takes -- the
+    // workspace's pane has not been built yet, runs another backend, or its
+    // agent has gone, which leaves a run or a terminal as the one that asked.
+    // The toast is per workspace and only shows while that workspace is in
+    // front, so a denial a transcript took would only ever repeat, beside it,
+    // what the pane in front already says.
+    QObject::connect(
+        m_controller, &AppController::agentNetworkNotice, this,
+        [this](const QString& workspaceId, const QString& host, const QString& backend,
+               bool allowable, const QString& text) {
+            TranscriptModel* model = m_agentArea->transcriptModel(workspaceId);
+            const QString adapter = tabFor(workspaceId).value("adapter").toString();
+            if (model != nullptr &&
+                model->noteNetworkDenied(host, backend, allowable, text, adapter)) {
+                return;
+            }
+            if (allowable) {
+                m_runModel->noteDenied(workspaceId, host);
+            }
+        });
     // Answering that toast from outside the panel. Only the workspace the panel
     // is actually showing may be answered: an allow routed anywhere else would
     // extend the allowlist of a workspace the user is not looking at, which is
