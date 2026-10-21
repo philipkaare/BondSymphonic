@@ -758,6 +758,32 @@ fn model_ids(body: &[u8]) -> Option<Vec<String>> {
     )
 }
 
+/// The arguments for [`curl_get`]: pinned to `resolve` (`host:port:ip`), no
+/// proxy, no redirect, and nothing from the user's `~/.curlrc` -- `-q` only
+/// works as the first argument. The URL and headers come on stdin (`-K -`).
+fn curl_args(resolve: &str, timeout: Duration) -> Vec<String> {
+    [
+        "-q",
+        "-sS",
+        "--noproxy",
+        "*",
+        "--max-redirs",
+        "0",
+        "--max-time",
+        &timeout.as_secs().max(1).to_string(),
+        "--resolve",
+        resolve,
+        "-o",
+        "-",
+        "-w",
+        "\n%{http_code}",
+        "-K",
+        "-",
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
 /// `GET url` over TLS, which the daemon has no stack for: the distro's `curl`,
 /// pinned to the address the proxy's connect just reached, with the key on
 /// its stdin rather than its argv.
@@ -794,22 +820,9 @@ async fn curl_get(
     } else {
         "curl"
     };
+    let resolve = format!("{}:{}:{ip}", target.host(), target.port());
     let mut child = tokio::process::Command::new(bin)
-        .args([
-            "-sS",
-            "--noproxy",
-            "*",
-            "--max-time",
-            &format!("{}", timeout.as_secs().max(1)),
-            "--resolve",
-            &format!("{}:{}:{ip}", target.host(), target.port()),
-            "-o",
-            "-",
-            "-w",
-            "\n%{http_code}",
-            "-K",
-            "-",
-        ])
+        .args(curl_args(&resolve, timeout))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1214,5 +1227,32 @@ mod tests {
             result.message
         );
         assert_eq!(result.model_ids, ["m"]);
+    }
+
+    /// The user's `~/.curlrc` cannot steer the test: `-q` (which only works
+    /// first) skips it, so a `-L` or a proxy there is never read, and no
+    /// redirect is followed past the pinned, granted origin.
+    #[test]
+    fn curl_ignores_the_users_curlrc_and_follows_no_redirect() {
+        let args = curl_args("api.example:443:203.0.113.7", Duration::from_secs(5));
+        assert_eq!(args[0], "-q");
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--max-redirs" && w[1] == "0"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "--noproxy" && w[1] == "*"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--resolve" && w[1] == "api.example:443:203.0.113.7"),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "-L" || a == "--location"),
+            "{args:?}"
+        );
     }
 }
