@@ -251,6 +251,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Arc<Mutex<Vec<String>>>) {
                                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                                 capabilities: Capabilities {
                                     backends: vec![],
+                                    opencode_providers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![AgentAdapterKind::Claude],
