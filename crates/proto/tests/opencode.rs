@@ -2,7 +2,7 @@ use bondsymphonic_proto::{AgentAdapterKind, SetupAction};
 
 #[test]
 fn opencode_requires_a_protocol_that_old_backend_decoders_will_reject() {
-    assert!(bondsymphonic_proto::PROTOCOL_VERSION >= 3);
+    const _: () = assert!(bondsymphonic_proto::PROTOCOL_VERSION >= 3);
 }
 
 #[test]

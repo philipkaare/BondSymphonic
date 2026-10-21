@@ -636,7 +636,7 @@ mod in_place_protocol {
 
     #[test]
     fn the_protocol_is_version_three_and_a_silent_peer_is_version_one() {
-        assert!(PROTOCOL_VERSION >= 3);
+        const _: () = assert!(PROTOCOL_VERSION >= 3);
         assert_eq!(peer_protocol_version(None), 1);
     }
 
