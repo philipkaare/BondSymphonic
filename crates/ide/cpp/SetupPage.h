@@ -174,6 +174,9 @@ private:
     void refreshBackendActions();
     /// The question asked before an uninstall: what is removed, what is kept.
     bool confirmUninstall(const QString& action);
+    /// An action as the terminal note names it: its button's label, never the
+    /// wire name.
+    static QString actionName(const QString& action);
     /// What an uninstall removes, and what it keeps.
     static QString uninstallTooltip(const QString& action);
     /// For a sign-in prerequisite whose CLI the last answer says is missing,

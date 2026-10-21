@@ -1513,6 +1513,16 @@ pub fn network_denial(ws: &Option<WorkspaceId>, ev: &Event) -> Option<(String, S
 /// The seven setup terminals, by the names the UI and the daemon both use.
 /// Anything else is refused here rather than sent on: the enum is the whole
 /// point of `system.setup_pty`, and a typo should fail loudly and locally.
+/// The backend an `uninstall_*` action removes the CLI of.
+fn uninstalled_backend(action: SetupAction) -> Option<AgentAdapterKind> {
+    match action {
+        SetupAction::UninstallClaude => Some(AgentAdapterKind::Claude),
+        SetupAction::UninstallCodex => Some(AgentAdapterKind::Codex),
+        SetupAction::UninstallOpencode => Some(AgentAdapterKind::OpenCode),
+        _ => None,
+    }
+}
+
 fn parse_setup_action(action: &str) -> Option<SetupAction> {
     match action {
         "codex_login" => Some(SetupAction::CodexLogin),
@@ -1588,6 +1598,8 @@ fn publish_connection_loss(qt: &QtHandle, losing: ConnectionState) {
         q.as_mut().rust_mut().codex_auth_ok = false;
         q.as_mut().rust_mut().codex_login_pty = None;
         q.as_mut().rust_mut().opencode_login_pty = None;
+        q.as_mut().rust_mut().uninstall_pty = None;
+        q.as_mut().rust_mut().uninstalled = None;
         q.as_mut().rust_mut().opencode_auth_failure = None;
         q.as_mut().rust_mut().opencode_auth_ok = false;
         q.as_mut().rust_mut().agent_backends.clear();
@@ -1689,6 +1701,13 @@ pub struct AppControllerRust {
     opencode_login_pty: Option<PtyId>,
     opencode_auth_failure: Option<String>,
     opencode_auth_ok: bool,
+    /// The PTY of the last `uninstall_*` terminal, and the backend it removes.
+    uninstall_pty: Option<(PtyId, AgentAdapterKind)>,
+    /// A backend whose uninstall terminal has exited and whose re-check has
+    /// not answered yet. That answer is what says whether the CLI really went
+    /// (the script leaves a copy it did not make), and only then is the
+    /// backend switched off.
+    uninstalled: Option<AgentAdapterKind>,
     agent_backends: std::collections::HashMap<String, AgentAdapterKind>,
     pending_backend_errors: std::collections::VecDeque<(String, String)>,
     /// Whether a prerequisite answer should open Settings on Setup, and
@@ -1734,6 +1753,8 @@ impl Default for AppControllerRust {
             opencode_login_pty: None,
             opencode_auth_failure: None,
             opencode_auth_ok: false,
+            uninstall_pty: None,
+            uninstalled: None,
             agent_backends: Default::default(),
             pending_backend_errors: Default::default(),
             setup_prompt: SetupPrompt::default(),
@@ -2073,6 +2094,16 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
                         q.as_mut().recheck_prereqs();
                         q.as_mut().refresh_backend_models(QString::from("opencode"));
                         q.as_mut().backend_settings_changed();
+                    }
+                    let uninstall = q.as_ref().rust().uninstall_pty.clone();
+                    if let Some((_, kind)) = uninstall.filter(|(pty, _)| *pty == pty_id) {
+                        q.as_mut().rust_mut().uninstall_pty = None;
+                        q.as_mut().rust_mut().uninstalled = Some(kind);
+                        model_generations().lock().unwrap().begin("prereqs");
+                        q.as_mut().recheck_prereqs();
+                        // The list came from the CLI that has just gone.
+                        q.as_mut()
+                            .refresh_backend_models(QString::from(backends::word(kind)));
                     }
                     if q.as_ref().rust().codex_login_pty.as_ref() == Some(&pty_id) {
                         q.as_mut().rust_mut().codex_login_pty = None;
@@ -3457,6 +3488,8 @@ impl qobject::AppController {
                             | SetupAction::ClaudeSetupToken
                     )
                     .then(|| res.pty_id.clone());
+                    let uninstalls = uninstalled_backend(action);
+                    let uninstall_pty = res.pty_id.clone();
                     let _ = qt.queue(move |mut q| {
                         if matches!(action, SetupAction::CodexLogin | SetupAction::CodexLogout) {
                             q.as_mut().rust_mut().codex_login_pty = Some(res.pty_id.clone());
@@ -3479,6 +3512,9 @@ impl qobject::AppController {
                         }
                         if let Some(pty) = login {
                             q.as_mut().rust_mut().login_pty = Some(pty);
+                        }
+                        if let Some(kind) = uninstalls {
+                            q.as_mut().rust_mut().uninstall_pty = Some((uninstall_pty, kind));
                         }
                         q.setup_pty_opened(QString::from(&name), QString::from(&id))
                     });
@@ -3564,17 +3600,27 @@ impl qobject::AppController {
                 })
                 .map(|descriptor| descriptor.id)
                 .collect();
+            let uninstalled = self.as_mut().rust_mut().uninstalled.take();
             if let Ok(mut settings) = Settings::try_load() {
+                let switched_off = uninstalled.is_some_and(|kind| {
+                    backends::disable_uninstalled_backend(&mut settings, kind, &items)
+                });
                 if backends::enable_authenticated_backends(
                     &mut settings,
                     &descriptors,
                     &items,
                     &credentials,
-                ) {
+                ) || switched_off
+                {
                     if let Err(error) = settings.save() {
                         tracing::warn!(
                             "authenticated harness settings could not be saved: {error}"
                         );
+                    }
+                    // Told, so an open Settings dialog unticks the box rather
+                    // than saving it back on with OK.
+                    if switched_off {
+                        self.as_mut().backend_settings_changed();
                     }
                 }
             }

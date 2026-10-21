@@ -320,3 +320,83 @@ fn a_backend_switched_in_settings_keeps_that_choice_through_sign_in_and_stored_k
     ));
     assert!(!settings.backends["claude"].enabled);
 }
+
+/// A backend whose CLI the last answer says is missing cannot run, so a
+/// sign-in that is still on disk does not switch it on: after an uninstall the
+/// login is deliberately kept, and the backend would otherwise come straight
+/// back as the default for agents that cannot start. An answer without the
+/// CLI's row says nothing about it and enables as before.
+#[test]
+fn a_backend_whose_cli_is_missing_is_not_enabled_by_its_sign_in() {
+    use bondsymphonic_ide::model::backends::enable_authenticated_backends;
+    use bondsymphonic_proto::PrereqStatus;
+    let row = |name: &str, ok| PrereqStatus {
+        name: name.into(),
+        ok,
+        detail: String::new(),
+        fix_hint: None,
+    };
+    let mut descriptor = legacy_descriptors().remove(0);
+    descriptor.id = AgentAdapterKind::Codex;
+    descriptor.prerequisite_names = vec!["codex".into(), "codex_auth".into()];
+    let mut settings = Settings::default();
+    assert!(!enable_authenticated_backends(
+        &mut settings,
+        &[descriptor.clone()],
+        &[row("codex", false), row("codex_auth", true)],
+        &[AgentAdapterKind::Codex]
+    ));
+    assert!(!settings.backends["codex"].enabled);
+    assert!(enable_authenticated_backends(
+        &mut settings,
+        &[descriptor],
+        &[row("codex", true), row("codex_auth", true)],
+        &[]
+    ));
+    assert!(settings.backends["codex"].enabled);
+}
+
+/// After an uninstall the backend is switched off once the answer confirms the
+/// CLI is gone -- not on an answer that still finds it (the script left a copy
+/// it did not make), and not on one that says nothing about it. The user's
+/// earlier on/off choice is left as it was: this is the program going away,
+/// not the user changing their mind about the backend.
+#[test]
+fn an_uninstalled_backend_is_switched_off_once_its_cli_is_gone() {
+    use bondsymphonic_ide::model::backends::disable_uninstalled_backend;
+    use bondsymphonic_proto::PrereqStatus;
+    let row = |name: &str, ok| PrereqStatus {
+        name: name.into(),
+        ok,
+        detail: String::new(),
+        fix_hint: None,
+    };
+    let mut settings = Settings::default();
+    settings.backends.get_mut("codex").unwrap().enabled = true;
+    settings.backends.get_mut("codex").unwrap().default_model = "kept".into();
+    assert!(!disable_uninstalled_backend(
+        &mut settings,
+        AgentAdapterKind::Codex,
+        &[row("codex", true)]
+    ));
+    assert!(!disable_uninstalled_backend(
+        &mut settings,
+        AgentAdapterKind::Codex,
+        &[row("codex_auth", false)]
+    ));
+    assert!(settings.backends["codex"].enabled);
+    assert!(disable_uninstalled_backend(
+        &mut settings,
+        AgentAdapterKind::Codex,
+        &[row("codex", false)]
+    ));
+    assert!(!settings.backends["codex"].enabled);
+    assert_eq!(settings.backends["codex"].default_model, "kept");
+    assert!(!settings.backends_chosen.contains("codex"));
+    // Already off: nothing to change.
+    assert!(!disable_uninstalled_backend(
+        &mut settings,
+        AgentAdapterKind::Codex,
+        &[row("codex", false)]
+    ));
+}

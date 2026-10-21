@@ -105,6 +105,11 @@ pub fn enable_authenticated_backends(
                 name.ends_with("_auth") && items.iter().any(|item| &item.name == name && item.ok)
             });
         let id = word(descriptor.id);
+        // A sign-in outlives an uninstall on purpose, and a backend whose CLI
+        // is gone cannot run whatever its credentials say.
+        if cli_missing(id, items) {
+            continue;
+        }
         if !authenticated || settings.backends_chosen.contains(id) {
             continue;
         }
@@ -121,6 +126,32 @@ pub fn enable_authenticated_backends(
         }
     }
     changed
+}
+
+/// Whether the answer says `id`'s CLI is not installed. The CLI's row is
+/// named after the backend; an answer without that row says nothing.
+fn cli_missing(id: &str, items: &[bondsymphonic_proto::PrereqStatus]) -> bool {
+    items.iter().any(|item| item.name == id && !item.ok)
+}
+
+/// Switches `kind` off after its CLI was uninstalled, once the answer confirms
+/// the CLI is gone. Left on, it would stay the default for agents that cannot
+/// start. The user's on/off choice is not recorded: the program went away, the
+/// user did not change their mind, so a reinstall with the kept sign-in brings
+/// the backend back the way a first sign-in would.
+pub fn disable_uninstalled_backend(
+    settings: &mut Settings,
+    kind: AgentAdapterKind,
+    items: &[bondsymphonic_proto::PrereqStatus],
+) -> bool {
+    let id = word(kind);
+    if !cli_missing(id, items) {
+        return false;
+    }
+    settings
+        .backends
+        .get_mut(id)
+        .is_some_and(|entry| std::mem::replace(&mut entry.enabled, false))
 }
 
 /// Enables a backend whose API key was just stored, unless the user has

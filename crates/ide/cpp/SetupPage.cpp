@@ -365,6 +365,9 @@ bool SetupPage::actionsAvailable() const {
 }
 
 void SetupPage::updateActionButtons() {
+    // A second check while one this page asked for is out would only race
+    // it; the button comes back when that one answers or fails.
+    m_recheckButton->setEnabled(!m_awaitingCheck);
     const bool available = actionsAvailable();
     auto apply = [available](QPushButton* button) {
         if (button != nullptr) {
@@ -647,6 +650,12 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
     m_rowsLayout->addWidget(row);
 }
 
+QString SetupPage::actionName(const QString& action) {
+    // What the button that started it said, in quotes because it is a name.
+    const QString label = buttonTextFor(action);
+    return QStringLiteral("“%1”").arg(label.isEmpty() ? action : label);
+}
+
 QString SetupPage::missingCliFor(const QString& name) const {
     if (!name.endsWith(QLatin1String("_auth"))) {
         return QString();
@@ -829,8 +838,8 @@ void SetupPage::runAction(const QString& action) {
     // The paste is named here because the one question this terminal asks
     // that cannot be typed is the sign-in code, and a shortcut nobody is
     // told about is a shortcut nobody finds.
-    setTerminalNote(
-        QString("Running %1. Answer its questions here; Ctrl+V pastes, Ctrl+C stops it.").arg(action));
+    setTerminalNote(QString("Running %1. Answer its questions here; Ctrl+V pastes, Ctrl+C stops it.")
+                        .arg(actionName(action)));
     m_terminal->setVisible(true);
     m_terminalHost->setVisible(true);
     // Deferred by one turn of the event loop: the pane has only just been
@@ -871,7 +880,7 @@ void SetupPage::onOperationFailed(const QString& op, const QString& message) {
     updateActionButtons();
     // The pane header says what went wrong, over a hidden terminal: nothing was
     // opened, so an empty black rectangle would only read as a hang.
-    setTerminalNote(QString("%1 could not start: %2").arg(action, message));
+    setTerminalNote(QString("%1 could not start: %2").arg(actionName(action), message));
     m_terminal->setVisible(false);
     m_terminalHost->setVisible(true);
 }
@@ -1624,6 +1633,63 @@ extern "C" std::int32_t bs_widget_test_setup_page_offers_one_button_per_pair() {
     install = shownButtonSaying(page, "Install Claude Code");
     if (install == nullptr || !install->isEnabled()) {
         return 11;
+    }
+    return 0;
+}
+
+/// The line over the terminal names the action the way its button did, never
+/// by its wire name; and Re-check is dead while the check it would start is
+/// already out -- after a click, and after a terminal exits -- and back as
+/// soon as that check answers or fails.
+extern "C" std::int32_t bs_widget_test_setup_page_names_the_action_and_holds_recheck() {
+    AppController controller;
+    SetupPage page(&controller);
+    page.setPtyCloser([](const QString&) {});
+    page.setBackendSettings(
+        QJsonObject{{QStringLiteral("claude"), QJsonObject{{QStringLiteral("enabled"), true}}}});
+    controller.prereqsChecked(QString::fromUtf8(kClaudeMissing));
+    collectRows();
+    QPushButton* recheck = shownButtonSaying(page, "Re-check");
+    if (recheck == nullptr || !recheck->isEnabled()) {
+        return 1;
+    }
+    recheck->click();
+    if (recheck->isEnabled()) {
+        return 2;
+    }
+    controller.prereqsChecked(QString::fromUtf8(kClaudeMissing));
+    collectRows();
+    if (!recheck->isEnabled()) {
+        return 3;
+    }
+    recheck->click();
+    controller.prereqsCheckFailed(QStringLiteral("daemon connection lost"));
+    if (!recheck->isEnabled()) {
+        return 4;
+    }
+
+    QPushButton* install = shownButtonSaying(page, "Install Claude Code");
+    if (install == nullptr) {
+        return 5;
+    }
+    install->click();
+    const QString note = terminalNote(page);
+    if (!note.contains(QLatin1String("Install Claude Code")) ||
+        note.contains(QLatin1String("install_claude"))) {
+        return 6;
+    }
+    controller.setupPtyOpened(QStringLiteral("install_claude"), QStringLiteral("pty_3"));
+    TerminalSession* session = page.findChild<TerminalSession*>();
+    if (session == nullptr) {
+        return 7;
+    }
+    session->exitedSignal();
+    if (recheck->isEnabled()) {
+        return 8;
+    }
+    controller.prereqsChecked(QString::fromUtf8(kClaudeReady));
+    if (!recheck->isEnabled()) {
+        return 9;
     }
     return 0;
 }
