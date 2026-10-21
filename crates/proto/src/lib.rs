@@ -22,7 +22,9 @@ pub use types::*;
 /// Version 2 added in-place workspaces (`WorkspaceCreateParams::in_place`).
 /// Version 3 adds OpenCode backend/setup variants, which older enum decoders
 /// cannot read in `hello` capabilities.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// Version 4 adds the `uninstall_*` setup actions, listed in the same
+/// capabilities for the same reason.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// What a peer that sends no `protocol_version` at all is speaking.
 ///

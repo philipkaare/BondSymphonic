@@ -148,6 +148,7 @@ impl Backend for CodexBackend {
             prerequisite_names: vec!["codex".into(), "codex_auth".into()],
             setup_actions: vec![
                 SetupAction::InstallCodex,
+                SetupAction::UninstallCodex,
                 SetupAction::CodexLogin,
                 SetupAction::CodexLogout,
             ],

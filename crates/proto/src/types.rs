@@ -89,6 +89,14 @@ pub enum SetupAction {
     InstallOpencode,
     OpencodeLogin,
     OpencodeLogout,
+    /// Remove the Claude Code CLI BondSymphonic's installer put in the
+    /// daemon user's home, breaking `claude` on purpose. Never the login or
+    /// `~/.claude`: an uninstall is about the program, not the account.
+    UninstallClaude,
+    /// Remove BondSymphonic's own Codex install and its Code Mode helper.
+    UninstallCodex,
+    /// Remove BondSymphonic's own OpenCode install.
+    UninstallOpencode,
 }
 
 /// What `repo.inspect` knows about a path the user picked.

@@ -1,8 +1,12 @@
 #pragma once
-#include <QList>
-#include <QString>
-#include <QWidget>
+#include <QHash>
+#include <QJsonArray>
 #include <QJsonObject>
+#include <QList>
+#include <QPointer>
+#include <QString>
+#include <QStringList>
+#include <QWidget>
 #include <functional>
 
 class AppController;
@@ -61,8 +65,36 @@ public:
     /// page that runs those things.
     bool ranAction() const;
     static QString buttonTextFor(const QString &action);
+    /// Starts `action`'s terminal. Refused while the page is busy -- a request
+    /// in flight, a terminal still running, or the re-check after one -- and,
+    /// for an uninstall, unless the confirmation says yes.
     void runAction(const QString &action);
     void setBackendSettings(const QJsonObject &settings);
+
+    /// The controls a backend's Settings tab carries: one button for the
+    /// install (Install or Uninstall) and one for the sign-in (Sign in or Sign
+    /// out), plus Claude's long-lived token offer. Each says what it will do
+    /// *now*, from the page's last prerequisite answer, and only actions the
+    /// daemon listed in `descriptor`'s `setup_actions` are ever offered.
+    ///
+    /// The page owns their state rather than the tab, so they go dead and come
+    /// back with the rows' own buttons: while there is no answer, while a
+    /// terminal is opening or running, and while the re-check after it is out.
+    QWidget* backendActions(const QJsonObject& descriptor, QWidget* parent);
+
+    /// Replaces the question an uninstall asks before it runs. The default is
+    /// a message box; this is the seam a test answers through, since a modal
+    /// box would wait for a click no offscreen test can give.
+    void setConfirmer(std::function<bool(const QString& action)> confirm);
+
+    /// The setup action that removes the CLI `name` checks for, or empty for
+    /// a prerequisite BondSymphonic did not install.
+    static QString uninstallActionFor(const QString& name);
+
+signals:
+    /// An action's terminal was asked for. What the Settings dialog scrolls
+    /// the terminal into view on, since a tab button is far from the pane.
+    void actionStarted(const QString& action);
 
 protected:
     /// Re-elides the sign-in URL: the label's width is only known once the
@@ -131,9 +163,24 @@ private:
     /// A failed `system.setup_pty`. The page has to come out of its in-flight
     /// state itself: nothing else will, and the buttons stay dead until it does.
     void onOperationFailed(const QString& op, const QString& message);
-    /// Enables or disables every action button at once, so a click cannot
-    /// start a second action while one is being opened.
-    void setActionsEnabled(bool enabled);
+    /// Re-enables or disables every action button -- the rows' and the
+    /// backend tabs' alike -- from `actionsAvailable` and each button's own
+    /// reason to stay dead (a sign-in whose CLI is not installed).
+    void updateActionButtons();
+    /// Whether an action may be started now: there is an answer to act on,
+    /// nothing is being opened or running, and no re-check is out.
+    bool actionsAvailable() const;
+    /// Points every backend tab's buttons at the last answer.
+    void refreshBackendActions();
+    /// The question asked before an uninstall: what is removed, what is kept.
+    bool confirmUninstall(const QString& action);
+    /// What an uninstall removes, and what it keeps.
+    static QString uninstallTooltip(const QString& action);
+    /// For a sign-in prerequisite whose CLI the last answer says is missing,
+    /// the CLI's name as its install button says it ("Codex"); else empty.
+    QString missingCliFor(const QString& name) const;
+    /// Holds `button` dead, saying why, while `missingCli` is not installed.
+    void blockFor(QPushButton* button, const QString& missingCli);
     /// Opens a login URL the terminal printed in the desktop browser, and
     /// raises the row that offers it again by hand.
     ///
@@ -222,6 +269,31 @@ private:
     QString m_ptyId;
     /// Never null: the constructor installs the session close.
     std::function<void(const QString& ptyId)> m_closePty;
+    /// The last answer, by prerequisite name, which is what a sign-in button
+    /// asks about its CLI and a backend tab draws from.
+    QHash<QString, QJsonObject> m_items;
+    /// The payload the rows were last drawn from, redrawn when the backend
+    /// switches change.
+    QString m_lastJson;
+    /// Every setup action some backend descriptor lists. An uninstall is only
+    /// offered when the daemon named it: a daemon that predates it would
+    /// refuse the request.
+    QStringList m_offeredActions;
+    /// A backend tab's buttons. `QPointer`, because they live on the tab, not
+    /// on this page.
+    struct BackendButtons {
+        QStringList offered;
+        QString binary;
+        QString auth;
+        QPointer<QPushButton> install;
+        QPointer<QPushButton> signIn;
+        QPointer<QPushButton> token;
+    };
+    QList<BackendButtons> m_backendButtons;
+    /// A terminal has exited, or Re-check was pressed, and the answer is not
+    /// back yet: the rows describe a machine that may since have changed.
+    bool m_awaitingCheck = false;
+    std::function<bool(const QString& action)> m_confirm;
     /// See [`ranAction`]. Set when an action's terminal is opened and never
     /// cleared: the page is destroyed with the dialog that asks.
     bool m_ranAction = false;

@@ -1082,6 +1082,20 @@ impl AgentManager {
     /// The same agents as [`records_of`](AgentManager::records_of), by id alone
     /// and in the same order. `WorkspaceInfo` carries both, so a client older
     /// than the records field still reads the list it has always read.
+    /// How many agents of `kind` have a live process: started by this daemon
+    /// and not yet exited. A restored agent has no process and does not count.
+    pub fn running(&self, kind: AgentAdapterKind) -> usize {
+        self.agents
+            .lock()
+            .values()
+            .filter(|a| {
+                a.entry.adapter == kind
+                    && a.adapter.is_some()
+                    && a.entry.state().0 != AgentState::Exited
+            })
+            .count()
+    }
+
     pub fn agents_of(&self, ws: &WorkspaceId) -> Vec<AgentId> {
         self.records_of(ws).into_iter().map(|a| a.id).collect()
     }
@@ -1510,5 +1524,68 @@ mod tests {
             stored, published,
             "the file must hold the same order the bus saw"
         );
+    }
+
+    /// What an uninstall is refused on: agents of that backend with a live
+    /// process. Another backend's agents, an exited one, and one restored from
+    /// its record -- which has no process -- do not count.
+    #[test]
+    fn only_live_agents_of_the_kind_count_as_running() {
+        struct Idle;
+        #[async_trait::async_trait]
+        impl AgentAdapter for Idle {
+            async fn start(&mut self) -> Result<(), RpcError> {
+                Ok(())
+            }
+            async fn send(&mut self, _: String) -> Result<(), RpcError> {
+                Ok(())
+            }
+            async fn permission_reply(
+                &mut self,
+                _: String,
+                _: PermissionDecision,
+                _: Option<serde_json::Value>,
+                _: Option<String>,
+            ) -> Result<(), RpcError> {
+                Ok(())
+            }
+            async fn interrupt(&mut self) -> Result<(), RpcError> {
+                Ok(())
+            }
+            async fn stop(&mut self) -> Result<(), RpcError> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AgentManager::new(
+            EventBus::new(16),
+            dir.path().join("transcripts"),
+            dir.path().join("agents.json"),
+        );
+        let add = |id: &str, kind: AgentAdapterKind, live: bool, state: AgentState| {
+            let entry = Arc::new(AgentEntry::new("ws_1".into(), kind));
+            *entry.state.lock() = (state, None);
+            let agent = Agent {
+                entry,
+                ordinal: 0,
+                started_with: StartedWith::from_options(&AgentStartOptions {
+                    command: None,
+                    resume_session: None,
+                    model: None,
+                    permission_mode: None,
+                    api_key: None,
+                }),
+                adapter: live
+                    .then(|| tokio::sync::Mutex::new(Box::new(Idle) as Box<dyn AgentAdapter>)),
+            };
+            manager.agents.lock().insert(id.into(), Arc::new(agent));
+        };
+        add("ag_1", AgentAdapterKind::Codex, true, AgentState::Working);
+        add("ag_2", AgentAdapterKind::Codex, true, AgentState::Exited);
+        add("ag_3", AgentAdapterKind::Codex, false, AgentState::Idle);
+        add("ag_4", AgentAdapterKind::Claude, true, AgentState::Idle);
+        assert_eq!(manager.running(AgentAdapterKind::Codex), 1);
+        assert_eq!(manager.running(AgentAdapterKind::Claude), 1);
+        assert_eq!(manager.running(AgentAdapterKind::OpenCode), 0);
     }
 }

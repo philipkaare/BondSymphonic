@@ -1522,6 +1522,12 @@ fn parse_setup_action(action: &str) -> Option<SetupAction> {
         // passes or fails: `claude setup-token` neither needs nor disturbs an
         // existing login.
         "claude_setup_token" => Some(SetupAction::ClaudeSetupToken),
+        // Offered on a passing install row, and only when the daemon's
+        // descriptor lists them: the same host terminal, and the same
+        // re-check when it exits, which turns the tick into a cross.
+        "uninstall_claude" => Some(SetupAction::UninstallClaude),
+        "uninstall_codex" => Some(SetupAction::UninstallCodex),
+        "uninstall_opencode" => Some(SetupAction::UninstallOpencode),
         _ => None,
     }
 }

@@ -143,6 +143,21 @@ impl Handler for WorkspaceHandler {
             // it needs the daemon and cannot live in `SystemHandler` with the
             // other `system.*` methods.
             Request::SystemSetupPty(p) => {
+                // Refused rather than warned about: the IDE asks before it
+                // sends this, and the daemon is the one place that knows which
+                // agents are running from every window.
+                if let Some(kind) = crate::setup::uninstalled_backend(p.action) {
+                    let running = d.agents.running(kind);
+                    if running > 0 {
+                        return Err(RpcError::new(
+                            ErrorCode::Conflict,
+                            format!(
+                                "{running} {kind:?} agent(s) still running; stop them before uninstalling"
+                            ),
+                        )
+                        .with_data(serde_json::json!({"reason": "agents_running"})));
+                    }
+                }
                 // For a logout this removes the long-lived token even if the
                 // terminal below then fails to open. Acceptable: the user sees
                 // that error and can press the button again, and removing the

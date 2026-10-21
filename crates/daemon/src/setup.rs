@@ -15,7 +15,7 @@
 //! [`SetupAction`] and nothing else, so no client can name the program that
 //! runs unsandboxed on the developer's machine.
 
-use bondsymphonic_proto::SetupAction;
+use bondsymphonic_proto::{AgentAdapterKind, SetupAction};
 use std::path::{Path, PathBuf};
 
 /// The sandbox backend the host handle is built from. Always the no-sandbox
@@ -25,7 +25,7 @@ pub const HOST_BACKEND: &str = "noop";
 
 /// Every action, for callers that need to enumerate them (tests, and any future
 /// listing of what the daemon can fix).
-pub const ALL_ACTIONS: [SetupAction; 13] = [
+pub const ALL_ACTIONS: [SetupAction; 16] = [
     SetupAction::ClaudeLogin,
     SetupAction::GhLogin,
     SetupAction::InstallClaude,
@@ -39,6 +39,9 @@ pub const ALL_ACTIONS: [SetupAction; 13] = [
     SetupAction::InstallOpencode,
     SetupAction::OpencodeLogin,
     SetupAction::OpencodeLogout,
+    SetupAction::UninstallClaude,
+    SetupAction::UninstallCodex,
+    SetupAction::UninstallOpencode,
 ];
 
 /// The command each action runs. The whole table is literal: an action selects
@@ -89,6 +92,23 @@ pub fn setup_argv(action: SetupAction) -> Vec<String> {
             "cli_auth_credentials_store=\"file\"",
             "logout",
         ],
+        // Each removes only what that CLI's installer made, by path, and says
+        // what it left alone; none touches a login or a configuration.
+        SetupAction::UninstallClaude => &[
+            "bash",
+            "-c",
+            include_str!("../../../scripts/uninstall-claude.sh"),
+        ],
+        SetupAction::UninstallCodex => &[
+            "bash",
+            "-c",
+            include_str!("../../../scripts/uninstall-codex.sh"),
+        ],
+        SetupAction::UninstallOpencode => &[
+            "bash",
+            "-c",
+            include_str!("../../../scripts/uninstall-opencode.sh"),
+        ],
     };
     argv.iter().map(|s| (*s).to_string()).collect()
 }
@@ -108,6 +128,20 @@ fn opencode_argv(args: &[&str]) -> Vec<String> {
     });
     argv.extend(args.iter().map(|s| (*s).to_string()));
     argv
+}
+
+/// The backend whose CLI `action` removes, or `None` for anything that is not
+/// an uninstall. What `system.setup_pty` refuses an uninstall on while that
+/// backend has agents running: each sandbox binds the CLI's files when it
+/// starts, and a running agent would carry on with a program the user has just
+/// been told is gone -- then fail to start again on its next restart.
+pub fn uninstalled_backend(action: SetupAction) -> Option<AgentAdapterKind> {
+    match action {
+        SetupAction::UninstallClaude => Some(AgentAdapterKind::Claude),
+        SetupAction::UninstallCodex => Some(AgentAdapterKind::Codex),
+        SetupAction::UninstallOpencode => Some(AgentAdapterKind::OpenCode),
+        _ => None,
+    }
 }
 
 pub fn setup_env(root: &Path, action: SetupAction) -> Vec<(String, String)> {
@@ -315,6 +349,39 @@ mod tests {
     #[test]
     fn the_host_home_is_never_empty() {
         assert!(!host_home().as_os_str().is_empty());
+    }
+
+    /// Only the three uninstalls name a backend, each its own.
+    #[test]
+    fn only_an_uninstall_names_the_backend_it_takes_away() {
+        for action in ALL_ACTIONS {
+            let expected = match action {
+                SetupAction::UninstallClaude => Some(AgentAdapterKind::Claude),
+                SetupAction::UninstallCodex => Some(AgentAdapterKind::Codex),
+                SetupAction::UninstallOpencode => Some(AgentAdapterKind::OpenCode),
+                _ => None,
+            };
+            assert_eq!(uninstalled_backend(action), expected, "{action:?}");
+        }
+    }
+
+    /// An uninstall is a script that deletes by path, so what it may delete is
+    /// pinned here: nothing it runs names a login, a config or `~` itself.
+    #[test]
+    fn an_uninstall_never_names_a_login_or_a_config() {
+        for action in [
+            SetupAction::UninstallClaude,
+            SetupAction::UninstallCodex,
+            SetupAction::UninstallOpencode,
+        ] {
+            let argv = setup_argv(action);
+            assert_eq!(argv[..2], ["bash", "-c"], "{action:?}");
+            for line in argv[2].lines().filter(|l| l.contains("rm ")) {
+                for forbidden in [".claude", ".config", "auth", "codex-home", "\"$HOME\""] {
+                    assert!(!line.contains(forbidden), "{action:?}: {line}");
+                }
+            }
+        }
     }
 
     /// [`before_setup`]: a Claude logout takes the long-lived token with it,

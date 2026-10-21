@@ -68,6 +68,9 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
     m_setup = new SetupPage(m_controller, setupBox);
     setupLayout->addWidget(m_setup);
     bodyLayout->addWidget(setupBox, 1);
+    // The terminal opens in the Setup section, far above a backend tab's
+    // buttons, so whichever button started it brings it into view.
+    QObject::connect(m_setup, &SetupPage::actionStarted, this, [this] { revealSetup(); });
 
     auto* agentBox = new QGroupBox("Agents", body);
     auto* form = new QFormLayout(agentBox);
@@ -95,18 +98,10 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
         enabled->setObjectName("BackendEnabled_" + id);
         enabled->setChecked(settings.value("enabled").toBool());
         backendForm->addRow(enabled);
-        auto *actions = new QHBoxLayout();
-        for (const auto &actionValue : descriptor.value("setup_actions").toArray()) {
-            const QString action = actionValue.toString();
-            const QString label = SetupPage::buttonTextFor(action);
-            auto *button = new QPushButton(label, page);
-            actions->addWidget(button);
-            QObject::connect(button, &QPushButton::clicked, this, [this, action] {
-                m_setup->runAction(action);
-                revealSetup();
-            });
-        }
-        backendForm->addRow("Sign-in and installation:", actions);
+        // One button per pair -- Install or Uninstall, Sign in or Sign out --
+        // saying what it will do now. The Setup page owns their state, so they
+        // follow its answer and go dead with its own buttons.
+        backendForm->addRow("Sign-in and installation:", m_setup->backendActions(descriptor, page));
         auto *model = new QComboBox(page);
         model->setObjectName("BackendModel_" + id);
         agentchoices::fillModelCombo(model, settings.value("default_model").toString(), id);
@@ -430,6 +425,102 @@ extern "C" std::int32_t bs_widget_test_settings_offers_the_one_permission_list()
     if (!openCodeEnabled->isChecked() || agentchoices::modelComboSelection(openCodeModel) != "local/my-model")
         return 30;
     if (three.findChild<QComboBox *>("DefaultBackend")->findData("opencode") < 0) return 31;
+    return 0;
+}
+
+/// A backend tab offers one button per pair, saying what it will do now.
+///
+/// The tab used to list every action its descriptor named -- Install, Sign in
+/// and Sign out side by side, all live whatever was installed or signed in.
+/// Now the install button is Install or Uninstall and the sign-in button Sign
+/// in or Sign out, from the Setup page's last answer; an uninstall the daemon
+/// did not list is never offered; and nothing is live before there is an
+/// answer or while an action's terminal is in hand.
+extern "C" std::int32_t bs_widget_test_settings_backend_tab_offers_one_button_per_pair() {
+    AppController controller;
+    const QJsonArray descriptors{
+        QJsonObject{{"id", "codex"},
+                    {"label", "Codex"},
+                    {"default_permission_mode", "never"},
+                    {"prerequisite_names", QJsonArray{"codex", "codex_auth"}},
+                    {"setup_actions",
+                     QJsonArray{"install_codex", "uninstall_codex", "codex_login", "codex_logout"}},
+                    {"credential_label", "OpenAI API key"}},
+        // A daemon that does not list an uninstall for OpenCode.
+        QJsonObject{{"id", "opencode"},
+                    {"label", "OpenCode"},
+                    {"default_permission_mode", "ask"},
+                    {"prerequisite_names", QJsonArray{"opencode", "opencode_auth"}},
+                    {"setup_actions",
+                     QJsonArray{"install_opencode", "opencode_login", "opencode_logout"}},
+                    {"credential_label", "OpenAI API key"}}};
+    SettingsDialog dialog(&controller, nullptr, descriptors);
+    auto* codexInstall = dialog.findChild<QPushButton*>("BackendInstall_codex");
+    auto* codexAuth = dialog.findChild<QPushButton*>("BackendAuth_codex");
+    auto* openInstall = dialog.findChild<QPushButton*>("BackendInstall_opencode");
+    auto* openAuth = dialog.findChild<QPushButton*>("BackendAuth_opencode");
+    if (!codexInstall || !codexAuth || !openInstall || !openAuth) {
+        return 1;
+    }
+    // No answer yet: nothing to act on.
+    if (codexInstall->isEnabled() || codexAuth->isEnabled()) {
+        return 2;
+    }
+    // Every other button on the tabs is the dialog's own, not a setup action.
+    for (QPushButton* button : dialog.findChildren<QPushButton*>()) {
+        if (button->text() == QLatin1String("Sign out of Codex") && button != codexAuth) {
+            return 3;
+        }
+    }
+
+    controller.prereqsChecked(QStringLiteral(
+        R"([{"name":"codex","ok":false,"detail":"missing"},{"name":"codex_auth","ok":false,"detail":"none"},)"
+        R"({"name":"opencode","ok":true,"detail":"installed"},{"name":"opencode_auth","ok":true,"detail":"signed in"}])"));
+    if (codexInstall->text() != QLatin1String("Install Codex") || !codexInstall->isEnabled()) {
+        return 4;
+    }
+    // Signing in to a CLI that is not there is offered, dead, saying why.
+    if (codexAuth->text() != QLatin1String("Sign in to ChatGPT") || codexAuth->isEnabled() ||
+        !codexAuth->toolTip().contains("Install")) {
+        return 5;
+    }
+    // Installed, with no uninstall listed: no install button at all.
+    if (!openInstall->isHidden()) {
+        return 6;
+    }
+    if (openAuth->text() != QLatin1String("Sign out of OpenCode") || !openAuth->isEnabled()) {
+        return 7;
+    }
+
+    controller.prereqsChecked(QStringLiteral(
+        R"([{"name":"codex","ok":true,"detail":"installed"},{"name":"codex_auth","ok":true,"detail":"signed in"},)"
+        R"({"name":"opencode","ok":false,"detail":"missing"},{"name":"opencode_auth","ok":false,"detail":"none"}])"));
+    if (codexInstall->text() != QLatin1String("Uninstall Codex") || !codexInstall->isEnabled() ||
+        codexInstall->isHidden()) {
+        return 8;
+    }
+    if (codexAuth->text() != QLatin1String("Sign out of Codex") || !codexAuth->isEnabled()) {
+        return 9;
+    }
+    if (openInstall->isHidden() || openInstall->text() != QLatin1String("Install OpenCode")) {
+        return 10;
+    }
+
+    // A click runs the action the button says, and the tab goes dead with
+    // the rows while it is in hand.
+    auto* setup = dialog.findChild<SetupPage*>();
+    if (setup == nullptr) {
+        return 11;
+    }
+    setup->setPtyCloser([](const QString&) {});
+    QString started;
+    QObject::connect(setup, &SetupPage::actionStarted,
+                     [&started](const QString& action) { started = action; });
+    codexAuth->click();
+    if (started != QLatin1String("codex_logout") || codexInstall->isEnabled() ||
+        codexAuth->isEnabled() || openInstall->isEnabled()) {
+        return 12;
+    }
     return 0;
 }
 

@@ -17,6 +17,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QMessageBox>
 #include <QPalette>
 #include <QPushButton>
 #include <QResizeEvent>
@@ -107,6 +108,7 @@ SetupPage::SetupPage(AppController* controller, QWidget* parent)
         // the daemon has already reaped comes back an error.
         m_session->setPtyId(QString());
     };
+    m_confirm = [this](const QString& action) { return confirmUninstall(action); };
     auto* outer = new QVBoxLayout(this);
 
     auto* subtitle = new QLabel(
@@ -202,8 +204,13 @@ SetupPage::SetupPage(AppController* controller, QWidget* parent)
     buttons->addStretch(1);
     outer->addLayout(buttons);
 
-    QObject::connect(m_recheckButton, &QPushButton::clicked, this,
-                     [this] { m_controller->recheckPrereqs(); });
+    QObject::connect(m_recheckButton, &QPushButton::clicked, this, [this] {
+        // The rows are about to be replaced; until they are, an action would
+        // be chosen from an answer that is on its way out.
+        m_awaitingCheck = true;
+        updateActionButtons();
+        m_controller->recheckPrereqs();
+    });
     QObject::connect(m_controller, &AppController::prereqsChecked, this, &SetupPage::applyPrereqs);
     QObject::connect(m_controller, &AppController::prereqsCheckFailed, this,
                      &SetupPage::onPrereqsCheckFailed);
@@ -260,10 +267,21 @@ void SetupPage::setPtyCloser(std::function<void(const QString& ptyId)> close) {
 
 void SetupPage::applyPrereqs(const QString& json) {
     m_answered = true;
+    m_awaitingCheck = false;
+    m_lastJson = json;
     clearRows();
     const QJsonArray items = QJsonDocument::fromJson(json.toUtf8()).array();
+    m_items.clear();
+    for (const auto& value : items) {
+        const QJsonObject item = value.toObject();
+        m_items.insert(item.value("name").toString(), item);
+    }
     const auto descriptors =
         QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array();
+    m_offeredActions.clear();
+    for (const auto& value : descriptors)
+        for (const auto& action : value.toObject().value("setup_actions").toArray())
+            m_offeredActions.append(action.toString());
     const auto settings =
         m_backendSettings.isEmpty()
             ? QJsonDocument::fromJson(m_controller->backendSettingsJson().toUtf8())
@@ -295,12 +313,15 @@ void SetupPage::applyPrereqs(const QString& json) {
                 addItem(item.toObject());
     }
     m_rowsLayout->addStretch(1);
+    refreshBackendActions();
 }
 
 void SetupPage::setBackendSettings(const QJsonObject &settings) {
     m_backendSettings = settings;
+    // The page's own last answer, not the controller's: they are the same
+    // payload in the running IDE, and the page's is the one its rows show.
     if (m_answered)
-        applyPrereqs(m_controller->prereqsJson());
+        applyPrereqs(m_lastJson);
 }
 
 void SetupPage::showCheckingRow() {
@@ -313,6 +334,10 @@ void SetupPage::showCheckingRow() {
 }
 
 void SetupPage::onPrereqsCheckFailed(const QString& message) {
+    // The re-check is over either way. The rows that stay are the daemon's
+    // last word, and Re-check is how to ask again.
+    m_awaitingCheck = false;
+    updateActionButtons();
     if (m_answered) {
         // There is an answer on the page already. It is still the daemon's
         // last word, the status bar is saying the connection is down, and
@@ -330,11 +355,29 @@ void SetupPage::onPrereqsCheckFailed(const QString& message) {
     m_rowsLayout->addStretch(1);
 }
 
-void SetupPage::setActionsEnabled(bool enabled) {
-    for (QPushButton* button : m_actionButtons) {
+bool SetupPage::actionsAvailable() const {
+    // The terminal counts until it exits, not only until it opens: a second
+    // action's terminal replaces the first one's, and the PTY that goes with
+    // it is closed -- an install killed halfway. And the re-check after it
+    // counts too, because until it answers the rows describe the machine as
+    // it was before the action ran.
+    return m_answered && m_pendingAction.isEmpty() && m_ptyId.isEmpty() && !m_awaitingCheck;
+}
+
+void SetupPage::updateActionButtons() {
+    const bool available = actionsAvailable();
+    auto apply = [available](QPushButton* button) {
         if (button != nullptr) {
-            button->setEnabled(enabled);
+            button->setEnabled(available && !button->property("bsBlocked").toBool());
         }
+    };
+    for (QPushButton* button : m_actionButtons) {
+        apply(button);
+    }
+    for (const BackendButtons& buttons : m_backendButtons) {
+        apply(buttons.install);
+        apply(buttons.signIn);
+        apply(buttons.token);
     }
 }
 
@@ -398,6 +441,18 @@ QString SetupPage::logoutActionFor(const QString& name) {
     return QString();
 }
 
+QString SetupPage::uninstallActionFor(const QString& name) {
+    // The three agent CLIs BondSymphonic's own installers put in the distro.
+    // Not `gh`: that came from apt, and the package manager is how it goes.
+    if (name == QLatin1String("claude"))
+        return QStringLiteral("uninstall_claude");
+    if (name == QLatin1String("codex"))
+        return QStringLiteral("uninstall_codex");
+    if (name == QLatin1String("opencode"))
+        return QStringLiteral("uninstall_opencode");
+    return QString();
+}
+
 QString SetupPage::tokenActionFor(const QString& name, bool ok, const QString& detail) {
     if (name != QLatin1String("claude_auth")) {
         return QString();
@@ -422,6 +477,12 @@ QString SetupPage::buttonTextFor(const QString& action) {
         return "Sign out of OpenCode";
     if (action == "install_codex")
         return "Install Codex";
+    if (action == QLatin1String("uninstall_claude"))
+        return QStringLiteral("Uninstall Claude Code");
+    if (action == QLatin1String("uninstall_codex"))
+        return QStringLiteral("Uninstall Codex");
+    if (action == QLatin1String("uninstall_opencode"))
+        return QStringLiteral("Uninstall OpenCode");
     if (action == "codex_login")
         return "Sign in to ChatGPT";
     if (action == "codex_logout")
@@ -517,7 +578,7 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
                          [this, action] { runAction(action); });
         // A re-check can rebuild the rows while a request is still in flight,
         // and the new buttons must be as dead as the ones they replaced.
-        button->setEnabled(m_pendingAction.isEmpty());
+        button->setEnabled(actionsAvailable());
         m_actionButtons.append(button);
         layout->addWidget(button);
         return button;
@@ -538,6 +599,13 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
             // pull the eye away from the rows that are not fine. The tooltip
             // is where it says what it will actually run.
             button->setToolTip(logoutTooltipFor(logout));
+        }
+        // The other passing row with an undo: a CLI BondSymphonic installed,
+        // offered only when the daemon says it can take it away again.
+        const QString uninstall = uninstallActionFor(name);
+        if (!uninstall.isEmpty() && m_offeredActions.contains(uninstall)) {
+            QPushButton* button = addActionButton(uninstall);
+            button->setToolTip(uninstallTooltip(uninstall));
         }
         const QString token = tokenActionFor(name, ok, detail);
         if (!token.isEmpty()) {
@@ -563,28 +631,192 @@ void SetupPage::addRow(const QString& name, bool ok, const QString& detail,
         m_rowsLayout->addWidget(row);
         return;
     }
-    addActionButton(action);
+    // A sign-in needs its CLI. Offered all the same, so the row still says
+    // what comes next, but dead until the install has happened: its terminal
+    // could only say the program is missing.
+    const QString missing = missingCliFor(name);
+    QPushButton* fix = addActionButton(action);
+    blockFor(fix, missing);
     const QString token = tokenActionFor(name, ok, detail);
     if (!token.isEmpty()) {
         QPushButton* button = addActionButton(token);
         button->setObjectName(kTokenButtonName);
         button->setToolTip(kTokenButtonTooltip);
+        blockFor(button, missing);
     }
     m_rowsLayout->addWidget(row);
 }
 
+QString SetupPage::missingCliFor(const QString& name) const {
+    if (!name.endsWith(QLatin1String("_auth"))) {
+        return QString();
+    }
+    const QString cli = name.chopped(5);
+    const auto item = m_items.constFind(cli);
+    // Unknown is not missing: a payload without the CLI's row says nothing
+    // about it, and a dead button would then have no reason to give.
+    if (item == m_items.constEnd() || item->value("ok").toBool()) {
+        return QString();
+    }
+    const QString install = buttonTextFor(actionFor(cli));
+    return install.isEmpty() ? cli : install.mid(QStringLiteral("Install ").size());
+}
+
+void SetupPage::blockFor(QPushButton* button, const QString& missingCli) {
+    if (button == nullptr) {
+        return;
+    }
+    const bool blocked = !missingCli.isEmpty();
+    button->setProperty("bsBlocked", blocked);
+    if (blocked) {
+        button->setToolTip(QStringLiteral("Install %1 first").arg(missingCli));
+    }
+    button->setEnabled(actionsAvailable() && !blocked);
+}
+
+QString SetupPage::uninstallTooltip(const QString& action) {
+    if (action == QLatin1String("uninstall_claude"))
+        return QStringLiteral("Removes ~/.local/bin/claude and ~/.local/share/claude from the "
+                              "distro. Your login and ~/.claude are kept.");
+    if (action == QLatin1String("uninstall_codex"))
+        return QStringLiteral("Removes the Codex BondSymphonic installed in ~/.local/bin and "
+                              "~/.local/share/bondsymphonic/codex. Your sign-in is kept.");
+    return QStringLiteral("Removes the OpenCode BondSymphonic installed in ~/.local/bin. Your "
+                          "sign-in and configuration are kept.");
+}
+
+bool SetupPage::confirmUninstall(const QString& action) {
+    const QString what = buttonTextFor(action).mid(QStringLiteral("Uninstall ").size());
+    const auto answer = QMessageBox::question(
+        this, buttonTextFor(action),
+        QStringLiteral("%1\n\nRunning %2 agents have to be stopped first. You can install it "
+                       "again from here at any time.")
+            .arg(uninstallTooltip(action), what),
+        QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+    return answer == QMessageBox::Yes;
+}
+
+void SetupPage::setConfirmer(std::function<bool(const QString& action)> confirm) {
+    if (confirm) {
+        m_confirm = std::move(confirm);
+    }
+}
+
+QWidget* SetupPage::backendActions(const QJsonObject& descriptor, QWidget* parent) {
+    auto* host = new QWidget(parent);
+    auto* layout = new QHBoxLayout(host);
+    layout->setContentsMargins(0, 0, 0, 0);
+    const QString id = descriptor.value("id").toString();
+    BackendButtons buttons;
+    for (const auto& action : descriptor.value("setup_actions").toArray()) {
+        buttons.offered.append(action.toString());
+    }
+    for (const auto& value : descriptor.value("prerequisite_names").toArray()) {
+        const QString name = value.toString();
+        if (name.endsWith(QLatin1String("_auth"))) {
+            buttons.auth = name;
+        } else if (!actionFor(name).isEmpty()) {
+            buttons.binary = name;
+        }
+    }
+    auto make = [this, host, layout](const QString& objectName) {
+        auto* button = new QPushButton(host);
+        button->setObjectName(objectName);
+        // The action is read off the button when it is clicked, since the
+        // same button is Install one moment and Uninstall the next.
+        QObject::connect(button, &QPushButton::clicked, this, [this, button] {
+            const QString action = button->property("bsAction").toString();
+            if (!action.isEmpty()) {
+                runAction(action);
+            }
+        });
+        layout->addWidget(button);
+        return button;
+    };
+    buttons.install = make(QStringLiteral("BackendInstall_") + id);
+    buttons.signIn = make(QStringLiteral("BackendAuth_") + id);
+    buttons.token = make(QStringLiteral("BackendToken_") + id);
+    layout->addStretch(1);
+    m_backendButtons.append(buttons);
+    refreshBackendActions();
+    return host;
+}
+
+void SetupPage::refreshBackendActions() {
+    // `action` when the descriptor offers it, otherwise no button at all: a
+    // daemon that does not list an action would refuse it.
+    auto point = [this](QPushButton* button, const BackendButtons& buttons, const QString& action,
+                        const QString& missingCli, const QString& tooltip) {
+        if (button == nullptr) {
+            return;
+        }
+        const bool offered = !action.isEmpty() && buttons.offered.contains(action);
+        // `setHidden` rather than `setVisible`: the tab may not be shown yet,
+        // and what is being said is "not part of this tab", not "on screen".
+        button->setHidden(!offered);
+        button->setProperty("bsAction", offered ? action : QString());
+        if (!offered) {
+            return;
+        }
+        button->setText(buttonTextFor(action));
+        button->setToolTip(tooltip);
+        blockFor(button, missingCli);
+    };
+    for (BackendButtons& buttons : m_backendButtons) {
+        // With no answer yet the pair says what it would do for a machine
+        // that has nothing, dead, rather than vanishing from the tab.
+        const auto binary = m_items.constFind(buttons.binary);
+        const auto auth = m_items.constFind(buttons.auth);
+        const bool known = m_answered;
+        if (!buttons.binary.isEmpty()) {
+            const bool installed =
+                known && binary != m_items.constEnd() && binary->value("ok").toBool();
+            const QString action =
+                installed ? uninstallActionFor(buttons.binary) : actionFor(buttons.binary);
+            point(buttons.install, buttons, action, QString(),
+                  installed ? uninstallTooltip(action) : QString());
+        } else {
+            point(buttons.install, buttons, QString(), QString(), QString());
+        }
+        if (!buttons.auth.isEmpty()) {
+            const bool signedIn = known && auth != m_items.constEnd() && auth->value("ok").toBool();
+            const QString action =
+                signedIn ? logoutActionFor(buttons.auth) : actionFor(buttons.auth);
+            const QString missing = signedIn ? QString() : missingCliFor(buttons.auth);
+            point(buttons.signIn, buttons, action, missing,
+                  signedIn ? logoutTooltipFor(action) : QString());
+            const QString token =
+                auth == m_items.constEnd()
+                    ? QString()
+                    : tokenActionFor(buttons.auth, signedIn, auth->value("detail").toString());
+            point(buttons.token, buttons, token, missing, kTokenButtonTooltip);
+        } else {
+            point(buttons.signIn, buttons, QString(), QString(), QString());
+            point(buttons.token, buttons, QString(), QString(), QString());
+        }
+    }
+    updateActionButtons();
+}
+
 void SetupPage::runAction(const QString& action) {
-    if (!m_pendingAction.isEmpty()) {
+    if (!actionsAvailable()) {
         // A second request while the first is being answered would orphan the
         // first one's process: `setupPtyOpened` carries the pty id, so until it
-        // arrives there is nothing to close.
+        // arrives there is nothing to close. And while that terminal runs, or
+        // the re-check after it is out, the buttons are dead for the reasons
+        // `actionsAvailable` gives; this is the same rule for a caller that
+        // is not a button.
+        return;
+    }
+    if (action.startsWith(QLatin1String("uninstall_")) && !m_confirm(action)) {
         return;
     }
     m_pendingAction = action;
     // From here the machine may be a different one by the time the dialog is
     // closed, which is the whole of what `ranAction` answers.
     m_ranAction = true;
-    setActionsEnabled(false);
+    updateActionButtons();
+    emit actionStarted(action);
     // Whatever the last terminal printed belongs to the last terminal. A row
     // left standing here would offer the previous login's URL beside the new
     // one's output.
@@ -597,7 +829,8 @@ void SetupPage::runAction(const QString& action) {
     // The paste is named here because the one question this terminal asks
     // that cannot be typed is the sign-in code, and a shortcut nobody is
     // told about is a shortcut nobody finds.
-    setTerminalNote(QString("Running %1. Answer its questions here; Ctrl+V pastes.").arg(action));
+    setTerminalNote(
+        QString("Running %1. Answer its questions here; Ctrl+V pastes, Ctrl+C stops it.").arg(action));
     m_terminal->setVisible(true);
     m_terminalHost->setVisible(true);
     // Deferred by one turn of the event loop: the pane has only just been
@@ -615,14 +848,16 @@ void SetupPage::onSetupPtyOpened(const QString& action, const QString& ptyId) {
     if (action != m_pendingAction) {
         return;
     }
-    m_pendingAction.clear();
-    setActionsEnabled(true);
     // Before `attach`, and kept here rather than read back off the session: the
     // session learns its own id a turn of the event loop later, so a page torn
     // down in between would have nothing to close and would leave a login
     // prompt running in the distro with nobody attached. `attach` closes
     // whatever PTY the session was holding before this one.
     m_ptyId = ptyId;
+    m_pendingAction.clear();
+    // Still dead: the terminal is running now, and stays this page's until
+    // it exits.
+    updateActionButtons();
     m_session->attach(ptyId, terminalCols(), terminalRows());
     m_terminal->setFocus();
 }
@@ -633,7 +868,7 @@ void SetupPage::onOperationFailed(const QString& op, const QString& message) {
     }
     const QString action = m_pendingAction;
     m_pendingAction.clear();
-    setActionsEnabled(true);
+    updateActionButtons();
     // The pane header says what went wrong, over a hidden terminal: nothing was
     // opened, so an empty black rectangle would only read as a hang.
     setTerminalNote(QString("%1 could not start: %2").arg(action, message));
@@ -752,6 +987,10 @@ void SetupPage::onTerminalExited() {
     // the user to a page that answers with an expired code.
     clearLink();
     m_terminalLabel->setText("Finished. Re-checking…");
+    // Dead until the answer is back: the rows still describe the machine
+    // from before the terminal ran.
+    m_awaitingCheck = true;
+    updateActionButtons();
     // The reply to `system.setup_pty` came back the moment the terminal
     // opened; the fix is only done now.
     m_controller->recheckPrereqs();
@@ -1205,12 +1444,13 @@ extern "C" std::int32_t bs_widget_test_setup_page_hides_the_rows_it_rebuilds() {
     int shownHeadings = 0;
     int shownInstallButtons = 0;
     for (QLabel* label : page.findChildren<QLabel*>()) {
-        if (label->text() == QLatin1String("System") && !label->isHidden()) {
+        if (label->text() == QLatin1String("System") && label->isVisibleTo(&page)) {
             ++shownHeadings;
         }
     }
     for (QPushButton* button : page.findChildren<QPushButton*>()) {
-        if (button->text() == QLatin1String("Install Claude Code") && !button->isHidden()) {
+        // Through the row: a rebuild hides the row, not the button on it.
+        if (button->text() == QLatin1String("Install Claude Code") && button->isVisibleTo(&page)) {
             ++shownInstallButtons;
         }
     }
@@ -1285,6 +1525,105 @@ extern "C" std::int32_t bs_widget_test_setup_page_says_it_is_checking_first() {
         if (rowSaying(page, "not installed") == nullptr) {
             return 10;
         }
+    }
+    return 0;
+}
+
+/// A button on the page reading exactly `text` that a rebuild has not taken
+/// down. `buttonSaying` finds those as well, since their deletes are deferred.
+QPushButton* shownButtonSaying(const SetupPage& page, const char* text) {
+    for (QPushButton* button : page.findChildren<QPushButton*>()) {
+        if (button->text() == QLatin1String(text) && !button->isHidden()) {
+            return button;
+        }
+    }
+    return nullptr;
+}
+
+/// Claude Code, missing and then installed and signed in.
+const char* const kClaudeMissing =
+    "[{\"name\":\"claude\",\"ok\":false,\"detail\":\"not found\",\"fix_hint\":\"\"},"
+    "{\"name\":\"claude_auth\",\"ok\":false,\"detail\":\"not logged in\",\"fix_hint\":\"\"}]";
+const char* const kClaudeReady =
+    "[{\"name\":\"claude\",\"ok\":true,\"detail\":\"2.1.0\",\"fix_hint\":\"\"},"
+    "{\"name\":\"claude_auth\",\"ok\":true,\"detail\":\"logged in to Claude\",\"fix_hint\":\"\"}]";
+
+/// Each pair is one button saying what it will do now: Install or Uninstall,
+/// Log in or Log out, never both halves at once. A sign-in whose CLI is not
+/// installed is offered but dead, since its terminal could only say the
+/// program is missing. And the page stays busy from the click until the
+/// re-check after the terminal has answered: a button pressed in between
+/// would act on a machine the rows no longer describe, and a second terminal
+/// would kill the first one's install halfway.
+extern "C" std::int32_t bs_widget_test_setup_page_offers_one_button_per_pair() {
+    AppController controller;
+    SetupPage page(&controller);
+    page.setPtyCloser([](const QString&) {});
+    page.setBackendSettings(
+        QJsonObject{{QStringLiteral("claude"), QJsonObject{{QStringLiteral("enabled"), true}}}});
+    controller.prereqsChecked(QString::fromUtf8(kClaudeMissing));
+    collectRows();
+    QPushButton* install = shownButtonSaying(page, "Install Claude Code");
+    QPushButton* login = shownButtonSaying(page, "Log in to Claude Code");
+    if (install == nullptr || !install->isEnabled()) {
+        return 1;
+    }
+    if (shownButtonSaying(page, "Uninstall Claude Code") != nullptr ||
+        shownButtonSaying(page, "Log out of Claude Code") != nullptr) {
+        return 2;
+    }
+    if (login == nullptr || login->isEnabled() || !login->toolTip().contains("Install")) {
+        return 3;
+    }
+
+    controller.prereqsChecked(QString::fromUtf8(kClaudeReady));
+    collectRows();
+    QPushButton* uninstall = shownButtonSaying(page, "Uninstall Claude Code");
+    QPushButton* logout = shownButtonSaying(page, "Log out of Claude Code");
+    if (uninstall == nullptr || !uninstall->isEnabled() || logout == nullptr ||
+        !logout->isEnabled()) {
+        return 4;
+    }
+    if (shownButtonSaying(page, "Install Claude Code") != nullptr ||
+        shownButtonSaying(page, "Log in to Claude Code") != nullptr) {
+        return 5;
+    }
+
+    // An uninstall asks first, and a no leaves everything as it was.
+    QString asked;
+    page.setConfirmer([&asked](const QString& action) {
+        asked = action;
+        return false;
+    });
+    uninstall->click();
+    if (asked != QLatin1String("uninstall_claude") || page.ranAction() || !uninstall->isEnabled()) {
+        return 6;
+    }
+    page.setConfirmer([](const QString&) { return true; });
+    uninstall->click();
+    if (!page.ranAction() || uninstall->isEnabled() || logout->isEnabled()) {
+        return 7;
+    }
+    // Opened: the terminal is running, and the buttons stay dead.
+    controller.setupPtyOpened(QStringLiteral("uninstall_claude"), QStringLiteral("pty_9"));
+    if (uninstall->isEnabled() || logout->isEnabled()) {
+        return 8;
+    }
+    // Exited: the re-check is out, and they are still dead.
+    TerminalSession* session = page.findChild<TerminalSession*>();
+    if (session == nullptr) {
+        return 9;
+    }
+    session->exitedSignal();
+    if (uninstall->isEnabled() || logout->isEnabled()) {
+        return 10;
+    }
+    // The answer is back: the pair now says Install again, and it is live.
+    controller.prereqsChecked(QString::fromUtf8(kClaudeMissing));
+    collectRows();
+    install = shownButtonSaying(page, "Install Claude Code");
+    if (install == nullptr || !install->isEnabled()) {
+        return 11;
     }
     return 0;
 }

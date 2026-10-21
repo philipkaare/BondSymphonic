@@ -713,7 +713,10 @@ async fn version_two_ide_is_refused_before_opencode_capabilities_are_sent() {
             ..
         } => {
             assert!(result.is_none());
-            assert_eq!(protocol_mismatch_versions(&error), Some((3, 2)));
+            assert_eq!(
+                protocol_mismatch_versions(&error),
+                Some((PROTOCOL_VERSION, 2))
+            );
         }
         other => panic!("unexpected {other:?}"),
     }

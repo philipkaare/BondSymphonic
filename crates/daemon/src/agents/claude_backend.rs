@@ -29,7 +29,7 @@ impl Backend for ClaudeBackend {
             permission_note: "Claude Code cannot reach this window to ask, so a tool that needs approval is refused rather than queued. YOLO runs everything — the sandbox, the worktree and the network proxy are what make that reasonable.".into(),
             credential_label: "Anthropic API key".into(),
             prerequisite_names: vec!["claude".into(), "claude_auth".into()],
-            setup_actions: vec![SetupAction::InstallClaude, SetupAction::ClaudeLogin, SetupAction::ClaudeLogout, SetupAction::ClaudeSetupToken],
+            setup_actions: vec![SetupAction::InstallClaude, SetupAction::UninstallClaude, SetupAction::ClaudeLogin, SetupAction::ClaudeLogout, SetupAction::ClaudeSetupToken],
         }
     }
     fn binary(&self) -> Option<PathBuf> {
