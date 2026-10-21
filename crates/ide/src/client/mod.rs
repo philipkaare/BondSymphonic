@@ -1,5 +1,8 @@
 pub mod codec;
+pub mod latest;
 pub mod router;
+
+pub use latest::{LatestOnly, Ticket, TicketHandle};
 
 use bondsymphonic_proto::*;
 use serde::de::DeserializeOwned;
@@ -144,6 +147,21 @@ impl Drop for ReaderGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.0.take() {
             handle.abort();
+        }
+    }
+}
+
+/// A request's entry in the pending map, withdrawn when the request stops
+/// waiting. Removing an entry the reader task already took is a no-op.
+struct PendingSlot<'a> {
+    pending: &'a Pending,
+    id: u64,
+}
+
+impl Drop for PendingSlot<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.id);
         }
     }
 }
@@ -322,12 +340,19 @@ impl DaemonClient {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
+        // However this wait ends -- an answer, a timeout, or the caller dropping
+        // this future because nobody wants the answer any more (a cancelled
+        // `repo.inspect`) -- the slot goes with it rather than lingering until
+        // a response that may never come.
+        let _slot = PendingSlot {
+            pending: &self.pending,
+            id,
+        };
         // The reader task clears `connected` *before* draining the pending map, so an entry
         // inserted after that drain would never be completed by anyone. Re-checking here,
         // after the insert, closes that window: either the drain sees our entry, or we see
         // the flag already cleared and withdraw it ourselves.
         if !self.is_connected() {
-            self.pending.lock().unwrap().remove(&id);
             return Err(ClientError::Disconnected);
         }
         if self
@@ -339,9 +364,8 @@ impl DaemonClient {
             .await
             .is_err()
         {
-            // The writer task is gone; nothing will ever complete this oneshot, so
-            // remove it instead of leaking it in the pending map.
-            self.pending.lock().unwrap().remove(&id);
+            // The writer task is gone; nothing will ever complete this oneshot.
+            // `_slot` removes it instead of leaking it in the pending map.
             return Err(ClientError::Disconnected);
         }
         match tokio::time::timeout(timeout, rx).await {
@@ -350,8 +374,7 @@ impl DaemonClient {
             Ok(Ok(PendingOutcome::Disconnected)) | Ok(Err(_)) => Err(ClientError::Disconnected),
             Err(_) => {
                 // A daemon that accepts a request and never answers it must not wedge the
-                // caller (nor leak its slot in the pending map) forever.
-                self.pending.lock().unwrap().remove(&id);
+                // caller (nor, through `_slot`, leak its slot in the pending map) forever.
                 Err(ClientError::Timeout)
             }
         }
