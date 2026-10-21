@@ -128,6 +128,32 @@ proxy. A model server running on **Windows** is reached either way:
   allow the port through Windows Firewall. This address can change when
   Windows restarts.
 
+**Settings > Agents > OpenCode** lists the providers in this config under
+**Model servers in this config**: the provider id and name, its base URL, how
+many models the config lists for it, and why a sandbox gets no route to it when
+it gets none (a `{env:...}` URL, a loopback server on port 3128, no base URL).
+**Reload** reads the config again. **Test connection** answers "would a
+sandboxed OpenCode agent reach this server?": the daemon resolves and connects
+to the base URL's origin with the same code the sandbox's proxy uses for a
+granted origin (`localhost` meaning the WSL distribution's loopback, private
+addresses allowed), then fetches `<baseURL>/models`, the OpenAI-compatible
+model list, within 5 seconds. It sends the key the agent would send: a literal
+`options.apiKey`, `{env:OPENAI_API_KEY}` as the OpenCode key stored in Settings
+(the only variable the sandbox gets), or the provider's key from **Sign in to
+OpenCode**; the key is never shown or logged. The answer is one of:
+
+- **Reachable**, with the number of models the server lists and the first few ids.
+- **HTTP 401 or 403**: the server is up but refused the key.
+- **HTTP 404**: nothing at `<baseURL>/models`; check the path prefix, such as `/v1`.
+- **Connection refused**: nothing listens there. For a server on Windows, see
+  the mirrored-networking note above.
+- **Timed out**, or the host name **does not resolve** from WSL.
+- **Not reachable from sandboxes**: no route is granted, so an agent cannot use it.
+
+The test runs in the daemon, not inside a sandbox, so it needs no running agent.
+A server reachable from Windows but not from WSL fails it, as it would fail the
+agent. The list needs a daemon from this release; an older daemon does not show it.
+
 What happens when a model server cannot be used:
 
 - **Not granted** (its URL is no longer in the config, or the address and port
