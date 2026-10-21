@@ -90,7 +90,7 @@ WSL2 itself is the one prerequisite the package cannot install for you. If `wsl 
 does not answer, run `wsl --install` in an elevated PowerShell and reboot first.
 
 `bondsymphonic-ide.exe --version` prints the build and the daemon protocol it speaks, for
-example `bondsymphonic-ide 0.1.0 (protocol 3)`. It answers before any window or daemon is
+example `bondsymphonic-ide 0.1.0 (protocol 4)`. It answers before any window or daemon is
 started, so it is the quickest check that a package unzipped correctly — it still needs the
 Qt and CRT DLLs beside it, which the exe imports at load time, but it needs no display, no
 platform plugin and no WSL.

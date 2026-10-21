@@ -213,7 +213,7 @@ To check that a package unzipped intact:
 
 ```powershell
 C:\Tools\BondSymphonic\bondsymphonic-ide.exe --version
-# bondsymphonic-ide 0.1.0 (protocol 3)
+# bondsymphonic-ide 0.1.0 (protocol 4)
 ```
 
 It answers before a window or a daemon is started, so it needs no display, no Qt
@@ -308,6 +308,31 @@ logout reaches workspaces that already exist as well: the credential files are
 copied into each workspace afresh every time an agent starts, and a file you no
 longer have is removed there too, so the next agent to start really is signed
 out rather than carrying on with the old session.
+
+**One button per pair.** A row, and each backend's tab under **Agents**, shows
+only the button that applies now: **Install** or **Uninstall**, **Log in** or
+**Log out**. The buttons are greyed out until the first check has answered,
+while a terminal is opening or running, and until the check after it answers. A
+sign-in or sign-out whose CLI is not installed is greyed out too, with "Install
+… first" as its tooltip: it would only run a program that is not there.
+
+**Uninstall.** A passing `claude`, `codex` or `opencode` check carries
+**Uninstall …**, which asks first and then removes only what BondSymphonic's own
+installer put in the distro:
+
+- Claude Code: the `~/.local/bin/claude` link and `~/.local/share/claude`.
+- Codex: the `codex` and `codex-code-mode-host` links in `~/.local/bin` and
+  `~/.local/share/bondsymphonic/codex`.
+- OpenCode: `~/.local/bin/opencode`, and `~/.opencode/bin/opencode` only when it
+  is the identical file the same install left there.
+
+Your logins, settings and sessions are kept (`~/.claude`, the Codex sign-in,
+OpenCode's sign-in and configuration), and a CLI the installer did not make is
+left alone; the terminal says what it removed and what it left. An uninstall is
+refused while agents of that backend are running -- stop them first. Once the
+check confirms the CLI is gone, the backend is switched off so new agents do not
+default to it; installing it again switches it back on through the kept
+sign-in. The GitHub CLI has no Uninstall: it came from `apt`.
 
 **The sign-in link.** `claude auth login` prints a URL and then waits for the
 code the browser gives you. The IDE opens that URL in your browser for you, and
