@@ -59,6 +59,18 @@ impl Handler for WorkspaceHandler {
                 )?;
                 ok(backend.list_models(d, p.api_key.as_deref()).await?)
             }
+            // Settings' model-server list and its connection test. Run from
+            // the daemon, where the companion proxy runs, with the proxy's own
+            // resolve and connect: see `agents::opencode_providers`.
+            Request::OpenCodeListProviders {} => {
+                ok(crate::agents::opencode_providers::handle_list(&d.dirs.root).await)
+            }
+            Request::OpenCodeTestProvider(p) => ok(crate::agents::opencode_providers::handle_test(
+                &d.dirs.root,
+                &p.provider_id,
+                p.api_key.as_deref(),
+            )
+            .await),
             Request::RepoInspect(p) => {
                 ok(crate::git::repo::inspect(&d.git, std::path::Path::new(&p.path)).await?)
             }

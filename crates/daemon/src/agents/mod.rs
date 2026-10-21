@@ -19,6 +19,7 @@ pub mod credentials;
 pub mod opencode;
 pub mod opencode_backend;
 pub mod opencode_config;
+pub mod opencode_providers;
 pub mod opencode_stream;
 pub mod persist;
 pub mod token;

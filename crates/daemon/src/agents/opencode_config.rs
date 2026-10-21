@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
-const CONFIGS: [&str; 3] = ["config.json", "opencode.json", "opencode.jsonc"];
+pub(crate) const CONFIGS: [&str; 3] = ["config.json", "opencode.json", "opencode.jsonc"];
 pub(crate) const CONFIG_READ_LIMIT: usize = 8 * 1024 * 1024;
 const MANIFEST: &str = ".native-config-mirrors.json";
 pub const USER_CONFIG_ROOT_ENV: &str = "BS_OPENCODE_CONFIG_ROOT";
@@ -528,7 +528,7 @@ pub fn provider_origins(config_home: &Path) -> Vec<crate::net::allowlist::Origin
 
 /// JSONC as plain JSON: `//` and `/* */` comments and trailing commas removed,
 /// strings left exactly as they are.
-fn strip_jsonc(text: &str) -> String {
+pub(crate) fn strip_jsonc(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     let mut in_string = false;

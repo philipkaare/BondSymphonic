@@ -76,9 +76,9 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long an allowed upstream has to accept the connection.
-#[cfg(unix)]
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an allowed upstream has to resolve, and then to accept the
+/// connection.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many connections one workspace may have in flight through its proxy.
 ///
@@ -744,6 +744,91 @@ async fn serve(mut client: tokio::net::UnixStream, ctx: &ConnCtx) -> std::io::Re
     }
 }
 
+/// Why an upstream the proxy decided to try could not be had. The proxy only
+/// logs it; Settings' connection test (`opencode.test_provider`) reports it,
+/// which is why resolving and connecting live here, outside the connection
+/// loop, where both use the same code.
+#[derive(Debug)]
+pub enum UpstreamError {
+    /// The name did not resolve.
+    Resolve(std::io::Error),
+    ResolveTimeout,
+    /// No address took the connection: the last error, or `None` when the
+    /// name resolved to no address the request may use.
+    Connect(Option<std::io::Error>),
+    /// The connect deadline ran out first.
+    ConnectTimeout,
+}
+
+impl std::fmt::Display for UpstreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpstreamError::Resolve(e) => write!(f, "resolve failed: {e}"),
+            UpstreamError::ResolveTimeout => f.write_str("resolve timed out"),
+            UpstreamError::Connect(Some(e)) => write!(f, "connect failed: {e}"),
+            UpstreamError::Connect(None) => f.write_str("connect failed: no address"),
+            UpstreamError::ConnectTimeout => f.write_str("connect timed out"),
+        }
+    }
+}
+
+/// The addresses `host` resolves to, on the daemon's side, within
+/// [`CONNECT_TIMEOUT`].
+pub async fn resolve_upstream(
+    host: &str,
+    port: u16,
+) -> Result<Vec<std::net::SocketAddr>, UpstreamError> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, port))).await {
+        Ok(Ok(addrs)) => Ok(addrs.collect()),
+        Ok(Err(e)) => Err(UpstreamError::Resolve(e)),
+        Err(_) => Err(UpstreamError::ResolveTimeout),
+    }
+}
+
+/// Which of `resolved` a request may be carried to.
+///
+/// A private destination is refused whatever name led to it, unless the
+/// allowlist entry is that literal address: a repository can add a *name* to
+/// the list at creation, but only a person writes `127.0.0.1` down. An origin
+/// grant (`granted`) is the other thing only a person writes: it comes from
+/// the backend's own config on the host, never from the repository, and
+/// admits every address its name resolves to.
+pub fn reachable_addrs(
+    resolved: &[std::net::SocketAddr],
+    granted: bool,
+    allow: &Allowlist,
+) -> Vec<std::net::SocketAddr> {
+    resolved
+        .iter()
+        .copied()
+        .filter(|a| {
+            granted
+                || !is_private_addr(&a.ip())
+                || allow.allows_literal_addr(&canonical_ip(a.ip()))
+        })
+        .collect()
+}
+
+/// The first of `addrs` to take a connection, in order.
+///
+/// One deadline over the whole list, not one per address: a name with four
+/// addresses behind it must not cost four times the budget, which is what
+/// `TcpStream::connect(host)` used to give without being told.
+pub async fn connect_upstream(
+    addrs: &[std::net::SocketAddr],
+) -> Result<tokio::net::TcpStream, UpstreamError> {
+    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+    let mut last = None;
+    for addr in addrs {
+        match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => return Ok(s),
+            Ok(Err(e)) => last = Some(e),
+            Err(_) => return Err(UpstreamError::ConnectTimeout),
+        }
+    }
+    Err(UpstreamError::Connect(last))
+}
+
 /// The upstream connection for one request, or `None` once the client has
 /// been answered with why there is not going to be one: the host is not on the
 /// allowlist, it resolves only to private addresses, or it would not take the
@@ -784,43 +869,17 @@ async fn open_upstream(
     // Resolved here rather than inside `connect`, because what the allowlist
     // cleared was a *name*: the destination it stands for is checked next, and
     // a name that resolves nowhere is a gateway failure like any other.
-    let resolved: Vec<std::net::SocketAddr> = match tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        tokio::net::lookup_host((host, port)),
-    )
-    .await
-    {
-        Ok(Ok(addrs)) => addrs.collect(),
+    let resolved = match resolve_upstream(host, port).await {
+        Ok(addrs) => addrs,
         // The reason stays in the daemon log: the client is inside the sandbox
         // and has no business learning about the host's DNS or routing.
-        Ok(Err(e)) => {
-            tracing::debug!(ws = %ctx.workspace, host = %host, port, "upstream resolve failed: {e}");
-            let _ = client.write_all(&bad_gateway()).await;
-            return Ok(None);
-        }
-        Err(_) => {
-            tracing::debug!(ws = %ctx.workspace, host = %host, port, "upstream resolve timed out");
+        Err(e) => {
+            tracing::debug!(ws = %ctx.workspace, host = %host, port, "upstream {e}");
             let _ = client.write_all(&bad_gateway()).await;
             return Ok(None);
         }
     };
-    // A private destination is refused whatever name led to it, unless the
-    // allowlist entry is that literal address: a repository can add a *name* to
-    // the list at creation, but only a person writes `127.0.0.1` down. An
-    // origin grant is the other thing only a person writes: it comes from the
-    // backend's own config on the host, never from the repository.
-    let reachable: Vec<std::net::SocketAddr> = {
-        let allow = ctx.allow.read();
-        resolved
-            .iter()
-            .copied()
-            .filter(|a| {
-                granted
-                    || !is_private_addr(&a.ip())
-                    || allow.allows_literal_addr(&canonical_ip(a.ip()))
-            })
-            .collect()
-    };
+    let reachable = reachable_addrs(&resolved, granted, &ctx.allow.read());
     if reachable.is_empty() {
         refuse(
             client,
@@ -833,28 +892,10 @@ async fn open_upstream(
         .await;
         return Ok(None);
     }
-    // One deadline over the whole list, not one per address: a name with four
-    // addresses behind it must not cost four times the budget, which is what
-    // `TcpStream::connect(host)` used to give without being told.
-    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
-    let mut connected = None;
-    for addr in &reachable {
-        match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await {
-            Ok(Ok(s)) => {
-                connected = Some(s);
-                break;
-            }
-            Ok(Err(e)) => {
-                tracing::debug!(ws = %ctx.workspace, host = %host, port, "upstream connect failed: {e}")
-            }
-            Err(_) => {
-                tracing::debug!(ws = %ctx.workspace, host = %host, port, "upstream connect timed out")
-            }
-        }
-    }
-    match connected {
-        Some(upstream) => Ok(Some(upstream)),
-        None => {
+    match connect_upstream(&reachable).await {
+        Ok(upstream) => Ok(Some(upstream)),
+        Err(e) => {
+            tracing::debug!(ws = %ctx.workspace, host = %host, port, "upstream {e}");
             // A model server the user configured being down is worth a line
             // at the default level: it is the likeliest reason an agent fails.
             if granted {
