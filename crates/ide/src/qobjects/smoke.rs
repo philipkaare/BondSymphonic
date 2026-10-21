@@ -242,9 +242,20 @@ pub(crate) async fn run(steps: Vec<String>, mut client: DaemonClient, qt: QtHand
                     .await
                     .map(|id| workspace = Some(id))
             }
-            "open_agent" => open_agent(&client, &qt, workspace.as_ref())
+            "create_opencode" => {
+                created += 1;
+                create(&client, &qt, &repo, created, OPENCODE_ADAPTER)
+                    .await
+                    .map(|id| workspace = Some(id))
+            }
+            "open_agent" => open_agent(&client, &qt, workspace.as_ref(), AgentAdapterKind::Claude)
                 .await
                 .map(|id| agent = Some(id)),
+            "open_opencode_agent" => {
+                open_agent(&client, &qt, workspace.as_ref(), AgentAdapterKind::OpenCode)
+                    .await
+                    .map(|id| agent = Some(id))
+            }
             "send" => send(&qt, agent.as_ref()).await,
             "allow" => allow(&qt, agent.as_ref()).await,
             "stop" => stop(&qt, agent.take()).await,
@@ -287,6 +298,9 @@ pub(crate) async fn run(steps: Vec<String>, mut client: DaemonClient, qt: QtHand
 /// a terminal pane for one and a transcript pane for the other.
 const TERMINAL_ADAPTER: &str = "terminal";
 const CLAUDE_ADAPTER: &str = "claude";
+/// An agent backend other than Claude: its tab has to get a transcript pane of
+/// its own rather than a placeholder.
+const OPENCODE_ADAPTER: &str = "opencode";
 
 /// Creates a Claude workspace the way the New Agent dialog does: through
 /// `createWorkspaceWithAgentAndRun`, so the window's own agent start follows
@@ -398,7 +412,7 @@ async fn create(
     Ok(info.id)
 }
 
-/// Starts a Claude agent and announces it with the signal
+/// Starts an agent of `adapter` and announces it with the signal
 /// `AppController::start_agent` emits.
 ///
 /// The request goes out on the script's own client, the way `create` makes its
@@ -410,12 +424,13 @@ async fn open_agent(
     client: &DaemonClient,
     qt: &QtHandle,
     workspace: Option<&WorkspaceId>,
+    adapter: AgentAdapterKind,
 ) -> Result<AgentId, String> {
     let workspace_id = need(workspace, "open_agent")?;
     let res = client
         .request::<AgentStartResult>(Request::AgentStart(AgentStartParams {
             workspace_id: workspace_id.clone(),
-            adapter: AgentAdapterKind::Claude,
+            adapter,
             options: AgentStartOptions {
                 command: None,
                 resume_session: None,

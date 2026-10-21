@@ -6253,3 +6253,94 @@ mod one_start_per_create {
         (addr, journal)
     }
 }
+
+/// An OpenCode agent gets a pane it can be used through.
+///
+/// `AgentArea` used to build a transcript only for Claude and Codex; every
+/// other adapter landed on "The opencode adapter has no pane yet". Nothing then
+/// held the agent's transcript, so the window had nowhere to route a prompt and
+/// `agent.send` never left the IDE. This run creates an OpenCode workspace,
+/// starts its agent, sends a prompt through the window and allows the tool the
+/// fake daemon asks about -- each of which only reaches the daemon through a
+/// transcript attached to that agent.
+mod opencode_pane {
+    use super::{contains_in_order, drain, fake_daemon, wait_for, Journals, REQUEST_ID, TOKEN};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    const SCRIPT: &str = "create_opencode,open_opencode_agent,send,allow,quit";
+    const EXPECTED: [&str; 4] = [
+        "workspace.create",
+        "agent.start",
+        "agent.send",
+        "agent.permission_reply",
+    ];
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+    #[test]
+    fn an_opencode_agent_takes_a_prompt_through_its_pane() {
+        if bondsymphonic_ide::testing::skip_without_qt("opencode pane") {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (addr, journals) = rt.block_on(fake_daemon());
+
+        // Never the developer's real `%APPDATA%\BondSymphonic`.
+        let config = std::env::temp_dir().join(format!("bs-opencode-pane-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("opencode pane config dir");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", SCRIPT)
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", config.join("state.json"))
+            .env("BS_LOG_DIR", config.join("logs"))
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let seen = Journals::read(&journals.methods);
+        let answered = Journals::read(&journals.replies);
+        let context = format!(
+            "requests: {seen:?}\npermission replies: {answered:?}\n\
+             --- stdout ---\n{out}\n--- stderr ---\n{err}"
+        );
+        let _ = std::fs::remove_dir_all(&config);
+
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(
+            status.success(),
+            "the IDE exited with {status}, expected 0\n{context}"
+        );
+        let logs = format!("{out}\n{err}");
+        assert!(
+            !logs.contains("panicked at"),
+            "the IDE logged a panic\n{context}"
+        );
+        assert!(
+            contains_in_order(&seen, &EXPECTED),
+            "the fake daemon did not see {EXPECTED:?} in order\n{context}"
+        );
+        assert_eq!(
+            answered,
+            vec![format!("{REQUEST_ID}:allow")],
+            "the allow did not reach the daemon as one allow for the pane's request\n{context}"
+        );
+    }
+}
