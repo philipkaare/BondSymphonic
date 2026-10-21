@@ -23,6 +23,7 @@
 #include <QJsonArray>
 #include <QTabWidget>
 #include <QSignalBlocker>
+#include <QSpinBox>
 #include <QTemporaryDir>
 #include <QUrl>
 
@@ -240,6 +241,30 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
     QObject::connect(m_theme, &QComboBox::currentIndexChanged, this, [this](int) {
         theme::apply(*qApp, theme::choiceFromName(m_theme->currentData().toString()));
     });
+    // The text sizes preview the same way, for the same reason: a size is
+    // chosen by looking at it.
+    const auto makeSize = [lookBox](const char* name, int value, const QString& tip) {
+        auto* box = new QSpinBox(lookBox);
+        box->setObjectName(QLatin1String(name));
+        box->setRange(theme::kMinFontPointSize, theme::kMaxFontPointSize);
+        box->setSuffix(QStringLiteral(" pt"));
+        box->setValue(value);
+        box->setToolTip(tip);
+        return box;
+    };
+    m_uiFontSize = makeSize("SettingsUiFontSize", m_controller->uiFontSize(),
+                            QStringLiteral("Menus, labels, buttons and the conversation."));
+    m_codeFontSize = makeSize(
+        "SettingsCodeFontSize", m_controller->codeFontSize(),
+        QStringLiteral("The editor, diffs, terminals, Run output and a tool call's input and "
+                       "result."));
+    lookForm->addRow("Interface text:", m_uiFontSize);
+    lookForm->addRow("Code text:", m_codeFontSize);
+    const auto previewFonts = [this](int) {
+        theme::applyFonts(*qApp, m_uiFontSize->value(), m_codeFontSize->value());
+    };
+    QObject::connect(m_uiFontSize, &QSpinBox::valueChanged, this, previewFonts);
+    QObject::connect(m_codeFontSize, &QSpinBox::valueChanged, this, previewFonts);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     outer->addWidget(buttons);
@@ -300,6 +325,7 @@ void SettingsDialog::accept() {
     }
     m_controller->setShowAgentMeta(m_showMeta->isChecked());
     m_controller->setTheme(m_theme->currentData().toString());
+    m_controller->setFontSizes(m_uiFontSize->value(), m_codeFontSize->value());
     QDialog::accept();
 }
 
@@ -307,6 +333,13 @@ void SettingsDialog::reject() {
     // The stored word, not the combo's: the combo is what the user was trying
     // out, and Cancel is them saying they would rather not keep it.
     theme::apply(*qApp, theme::choiceFromName(m_controller->theme()));
+    // The stored sizes likewise -- and only when a preview moved them, since
+    // putting them back re-sizes every widget in the application.
+    const int ui = m_controller->uiFontSize();
+    const int code = m_controller->codeFontSize();
+    if (m_uiFontSize->value() != ui || m_codeFontSize->value() != code) {
+        theme::applyFonts(*qApp, ui, code);
+    }
     QDialog::reject();
 }
 
@@ -522,6 +555,50 @@ extern "C" std::int32_t bs_widget_test_settings_backend_tab_offers_one_button_pe
         return 12;
     }
     return 0;
+}
+
+/// Settings offers both text sizes, in the bounds the IDE lays out, and they
+/// apply as they are changed and go back on Cancel -- the same as the theme.
+extern "C" std::int32_t bs_widget_test_settings_offers_the_text_sizes() {
+    const int uiBefore = QApplication::font().pointSize();
+    const int codeBefore = theme::codePointSizeSlot();
+    std::int32_t failure = 0;
+    {
+        AppController controller;
+        SettingsDialog dialog(&controller);
+        auto* ui = dialog.findChild<QSpinBox*>(QStringLiteral("SettingsUiFontSize"));
+        auto* code = dialog.findChild<QSpinBox*>(QStringLiteral("SettingsCodeFontSize"));
+        if (ui == nullptr || code == nullptr) {
+            failure = 1;
+        } else if (ui->minimum() != theme::kMinFontPointSize ||
+                   ui->maximum() != theme::kMaxFontPointSize ||
+                   code->minimum() != theme::kMinFontPointSize ||
+                   code->maximum() != theme::kMaxFontPointSize) {
+            failure = 2;
+        } else if (ui->value() != controller.uiFontSize() ||
+                   code->value() != controller.codeFontSize()) {
+            failure = 3;
+        } else {
+            // A preview: picked sizes are worn at once, by the dialog too.
+            const int pickedUi = controller.uiFontSize() == 20 ? 21 : 20;
+            const int pickedCode = controller.codeFontSize() == 22 ? 23 : 22;
+            ui->setValue(pickedUi);
+            code->setValue(pickedCode);
+            if (QApplication::font().pointSize() != pickedUi ||
+                theme::codePointSizeSlot() != pickedCode || dialog.font().pointSize() != pickedUi) {
+                failure = 4;
+            } else {
+                // Cancel puts back what is stored, and stores nothing.
+                dialog.reject();
+                if (QApplication::font().pointSize() != controller.uiFontSize() ||
+                    theme::codePointSizeSlot() != controller.codeFontSize()) {
+                    failure = 5;
+                }
+            }
+        }
+    }
+    theme::applyFonts(*qApp, uiBefore, codeBefore);
+    return failure;
 }
 
 #endif // BS_WIDGET_TESTS

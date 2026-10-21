@@ -723,6 +723,22 @@ Follow system means following it as it changes, so a desktop that switches at
 dusk takes the IDE with it. The choice applies as you pick it — the point of
 choosing a palette is seeing it — and Cancel puts back the one you had.
 
+### Text size
+
+**Settings > Appearance** has two sizes, in points, each from 8 to 24:
+
+- **Interface text** — menus, labels, buttons, the conversation. Default 10 pt.
+- **Code text** — the fixed-pitch font of the editor, diffs, terminals, Run
+  output, a tool call's input and result, and a workspace's error output.
+  Default 11 pt.
+
+Both defaults are one point bigger than the sizes the IDE used before there was
+a setting (9 pt interface, 10 pt code). Like the theme, a size applies to every
+open window as you change it, and Cancel puts back the one you had. The sizes
+are stored in `settings.json` as `ui_font_size` and `code_font_size`; a file
+without them gets the defaults, and a hand-edited size outside 8–24 reads as
+the nearest bound.
+
 ---
 
 ## The Claude tab

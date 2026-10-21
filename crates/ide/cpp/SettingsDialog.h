@@ -11,10 +11,11 @@ class QComboBox;
 class QLineEdit;
 class QPushButton;
 class QScrollArea;
+class QSpinBox;
 
 /// The application settings: setup and logins, the Anthropic API key, what
-/// permission mode a new agent starts on, and which palette the application
-/// wears.
+/// permission mode a new agent starts on, and the palette and text sizes the
+/// application wears.
 ///
 /// Setup is the first section, and it is the whole `SetupPage`: the
 /// prerequisite rows, their fix buttons, the login terminal and the sign-in
@@ -41,9 +42,9 @@ public:
 
     void accept() override;
 
-    /// Puts the palette back to the stored choice. The Theme combo applies as
-    /// it is picked, so a dialog dismissed without this would leave the window
-    /// wearing a palette the user just declined to keep.
+    /// Puts the palette and the text sizes back to the stored choice. Both
+    /// apply as they are picked, so a dialog dismissed without this would leave
+    /// the window wearing a look the user just declined to keep.
     void reject() override;
 
 private:
@@ -73,4 +74,7 @@ private:
     /// window's job: this dialog knows the setting and no transcripts.
     QCheckBox* m_showMeta = nullptr;
     QComboBox* m_theme = nullptr;
+    /// The interface and code text sizes, in points.
+    QSpinBox* m_uiFontSize = nullptr;
+    QSpinBox* m_codeFontSize = nullptr;
 };
