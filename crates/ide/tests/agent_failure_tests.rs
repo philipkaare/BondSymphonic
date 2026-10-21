@@ -229,3 +229,16 @@ fn fresh_start_options_drop_only_the_session() {
     // Not an object: the daemon's defaults are a working agent.
     assert_eq!(fresh_start_options("nonsense"), "{}");
 }
+
+#[test]
+fn a_failed_queued_message_action_says_what_did_not_happen() {
+    let f = describe(
+        "agent.queued_prompt",
+        "rpc: InvalidParams: no queued prompt q1",
+        None,
+    );
+    assert_eq!(f.op, "agent.queued_prompt");
+    assert_eq!(f.title, "The queued message couldn't be changed.");
+    assert_plain(&f.title);
+    assert_plain(&f.detail);
+}

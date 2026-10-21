@@ -285,6 +285,7 @@ enum Repeatable {
         message: Option<String>,
     },
     Request(fn(AgentIdParams) -> Request, &'static str),
+    Queued(String, QueuedPromptAction),
 }
 
 impl Default for TranscriptModelRust {
@@ -609,10 +610,12 @@ impl qobject::TranscriptModel {
     /// Asks the daemon to act on a queued message. The answer is the
     /// `prompt_dequeued` row it writes, which settles the item.
     fn queued_prompt(self: Pin<&mut Self>, id: QString, action: QueuedPromptAction) {
-        let Some((shared, agent, qt)) = self.connection() else {
+        let prompt_id = id.to_string();
+        let op = "agent.queued_prompt";
+        let again = Repeatable::Queued(prompt_id.clone(), action);
+        let Some((shared, agent, qt)) = self.connection(op, &again) else {
             return;
         };
-        let prompt_id = id.to_string();
         runtime().spawn(async move {
             let params = AgentQueuedPromptParams {
                 agent_id: agent,
@@ -624,7 +627,7 @@ impl qobject::TranscriptModel {
                 .request_raw(Request::AgentQueuedPrompt(params))
                 .await
             {
-                report(&qt, format!("agent.queued_prompt failed: {e}"));
+                report(&qt, op, format!("{op} failed: {e}"), again);
             }
         });
     }
@@ -1021,6 +1024,9 @@ impl qobject::TranscriptModel {
                 message,
             } => self.send_permission_reply(request_id, decision, message),
             Repeatable::Request(build, op) => self.agent_request(build, op),
+            Repeatable::Queued(prompt_id, action) => {
+                self.queued_prompt(QString::from(&prompt_id), action)
+            }
         }
     }
 }

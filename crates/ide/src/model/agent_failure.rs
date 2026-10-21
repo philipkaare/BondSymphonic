@@ -281,6 +281,7 @@ fn title_for(op: &str) -> &'static str {
         "agent.interrupt" => "The agent couldn't be interrupted.",
         "agent.stop" => "The agent couldn't be stopped.",
         "agent.history" => "The conversation couldn't be loaded.",
+        "agent.queued_prompt" => "The queued message couldn't be changed.",
         _ => "The agent request failed.",
     }
 }
