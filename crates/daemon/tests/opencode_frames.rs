@@ -239,9 +239,12 @@ async fn recorded_refusal_is_an_error_and_a_cancelled_turn_says_so() {
     let turns = turn_rows(&messages);
     assert_eq!(turns[0]["stopReason"], "end_turn");
     assert_eq!(turns[2]["stopReason"], "cancelled");
-    assert!(messages
-        .iter()
-        .any(|m| matches!(m, AgentMessageBody::AssistantText { text } if text == "1 2 3 4 5 ")));
+    assert!(
+        messages
+            .iter()
+            .any(|m| matches!(m, AgentMessageBody::AssistantText { text } if text == "1 2 3 4 5 ")),
+        "{messages:#?}"
+    );
     // Neither the refusal nor the cancel is mistaken for a silent model.
     assert_eq!(notices(&messages), Vec::<String>::new());
     f.wait_state(AgentState::Idle).await;

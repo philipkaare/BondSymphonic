@@ -204,8 +204,12 @@ fn discarded_rows(why: &str, discarded: &[Queued], log: &Log) -> Vec<AgentMessag
     ));
     rows
 }
-/// Writes `bodies` after finalising any text still streaming.
+/// Writes `bodies` after finalising any text still streaming. Nothing at all
+/// when there is nothing to write: finalising would split a bubble in two.
 async fn put(sink: &AgentSink, stream: &Stream, bodies: Vec<AgentMessageBody>) {
+    if bodies.is_empty() {
+        return;
+    }
     let mut stream = stream.lock().await;
     for body in stream.flush().into_iter().chain(bodies) {
         sink.message(body).await;
