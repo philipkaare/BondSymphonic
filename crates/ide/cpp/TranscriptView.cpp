@@ -8,6 +8,8 @@
 #include "bondsymphonic-ide/src/qobjects/transcript_model.cxxqt.h"
 #include <QChar>
 #include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QEvent>
 #include <QFont>
 #include <QFontMetrics>
@@ -20,6 +22,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPalette>
+#include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QScrollArea>
@@ -126,8 +129,11 @@ QString resultLine(const QJsonObject& item) {
     const double seconds = item.value(QStringLiteral("duration_ms")).toDouble() / 1000.0;
     const int turns = item.value(QStringLiteral("num_turns")).toInt();
     const QString dot = QStringLiteral(" ") + QChar(kMiddleDot) + QStringLiteral(" ");
-    return QStringLiteral("turn %1").arg(turns) + dot +
-           QStringLiteral("$%1").arg(cost, 0, 'f', 4) + dot +
+    // A backend that reports tokens rather than a price: its `cost_usd` is
+    // not a cost, so the tokens take its place.
+    const QString usage = item.value(QStringLiteral("usage")).toString();
+    const QString spent = usage.isEmpty() ? QStringLiteral("$%1").arg(cost, 0, 'f', 4) : usage;
+    return QStringLiteral("turn %1").arg(turns) + dot + spent + dot +
            QStringLiteral("%1 s").arg(seconds, 0, 'f', 1);
 }
 
@@ -935,6 +941,12 @@ QWidget* TranscriptView::makeFrame(const QJsonObject& item, int index) {
     if (kind == QString::fromUtf8(kKindNetworkDenied)) {
         return makeDenialFrame(item, index);
     }
+    if (kind == QStringLiteral("notice")) {
+        return makeNoticeFrame(item);
+    }
+    if (kind == QStringLiteral("queued")) {
+        return makeQueuedFrame(item);
+    }
     if (kind == QStringLiteral("tool_use")) {
         auto* card = new ToolCard(item, m_scroll->widget());
         QObject::connect(card, &ToolCard::collapsedChanged, this, [this, index](bool collapsed) {
@@ -1040,6 +1052,122 @@ QWidget* TranscriptView::makeDenialFrame(const QJsonObject& item, int index) {
     return frame;
 }
 
+QWidget* TranscriptView::makeNoticeFrame(const QJsonObject& item) {
+    QFrame* frame = makeTextFrame(QStringLiteral("notice"), m_scroll->widget());
+    QLabel* label = bodyLabel(frame);
+    label->setTextFormat(Qt::PlainText);
+    label->setMinimumWidth(1);
+    label->setText(item.value(QStringLiteral("text")).toString());
+    const bool live = item.value(QStringLiteral("live")).toBool();
+    auto* row = new QHBoxLayout();
+    row->setContentsMargins(0, 2, 0, 2);
+    for (const QJsonValue& value : item.value(QStringLiteral("actions")).toArray()) {
+        const QString action = value.toString();
+        QPushButton* button = nullptr;
+        if (action == QStringLiteral("interrupt")) {
+            if (!live) {
+                continue; // The turn it was about has ended.
+            }
+            button = new QPushButton(QStringLiteral("Interrupt"), frame);
+            button->setObjectName(QStringLiteral("NoticeInterrupt"));
+            QObject::connect(button, &QPushButton::clicked, this, [this] {
+                if (!m_model.isNull()) {
+                    m_model->interrupt();
+                }
+            });
+        } else if (action == QStringLiteral("show_log")) {
+            button = new QPushButton(QStringLiteral("Show OpenCode log"), frame);
+            button->setObjectName(QStringLiteral("NoticeShowLog"));
+            QObject::connect(button, &QPushButton::clicked, this,
+                             [this, item] { showLog(item); });
+        } else if (action == QStringLiteral("open_config_folder")) {
+            button = new QPushButton(QStringLiteral("Open OpenCode config folder"), frame);
+            button->setObjectName(QStringLiteral("NoticeOpenConfigFolder"));
+            QObject::connect(button, &QPushButton::clicked, this,
+                             [this] { emit openConfigFolderRequested(); });
+        } else {
+            continue; // An action this build does not know.
+        }
+        row->addWidget(button);
+    }
+    row->addStretch(1);
+    static_cast<QVBoxLayout*>(frame->layout())->addLayout(row);
+    return frame;
+}
+
+QWidget* TranscriptView::makeQueuedFrame(const QJsonObject& item) {
+    const QString status = item.value(QStringLiteral("status")).toString();
+    if (status == QStringLiteral("sent")) {
+        return nullptr;
+    }
+    const bool pending = status == QStringLiteral("pending");
+    QFrame* frame = makeTextFrame(QStringLiteral("queued"), m_scroll->widget());
+    QLabel* label = bodyLabel(frame);
+    label->setTextFormat(Qt::PlainText);
+    label->setMinimumWidth(1);
+    const QString text = item.value(QStringLiteral("text")).toString();
+    label->setText((pending ? QStringLiteral("Queued: ") : QStringLiteral("Not sent: ")) + text);
+    applySmallGrey(label, !pending);
+    if (!pending) {
+        QFont font = label->font();
+        font.setStrikeOut(true);
+        label->setFont(font);
+        return frame;
+    }
+    const QString id = item.value(QStringLiteral("id")).toString();
+    auto* row = new QHBoxLayout();
+    row->setContentsMargins(0, 2, 0, 2);
+    auto* sendNow = new QPushButton(QStringLiteral("Send now"), frame);
+    sendNow->setObjectName(QStringLiteral("QueuedSendNow"));
+    sendNow->setToolTip(QStringLiteral("Interrupt the current turn and send this message next"));
+    QObject::connect(sendNow, &QPushButton::clicked, this, [this, id] {
+        if (!m_model.isNull()) {
+            m_model->sendQueuedNow(id);
+        }
+    });
+    auto* discard = new QPushButton(QStringLiteral("Discard"), frame);
+    discard->setObjectName(QStringLiteral("QueuedDiscard"));
+    QObject::connect(discard, &QPushButton::clicked, this, [this, id] {
+        if (!m_model.isNull()) {
+            m_model->discardQueued(id);
+        }
+    });
+    row->addWidget(sendNow);
+    row->addWidget(discard);
+    row->addStretch(1);
+    static_cast<QVBoxLayout*>(frame->layout())->addLayout(row);
+    return frame;
+}
+
+void TranscriptView::showLog(const QJsonObject& item) {
+    QStringList lines;
+    for (const QJsonValue& line : item.value(QStringLiteral("log")).toArray()) {
+        lines.append(line.toString());
+    }
+    auto* dialog = new QDialog(this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setWindowTitle(QStringLiteral("OpenCode log"));
+    auto* layout = new QVBoxLayout(dialog);
+    auto* note = new QLabel(
+        QStringLiteral("OpenCode's last warnings and errors before this notice, with secrets "
+                       "removed."),
+        dialog);
+    note->setWordWrap(true);
+    layout->addWidget(note);
+    auto* text = new QPlainTextEdit(dialog);
+    text->setReadOnly(true);
+    text->setLineWrapMode(QPlainTextEdit::NoWrap);
+    text->setPlainText(lines.isEmpty()
+                           ? QStringLiteral("OpenCode logged no warnings or errors before this notice.")
+                           : lines.join(QLatin1Char('\n')));
+    layout->addWidget(text);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dialog);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::close);
+    layout->addWidget(buttons);
+    dialog->resize(720, 360);
+    dialog->show();
+}
+
 void TranscriptView::updateFrame(int index, const QJsonObject& item) {
     if (index < 0 || index >= m_frames.size()) {
         return;
@@ -1065,7 +1193,11 @@ void TranscriptView::updateFrame(int index, const QJsonObject& item) {
             return;
         }
     } else if (frame->property(kKindProperty).toString() == kind &&
-               kind != QString::fromUtf8(kKindNetworkDenied)) {
+               kind != QString::fromUtf8(kKindNetworkDenied) && kind != QStringLiteral("notice") &&
+               kind != QStringLiteral("queued")) {
+        // A notice or a queued message changes its buttons, not its text, so
+        // those two are rebuilt below rather than relabelled here; a denial
+        // changes both.
         QLabel* label = bodyLabel(frame);
         if (label != nullptr) {
             if (kind == QStringLiteral("assistant")) {
@@ -1943,6 +2075,70 @@ extern "C" std::int32_t bs_widget_test_transcript_shows_a_blocked_host_inline() 
     view.setTestItems(QStringList{ denialItem(QStringLiteral("blocked"), 1, false) });
     model.resetItems();
     if (button() != nullptr || text().contains(QChar(kTimes))) {
+        return 8;
+    }
+    return 0;
+}
+
+/// OpenCode's notices carry buttons, a queued message offers Send now and
+/// Discard until it is settled, and a turn that reported tokens shows them
+/// instead of a cost it never had.
+extern "C" std::int32_t bs_widget_test_transcript_notices_and_queued_messages_offer_actions() {
+    TranscriptModel model;
+    TranscriptView view(&model);
+    view.resize(480, 320);
+    QStringList items{
+        QStringLiteral(R"({"kind":"notice","text":"No response","notice_kind":"stall","actions":["interrupt","show_log","open_config_folder"],"log":["ERROR HTTP 500"],"live":true})"),
+        QStringLiteral(R"({"kind":"queued","id":"q1","text":"two","status":"pending"})"),
+        QStringLiteral(R"({"kind":"queued","id":"q0","text":"one","status":"sent"})"),
+        QStringLiteral(R"({"kind":"result","cost_usd":0.0,"duration_ms":1200,"num_turns":1,"usage":"15.9k in, 87 out"})"),
+    };
+    view.setTestItems(items);
+    model.resetItems();
+    QWidget* notice = view.frameAt(0);
+    if (notice == nullptr) {
+        return 1;
+    }
+    for (const char* name : {"NoticeInterrupt", "NoticeShowLog", "NoticeOpenConfigFolder"}) {
+        if (notice->findChild<QPushButton*>(QString::fromLatin1(name)) == nullptr) {
+            return 2;
+        }
+    }
+    bool openRequested = false;
+    QObject::connect(&view, &TranscriptView::openConfigFolderRequested,
+                     [&openRequested] { openRequested = true; });
+    notice->findChild<QPushButton*>(QStringLiteral("NoticeOpenConfigFolder"))->click();
+    if (!openRequested) {
+        return 3;
+    }
+    QWidget* queued = view.frameAt(1);
+    if (queued == nullptr || queued->findChild<QPushButton*>(QStringLiteral("QueuedSendNow")) == nullptr ||
+        queued->findChild<QPushButton*>(QStringLiteral("QueuedDiscard")) == nullptr) {
+        return 4;
+    }
+    // A sent message is the user row that follows it; the queued row goes.
+    if (view.frameAt(2) != nullptr) {
+        return 5;
+    }
+    QLabel* result = bodyLabel(view.frameAt(3));
+    if (result == nullptr || !result->text().contains(QStringLiteral("15.9k in")) ||
+        result->text().contains(QLatin1Char('$'))) {
+        return 6;
+    }
+    // The turn ended and the message was discarded: no Interrupt, no buttons.
+    items[0] = QStringLiteral(R"({"kind":"notice","text":"No response","notice_kind":"stall","actions":["interrupt","show_log","open_config_folder"],"log":[],"live":false})");
+    items[1] = QStringLiteral(R"({"kind":"queued","id":"q1","text":"two","status":"discarded"})");
+    view.setTestItems(items);
+    model.itemChanged(0);
+    model.itemChanged(1);
+    settle();
+    notice = view.frameAt(0);
+    if (notice == nullptr || notice->findChild<QPushButton*>(QStringLiteral("NoticeInterrupt")) != nullptr ||
+        notice->findChild<QPushButton*>(QStringLiteral("NoticeShowLog")) == nullptr) {
+        return 7;
+    }
+    queued = view.frameAt(1);
+    if (queued == nullptr || queued->findChild<QPushButton*>(QStringLiteral("QueuedDiscard")) != nullptr) {
         return 8;
     }
     return 0;

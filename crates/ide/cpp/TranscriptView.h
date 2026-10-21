@@ -176,6 +176,11 @@ signals:
     /// Settings on its Setup section; this view knows nothing about dialogs.
     void loginRequested();
 
+    /// The user pressed "Open OpenCode config folder" on a notice. The window
+    /// answers with the same folder Settings opens; this view does not know
+    /// where it is.
+    void openConfigFolderRequested();
+
 protected:
     /// A palette change is the theme moving under the pane. The banner's red
     /// is mixed into the pane's own background, so it has to be mixed again
@@ -229,6 +234,15 @@ private:
     /// and the "Allow for this workspace" button or where allowing it got to.
     /// Rebuilt rather than repainted when the item changes.
     QWidget* makeDenialFrame(const QJsonObject& item, int index);
+    /// A notice: its sentence and a button per action it offers. Interrupt
+    /// only while `live`.
+    QWidget* makeNoticeFrame(const QJsonObject& item);
+    /// A queued message: Send now and Discard while it is pending, a grey
+    /// "not sent" line once it never will be. Null once it was sent, since
+    /// the user row that follows says so.
+    QWidget* makeQueuedFrame(const QJsonObject& item);
+    /// Opens a window showing the log lines a notice carries.
+    void showLog(const QJsonObject& item);
     /// Repaints the frame at `index`, or replaces it if the item is no longer
     /// the kind that frame was built for.
     void updateFrame(int index, const QJsonObject& item);

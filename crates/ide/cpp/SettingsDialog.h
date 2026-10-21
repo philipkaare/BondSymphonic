@@ -12,6 +12,12 @@ class QLineEdit;
 class QPushButton;
 class QScrollArea;
 class QSpinBox;
+class QWidget;
+
+/// Creates and opens `directory`, OpenCode's Windows user configuration
+/// folder, warning over `parent` when either fails. The one action behind
+/// Settings' "Open config folder" and an OpenCode notice's button.
+void openOpenCodeConfigFolder(QWidget* parent, const QString& directory);
 
 /// The application settings: setup and logins, the Anthropic API key, what
 /// permission mode a new agent starts on, and the palette and text sizes the

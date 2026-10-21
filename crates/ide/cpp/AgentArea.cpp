@@ -338,6 +338,8 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
                          [this, workspaceId] { emit startAgentRequested(workspaceId); });
         QObject::connect(view, &TranscriptView::loginRequested, this,
                          &AgentArea::loginRequested);
+        QObject::connect(view, &TranscriptView::openConfigFolderRequested, this,
+                         &AgentArea::openConfigFolderRequested);
         QObject::connect(view, &TranscriptView::optionsChanged, this,
                          [this, workspaceId](const QString& optionsJson) {
                              emit agentOptionsChanged(workspaceId, optionsJson);

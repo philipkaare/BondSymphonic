@@ -71,6 +71,9 @@ signals:
     /// A banner's Open log was pressed.
     void openLogRequested();
 
+    /// A transcript notice's "Open OpenCode config folder" was pressed.
+    void openConfigFolderRequested();
+
 public:
     /// What the placeholder page says while nothing is showing.
     void setPlaceholderText(const QString& text);

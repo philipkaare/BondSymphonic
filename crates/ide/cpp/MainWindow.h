@@ -688,6 +688,8 @@ private:
     /// The watch on the active transcript's cost, dropped and remade whenever
     /// the active tab changes.
     QMetaObject::Connection m_costWatch;
+    /// The same for the token summary Codex and OpenCode tabs show instead.
+    QMetaObject::Connection m_usageWatch;
     CloseState m_closeState = CloseState::Idle;
     /// The two connections `armCloseAfterSaves` makes, so they can be dropped
     /// again whichever way the wait ends.

@@ -36,6 +36,16 @@ constexpr int kDialogHeight = 700;
 
 } // namespace
 
+void openOpenCodeConfigFolder(QWidget* parent, const QString& directory) {
+    if (directory.isEmpty() || !QDir().mkpath(directory)) {
+        QMessageBox::warning(parent, "Settings", "The OpenCode config folder could not be created.");
+        return;
+    }
+    if (!QDesktopServices::openUrl(QUrl::fromLocalFile(directory))) {
+        QMessageBox::warning(parent, "Settings", "The OpenCode config folder could not be opened.");
+    }
+}
+
 SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
                                const QJsonArray &suppliedDescriptors)
     : QDialog(parent), m_controller(controller) {
@@ -171,15 +181,7 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
             backendForm->addRow(openConfigFolder);
             QObject::connect(openConfigFolder, &QPushButton::clicked, this,
                              [this, configDirectory] {
-                if (configDirectory.isEmpty() || !QDir().mkpath(configDirectory)) {
-                    QMessageBox::warning(this, "Settings",
-                                         "The OpenCode config folder could not be created.");
-                    return;
-                }
-                if (!QDesktopServices::openUrl(QUrl::fromLocalFile(configDirectory))) {
-                    QMessageBox::warning(this, "Settings",
-                                         "The OpenCode config folder could not be opened.");
-                }
+                openOpenCodeConfigFolder(this, configDirectory);
             });
         }
         const QString label = descriptor.value("label").toString(id);

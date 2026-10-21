@@ -23,8 +23,8 @@ use crate::model::transcript::{Applied, LiveEvent, NetworkNotice, Transcript};
 use crate::qobjects::app_controller::{on_reconnect, require_connection, runtime, Shared};
 use crate::qobjects::run_panel::add_host_to_allowlist;
 use bondsymphonic_proto::{
-    AgentId, AgentIdParams, AgentMessage, AgentPermissionReplyParams, AgentSendParams, Event,
-    HistoryResult, PermissionDecision, Request,
+    AgentId, AgentIdParams, AgentMessage, AgentPermissionReplyParams, AgentQueuedPromptParams,
+    AgentSendParams, Event, HistoryResult, PermissionDecision, QueuedPromptAction, Request,
 };
 
 #[cxx_qt::bridge]
@@ -49,6 +49,10 @@ pub mod qobject {
         #[qproperty(QString, state)]
         #[qproperty(QString, state_detail)]
         #[qproperty(f64, cost_usd)]
+        // What a backend that reports tokens rather than a cost last said:
+        // "15.9k in · 87 out · context 6% of 258k", and the session's cost
+        // only when it reported one. Empty until then, and always for Claude.
+        #[qproperty(QString, usage_text)]
         #[qproperty(i32, turns)]
         #[qproperty(QString, pending_json)]
         #[qproperty(bool, busy)]
@@ -124,6 +128,15 @@ pub mod qobject {
         /// Interrupts the current turn; the agent stays alive.
         #[qinvokable]
         fn interrupt(self: Pin<&mut TranscriptModel>);
+
+        /// Interrupts the current turn and sends the queued message `id`
+        /// next, ahead of the others.
+        #[qinvokable]
+        fn send_queued_now(self: Pin<&mut TranscriptModel>, id: QString);
+
+        /// Discards the queued message `id`; it is never sent.
+        #[qinvokable]
+        fn discard_queued(self: Pin<&mut TranscriptModel>, id: QString);
 
         /// Stops the agent process.
         #[qinvokable]
@@ -228,6 +241,7 @@ pub struct TranscriptModelRust {
     state: QString,
     state_detail: QString,
     cost_usd: f64,
+    usage_text: QString,
     turns: i32,
     pending_json: QString,
     busy: bool,
@@ -282,6 +296,7 @@ impl Default for TranscriptModelRust {
             state: QString::from(transcript.state.word()),
             state_detail: QString::from(""),
             cost_usd: 0.0,
+            usage_text: QString::from(""),
             turns: 0,
             pending_json: QString::from(""),
             busy: false,
@@ -583,6 +598,37 @@ impl qobject::TranscriptModel {
         self.agent_request(Request::AgentStop, "agent.stop");
     }
 
+    pub fn send_queued_now(self: Pin<&mut Self>, id: QString) {
+        self.queued_prompt(id, QueuedPromptAction::SendNow);
+    }
+
+    pub fn discard_queued(self: Pin<&mut Self>, id: QString) {
+        self.queued_prompt(id, QueuedPromptAction::Discard);
+    }
+
+    /// Asks the daemon to act on a queued message. The answer is the
+    /// `prompt_dequeued` row it writes, which settles the item.
+    fn queued_prompt(self: Pin<&mut Self>, id: QString, action: QueuedPromptAction) {
+        let Some((shared, agent, qt)) = self.connection() else {
+            return;
+        };
+        let prompt_id = id.to_string();
+        runtime().spawn(async move {
+            let params = AgentQueuedPromptParams {
+                agent_id: agent,
+                prompt_id,
+                action,
+            };
+            if let Err(e) = shared
+                .client
+                .request_raw(Request::AgentQueuedPrompt(params))
+                .await
+            {
+                report(&qt, format!("agent.queued_prompt failed: {e}"));
+            }
+        });
+    }
+
     pub fn items_json(&self) -> QString {
         QString::from(&self.rust().transcript.items_json())
     }
@@ -743,6 +789,7 @@ impl qobject::TranscriptModel {
     /// ends in a single `resetItems()`, so this never runs while `busy`.
     fn apply_message(mut self: Pin<&mut Self>, message: &AgentMessage) {
         let applied = self.as_mut().rust_mut().transcript.apply(message);
+        let changed = self.as_mut().rust_mut().transcript.take_changed();
         self.as_mut().publish_totals();
         match applied {
             Applied::Appended(i) => self.as_mut().item_appended(index_of(i)),
@@ -751,6 +798,9 @@ impl qobject::TranscriptModel {
             // view holds has moved and only a rebuild is correct.
             Applied::Reset => self.as_mut().reset_items(),
             Applied::Nothing => {}
+        }
+        if applied != Applied::Reset {
+            self.as_mut().repaint(changed);
         }
         self.sync_pending();
     }
@@ -767,27 +817,38 @@ impl qobject::TranscriptModel {
             LiveEvent::Message(message) => self.apply_message(&message),
             LiveEvent::State(state, detail) => {
                 self.as_mut().rust_mut().transcript.set_state(state, detail);
+                let changed = self.as_mut().rust_mut().transcript.take_changed();
+                self.as_mut().repaint(changed);
                 self.as_mut().publish_totals();
                 self.sync_pending();
             }
         }
     }
 
+    /// Repaints items the transcript changed as a side effect.
+    fn repaint(mut self: Pin<&mut Self>, changed: Vec<usize>) {
+        for i in changed {
+            self.as_mut().item_changed(index_of(i));
+        }
+    }
+
     /// Republishes every property derived from the transcript.
     fn publish_totals(mut self: Pin<&mut Self>) {
-        let (state, detail, cost, turns) = {
+        let (state, detail, cost, usage, turns) = {
             let this = self.as_ref();
             let t = &this.rust().transcript;
             (
                 t.state.word(),
                 t.state_detail.clone(),
                 t.cost_usd,
+                t.usage_summary(),
                 i32::try_from(t.turns).unwrap_or(i32::MAX),
             )
         };
         self.as_mut().set_state(QString::from(state));
         self.as_mut().set_state_detail(QString::from(&detail));
         self.as_mut().set_cost_usd(cost);
+        self.as_mut().set_usage_text(QString::from(&usage));
         self.as_mut().set_turns(turns);
     }
 

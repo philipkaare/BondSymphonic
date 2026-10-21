@@ -1311,6 +1311,9 @@ void MainWindow::connectController() {
                          });
     }
     QObject::connect(m_agentArea, &AgentArea::loginRequested, this, &MainWindow::showSetupPage);
+    QObject::connect(m_agentArea, &AgentArea::openConfigFolderRequested, this, [this] {
+        openOpenCodeConfigFolder(this, m_controller->opencodeConfigDirectory());
+    });
     // A workspace that cannot run. Retry is its own request; Remove is the
     // tab menu's destroy, confirmation and busy check included, because it is
     // the same act reached from somewhere else.
@@ -2962,22 +2965,32 @@ void MainWindow::rebindCost() {
     const QString workspaceId = activeWorkspaceId();
     TranscriptModel* model =
         workspaceId.isEmpty() ? nullptr : m_agentArea->transcriptModel(workspaceId);
+    QObject::disconnect(m_usageWatch);
     if (model != nullptr) {
         m_costWatch = QObject::connect(model, &TranscriptModel::costUsdChanged, this,
                                        &MainWindow::updateCostLabel);
+        m_usageWatch = QObject::connect(model, &TranscriptModel::usageTextChanged, this,
+                                        &MainWindow::updateCostLabel);
     }
     updateCostLabel();
 }
 
 void MainWindow::updateCostLabel() {
     const QString backend = activeTab().value("adapter").toString();
-    if (backend == "codex" || backend == "opencode") {
-        m_costLabel->setText("Cost unavailable");
-        return;
-    }
     const QString workspaceId = activeWorkspaceId();
     TranscriptModel* model =
         workspaceId.isEmpty() ? nullptr : m_agentArea->transcriptModel(workspaceId);
+    if (backend == "codex" || backend == "opencode") {
+        // These report tokens, and a price only sometimes; never a made-up one.
+        const QString usage = model == nullptr ? QString() : model->getUsageText();
+        m_costLabel->setText(usage.isEmpty() ? QStringLiteral("Cost unavailable") : usage);
+        m_costLabel->setToolTip(usage.isEmpty()
+                                    ? QString()
+                                    : QStringLiteral("Tokens the backend reported for the last turn, "
+                                                     "and its context window in use"));
+        return;
+    }
+    m_costLabel->setToolTip(QString());
     // A terminal tab has no transcript and so no cost; the label still shows a
     // number, because a blank one reads as "unknown" rather than as "nothing".
     const double cost = model == nullptr ? 0.0 : model->getCostUsd();
