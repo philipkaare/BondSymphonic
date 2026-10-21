@@ -9,9 +9,31 @@ use bondsymphonic_daemon::{
 use bondsymphonic_proto::*;
 use std::{sync::Arc, time::Duration};
 
+/// The budget for each startup call. It includes starting the fake's Python,
+/// which takes seconds on a loaded machine, so only the test about the budget
+/// itself uses a short one.
+const CALL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a test waits for something the fake does promptly. Generous for
+/// the same reason; a pass never waits it out.
+const WAIT: Duration = Duration::from_secs(30);
+
 async fn fixture(
     mode: &str,
     resume: Option<String>,
+) -> (
+    tempfile::TempDir,
+    CodexAdapter,
+    Arc<AgentEntry>,
+    Arc<TranscriptStore>,
+) {
+    fixture_with(mode, resume, CALL_TIMEOUT).await
+}
+
+async fn fixture_with(
+    mode: &str,
+    resume: Option<String>,
+    timeout: Duration,
 ) -> (
     tempfile::TempDir,
     CodexAdapter,
@@ -59,14 +81,14 @@ async fn fixture(
     };
     (
         dir,
-        CodexAdapter::new(sink, handle, prepared).with_timeout(Duration::from_millis(500)),
+        CodexAdapter::new(sink, handle, prepared).with_timeout(timeout),
         entry,
         store,
     )
 }
 
 async fn wait_state(entry: &AgentEntry, wanted: AgentState) {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(WAIT, async {
         while entry.state().0 != wanted {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -114,7 +136,7 @@ async fn resuming_a_thread_codex_never_saved_starts_a_new_one() {
     adapter.start().await.unwrap();
     assert_eq!(entry.session_id.lock().as_deref(), None);
     adapter.send("first".into()).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(WAIT, async {
         while entry.session_id.lock().is_none() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -153,7 +175,7 @@ async fn answering_one_of_two_codex_approvals_keeps_the_agent_waiting() {
     let (_dir, mut adapter, entry, store) = fixture("doubleapproval", None).await;
     adapter.start().await.unwrap();
     adapter.send("first".into()).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(WAIT, async {
         loop {
             let messages = store.read(&AgentId("agent".into())).await.unwrap();
             if messages
@@ -195,7 +217,9 @@ async fn answering_one_of_two_codex_approvals_keeps_the_agent_waiting() {
 #[tokio::test]
 async fn initialization_eof_and_timeout_are_bounded_and_end_agent() {
     for mode in ["die", "hang"] {
-        let (_dir, mut adapter, entry, _) = fixture(mode, None).await;
+        // "hang" is the budget under test: it must end the start, not the
+        // outer bound below.
+        let (_dir, mut adapter, entry, _) = fixture_with(mode, None, Duration::from_secs(1)).await;
         assert!(
             tokio::time::timeout(Duration::from_secs(8), adapter.start())
                 .await
@@ -260,7 +284,7 @@ async fn each_turn_row_carries_that_turns_tokens_and_context() {
     let mut usages = vec![];
     for (n, prompt) in ["first", "second"].into_iter().enumerate() {
         adapter.send(prompt.into()).await.unwrap();
-        let messages = tokio::time::timeout(Duration::from_secs(5), async {
+        let messages = tokio::time::timeout(WAIT, async {
             loop {
                 let messages = store.read(&AgentId("agent".into())).await.unwrap();
                 if messages
