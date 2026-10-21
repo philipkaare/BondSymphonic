@@ -290,4 +290,8 @@ private:
     bool m_prereqsAnswered = false;
     /// See [`setClaudeAuthFailure`]. Empty until the CLI has said otherwise.
     QString m_claudeAuthFailure;
+    /// The login gate for `backend`'s panes: Claude's own state for Claude,
+    /// [`setBackendAuth`]'s for every other agent backend.
+    bool loggedInFor(const QString& backend) const;
+    QString authFailureFor(const QString& backend) const;
 };

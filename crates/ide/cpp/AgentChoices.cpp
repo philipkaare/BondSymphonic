@@ -2,6 +2,7 @@
 #include <QComboBox>
 #include <QLineEdit>
 #include <QMap>
+#include <QJsonArray>
 #include <QJsonObject>
 
 namespace {
@@ -172,10 +173,17 @@ void agentchoices::fillPermissionCombo(QComboBox *combo, const QString &selected
         combo->setCurrentIndex(combo->count() - 1);
         return;
     }
-    const int manual =
-        combo->findData(backend == QLatin1String("claude") ? QStringLiteral("manual")
-                                                           : QStringLiteral("on-request"));
-    combo->setCurrentIndex(manual >= 0 ? manual : 0);
+    // No mode at all: the one that asks, whatever this backend calls it. The
+    // first entry is the fallback only for a list with none of them, because
+    // the first entry is YOLO for every backend that has one.
+    for (const char* asking : { "manual", "on-request", "ask" }) {
+        const int index = combo->findData(QString::fromLatin1(asking));
+        if (index >= 0) {
+            combo->setCurrentIndex(index);
+            return;
+        }
+    }
+    combo->setCurrentIndex(0);
 }
 
 void agentchoices::setDescriptors(const QJsonArray &descriptors) {
@@ -314,6 +322,46 @@ void agentchoices::resetModelsForTest() {
     backendModes.clear();
     backendNotes.clear();
     hasFetchedModels() = false;
+}
+
+/// A backend's combo with no mode chosen yet settles on the mode that asks,
+/// never on whichever mode happens to be listed first: OpenCode lists YOLO
+/// first, and a New Agent dialog opened before its defaults were saved would
+/// otherwise have preselected YOLO without anyone choosing it.
+extern "C" std::int32_t bs_widget_test_agent_choices_default_to_the_asking_mode() {
+    agentchoices::setDescriptors(QJsonArray{
+        QJsonObject{{"id", "opencode"},
+                    {"permission_modes",
+                     QJsonArray{QJsonObject{{"id", "yolo"}, {"label", "YOLO (sandboxed)"}},
+                                QJsonObject{{"id", "ask"}, {"label", "Ask before tools"}}}},
+                    {"default_permission_mode", "ask"}},
+        QJsonObject{{"id", "codex"},
+                    {"permission_modes",
+                     QJsonArray{QJsonObject{{"id", "never"}, {"label", "YOLO"}},
+                                QJsonObject{{"id", "on-request"}, {"label", "Ask"}}}},
+                    {"default_permission_mode", "never"}},
+    });
+    QComboBox opencode;
+    agentchoices::fillPermissionCombo(&opencode, QString(), QStringLiteral("opencode"));
+    const QString opencodeMode = opencode.currentData().toString();
+    QComboBox codex;
+    agentchoices::fillPermissionCombo(&codex, QString(), QStringLiteral("codex"));
+    const QString codexMode = codex.currentData().toString();
+    QComboBox chosen;
+    agentchoices::fillPermissionCombo(&chosen, QStringLiteral("yolo"), QStringLiteral("opencode"));
+    const QString chosenMode = chosen.currentData().toString();
+    agentchoices::resetModelsForTest();
+    if (opencodeMode != QLatin1String("ask")) {
+        return 1;
+    }
+    if (codexMode != QLatin1String("on-request")) {
+        return 2;
+    }
+    // An explicit choice is still honoured.
+    if (chosenMode != QLatin1String("yolo")) {
+        return 3;
+    }
+    return 0;
 }
 
 #endif // BS_WIDGET_TESTS

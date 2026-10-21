@@ -48,8 +48,11 @@ PermissionBar::PermissionBar(QWidget* parent) : QFrame(parent) {
 
 void PermissionBar::show(const QJsonObject& pending) {
     const QString requestId = pending.value(QStringLiteral("request_id")).toString();
-    m_always->setText(requestId.startsWith("codex:") ? "Allow for this Codex session"
-                                                     : "Always allow this tool for this session");
+    // Codex and OpenCode remember an approval themselves for the rest of their
+    // own session; a Claude request's box is the IDE's per-tool allowlist.
+    m_always->setText(requestId.startsWith("codex:")      ? "Allow for this Codex session"
+                      : requestId.startsWith("opencode:") ? "Allow for this OpenCode session"
+                                                          : "Always allow this tool for this session");
     const QString tool = pending.value(QStringLiteral("tool_name")).toString();
     const QString summary = pending.value(QStringLiteral("summary")).toString();
     if (requestId != m_requestId) {
@@ -132,6 +135,31 @@ extern "C" std::int32_t bs_widget_test_permission_bar_follows_the_palette() {
     }
     if (theme::isDark(bar->palette())) {
         return 2;
+    }
+    return 0;
+}
+
+/// "Allow for this session" says whose session: Codex and OpenCode remember
+/// the approval themselves for the rest of their own session, which is not the
+/// IDE-side per-tool allowlist a Claude request's box means.
+extern "C" std::int32_t bs_widget_test_permission_bar_names_the_backend_session() {
+    QWidget host;
+    auto* bar = new PermissionBar(&host);
+    auto* always = bar->findChild<QCheckBox*>();
+    if (always == nullptr) {
+        return 1;
+    }
+    bar->show(QJsonObject{{"request_id", "opencode:0"}, {"tool_name", "bash"}});
+    if (always->text() != QLatin1String("Allow for this OpenCode session")) {
+        return 2;
+    }
+    bar->show(QJsonObject{{"request_id", "codex:1"}, {"tool_name", "exec"}});
+    if (always->text() != QLatin1String("Allow for this Codex session")) {
+        return 3;
+    }
+    bar->show(QJsonObject{{"request_id", "req-1"}, {"tool_name", "Bash"}});
+    if (always->text() != QLatin1String("Always allow this tool for this session")) {
+        return 4;
     }
     return 0;
 }

@@ -1649,6 +1649,9 @@ mod cpp_widgets {
         fn bs_widget_test_setup_page_hides_the_rows_it_rebuilds() -> i32;
         fn bs_widget_test_transcript_a_long_system_word_keeps_answers_wrapping() -> i32;
         fn bs_widget_test_transcript_shows_progress_while_the_agent_comes_back() -> i32;
+        fn bs_widget_test_agent_area_gives_every_agent_backend_a_transcript() -> i32;
+        fn bs_widget_test_agent_choices_default_to_the_asking_mode() -> i32;
+        fn bs_widget_test_permission_bar_names_the_backend_session() -> i32;
     }
 
     /// Every widget check, in one run of one thread.
@@ -1662,7 +1665,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 55] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 58] = [
             // These four build a whole MainWindow, and each begins by pointing
             // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
             // is load-bearing rather than tidy: the state store settles its
@@ -1891,6 +1894,18 @@ mod cpp_widgets {
             (
                 "A restored agent shows progress, not an error, and the box is shut until it runs",
                 bs_widget_test_transcript_shows_progress_while_the_agent_comes_back,
+            ),
+            (
+                "AgentArea gives every agent backend a transcript, gated on its own sign-in",
+                bs_widget_test_agent_area_gives_every_agent_backend_a_transcript,
+            ),
+            (
+                "A permission combo with no mode chosen settles on the mode that asks",
+                bs_widget_test_agent_choices_default_to_the_asking_mode,
+            ),
+            (
+                "The permission bar names whose session an allow is for",
+                bs_widget_test_permission_bar_names_the_backend_session,
             ),
         ];
 

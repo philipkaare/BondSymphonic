@@ -12,8 +12,9 @@
 
 namespace {
 
-/// The two adapters with a pane. Anything else gets the placeholder until it
-/// grows one.
+/// The one adapter whose pane is a terminal. Every other adapter is an agent
+/// backend that speaks the daemon's agent protocol -- Claude, Codex, OpenCode,
+/// and whatever the daemon's descriptors add next -- and gets a transcript.
 const QString kTerminalAdapter = QStringLiteral("terminal");
 const QString kClaudeAdapter = QStringLiteral("claude");
 
@@ -40,20 +41,20 @@ void AgentArea::showWorkspace(const QString& workspaceId, const QString& adapter
         showPlaceholder();
         return;
     }
-    if (adapter == kClaudeAdapter || adapter == QLatin1String("codex")) {
-        // Backend identity is set before options and login state are applied.
-        TranscriptView* view = ensureTranscript(workspaceId, agentId);
-        view->setBackend(adapter);
-        view->setClaudeLoggedIn(adapter == "claude" ? m_claudeLoggedIn
-                                                    : m_backendLoggedIn.value(adapter, false));
-        view->setClaudeAuthFailure(adapter == "claude" ? m_claudeAuthFailure
-                                                       : m_backendAuthFailure.value(adapter));
-        setCurrentWidget(m_pages.value(workspaceId, view));
+    if (adapter.isEmpty()) {
+        // Nothing recorded to build a pane for. The tab model always names an
+        // adapter, so this is a caller with nothing to say rather than a backend.
+        m_placeholder->setText(QStringLiteral("This tab has no adapter"));
+        setCurrentWidget(m_placeholder);
         return;
     }
     if (adapter != kTerminalAdapter) {
-        m_placeholder->setText(QStringLiteral("The %1 adapter has no pane yet").arg(adapter));
-        setCurrentWidget(m_placeholder);
+        // Backend identity is set before options and login state are applied.
+        TranscriptView* view = ensureTranscript(workspaceId, agentId);
+        view->setBackend(adapter);
+        view->setClaudeLoggedIn(loggedInFor(adapter));
+        view->setClaudeAuthFailure(authFailureFor(adapter));
+        setCurrentWidget(m_pages.value(workspaceId, view));
         return;
     }
     TerminalWidget* terminal = m_terminals.value(workspaceId);
@@ -308,6 +309,14 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
     return view;
 }
 
+bool AgentArea::loggedInFor(const QString& backend) const {
+    return backend == kClaudeAdapter ? m_claudeLoggedIn : m_backendLoggedIn.value(backend, false);
+}
+
+QString AgentArea::authFailureFor(const QString& backend) const {
+    return backend == kClaudeAdapter ? m_claudeAuthFailure : m_backendAuthFailure.value(backend);
+}
+
 void AgentArea::setBackendAuth(const QString &backend, bool loggedIn, const QString &failure) {
     m_backendLoggedIn.insert(backend, loggedIn);
     m_backendAuthFailure.insert(backend, failure);
@@ -321,7 +330,7 @@ void AgentArea::setBackendAuth(const QString &backend, bool loggedIn, const QStr
 void AgentArea::setClaudeLoggedIn(bool loggedIn) {
     m_claudeLoggedIn = loggedIn;
     for (TranscriptView* view : m_transcripts) {
-        if (view != nullptr && view->backend() == "claude") {
+        if (view != nullptr && view->backend() == kClaudeAdapter) {
             view->setClaudeLoggedIn(loggedIn);
         }
     }
@@ -339,7 +348,7 @@ void AgentArea::setPrereqsAnswered(bool answered) {
 void AgentArea::setClaudeAuthFailure(const QString& sentence) {
     m_claudeAuthFailure = sentence;
     for (TranscriptView* view : m_transcripts) {
-        if (view != nullptr && view->backend() == "claude") {
+        if (view != nullptr && view->backend() == kClaudeAdapter) {
             view->setClaudeAuthFailure(sentence);
         }
     }
@@ -592,6 +601,87 @@ extern "C" std::int32_t bs_widget_test_agent_area_holds_a_workspace_problem() {
     area.clearWorkspaceProblem(workspace);
     if (banner->hasWorkspaceProblem() || banner->isHidden()) {
         return 8;
+    }
+    return 0;
+}
+
+/// Every agent backend gets a transcript pane, not only the two that existed
+/// when the pane was written: an OpenCode agent created from New Agent used to
+/// land on "The opencode adapter has no pane yet" with no way to talk to it.
+/// Its login gate follows OpenCode's own sign-in state, not Claude's, and the
+/// options the pane carries name it, which is what maps its permission replies.
+extern "C" std::int32_t bs_widget_test_agent_area_gives_every_agent_backend_a_transcript() {
+    const QString workspace = QStringLiteral("ws_opencode");
+    {
+        AgentArea area;
+        area.setPrereqsAnswered(true);
+        area.setClaudeLoggedIn(true);
+        area.showWorkspace(workspace, QStringLiteral("opencode"), QString());
+        if (area.transcriptModel(workspace) == nullptr) {
+            return 1;
+        }
+        auto* view = area.currentWidget() == nullptr
+                         ? nullptr
+                         : area.currentWidget()->findChild<TranscriptView*>();
+        if (view == nullptr || view->backend() != QLatin1String("opencode")) {
+            return 2;
+        }
+        auto* gate = view->findChild<QWidget*>(QStringLiteral("bsClaudeGate"));
+        auto* gateText = view->findChild<QLabel*>(QStringLiteral("bsClaudeGateText"));
+        auto* login = view->findChild<QPushButton*>(QStringLiteral("bsClaudeLogin"));
+        if (gate == nullptr || gateText == nullptr || login == nullptr) {
+            return 3;
+        }
+        area.setBackendAuth(QStringLiteral("opencode"), true, QString());
+        if (!gate->isHidden()) {
+            return 4;
+        }
+        // Claude signing out says nothing about OpenCode.
+        area.setClaudeLoggedIn(false);
+        area.setClaudeAuthFailure(QStringLiteral("Claude token expired"));
+        if (!gate->isHidden()) {
+            return 5;
+        }
+        const QString failed = QStringLiteral("OpenCode authentication failed.");
+        area.setBackendAuth(QStringLiteral("opencode"), false, failed);
+        if (gate->isHidden() || gateText->text() != failed ||
+            !login->text().contains(QLatin1String("OpenCode"))) {
+            return 6;
+        }
+        area.setOptionsJson(workspace, QStringLiteral(R"({"permission_mode":"ask"})"));
+        const QJsonObject options =
+            QJsonDocument::fromJson(area.transcriptModel(workspace)->getOptionsJson().toUtf8())
+                .object();
+        if (options.value(QStringLiteral("adapter")).toString() != QLatin1String("opencode")) {
+            return 7;
+        }
+    }
+    {
+        // A pane built after the sign-in state was already known opens on it.
+        AgentArea area;
+        area.setPrereqsAnswered(true);
+        area.setClaudeLoggedIn(false);
+        area.setBackendAuth(QStringLiteral("opencode"), true, QString());
+        area.showWorkspace(workspace, QStringLiteral("opencode"), QString());
+        TranscriptModel* model = area.transcriptModel(workspace);
+        auto* view = area.currentWidget() == nullptr
+                         ? nullptr
+                         : area.currentWidget()->findChild<TranscriptView*>();
+        if (model == nullptr || view == nullptr) {
+            return 8;
+        }
+        if (!view->findChild<QWidget*>(QStringLiteral("bsClaudeGate"))->isHidden()) {
+            return 9;
+        }
+    }
+    {
+        // A tab with no adapter recorded at all still says there is nothing
+        // to show rather than inventing a backend for it.
+        AgentArea area;
+        area.showWorkspace(workspace, QString(), QString());
+        if (area.transcriptModel(workspace) != nullptr) {
+            return 10;
+        }
     }
     return 0;
 }
