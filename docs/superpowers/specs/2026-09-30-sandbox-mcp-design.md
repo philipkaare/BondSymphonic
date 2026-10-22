@@ -1,6 +1,7 @@
 # General MCP support with a Jira Cloud preset — design
 
-Date: 2026-09-30. Status: draft for user review; product implementation has not started.
+Date: 2026-09-30. Status: approved 2026-10-22 ("start from the existing spec"); see
+"Rebase onto main (2026-10-22)" at the end for what changed since.
 
 ## Intent and confirmed scope
 
@@ -174,3 +175,52 @@ disposable issue only after the user names an appropriate test project.
 Approve or revise the shared broker/single-login architecture and settings
 behavior before the implementation plan is written. OpenCode is specified in
 `2026-09-30-opencode-adapter-design.md` and consumes this MCP contract.
+
+## Rebase onto main (2026-10-22)
+
+A first implementation was built against `be3fef9` and archived unmerged as
+`origin/wip/codex-adapter-2026-09-30` (never tested live). Main has moved since then:
+`mcp/` now serves the brokered git/GitHub tools on `/run/bs/mcp.sock`, and
+OpenCode uses the simplified native-config design with no provider page.
+The calls below fit this spec to current main. They are the builder's calls,
+not the user's, and the user can revisit them.
+
+- **One socket per remote server per sandbox.** The daemon listens on
+  `<run_dir>/mcp-<server_id>.sock` (sandbox: `/run/bs/mcp-<server_id>.sock`)
+  next to the existing `mcp.sock`, using the same listener-registry pattern.
+  The socket's file name, inside a sandbox's own run directory, is the binding
+  to workspace, sandbox and server, so no tokens or preambles are needed. The
+  existing `mcp-bridge --socket <path>` subcommand is reused unchanged.
+- **Local stdio servers run through a wrapper that keeps secrets out of argv.**
+  The agent's config runs `/opt/bs/daemon mcp-exec --env-file
+  /run/bs/mcp-env/<server_id>.env -- <command> <args…>`. The env file is
+  written `0600` at agent start, and the wrapper sets those variables and
+  `exec`s the command. This works the same for all three CLIs, and no secret
+  reaches a CLI's argv, the daemon log or a transcript.
+- **The server name `bondsymphonic` is reserved** for the built-in git tools.
+  A server ID must match `[a-z0-9][a-z0-9_-]{0,31}`.
+- **Backends.** Claude gets the servers added to its existing `--mcp-config`
+  JSON. Codex gets more `-c mcp_servers.<id>.*` overrides. OpenCode gets more
+  entries in the ACP `session/new` `mcpServers` array. All three are built
+  from one resolved list per (workspace, backend). Discovered tools are not
+  added to Claude's `--allowedTools`, so the CLI's own permission prompt
+  governs them.
+- **When changes take effect.** The server set is resolved when an agent
+  starts. Disabling a server, disabling it for a workspace, removing it, or
+  disconnecting it stops its sockets in every sandbox at once, so stale tools
+  fail. Enabling or adding a server takes effect at the next agent start, and
+  the UI says so.
+- **Workspace overrides** are set in a per-workspace "MCP servers…" dialog on
+  the Workspace menu, next to "Network rules…".
+- **Settings** gets an "MCP servers" tab in the existing Settings dialog.
+- **The OAuth callback** goes to a `QTcpServer` on `127.0.0.1:<ephemeral>` in
+  the IDE, with redirect URI `http://127.0.0.1:<port>/callback`. The listener
+  lasts as long as the attempt, at most 10 minutes.
+- **HTTPS** uses the host `curl` with no redirects and bounded size and time,
+  matching main's connection test (`f6f3cad`: `-q`, no `~/.curlrc`). No new TLS
+  crate is added.
+- **Reused from the archive:** the proto contracts, registry and secret
+  persistence, OAuth, Streamable HTTP transport and their tests. They are
+  ported file by file and adapted, never merged wholesale. The archived
+  OpenCode provider work, the harness-update work and the token-based broker
+  bindings are dropped.
