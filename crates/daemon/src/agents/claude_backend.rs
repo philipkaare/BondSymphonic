@@ -47,11 +47,14 @@ impl Backend for ClaudeBackend {
         ws: &Workspace,
         options: &AgentStartOptions,
     ) -> Result<PreparedAgent, RpcError> {
+        // The user's MCP servers first, because the argv names them. Preparing
+        // them spawns nothing and never fails the start.
+        let mcp_servers = crate::mcp::prepare_agent_servers(d, &ws.id, AgentAdapterKind::Claude);
         // The backend decides how the CLI is named: bound into the sandbox at a
         // fixed path under bwrap, and at its host path where there are no
         // mounts. Resolved before anything is spawned, so a missing install is
         // a `PrereqMissing` naming the path rather than an exec failure.
-        let argv = claude::claude_argv(options, d.backend.name())?;
+        let argv = claude::claude_argv(options, d.backend.name(), &mcp_servers)?;
         // And before anything is written: a CLI that cannot even say its
         // version is one this workspace should not be prepared for.
         let phase = Instant::now();
@@ -100,6 +103,7 @@ impl Backend for ClaudeBackend {
             env,
             cwd: ws.worktree_path.clone(),
             options: options.clone(),
+            mcp_servers,
         })
     }
     fn adapter(

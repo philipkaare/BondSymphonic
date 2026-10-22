@@ -400,7 +400,7 @@ impl OpenCodeAdapter {
             .iter()
             .any(|(k, v)| k == "BS_OPENCODE_SANDBOX" && v == "1");
         let servers = if sandboxed {
-            json!([{"name":crate::mcp::SERVER_NAME,"command":crate::mcp::DAEMON_IN_SANDBOX,"args":crate::mcp::bridge_args(),"env":[]}])
+            crate::mcp::opencode_mcp_servers(&self.prepared.mcp_servers)
         } else {
             json!([])
         };

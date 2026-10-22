@@ -268,6 +268,7 @@ impl Backend for OpenCodeBackend {
                 format!("OpenCode sign-in could not be given to the workspace: {error}"),
             )
         })?;
+        let mcp_servers = crate::mcp::prepare_agent_servers(d, &ws.id, AgentAdapterKind::OpenCode);
         let mut env = sandbox_env(&d.dirs.root, &ws.id, options.api_key.as_deref());
         if d.backend.name() == super::claude::SANDBOXED_BACKEND {
             env.push(("BS_OPENCODE_SANDBOX".into(), "1".into()));
@@ -297,6 +298,7 @@ impl Backend for OpenCodeBackend {
             env,
             cwd: ws.worktree_path.clone(),
             options: options.clone(),
+            mcp_servers,
         })
     }
     fn adapter(

@@ -78,6 +78,7 @@ async fn fixture_with(
         env: vec![],
         cwd: dir.path().into(),
         options,
+        mcp_servers: vec![],
     };
     (
         dir,

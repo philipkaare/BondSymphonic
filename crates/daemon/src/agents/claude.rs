@@ -329,8 +329,14 @@ fn claude_bin(backend: &str) -> Result<Vec<String>, RpcError> {
 /// (`control_request`) instead of denying anything that would prompt.
 /// `backend` is the sandbox backend's [`name`](crate::sandbox::SandboxBackend::name),
 /// which is what decides whether the program is named by its host path or by
-/// the path it is bound to inside the sandbox.
-pub fn claude_argv(options: &AgentStartOptions, backend: &str) -> Result<Vec<String>, RpcError> {
+/// the path it is bound to inside the sandbox. `servers` are the user's MCP
+/// servers [prepared](crate::mcp::prepare_servers) for this start; only a
+/// sandboxed agent gets them, beside the git tools.
+pub fn claude_argv(
+    options: &AgentStartOptions,
+    backend: &str,
+    servers: &[crate::mcp::ResolvedServer],
+) -> Result<Vec<String>, RpcError> {
     let mut argv = claude_bin(backend)?;
     argv.extend(
         [
@@ -371,7 +377,7 @@ pub fn claude_argv(options: &AgentStartOptions, backend: &str) -> Result<Vec<Str
         // Both flags are variadic, so each must be followed by another flag;
         // `--append-system-prompt` stays last to guarantee that.
         argv.push("--mcp-config".to_owned());
-        argv.push(crate::mcp::claude_mcp_config());
+        argv.push(crate::mcp::claude_mcp_config(servers));
         argv.push("--allowedTools".to_owned());
         argv.push(crate::mcp::claude_allowed_tools());
         argv.push("--append-system-prompt".to_owned());
@@ -1403,12 +1409,12 @@ settings = \"s.json\"
             permission_mode: Some(mode.to_owned()),
             api_key: None,
         };
-        assert!(claude_argv(&options("default"), BWRAP).is_ok());
-        assert!(claude_argv(&options("manual"), BWRAP).is_ok());
-        assert!(claude_argv(&options("bypassPermissions"), BWRAP).is_ok());
-        assert!(claude_argv(&options("nonsense"), BWRAP).is_err());
+        assert!(claude_argv(&options("default"), BWRAP, &[]).is_ok());
+        assert!(claude_argv(&options("manual"), BWRAP, &[]).is_ok());
+        assert!(claude_argv(&options("bypassPermissions"), BWRAP, &[]).is_ok());
+        assert!(claude_argv(&options("nonsense"), BWRAP, &[]).is_err());
         assert_eq!(
-            claude_argv(&plain, NOOP).unwrap(),
+            claude_argv(&plain, NOOP, &[]).unwrap(),
             [
                 "claude",
                 "-p",
@@ -1429,7 +1435,7 @@ settings = \"s.json\"
             permission_mode: Some("acceptEdits".into()),
             ..plain.clone()
         };
-        let argv = claude_argv(&full, NOOP).unwrap();
+        let argv = claude_argv(&full, NOOP, &[]).unwrap();
         assert_eq!(
             &argv[argv.len() - 6..],
             [
@@ -1447,7 +1453,7 @@ settings = \"s.json\"
             ..plain.clone()
         };
         assert_eq!(
-            claude_argv(&bad, NOOP).unwrap_err().code,
+            claude_argv(&bad, NOOP, &[]).unwrap_err().code,
             ErrorCode::InvalidParams
         );
         // Every mode the list holds is accepted, the undocumented alias
@@ -1457,7 +1463,10 @@ settings = \"s.json\"
                 permission_mode: Some(mode.into()),
                 ..plain.clone()
             };
-            assert!(claude_argv(&opts, NOOP).is_ok(), "{mode} must be accepted");
+            assert!(
+                claude_argv(&opts, NOOP, &[]).is_ok(),
+                "{mode} must be accepted"
+            );
         }
 
         // The hook replaces the program, is split the way a shell would, and
@@ -1465,7 +1474,7 @@ settings = \"s.json\"
         // names has to be reachable from inside.
         std::env::set_var("BS_CLAUDE_BIN", "\"python\" \"/tmp/fake claude.py\"");
         for backend in [NOOP, BWRAP] {
-            let argv = claude_argv(&plain, backend).unwrap();
+            let argv = claude_argv(&plain, backend, &[]).unwrap();
             assert_eq!(
                 &argv[..3],
                 ["python", "/tmp/fake claude.py", "-p"],
@@ -1474,25 +1483,25 @@ settings = \"s.json\"
         }
         // A sandboxed agent is told it cannot fetch, as the last two
         // arguments; the development backend's agent is not.
-        let sandboxed = claude_argv(&plain, BWRAP).unwrap();
+        let sandboxed = claude_argv(&plain, BWRAP, &[]).unwrap();
         assert_eq!(
             &sandboxed[sandboxed.len() - 2..],
             ["--append-system-prompt", crate::agents::SANDBOX_GIT_NOTE]
         );
-        assert!(!claude_argv(&plain, NOOP)
+        assert!(!claude_argv(&plain, NOOP, &[])
             .unwrap()
             .contains(&"--append-system-prompt".to_owned()));
         let pos = |argv: &[String], flag: &str| argv.iter().position(|a| a == flag);
         let at = pos(&sandboxed, "--mcp-config").expect("--mcp-config");
-        assert_eq!(sandboxed[at + 1], crate::mcp::claude_mcp_config());
+        assert_eq!(sandboxed[at + 1], crate::mcp::claude_mcp_config(&[]));
         let at = pos(&sandboxed, "--allowedTools").expect("--allowedTools");
         assert_eq!(sandboxed[at + 1], crate::mcp::claude_allowed_tools());
-        let noop = claude_argv(&plain, NOOP).unwrap();
+        let noop = claude_argv(&plain, NOOP, &[]).unwrap();
         assert!(pos(&noop, "--mcp-config").is_none());
         assert!(pos(&noop, "--allowedTools").is_none());
         std::env::set_var("BS_CLAUDE_BIN", "   ");
         assert_eq!(
-            claude_argv(&plain, NOOP).unwrap_err().code,
+            claude_argv(&plain, NOOP, &[]).unwrap_err().code,
             ErrorCode::InvalidParams
         );
 
@@ -1513,9 +1522,12 @@ settings = \"s.json\"
         std::env::remove_var("BS_CLAUDE_BIN");
         match host_claude_bin() {
             Some(host) => {
-                assert_eq!(claude_argv(&plain, BWRAP).unwrap()[0], CLAUDE_IN_SANDBOX);
                 assert_eq!(
-                    claude_argv(&plain, NOOP).unwrap()[0],
+                    claude_argv(&plain, BWRAP, &[]).unwrap()[0],
+                    CLAUDE_IN_SANDBOX
+                );
+                assert_eq!(
+                    claude_argv(&plain, NOOP, &[]).unwrap()[0],
                     host.to_string_lossy()
                 );
                 assert!(host.is_absolute(), "{host:?}");
@@ -1544,7 +1556,7 @@ settings = \"s.json\"
             // the path, not spawn something that cannot exist.
             None => {
                 for backend in [NOOP, BWRAP] {
-                    let e = claude_argv(&plain, backend).unwrap_err();
+                    let e = claude_argv(&plain, backend, &[]).unwrap_err();
                     assert_eq!(e.code, ErrorCode::PrereqMissing, "{backend}");
                     assert!(
                         e.message

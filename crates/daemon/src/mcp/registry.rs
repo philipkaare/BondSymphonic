@@ -143,10 +143,15 @@ impl McpRegistry {
     /// Stops the listeners `which` selects, with their connections, and
     /// deletes their socket files.
     fn stop_where(&self, which: impl Fn(&Listener) -> bool) {
+        self.stop_matching(|_, l| which(l));
+    }
+
+    /// The same, selecting by socket path and listener.
+    fn stop_matching(&self, which: impl Fn(&Path, &Listener) -> bool) {
         let mut listeners = self.listeners.lock();
         let gone: Vec<PathBuf> = listeners
             .iter()
-            .filter(|(_, l)| which(l))
+            .filter(|(p, l)| which(p, l))
             .map(|(p, _)| p.clone())
             .collect();
         for path in gone {
@@ -162,6 +167,13 @@ impl McpRegistry {
     /// deletes their socket files.
     pub fn stop_workspace(&self, id: &WorkspaceId) {
         self.stop_where(|l| &l.workspace == id);
+    }
+
+    /// Stops every listener in the run directory `dir` -- one sandbox's, tools
+    /// and servers alike -- for a sandbox that stopped while its workspace
+    /// lives on (a companion agent sandbox that died).
+    pub fn stop_dir(&self, dir: &Path) {
+        self.stop_matching(|p, _| p.parent() == Some(dir));
     }
 
     /// Stops `server`'s listeners in every sandbox.
@@ -307,6 +319,23 @@ mod tests {
         servers.set_secret(&jira, TOKEN_SECRET, None).unwrap();
         registry.reconcile(&servers);
         assert_eq!(paths(&registry), ["a-tools"], "the tools socket stays");
+    }
+
+    #[test]
+    fn stop_dir_takes_one_sandboxs_listeners_only() {
+        let jira: McpServerId = "jira".into();
+        let registry = registry_with(&[
+            ("ws/mcp.sock", "a", ListenerKind::Tools),
+            ("ws/mcp-jira.sock", "a", ListenerKind::Server(jira.clone())),
+            ("codex/mcp.sock", "a", ListenerKind::Tools),
+            (
+                "codex/mcp-jira.sock",
+                "a",
+                ListenerKind::Server(jira.clone()),
+            ),
+        ]);
+        registry.stop_dir(Path::new("codex"));
+        assert_eq!(paths(&registry), ["ws/mcp-jira.sock", "ws/mcp.sock"]);
     }
 
     #[test]

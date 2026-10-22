@@ -30,6 +30,23 @@ fn backend_name(kind: AgentAdapterKind) -> &'static str {
     }
 }
 
+/// A companion sandbox's runtime directory, `/run/bs` inside it.
+fn companion_run_dir(root: &std::path::Path, kind: AgentAdapterKind, ws: &WorkspaceId) -> PathBuf {
+    root.join("agent-run")
+        .join(backend_name(kind))
+        .join(ws.as_str())
+}
+
+/// The runtime directory of the sandbox an agent of `kind` in `ws` runs in:
+/// the workspace sandbox's for Claude, its own companion's otherwise. This is
+/// where that agent's MCP server sockets and env files go.
+pub fn agent_run_dir(d: &Daemon, ws: &WorkspaceId, kind: AgentAdapterKind) -> PathBuf {
+    match kind {
+        AgentAdapterKind::Claude => d.dirs.run(ws),
+        _ => companion_run_dir(&d.dirs.root, kind, ws),
+    }
+}
+
 async fn build_spec(
     d: &Daemon,
     ws: &Workspace,
@@ -57,12 +74,7 @@ async fn build_spec(
         .join("agent-homes")
         .join(name)
         .join(ws.id.as_str());
-    spec.run_dir = d
-        .dirs
-        .root
-        .join("agent-run")
-        .join(name)
-        .join(ws.id.as_str());
+    spec.run_dir = companion_run_dir(&d.dirs.root, kind, &ws.id);
     // Siblings of the base home, never children of it: a child would be
     // readable through Claude's HOME mount.
     let cache = d
@@ -352,6 +364,8 @@ impl AgentSandboxes {
         );
         startup.committed = true;
         self.watch(
+            d.weak(),
+            spec.run_dir.clone(),
             key,
             handle.clone(),
             base,
@@ -360,8 +374,14 @@ impl AgentSandboxes {
         Ok(handle)
     }
 
+    /// Ends the companion when it or its workspace sandbox dies, or it
+    /// breaches the protected snapshot: its proxy, its process, and the MCP
+    /// listeners in `run_dir` (the git tools' and the user's servers'), so no
+    /// socket outlives the sandbox it was for. The next start makes them anew.
     fn watch(
         &self,
+        daemon: std::sync::Weak<Daemon>,
+        run_dir: PathBuf,
         key: AgentSandboxKey,
         handle: Arc<dyn SandboxHandle>,
         base: Arc<dyn SandboxHandle>,
@@ -408,6 +428,15 @@ impl AgentSandboxes {
                         entry
                             .proxy
                             .stop_generation(&key.workspace_id, entry.generation);
+                        // Under the lock, like `ensure`'s start of the tools
+                        // listener, so a replacement's cannot be stopped here.
+                        // The server sockets are started earlier, in the
+                        // backend's `prepare`: one started by an agent start
+                        // racing this death goes too, and that agent finds its
+                        // user servers unreachable until its next start.
+                        if let Some(d) = daemon.upgrade() {
+                            d.mcp.stop_dir(&run_dir);
+                        }
                         drop(state);
                         let _ = handle.shutdown().await;
                     }

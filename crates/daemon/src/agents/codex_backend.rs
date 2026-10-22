@@ -230,13 +230,15 @@ impl Backend for CodexBackend {
         };
         let (config, env) = process_config(&d.dirs.root, options.api_key.as_deref());
         argv.extend(config);
-        argv.extend(sandbox_args(d.backend.name()));
+        let mcp_servers = crate::mcp::prepare_agent_servers(d, &ws.id, AgentAdapterKind::Codex);
+        argv.extend(sandbox_args(d.backend.name(), &mcp_servers));
         argv.extend(["app-server".into(), "--listen".into(), "stdio://".into()]);
         Ok(PreparedAgent {
             argv,
             env,
             cwd: ws.worktree_path.clone(),
             options: options.clone(),
+            mcp_servers,
         })
     }
     fn adapter(
@@ -329,10 +331,11 @@ pub async fn list_models_process(
 }
 
 /// Config overrides only a sandboxed Codex gets: the bridge to the brokered
-/// git and GitHub tools. Other backends have real credentials and no socket.
-fn sandbox_args(backend: &str) -> Vec<String> {
+/// git and GitHub tools, and the user's MCP servers. Other backends have real
+/// credentials and no socket.
+fn sandbox_args(backend: &str, servers: &[crate::mcp::ResolvedServer]) -> Vec<String> {
     if backend == super::claude::SANDBOXED_BACKEND {
-        crate::mcp::codex_config()
+        crate::mcp::codex_config(servers)
     } else {
         Vec::new()
     }
@@ -345,9 +348,9 @@ mod sandbox_args_tests {
     #[test]
     fn only_the_sandboxed_backend_gets_the_bridge() {
         assert_eq!(
-            sandbox_args(crate::agents::claude::SANDBOXED_BACKEND),
-            crate::mcp::codex_config()
+            sandbox_args(crate::agents::claude::SANDBOXED_BACKEND, &[]),
+            crate::mcp::codex_config(&[])
         );
-        assert!(sandbox_args("noop").is_empty());
+        assert!(sandbox_args("noop", &[]).is_empty());
     }
 }

@@ -450,3 +450,136 @@ fn exec_sets_env_and_keeps_argv_clean() {
         "{stdout}"
     );
 }
+
+fn bwrap_available() -> bool {
+    std::process::Command::new("bwrap")
+        .args([
+            "--ro-bind",
+            "/",
+            "/",
+            "--unshare-all",
+            "--die-with-parent",
+            "true",
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// An agent starts under the real sandbox with the default registry, whose
+/// Jira preset has never been connected: the start succeeds, the agent's MCP
+/// config names `jira` beside the git tools, and the socket it names is there
+/// and answers "not connected" rather than being left out.
+#[tokio::test]
+async fn unauthenticated_preset_does_not_block_start() {
+    use bondsymphonic_daemon::sandbox::backend_for;
+    use bondsymphonic_daemon::server::{Server, ServerConfig};
+    use bondsymphonic_daemon::workspace::{lifecycle, DataDirs};
+
+    if !bwrap_available() || !Path::new("/usr/bin/python3").exists() {
+        eprintln!("SKIP: bwrap or /usr/bin/python3 unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let d = Daemon::new(
+        DataDirs::new(dir.path().join("data")),
+        backend_for("linux_bwrap"),
+        server.event_bus(),
+    )
+    .unwrap();
+    assert!(
+        d.mcp_servers
+            .snapshot()
+            .servers
+            .iter()
+            .any(|s| s.id.as_str() == "jira"),
+        "the preset is seeded"
+    );
+    let ws = lifecycle::create(
+        &d,
+        WorkspaceCreateParams {
+            repo_path: repo.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: "mcp".into(),
+            init_if_missing: false,
+            in_place: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+
+    // The fake, and a wrapper that records the argv it was given, both in the
+    // worktree: the one directory bound read-write at its own path.
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let worktree = PathBuf::from(&ws.worktree_path);
+    std::fs::copy(
+        fixtures.join("fake_claude.py"),
+        worktree.join("fake_claude.py"),
+    )
+    .unwrap();
+    std::fs::copy(
+        fixtures.join("claude-stream/simple_turn.ndjson"),
+        worktree.join("fixture.ndjson"),
+    )
+    .unwrap();
+    let wrapper = worktree.join("fake.sh");
+    std::fs::write(
+        &wrapper,
+        "d=$(dirname \"$0\")\nprintf '%s\n' \"$@\" > \"$d/argv.txt\"\nexec /usr/bin/python3 \"$d/fake_claude.py\" \"$@\"\n",
+    )
+    .unwrap();
+    std::env::set_var("BS_CLAUDE_BIN", format!("/bin/sh {}", wrapper.display()));
+
+    let started = d
+        .agents
+        .start(
+            &d,
+            AgentStartParams {
+                workspace_id: ws.id.clone(),
+                adapter: AgentAdapterKind::Claude,
+                options: AgentStartOptions {
+                    command: None,
+                    resume_session: None,
+                    model: None,
+                    permission_mode: None,
+                    api_key: None,
+                },
+            },
+        )
+        .await;
+    std::env::remove_var("BS_CLAUDE_BIN");
+    started.expect("a missing login must not block the start");
+
+    // The sandboxed run overwrites what the host-side version probe wrote.
+    let argv_file = worktree.join("argv.txt");
+    let mut config = None;
+    for _ in 0..200 {
+        let argv = std::fs::read_to_string(&argv_file).unwrap_or_default();
+        let lines: Vec<&str> = argv.lines().collect();
+        if let Some(at) = lines.iter().position(|l| *l == "--mcp-config") {
+            config = lines.get(at + 1).map(|s| s.to_string());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let config: Value = serde_json::from_str(&config.expect("the agent got --mcp-config")).unwrap();
+    assert_eq!(
+        config["mcpServers"]["jira"]["args"],
+        json!(["mcp-bridge", "--socket", "/run/bs/mcp-jira.sock"]),
+        "{config}"
+    );
+    assert!(
+        config["mcpServers"]["bondsymphonic"].is_object(),
+        "{config}"
+    );
+
+    let socket = d.dirs.run(&ws.id).join("mcp-jira.sock");
+    let mut c = Conn::open(&socket).await;
+    assert_eq!(c.initialize().await["error"]["code"], -32001);
+
+    lifecycle::destroy(&d, &ws.id, true).await.unwrap();
+    gone(&socket).await;
+}

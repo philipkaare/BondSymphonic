@@ -13,6 +13,10 @@ pub struct PreparedAgent {
     pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
     pub options: AgentStartOptions,
+    /// The user's MCP servers this agent is given, prepared at start (see
+    /// [`crate::mcp::prepare_servers`]). Claude and Codex carry them in
+    /// `argv`; OpenCode names them in its ACP `session/new`.
+    pub mcp_servers: Vec<crate::mcp::ResolvedServer>,
 }
 
 impl std::fmt::Debug for PreparedAgent {

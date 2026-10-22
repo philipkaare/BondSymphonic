@@ -138,6 +138,7 @@ async fn live(status: Option<&str>, stall_after: Duration) -> Option<Live> {
         env,
         cwd: work,
         options: serde_json::from_value(serde_json::json!({"model":"mock/m1"})).unwrap(),
+        mcp_servers: vec![],
     };
     Some(Live {
         _mock: mock,

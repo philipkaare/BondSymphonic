@@ -76,6 +76,7 @@ async fn fixture_with(
         env: vec![("PROVIDER_API_KEY".into(), "secret-value".into())],
         cwd: dir.path().into(),
         options,
+        mcp_servers: vec![],
     };
     if mode == "sandbox" {
         prepared

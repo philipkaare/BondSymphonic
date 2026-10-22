@@ -55,6 +55,7 @@ async fn fixture(mode: &str) -> Fixture {
         env: vec![],
         cwd: dir.path().into(),
         options: serde_json::from_value(serde_json::json!({"model":"provider/model"})).unwrap(),
+        mcp_servers: vec![],
     };
     Fixture {
         adapter: OpenCodeAdapter::new(sink, handle, prepared)
