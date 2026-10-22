@@ -239,3 +239,91 @@ fn connection(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::servers::auth::TOKEN_SECRET;
+    use bondsymphonic_proto::{McpOverrideParams, McpSecretValue};
+
+    fn registry_with(listeners: &[(&str, &str, ListenerKind)]) -> McpRegistry {
+        let registry = McpRegistry::default();
+        for (path, ws, kind) in listeners {
+            registry.listeners.lock().insert(
+                PathBuf::from(path),
+                Listener {
+                    workspace: (*ws).into(),
+                    kind: kind.clone(),
+                    cancel: CancellationToken::new(),
+                    logged_in: false,
+                },
+            );
+        }
+        registry
+    }
+
+    fn paths(registry: &McpRegistry) -> Vec<String> {
+        let mut paths: Vec<String> = registry
+            .listeners
+            .lock()
+            .keys()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// A server that never had a login keeps its sockets (its tools answer
+    /// "not connected"); losing a login it had stops them.
+    #[test]
+    fn reconcile_stops_on_lost_login_and_workspace_override_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let servers = McpServers::load(dir.path()).unwrap();
+        let jira: McpServerId = "jira".into();
+        let registry = registry_with(&[
+            ("a-tools", "a", ListenerKind::Tools),
+            ("a-jira", "a", ListenerKind::Server(jira.clone())),
+            ("b-jira", "b", ListenerKind::Server(jira.clone())),
+        ]);
+        registry.reconcile(&servers);
+        assert_eq!(paths(&registry), ["a-jira", "a-tools", "b-jira"]);
+
+        servers
+            .set_secret(&jira, TOKEN_SECRET, Some(McpSecretValue("{}".into())))
+            .unwrap();
+        registry.reconcile(&servers);
+        assert_eq!(paths(&registry), ["a-jira", "a-tools", "b-jira"]);
+
+        servers
+            .set_override(McpOverrideParams {
+                server_id: jira.clone(),
+                workspace_id: "b".into(),
+                value: McpWorkspaceOverride::Disabled,
+            })
+            .unwrap();
+        registry.reconcile(&servers);
+        assert_eq!(paths(&registry), ["a-jira", "a-tools"]);
+
+        servers.set_secret(&jira, TOKEN_SECRET, None).unwrap();
+        registry.reconcile(&servers);
+        assert_eq!(paths(&registry), ["a-tools"], "the tools socket stays");
+    }
+
+    #[test]
+    fn removal_stops_every_workspace_and_stop_workspace_takes_all_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let servers = McpServers::load(dir.path()).unwrap();
+        let jira: McpServerId = "jira".into();
+        let registry = registry_with(&[
+            ("a-tools", "a", ListenerKind::Tools),
+            ("a-jira", "a", ListenerKind::Server(jira.clone())),
+            ("b-tools", "b", ListenerKind::Tools),
+            ("b-jira", "b", ListenerKind::Server(jira.clone())),
+        ]);
+        registry.stop_workspace(&"b".into());
+        assert_eq!(paths(&registry), ["a-jira", "a-tools"]);
+        servers.remove(&jira).unwrap();
+        registry.reconcile(&servers);
+        assert_eq!(paths(&registry), ["a-tools"]);
+    }
+}
