@@ -860,6 +860,12 @@ impl RemoteSession {
         self.cancel.cancel();
     }
 
+    /// Whether the session has a live upstream initialization: false before
+    /// `initialize` and again after the server expired the session.
+    pub fn is_initialized(&self) -> bool {
+        self.state.lock().initialized
+    }
+
     /// The URL to post to, after checking the server still allows it.
     fn current_url(&self) -> Result<String, RpcError> {
         let pinned = self
