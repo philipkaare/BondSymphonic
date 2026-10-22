@@ -1,6 +1,7 @@
 //! Brokered git and GitHub tools for sandboxed agents, served over MCP.
 
 pub mod bridge;
+pub mod exec;
 pub mod protocol;
 pub mod registry;
 pub mod servers;
@@ -12,6 +13,19 @@ pub const SERVER_NAME: &str = "bondsymphonic";
 pub const SOCKET_FILE: &str = "mcp.sock";
 /// Where the socket appears inside the sandbox.
 pub const SOCKET_IN_SANDBOX: &str = "/run/bs/mcp.sock";
+
+/// A user-configured remote server's socket file inside a sandbox's runtime
+/// directory, next to [`SOCKET_FILE`]. The server id's alphabet
+/// (`[a-z0-9_-]`) keeps it one path component, and the name alone binds a
+/// connection to its sandbox and server: no token or preamble is needed.
+pub fn server_socket_file(id: &bondsymphonic_proto::McpServerId) -> String {
+    format!("mcp-{}.sock", id.as_str())
+}
+
+/// Where [`server_socket_file`] appears inside the sandbox.
+pub fn server_socket_in_sandbox(id: &bondsymphonic_proto::McpServerId) -> String {
+    format!("/run/bs/{}", server_socket_file(id))
+}
 
 /// Where the daemon binary appears inside the sandbox: the path
 /// `sandbox::linux_bwrap` binds it at, and the command the agents' MCP config
@@ -77,6 +91,13 @@ mod tests {
             claude_allowed_tools(),
             "mcp__bondsymphonic__git_fetch,mcp__bondsymphonic__pr_view,mcp__bondsymphonic__ci_logs,mcp__bondsymphonic__issue_view"
         );
+    }
+
+    #[test]
+    fn server_sockets_sit_beside_the_tools_socket() {
+        let id: bondsymphonic_proto::McpServerId = "jira".into();
+        assert_eq!(server_socket_file(&id), "mcp-jira.sock");
+        assert_eq!(server_socket_in_sandbox(&id), "/run/bs/mcp-jira.sock");
     }
 
     #[test]

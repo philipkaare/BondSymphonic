@@ -74,6 +74,16 @@ enum Cmd {
         #[arg(long)]
         socket: PathBuf,
     },
+    /// Internal: run a sandbox-local MCP server with the environment in its
+    /// env file, so its secrets never appear in an argv. Not for direct use.
+    McpExec {
+        /// The server's env file, as seen from inside the sandbox.
+        #[arg(long)]
+        env_file: PathBuf,
+        /// The server's command and its arguments, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<std::ffi::OsString>,
+    },
     /// Internal: forward a socket in the sandbox's run directory to a port on
     /// the sandbox's loopback, so the host can reach a run. Not for direct use.
     Forward {
@@ -122,6 +132,10 @@ fn main() -> Result<()> {
             rt.shutdown_background();
             return result;
         }
+        Some(Cmd::McpExec {
+            ref env_file,
+            ref command,
+        }) => mcp::exec::run(env_file, command),
         None => {}
     }
     tokio::runtime::Runtime::new()?.block_on(serve(args))

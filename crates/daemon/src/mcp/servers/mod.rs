@@ -18,6 +18,7 @@
 //! under an older generation (a pending login, a token refresh in flight) is
 //! discarded instead of stored: see [`McpServers::set_secret_at`].
 pub mod auth;
+pub mod broker;
 pub(crate) mod config;
 pub(crate) mod secrets;
 pub mod transport;
@@ -163,6 +164,19 @@ impl McpServers {
     pub fn with_http(mut self, http: Arc<dyn HttpClient>) -> Self {
         self.http = http;
         self
+    }
+
+    /// The HTTP client remote sessions use: the broker opens its sessions
+    /// with the same one as OAuth and the connection test.
+    pub(crate) fn http(&self) -> Arc<dyn HttpClient> {
+        self.http.clone()
+    }
+
+    /// Whether the daemon holds an OAuth login for `id`. Losing one (a
+    /// disconnect, a replaced account, an edit that invalidated it) is what
+    /// stops the server's live sockets.
+    pub(crate) fn has_login(&self, id: &McpServerId) -> bool {
+        self.secret(id, auth::TOKEN_SECRET).is_some()
     }
 
     /// `Err` when the registry is degraded; see [`McpServers::load`].

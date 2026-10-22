@@ -253,7 +253,7 @@ impl Daemon {
         let mcp_servers = Arc::new(crate::mcp::servers::McpServers::load(&dirs.root)?);
         let agents =
             AgentManager::new(events.clone(), dirs.transcripts.clone(), dirs.agents_file());
-        Ok(Arc::new_cyclic(|me| Self {
+        let daemon = Arc::new_cyclic(|me| Self {
             dirs,
             registry,
             network_rules_lock: tokio::sync::Mutex::new(()),
@@ -277,7 +277,54 @@ impl Daemon {
             mcp: Default::default(),
             mcp_servers,
             me: me.clone(),
-        }))
+        });
+        // Outside a runtime (a synchronous unit test) there is nothing to
+        // watch with, and no listener to stop either.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            daemon.watch_mcp_servers();
+        }
+        Ok(daemon)
+    }
+
+    /// Keeps the MCP server sockets in line with the registry for the
+    /// daemon's lifetime: every registry change (disable, removal, workspace
+    /// override) and every status change (a disconnect, a lost login) stops
+    /// the sockets that no longer serve; see [`McpRegistry::reconcile`].
+    ///
+    /// Status changes are also announced as `mcp.changed`: a token refresh
+    /// that fails or an upstream 401 happens outside any request, and a
+    /// client would otherwise show a stale status until it next lists.
+    ///
+    /// [`McpRegistry::reconcile`]: crate::mcp::registry::McpRegistry::reconcile
+    fn watch_mcp_servers(&self) {
+        let mut changes = self.mcp_servers.subscribe();
+        let mut statuses = self.mcp_servers.subscribe_status();
+        let me = self.weak();
+        tokio::spawn(async move {
+            loop {
+                // Either channel closes with the registry, i.e. the daemon.
+                let status = tokio::select! {
+                    changed = changes.changed() => match changed {
+                        Ok(()) => false,
+                        Err(_) => break,
+                    },
+                    changed = statuses.changed() => match changed {
+                        Ok(()) => true,
+                        Err(_) => break,
+                    },
+                };
+                let Some(d) = me.upgrade() else { break };
+                d.mcp.reconcile(&d.mcp_servers);
+                if status && d.mcp_servers.ensure_usable().is_ok() {
+                    d.events.publish(
+                        None,
+                        Event::McpChanged {
+                            revision: d.mcp_servers.snapshot().revision,
+                        },
+                    );
+                }
+            }
+        });
     }
 
     /// A weak handle on this daemon: see the `me` field.

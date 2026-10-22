@@ -280,6 +280,7 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
         d.weak(),
         &ws.id,
         &d.dirs.run(&ws.id).join(crate::mcp::SOCKET_FILE),
+        crate::mcp::registry::ListenerKind::Tools,
     ) {
         tracing::warn!(ws = %ws.id, "agent tools unavailable: {}", e.message);
     }

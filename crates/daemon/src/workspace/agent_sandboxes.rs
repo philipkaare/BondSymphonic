@@ -313,6 +313,7 @@ impl AgentSandboxes {
             d.weak(),
             &ws.id,
             &spec.run_dir.join(crate::mcp::SOCKET_FILE),
+            crate::mcp::registry::ListenerKind::Tools,
         ) {
             tracing::warn!(ws = %ws.id, "agent tools unavailable: {}", e.message);
         }
