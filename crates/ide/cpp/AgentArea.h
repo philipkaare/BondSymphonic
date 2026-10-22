@@ -34,6 +34,7 @@ signals:
     /// `workspaceId`. The window is what knows the options the tab was created
     /// with and how to reach the controller.
     void startAgentRequested(const QString& workspaceId);
+    void resumeSessionRequested(const QString& workspaceId, const QString& session);
 
     /// `workspaceId`'s composer chose a different model or permission mode, and
     /// `optionsJson` is the whole `AgentStartOptions` that choice means. The

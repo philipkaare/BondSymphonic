@@ -847,11 +847,21 @@ async fn open_upstream(
     // across the awaits below would block every `set_allowlist` behind a tunnel.
     // An origin a backend's own config names is checked with its port, and may
     // be private: see `Origin`.
-    let (allowed, granted) = {
+    let (allowed, granted, blocked) = {
         let allow = ctx.allow.read();
         let granted = allow.allows_origin(host, port);
-        (granted || allow.allows(host), granted)
+        (granted || allow.allows(host), granted, allow.blocks(host))
     };
+    if blocked {
+        // An explicit user decision is enforced silently on every retry.
+        client
+            .write_all(&text_response(
+                "403 Forbidden",
+                &format!("host {host} is blocked by a workspace network rule\n"),
+            ))
+            .await?;
+        return Ok(None);
+    }
     if !allowed {
         refuse(
             client,

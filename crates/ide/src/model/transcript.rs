@@ -136,6 +136,7 @@ pub enum DenialStatus {
     Blocked,
     Allowing,
     Allowed,
+    AlwaysBlocked,
     Failed,
 }
 
@@ -295,6 +296,7 @@ pub enum Applied {
 /// The state of one agent tab.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Transcript {
+    pub commands: Vec<crate::model::commands::Command>,
     pub items: Vec<TranscriptItem>,
     /// What the fold has taken off the top, oldest first, and whether the user
     /// has asked for it back. Private: the view reads `items`, and these two
@@ -328,6 +330,7 @@ pub struct Transcript {
 impl Default for Transcript {
     fn default() -> Self {
         Self {
+            commands: Vec::new(),
             items: Vec::new(),
             earlier: Vec::new(),
             earlier_expanded: false,
@@ -357,6 +360,14 @@ impl Transcript {
             return Applied::Nothing;
         }
         self.last_seq = Some(msg.seq);
+        if let AgentMessageBody::System { subtype, data } = &msg.body {
+            if let Some(commands) = crate::model::commands::from_system(subtype, data) {
+                self.commands = commands;
+                if subtype == "agent_commands" {
+                    return Applied::Nothing;
+                }
+            }
+        }
         match &msg.body {
             AgentMessageBody::UserText { text } => {
                 // Deliberately does *not* answer a pending request. Only what
@@ -513,6 +524,11 @@ impl Transcript {
             // turn, a silent model, messages an interrupt discarded. One with
             // nothing to offer -- all a daemon before the structure wrote --
             // is a plain line.
+            AgentMessageBody::System { subtype, data } if subtype == "agent_command_result" => {
+                self.push(TranscriptItem::System {
+                    text: data.get("message").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                })
+            }
             AgentMessageBody::System { subtype, data } if subtype == "opencode_notice" => {
                 match AgentNotice::from_message(&msg.body) {
                     Some(notice)
@@ -1023,6 +1039,53 @@ impl Transcript {
         }
     }
 
+    /// Both ordinary denials and refused model-server tunnels may be blocked.
+    pub fn begin_block(&mut self, i: usize) -> Option<String> {
+        match self.items.get_mut(i) {
+            Some(TranscriptItem::NetworkDenied {
+                host,
+                status: status @ (DenialStatus::Blocked | DenialStatus::Failed),
+                error,
+                ..
+            }) => {
+                *status = DenialStatus::Allowing;
+                error.clear();
+                Some(host.clone())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn finish_block(&mut self, host: &str, result: Result<(), String>) -> Vec<usize> {
+        let mut changed = Vec::new();
+        for (i, item) in self.items.iter_mut().enumerate() {
+            if let TranscriptItem::NetworkDenied {
+                host: h,
+                status,
+                error,
+                ..
+            } = item
+            {
+                if h != host {
+                    continue;
+                }
+                match &result {
+                    Ok(()) => {
+                        *status = DenialStatus::AlwaysBlocked;
+                        error.clear();
+                    }
+                    Err(message) if *status == DenialStatus::Allowing => {
+                        *status = DenialStatus::Failed;
+                        error.clone_from(message);
+                    }
+                    _ => continue,
+                }
+                changed.push(i);
+            }
+        }
+        changed
+    }
+
     /// Settles an "Allow" for `host`: on success every unsettled item for it
     /// says it is allowed, wherever in the conversation it is; on failure the
     /// one being allowed says why and offers the button again. Returns the
@@ -1044,7 +1107,7 @@ impl Transcript {
                 continue;
             }
             match &result {
-                Ok(()) if *status != DenialStatus::Allowed => {
+                Ok(()) if !matches!(*status, DenialStatus::Allowed | DenialStatus::AlwaysBlocked) => {
                     *status = DenialStatus::Allowed;
                     error.clear();
                     changed.push(i);

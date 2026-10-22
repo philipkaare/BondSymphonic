@@ -14,6 +14,30 @@ use bondsymphonic_proto::{AgentMessageBody, TurnUsage};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
+/// Keep the ACP command catalog in the transcript so reconnects restore completion.
+pub fn command_metadata(update: &Value) -> AgentMessageBody {
+    let commands: Vec<Value> = update["availableCommands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|command| {
+            let name = command["name"].as_str()?.trim_start_matches('/');
+            if name.is_empty() || name.chars().any(char::is_whitespace) {
+                return None;
+            }
+            let mut row = json!({"name":name,"description":command["description"].as_str().unwrap_or_default()});
+            if let Some(hint) = command["input"]["hint"].as_str() {
+                row["argument_hint"] = json!(hint);
+            }
+            Some(row)
+        })
+        .collect();
+    AgentMessageBody::System {
+        subtype: "agent_commands".into(),
+        data: json!({"commands":commands}),
+    }
+}
+
 #[derive(Default)]
 pub struct OpenCodeStream {
     /// Every field seen for each of this turn's tool calls, merged.
@@ -123,6 +147,7 @@ impl OpenCodeStream {
                 out
             }
             "tool_call" | "tool_call_update" => self.tool(update),
+            "available_commands_update" => vec![command_metadata(&update)],
             // Not a row: it is folded into the turn's usage when it ends.
             "usage_update" => {
                 self.usage = Some(update);
@@ -130,8 +155,7 @@ impl OpenCodeStream {
             }
             // Bookkeeping, replayed history and plans: none of it is the
             // conversation, and most of it arrives once per step.
-            "available_commands_update"
-            | "current_mode_update"
+            "current_mode_update"
             | "config_option_update"
             | "user_message_chunk"
             | "plan" => vec![],
@@ -546,5 +570,20 @@ mod tests {
             stream.finish_turn().0,
             vec![AgentMessageBody::AssistantText { text: "two".into() }]
         );
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn commands_are_normalized_into_replayable_metadata() {
+        let rows = OpenCodeStream::default().ingest(json!({
+            "sessionUpdate":"available_commands_update",
+            "availableCommands":[{"name":"review","description":"Review changes","input":{"hint":"target"}}]
+        }));
+        assert!(matches!(&rows[..], [AgentMessageBody::System { subtype, data }]
+            if subtype == "agent_commands" && data["commands"][0] == json!({"name":"review","description":"Review changes","argument_hint":"target"})));
     }
 }

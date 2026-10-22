@@ -82,6 +82,17 @@ params!(WorkspaceCreatePrParams {
     body: String,
     draft: bool
 });
+params!(WorkspaceSetNetworkRulesParams {
+    workspace_id: WorkspaceId,
+    allow: Vec<String>,
+    block: Vec<String>,
+    /// The snapshot an editor loaded. Reject stale edits rather than overwriting newer decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_allow: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_block: Option<Vec<String>>
+});
+params!(WorkspaceBlockHostParams { workspace_id: WorkspaceId, host: String });
 params!(WorkspaceSetAllowlistParams { workspace_id: WorkspaceId, hosts: Vec<String> });
 params!(FsPathParams {
     workspace_id: WorkspaceId,
@@ -210,6 +221,10 @@ pub enum Request {
     WorkspaceCreatePr(WorkspaceCreatePrParams),
     #[serde(rename = "workspace.set_allowlist")]
     WorkspaceSetAllowlist(WorkspaceSetAllowlistParams),
+    #[serde(rename = "workspace.set_network_rules")]
+    WorkspaceSetNetworkRules(WorkspaceSetNetworkRulesParams),
+    #[serde(rename = "workspace.block_host")]
+    WorkspaceBlockHost(WorkspaceBlockHostParams),
     /// Fetches the workspace's repository from `origin`, on the host with the
     /// user's own credentials. Agents cannot fetch: their sandbox holds no
     /// credentials and the shared `.git` is read-only to them, so this is how
@@ -297,6 +312,8 @@ impl Request {
             WorkspaceMerge(_) => "workspace.merge",
             WorkspaceCreatePr(_) => "workspace.create_pr",
             WorkspaceSetAllowlist(_) => "workspace.set_allowlist",
+            WorkspaceSetNetworkRules(_) => "workspace.set_network_rules",
+            WorkspaceBlockHost(_) => "workspace.block_host",
             WorkspaceFetch(_) => "workspace.fetch",
             FsListDir(_) => "fs.list_dir",
             FsReadFile(_) => "fs.read_file",

@@ -942,3 +942,18 @@ fn a_settled_queued_prompt_is_recognisable_after_the_wire() {
         4, 3
     )));
 }
+
+#[test]
+fn network_rule_edits_and_block_decisions_round_trip() {
+    for (method, params) in [
+        ("workspace.set_network_rules", serde_json::json!({
+            "workspace_id": "ws_1", "allow": ["*.example.com"], "block": ["api.example.com"]
+        })),
+        ("workspace.block_host", serde_json::json!({"workspace_id": "ws_1", "host": "api.example.com"})),
+    ] {
+        let wire = serde_json::json!({"method": method, "params": params});
+        let request: Request = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(request.method_name(), method);
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+    }
+}

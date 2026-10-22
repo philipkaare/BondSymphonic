@@ -260,6 +260,7 @@ impl Event {
                     worktree_path: "/w".into(),
                     created_at: "2026-09-08T10:00:00Z".into(),
                     allowlist: vec![],
+                    blocklist: vec![],
                     kind: WorkspaceKind::InPlace,
                     state: WorkspaceState::Error("x".into()),
                     agents: vec![],

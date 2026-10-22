@@ -84,6 +84,9 @@ pub mod qobject {
         #[qinvokable]
         fn rename_group(self: Pin<&mut GroupModel>, idx: i32, name: QString) -> bool;
 
+        #[qinvokable]
+        fn rename_agent(self: Pin<&mut GroupModel>, workspace_id: QString, name: QString) -> bool;
+
         /// Adds a tab for the `WorkspaceInfo` in `info_json` to the group named
         /// `group_name`, creating that group if it does not exist, and makes it
         /// active. An empty `group_name` is not a group called "": it means the
@@ -646,6 +649,19 @@ impl qobject::GroupModel {
         ok
     }
 
+    pub fn rename_agent(mut self: Pin<&mut Self>, workspace_id: QString, name: QString) -> bool {
+        let id = WorkspaceId(workspace_id.to_string());
+        let ok = self
+            .as_mut()
+            .rust_mut()
+            .workspaces
+            .rename_agent(&id, &name.to_string());
+        if ok {
+            self.publish();
+        }
+        ok
+    }
+
     pub fn add_tab(
         mut self: Pin<&mut Self>,
         info_json: QString,
@@ -1179,6 +1195,7 @@ mod tests {
         AgentTab {
             workspace_id: WorkspaceId("ws_x".to_owned()),
             name: "x".to_owned(),
+            name_override: None,
             repo_path: "/r".to_owned(),
             branch: "bs/x/work".to_owned(),
             base_branch: "main".to_owned(),
@@ -1225,6 +1242,7 @@ mod tests {
             worktree_path: format!("/wt/{id}"),
             created_at: "2026-09-11T10:00:00Z".to_owned(),
             allowlist: Vec::new(),
+            blocklist: vec![],
             kind: bondsymphonic_proto::WorkspaceKind::Worktree,
             state: WorkspaceState::Ready,
             agents: Vec::new(),

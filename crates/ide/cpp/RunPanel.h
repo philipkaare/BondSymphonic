@@ -181,6 +181,7 @@ private:
     /// offer whose answer is still out.
     void onDenialFailed(const QString& host, const QString& message);
     void onAllowClicked();
+    void onBlockClicked();
     void onDismissClicked();
     void openUrl();
 
@@ -219,6 +220,7 @@ private:
     QFrame* m_toast = nullptr;
     QLabel* m_toastText = nullptr;
     QPushButton* m_allow = nullptr;
+    QPushButton* m_block = nullptr;
     QPushButton* m_dismiss = nullptr;
     QPlainTextEdit* m_log = nullptr;
 

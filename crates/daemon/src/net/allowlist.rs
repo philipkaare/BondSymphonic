@@ -280,6 +280,7 @@ impl Origin {
 #[derive(Clone, Debug, Default)]
 pub struct Allowlist {
     patterns: Vec<HostPattern>,
+    blocked: Vec<HostPattern>,
     origins: Vec<Origin>,
 }
 
@@ -300,8 +301,22 @@ impl Allowlist {
         }
         Allowlist {
             patterns,
+            blocked: Vec::new(),
             origins: Vec::new(),
         }
+    }
+
+    /// Adds validated workspace blocks, which override patterns and origins.
+    pub fn with_blocks(mut self, items: &[String]) -> Allowlist {
+        self.blocked = items
+            .iter()
+            .filter_map(|s| HostPattern::parse(s).ok())
+            .collect();
+        self
+    }
+
+    pub fn blocks(&self, host: &str) -> bool {
+        self.blocked.iter().any(|p| p.matches(host))
     }
 
     /// The same list, plus exactly these origins. See [`Origin`].
@@ -314,9 +329,11 @@ impl Allowlist {
     /// be reached at whatever address it resolves to.
     pub fn allows_origin(&self, host: &str, port: u16) -> bool {
         let host = normalize_host(host);
-        self.origins
-            .iter()
-            .any(|o| o.port == port && o.host == host)
+        !self.blocks(&host)
+            && self
+                .origins
+                .iter()
+                .any(|o| o.port == port && o.host == host)
     }
 
     /// The granted origins, in the order they were given.
@@ -326,7 +343,7 @@ impl Allowlist {
 
     /// Whether any pattern covers `host`.
     pub fn allows(&self, host: &str) -> bool {
-        self.patterns.iter().any(|p| p.matches(host))
+        !self.blocks(host) && self.patterns.iter().any(|p| p.matches(host))
     }
 
     /// Whether some entry is the literal address `addr`.
@@ -337,9 +354,11 @@ impl Allowlist {
     /// loopback is the attack the refusal exists for. See
     /// [`crate::net::proxy`].
     pub fn allows_literal_addr(&self, addr: &std::net::IpAddr) -> bool {
-        self.patterns
-            .iter()
-            .any(|p| p.as_ip().as_ref() == Some(addr))
+        !self.blocks(&addr.to_string())
+            && self
+                .patterns
+                .iter()
+                .any(|p| p.as_ip().as_ref() == Some(addr))
     }
 
     /// The patterns as text, in order, for the registry and the IDE.
@@ -663,5 +682,22 @@ mod tests {
         assert!(list.to_strings().is_empty());
         let patterns = Allowlist::from_strings(&["localhost".to_string()]);
         assert!(!patterns.allows_origin("localhost", 11434));
+    }
+}
+
+#[cfg(test)]
+mod block_rule_tests {
+    use super::*;
+
+    #[test]
+    fn blocks_override_wildcards_and_backend_origins() {
+        let rules = Allowlist::from_strings(&["*.example.com".into(), "127.0.0.1".into()])
+            .with_blocks(&["API.EXAMPLE.COM.".into(), "127.0.0.1".into()])
+            .with_origins(vec![Origin::from_url("http://api.example.com:8080").unwrap()]);
+        assert!(!rules.allows("api.example.com"));
+        assert!(!rules.allows_origin("api.example.com", 8080));
+        assert!(!rules.allows_literal_addr(&"127.0.0.1".parse().unwrap()));
+        assert!(rules.allows("other.example.com"));
+        assert!(rules.blocks("API.EXAMPLE.COM."));
     }
 }

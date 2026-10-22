@@ -242,6 +242,9 @@ pub struct WorkspaceInfo {
     pub worktree_path: String,
     pub created_at: String, // RFC 3339
     pub allowlist: Vec<String>,
+    /// Explicit workspace blocks take precedence over all network grants.
+    #[serde(default)]
+    pub blocklist: Vec<String>,
     /// Which kind of workspace this is. See [`WorkspaceKind`].
     #[serde(default)]
     pub kind: WorkspaceKind,

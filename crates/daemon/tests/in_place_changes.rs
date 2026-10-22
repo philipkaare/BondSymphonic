@@ -34,6 +34,7 @@ async fn in_place_on(dir: &Path, root: &Path, base_branch: &str) -> (Arc<Daemon>
             worktree_path: root.into(),
             created_at: now_rfc3339(),
             allowlist: vec![],
+            blocklist: vec![],
             state: WorkspaceState::Ready,
             agents: vec![],
             runs: vec![],

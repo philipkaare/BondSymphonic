@@ -196,3 +196,34 @@ fn a_tunnel_refusal_is_shown_without_an_allow() {
         .unwrap()
         .starts_with("The agent's connection to ollama.lan was refused"));
 }
+
+#[test]
+fn always_block_settles_denials_and_a_failure_can_be_retried() {
+    let mut t = Transcript::default();
+    t.note_network_denied(&denied("blocked.example"));
+    assert_eq!(t.begin_block(0), Some("blocked.example".into()));
+    assert_eq!(t.begin_block(0), None);
+    assert_eq!(t.finish_block("blocked.example", Err("disk full".into())), vec![0]);
+    assert_eq!(denial_at(&t, 0).2, DenialStatus::Failed);
+    assert_eq!(denial_at(&t, 0).3, "disk full");
+    assert_eq!(t.begin_block(0), Some("blocked.example".into()));
+    assert_eq!(t.finish_block("blocked.example", Ok(())), vec![0]);
+    assert_eq!(denial_at(&t, 0).2, DenialStatus::AlwaysBlocked);
+    assert_eq!(t.begin_allow(0), None);
+    assert_eq!(t.begin_block(0), None);
+}
+
+#[test]
+fn a_refused_model_tunnel_can_also_be_always_blocked() {
+    let mut t = Transcript::default();
+    let event = Event::tunnel_refused("ollama.lan", AgentAdapterKind::OpenCode);
+    let (_, notice) = network_notice(&Some(WorkspaceId("ws_1".into())), &event).unwrap();
+    t.note_network_denied(&notice);
+    assert_eq!(t.begin_allow(0), None);
+    assert_eq!(t.begin_block(0), Some("ollama.lan".into()));
+    t.finish_block("ollama.lan", Err("disconnected".into()));
+    assert_eq!(denial_at(&t, 0).2, DenialStatus::Failed);
+    assert_eq!(t.begin_block(0), Some("ollama.lan".into()));
+    t.finish_block("ollama.lan", Ok(()));
+    assert_eq!(denial_at(&t, 0).2, DenialStatus::AlwaysBlocked);
+}

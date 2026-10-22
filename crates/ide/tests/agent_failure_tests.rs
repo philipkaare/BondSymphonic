@@ -260,6 +260,18 @@ fn a_timed_out_start_or_send_offers_no_retry_and_says_it_may_still_complete() {
     }
 }
 
+#[test]
+fn a_send_timeout_reports_unconfirmed_delivery_instead_of_a_rejected_message() {
+    for raw in ["request timed out", "agent.send failed: request timed out"] {
+        let f = describe("agent.send", raw, None);
+        assert_eq!(f.kind, FailureKind::Timeout);
+        assert_eq!(f.title, "Message delivery wasn't confirmed.");
+        assert!(f.detail.contains("may already have reached"));
+        assert!(!f.retry, "a retry could deliver the same message twice");
+        assert_eq!(f.technical, raw);
+    }
+}
+
 /// Send now or Discard on a message the agent has just taken off the queue is
 /// a race the user lost by a moment: the transcript's own row settles it, and
 /// no banner goes up. Any other failure of the request still does.

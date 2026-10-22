@@ -114,7 +114,7 @@ pub fn companion_proxy(kind: AgentAdapterKind) -> ProxyRegistry {
 pub fn companion_allowlist(ws: &Workspace, extra: &[String]) -> Allowlist {
     let mut hosts = ws.allowlist.clone();
     hosts.extend_from_slice(extra);
-    Allowlist::from_strings(&hosts)
+    Allowlist::from_strings(&hosts).with_blocks(&ws.blocklist)
 }
 
 /// The exact origins a companion is granted beyond its allowlist: the model

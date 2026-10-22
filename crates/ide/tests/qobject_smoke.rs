@@ -31,6 +31,7 @@ fn info(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
         worktree_path: format!("/wt/{name}"),
         created_at: "2026-09-09T10:00:00Z".to_owned(),
         allowlist: Vec::new(),
+        blocklist: vec![],
         kind: bondsymphonic_proto::WorkspaceKind::Worktree,
         state,
         agents: Vec::new(),
@@ -43,6 +44,7 @@ fn tab(info: &WorkspaceInfo) -> AgentTab {
     AgentTab {
         workspace_id: info.id.clone(),
         name: info.name.clone(),
+        name_override: None,
         repo_path: info.repo_path.clone(),
         branch: info.branch.clone(),
         base_branch: info.base_branch.clone(),

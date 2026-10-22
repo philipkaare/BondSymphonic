@@ -765,6 +765,14 @@ impl AgentAdapter for OpenCodeAdapter {
                         }
                         continue;
                     }
+                    // Commands are session metadata: retain replay and idle
+                    // updates, but apply the session guard above first.
+                    if text(&frame, "method") == "session/update"
+                        && text(&p["update"], "sessionUpdate") == "available_commands_update"
+                    {
+                        sink.message(super::opencode_stream::command_metadata(&p["update"])).await;
+                        continue;
+                    }
                     if replaying.load(Ordering::SeqCst)
                         && text(&frame, "method") == "session/request_permission"
                     {

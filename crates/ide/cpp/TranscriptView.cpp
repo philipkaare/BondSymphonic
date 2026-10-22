@@ -25,6 +25,8 @@
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QRegularExpression>
+#include <QTextCursor>
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QTimer>
@@ -371,12 +373,10 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     QObject::connect(model, &TranscriptModel::stateDetailChanged, this,
                      &TranscriptView::onStateChanged);
 
-    QObject::connect(m_input, &PromptInput::submitted, this, [this](const QString& text) {
-        if (m_model.isNull()) {
-            return;
-        }
-        m_model->send(text);
-    });
+    QObject::connect(m_input, &PromptInput::submitted, this, &TranscriptView::submitPrompt);
+    QObject::connect(model, &TranscriptModel::commandsJsonChanged, this,
+                     &TranscriptView::refreshCommandCatalog);
+    refreshCommandCatalog();
     QObject::connect(m_permission, &PermissionBar::allowed, this, [this](bool always) {
         if (!m_model.isNull()) {
             m_model->reply(m_permission->requestId(), true, always, QString());
@@ -411,6 +411,8 @@ void TranscriptView::setBackend(const QString &backend) {
     m_loginButton->setText(backend == "codex" ? "Sign in to Codex…" : backend == "opencode" ? "Sign in to OpenCode…" : "Log in to Claude Code…");
     applyOptionsToChoices();
     refreshGate();
+    onStateChanged();
+    refreshCommandCatalog();
 }
 
 TranscriptModel* TranscriptView::model() const { return m_model.data(); }
@@ -627,6 +629,79 @@ void TranscriptView::setWorkspaceDown(bool down) {
     onStateChanged();
 }
 
+void TranscriptView::refreshCommandCatalog() {
+    QJsonArray commands = m_model.isNull() ? QJsonArray{}
+        : QJsonDocument::fromJson(m_model->getCommandsJson().toUtf8()).array();
+    const auto add = [&commands](const QString& name, const QString& description, const QString& hint = QString()) {
+        for (const auto& value : commands) {
+            if (value.toObject().value("name").toString() == name) { return; }
+        }
+        commands.append(QJsonObject{{"name", name}, {"description", description}, {"argument_hint", hint}});
+    };
+    add(QStringLiteral("resume"), QStringLiteral("Resume the latest saved session or a session ID"), QStringLiteral("[session-id]"));
+    add(QStringLiteral("model"), QStringLiteral("Choose the agent model"), QStringLiteral("[model]"));
+    if (m_permissionChoice->count() > 0) {
+        add(QStringLiteral("permissions"), QStringLiteral("Choose the permission mode"), QStringLiteral("[mode]"));
+    }
+    add(QStringLiteral("help"), QStringLiteral("Show available commands"));
+    m_input->setCommands(commands);
+}
+
+void TranscriptView::submitPrompt(const QString& text) {
+    if (m_model.isNull()) { return; }
+    const int separator = text.indexOf(QRegularExpression(QStringLiteral("\\s")));
+    const QString command = separator < 0 ? text : text.left(separator);
+    const QString argument = separator < 0 ? QString() : text.mid(separator).trimmed();
+    if (command == QLatin1String("/resume")) {
+        emit resumeSessionRequested(argument);
+        return;
+    }
+    // Harness commands take precedence over editor conveniences with the
+    // same name. /resume is handled above because it selects a conversation.
+    if (command.startsWith(QLatin1Char('/'))) {
+        const auto native = QJsonDocument::fromJson(m_model->getCommandsJson().toUtf8()).array();
+        for (const auto& value : native) {
+            if (value.toObject().value("name").toString() == command.mid(1)) {
+                m_model->send(text);
+                return;
+            }
+        }
+    }
+    if (command == QLatin1String("/help") && argument.isEmpty()) {
+        m_input->setPlainText(QStringLiteral("/"));
+        QTextCursor cursor = m_input->textCursor();
+        cursor.movePosition(QTextCursor::End);
+        m_input->setTextCursor(cursor);
+        m_input->setFocus();
+        return;
+    }
+    if (command == QLatin1String("/model")) {
+        if (argument.isEmpty()) {
+            m_modelChoice->setFocus();
+            m_modelChoice->showPopup();
+        } else {
+            const int index = m_modelChoice->findData(argument);
+            if (index >= 0) { m_modelChoice->setCurrentIndex(index); }
+            else { m_modelChoice->setEditText(argument); }
+            emitOptionsChanged();
+        }
+        return;
+    }
+    if (command == QLatin1String("/permissions") && m_permissionChoice->count() > 0) {
+        if (argument.isEmpty()) {
+            m_permissionChoice->setFocus();
+            m_permissionChoice->showPopup();
+        } else {
+            const int index = m_permissionChoice->findData(argument);
+            if (index >= 0) { m_permissionChoice->setCurrentIndex(index); }
+            else { m_permissionChoice->showPopup(); }
+        }
+        return;
+    }
+    // Native slash commands advertised by the harness travel unchanged.
+    m_model->send(text);
+}
+
 void TranscriptView::onStateChanged() {
     if (m_model.isNull()) {
         return;
@@ -679,8 +754,11 @@ void TranscriptView::onStateChanged() {
     } else if (state == QString::fromUtf8(kStateError)) {
         m_input->setBusy(true, QStringLiteral("the agent stopped with an error"));
     } else {
-        m_input->setBusy(working);
+        m_input->setBusy(false);
     }
+    // Codex accepts a follow-up immediately through its native turn steering;
+    // the other harnesses queue input behind the turn already running.
+    m_input->setQueueing(working && m_backend != QLatin1String("codex") && !m_input->isBusy());
     // The daemon's own words for the phase the start is in, once it has said
     // any: a first Codex or OpenCode start can take tens of seconds, and
     // "Starting the sandbox" says what they are spent on.
@@ -993,6 +1071,7 @@ QWidget* TranscriptView::makeDenialFrame(const QJsonObject& item, int index) {
     const QString status = item.value(QStringLiteral("status")).toString();
     const bool allowable = item.value(QStringLiteral("allowable")).toBool();
     const bool allowed = status == QLatin1String("allowed");
+    const bool alwaysBlocked = status == QLatin1String("always_blocked");
     const int count = item.value(QStringLiteral("count")).toInt();
 
     auto* frame = new QFrame(m_scroll->widget());
@@ -1018,8 +1097,10 @@ QWidget* TranscriptView::makeDenialFrame(const QJsonObject& item, int index) {
     if (allowed) {
         text += QStringLiteral("\nAllowed for this workspace. The agent can reach %1 on its next try.")
                     .arg(host);
+    } else if (alwaysBlocked) {
+        text += QStringLiteral("\nAlways blocked for this workspace. Edit this in Workspace → Network rules…");
     } else if (status == QLatin1String("failed")) {
-        text += QStringLiteral("\nCould not allow it: %1")
+        text += QStringLiteral("\nCould not save the network decision: %1")
                     .arg(item.value(QStringLiteral("error")).toString());
     }
     auto* label = new QLabel(text, frame);
@@ -1030,10 +1111,10 @@ QWidget* TranscriptView::makeDenialFrame(const QJsonObject& item, int index) {
     label->setTextInteractionFlags(Qt::TextSelectableByMouse);
     layout->addWidget(label, 1);
 
-    if (allowable && !allowed) {
+    if (allowable && !allowed && !alwaysBlocked) {
         const bool allowing = status == QLatin1String("allowing");
         auto* button = new QPushButton(
-            allowing ? QStringLiteral("Allowing") + QChar(kEllipsis)
+            allowing ? QStringLiteral("Saving") + QChar(kEllipsis)
                      : status == QLatin1String("failed") ? QStringLiteral("Try again")
                                                          : QStringLiteral("Allow for this workspace"),
             frame);
@@ -1047,6 +1128,16 @@ QWidget* TranscriptView::makeDenialFrame(const QJsonObject& item, int index) {
                 // Answers with `itemChanged`, which rebuilds this frame.
                 m_model->allowDeniedHost(index);
             }
+        });
+    }
+    if (!allowed && !alwaysBlocked) {
+        auto* block = new QPushButton(QStringLiteral("Always block"), frame);
+        block->setObjectName(QStringLiteral("TranscriptBlockHost"));
+        block->setToolTip(QStringLiteral("Always block %1 for this workspace").arg(host));
+        block->setEnabled(status != QLatin1String("allowing"));
+        layout->addWidget(block, 0, Qt::AlignTop);
+        QObject::connect(block, &QPushButton::clicked, this, [this, index] {
+            if (!m_model.isNull()) { m_model->blockDeniedHost(index); }
         });
     }
     return frame;
@@ -1359,6 +1450,8 @@ bool TranscriptView::atBottom() const {
 //
 // See the note in `EditorArea.cpp`. `bs_widget_test_begin` must have run first.
 #if defined(BS_WIDGET_TESTS)
+#include <QApplication>
+#include <QKeyEvent>
 #include <QCoreApplication>
 #include <QJsonValue>
 #include <QLatin1Char>
@@ -2030,6 +2123,11 @@ extern "C" std::int32_t bs_widget_test_transcript_shows_a_blocked_host_inline() 
                    ? nullptr
                    : frame->findChild<QPushButton*>(QStringLiteral("TranscriptAllowHost"));
     };
+    const auto blockButton = [&view]() -> QPushButton* {
+        QWidget* frame = view.frameAt(0);
+        return frame == nullptr ? nullptr
+            : frame->findChild<QPushButton*>(QStringLiteral("TranscriptBlockHost"));
+    };
     const auto text = [&view]() -> QString {
         QLabel* label = bodyLabel(view.frameAt(0));
         return label == nullptr ? QString() : label->text();
@@ -2037,7 +2135,7 @@ extern "C" std::int32_t bs_widget_test_transcript_shows_a_blocked_host_inline() 
 
     view.setTestItems(QStringList{ denialItem(QStringLiteral("blocked"), 3, true) });
     model.resetItems();
-    if (view.frameCount() != 1 || button() == nullptr) {
+    if (view.frameCount() != 1 || button() == nullptr || blockButton() == nullptr) {
         return 1;
     }
     if (!button()->isEnabled() || button()->text() != QLatin1String("Allow for this workspace")) {
@@ -2051,7 +2149,7 @@ extern "C" std::int32_t bs_widget_test_transcript_shows_a_blocked_host_inline() 
     view.setTestItems(QStringList{ denialItem(QStringLiteral("allowing"), 3, true) });
     model.itemChanged(0);
     settle();
-    if (button() == nullptr || button()->isEnabled()) {
+    if (button() == nullptr || button()->isEnabled() || blockButton()->isEnabled()) {
         return 4;
     }
 
@@ -2077,6 +2175,11 @@ extern "C" std::int32_t bs_widget_test_transcript_shows_a_blocked_host_inline() 
     if (button() != nullptr || text().contains(QChar(kTimes))) {
         return 8;
     }
+    if (blockButton() == nullptr || !blockButton()->isEnabled()) { return 9; }
+    view.setTestItems(QStringList{ denialItem(QStringLiteral("always_blocked"), 1, true) });
+    model.resetItems();
+    if (button() != nullptr || blockButton() != nullptr ||
+        !text().contains(QLatin1String("Always blocked for this workspace"))) { return 10; }
     return 0;
 }
 
@@ -2167,6 +2270,70 @@ extern "C" std::int32_t bs_widget_test_transcript_names_the_start_phase() {
     if (!view.progressText().startsWith(QLatin1String("Starting the agent"))) {
         return 4;
     }
+    return 0;
+}
+
+extern "C" std::int32_t bs_widget_test_working_agent_keeps_composer_editable() {
+    TranscriptModel model;
+    TranscriptView view(&model);
+    model.setAgentId(QStringLiteral("ag_composer"));
+    model.setState(QStringLiteral("working"));
+    auto* input = view.findChild<PromptInput*>();
+    if (input == nullptr || input->isReadOnly() || view.inputLocked()) { return 1; }
+    if (!input->placeholderText().contains(QLatin1String("Enter to queue"))) { return 2; }
+    QStringList submitted;
+    QObject::connect(input, &PromptInput::submitted, input,
+                     [&submitted](const QString& text) { submitted.append(text); });
+    input->insertPlainText(QStringLiteral("follow up"));
+    QKeyEvent enter(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+    QApplication::sendEvent(input, &enter);
+    if (submitted != QStringList{QStringLiteral("follow up")} || !input->toPlainText().isEmpty()) {
+        return 3;
+    }
+    input->insertPlainText(QStringLiteral("another"));
+    QKeyEvent newline(QEvent::KeyPress, Qt::Key_Return, Qt::ShiftModifier);
+    QApplication::sendEvent(input, &newline);
+    input->insertPlainText(QStringLiteral("line"));
+    if (input->toPlainText() != QLatin1String("another\nline") || submitted.size() != 1) { return 4; }
+    view.setBackend(QStringLiteral("codex"));
+    if (input->isReadOnly() || !input->placeholderText().contains(QLatin1String("Enter to send"))) {
+        return 9;
+    }
+    view.setBackend(QStringLiteral("opencode"));
+    if (input->isReadOnly() || !input->placeholderText().contains(QLatin1String("Enter to queue"))) {
+        return 10;
+    }
+    model.setState(QStringLiteral("idle"));
+    if (input->isReadOnly() || !input->placeholderText().contains(QLatin1String("Enter to send"))) {
+        return 5;
+    }
+    model.setBusy(true);
+    if (!input->isReadOnly()) { return 6; }
+    model.setBusy(false);
+    model.setState(QStringLiteral("exited"));
+    if (!input->isReadOnly()) { return 7; }
+    input->submit();
+    if (submitted.size() != 1 || input->toPlainText() != QLatin1String("another\nline")) { return 8; }
+    return 0;
+}
+
+
+extern "C" std::int32_t bs_widget_test_resume_command_selects_session() {
+    TranscriptModel model;
+    TranscriptView view(&model);
+    model.setAgentId(QStringLiteral("ag_commands"));
+    model.setState(QStringLiteral("idle"));
+    view.setBackend(QStringLiteral("codex"));
+    auto* input = view.findChild<PromptInput*>();
+    if (!input || input->isBusy()) { return 1; }
+    QStringList resumed;
+    QObject::connect(&view, &TranscriptView::resumeSessionRequested, &view,
+                     [&resumed](const QString& session) { resumed.append(session); });
+    input->setPlainText(QStringLiteral("/resume"));
+    input->submit();
+    input->setPlainText(QStringLiteral("/resume saved-session"));
+    input->submit();
+    if (resumed != QStringList{QString(), QStringLiteral("saved-session")}) { return 2; }
     return 0;
 }
 

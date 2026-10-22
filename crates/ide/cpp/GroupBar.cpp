@@ -12,6 +12,8 @@
 #include <QFont>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QDialogButtonBox>
+#include <QPushButton>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -432,6 +434,10 @@ void GroupBar::openAgentMenu(int index, const QPoint& globalPos) {
 
     QMenu menu(this);
     QAction* newAction = menu.addAction("New agent…");
+    QAction* renameAction = workspaceId.isEmpty() ? nullptr : menu.addAction("Rename agent…");
+    if (renameAction != nullptr) {
+        renameAction->setObjectName(QStringLiteral("GroupBarRenameAgentAction"));
+    }
     QAction* destroyAction =
         workspaceId.isEmpty()
             ? nullptr
@@ -448,6 +454,32 @@ void GroupBar::openAgentMenu(int index, const QPoint& globalPos) {
     }
     if (chosen == newAction) {
         emit newAgentRequested();
+    } else if (chosen == renameAction) {
+        const QString currentName = m_model->workspaceName(workspaceId);
+        if (currentName.isEmpty()) {
+            QMessageBox::information(this, QStringLiteral("Rename agent"),
+                QStringLiteral("This agent is no longer open."));
+            return;
+        }
+        QInputDialog dialog(this);
+        dialog.setObjectName(QStringLiteral("RenameAgentDialog"));
+        dialog.setWindowTitle(QStringLiteral("Rename agent"));
+        dialog.setLabelText(QStringLiteral("Agent name:"));
+        dialog.setInputMode(QInputDialog::TextInput);
+        dialog.setTextValue(currentName);
+        const auto validate = [&dialog](const QString& text) {
+            dialog.setOkButtonText(QStringLiteral("Rename"));
+            if (auto* buttons = dialog.findChild<QDialogButtonBox*>()) {
+                buttons->button(QDialogButtonBox::Ok)->setEnabled(!text.trimmed().isEmpty());
+            }
+        };
+        QObject::connect(&dialog, &QInputDialog::textValueChanged, &dialog, validate);
+        validate(dialog.textValue());
+        if (dialog.exec() != QDialog::Accepted) { return; }
+        if (!m_model->renameAgent(workspaceId, dialog.textValue())) {
+            QMessageBox::information(this, QStringLiteral("Rename agent"),
+                QStringLiteral("This agent is no longer open, or its name is blank."));
+        }
     } else if (chosen == destroyAction) {
         emit destroyRequested(workspaceId, workspaceName);
     }

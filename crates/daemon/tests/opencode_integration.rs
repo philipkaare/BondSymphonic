@@ -531,3 +531,19 @@ async fn invalid_utf8_on_stderr_does_not_stall_the_peer() {
     .await;
     adapter.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn command_catalog_survives_replay_and_idle_but_rejects_other_sessions() {
+    let (_dir, mut adapter, _entry, store) = fixture("commands", Some("saved-session")).await;
+    adapter.start().await.unwrap();
+    let rows = wait_for(&store, |rows| rows.iter().any(|row| matches!(&row.body,
+        AgentMessageBody::System { subtype, data }
+        if subtype == "agent_commands" && data["commands"][0]["name"] == "idle"))).await;
+    let catalogs: Vec<_> = rows.iter().filter_map(|row| match &row.body {
+        AgentMessageBody::System { subtype, data } if subtype == "agent_commands" =>
+            Some(data["commands"][0]["name"].as_str().unwrap()),
+        _ => None,
+    }).collect();
+    assert_eq!(catalogs, vec!["replay", "idle"]);
+    adapter.stop().await.unwrap();
+}

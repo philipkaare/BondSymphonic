@@ -12,6 +12,7 @@ fn sample(id: &str, name: &str) -> Workspace {
         worktree_path: format!("/data/worktrees/{id}").into(),
         created_at: "2026-09-08T10:00:00Z".into(),
         allowlist: vec![],
+        blocklist: vec![],
         kind: bondsymphonic_proto::WorkspaceKind::Worktree,
         state: WorkspaceState::Ready,
         agents: vec![],
@@ -351,4 +352,12 @@ fn a_registry_from_a_newer_daemon_is_loaded_rather_than_refused() {
     // And an unknown field is dropped rather than refused, which is what turns
     // an in-place workspace into a worktree workspace on an older build.
     assert_eq!(registry.list()[0].name, "future");
+}
+
+#[test]
+fn older_workspace_records_default_to_no_explicit_blocks() {
+    let mut old = serde_json::to_value(sample("ws_old", "old")).unwrap();
+    old.as_object_mut().unwrap().remove("blocklist");
+    let workspace: Workspace = serde_json::from_value(old).unwrap();
+    assert!(workspace.blocklist.is_empty());
 }

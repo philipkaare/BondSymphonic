@@ -735,7 +735,11 @@ sandbox cannot fully close off:
 ## The window
 
 The shape is Visual Studio's: the editor is the fixed centre, and everything
-else is a tool window docked around it.
+else is a tool window docked around it. The Agent tool window's title shows
+which harness and workspace are selected, for example **Agent — Claude Code · alpha**,
+and follows you when you switch tabs. Right-click an agent tab and choose
+**Rename agent…** to change its display name. The dialog starts with the current
+name, rejects blank names, and saves the new label across restarts.
 
 A splash screen sits over the window from launch until the IDE is ready to
 use: it names the phase — launching the daemon, connecting, checking the
@@ -795,6 +799,29 @@ the nearest bound.
 ## The Claude tab
 
 A Claude Code workspace's pane shows the conversation as it arrives.
+
+The message box stays editable while an agent works. **Enter** sends a follow-up
+through that harness's normal input path; **Shift+Enter** inserts a new line.
+Claude Code and OpenCode queue follow-ups, while Codex receives them immediately
+as input to its current turn. The hint says **Enter to queue** or **Enter to send**
+to match. The box remains locked while history replays or the agent is unavailable.
+
+Opening an existing agent reattaches its live session or resumes the latest saved
+conversation for that workspace and harness. A newer launch that never created a
+session does not hide an older saved conversation.
+
+Type `/` at the start of the message box to open command completion. The dropdown
+filters as you type and shows descriptions and argument hints from the attached
+harness. Use **Up/Down** to select, **Tab** or **Enter** to complete, and **Escape**
+to dismiss; completion does not send the command. Press **Enter** again to run it.
+The available choices refresh when you switch agents. `/resume [session-id]`
+reattaches a running session or resumes a saved one, with no ID meaning the latest
+session. `/model`, `/permissions` and `/help` use the app's existing controls when
+the harness does not advertise its own command with that name. Codex's app-server
+actions include `/compact` and `/status`; the dropdown lists supported actions,
+rather than every command from the terminal UI.
+
+
 
 - **The prompt box only appears once Claude Code has a credential** — either
   the `claude_auth` check passes, or you have stored an Anthropic API key under
@@ -1102,10 +1129,23 @@ everything goes through a per-workspace proxy that checks the host against an
 allowlist and refuses anything else with a 403. The default list covers
 Anthropic, npm, PyPI, crates.io and GitHub. When a connection is refused, the
 Run panel shows a toast on that workspace: **Blocked network access to
-`<host>`**, with **Allow host** and **Dismiss**. Allow host adds the host to
+`<host>`**, with **Allow host**, **Always block** and **Dismiss**. Allow host adds the host to
 that workspace's allowlist and the daemon puts the new list in front of the
 proxy at once — the next attempt goes through with nothing restarted — and
 writes it into the registry, so it survives a daemon restart.
+
+**Always block** saves an explicit block for that workspace and suppresses future
+network notices for the host. The same choice is available on inline network
+notices in an agent's transcript. Block rules override allowed hosts and backend
+model-server grants.
+
+Open **Workspace → Network rules…** to edit the workspace's effective allowed and
+blocked hosts, one host or `*.example.com` wildcard per line. **Save** validates
+both lists before applying either; invalid entries leave the current rules in
+place. Changes persist between sessions and apply to new connections immediately;
+existing connections keep running. If another decision changed the rules while
+the dialog was open, saving reports a conflict so you can reopen it with the
+latest rules.
 
 The proxy also refuses any destination that resolves to a loopback,
 link-local, private, unique-local, unspecified or multicast address, whatever

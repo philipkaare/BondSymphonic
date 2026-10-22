@@ -286,8 +286,13 @@ void RunPanel::buildToast(QVBoxLayout* outer) {
 
     m_allow = new QPushButton("Allow host", m_toast);
     m_allow->setToolTip("Add the host to this workspace's allowlist");
+    m_block = new QPushButton("Always block", m_toast);
+    m_block->setObjectName(QStringLiteral("RunBlockHost"));
+    m_block->setToolTip("Always block this host for this workspace");
+    QObject::connect(m_block, &QPushButton::clicked, this, &RunPanel::onBlockClicked);
     m_dismiss = new QPushButton("Dismiss", m_toast);
     layout->addWidget(m_allow, 0);
+    layout->addWidget(m_block, 0);
     layout->addWidget(m_dismiss, 0);
     m_toast->hide();
     outer->addWidget(m_toast);
@@ -697,6 +702,7 @@ void RunPanel::setToastBusy(bool busy) {
     // waiting rather than offering to allow nothing.
     m_allowHostAction->setEnabled(!busy && !m_deniedHost.isEmpty());
     m_dismiss->setEnabled(!busy);
+    m_block->setEnabled(!busy && !m_deniedHost.isEmpty());
     if (m_deniedHost.isEmpty()) {
         return;
     }
@@ -704,7 +710,7 @@ void RunPanel::setToastBusy(bool busy) {
     // failed allow must stop claiming the host is being allowed, and must say
     // what went wrong where the offer it belongs to is.
     if (busy) {
-        m_toastText->setText(QStringLiteral("Allowing %1…").arg(m_deniedHost));
+        m_toastText->setText(QStringLiteral("Saving network decision for %1…").arg(m_deniedHost));
         return;
     }
     const QString blocked = QStringLiteral("Blocked network access to %1").arg(m_deniedHost);
@@ -738,6 +744,16 @@ void RunPanel::onAllowClicked() {
     m_lastError.clear();
     updateRow();
     m_model->allowHost(host);
+}
+
+void RunPanel::onBlockClicked() {
+    const QString host = m_deniedHost;
+    if (host.isEmpty() || m_model.isNull()) { return; }
+    m_denialError.clear();
+    setToastBusy(true);
+    m_lastError.clear();
+    updateRow();
+    m_model->blockHost(host);
 }
 
 void RunPanel::onDismissClicked() {

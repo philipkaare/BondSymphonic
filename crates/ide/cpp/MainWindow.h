@@ -25,6 +25,7 @@ class NewAgentDialog;
 class QAction;
 class QCloseEvent;
 class QDockWidget;
+class QDialog;
 class QEvent;
 class QJsonObject;
 class QLabel;
@@ -608,6 +609,8 @@ private:
     QAction* m_restartAgentAction = nullptr;
     /// Workspace > Fetch from origin; see `AppController::fetchWorkspace`.
     QAction* m_fetchAction = nullptr;
+    QAction* m_networkRulesAction = nullptr;
+    QPointer<QDialog> m_networkRulesDialog;
     QAction* m_destroyAction = nullptr;
     QAction* m_closeGroupAction = nullptr;
     /// The two that need a *second* tab to go to rather than merely one tab.

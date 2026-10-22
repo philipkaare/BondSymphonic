@@ -336,6 +336,10 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
         addWidget(makePage(workspaceId, view));
         QObject::connect(view, &TranscriptView::startAgentRequested, this,
                          [this, workspaceId] { emit startAgentRequested(workspaceId); });
+        QObject::connect(view, &TranscriptView::resumeSessionRequested, this,
+                         [this, workspaceId](const QString& session) {
+                             emit resumeSessionRequested(workspaceId, session);
+                         });
         QObject::connect(view, &TranscriptView::loginRequested, this,
                          &AgentArea::loginRequested);
         QObject::connect(view, &TranscriptView::openConfigFolderRequested, this,

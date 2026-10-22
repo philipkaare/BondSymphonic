@@ -137,6 +137,9 @@ pub mod qobject {
         #[qinvokable]
         fn allow_host(self: Pin<&mut RunPanelModel>, host: QString);
 
+        #[qinvokable]
+        fn block_host(self: Pin<&mut RunPanelModel>, host: QString);
+
         /// Takes `host`'s toast down without allowing it.
         #[qinvokable]
         fn dismiss_denied(self: Pin<&mut RunPanelModel>, host: QString);
@@ -380,6 +383,14 @@ pub async fn add_host_to_allowlist(
         .await
         .map(|_| ())
         .map_err(|e| format!("workspace.set_allowlist failed: {e}"))
+}
+
+pub async fn block_network_host(shared: &Shared, workspace: &str, host: &str) -> Result<(), String> {
+    shared.client.request_raw(Request::WorkspaceBlockHost(
+        bondsymphonic_proto::WorkspaceBlockHostParams {
+            workspace_id: WorkspaceId(workspace.to_owned()), host: host.to_owned(),
+        }
+    )).await.map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Detects the configurations of `worktree` and lists `workspace`'s runs, then
@@ -660,6 +671,32 @@ impl qobject::RunPanelModel {
                     });
                 }
             }
+        });
+    }
+
+    pub fn block_host(mut self: Pin<&mut Self>, host: QString) {
+        let host = host.to_string();
+        let Some(workspace) = self.as_ref().denial_owner_of(&host) else {
+            return;
+        };
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                self.as_mut().deny_failed(&host, message);
+                return;
+            }
+        };
+        let qt = self.as_ref().qt_thread();
+        self.as_mut().begin_request();
+        runtime().spawn(async move {
+            let result = block_network_host(&shared, &workspace, &host).await;
+            let _ = qt.queue(move |mut q| {
+                q.as_mut().end_request();
+                match result {
+                    Ok(()) => q.clear_denial(&workspace, &host),
+                    Err(message) => q.deny_failed(&host, &message),
+                }
+            });
         });
     }
 

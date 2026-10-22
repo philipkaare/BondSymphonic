@@ -6,6 +6,7 @@ use bondsymphonic_ide::testing::skip_without_qt;
 
 extern "C" {
     fn bs_widget_test_begin();
+    fn bs_widget_test_network_rules_dialog() -> i32;
     fn bs_widget_test_transcript_shows_a_blocked_host_inline() -> i32;
 }
 
@@ -20,4 +21,6 @@ fn the_transcript_shows_a_blocked_host_inline() {
         code, 0,
         "TranscriptView blocked-host line failed at step {code}"
     );
+    let code = unsafe { bs_widget_test_network_rules_dialog() };
+    assert_eq!(code, 0, "Network rules dialog failed at step {code}");
 }

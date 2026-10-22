@@ -47,7 +47,12 @@ for line in sys.stdin:
         assert initialized
         thread = p.get("threadId", "new-thread")
         emit({"id": m["id"], "result": {"thread": {"id": thread}}})
+    elif method == "thread/compact/start":
+        assert mode == "commands"
+        assert p == {"threadId": thread}
+        emit({"id": m["id"], "result": {}})
     elif method == "turn/start":
+        assert mode != "commands", "slash commands must not reach the model"
         turn += 1
         emit({"id": m["id"], "result": {"turn": {"id": str(turn)}}})
         event("turn/started", {"threadId": thread, "turn": {"id": str(turn)}})

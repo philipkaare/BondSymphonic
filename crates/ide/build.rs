@@ -67,6 +67,7 @@ fn main() {
             "cpp/SetupPage.cpp",
             "cpp/SettingsDialog.h",
             "cpp/SettingsDialog.cpp",
+            "cpp/NetworkRulesDialog.cpp",
             "cpp/PromptInput.h",
             "cpp/PromptInput.cpp",
             "cpp/ToolCard.h",

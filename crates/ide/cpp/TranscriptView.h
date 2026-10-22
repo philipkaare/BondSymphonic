@@ -161,6 +161,7 @@ signals:
     /// A restart was asked for. The area turns this into the workspace id the
     /// window needs; this view knows only its model.
     void startAgentRequested();
+    void resumeSessionRequested(const QString& session);
 
     /// The user chose a different model or permission mode, and `optionsJson`
     /// is the whole `AgentStartOptions` that choice means -- this tab's own
@@ -198,6 +199,8 @@ private:
     void onPermissionRequested();
     void onBusyChanged();
     void onStateChanged();
+    void refreshCommandCatalog();
+    void submitPrompt(const QString& text);
     /// Puts the tab's own options into the two dropdowns. Guarded, because a
     /// combo told what the agent already runs on must not read as the user
     /// asking for a restart.

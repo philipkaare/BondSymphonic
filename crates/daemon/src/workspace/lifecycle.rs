@@ -268,7 +268,7 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
         .start(
             &ws.id,
             &d.dirs.run(&ws.id).join(PROXY_SOCKET_FILE),
-            Allowlist::from_strings(&ws.allowlist),
+            Allowlist::from_strings(&ws.allowlist).with_blocks(&ws.blocklist),
             d.events.clone(),
         )
         .await?;
@@ -431,6 +431,17 @@ pub async fn set_allowlist(
     id: &WorkspaceId,
     hosts: &[String],
 ) -> Result<Empty, RpcError> {
+    let _guard = d.network_rules_lock.lock().await;
+    let patterns = validate_network_patterns(hosts)?;
+    let ws = d
+        .registry
+        .update(id, |w| w.allowlist = patterns.clone())
+        .await?;
+    apply_network_rules(d, &ws).await;
+    Ok(Empty {})
+}
+
+fn validate_network_patterns(hosts: &[String]) -> Result<Vec<String>, RpcError> {
     if hosts.len() > MAX_ALLOWLIST_ENTRIES {
         return Err(RpcError::invalid_params(format!(
             "an allowlist may hold at most {MAX_ALLOWLIST_ENTRIES} entries, not {}",
@@ -448,15 +459,77 @@ pub async fn set_allowlist(
         let pattern = HostPattern::parse(host).map_err(RpcError::invalid_params)?;
         patterns.push(pattern.as_str().to_string());
     }
+    Ok(patterns)
+}
+
+/// Validates both lists before atomically persisting either of them.
+pub async fn set_network_rules(
+    d: &Daemon,
+    rules: &bondsymphonic_proto::WorkspaceSetNetworkRulesParams,
+) -> Result<Empty, RpcError> {
+    let _guard = d.network_rules_lock.lock().await;
+    let id = &rules.workspace_id;
+    let current = d.workspace(id)?;
+    if rules
+        .expected_allow
+        .as_ref()
+        .is_some_and(|list| list != &current.allowlist)
+        || rules
+            .expected_block
+            .as_ref()
+            .is_some_and(|list| list != &current.blocklist)
+    {
+        return Err(RpcError::invalid_params(
+            "Network rules changed while this dialog was open. Reopen Network rules to load the latest rules before saving."
+        ));
+    }
+    let allow = validate_network_patterns(&rules.allow)?;
+    let block = validate_network_patterns(&rules.block)?;
     let ws = d
         .registry
-        .update(id, |w| w.allowlist = patterns.clone())
+        .update(id, |w| {
+            w.allowlist = allow.clone();
+            w.blocklist = block.clone();
+        })
         .await?;
-    d.proxies
-        .set_allowlist(id, Allowlist::from_strings(&ws.allowlist));
-    d.agent_sandboxes.set_allowlist(&ws).await;
-    d.emit_state(&ws);
+    apply_network_rules(d, &ws).await;
     Ok(Empty {})
+}
+
+/// Appends to the current list under the registry lock, avoiding lost edits.
+pub async fn block_host(d: &Daemon, id: &WorkspaceId, host: &str) -> Result<Empty, RpcError> {
+    let _guard = d.network_rules_lock.lock().await;
+    if host.contains('*') {
+        return Err(RpcError::invalid_params(
+            "a blocked connection must name one host",
+        ));
+    }
+    let host = validate_network_patterns(&[host.to_owned()])?.remove(0);
+    // Leave a full list untouched; duplicate clicks remain idempotent.
+    let ws = d
+        .registry
+        .update(id, |w| {
+            if w.blocklist.len() < MAX_ALLOWLIST_ENTRIES && !w.blocklist.contains(&host) {
+                w.blocklist.push(host.clone());
+            }
+        })
+        .await?;
+    if !ws.blocklist.contains(&host) {
+        return Err(RpcError::invalid_params(
+            "the workspace block list is full",
+        ));
+    }
+    apply_network_rules(d, &ws).await;
+    Ok(Empty {})
+}
+
+async fn apply_network_rules(d: &Daemon, ws: &Workspace) {
+    d.proxies.set_allowlist(
+        &ws.id,
+        Allowlist::from_strings(&ws.allowlist).with_blocks(&ws.blocklist),
+    );
+    d.agent_sandboxes.set_allowlist(ws).await;
+    d.emit_state(ws);
 }
 
 /// Reports a sandbox that dies on its own as `SandboxDown`.
@@ -855,6 +928,7 @@ async fn create_the_workspace(
         worktree_path: d.dirs.worktree(&id),
         created_at: now_rfc3339(),
         allowlist: effective_allowlist(repo_path),
+        blocklist: vec![],
         kind: WorkspaceKind::Worktree,
         state: WorkspaceState::Creating,
         agents: vec![],
@@ -970,6 +1044,7 @@ async fn create_in_place(
         worktree_path: repo_path.to_path_buf(),
         created_at: now_rfc3339(),
         allowlist: effective_allowlist(repo_path),
+        blocklist: vec![],
         kind: WorkspaceKind::InPlace,
         state: WorkspaceState::Creating,
         agents: vec![],
@@ -1748,6 +1823,7 @@ mod tests {
             worktree_path: dir.path().into(),
             created_at: now_rfc3339(),
             allowlist: vec![],
+            blocklist: vec![],
             kind: WorkspaceKind::Worktree,
             state: WorkspaceState::Ready,
             agents: vec![],
@@ -1903,6 +1979,7 @@ mod tests {
             worktree_path: repo,
             created_at: now_rfc3339(),
             allowlist: vec![],
+            blocklist: vec![],
             kind: WorkspaceKind::InPlace,
             state,
             agents: vec![],

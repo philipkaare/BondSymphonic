@@ -124,6 +124,10 @@ impl Handler for WorkspaceHandler {
             Request::WorkspaceSetAllowlist(p) => {
                 ok(lifecycle::set_allowlist(d, &p.workspace_id, &p.hosts).await?)
             }
+            Request::WorkspaceSetNetworkRules(p) => ok(lifecycle::set_network_rules(d, &p).await?),
+            Request::WorkspaceBlockHost(p) => {
+                ok(lifecycle::block_host(d, &p.workspace_id, &p.host).await?)
+            }
             Request::WorkspaceChanges(p) => ok(changes::changes(d, &p.workspace_id).await?),
             Request::WorkspaceDiff(p) => ok(changes::diff(d, &p.workspace_id, &p.path).await?),
             // Merging runs as the daemon in the main repository, never in the

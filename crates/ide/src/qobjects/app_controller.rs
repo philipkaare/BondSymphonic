@@ -802,6 +802,9 @@ pub mod qobject {
         #[qinvokable]
         fn start_agent(self: Pin<&mut AppController>, workspace_id: QString, options_json: QString);
 
+        #[qinvokable]
+        fn resume_agent(self: Pin<&mut AppController>, workspace_id: QString, options_json: QString, session: QString);
+
         /// Destroy a workspace. Answers with `workspace_destroyed` or
         /// `operation_failed`.
         #[qinvokable]
@@ -845,6 +848,19 @@ pub mod qobject {
         /// answers with `operation_failed("workspace.set_allowlist", ...)`.
         #[qinvokable]
         fn set_allowlist(self: Pin<&mut AppController>, workspace_id: QString, hosts_json: QString);
+
+        #[qinvokable]
+        fn load_network_rules(self: Pin<&mut AppController>, workspace_id: QString);
+
+        #[qinvokable]
+        fn set_network_rules(self: Pin<&mut AppController>, workspace_id: QString, rules_json: QString);
+
+        #[qsignal]
+        fn network_rules_loaded(self: Pin<&mut AppController>, workspace_id: QString, json: QString);
+
+        #[qsignal]
+        fn network_rules_saved(self: Pin<&mut AppController>, workspace_id: QString);
+
 
         /// Translates a Windows path to the WSL path the daemon expects, or
         /// returns an empty string if it is not a translatable path.
@@ -3316,6 +3332,56 @@ impl qobject::AppController {
         );
     }
 
+    pub fn resume_agent(self: Pin<&mut Self>, workspace_id: QString, options_json: QString, session: QString) {
+        use crate::model::commands::{resume_target, ResumeTarget};
+        let qt = self.qt_thread();
+        let workspace = WorkspaceId(workspace_id.to_string());
+        let options_json = options_json.to_string();
+        let (adapter, mut options) = match self.resolved_start(&options_json) {
+            Ok(start) => start,
+            Err(message) => {
+                report_agent_failure(&qt, workspace.to_string(), "agent.start", message, Some(options_json));
+                return;
+            }
+        };
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_agent_failure(&qt, workspace.to_string(), "agent.start", message.to_owned(), Some(options_json));
+                return;
+            }
+        };
+        let session = session.to_string();
+        runtime().spawn(async move {
+            let info = match shared.client.request::<WorkspaceInfo>(Request::WorkspaceGet(
+                WorkspaceIdParams { workspace_id: workspace.clone() }
+            )).await {
+                Ok(info) => info,
+                Err(error) => {
+                    report_agent_failure(&qt, workspace.to_string(), "agent.start", error.to_string(), Some(options_json));
+                    return;
+                }
+            };
+            match resume_target(&info.agent_records, adapter, &session) {
+                Ok(ResumeTarget::Attach(agent)) => {
+                    let _ = qt.queue(move |mut q| {
+                        q.as_mut().register_agent_backend(agent.to_string(), adapter);
+                        q.agent_started(QString::from(workspace.as_str()), QString::from(agent.as_str()));
+                    });
+                }
+                Ok(ResumeTarget::Session(session)) => {
+                    options.resume_session = Some(session.clone());
+                    let mut json = serde_json::from_str::<serde_json::Value>(&options_json)
+                        .ok().filter(serde_json::Value::is_object)
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    json["resume_session"] = serde_json::json!(session);
+                    start_agent_and_prompt(shared, qt, workspace, adapter, options, json.to_string(), String::new(), false).await;
+                }
+                Err(message) => report_agent_failure(&qt, workspace.to_string(), "agent.start", message, None),
+            }
+        });
+    }
+
     pub fn start_agent(self: Pin<&mut Self>, workspace_id: QString, options_json: QString) {
         let qt = self.qt_thread();
         let workspace = WorkspaceId(workspace_id.to_string());
@@ -3573,6 +3639,69 @@ impl qobject::AppController {
                     });
                 }
                 Err(e) => report_failure(&qt, "repo.detect_run_configs", e.to_string()),
+            }
+        });
+    }
+
+    pub fn load_network_rules(self: Pin<&mut Self>, workspace_id: QString) {
+        let qt = self.qt_thread();
+        let workspace = workspace_id.to_string();
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_workspace_op_failure(&qt, workspace, "workspace.get", message.to_owned());
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            let result = shared.client.request::<WorkspaceInfo>(Request::WorkspaceGet(
+                WorkspaceIdParams { workspace_id: WorkspaceId(workspace.clone()) }
+            )).await;
+            match result {
+                Ok(info) => {
+                    let json = serde_json::json!({"allow": info.allowlist, "block": info.blocklist}).to_string();
+                    let _ = qt.queue(move |q| q.network_rules_loaded(QString::from(&workspace), QString::from(&json)));
+                }
+                Err(e) => report_workspace_op_failure(&qt, workspace, "workspace.get", e.to_string()),
+            }
+        });
+    }
+
+    pub fn set_network_rules(self: Pin<&mut Self>, workspace_id: QString, rules_json: QString) {
+        let qt = self.qt_thread();
+        let workspace = workspace_id.to_string();
+        #[derive(serde::Deserialize)]
+        struct Rules {
+            allow: Vec<String>,
+            block: Vec<String>,
+            expected_allow: Vec<String>,
+            expected_block: Vec<String>,
+        }
+        let rules: Rules = match serde_json::from_str(&rules_json.to_string()) {
+            Ok(rules) => rules,
+            Err(e) => {
+                report_workspace_op_failure(&qt, workspace, "workspace.set_network_rules", e.to_string());
+                return;
+            }
+        };
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_workspace_op_failure(&qt, workspace, "workspace.set_network_rules", message.to_owned());
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            let params = WorkspaceSetNetworkRulesParams {
+                workspace_id: WorkspaceId(workspace.clone()),
+                allow: rules.allow,
+                block: rules.block,
+                expected_allow: Some(rules.expected_allow),
+                expected_block: Some(rules.expected_block),
+            };
+            match shared.client.request_raw(Request::WorkspaceSetNetworkRules(params)).await {
+                Ok(_) => { let _ = qt.queue(move |q| q.network_rules_saved(QString::from(&workspace))); }
+                Err(e) => report_workspace_op_failure(&qt, workspace, "workspace.set_network_rules", e.to_string()),
             }
         });
     }
