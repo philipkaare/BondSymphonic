@@ -1,4 +1,5 @@
 use crate::ids::*;
+use crate::mcp::*;
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -312,6 +313,34 @@ pub enum Request {
     /// `GET <baseURL>/models`. Gated like `opencode.list_providers`.
     #[serde(rename = "opencode.test_provider")]
     OpenCodeTestProvider(OpenCodeTestProviderParams),
+    /// The user's MCP server registry with each server's connection status.
+    /// The `mcp.*` requests are additive and gated on
+    /// [`crate::Capabilities::mcp_servers`], so they do not move
+    /// [`crate::PROTOCOL_VERSION`].
+    #[serde(rename = "mcp.list")]
+    McpList {},
+    #[serde(rename = "mcp.upsert")]
+    McpUpsert(McpUpsertParams),
+    #[serde(rename = "mcp.remove")]
+    McpRemove(McpServerIdParams),
+    #[serde(rename = "mcp.import_preview")]
+    McpImportPreview(McpImportParams),
+    #[serde(rename = "mcp.import_apply")]
+    McpImportApply(McpImportParams),
+    #[serde(rename = "mcp.export")]
+    McpExport {},
+    #[serde(rename = "mcp.restore_preset")]
+    McpRestorePreset {},
+    #[serde(rename = "mcp.override")]
+    McpOverride(McpOverrideParams),
+    #[serde(rename = "mcp.connect")]
+    McpConnect(McpConnectParams),
+    #[serde(rename = "mcp.callback")]
+    McpCallback(McpCallbackParams),
+    #[serde(rename = "mcp.disconnect")]
+    McpDisconnect(McpServerIdParams),
+    #[serde(rename = "mcp.test")]
+    McpTest(McpTestParams),
 }
 
 impl Request {
@@ -363,6 +392,18 @@ impl Request {
             AgentQueuedPrompt(_) => "agent.queued_prompt",
             OpenCodeListProviders {} => "opencode.list_providers",
             OpenCodeTestProvider(_) => "opencode.test_provider",
+            McpList {} => "mcp.list",
+            McpUpsert(_) => "mcp.upsert",
+            McpRemove(_) => "mcp.remove",
+            McpImportPreview(_) => "mcp.import_preview",
+            McpImportApply(_) => "mcp.import_apply",
+            McpExport {} => "mcp.export",
+            McpRestorePreset {} => "mcp.restore_preset",
+            McpOverride(_) => "mcp.override",
+            McpConnect(_) => "mcp.connect",
+            McpCallback(_) => "mcp.callback",
+            McpDisconnect(_) => "mcp.disconnect",
+            McpTest(_) => "mcp.test",
         }
     }
 
@@ -374,6 +415,58 @@ impl Request {
         let pty: PtyId = "pty_1".into();
         let run: RunId = "run_1".into();
         vec![
+            McpList {},
+            McpExport {},
+            McpRestorePreset {},
+            McpRemove(McpServerIdParams {
+                server_id: "mcp_example".into(),
+            }),
+            McpDisconnect(McpServerIdParams {
+                server_id: "mcp_example".into(),
+            }),
+            McpConnect(McpConnectParams {
+                server_id: "mcp_example".into(),
+                redirect_uri: "http://127.0.0.1:4123/callback".into(),
+            }),
+            McpCallback(McpCallbackParams {
+                server_id: "mcp_example".into(),
+                state: McpSecretValue("state".into()),
+                code: McpSecretValue("code".into()),
+                issuer: None,
+            }),
+            McpOverride(McpOverrideParams {
+                server_id: "mcp_example".into(),
+                workspace_id: ws.clone(),
+                value: McpWorkspaceOverride::Inherit,
+            }),
+            McpTest(McpTestParams {
+                server_id: "mcp_example".into(),
+            }),
+            McpImportPreview(McpImportParams {
+                document: McpSecretValue("{}".into()),
+                resolutions: Default::default(),
+                expected_revision: None,
+            }),
+            McpImportApply(McpImportParams {
+                document: McpSecretValue("{}".into()),
+                resolutions: Default::default(),
+                expected_revision: None,
+            }),
+            McpUpsert(McpUpsertParams {
+                server: McpServerConfig {
+                    id: "mcp_example".into(),
+                    name: "Example".into(),
+                    transport: McpTransportConfig::Http {
+                        url: "https://example.com/mcp".into(),
+                        auth: McpAuthConfig::None,
+                    },
+                    enabled: true,
+                    default_workspace_enabled: true,
+                    enabled_backends: vec!["claude".into()],
+                },
+                secrets: vec![],
+                expected_revision: None,
+            }),
             Hello(HelloParams {
                 token: "t".into(),
                 client_version: "0.1.0".into(),

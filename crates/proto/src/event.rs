@@ -74,6 +74,12 @@ pub enum Event {
         #[serde(default)]
         label: String,
     },
+    /// The MCP server registry or a server's connection status changed.
+    /// `revision` is the registry revision after the change; a client that
+    /// holds an older one re-fetches with `mcp.list`. Sent to every client,
+    /// and an older IDE ignores the kind it does not know.
+    #[serde(rename = "mcp.changed")]
+    McpChanged { revision: u64 },
 }
 
 /// The `hello` feature that turns [`Event::AgentStartProgress`] on for a
@@ -244,6 +250,7 @@ impl Event {
     pub fn examples() -> Vec<Event> {
         use Event::*;
         vec![
+            McpChanged { revision: 3 },
             DaemonLog {
                 level: LogLevel::Info,
                 message: "m".into(),

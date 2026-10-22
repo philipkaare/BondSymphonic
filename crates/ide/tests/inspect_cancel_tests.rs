@@ -69,6 +69,7 @@ async fn fake_daemon(release: Arc<Notify>) -> std::net::SocketAddr {
                                 git_protect: false,
                                 adapters: vec![],
                                 opencode_providers: false,
+                                mcp_servers: false,
                             },
                             protocol_version: Some(PROTOCOL_VERSION),
                         },

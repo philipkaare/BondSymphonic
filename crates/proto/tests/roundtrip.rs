@@ -1004,3 +1004,15 @@ fn commit_and_ignore_contracts_roundtrip() {
         "file_type"
     );
 }
+
+#[test]
+fn mcp_changed_event_roundtrips_with_its_revision() {
+    let event = bondsymphonic_proto::Event::McpChanged { revision: 7 };
+    let wire = serde_json::to_value(&event).unwrap();
+    assert_eq!(wire["kind"], "mcp.changed");
+    assert_eq!(wire["revision"], 7);
+    assert_eq!(
+        serde_json::from_value::<bondsymphonic_proto::Event>(wire).unwrap(),
+        event
+    );
+}

@@ -49,6 +49,7 @@ async fn fake_daemon(
                         capabilities: Capabilities {
                             backends: vec![],
                             opencode_providers: false,
+                            mcp_servers: false,
                             sandbox_backend: "noop".into(),
                             git_protect: false,
                             adapters: vec![],

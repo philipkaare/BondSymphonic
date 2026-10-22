@@ -166,6 +166,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                             capabilities: Capabilities {
                                 backends: vec![],
                                 opencode_providers: false,
+                                mcp_servers: false,
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
                                 adapters: vec![
@@ -627,6 +628,7 @@ mod task_10 {
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![
@@ -902,6 +904,7 @@ mod task_10_agent_state_race {
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![

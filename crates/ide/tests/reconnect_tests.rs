@@ -343,6 +343,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                             capabilities: Capabilities {
                                 backends: vec![],
                                 opencode_providers: false,
+                                mcp_servers: false,
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
                                 adapters: vec![
@@ -675,6 +676,7 @@ async fn fake_daemon_speaking_the_next_protocol() -> (std::net::SocketAddr, Jour
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![],

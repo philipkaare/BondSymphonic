@@ -15,6 +15,11 @@ pub struct Capabilities {
     /// which reads as `false`, and Settings then hides the model-server list.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub opencode_providers: bool,
+    /// The daemon answers the `mcp.*` requests (the user's MCP server
+    /// registry). A daemon that predates them sends nothing, which reads as
+    /// `false`, and the IDE then hides the MCP controls.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mcp_servers: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

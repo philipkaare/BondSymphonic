@@ -651,6 +651,7 @@ mod review_fixes_task_7 {
                                     capabilities: Capabilities {
                                         backends: vec![],
                                         opencode_providers: false,
+                                        mcp_servers: false,
                                         sandbox_backend: "noop".into(),
                                         git_protect: false,
                                         adapters: vec![],

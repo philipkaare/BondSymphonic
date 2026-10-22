@@ -847,6 +847,7 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journals) {
                             capabilities: Capabilities {
                                 backends: vec![],
                                 opencode_providers: false,
+                                mcp_servers: false,
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
                                 // What a daemon with a `claude` on PATH advertises.
@@ -1815,6 +1816,7 @@ mod menu_targets {
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![
@@ -2150,6 +2152,7 @@ mod task_16 {
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![AgentAdapterKind::Terminal],
@@ -2575,6 +2578,7 @@ mod sandbox_retry {
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![AgentAdapterKind::Claude],
@@ -2885,6 +2889,7 @@ mod sandbox_remove_dirty {
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![AgentAdapterKind::Claude],
@@ -3267,6 +3272,7 @@ mod sandbox_retry_followups {
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![AgentAdapterKind::Claude],
@@ -3543,6 +3549,7 @@ mod seam_targets {
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![AgentAdapterKind::Claude],
@@ -3760,6 +3767,7 @@ mod sandbox_retry_destroying {
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![AgentAdapterKind::Claude],
@@ -4004,6 +4012,7 @@ mod in_place_close {
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![AgentAdapterKind::Claude],
@@ -4240,6 +4249,7 @@ mod in_place_breach_detail {
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![AgentAdapterKind::Claude],
@@ -4907,6 +4917,7 @@ mod agent_auto_restart {
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![AgentAdapterKind::Claude],
@@ -5405,6 +5416,7 @@ mod front_tab_after_destroy {
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![AgentAdapterKind::Claude],
@@ -5835,6 +5847,7 @@ mod claude_auth_override {
                                 capabilities: Capabilities {
                                     backends: vec![],
                                     opencode_providers: false,
+                                    mcp_servers: false,
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
                                     adapters: vec![AgentAdapterKind::Claude],
@@ -6136,6 +6149,7 @@ mod one_start_per_create {
                                     capabilities: Capabilities {
                                         backends: vec![],
                                         opencode_providers: false,
+                                        mcp_servers: false,
                                         sandbox_backend: "noop".into(),
                                         git_protect: false,
                                         adapters: vec![
