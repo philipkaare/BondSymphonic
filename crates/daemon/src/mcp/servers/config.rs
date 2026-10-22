@@ -101,7 +101,9 @@ pub(crate) fn validate(server: &McpServerConfig) -> Result<(), RpcError> {
                     "MCP credential arguments are unsupported; use secret environment variables",
                 ));
             }
-            let bad_name = |k: &String| k.is_empty() || k.contains(['=', '\0']);
+            // Names end up in an env file and a process environment: anything
+            // beyond a plain identifier (newlines, `=`) could inject variables.
+            let bad_name = |k: &String| !env_name_ok(k);
             let distinct: BTreeSet<_> = secret_env.iter().collect();
             if command.trim().is_empty()
                 || command.contains('\0')
@@ -131,6 +133,14 @@ pub(crate) fn validate(server: &McpServerConfig) -> Result<(), RpcError> {
         }
     }
     Ok(())
+}
+
+fn env_name_ok(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+        && bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
 fn credential_argument(argument: &str) -> bool {

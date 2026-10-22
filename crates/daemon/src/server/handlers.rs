@@ -91,12 +91,15 @@ impl Handler for WorkspaceHandler {
             // all clients the new revision; `mcp.connect`, `.callback`,
             // `.disconnect` and `.test` fall through to "not implemented"
             // until the transport layer exists.
-            Request::McpList {} => ok(d.mcp_servers.list()),
+            Request::McpList {} => ok(d.mcp_servers.list()?),
             Request::McpUpsert(p) => mcp_saved(d, d.mcp_servers.upsert(p)),
             Request::McpRemove(p) => mcp_saved(d, d.mcp_servers.remove(&p.server_id)),
             Request::McpImportPreview(p) => ok(d.mcp_servers.import_preview(&p)?),
             Request::McpImportApply(p) => mcp_saved(d, d.mcp_servers.import_apply(p)),
-            Request::McpExport {} => ok(serde_json::json!({ "document": d.mcp_servers.export() })),
+            Request::McpExport {} => {
+                d.mcp_servers.ensure_usable()?;
+                ok(serde_json::json!({ "document": d.mcp_servers.export() }))
+            }
             Request::McpRestorePreset {} => mcp_saved(d, d.mcp_servers.restore_preset()),
             Request::McpOverride(p) => mcp_saved(d, d.mcp_servers.set_override(p)),
             Request::RepoInspect(p) => {

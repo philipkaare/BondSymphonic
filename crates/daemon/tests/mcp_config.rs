@@ -638,14 +638,6 @@ fn state_survives_reload_and_changes_are_announced() {
     assert_eq!(load(root.path()).snapshot(), saved);
 }
 
-#[test]
-fn corrupt_registry_is_an_error_not_a_reset() {
-    let root = tempfile::tempdir().unwrap();
-    load(root.path());
-    std::fs::write(root.path().join("mcp/registry.json"), "{ nope").unwrap();
-    assert!(McpServers::load(root.path()).is_err());
-}
-
 #[tokio::test]
 async fn rpc_handlers_serve_the_registry_and_announce_changes() {
     let root = tempfile::tempdir().unwrap();
@@ -714,4 +706,141 @@ async fn rpc_handlers_serve_the_registry_and_announce_changes() {
         .unwrap_err();
     assert!(connect.message.contains("not implemented"), "{connect:?}");
     cancel.cancel();
+}
+
+#[test]
+fn env_name_with_newline_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let servers = load(root.path());
+    for name in ["A\nLD_PRELOAD", "1ABC", "A B", "A=B", ""] {
+        let mut secret = stdio_server("local");
+        if let McpTransportConfig::Stdio { secret_env, .. } = &mut secret.transport {
+            *secret_env = vec![name.into()];
+        }
+        let mut plain = stdio_server("local");
+        if let McpTransportConfig::Stdio {
+            env, secret_env, ..
+        } = &mut plain.transport
+        {
+            secret_env.clear();
+            env.insert(name.into(), "v".into());
+        }
+        for server in [secret, plain] {
+            assert_eq!(
+                servers.upsert(upsert(server, vec![])).unwrap_err().code,
+                ErrorCode::InvalidParams,
+                "{name:?}"
+            );
+        }
+    }
+    let doc =
+        serde_json::json!({"mcpServers":{"x":{"command":"node","env":{"A\nLD_PRELOAD":"v"}}}});
+    let preview = servers.import_preview(&import(&doc.to_string())).unwrap();
+    assert!(preview.servers.is_empty());
+    assert_eq!(preview.issues.len(), 1);
+    assert!(servers.import_apply(import(&doc.to_string())).is_err());
+}
+
+fn assert_degraded(servers: &McpServers, path: &std::path::Path) {
+    assert!(servers
+        .resolve(&WorkspaceId("ws".into()), AgentAdapterKind::Claude)
+        .is_empty());
+    let message = format!("{path:?}");
+    let message = message.trim_matches('"');
+    for error in [
+        servers.list().unwrap_err(),
+        servers
+            .upsert(upsert(http_server("a"), vec![]))
+            .unwrap_err(),
+        servers.remove(&"jira".into()).unwrap_err(),
+        servers.restore_preset().unwrap_err(),
+        servers.import_preview(&import("{}")).unwrap_err(),
+    ] {
+        assert_eq!(error.code, ErrorCode::IoError);
+        assert!(error.message.contains("MCP registry"), "{error:?}");
+        assert!(
+            error.message.contains("registry.json"),
+            "{error:?} {message}"
+        );
+    }
+    assert!(servers.ensure_usable().is_err());
+}
+
+#[test]
+fn corrupt_registry_loads_degraded_and_is_left_untouched() {
+    let root = tempfile::tempdir().unwrap();
+    load(root.path());
+    let path = root.path().join("mcp/registry.json");
+    std::fs::write(&path, "{ nope").unwrap();
+    let before = mcp_files(root.path());
+    let servers = McpServers::load(root.path()).unwrap();
+    assert_degraded(&servers, &path);
+    // No re-seeded Jira, no sweep, nothing rewritten.
+    let mut after = mcp_files(root.path());
+    let mut before = before;
+    before.sort();
+    after.sort();
+    assert_eq!(before, after);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ nope");
+}
+
+#[test]
+fn missing_secrets_file_loads_degraded() {
+    let root = tempfile::tempdir().unwrap();
+    load(root.path());
+    for (name, _) in mcp_files(root.path()) {
+        if name.starts_with("secrets-") {
+            std::fs::remove_file(root.path().join("mcp").join(name)).unwrap();
+        }
+    }
+    let servers = McpServers::load(root.path()).unwrap();
+    assert_degraded(&servers, &root.path().join("mcp/registry.json"));
+}
+
+#[test]
+fn unwritable_first_start_loads_degraded() {
+    let root = tempfile::tempdir().unwrap();
+    // A file where the mcp directory should be: the seed write cannot succeed.
+    std::fs::write(root.path().join("mcp"), "x").unwrap();
+    let servers = McpServers::load(root.path()).unwrap();
+    assert!(servers.ensure_usable().is_err());
+}
+
+#[test]
+fn invalid_stored_server_is_skipped_not_fatal() {
+    let root = tempfile::tempdir().unwrap();
+    let servers = load(root.path());
+    servers.upsert(upsert(http_server("good"), vec![])).unwrap();
+    let path = root.path().join("mcp/registry.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut bad = serde_json::to_value(http_server("plain")).unwrap();
+    bad["transport"]["url"] = "http://example.com/mcp".into();
+    manifest["servers"].as_array_mut().unwrap().push(bad);
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let reloaded = McpServers::load(root.path()).unwrap();
+    assert!(reloaded.ensure_usable().is_ok());
+    let ids: Vec<_> = reloaded
+        .snapshot()
+        .servers
+        .iter()
+        .map(|s| s.id.0.clone())
+        .collect();
+    assert_eq!(ids, ["jira", "good"]);
+}
+
+#[test]
+fn daemon_still_constructs_with_a_corrupt_registry() {
+    use bondsymphonic_daemon::{daemon::Daemon, server::broadcast::EventBus, workspace::DataDirs};
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    std::fs::create_dir_all(data.join("mcp")).unwrap();
+    std::fs::write(data.join("mcp/registry.json"), "{ nope").unwrap();
+    let daemon = Daemon::new(
+        DataDirs::new(&data),
+        bondsymphonic_daemon::sandbox::backend_for("noop"),
+        EventBus::new(16),
+    )
+    .unwrap();
+    assert!(daemon.mcp_servers.ensure_usable().is_err());
 }

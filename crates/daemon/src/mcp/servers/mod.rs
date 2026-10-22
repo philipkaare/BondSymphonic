@@ -43,6 +43,8 @@ struct State {
 
 pub struct McpServers {
     dir: PathBuf,
+    /// Set when the files on disk could not be used; see [`McpServers::load`].
+    damaged: Option<RpcError>,
     state: Mutex<State>,
     changes: tokio::sync::watch::Sender<u64>,
 }
@@ -71,20 +73,64 @@ impl McpServers {
     /// `data_dir` is the daemon's data directory; the files live in its `mcp`
     /// child. A first start seeds the Jira preset exactly once: after that,
     /// deleting it is permanent until [`McpServers::restore_preset`].
+    ///
+    /// Never fails the daemon: if the files cannot be used (corrupt JSON, a
+    /// missing secrets file, a failed first-start write) the registry loads
+    /// *degraded*. It logs the path, leaves the files untouched, resolves no
+    /// servers, and `list` and every mutation answer an `IoError` naming the
+    /// file. So a bad file is neither a daemon that will not start nor a reset
+    /// that re-seeds Jira over the user's data. A single stored server that
+    /// fails today's validation is skipped and logged instead.
     pub fn load(data_dir: &Path) -> Result<Self, RpcError> {
         let dir = data_dir.join("mcp");
         let path = dir.join("registry.json");
-        let state = match std::fs::read(&path) {
+        Ok(Self::try_load(&dir, &path).unwrap_or_else(|_| {
+            tracing::warn!(
+                path = %path.display(),
+                "MCP registry could not be read; MCP servers are disabled until it is fixed"
+            );
+            let (changes, _) = tokio::sync::watch::channel(0);
+            Self {
+                dir: dir.clone(),
+                damaged: Some(RpcError::new(
+                    ErrorCode::IoError,
+                    format!(
+                        "the MCP registry at {} could not be read; fix or remove it and restart the daemon",
+                        path.display()
+                    ),
+                )),
+                state: Mutex::new(State {
+                    snapshot: Default::default(),
+                    secret_file: String::new(),
+                    secrets: SecretStore::default(),
+                }),
+                changes,
+            }
+        }))
+    }
+
+    /// `Err` when the registry is degraded; see [`McpServers::load`].
+    pub fn ensure_usable(&self) -> Result<(), RpcError> {
+        self.damaged.clone().map_or(Ok(()), Err)
+    }
+
+    fn try_load(dir: &Path, path: &Path) -> Result<Self, RpcError> {
+        let dir = dir.to_path_buf();
+        let state = match std::fs::read(path) {
             Ok(bytes) => {
-                let manifest: Manifest =
+                let mut manifest: Manifest =
                     serde_json::from_slice(&bytes).map_err(|_| storage_error())?;
                 let mut ids = BTreeSet::new();
-                for server in &manifest.snapshot.servers {
-                    config::validate(server)?;
-                    if !ids.insert(&server.id) {
-                        return Err(storage_error());
+                manifest.snapshot.servers.retain(|server| {
+                    let ok = config::validate(server).is_ok() && ids.insert(server.id.clone());
+                    if !ok {
+                        tracing::warn!(
+                            server = %server.id.as_str(),
+                            "skipping an invalid or duplicate MCP server in the registry"
+                        );
                     }
-                }
+                    ok
+                });
                 if !secrets::is_version_name(&manifest.secret_file) {
                     return Err(storage_error());
                 }
@@ -132,6 +178,7 @@ impl McpServers {
         let (changes, _) = tokio::sync::watch::channel(state.snapshot.revision);
         Ok(Self {
             dir,
+            damaged: None,
             state: Mutex::new(state),
             changes,
         })
@@ -148,7 +195,8 @@ impl McpServers {
 
     /// Every server `Disconnected`: live connection state arrives with the
     /// transport layer.
-    pub fn list(&self) -> McpListResult {
+    pub fn list(&self) -> Result<McpListResult, RpcError> {
+        self.ensure_usable()?;
         let registry = self.snapshot();
         let statuses = registry
             .servers
@@ -159,7 +207,7 @@ impl McpServers {
                 reason: None,
             })
             .collect();
-        McpListResult { registry, statuses }
+        Ok(McpListResult { registry, statuses })
     }
 
     /// The registry as JSON: configuration and secret references, never values.
@@ -185,6 +233,7 @@ impl McpServers {
         name: &str,
         value: Option<McpSecretValue>,
     ) -> Result<(), RpcError> {
+        self.ensure_usable()?;
         let mut state = self.state.lock();
         if !state.snapshot.servers.iter().any(|s| &s.id == id) {
             return Err(RpcError::not_found("MCP server not found"));
@@ -224,6 +273,7 @@ impl McpServers {
         expected: Option<u64>,
         change: impl FnOnce(&mut McpRegistrySnapshot, &mut SecretStore) -> Result<(), RpcError>,
     ) -> Result<McpRegistrySnapshot, RpcError> {
+        self.ensure_usable()?;
         let mut state = self.state.lock();
         if expected.is_some_and(|r| r != state.snapshot.revision) {
             return Err(RpcError::new(
@@ -325,6 +375,7 @@ impl McpServers {
         &self,
         params: &McpImportParams,
     ) -> Result<McpImportPreviewResult, RpcError> {
+        self.ensure_usable()?;
         Ok(config::parse_import(params, &self.snapshot().servers)?.preview)
     }
 
