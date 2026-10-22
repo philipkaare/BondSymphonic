@@ -129,7 +129,15 @@ async fn mixed_agents_keep_separate_histories_permissions_and_resume_after_daemo
         })
         .await
         .unwrap();
-    let codex_history = wait_for(&d, &codex, |h| h.state == AgentState::Idle).await;
+    // Idle is published before the turn's Result message is recorded, so
+    // wait for both: the session id is read from the Result.
+    let codex_history = wait_for(&d, &codex, |h| {
+        h.state == AgentState::Idle
+            && h.messages
+                .iter()
+                .any(|m| matches!(m.body, AgentMessageBody::Result { .. }))
+    })
+    .await;
     assert!(!codex_history
         .messages
         .iter()
