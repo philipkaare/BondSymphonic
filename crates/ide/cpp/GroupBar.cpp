@@ -422,6 +422,10 @@ void GroupBar::openGroupMenu(int index, const QPoint& globalPos) {
     }
 }
 
+void GroupBar::setHarnessChoices(const QList<QPair<QString, QString>>& choices) {
+    m_harnessChoices = choices;
+}
+
 void GroupBar::openAgentMenu(int index, const QPoint& globalPos) {
     // Both read before the menu runs, for the reason spelled out in
     // `openGroupMenu`: the id is what gets destroyed and the name is what the
@@ -437,6 +441,20 @@ void GroupBar::openAgentMenu(int index, const QPoint& globalPos) {
     QAction* renameAction = workspaceId.isEmpty() ? nullptr : menu.addAction("Rename agent…");
     if (renameAction != nullptr) {
         renameAction->setObjectName(QStringLiteral("GroupBarRenameAgentAction"));
+    }
+    // Every harness but the one running here; a shell tab has no harness.
+    QMenu* harnessMenu = nullptr;
+    const QString adapter = workspaceId.isEmpty() ? QString() : m_model->workspaceAdapter(workspaceId);
+    if (!adapter.isEmpty() && adapter != QLatin1String("terminal") && m_harnessChoices.size() > 1) {
+        harnessMenu = menu.addMenu(QStringLiteral("Switch harness"));
+        harnessMenu->setObjectName(QStringLiteral("GroupBarSwitchHarnessMenu"));
+        for (const auto& [id, label] : m_harnessChoices) {
+            QAction* action = harnessMenu->addAction(label);
+            action->setData(id);
+            action->setCheckable(true);
+            action->setChecked(id == adapter);
+            action->setEnabled(id != adapter);
+        }
     }
     QAction* destroyAction =
         workspaceId.isEmpty()
@@ -482,6 +500,8 @@ void GroupBar::openAgentMenu(int index, const QPoint& globalPos) {
         }
     } else if (chosen == destroyAction) {
         emit destroyRequested(workspaceId, workspaceName);
+    } else if (harnessMenu != nullptr && chosen->parent() == harnessMenu) {
+        emit switchHarnessRequested(workspaceId, chosen->data().toString());
     }
 }
 

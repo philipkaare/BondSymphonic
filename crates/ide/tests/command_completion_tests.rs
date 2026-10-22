@@ -86,3 +86,61 @@ fn resume_uses_the_live_session_or_latest_saved_conversation_for_this_harness() 
     );
     assert!(resume_target(&[], Kind::Codex, "").is_err());
 }
+
+#[test]
+fn switching_harness_stops_other_live_agents_and_resumes_the_targets_own_session() {
+    use bondsymphonic_ide::model::commands::plan_harness_switch;
+    use bondsymphonic_proto::{AgentAdapterKind as Kind, AgentId, AgentState, AgentSummary};
+    let record =
+        |id: &str, adapter, state, session: Option<&str>, model: Option<&str>| AgentSummary {
+            id: AgentId(id.into()),
+            adapter,
+            state,
+            session_id: session.map(str::to_owned),
+            command: None,
+            model: model.map(str::to_owned),
+            permission_mode: None,
+        };
+    let records = vec![
+        record(
+            "c1",
+            Kind::Codex,
+            AgentState::Exited,
+            Some("codex-saved"),
+            Some("gpt-x"),
+        ),
+        record("o1", Kind::OpenCode, AgentState::Idle, Some("oc"), None),
+        record(
+            "k1",
+            Kind::Claude,
+            AgentState::Working,
+            Some("claude-now"),
+            None,
+        ),
+    ];
+
+    // Back to Codex: every live agent of another harness stops, and Codex
+    // resumes its own conversation with the model it ran.
+    let plan = plan_harness_switch(&records, Kind::Codex);
+    assert_eq!(plan.stop, vec![AgentId("o1".into()), AgentId("k1".into())]);
+    assert_eq!(plan.attach, None);
+    let options: serde_json::Value = serde_json::from_str(&plan.options_json).unwrap();
+    assert_eq!(
+        options,
+        json!({"adapter":"codex","model":"gpt-x","resume_session":"codex-saved"})
+    );
+
+    // A live agent of the target is attached to, not restarted.
+    let plan = plan_harness_switch(&records, Kind::OpenCode);
+    assert_eq!(plan.attach, Some(AgentId("o1".into())));
+    assert_eq!(plan.stop, vec![AgentId("k1".into())]);
+
+    // Never used here: a fresh start that names only the harness. Another
+    // harness's session never carries over.
+    let plan = plan_harness_switch(&records[..1], Kind::Claude);
+    assert_eq!(plan.stop, Vec::<AgentId>::new());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&plan.options_json).unwrap(),
+        json!({"adapter":"claude"})
+    );
+}

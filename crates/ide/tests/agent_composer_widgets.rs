@@ -7,6 +7,7 @@ extern "C" {
     fn bs_widget_test_resume_command_selects_session() -> i32;
     fn bs_widget_test_working_agent_keeps_composer_editable() -> i32;
     fn bs_widget_test_agent_title_follows_selected_tab() -> i32;
+    fn bs_widget_test_transcript_harness_choice_asks_for_a_switch() -> i32;
 }
 
 #[test]
@@ -26,4 +27,6 @@ fn agent_header_and_working_composer() {
     assert_eq!(composer, 0, "Working composer failed at step {composer}");
     let title = unsafe { bs_widget_test_agent_title_follows_selected_tab() };
     assert_eq!(title, 0, "Agent title failed at step {title}");
+    let harness = unsafe { bs_widget_test_transcript_harness_choice_asks_for_a_switch() };
+    assert_eq!(harness, 0, "Harness choice failed at step {harness}");
 }

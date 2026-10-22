@@ -517,6 +517,8 @@ void MainWindow::buildCentral() {
     QObject::connect(m_groupBar, &GroupBar::newAgentRequested, this, &MainWindow::onNewAgent);
     QObject::connect(m_groupBar, &GroupBar::destroyRequested, this, &MainWindow::onDestroyRequested);
     QObject::connect(m_groupBar, &GroupBar::closeGroupRequested, this, &MainWindow::onCloseGroup);
+    QObject::connect(m_groupBar, &GroupBar::switchHarnessRequested, this,
+                     &MainWindow::onSwitchHarness);
 
     if (menuTest().contains(QLatin1String("widgets"))) {
         // Not `singleShot(0)`: one of the four values is a tab's text colour,
@@ -1220,6 +1222,20 @@ void MainWindow::connectController() {
     // as a restart is, because it is one: `claude -p` reads both flags when the
     // process starts and there is no way to change either in flight. The
     // options already carry the session id, so the conversation continues.
+    QObject::connect(m_agentArea, &AgentArea::harnessChangeRequested, this,
+                     &MainWindow::onSwitchHarness);
+    // The switch has been decided and the other harnesses' agents asked to
+    // stop. The tab and its pane move over now; `agentStarted` binds the agent.
+    QObject::connect(m_controller, &AppController::harnessSwitched, this,
+                     [this](const QString& workspaceId, const QString& adapter,
+                            const QString& optionsJson) {
+                         m_groupModel->setTabAdapter(workspaceId, adapter, optionsJson);
+                         m_agentArea->setBackend(workspaceId, adapter);
+                         m_agentArea->setOptionsJson(workspaceId, optionsJson);
+                         if (workspaceId == activeWorkspaceId()) {
+                             updateWindowTitle(activeTab());
+                         }
+                     });
     QObject::connect(m_agentArea, &AgentArea::agentOptionsChanged, this,
                      [this](const QString& workspaceId, const QString& optionsJson) {
                          if (workspaceId.isEmpty() || optionsJson.isEmpty()) {
@@ -1284,12 +1300,15 @@ void MainWindow::connectController() {
         const QJsonArray descriptors =
             QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array();
         agentchoices::setDescriptors(descriptors);
+        refreshHarnessChoices();
         for (const QJsonValue &descriptor : descriptors) {
             const QString backend = descriptor.toObject().value("id").toString();
             m_agentArea->setBackendAuth(backend, m_controller->backendLoggedIn(backend),
                                       m_controller->backendAuthFailure(backend));
         }
     });
+    // Before the daemon answers: Settings alone already names the harnesses.
+    refreshHarnessChoices();
     if (menuTest().contains(QLatin1String("backend-auth"))) {
         auto logout = std::make_shared<bool>(false);
         QObject::connect(
@@ -2412,6 +2431,66 @@ void MainWindow::onStartAgentRequested(const QString& workspaceId) {
     const QString options = model == nullptr ? tab.value("options_json").toString()
                                              : model->restartOptionsJson();
     m_controller->startAgent(workspaceId, options);
+}
+
+void MainWindow::refreshHarnessChoices() {
+    // The same list the New Agent dialog offers: the daemon's harnesses that
+    // are enabled in Settings. Terminal is not one; a shell is another pane.
+    const QJsonObject enabled = QJsonDocument::fromJson(m_controller->backendSettingsJson().toUtf8())
+                                    .object()
+                                    .value("backends")
+                                    .toObject();
+    QList<QPair<QString, QString>> choices;
+    for (const QJsonValue& value :
+         QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array()) {
+        const QJsonObject descriptor = value.toObject();
+        const QString id = descriptor.value("id").toString();
+        if (enabled.value(id).toObject().value("enabled").toBool()) {
+            choices.append({ id, descriptor.value("label").toString() });
+        }
+    }
+    m_agentArea->setHarnessChoices(choices);
+    m_groupBar->setHarnessChoices(choices);
+}
+
+void MainWindow::onSwitchHarness(const QString& workspaceId, const QString& backend) {
+    const QString current = m_groupModel->workspaceAdapter(workspaceId);
+    if (workspaceId.isEmpty() || backend.isEmpty() || current.isEmpty() || backend == current ||
+        current == QLatin1String("terminal")) {
+        return;
+    }
+    // One start at a time per workspace; a switch is one.
+    if (m_autoStarting.contains(workspaceId)) {
+        return;
+    }
+    const auto label = [](const QString& adapter) {
+        return adapter == QLatin1String("claude")     ? QStringLiteral("Claude Code")
+               : adapter == QLatin1String("codex")    ? QStringLiteral("Codex")
+               : adapter == QLatin1String("opencode") ? QStringLiteral("OpenCode")
+                                                      : adapter;
+    };
+    QMessageBox box(QMessageBox::Question, QStringLiteral("Switch harness"),
+                    QStringLiteral("Switch %1 to %2?")
+                        .arg(m_groupModel->workspaceName(workspaceId), label(backend)),
+                    QMessageBox::Cancel, this);
+    box.setObjectName(QStringLiteral("SwitchHarnessBox"));
+    box.setInformativeText(
+        QStringLiteral("The %1 agent stops, and a turn in progress is cut short. Its conversation "
+                       "is kept and resumes if you switch back. %2 resumes its own latest "
+                       "conversation in this workspace, or starts a new one.")
+            .arg(label(current), label(backend)));
+    QPushButton* proceed = box.addButton(QStringLiteral("Switch"), QMessageBox::AcceptRole);
+    box.setDefaultButton(proceed);
+    box.exec();
+    if (box.clickedButton() != proceed || m_autoStarting.contains(workspaceId)) {
+        return;
+    }
+    // Booked as a start in flight: it keeps every automatic start away, and the
+    // old agent's exit is the replacement it is rather than "The agent
+    // stopped.". `agentStarted` or a failed start clears it.
+    m_autoStarting.insert(workspaceId);
+    m_agentArea->setStarting(workspaceId, true, true);
+    m_controller->switchHarness(workspaceId, backend);
 }
 
 void MainWindow::onCloseGroup(const QString& groupName) {

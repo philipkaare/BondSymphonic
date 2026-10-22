@@ -1,6 +1,7 @@
 #pragma once
 #include <QHash>
 #include <QList>
+#include <QPair>
 #include <QSet>
 #include <QStackedWidget>
 #include <QString>
@@ -41,6 +42,8 @@ signals:
     /// window answers it the way it answers a restart, because that is what it
     /// is: `claude -p` reads both flags once, when the process starts.
     void agentOptionsChanged(const QString& workspaceId, const QString& optionsJson);
+    /// The user picked `backend` in `workspaceId`'s harness combo.
+    void harnessChangeRequested(const QString& workspaceId, const QString& backend);
 
     /// The user dismissed `workspaceId`'s error banner. The window answers by
     /// clearing the tab's error mark; the area touches no model.
@@ -137,6 +140,10 @@ public:
     /// showing lines the user turned off.
     void setShowMeta(bool show);
 
+    /// The harnesses a transcript pane offers to switch to, as (id, label)
+    /// pairs. Applied to every pane, and remembered for panes built later.
+    void setHarnessChoices(const QList<QPair<QString, QString>>& choices);
+
     /// `system.list_models` answered: every transcript pane's model combo is
     /// re-filled from the new list, keeping its current choice. Nothing to
     /// remember for panes built afterwards -- a pane reads `agentchoices::models()`
@@ -232,6 +239,10 @@ public:
     /// ignored.
     void setOptionsJson(const QString& workspaceId, const QString& optionsJson);
 
+    /// `workspaceId`'s pane now runs `adapter`: its login gate, choices and
+    /// command list follow, without showing the pane. A harness switch.
+    void setBackend(const QString& workspaceId, const QString& adapter);
+
 private:
   QHash<QString, bool> m_backendLoggedIn;
   QHash<QString, QString> m_backendAuthFailure;
@@ -320,6 +331,7 @@ private:
     /// See [`setShowMeta`]. True until the window says otherwise, which is the
     /// setting's own default.
     bool m_showMeta = true;
+    QList<QPair<QString, QString>> m_harnessChoices;
     /// See [`setClaudeLoggedIn`]. False until the first prerequisite check
     /// answers, so a pane built in the seconds before it opens no composer.
     bool m_claudeLoggedIn = false;

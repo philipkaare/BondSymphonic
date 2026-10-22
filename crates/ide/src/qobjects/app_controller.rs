@@ -562,6 +562,18 @@ pub mod qobject {
         #[qsignal]
         fn agent_started(self: Pin<&mut AppController>, workspace_id: QString, agent_id: QString);
 
+        /// `switch_harness` decided: the workspace's tab is `adapter` from now
+        /// on, with `options_json` for its starts. Emitted after the other
+        /// harnesses' agents were asked to stop and before the target agent
+        /// is attached or started, whose answer is `agent_started` as usual.
+        #[qsignal]
+        fn harness_switched(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            adapter: QString,
+            options_json: QString,
+        );
+
         /// An agent changed state. `state` is the daemon's snake_case word
         /// ("idle", "working", "waiting_permission", "error", "exited") and
         /// `detail` its explanation, or empty.
@@ -801,6 +813,14 @@ pub mod qobject {
         /// `agent_started` or `operation_failed("agent.start", ...)`.
         #[qinvokable]
         fn start_agent(self: Pin<&mut AppController>, workspace_id: QString, options_json: QString);
+
+        /// Moves a workspace to another harness (`claude`, `codex`,
+        /// `opencode`): stops the live agents of the others, then attaches to
+        /// a live agent of the target, resumes its latest session, or starts
+        /// it fresh. Answers with `harness_switched` then `agent_started`, or
+        /// `operation_failed("agent.start", ...)`.
+        #[qinvokable]
+        fn switch_harness(self: Pin<&mut AppController>, workspace_id: QString, adapter: QString);
 
         #[qinvokable]
         fn resume_agent(
@@ -3487,6 +3507,87 @@ impl qobject::AppController {
                     report_agent_failure(&qt, workspace.to_string(), "agent.start", message, None)
                 }
             }
+        });
+    }
+
+    pub fn switch_harness(self: Pin<&mut Self>, workspace_id: QString, adapter: QString) {
+        let qt = self.qt_thread();
+        let workspace = WorkspaceId(workspace_id.to_string());
+        let word = adapter.to_string();
+        // Refused here, before anything is stopped: a harness that is off in
+        // Settings or missing from the daemon must not cost the running agent.
+        let target = match self.resolved_start(&serde_json::json!({ "adapter": word }).to_string())
+        {
+            Ok((kind, _)) => kind,
+            Err(message) => {
+                report_agent_failure(&qt, workspace.to_string(), "agent.start", message, None);
+                return;
+            }
+        };
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_agent_failure(
+                    &qt,
+                    workspace.to_string(),
+                    "agent.start",
+                    message.to_owned(),
+                    None,
+                );
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            let info = match shared
+                .client
+                .request::<WorkspaceInfo>(Request::WorkspaceGet(WorkspaceIdParams {
+                    workspace_id: workspace.clone(),
+                }))
+                .await
+            {
+                Ok(info) => info,
+                Err(error) => {
+                    report_agent_failure(
+                        &qt,
+                        workspace.to_string(),
+                        "agent.start",
+                        error.to_string(),
+                        None,
+                    );
+                    return;
+                }
+            };
+            let plan = crate::model::commands::plan_harness_switch(&info.agent_records, target);
+            for agent_id in plan.stop {
+                // Best effort: an agent that already ended answers with an
+                // error, and the switch must not stall behind it.
+                if let Err(error) = shared
+                    .client
+                    .request::<serde_json::Value>(Request::AgentStop(AgentIdParams {
+                        agent_id: agent_id.clone(),
+                    }))
+                    .await
+                {
+                    tracing::warn!(%agent_id, %error, "switch harness: stopping the old agent failed");
+                }
+            }
+            let _ = qt.queue(move |mut q| {
+                let id = QString::from(workspace.as_str());
+                let options = QString::from(&plan.options_json);
+                q.as_mut().harness_switched(
+                    id.clone(),
+                    QString::from(crate::model::backends::word(target)),
+                    options.clone(),
+                );
+                match plan.attach {
+                    Some(agent) => {
+                        q.as_mut()
+                            .register_agent_backend(agent.to_string(), target);
+                        q.agent_started(id, QString::from(agent.as_str()));
+                    }
+                    None => q.start_agent(id, options),
+                }
+            });
         });
     }
 

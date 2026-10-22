@@ -8,6 +8,7 @@
 #include "bondsymphonic-ide/src/qobjects/transcript_model.cxxqt.h"
 #include <QChar>
 #include <QComboBox>
+#include <QSignalBlocker>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QEvent>
@@ -250,6 +251,12 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     // something anybody wants from the place they type a sentence.
     auto* choices = new QHBoxLayout();
     choices->setSpacing(4);
+    m_harnessChoice = new QComboBox(m_composer);
+    m_harnessChoice->setObjectName(QStringLiteral("TranscriptHarnessChoice"));
+    m_harnessChoice->setToolTip(QStringLiteral(
+        "The harness that runs this workspace's agent. Switching stops the current agent; "
+        "each harness keeps its own conversation and resumes it when you switch back."));
+    m_harnessChoice->setVisible(false);
     m_modelChoice = new QComboBox(m_composer);
     m_modelChoice->setObjectName(QStringLiteral("TranscriptModelChoice"));
     m_modelChoice->setToolTip(QStringLiteral(
@@ -277,12 +284,20 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
         choice->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
         choice->setMinimumContentsLength(6);
     }
+    choices->addWidget(m_harnessChoice, 0);
     choices->addWidget(m_modelChoice, 1);
     choices->addWidget(m_permissionChoice, 1);
     choices->addWidget(m_interrupt, 0);
     bottom->addLayout(choices, 0);
     outer->addWidget(m_composer);
 
+    QObject::connect(m_harnessChoice, &QComboBox::activated, this, [this](int index) {
+        const QString chosen = m_harnessChoice->itemData(index).toString();
+        selectHarness();
+        if (!chosen.isEmpty() && chosen != m_backend) {
+            emit harnessChangeRequested(chosen);
+        }
+    });
     QObject::connect(m_modelChoice, &QComboBox::currentIndexChanged, this, [this](int) {
         emitOptionsChanged();
         updateWelcome();
@@ -408,11 +423,33 @@ void TranscriptView::setBackend(const QString &backend) {
     if (m_backend == backend)
         return;
     m_backend = backend;
+    selectHarness();
     m_loginButton->setText(backend == "codex" ? "Sign in to Codex…" : backend == "opencode" ? "Sign in to OpenCode…" : "Log in to Claude Code…");
     applyOptionsToChoices();
     refreshGate();
     onStateChanged();
     refreshCommandCatalog();
+}
+
+void TranscriptView::setHarnessChoices(const QList<QPair<QString, QString>>& choices) {
+    const QSignalBlocker quiet(m_harnessChoice);
+    m_harnessChoice->clear();
+    for (const auto& [id, label] : choices) {
+        m_harnessChoice->addItem(label, id);
+    }
+    selectHarness();
+}
+
+void TranscriptView::selectHarness() {
+    const QSignalBlocker quiet(m_harnessChoice);
+    int index = m_harnessChoice->findData(m_backend);
+    if (index < 0 && !m_backend.isEmpty()) {
+        // A harness since turned off in Settings is still what runs here.
+        m_harnessChoice->addItem(m_backend, m_backend);
+        index = m_harnessChoice->count() - 1;
+    }
+    m_harnessChoice->setCurrentIndex(index);
+    m_harnessChoice->setVisible(m_harnessChoice->count() > 1);
 }
 
 TranscriptModel* TranscriptView::model() const { return m_model.data(); }
@@ -776,6 +813,7 @@ void TranscriptView::onStateChanged() {
     const bool choosable = !m_starting && !busy && !m_workspaceDown;
     m_modelChoice->setEnabled(choosable);
     m_permissionChoice->setEnabled(choosable);
+    m_harnessChoice->setEnabled(choosable);
     refreshBanner();
 }
 
@@ -2334,6 +2372,34 @@ extern "C" std::int32_t bs_widget_test_resume_command_selects_session() {
     input->setPlainText(QStringLiteral("/resume saved-session"));
     input->submit();
     if (resumed != QStringList{QString(), QStringLiteral("saved-session")}) { return 2; }
+    return 0;
+}
+
+/// The harness combo is hidden with one harness, offers each enabled one, asks
+/// for a switch on a pick, and snaps back until the switch has happened.
+extern "C" std::int32_t bs_widget_test_transcript_harness_choice_asks_for_a_switch() {
+    TranscriptModel model;
+    TranscriptView view(&model);
+    view.setBackend(QStringLiteral("claude"));
+    auto* harness = view.findChild<QComboBox*>(QStringLiteral("TranscriptHarnessChoice"));
+    if (harness == nullptr) { return 1; }
+    view.setHarnessChoices({ { QStringLiteral("claude"), QStringLiteral("Claude Code") } });
+    if (!harness->isHidden()) { return 2; }
+    view.setHarnessChoices({ { QStringLiteral("claude"), QStringLiteral("Claude Code") },
+                             { QStringLiteral("codex"), QStringLiteral("Codex") } });
+    if (harness->isHidden() || harness->currentData().toString() != QLatin1String("claude")) {
+        return 3;
+    }
+    QStringList asked;
+    QObject::connect(&view, &TranscriptView::harnessChangeRequested, &view,
+                     [&asked](const QString& backend) { asked.append(backend); });
+    emit harness->activated(1);
+    if (asked != QStringList{ QStringLiteral("codex") }) { return 4; }
+    if (harness->currentData().toString() != QLatin1String("claude")) { return 5; }
+    view.setBackend(QStringLiteral("codex"));
+    if (harness->currentData().toString() != QLatin1String("codex") || asked.size() != 1) {
+        return 6;
+    }
     return 0;
 }
 

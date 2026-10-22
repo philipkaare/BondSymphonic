@@ -98,3 +98,49 @@ pub fn resume_target(
         })
         .ok_or_else(|| "No saved session is available for this agent yet.".to_owned())
 }
+
+/// What switching a workspace to the `target` harness does, decided from the
+/// daemon's current records (oldest first).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HarnessSwitch {
+    /// Live agents of every other harness. One agent works in a workspace at a
+    /// time; each keeps its session, so switching back resumes it.
+    pub stop: Vec<bondsymphonic_proto::AgentId>,
+    /// The options the tab carries from now on, `adapter` always included.
+    pub options_json: String,
+    /// A live agent of the target harness to attach to rather than start.
+    pub attach: Option<bondsymphonic_proto::AgentId>,
+}
+
+/// Resumes the target harness's own latest conversation, with the model and
+/// permission mode it last ran with; a harness never used here starts fresh.
+/// A conversation never moves between harnesses: each one's session is native.
+pub fn plan_harness_switch(
+    records: &[bondsymphonic_proto::AgentSummary],
+    target: bondsymphonic_proto::AgentAdapterKind,
+) -> HarnessSwitch {
+    use bondsymphonic_proto::AgentState;
+    let live = |state: &AgentState| {
+        matches!(
+            state,
+            AgentState::Idle | AgentState::Working | AgentState::WaitingPermission
+        )
+    };
+    let stop = records
+        .iter()
+        .filter(|r| r.adapter != target && live(&r.state))
+        .map(|r| r.id.clone())
+        .collect();
+    let preferred = crate::model::app_state::preferred_record(records, target);
+    let mut options = preferred
+        .map(crate::model::app_state::restart_options_json)
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    options["adapter"] = serde_json::json!(crate::model::backends::word(target));
+    HarnessSwitch {
+        stop,
+        options_json: options.to_string(),
+        attach: preferred.filter(|r| live(&r.state)).map(|r| r.id.clone()),
+    }
+}

@@ -821,7 +821,16 @@ the harness does not advertise its own command with that name. Codex's app-serve
 actions include `/compact` and `/status`; the dropdown lists supported actions,
 rather than every command from the terminal UI.
 
-
+**Switching harness.** A workspace runs one harness at a time, and you can move
+it to another enabled one (Claude Code, Codex, OpenCode) with the harness
+dropdown at the left of the composer's bottom row, or **Switch harness** on the
+agent tab's right-click menu. After you confirm, the current agent stops — a turn
+in progress is cut short — and the new harness resumes its own latest
+conversation in this workspace with the model it last used, or starts a new one
+if it has never run here. Conversations never move between harnesses, because
+each harness's sessions are its own; switching back resumes where that harness
+left off. The dropdown is hidden while only one harness is enabled in Settings,
+and a terminal tab has no harness to switch.
 
 - **The prompt box only appears once Claude Code has a credential** — either
   the `claude_auth` check passes, or you have stored an Anthropic API key under

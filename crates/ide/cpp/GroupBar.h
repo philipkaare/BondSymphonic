@@ -1,4 +1,6 @@
 #pragma once
+#include <QList>
+#include <QPair>
 #include <QString>
 #include <QStringList>
 #include <QWidget>
@@ -34,6 +36,10 @@ public:
     /// no group. The New Agent dialog defaults to it.
     QString currentGroupName() const;
 
+    /// The harnesses an agent tab's menu offers under "Switch harness", as
+    /// (id, label) pairs. A terminal tab gets no such menu.
+    void setHarnessChoices(const QList<QPair<QString, QString>>& choices);
+
 signals:
     /// The New agent button, or "New agent…" from the agent tab context menu.
     void newAgentRequested();
@@ -47,6 +53,8 @@ signals:
     /// run for the same reason. The window asks what to do with each of its
     /// workspaces; the bar only says which group.
     void closeGroupRequested(const QString& groupName);
+    /// "Switch harness ▸ <backend>" on the agent tab for this workspace.
+    void switchHarnessRequested(const QString& workspaceId, const QString& backend);
 
 protected:
     /// A palette change is the theme moving under the bar. Its band fill and
@@ -104,6 +112,7 @@ private:
     void runMenuTests();
 
     GroupModel* m_model;
+    QList<QPair<QString, QString>> m_harnessChoices;
     QTabBar* m_groupTabs = nullptr;
     QTabBar* m_agentTabs = nullptr;
     QToolButton* m_addButton = nullptr;

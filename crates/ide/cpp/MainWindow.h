@@ -250,6 +250,11 @@ private:
     /// bar sends a name: the group tabs may have moved between the click and
     /// the menu being answered.
     void onCloseGroup(const QString& groupName);
+    /// The composer's harness combo or the tab's "Switch harness" menu: asks,
+    /// then has the controller stop the running agent and start `backend`.
+    void onSwitchHarness(const QString& workspaceId, const QString& backend);
+    /// The enabled harnesses, offered by the composer combo and the tab menu.
+    void refreshHarnessChoices();
     /// Puts one confirmation in front of a close-group run that would destroy
     /// anything, naming each workspace and what goes with it. True when there
     /// is nothing to destroy, or the user said yes; false cancels the whole

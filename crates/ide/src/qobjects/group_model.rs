@@ -252,6 +252,11 @@ pub mod qobject {
         #[qinvokable]
         fn workspace_name(self: &GroupModel, workspace_id: QString) -> QString;
 
+        /// `workspace_id`'s tab adapter word (`claude`, `codex`, `opencode`,
+        /// `terminal`), or empty. The tab menu offers the other harnesses.
+        #[qinvokable]
+        fn workspace_adapter(self: &GroupModel, workspace_id: QString) -> QString;
+
         /// Whether `workspace_id` works directly in its repository's checkout.
         /// The window words Close and the menus from it; false for a workspace
         /// the model does not track.
@@ -353,6 +358,17 @@ pub mod qobject {
         fn set_tab_options(
             self: Pin<&mut GroupModel>,
             workspace_id: QString,
+            options_json: QString,
+        ) -> bool;
+
+        /// Moves the workspace's tab to another harness (`claude`, `codex`,
+        /// `opencode`) with the options its next start uses. False for an
+        /// unknown adapter, a terminal tab, or an untracked workspace.
+        #[qinvokable]
+        fn set_tab_adapter(
+            self: Pin<&mut GroupModel>,
+            workspace_id: QString,
+            adapter: QString,
             options_json: QString,
         ) -> bool;
     }
@@ -984,6 +1000,17 @@ impl qobject::GroupModel {
         }
     }
 
+    pub fn workspace_adapter(&self, workspace_id: QString) -> QString {
+        let id = WorkspaceId(workspace_id.to_string());
+        self.rust()
+            .workspaces
+            .find(&id)
+            .and_then(|(g, t)| self.rust().workspaces.groups.get(g)?.tabs.get(t))
+            .map_or_else(QString::default, |tab| {
+                QString::from(crate::model::backends::word(tab.adapter))
+            })
+    }
+
     pub fn workspace_name(&self, workspace_id: QString) -> QString {
         let id = WorkspaceId(workspace_id.to_string());
         match self
@@ -1152,6 +1179,27 @@ impl qobject::GroupModel {
             .workspaces
             .set_tab_options(&id, &options)
         {
+            return false;
+        }
+        self.publish();
+        true
+    }
+
+    pub fn set_tab_adapter(
+        mut self: Pin<&mut Self>,
+        workspace_id: QString,
+        adapter: QString,
+        options_json: QString,
+    ) -> bool {
+        let Some(adapter) = crate::model::backends::parse(&adapter.to_string()) else {
+            return false;
+        };
+        let id = WorkspaceId(workspace_id.to_string());
+        if !self.as_mut().rust_mut().workspaces.set_tab_adapter(
+            &id,
+            adapter,
+            &options_json.to_string(),
+        ) {
             return false;
         }
         self.publish();

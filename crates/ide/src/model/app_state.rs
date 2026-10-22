@@ -532,12 +532,15 @@ impl AgentTab {
 /// Records are oldest first. Keep selection within the chosen harness so a
 /// saved conversation from another adapter cannot change a tab's backend.
 fn preferred_agent(info: &WorkspaceInfo, adapter: AgentAdapterKind) -> Option<&AgentSummary> {
-    let matching = || {
-        info.agent_records
-            .iter()
-            .rev()
-            .filter(|a| a.adapter == adapter)
-    };
+    preferred_record(&info.agent_records, adapter)
+}
+
+/// [`preferred_agent`] over bare records, oldest first.
+pub(crate) fn preferred_record(
+    records: &[AgentSummary],
+    adapter: AgentAdapterKind,
+) -> Option<&AgentSummary> {
+    let matching = || records.iter().rev().filter(|a| a.adapter == adapter);
     matching()
         .find(|a| {
             matches!(
@@ -566,7 +569,7 @@ fn preferred_agent(info: &WorkspaceInfo, adapter: AgentAdapterKind) -> Option<&A
 /// leaves it with nothing while the daemon still holds the id the agent
 /// reported. Restarting into a fresh session there loses the conversation the
 /// user is looking at, which is the one thing Restart exists to keep.
-fn restart_options_json(agent: &AgentSummary) -> String {
+pub(crate) fn restart_options_json(agent: &AgentSummary) -> String {
     let mut options = serde_json::Map::new();
     if agent.adapter != AgentAdapterKind::Claude {
         options.insert(
@@ -1014,6 +1017,27 @@ impl Workspaces {
     /// choosing a model or a permission mode. Letting an empty string through
     /// would turn a choice into its absence, which is the one thing this must
     /// not do quietly.
+    /// Moves the tab to another harness: its adapter, and the options its next
+    /// start or restart uses. Refused for a terminal on either side (a shell
+    /// pane is a different widget) and for a workspace that is not tracked.
+    pub fn set_tab_adapter(
+        &mut self,
+        id: &WorkspaceId,
+        adapter: AgentAdapterKind,
+        options: &str,
+    ) -> bool {
+        let Some((g, t)) = self.find(id) else {
+            return false;
+        };
+        let tab = &mut self.groups[g].tabs[t];
+        if adapter == AgentAdapterKind::Terminal || tab.adapter == AgentAdapterKind::Terminal {
+            return false;
+        }
+        tab.adapter = adapter;
+        tab.options_json = options.to_owned();
+        true
+    }
+
     pub fn set_tab_options(&mut self, id: &WorkspaceId, options: &str) -> bool {
         if options.is_empty() {
             return false;

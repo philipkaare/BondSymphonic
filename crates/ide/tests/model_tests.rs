@@ -1694,3 +1694,28 @@ fn failed_empty_launch_does_not_hide_saved_conversation_on_restore_or_refresh() 
     let options: serde_json::Value = serde_json::from_str(&tab.options_json).unwrap();
     assert_eq!(options["resume_session"], "conversation");
 }
+
+#[test]
+fn a_harness_switch_moves_the_tab_but_never_to_or_from_a_terminal() {
+    let mut w = Workspaces::new_default();
+    let g = w.add_group("Agents");
+    let mut claude = tab("ws_a", "alpha");
+    claude.adapter = AgentAdapterKind::Claude;
+    claude.options_json = r#"{"model":"claude-x","resume_session":"s"}"#.into();
+    w.add_tab(g, claude);
+    w.add_tab(g, tab("ws_t", "shell"));
+    let id = WorkspaceId("ws_a".into());
+    let codex = r#"{"adapter":"codex"}"#;
+    assert!(w.set_tab_adapter(&id, AgentAdapterKind::Codex, codex));
+    let (gi, ti) = w.find(&id).unwrap();
+    assert_eq!(w.groups[gi].tabs[ti].adapter, AgentAdapterKind::Codex);
+    // The Claude session must not ride along into Codex.
+    assert_eq!(w.groups[gi].tabs[ti].options_json, codex);
+    assert!(!w.set_tab_adapter(&id, AgentAdapterKind::Terminal, ""));
+    assert!(!w.set_tab_adapter(&WorkspaceId("ws_t".into()), AgentAdapterKind::Codex, codex));
+    assert!(!w.set_tab_adapter(
+        &WorkspaceId("ws_gone".into()),
+        AgentAdapterKind::Codex,
+        codex
+    ));
+}
