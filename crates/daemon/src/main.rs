@@ -194,7 +194,7 @@ async fn serve(args: Args) -> Result<()> {
             &bondsymphonic_daemon::agents::backend::known_backends(),
         ),
         opencode_providers: true,
-        mcp_servers: false,
+        mcp_servers: true,
     };
 
     let server = Server::bind(ServerConfig {

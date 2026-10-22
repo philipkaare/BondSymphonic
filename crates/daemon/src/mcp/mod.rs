@@ -3,6 +3,7 @@
 pub mod bridge;
 pub mod protocol;
 pub mod registry;
+pub mod servers;
 pub mod tools;
 
 /// The name this server announces to MCP clients.

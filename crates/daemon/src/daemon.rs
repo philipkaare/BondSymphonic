@@ -234,6 +234,9 @@ pub struct Daemon {
     /// The agent tools' MCP listeners, one per live sandbox. See
     /// [`crate::mcp::registry`].
     pub mcp: crate::mcp::registry::McpRegistry,
+    /// The user-configured MCP servers: the registry and their secrets. See
+    /// [`crate::mcp::servers`].
+    pub mcp_servers: Arc<crate::mcp::servers::McpServers>,
     /// The daemon itself, for what it starts that must call back into it
     /// without keeping it alive (the MCP listeners). Set by `Arc::new_cyclic`.
     me: std::sync::Weak<Daemon>,
@@ -247,6 +250,7 @@ impl Daemon {
     ) -> anyhow::Result<Arc<Self>> {
         dirs.ensure()?;
         let registry = Registry::load(&dirs.registry_file())?;
+        let mcp_servers = Arc::new(crate::mcp::servers::McpServers::load(&dirs.root)?);
         let agents =
             AgentManager::new(events.clone(), dirs.transcripts.clone(), dirs.agents_file());
         Ok(Arc::new_cyclic(|me| Self {
@@ -271,6 +275,7 @@ impl Daemon {
             models: crate::models::ModelsCache::new(),
             host: tokio::sync::OnceCell::new(),
             mcp: Default::default(),
+            mcp_servers,
             me: me.clone(),
         }))
     }

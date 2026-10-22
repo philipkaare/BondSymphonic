@@ -18,6 +18,22 @@ fn ok<T: serde::Serialize>(v: T) -> Result<Value, RpcError> {
     serde_json::to_value(v).map_err(|e| RpcError::internal(e.to_string()))
 }
 
+/// Answers a registry mutation with the new snapshot, after telling every
+/// client the revision it reached.
+fn mcp_saved(
+    d: &Daemon,
+    saved: Result<McpRegistrySnapshot, RpcError>,
+) -> Result<Value, RpcError> {
+    let snapshot = saved?;
+    d.events.publish(
+        None,
+        Event::McpChanged {
+            revision: snapshot.revision,
+        },
+    );
+    ok(snapshot)
+}
+
 #[async_trait]
 impl Handler for WorkspaceHandler {
     async fn handle(&self, req: Request, ctx: &ConnCtx) -> Result<Value, RpcError> {
@@ -71,6 +87,18 @@ impl Handler for WorkspaceHandler {
                 p.api_key.as_deref(),
             )
             .await),
+            // The user-configured MCP servers. Every successful change tells
+            // all clients the new revision; `mcp.connect`, `.callback`,
+            // `.disconnect` and `.test` fall through to "not implemented"
+            // until the transport layer exists.
+            Request::McpList {} => ok(d.mcp_servers.list()),
+            Request::McpUpsert(p) => mcp_saved(d, d.mcp_servers.upsert(p)),
+            Request::McpRemove(p) => mcp_saved(d, d.mcp_servers.remove(&p.server_id)),
+            Request::McpImportPreview(p) => ok(d.mcp_servers.import_preview(&p)?),
+            Request::McpImportApply(p) => mcp_saved(d, d.mcp_servers.import_apply(p)),
+            Request::McpExport {} => ok(serde_json::json!({ "document": d.mcp_servers.export() })),
+            Request::McpRestorePreset {} => mcp_saved(d, d.mcp_servers.restore_preset()),
+            Request::McpOverride(p) => mcp_saved(d, d.mcp_servers.set_override(p)),
             Request::RepoInspect(p) => {
                 ok(crate::git::repo::inspect(&d.git, std::path::Path::new(&p.path)).await?)
             }
