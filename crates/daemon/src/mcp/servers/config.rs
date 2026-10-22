@@ -44,7 +44,7 @@ pub(crate) fn refs(server: &McpServerConfig) -> BTreeSet<String> {
 
 /// Loopback `http://` exists so tests can talk to a local fake server; it is
 /// off unless `BS_MCP_ALLOW_HTTP=1`.
-fn loopback_http_allowed() -> bool {
+pub(crate) fn loopback_http_allowed() -> bool {
     std::env::var("BS_MCP_ALLOW_HTTP").is_ok_and(|v| v == "1")
 }
 

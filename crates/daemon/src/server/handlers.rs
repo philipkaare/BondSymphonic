@@ -20,10 +20,7 @@ fn ok<T: serde::Serialize>(v: T) -> Result<Value, RpcError> {
 
 /// Answers a registry mutation with the new snapshot, after telling every
 /// client the revision it reached.
-fn mcp_saved(
-    d: &Daemon,
-    saved: Result<McpRegistrySnapshot, RpcError>,
-) -> Result<Value, RpcError> {
+fn mcp_saved(d: &Daemon, saved: Result<McpRegistrySnapshot, RpcError>) -> Result<Value, RpcError> {
     let snapshot = saved?;
     d.events.publish(
         None,
@@ -32,6 +29,24 @@ fn mcp_saved(
         },
     );
     ok(snapshot)
+}
+
+/// Answers a connection-state request, after telling every client to
+/// re-list: a status may have changed even when the request failed. A
+/// degraded registry changed nothing and announces nothing.
+fn mcp_status<T: serde::Serialize>(
+    d: &Daemon,
+    result: Result<T, RpcError>,
+) -> Result<Value, RpcError> {
+    if d.mcp_servers.ensure_usable().is_ok() {
+        d.events.publish(
+            None,
+            Event::McpChanged {
+                revision: d.mcp_servers.snapshot().revision,
+            },
+        );
+    }
+    ok(result?)
 }
 
 #[async_trait]
@@ -88,10 +103,16 @@ impl Handler for WorkspaceHandler {
             )
             .await),
             // The user-configured MCP servers. Every successful change tells
-            // all clients the new revision; `mcp.connect`, `.callback`,
-            // `.disconnect` and `.test` fall through to "not implemented"
-            // until the transport layer exists.
+            // all clients the new revision, and every connection-state
+            // request (login, callback, disconnect, test) the current one,
+            // so they re-list the statuses.
             Request::McpList {} => ok(d.mcp_servers.list()?),
+            Request::McpConnect(p) => mcp_status(d, d.mcp_servers.connect(p).await),
+            Request::McpCallback(p) => mcp_status(d, d.mcp_servers.callback(p).await),
+            Request::McpDisconnect(p) => {
+                mcp_status(d, d.mcp_servers.disconnect(&p.server_id).await)
+            }
+            Request::McpTest(p) => mcp_status(d, d.mcp_servers.test(&p.server_id).await),
             Request::McpUpsert(p) => mcp_saved(d, d.mcp_servers.upsert(p)),
             Request::McpRemove(p) => mcp_saved(d, d.mcp_servers.remove(&p.server_id)),
             Request::McpImportPreview(p) => ok(d.mcp_servers.import_preview(&p)?),

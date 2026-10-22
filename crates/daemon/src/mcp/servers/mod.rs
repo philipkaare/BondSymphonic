@@ -9,16 +9,27 @@
 //! `SecretRef` in `McpSecretWrite`, with one exception for stdio servers: there
 //! the reference IS the environment variable's name, since the name is the only
 //! thing that identifies a `secret_env` entry. Remote servers' bearer, header
-//! and OAuth client-secret references are used as given.
+//! and OAuth client-secret references are used as given. The daemon's own
+//! OAuth record lives under [`auth::TOKEN_SECRET`] (`oauth.token`): a dot is
+//! outside the reference alphabet, so it can never collide with either.
+//!
+//! Each server also has an in-memory *generation*, bumped by every edit or
+//! removal of it and by OAuth connect and disconnect. Anything that started
+//! under an older generation (a pending login, a token refresh in flight) is
+//! discarded instead of stored: see [`McpServers::set_secret_at`].
+pub mod auth;
 pub(crate) mod config;
 pub(crate) mod secrets;
+pub mod transport;
 
 use bondsymphonic_proto::*;
 use parking_lot::Mutex;
 use secrets::SecretStore;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use transport::{HttpClient, RemoteSession};
 
 /// `registry.json`: the public snapshot plus the name of the secrets file it
 /// is consistent with.
@@ -39,6 +50,34 @@ struct State {
     snapshot: McpRegistrySnapshot,
     secret_file: String,
     secrets: SecretStore,
+    /// Per-server generations (absent is 0), never reused: each bump takes
+    /// the next value of `next_generation`, so a server removed and added
+    /// again revives nothing of its predecessor.
+    generations: BTreeMap<McpServerId, u64>,
+    next_generation: u64,
+}
+
+impl State {
+    fn new(snapshot: McpRegistrySnapshot, secret_file: String, secrets: SecretStore) -> Self {
+        Self {
+            snapshot,
+            secret_file,
+            secrets,
+            generations: BTreeMap::new(),
+            next_generation: 1,
+        }
+    }
+
+    fn bump(&mut self, id: &McpServerId) -> u64 {
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.generations.insert(id.clone(), generation);
+        generation
+    }
+
+    fn generation(&self, id: &McpServerId) -> u64 {
+        self.generations.get(id).copied().unwrap_or(0)
+    }
 }
 
 pub struct McpServers {
@@ -47,6 +86,13 @@ pub struct McpServers {
     damaged: Option<RpcError>,
     state: Mutex<State>,
     changes: tokio::sync::watch::Sender<u64>,
+    /// Ticks on every connection-state change (login, disconnect, test,
+    /// refresh), none of which moves the registry revision.
+    status_changes: tokio::sync::watch::Sender<u64>,
+    /// Pending logins, refresh locks and recorded statuses. Lock order: this
+    /// is never taken while `state` is held.
+    auth: Mutex<auth::AuthState>,
+    http: Arc<dyn HttpClient>,
 }
 
 /// Storage errors carry no detail: the files hold credentials and the path or
@@ -99,14 +145,24 @@ impl McpServers {
                         path.display()
                     ),
                 )),
-                state: Mutex::new(State {
-                    snapshot: Default::default(),
-                    secret_file: String::new(),
-                    secrets: SecretStore::default(),
-                }),
+                state: Mutex::new(State::new(
+                    Default::default(),
+                    String::new(),
+                    SecretStore::default(),
+                )),
                 changes,
+                status_changes: tokio::sync::watch::channel(0).0,
+                auth: Default::default(),
+                http: Arc::new(transport::CurlClient),
             }
         }))
+    }
+
+    /// Replaces the HTTP client used for OAuth and connection tests (tests
+    /// put a fake upstream here).
+    pub fn with_http(mut self, http: Arc<dyn HttpClient>) -> Self {
+        self.http = http;
+        self
     }
 
     /// `Err` when the registry is degraded; see [`McpServers::load`].
@@ -140,22 +196,18 @@ impl McpServers {
                 .map_err(|_| storage_error())?;
                 // Secrets of a server the registry no longer has are dead weight.
                 store.0.retain(|id, _| ids.contains(id));
-                State {
-                    snapshot: manifest.snapshot,
-                    secret_file: manifest.secret_file,
-                    secrets: store,
-                }
+                State::new(manifest.snapshot, manifest.secret_file, store)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let state = State {
-                    snapshot: McpRegistrySnapshot {
+                let state = State::new(
+                    McpRegistrySnapshot {
                         revision: 0,
                         servers: vec![config::preset()],
                         overrides: Default::default(),
                     },
-                    secret_file: new_secret_file(),
-                    secrets: SecretStore::default(),
-                };
+                    new_secret_file(),
+                    SecretStore::default(),
+                );
                 write_state(&dir, &state)?;
                 state
             }
@@ -181,6 +233,9 @@ impl McpServers {
             damaged: None,
             state: Mutex::new(state),
             changes,
+            status_changes: tokio::sync::watch::channel(0).0,
+            auth: Default::default(),
+            http: Arc::new(transport::CurlClient),
         })
     }
 
@@ -193,21 +248,82 @@ impl McpServers {
         self.changes.subscribe()
     }
 
-    /// Every server `Disconnected`: live connection state arrives with the
-    /// transport layer.
+    /// The registry with every server's connection state; see
+    /// [`McpServers::status`].
     pub fn list(&self) -> Result<McpListResult, RpcError> {
         self.ensure_usable()?;
         let registry = self.snapshot();
         let statuses = registry
             .servers
             .iter()
-            .map(|s| McpServerStatus {
-                server_id: s.id.clone(),
-                state: McpConnectionState::Disconnected,
-                reason: None,
-            })
+            .map(|s| self.status(&s.id))
             .collect();
         Ok(McpListResult { registry, statuses })
+    }
+
+    /// One server's configuration, if it exists.
+    pub(crate) fn server(&self, id: &McpServerId) -> Option<McpServerConfig> {
+        self.state
+            .lock()
+            .snapshot
+            .servers
+            .iter()
+            .find(|s| &s.id == id)
+            .cloned()
+    }
+
+    /// The server's current generation; see the module documentation.
+    pub fn generation(&self, id: &McpServerId) -> u64 {
+        self.state.lock().generation(id)
+    }
+
+    /// Ticks on every connection-state change.
+    pub fn subscribe_status(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.status_changes.subscribe()
+    }
+
+    fn status_changed(&self) {
+        self.status_changes
+            .send_modify(|tick| *tick = tick.wrapping_add(1));
+    }
+
+    /// Connects to a remote server and lists its tools (`initialize`, then
+    /// `tools/list`), recording the outcome as its status. A local server
+    /// runs only inside a sandbox, so the host cannot test it.
+    pub async fn test(self: &Arc<Self>, id: &McpServerId) -> Result<McpTestResult, RpcError> {
+        self.ensure_usable()?;
+        let config = self
+            .server(id)
+            .ok_or_else(|| RpcError::not_found("MCP server not found"))?;
+        if matches!(config.transport, McpTransportConfig::Stdio { .. }) {
+            return Ok(McpTestResult {
+                status: McpServerStatus {
+                    server_id: id.clone(),
+                    state: McpConnectionState::Error,
+                    reason: Some("local servers are tested when an agent starts".into()),
+                },
+                tool_names: vec![],
+            });
+        }
+        let generation = self.generation(id);
+        let session =
+            RemoteSession::open(self.clone(), id.clone(), self.http.clone()).allowing_disabled();
+        let listed = list_tools(&session).await;
+        session.close();
+        let tool_names = match listed {
+            Ok(names) => {
+                self.record_status(id, generation, McpConnectionState::Connected, None);
+                names
+            }
+            Err(e) => {
+                self.record_status(id, generation, McpConnectionState::Error, Some(e.message));
+                vec![]
+            }
+        };
+        Ok(McpTestResult {
+            status: self.status(id),
+            tool_names,
+        })
     }
 
     /// The registry as JSON: configuration and secret references, never values.
@@ -215,8 +331,6 @@ impl McpServers {
         serde_json::to_string_pretty(&self.snapshot()).unwrap_or_default()
     }
 
-    // Read by the transport and backend layers that build on this registry.
-    #[allow(dead_code)]
     /// The secret stored for `id` under `name`, if any. Crate-private on
     /// purpose: no RPC reads a value back.
     pub(crate) fn secret(&self, id: &McpServerId, name: &str) -> Option<McpSecretValue> {
@@ -248,6 +362,64 @@ impl McpServers {
         Ok(())
     }
 
+    /// Like [`McpServers::set_secret`], but only while the server is still at
+    /// `generation`: the check and the write happen under one lock, so an
+    /// edit, removal or disconnect that bumped it in between always wins.
+    pub(crate) fn set_secret_at(
+        &self,
+        id: &McpServerId,
+        generation: u64,
+        name: &str,
+        value: Option<McpSecretValue>,
+    ) -> Result<(), RpcError> {
+        self.ensure_usable()?;
+        let mut state = self.state.lock();
+        if state.generation(id) != generation || !state.snapshot.servers.iter().any(|s| &s.id == id)
+        {
+            return Err(transport::error("credential update invalidated"));
+        }
+        let mut secrets = state.secrets.clone();
+        match value {
+            Some(v) => secrets.set(id, name, v),
+            None => secrets.remove(id, name),
+        }
+        let snapshot = state.snapshot.clone();
+        self.publish(&mut state, snapshot, secrets)
+    }
+
+    /// The secret `name` with the server's generation, read together.
+    pub(crate) fn secret_with_generation(
+        &self,
+        id: &McpServerId,
+        name: &str,
+    ) -> (u64, Option<McpSecretValue>) {
+        let state = self.state.lock();
+        (state.generation(id), state.secrets.get(id, name).cloned())
+    }
+
+    /// Bumps the server's generation and durably removes the secret `name`,
+    /// returning the new generation and the removed value: nothing started
+    /// before can store anything afterwards.
+    pub(crate) fn invalidate(
+        &self,
+        id: &McpServerId,
+        name: &str,
+    ) -> Result<(u64, Option<McpSecretValue>), RpcError> {
+        self.ensure_usable()?;
+        let mut state = self.state.lock();
+        if !state.snapshot.servers.iter().any(|s| &s.id == id) {
+            return Err(RpcError::not_found("MCP server not found"));
+        }
+        let removed = state.secrets.get(id, name).cloned();
+        if removed.is_some() {
+            let mut secrets = state.secrets.clone();
+            secrets.remove(id, name);
+            let snapshot = state.snapshot.clone();
+            self.publish(&mut state, snapshot, secrets)?;
+        }
+        Ok((state.bump(id), removed))
+    }
+
     /// Writes the new secrets version, then the manifest that points at it,
     /// and only then swaps the in-memory state. A failure leaves the published
     /// state and the files as they were.
@@ -261,6 +433,8 @@ impl McpServers {
             snapshot,
             secret_file: new_secret_file(),
             secrets,
+            generations: state.generations.clone(),
+            next_generation: state.next_generation,
         };
         write_state(&self.dir, &next)?;
         let old = std::mem::replace(state, next).secret_file;
@@ -288,8 +462,16 @@ impl McpServers {
             .revision
             .checked_add(1)
             .ok_or_else(|| RpcError::internal("MCP revision exhausted"))?;
+        let changed = settle_credentials(&state.snapshot, &state.secrets, &snapshot, &mut secrets);
         self.publish(&mut state, snapshot.clone(), secrets)?;
+        for id in &changed {
+            state.bump(id);
+        }
+        drop(state);
         self.changes.send_replace(snapshot.revision);
+        if !changed.is_empty() {
+            self.status_changed();
+        }
         Ok(snapshot)
     }
 
@@ -402,6 +584,102 @@ impl McpServers {
             Ok(())
         })
     }
+}
+
+/// After an edit: the servers whose generation must move (any change to their
+/// configuration or credentials, or their removal), with the daemon's OAuth
+/// record dropped from those whose transport or credentials changed. A
+/// rename or a backend toggle keeps the login; a new URL, client or client
+/// secret does not, so an account never outlives the configuration it was
+/// granted for, not even across a restart.
+fn settle_credentials(
+    before: &McpRegistrySnapshot,
+    before_secrets: &SecretStore,
+    after: &McpRegistrySnapshot,
+    secrets: &mut SecretStore,
+) -> Vec<McpServerId> {
+    let configured = |store: &SecretStore, id: &McpServerId| -> BTreeMap<String, McpSecretValue> {
+        store
+            .0
+            .get(id)
+            .map(|own| {
+                own.iter()
+                    .filter(|(name, _)| !name.starts_with(auth::RESERVED_PREFIX))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut changed = vec![];
+    for server in &after.servers {
+        let old = before.servers.iter().find(|s| s.id == server.id);
+        let credentials_changed =
+            configured(before_secrets, &server.id) != configured(secrets, &server.id);
+        if credentials_changed || old.is_none_or(|old| old.transport != server.transport) {
+            secrets.remove(&server.id, auth::TOKEN_SECRET);
+        }
+        if credentials_changed || old != Some(server) {
+            changed.push(server.id.clone());
+        }
+    }
+    for old in &before.servers {
+        if !after.servers.iter().any(|s| s.id == old.id) {
+            changed.push(old.id.clone());
+        }
+    }
+    changed
+}
+
+/// `tools/list` through every page, after the `initialize` handshake.
+async fn list_tools(session: &RemoteSession) -> Result<Vec<String>, RpcError> {
+    use serde_json::json;
+    session
+        .request(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": transport::PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "BondSymphonic", "version": env!("CARGO_PKG_VERSION")},
+            },
+        }))
+        .await?;
+    session
+        .request(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        .await?;
+    let mut names = vec![];
+    let mut cursor: Option<String> = None;
+    // Bounded: a server that pages forever is not waited for.
+    for id in 2..22u64 {
+        let mut message = json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"});
+        if let Some(cursor) = &cursor {
+            message["params"] = json!({ "cursor": cursor });
+        }
+        let messages = session.request(message).await?;
+        let result = messages
+            .iter()
+            .find(|m| m.get("id") == Some(&json!(id)))
+            .and_then(|m| m.get("result"))
+            .ok_or_else(|| transport::error("tools/list failed"))?;
+        for tool in result
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .ok_or_else(|| transport::error("invalid tools/list reply"))?
+        {
+            let name = tool
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| transport::error("invalid tools/list reply"))?;
+            names.push(name.to_owned());
+        }
+        cursor = result
+            .get("nextCursor")
+            .and_then(|c| c.as_str())
+            .map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(names)
 }
 
 fn write_state(dir: &Path, state: &State) -> Result<(), RpcError> {

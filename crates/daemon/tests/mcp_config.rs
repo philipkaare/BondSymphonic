@@ -2,7 +2,6 @@
 //! and import/export. Secret values use the sentinel `s3cr3t-sentinel`, which
 //! must never surface outside the private secrets file.
 use bondsymphonic_daemon::mcp::servers::McpServers;
-#[allow(dead_code)]
 mod common;
 
 use bondsymphonic_proto::*;
@@ -696,7 +695,10 @@ async fn rpc_handlers_serve_the_registry_and_announce_changes() {
         serde_json::from_value(c.call(Request::McpRestorePreset {}).await.unwrap()).unwrap();
     assert_eq!(restored.servers.len(), 1);
 
-    // The transport-layer requests are not served yet.
+    // Connection-state requests are served, and each one tells the clients
+    // to re-list. A callback URL without a port is refused before any
+    // network traffic.
+    c.drain_events();
     let connect = c
         .call(Request::McpConnect(McpConnectParams {
             server_id: "jira".into(),
@@ -704,7 +706,42 @@ async fn rpc_handlers_serve_the_registry_and_announce_changes() {
         }))
         .await
         .unwrap_err();
-    assert!(connect.message.contains("not implemented"), "{connect:?}");
+    assert_eq!(connect.code, ErrorCode::InvalidParams, "{connect:?}");
+    let callback = c
+        .call(Request::McpCallback(McpCallbackParams {
+            server_id: "jira".into(),
+            state: McpSecretValue(SENTINEL.into()),
+            code: McpSecretValue(SENTINEL.into()),
+            issuer: None,
+        }))
+        .await
+        .unwrap_err();
+    assert!(!callback.message.contains(SENTINEL));
+    let status: McpServerStatus = serde_json::from_value(
+        c.call(Request::McpDisconnect(McpServerIdParams {
+            server_id: "jira".into(),
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status.state, McpConnectionState::Disconnected);
+    assert!(c
+        .drain_events()
+        .iter()
+        .any(|(_, e)| matches!(e, Event::McpChanged { .. })));
+    c.call(Request::McpUpsert(upsert(stdio_server("local"), vec![])))
+        .await
+        .unwrap();
+    let tested: McpTestResult = serde_json::from_value(
+        c.call(Request::McpTest(McpTestParams {
+            server_id: "local".into(),
+        }))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(tested.status.state, McpConnectionState::Error);
     cancel.cancel();
 }
 
