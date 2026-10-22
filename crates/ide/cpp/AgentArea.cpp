@@ -248,6 +248,16 @@ void AgentArea::clearBanner(const QString& workspaceId) {
     }
 }
 
+void AgentArea::setBackend(const QString& workspaceId, const QString& adapter) {
+    TranscriptView* view = m_transcripts.value(workspaceId);
+    if (view == nullptr || adapter.isEmpty() || adapter == kTerminalAdapter) {
+        return;
+    }
+    view->setBackend(adapter);
+    view->setClaudeLoggedIn(loggedInFor(adapter));
+    view->setClaudeAuthFailure(authFailureFor(adapter));
+}
+
 void AgentArea::setOptionsJson(const QString& workspaceId, const QString& optionsJson) {
     TranscriptView* view = m_transcripts.value(workspaceId);
     TranscriptModel* model = view == nullptr ? nullptr : view->model();
@@ -336,6 +346,10 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
         addWidget(makePage(workspaceId, view));
         QObject::connect(view, &TranscriptView::startAgentRequested, this,
                          [this, workspaceId] { emit startAgentRequested(workspaceId); });
+        QObject::connect(view, &TranscriptView::resumeSessionRequested, this,
+                         [this, workspaceId](const QString& session) {
+                             emit resumeSessionRequested(workspaceId, session);
+                         });
         QObject::connect(view, &TranscriptView::loginRequested, this,
                          &AgentArea::loginRequested);
         QObject::connect(view, &TranscriptView::openConfigFolderRequested, this,
@@ -343,6 +357,10 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
         QObject::connect(view, &TranscriptView::optionsChanged, this,
                          [this, workspaceId](const QString& optionsJson) {
                              emit agentOptionsChanged(workspaceId, optionsJson);
+                         });
+        QObject::connect(view, &TranscriptView::harnessChangeRequested, this,
+                         [this, workspaceId](const QString& backend) {
+                             emit harnessChangeRequested(workspaceId, backend);
                          });
         // A prompt, a permission answer or a stop that failed goes to the
         // banner over the pane, by way of the window, as a failed start does.
@@ -363,6 +381,7 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
         // existed, which for a workspace just created is all of it.
         applyWelcome(workspaceId, view);
         view->setShowMeta(m_showMeta);
+        view->setHarnessChoices(m_harnessChoices);
     }
     setAgent(workspaceId, agentId);
     return view;
@@ -417,6 +436,15 @@ void AgentArea::refillModels() {
     for (TranscriptView* view : m_transcripts) {
         if (view != nullptr) {
             view->refillModels();
+        }
+    }
+}
+
+void AgentArea::setHarnessChoices(const QList<QPair<QString, QString>>& choices) {
+    m_harnessChoices = choices;
+    for (TranscriptView* view : m_transcripts) {
+        if (view != nullptr) {
+            view->setHarnessChoices(choices);
         }
     }
 }

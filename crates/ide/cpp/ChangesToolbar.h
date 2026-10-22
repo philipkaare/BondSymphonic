@@ -80,8 +80,29 @@ public:
     void noteBranches(const QString& workspaceId, const QString& branch,
                       const QString& baseBranch);
 
+    /// Ignore uses the current path. Commit from the toolbar starts with all
+    /// pending files; a context menu passes its captured selection explicitly.
+    void setSelection(const QString& path, bool directory, const QStringList& selectedPaths);
+    void commitSelected(const QStringList& paths = {});
+    void ignoreSelected(const QString& path, bool directory);
+    QAction* commitAction() const;
+    QAction* ignoreAction() const;
+
+    struct CommitAnswer {
+        bool accepted = false;
+        QString message;
+        QStringList paths;
+    };
+    struct IgnoreAnswer {
+        bool accepted = false;
+        QString path;
+        QString target;
+    };
+    void setCommitPrompt(std::function<CommitAnswer(const QString&, const QString&, const QStringList&)> ask);
+    void setIgnorePrompt(std::function<IgnoreAnswer(const QString&, const QString&)> ask);
+
     /// Which confirmation an action puts in front of the user.
-    enum class Ask { Merge, Rebase, Squash, Pr, Discard };
+    enum class Ask { Merge, Rebase, Squash, Pr, Discard, CommitContinue };
 
     /// What one came back with.
     ///
@@ -144,6 +165,11 @@ private:
     void onSquash();
     void onCreatePr();
     void onDiscard();
+    void onCommitPrepared(const QString& workspaceId, const QString& json);
+    void onIgnoreOptions(const QString& workspaceId, const QString& json);
+    void onCommitted(const QString& workspaceId, const QString& commit);
+    void requestPrepare(QString workspaceId, bool forPr, const QStringList& paths = {});
+    bool sameWorkspace(const QString& workspaceId, quint64 epoch) const;
 
     void onMergeFinished(const QString& workspaceId, bool ok, const QString& conflictsJson,
                          const QString& reason);
@@ -193,6 +219,23 @@ private:
     QString m_name;
     QString m_branch;
     QString m_baseBranch;
+    QAction* m_commit = nullptr;
+    QAction* m_ignore = nullptr;
+    QString m_selectionPath;
+    QStringList m_selectedPaths;
+    bool m_selectionDirectory = false;
+    quint64 m_workspaceEpoch = 0;
+    struct Pending {
+        QString name;
+        QStringList paths;
+        quint64 epoch = 0;
+        bool forPr = false;
+        bool awaitingCommit = false;
+        bool ignoring = false;
+    };
+    QHash<QString, Pending> m_pending;
+    std::function<CommitAnswer(const QString&, const QString&, const QStringList&)> m_commitPrompt;
+    std::function<IgnoreAnswer(const QString&, const QString&)> m_ignorePrompt;
     QAction* m_merge = nullptr;
     QAction* m_rebase = nullptr;
     QAction* m_squash = nullptr;

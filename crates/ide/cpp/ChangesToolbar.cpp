@@ -1,5 +1,7 @@
 #include "ChangesToolbar.h"
 #include "PrDialog.h"
+#include "CommitDialog.h"
+#include "IgnoreDialog.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include <QAction>
 #include <QInputDialog>
@@ -8,6 +10,7 @@
 #include <QJsonObject>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QPushButton>
 #include <QStringList>
 #include <cstdint>
 #include <utility>
@@ -72,6 +75,22 @@ ChangesToolbar::ChangesToolbar(AppController* controller, QWidget* parent)
     m_ask = [this](Ask ask, const QString& workspaceId) {
         return askModal(ask, workspaceId);
     };
+    m_commitPrompt = [this](const QString& name, const QString& json, const QStringList& paths) {
+        CommitDialog dialog(name, json, paths, this);
+        CommitAnswer answer;
+        answer.accepted = dialog.exec() == QDialog::Accepted;
+        answer.message = dialog.message();
+        answer.paths = dialog.paths();
+        return answer;
+    };
+    m_ignorePrompt = [this](const QString& name, const QString& json) {
+        IgnoreDialog dialog(name, json, this);
+        IgnoreAnswer answer;
+        answer.accepted = dialog.exec() == QDialog::Accepted;
+        answer.path = dialog.path();
+        answer.target = dialog.target();
+        return answer;
+    };
     setObjectName(QStringLiteral("ChangesToolbar"));
     setMovable(false);
     setToolButtonStyle(Qt::ToolButtonTextOnly);
@@ -81,6 +100,13 @@ ChangesToolbar::ChangesToolbar(AppController* controller, QWidget* parent)
     // that ask something before they act.
     const QString ellipsis = QString(QChar(0x2026));
 
+    m_commit = addAction(QStringLiteral("Commit") + ellipsis);
+    m_commit->setObjectName(QStringLiteral("ChangesCommitAction"));
+    m_commit->setToolTip(QStringLiteral("Choose pending files and a commit message"));
+    m_ignore = addAction(QStringLiteral("Ignore") + ellipsis);
+    m_ignore->setObjectName(QStringLiteral("ChangesIgnoreAction"));
+    m_ignore->setToolTip(QStringLiteral("Choose an ignore rule for the selected path"));
+    addSeparator();
     m_merge = addAction(QStringLiteral("Merge"));
     m_merge->setObjectName(QStringLiteral("ChangesMergeAction"));
     m_merge->setToolTip(QStringLiteral("Merge this workspace's branch into its base"));
@@ -98,6 +124,10 @@ ChangesToolbar::ChangesToolbar(AppController* controller, QWidget* parent)
     m_discard->setObjectName(QStringLiteral("ChangesDiscardAction"));
     m_discard->setToolTip(QStringLiteral("Destroy the workspace and everything unmerged in it"));
 
+    QObject::connect(m_commit, &QAction::triggered, this, [this] { commitSelected(); });
+    QObject::connect(m_ignore, &QAction::triggered, this, [this] {
+        ignoreSelected(m_selectionPath, m_selectionDirectory);
+    });
     QObject::connect(m_merge, &QAction::triggered, this,
                      [this] { onMerge(QString::fromUtf8(kModeMerge)); });
     QObject::connect(m_rebase, &QAction::triggered, this,
@@ -108,6 +138,15 @@ ChangesToolbar::ChangesToolbar(AppController* controller, QWidget* parent)
 
     if (!m_controller.isNull()) {
         AppController* c = m_controller;
+        QObject::connect(c, &AppController::commitPrepared, this, &ChangesToolbar::onCommitPrepared);
+        QObject::connect(c, &AppController::ignoreOptionsReady, this, &ChangesToolbar::onIgnoreOptions);
+        QObject::connect(c, &AppController::workspaceCommitted, this, &ChangesToolbar::onCommitted);
+        QObject::connect(c, &AppController::workspaceIgnored, this,
+                         [this](const QString& id, const QString& pattern) {
+            emit workspaceRecovered(id);
+            emit statusMessage(QStringLiteral("Ignored %1").arg(pattern), QString());
+            requestSummary(id);
+        });
         QObject::connect(c, &AppController::mergeFinished, this, &ChangesToolbar::onMergeFinished);
         QObject::connect(c, &AppController::prCreated, this, &ChangesToolbar::onPrCreated);
         QObject::connect(c, &AppController::workspaceOperationFailed, this,
@@ -117,6 +156,7 @@ ChangesToolbar::ChangesToolbar(AppController* controller, QWidget* parent)
         // A workspace that has gone takes its bookkeeping with it, so a later
         // workspace reusing the id could never inherit stale numbers.
         QObject::connect(c, &AppController::workspaceDestroyed, this, [this](const QString& id) {
+            m_pending.remove(id);
             m_changedFiles.remove(id);
             m_branchOf.remove(id);
             updateActions();
@@ -133,6 +173,11 @@ ChangesToolbar::ChangesToolbar(AppController* controller, QWidget* parent)
 void ChangesToolbar::setWorkspace(const QString& workspaceId, const QString& name,
                                   const QString& branch, const QString& baseBranch) {
     const bool moved = workspaceId != m_workspaceId;
+    if (moved) {
+        ++m_workspaceEpoch;
+        m_selectionPath.clear();
+        m_selectedPaths.clear();
+    }
     m_workspaceId = workspaceId;
     m_name = name;
     m_branch = branch;
@@ -178,7 +223,10 @@ bool ChangesToolbar::busy(const QString& workspaceId) const {
 }
 
 void ChangesToolbar::updateActions() {
-    const bool live = !m_workspaceId.isEmpty() && !busy(m_workspaceId);
+    const bool live = !m_workspaceId.isEmpty() && !busy(m_workspaceId) &&
+                      !m_pending.contains(m_workspaceId);
+    m_commit->setEnabled(live);
+    m_ignore->setEnabled(live && !m_selectionPath.isEmpty());
     for (QAction* action : { m_merge, m_rebase, m_squash, m_pr, m_discard }) {
         action->setEnabled(live);
     }
@@ -240,6 +288,16 @@ ChangesToolbar::Answer ChangesToolbar::askModal(Ask ask, const QString& workspac
             QLineEdit::Normal, QString(), &ok);
         answer.accepted = ok;
         answer.summary = summary.trimmed();
+        return answer;
+    }
+    case Ask::CommitContinue: {
+        QMessageBox box(QMessageBox::Question, QStringLiteral("Commit before creating PR"),
+                        QStringLiteral("%1 has uncommitted changes.").arg(m_name),
+                        QMessageBox::Cancel, this);
+        auto* proceed = box.addButton(QStringLiteral("Commit and continue"), QMessageBox::AcceptRole);
+        box.setDefaultButton(QMessageBox::Cancel);
+        box.exec();
+        answer.accepted = box.clickedButton() == proceed;
         return answer;
     }
     case Ask::Pr: {
@@ -349,22 +407,169 @@ void ChangesToolbar::onSquash() {
 }
 
 void ChangesToolbar::onCreatePr() {
-    const QString workspaceId = m_workspaceId;
-    if (workspaceId.isEmpty()) {
+    requestPrepare(m_workspaceId, true);
+}
+
+void ChangesToolbar::setSelection(const QString& path, bool directory,
+                                  const QStringList& selectedPaths) {
+    m_selectionPath = path;
+    m_selectionDirectory = directory;
+    m_selectedPaths = selectedPaths;
+    updateActions();
+}
+
+QAction* ChangesToolbar::commitAction() const { return m_commit; }
+QAction* ChangesToolbar::ignoreAction() const { return m_ignore; }
+
+void ChangesToolbar::setCommitPrompt(
+    std::function<CommitAnswer(const QString&, const QString&, const QStringList&)> ask) {
+    if (ask) {
+        m_commitPrompt = std::move(ask);
+    }
+}
+
+void ChangesToolbar::setIgnorePrompt(
+    std::function<IgnoreAnswer(const QString&, const QString&)> ask) {
+    if (ask) {
+        m_ignorePrompt = std::move(ask);
+    }
+}
+
+bool ChangesToolbar::sameWorkspace(const QString& id, quint64 epoch) const {
+    return stillOn(id) && epoch == m_workspaceEpoch;
+}
+
+void ChangesToolbar::requestPrepare(QString id, bool forPr, const QStringList& paths) {
+    if (!beginOperation(id) || m_pending.contains(id)) return;
+    Pending pending;
+    pending.name = m_name;
+    pending.paths = paths;
+    pending.epoch = m_workspaceEpoch;
+    pending.forPr = forPr;
+    m_pending.insert(id, pending);
+    updateActions();
+    m_controller->prepareCommit(id);
+}
+
+void ChangesToolbar::commitSelected(const QStringList& paths) {
+    requestPrepare(m_workspaceId, false, paths);
+}
+
+void ChangesToolbar::ignoreSelected(const QString& path, bool directory) {
+    const QString id = m_workspaceId;
+    if (path.isEmpty() || !beginOperation(id) || m_pending.contains(id)) return;
+    Pending pending;
+    pending.name = m_name;
+    pending.epoch = m_workspaceEpoch;
+    pending.ignoring = true;
+    m_pending.insert(id, pending);
+    updateActions();
+    m_controller->prepareIgnore(id, path, directory);
+}
+
+void ChangesToolbar::onCommitPrepared(const QString& id, const QString& json) {
+    if (!m_pending.contains(id) || m_pending.value(id).ignoring ||
+        m_pending.value(id).awaitingCommit) return;
+    const Pending pending = m_pending.take(id);
+    updateActions();
+    if (!sameWorkspace(id, pending.epoch)) {
+        reportCancelled(pending.forPr ? QStringLiteral("pull request") : QStringLiteral("commit"));
         return;
     }
-    const Answer answer = m_ask(Ask::Pr, workspaceId);
-    if (!answer.accepted) {
+    const QJsonObject prepared = QJsonDocument::fromJson(json.toUtf8()).object();
+    const bool dirty = !prepared.value(QStringLiteral("files")).toArray().isEmpty();
+    if (pending.forPr && !dirty) {
+        if (prepared.value(QStringLiteral("ahead")).toInt() == 0) {
+            emit workspaceError(id, QStringLiteral("No committed changes to open a pull request"),
+                                QStringLiteral("Commit changes on this branch before creating a pull request."),
+                                QString());
+            return;
+        }
+        const Answer answer = m_ask(Ask::Pr, id);
+        if (!answer.accepted) return;
+        if (!sameWorkspace(id, pending.epoch)) {
+            reportCancelled(QStringLiteral("pull request"));
+            return;
+        }
+        if (beginOperation(id)) m_controller->createPr(id, answer.title, answer.body, answer.draft);
         return;
     }
-    if (!stillOn(workspaceId)) {
+    if (!dirty) {
+        emit statusMessage(QStringLiteral("No pending changes to commit"), QString());
+        return;
+    }
+    if (!pending.paths.isEmpty()) {
+        bool selectedPending = false;
+        for (const QJsonValue& value : prepared.value(QStringLiteral("files")).toArray()) {
+            const QString path = value.toObject().value(QStringLiteral("path")).toString();
+            for (const QString& selected : pending.paths) {
+                if (path == selected || path.startsWith(selected + QLatin1Char('/'))) {
+                    selectedPending = true;
+                    break;
+                }
+            }
+            if (selectedPending) break;
+        }
+        if (!selectedPending) {
+            emit statusMessage(QStringLiteral("No pending changes in the selected paths"), QString());
+            return;
+        }
+    }
+    if (pending.forPr && !m_ask(Ask::CommitContinue, id).accepted) return;
+    if (!sameWorkspace(id, pending.epoch)) {
+        reportCancelled(QStringLiteral("commit"));
+        return;
+    }
+    const CommitAnswer answer = m_commitPrompt(pending.name, json, pending.paths);
+    if (!answer.accepted) return;
+    if (!sameWorkspace(id, pending.epoch)) {
+        reportCancelled(QStringLiteral("commit"));
+        return;
+    }
+    if (!beginOperation(id) || answer.paths.isEmpty() || answer.message.trimmed().isEmpty()) return;
+    if (pending.forPr) {
+        Pending next = pending;
+        next.awaitingCommit = true;
+        m_pending.insert(id, next);
+        updateActions();
+    }
+    const QString pathsJson = QString::fromUtf8(QJsonDocument(QJsonArray::fromStringList(answer.paths))
+                                                  .toJson(QJsonDocument::Compact));
+    m_controller->commitWorkspace(id, pathsJson, answer.message);
+}
+
+void ChangesToolbar::onIgnoreOptions(const QString& id, const QString& json) {
+    if (!m_pending.contains(id) || !m_pending.value(id).ignoring) return;
+    const Pending pending = m_pending.take(id);
+    updateActions();
+    if (!sameWorkspace(id, pending.epoch)) {
+        reportCancelled(QStringLiteral("ignore"));
+        return;
+    }
+    const IgnoreAnswer answer = m_ignorePrompt(pending.name, json);
+    if (!answer.accepted) return;
+    if (!sameWorkspace(id, pending.epoch)) {
+        reportCancelled(QStringLiteral("ignore"));
+        return;
+    }
+    if (beginOperation(id) && !answer.path.isEmpty() && !answer.target.isEmpty())
+        m_controller->ignoreWorkspace(id, answer.path, answer.target);
+}
+
+void ChangesToolbar::onCommitted(const QString& id, const QString& commit) {
+    emit workspaceRecovered(id);
+    emit statusMessage(QStringLiteral("Committed %1").arg(commit), QString());
+    requestSummary(id);
+    if (!m_pending.contains(id) || !m_pending.value(id).awaitingCommit) return;
+    const Pending pending = m_pending.take(id);
+    updateActions();
+    if (!sameWorkspace(id, pending.epoch)) {
         reportCancelled(QStringLiteral("pull request"));
         return;
     }
-    if (!beginOperation(workspaceId)) {
-        return;
-    }
-    m_controller->createPr(workspaceId, answer.title, answer.body, answer.draft);
+    // A partial commit or another writer may have left pending work. Prepare
+    // again rather than pushing until the workspace is clean.
+    requestPrepare(id, true);
 }
 
 void ChangesToolbar::onDiscard() {
@@ -431,6 +636,8 @@ void ChangesToolbar::onPrCreated(const QString& workspaceId, const QString& url)
 
 void ChangesToolbar::onOperationFailed(const QString& workspaceId, const QString& op,
                                        const QString& message, const QString& dataJson) {
+    m_pending.remove(workspaceId);
+    updateActions();
     // Not `data`: `QWidget` has a member of that name, and a local hiding it
     // is a warning this build treats as one to fix.
     const QJsonObject payload = QJsonDocument::fromJson(dataJson.toUtf8()).object();
@@ -439,7 +646,17 @@ void ChangesToolbar::onOperationFailed(const QString& workspaceId, const QString
 
     QString title = op;
     QString detail = message;
-    if (reason == QLatin1String(kReasonBaseDirty)) {
+    if (reason == QLatin1String("no_commits")) {
+        title = QStringLiteral("No committed changes to open a pull request");
+    } else if (op == QLatin1String("workspace.prepare_commit")) {
+        title = QStringLiteral("Could not read pending changes");
+    } else if (op == QLatin1String("workspace.ignore_options")) {
+        title = QStringLiteral("Could not prepare ignore options");
+    } else if (op == QLatin1String("workspace.commit")) {
+        title = QStringLiteral("Commit failed");
+    } else if (op == QLatin1String("workspace.ignore")) {
+        title = QStringLiteral("Ignore failed");
+    } else if (reason == QLatin1String(kReasonBaseDirty)) {
         title = QStringLiteral("The base repository has uncommitted work");
         // The daemon's sentence names the repository and the branch; what it
         // cannot say is what the user should do next.
@@ -539,6 +756,9 @@ std::int32_t runToolbarAction(const ToolbarAction& action, std::int32_t index,
         return 100 + index;
     }
     trigger->trigger();
+    if (QString::fromUtf8(action.objectName) == QLatin1String("ChangesCreatePrAction")) {
+        controller.commitPrepared(QStringLiteral("ws_1"), QStringLiteral("{\"files\":[],\"ahead\":1}"));
+    }
 
     const bool moved = !switchTo.isEmpty();
     // The workspace the confirmation was about: acted on when it is still the
@@ -620,6 +840,101 @@ extern "C" std::int32_t bs_widget_test_changes_toolbar_hides_git_actions_in_plac
             return 3;
         }
     }
+    return 0;
+}
+
+/// New write actions stay available in the checkout, and a commit uses the
+/// paths captured before asynchronous status preparation, not a later selection.
+extern "C" std::int32_t bs_widget_test_changes_toolbar_commit_selection() {
+    AppController controller;
+    ChangesToolbar toolbar(&controller);
+    toolbar.setWorkspace(QStringLiteral("ws_1"), QStringLiteral("alpha"),
+                         QStringLiteral("main"), QStringLiteral("main"));
+    toolbar.setInPlace(true);
+    if (!toolbar.commitAction()->isVisible() || !toolbar.commitAction()->isEnabled() ||
+        !toolbar.ignoreAction()->isVisible() || toolbar.ignoreAction()->isEnabled()) return 1;
+    toolbar.setSelection(QStringLiteral("src/a.rs"), false, { QStringLiteral("src/a.rs") });
+    if (!toolbar.ignoreAction()->isEnabled()) return 2;
+    QStringList requested;
+    toolbar.setCommitPrompt([&requested](const QString&, const QString&, const QStringList& paths) {
+        requested = paths;
+        ChangesToolbar::CommitAnswer answer;
+        answer.accepted = true;
+        answer.paths = paths;
+        answer.message = QStringLiteral("Commit selected change");
+        return answer;
+    });
+    toolbar.commitSelected({ QStringLiteral("src/a.rs") });
+    toolbar.setSelection(QStringLiteral("other.rs"), false, { QStringLiteral("other.rs") });
+    controller.commitPrepared(QStringLiteral("ws_1"),
+                              QStringLiteral("{\"files\":[{\"path\":\"src/a.rs\"}],\"ahead\":0}"));
+    if (requested != QStringList{ QStringLiteral("src/a.rs") }) return 3;
+    if (!controller.isWorkspaceBusy(QStringLiteral("ws_1"))) return 4;
+    return 0;
+}
+
+/// Both an asynchronous answer and a nested dialog can arrive after tab switch.
+/// Neither is allowed to write into the newly active workspace.
+extern "C" std::int32_t bs_widget_test_changes_toolbar_write_switch_safety() {
+    AppController controller;
+    ChangesToolbar toolbar(&controller);
+    toolbar.setWorkspace(QStringLiteral("ws_1"), QStringLiteral("alpha"),
+                         QStringLiteral("bs/alpha"), QStringLiteral("main"));
+    bool asked = false;
+    toolbar.setCommitPrompt([&asked](const QString&, const QString&, const QStringList&) {
+        asked = true;
+        return ChangesToolbar::CommitAnswer{};
+    });
+    toolbar.commitSelected();
+    toolbar.setWorkspace(QStringLiteral("ws_2"), QStringLiteral("beta"),
+                         QStringLiteral("bs/beta"), QStringLiteral("main"));
+    controller.commitPrepared(QStringLiteral("ws_1"),
+                              QStringLiteral("{\"files\":[{\"path\":\"a\"}],\"ahead\":0}"));
+    if (asked) return 1;
+    toolbar.setIgnorePrompt([&toolbar](const QString&, const QString&) {
+        toolbar.setWorkspace(QStringLiteral("ws_3"), QStringLiteral("gamma"),
+                             QStringLiteral("bs/gamma"), QStringLiteral("main"));
+        ChangesToolbar::IgnoreAnswer answer;
+        answer.accepted = true;
+        answer.path = QStringLiteral("a");
+        answer.target = QStringLiteral("file");
+        return answer;
+    });
+    toolbar.ignoreSelected(QStringLiteral("a"), false);
+    controller.ignoreOptionsReady(QStringLiteral("ws_2"), QStringLiteral("{\"options\":[]}"));
+    for (const QString& id : { QStringLiteral("ws_1"), QStringLiteral("ws_2"), QStringLiteral("ws_3") }) {
+        if (controller.isWorkspaceBusy(id)) return 2;
+    }
+    return 0;
+}
+
+/// A dirty PR must stop at the commit choice; a clean branch with no commits
+/// must stop before the PR details dialog.
+extern "C" std::int32_t bs_widget_test_changes_toolbar_pr_preflight() {
+    AppController controller;
+    ChangesToolbar toolbar(&controller);
+    toolbar.setWorkspace(QStringLiteral("ws_1"), QStringLiteral("alpha"),
+                         QStringLiteral("bs/alpha"), QStringLiteral("main"));
+    int commitChoices = 0;
+    int prPrompts = 0;
+    toolbar.setConfirmPrompt([&](ChangesToolbar::Ask ask, const QString&) {
+        if (ask == ChangesToolbar::Ask::CommitContinue) ++commitChoices;
+        if (ask == ChangesToolbar::Ask::Pr) ++prPrompts;
+        return ChangesToolbar::Answer{};
+    });
+    toolbar.prAction()->trigger();
+    controller.commitPrepared(QStringLiteral("ws_1"),
+                              QStringLiteral("{\"files\":[{\"path\":\"a\"}],\"ahead\":1}"));
+    if (commitChoices != 1 || prPrompts != 0) return 1;
+    QString error;
+    QObject::connect(&toolbar, &ChangesToolbar::workspaceError, &toolbar,
+                     [&error](const QString&, const QString& title, const QString&, const QString&) {
+        error = title;
+    });
+    toolbar.prAction()->trigger();
+    controller.commitPrepared(QStringLiteral("ws_1"), QStringLiteral("{\"files\":[],\"ahead\":0}"));
+    if (prPrompts != 0 || !error.contains(QStringLiteral("No committed changes"))) return 2;
+    if (controller.isWorkspaceBusy(QStringLiteral("ws_1"))) return 3;
     return 0;
 }
 

@@ -183,6 +183,8 @@ pub struct HostHandle {
 pub struct Daemon {
     pub dirs: DataDirs,
     pub registry: Registry,
+    /// Keeps persistence, live proxy updates and announcements in the same order.
+    pub network_rules_lock: tokio::sync::Mutex<()>,
     pub git: Git,
     pub backend: Arc<dyn SandboxBackend>,
     pub sandboxes: Mutex<HashMap<WorkspaceId, Arc<dyn SandboxHandle>>>,
@@ -250,6 +252,7 @@ impl Daemon {
         Ok(Arc::new_cyclic(|me| Self {
             dirs,
             registry,
+            network_rules_lock: tokio::sync::Mutex::new(()),
             git: Git::new(),
             backend,
             sandboxes: Mutex::new(HashMap::new()),

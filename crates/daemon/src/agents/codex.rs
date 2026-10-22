@@ -26,6 +26,23 @@ use tokio::{
 
 pub const TESTED_CODEX_VERSION: &str = "0.158.0";
 
+// Only app-server actions implemented here belong in completion. TUI-only
+// slash commands are deliberately left to normal input handling.
+fn local_command(input: &str) -> Result<Option<&str>, RpcError> {
+    let mut words = input.split_whitespace();
+    let command = match words.next() {
+        Some("/compact") => "compact",
+        Some("/status") => "status",
+        _ => return Ok(None),
+    };
+    if words.next().is_some() {
+        return Err(RpcError::invalid_params(format!(
+            "/{command} takes no arguments"
+        )));
+    }
+    Ok(Some(command))
+}
+
 #[derive(Default)]
 struct TurnState {
     active: Option<String>,
@@ -39,6 +56,7 @@ pub struct CodexAdapter {
     prepared: PreparedAgent,
     rpc: Option<Arc<CodexRpc>>,
     thread: String,
+    model: Option<String>,
     state: Arc<Mutex<TurnState>>,
     changed: Arc<tokio::sync::Notify>,
     exited: Arc<AtomicBool>,
@@ -64,6 +82,7 @@ impl CodexAdapter {
             prepared,
             rpc: None,
             thread: String::new(),
+            model: None,
             state: Arc::new(Mutex::new(TurnState::default())),
             changed: Arc::new(tokio::sync::Notify::new()),
             exited: Arc::new(AtomicBool::new(false)),
@@ -130,6 +149,10 @@ impl CodexAdapter {
             Some(result) => result,
             None => rpc.call("thread/start", params).await?,
         };
+        self.model = result["model"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| self.prepared.options.model.clone());
         self.thread = text(&result["thread"], "id").into();
         if self.thread.is_empty() {
             return Err(error("Codex did not return a thread ID"));
@@ -141,6 +164,15 @@ impl CodexAdapter {
         if resuming {
             self.sink.session_id(self.thread.clone()).await;
         }
+        self.sink
+            .message(AgentMessageBody::System {
+                subtype: "agent_commands".into(),
+                data: json!({"commands":[
+                    {"name":"compact","description":"Compact the current thread context"},
+                    {"name":"status","description":"Show current thread and model"}
+                ]}),
+            })
+            .await;
         Ok(())
     }
 }
@@ -297,6 +329,38 @@ impl AgentAdapter for CodexAdapter {
 
     async fn send(&mut self, text: String) -> Result<(), RpcError> {
         let rpc = self.rpc()?;
+        if let Some(command) = local_command(&text)? {
+            if command == "compact" {
+                let state = self.state.lock();
+                if state.active.is_some() || !state.approvals.is_empty() {
+                    return Err(error(
+                        "Wait for the current Codex turn to finish before compacting",
+                    ));
+                }
+            }
+            self.sink
+                .message(AgentMessageBody::UserText { text: text.clone() })
+                .await;
+            let message = match command {
+                "compact" => {
+                    rpc.call("thread/compact/start", json!({"threadId":self.thread}))
+                        .await?;
+                    "Context compaction started.".to_owned()
+                }
+                _ => format!(
+                    "Thread: {}\nModel: {}",
+                    self.thread,
+                    self.model.as_deref().unwrap_or("server default")
+                ),
+            };
+            self.sink
+                .message(AgentMessageBody::System {
+                    subtype: "agent_command_result".into(),
+                    data: json!({"command":command,"message":message}),
+                })
+                .await;
+            return Ok(());
+        }
         let active = {
             let state = self.state.lock();
             if !state.approvals.is_empty() {
@@ -443,5 +507,19 @@ impl Drop for CodexAdapter {
                 kill();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn supported_commands_are_dispatched_without_prompting() {
+        assert_eq!(local_command(" /compact ").unwrap(), Some("compact"));
+        assert_eq!(local_command("/status").unwrap(), Some("status"));
+        assert!(local_command("/compact extra").is_err());
+        assert_eq!(local_command("/unknown hello").unwrap(), None);
+        assert_eq!(local_command("explain /compact").unwrap(), None);
     }
 }

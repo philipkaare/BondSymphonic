@@ -735,7 +735,11 @@ sandbox cannot fully close off:
 ## The window
 
 The shape is Visual Studio's: the editor is the fixed centre, and everything
-else is a tool window docked around it.
+else is a tool window docked around it. The Agent tool window's title shows
+which harness and workspace are selected, for example **Agent — Claude Code · alpha**,
+and follows you when you switch tabs. Right-click an agent tab and choose
+**Rename agent…** to change its display name. The dialog starts with the current
+name, rejects blank names, and saves the new label across restarts.
 
 A splash screen sits over the window from launch until the IDE is ready to
 use: it names the phase — launching the daemon, connecting, checking the
@@ -795,6 +799,38 @@ the nearest bound.
 ## The Claude tab
 
 A Claude Code workspace's pane shows the conversation as it arrives.
+
+The message box stays editable while an agent works. **Enter** sends a follow-up
+through that harness's normal input path; **Shift+Enter** inserts a new line.
+Claude Code and OpenCode queue follow-ups, while Codex receives them immediately
+as input to its current turn. The hint says **Enter to queue** or **Enter to send**
+to match. The box remains locked while history replays or the agent is unavailable.
+
+Opening an existing agent reattaches its live session or resumes the latest saved
+conversation for that workspace and harness. A newer launch that never created a
+session does not hide an older saved conversation.
+
+Type `/` at the start of the message box to open command completion. The dropdown
+filters as you type and shows descriptions and argument hints from the attached
+harness. Use **Up/Down** to select, **Tab** or **Enter** to complete, and **Escape**
+to dismiss; completion does not send the command. Press **Enter** again to run it.
+The available choices refresh when you switch agents. `/resume [session-id]`
+reattaches a running session or resumes a saved one, with no ID meaning the latest
+session. `/model`, `/permissions` and `/help` use the app's existing controls when
+the harness does not advertise its own command with that name. Codex's app-server
+actions include `/compact` and `/status`; the dropdown lists supported actions,
+rather than every command from the terminal UI.
+
+**Switching harness.** A workspace runs one harness at a time, and you can move
+it to another enabled one (Claude Code, Codex, OpenCode) with the harness
+dropdown at the left of the composer's bottom row, or **Switch harness** on the
+agent tab's right-click menu. After you confirm, the current agent stops — a turn
+in progress is cut short — and the new harness resumes its own latest
+conversation in this workspace with the model it last used, or starts a new one
+if it has never run here. Conversations never move between harnesses, because
+each harness's sessions are its own; switching back resumes where that harness
+left off. The dropdown is hidden while only one harness is enabled in Settings,
+and a terminal tab has no harness to switch.
 
 - **The prompt box only appears once Claude Code has a credential** — either
   the `claude_auth` check passes, or you have stored an Anthropic API key under
@@ -1026,6 +1062,18 @@ green and red tints, two line-number columns, scrolling synchronised in both
 axes, and the same highlighting as the editor. A diff does not reload when the
 file changes underneath it — close it and open it again.
 
+**Commit…** in the Changes toolbar opens a checklist of pending changes and a
+commit message. Choose the files to include; unrelated staged files stay staged.
+Right-click a file or directory in Files or Changes to open the same dialog with
+that selection checked. The checklist shows changes since the latest commit,
+including new files, rather than everything differing from the base branch.
+
+**Ignore…** in the toolbar or either tree's right-click menu asks whether to
+ignore the selected file, one of its parent directories up to the workspace
+root, or its file type. It previews the exact rule before adding it to the root
+`.gitignore`. Existing tracked files remain tracked. Both Commit and Ignore are
+also available when working directly in a checkout.
+
 ---
 
 ## Running the web app
@@ -1102,10 +1150,23 @@ everything goes through a per-workspace proxy that checks the host against an
 allowlist and refuses anything else with a 403. The default list covers
 Anthropic, npm, PyPI, crates.io and GitHub. When a connection is refused, the
 Run panel shows a toast on that workspace: **Blocked network access to
-`<host>`**, with **Allow host** and **Dismiss**. Allow host adds the host to
+`<host>`**, with **Allow host**, **Always block** and **Dismiss**. Allow host adds the host to
 that workspace's allowlist and the daemon puts the new list in front of the
 proxy at once — the next attempt goes through with nothing restarted — and
 writes it into the registry, so it survives a daemon restart.
+
+**Always block** saves an explicit block for that workspace and suppresses future
+network notices for the host. The same choice is available on inline network
+notices in an agent's transcript. Block rules override allowed hosts and backend
+model-server grants.
+
+Open **Workspace → Network rules…** to edit the workspace's effective allowed and
+blocked hosts, one host or `*.example.com` wildcard per line. **Save** validates
+both lists before applying either; invalid entries leave the current rules in
+place. Changes persist between sessions and apply to new connections immediately;
+existing connections keep running. If another decision changed the rules while
+the dialog was open, saving reports a conflict so you can reopen it with the
+latest rules.
 
 The proxy also refuses any destination that resolves to a loopback,
 link-local, private, unique-local, unspecified or multicast address, whatever
@@ -1118,8 +1179,8 @@ name was allowed, unless the allowlist entry *is* that literal address.
 **A workspace working directly in a checkout has nothing here to finish.**
 Its changes are already in your checkout, on your own branch — there is no
 Merge, Rebase, Squash, Create PR or Discard, because there is no workspace
-branch for any of them to act on. Commit and push it the way you always have,
-from your own `git` or the agent's; when you are done with the workspace,
+branch for any of them to act on. Use **Commit…** or your own `git` to commit,
+then push from your checkout; when you are done with the workspace,
 **Close workspace…** stops the agent and its sandbox without touching any of
 it (see "Working directly in a checkout" above).
 
@@ -1129,7 +1190,9 @@ The **Changes** tab's toolbar is where work goes back.
 - **Rebase** replays the workspace's commits onto the base and fast-forwards it.
 - **Squash…** lands the lot as one commit whose subject you type. Leave it empty
   and the workspace's last commit subject is used.
-- **Create PR…** asks for a title, a body and a draft flag, then runs
+- **Create PR…** first checks for pending changes and offers **Commit and
+  continue** or **Cancel**. It also explains when there are no commits to publish.
+  Once the checkout is clean, it asks for a title, a body and a draft flag, then runs
   `git push origin bs/<name>/work` followed by `gh pr create` with your own
   credentials, never in a sandbox. The pull request's URL appears in the status
   bar as a link. The push deliberately sets no upstream: `-u` would write
@@ -1162,9 +1225,11 @@ Three things worth knowing before you rely on this:
 - **A merge runs none of your repository's hooks.** The daemon pins
   `core.hooksPath` at an empty directory, so a `post-merge` or `commit-msg` hook
   of yours does not fire for work landed from the Changes tab. The push behind
-  Create PR is the one exception and keeps your hooks, because `pre-push` is how
-  `git-lfs` uploads objects. Your own `git merge` and `git push` are unaffected
-  either way.
+  Create PR keeps your push hooks, because `pre-push` is how `git-lfs` uploads
+  objects. **Commit…** runs no hooks either: it commits content an agent wrote,
+  and a `pre-commit` hook that runs scripts from the worktree would run them
+  outside the sandbox. Your own `git commit`, `git merge` and `git push` are
+  unaffected either way.
 - **`objects_stranded`.** A workspace's commits live in its own object
   directory, and the daemon copies the merged range into the shared store
   afterwards. If that fails the RPC reports `reason: "objects_stranded"` with

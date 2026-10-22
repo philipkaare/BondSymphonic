@@ -145,6 +145,8 @@ for line in sys.stdin:
         if method == "session/load":
             update({"sessionUpdate": "user_message_chunk", "messageId": "msg_old_user", "content": {"type": "text", "text": "old prompt"}})
             update({"sessionUpdate": "agent_message_chunk", "messageId": "msg_old", "content": {"type": "text", "text": "replayed"}})
+        if mode == "commands":
+            update({"sessionUpdate":"available_commands_update", "availableCommands":[{"name":"replay", "description":"During loading"}]})
         result = {"configOptions": [{"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "provider/default", "options": []}]} if mode != "legacy" else {"models": {"currentModelId": "provider/default"}}
         if method == "session/new":
             result["sessionId"] = session
@@ -153,6 +155,9 @@ for line in sys.stdin:
         answer(request, result)
     elif method == "session/set_config_option":
         assert p["configId"] == "model" and p["value"] == "provider/model"
+        if mode == "commands":
+            emit({"method":"session/update", "params":{"sessionId":"unrelated", "update":{"sessionUpdate":"available_commands_update", "availableCommands":[{"name":"wrong"}]}}})
+            update({"sessionUpdate":"available_commands_update", "availableCommands":[{"name":"idle", "description":"While idle"}]})
         answer(request, {"configOptions": []})
     elif method == "session/set_model":
         assert mode == "legacy" and p["modelId"] == "provider/model"

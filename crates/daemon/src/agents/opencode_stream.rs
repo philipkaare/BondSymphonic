@@ -14,6 +14,30 @@ use bondsymphonic_proto::{AgentMessageBody, TurnUsage};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
+/// Keep the ACP command catalog in the transcript so reconnects restore completion.
+pub fn command_metadata(update: &Value) -> AgentMessageBody {
+    let commands: Vec<Value> = update["availableCommands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|command| {
+            let name = command["name"].as_str()?.trim_start_matches('/');
+            if name.is_empty() || name.chars().any(char::is_whitespace) {
+                return None;
+            }
+            let mut row = json!({"name":name,"description":command["description"].as_str().unwrap_or_default()});
+            if let Some(hint) = command["input"]["hint"].as_str() {
+                row["argument_hint"] = json!(hint);
+            }
+            Some(row)
+        })
+        .collect();
+    AgentMessageBody::System {
+        subtype: "agent_commands".into(),
+        data: json!({"commands":commands}),
+    }
+}
+
 #[derive(Default)]
 pub struct OpenCodeStream {
     /// Every field seen for each of this turn's tool calls, merged.
@@ -130,6 +154,8 @@ impl OpenCodeStream {
             }
             // Bookkeeping, replayed history and plans: none of it is the
             // conversation, and most of it arrives once per step.
+            // The command catalogue is metadata the adapter forwards itself
+            // (`command_metadata`), before replay and idle filtering.
             "available_commands_update"
             | "current_mode_update"
             | "config_option_update"
@@ -545,6 +571,31 @@ mod tests {
         assert_eq!(
             stream.finish_turn().0,
             vec![AgentMessageBody::AssistantText { text: "two".into() }]
+        );
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn commands_are_normalized_into_replayable_metadata() {
+        let row = command_metadata(&json!({
+            "sessionUpdate":"available_commands_update",
+            "availableCommands":[
+                {"name":"review","description":"Review changes","input":{"hint":"target"}},
+                {"name":"/two words","description":"refused"}
+            ]
+        }));
+        assert_eq!(
+            row,
+            AgentMessageBody::System {
+                subtype: "agent_commands".into(),
+                data: json!({"commands":[
+                    {"name":"review","description":"Review changes","argument_hint":"target"}
+                ]})
+            }
         );
     }
 }

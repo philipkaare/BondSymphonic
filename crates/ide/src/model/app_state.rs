@@ -218,6 +218,9 @@ impl TabStatus {
 pub struct AgentTab {
     pub workspace_id: WorkspaceId,
     pub name: String,
+    /// The display name chosen in the IDE, separate from the daemon's workspace name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_override: Option<String>,
     pub repo_path: String,
     pub branch: String,
     /// The branch this workspace was forked from and merges back into, from
@@ -491,19 +494,20 @@ impl AgentTab {
     /// terminal workspace is remembered locally instead; see
     /// [`Workspaces::from_persisted`].
     ///
-    /// The last entry rather than a search for a running one: the daemon lists
-    /// a workspace's agents oldest first, handing restored ones their place
-    /// before any new agent can take it, and an agent that has ended is exactly
-    /// the one worth coming back to -- its transcript replays and its Restart
-    /// resumes the session.
+    /// Prefer a live agent for the latest harness, then its latest saved
+    /// conversation. An empty failed start must not hide earlier history.
     pub fn from_workspace_info(info: &WorkspaceInfo) -> AgentTab {
         // `agent_records` rather than `agents`: the bare ids beside it say
         // nothing about the adapter, and a daemon too old to send the records
         // leaves them empty, which is the terminal tab this built before.
-        let agent = info.agent_records.last();
+        let agent = info
+            .agent_records
+            .last()
+            .and_then(|latest| preferred_agent(info, latest.adapter));
         AgentTab {
             workspace_id: info.id.clone(),
             name: info.name.clone(),
+            name_override: None,
             repo_path: info.repo_path.clone(),
             branch: info.branch.clone(),
             base_branch: info.base_branch.clone(),
@@ -525,6 +529,31 @@ impl AgentTab {
     }
 }
 
+/// Records are oldest first. Keep selection within the chosen harness so a
+/// saved conversation from another adapter cannot change a tab's backend.
+fn preferred_agent(info: &WorkspaceInfo, adapter: AgentAdapterKind) -> Option<&AgentSummary> {
+    preferred_record(&info.agent_records, adapter)
+}
+
+/// [`preferred_agent`] over bare records, oldest first.
+pub(crate) fn preferred_record(
+    records: &[AgentSummary],
+    adapter: AgentAdapterKind,
+) -> Option<&AgentSummary> {
+    let matching = || records.iter().rev().filter(|a| a.adapter == adapter);
+    matching()
+        .find(|a| {
+            matches!(
+                a.state,
+                AgentState::Idle | AgentState::Working | AgentState::WaitingPermission
+            )
+        })
+        .or_else(|| {
+            matching().find(|a| a.session_id.as_ref().is_some_and(|s| !s.trim().is_empty()))
+        })
+        .or_else(|| matching().next())
+}
+
 /// The `options_json` a tab restored onto `agent` carries: the options the
 /// daemon says it was started with, as an `AgentStartOptions` object.
 ///
@@ -540,7 +569,7 @@ impl AgentTab {
 /// leaves it with nothing while the daemon still holds the id the agent
 /// reported. Restarting into a fresh session there loses the conversation the
 /// user is looking at, which is the one thing Restart exists to keep.
-fn restart_options_json(agent: &AgentSummary) -> String {
+pub(crate) fn restart_options_json(agent: &AgentSummary) -> String {
     let mut options = serde_json::Map::new();
     if agent.adapter != AgentAdapterKind::Claude {
         options.insert(
@@ -656,6 +685,14 @@ impl Workspaces {
                 // exist only in `state.json`, so this is the one place they can
                 // come back from.
                 if let Some(saved) = persisted.tab(id) {
+                    if let Some(name) = saved
+                        .name_override
+                        .as_ref()
+                        .filter(|n| !n.trim().is_empty())
+                    {
+                        tab.name = name.clone();
+                        tab.name_override = Some(name.clone());
+                    }
                     tab.command = saved.command.clone();
                     tab.run_config = saved.run_config.clone();
                     // Only for a workspace the daemon has no agent for. An
@@ -730,11 +767,13 @@ impl Workspaces {
                     .iter()
                     .filter(|t| {
                         t.command.is_some()
+                            || t.name_override.is_some()
                             || t.run_config.is_some()
                             || t.adapter != AgentAdapterKind::Claude
                     })
                     .map(|t| PersistedTab {
                         workspace_id: t.workspace_id.0.clone(),
+                        name_override: t.name_override.clone(),
                         command: t.command.clone(),
                         run_config: t.run_config.clone(),
                         // Recorded only when it is not the default, so the
@@ -978,6 +1017,27 @@ impl Workspaces {
     /// choosing a model or a permission mode. Letting an empty string through
     /// would turn a choice into its absence, which is the one thing this must
     /// not do quietly.
+    /// Moves the tab to another harness: its adapter, and the options its next
+    /// start or restart uses. Refused for a terminal on either side (a shell
+    /// pane is a different widget) and for a workspace that is not tracked.
+    pub fn set_tab_adapter(
+        &mut self,
+        id: &WorkspaceId,
+        adapter: AgentAdapterKind,
+        options: &str,
+    ) -> bool {
+        let Some((g, t)) = self.find(id) else {
+            return false;
+        };
+        let tab = &mut self.groups[g].tabs[t];
+        if adapter == AgentAdapterKind::Terminal || tab.adapter == AgentAdapterKind::Terminal {
+            return false;
+        }
+        tab.adapter = adapter;
+        tab.options_json = options.to_owned();
+        true
+    }
+
     pub fn set_tab_options(&mut self, id: &WorkspaceId, options: &str) -> bool {
         if options.is_empty() {
             return false;
@@ -1007,6 +1067,47 @@ impl Workspaces {
     pub fn apply_workspace_info(&mut self, info: &WorkspaceInfo) -> Option<(usize, usize)> {
         let (g, t) = self.find(&info.id)?;
         let tab = &mut self.groups[g].tabs[t];
+        let current = tab
+            .agent_id
+            .as_ref()
+            .and_then(|id| info.agent_records.iter().find(|a| &a.id == id));
+        // A current live agent belongs to this tab even if another record is
+        // newer. An id missing from the snapshot may have just been started;
+        // wait for a snapshot that knows it before replacing it.
+        let selected = match current {
+            Some(agent)
+                if matches!(
+                    agent.state,
+                    AgentState::Idle | AgentState::Working | AgentState::WaitingPermission
+                ) =>
+            {
+                Some(agent)
+            }
+            _ if tab.agent_id.is_none() || current.is_some() => preferred_agent(info, tab.adapter),
+            _ => None,
+        };
+        if let Some(agent) = selected.filter(|a| a.adapter == tab.adapter) {
+            if tab.agent_id.as_ref() != Some(&agent.id) {
+                tab.agent_id = Some(agent.id.clone());
+                tab.agent_status = Some(TabStatus::from_agent_state(&agent.state));
+                tab.agent_detail.clear();
+                tab.options_json = restart_options_json(agent);
+            } else if agent
+                .session_id
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                // Seed resume while transcript replay is still catching up,
+                // preserving local model/permission choices and other options.
+                let mut options =
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                        &tab.options_json,
+                    )
+                    .unwrap_or_default();
+                options.insert("resume_session".into(), serde_json::json!(agent.session_id));
+                tab.options_json = serde_json::Value::Object(options).to_string();
+            }
+        }
         let agent_owns_status =
             tab.agent_id.is_some() && matches!(info.state, WorkspaceState::Ready);
         if agent_owns_status {
@@ -1030,6 +1131,24 @@ impl Workspaces {
         // warning the daemon sent about it is put back on.
         self.apply_note(&info.id);
         Some((g, t))
+    }
+
+    /// Renames a tab by stable workspace id, including one that is not selected.
+    pub fn rename_agent(&mut self, id: &WorkspaceId, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let Some((g, t)) = self.find(id) else {
+            return false;
+        };
+        let tab = &mut self.groups[g].tabs[t];
+        tab.name = name.to_owned();
+        tab.name_override = Some(name.to_owned());
+        if !tab.attention.is_empty() {
+            tab.attention = permission_attention(name);
+        }
+        true
     }
 
     /// Marks the workspace's tab as carrying a failed operation, with `detail`
@@ -1535,6 +1654,7 @@ mod tests {
         AgentTab {
             workspace_id: WorkspaceId(id.to_owned()),
             name: id.to_owned(),
+            name_override: None,
             repo_path: "/repo".to_owned(),
             branch: format!("bs/{id}/work"),
             base_branch: "main".to_owned(),

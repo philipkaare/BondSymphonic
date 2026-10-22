@@ -1,5 +1,6 @@
 pub mod agent_sandboxes;
 pub mod changes;
+pub mod editing;
 pub mod in_place;
 pub mod lifecycle;
 pub mod registry;
@@ -20,6 +21,9 @@ pub struct Workspace {
     pub worktree_path: PathBuf,
     pub created_at: String,
     pub allowlist: Vec<String>,
+    /// Explicit workspace blocks take precedence over all network grants.
+    #[serde(default)]
+    pub blocklist: Vec<String>,
     pub state: WorkspaceState,
     pub agents: Vec<AgentId>,
     pub runs: Vec<RunId>,
@@ -43,6 +47,7 @@ impl Workspace {
             worktree_path: self.worktree_path.to_string_lossy().into_owned(),
             created_at: self.created_at.clone(),
             allowlist: self.allowlist.clone(),
+            blocklist: self.blocklist.clone(),
             kind: self.kind,
             state: self.state.clone(),
             // Both agent lists are left empty here and filled in by

@@ -315,3 +315,25 @@ async fn each_turn_row_carries_that_turns_tokens_and_context() {
     assert_eq!(usages[1].context_tokens, Some(2460));
     adapter.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn slash_commands_use_native_compaction_and_local_status() {
+    let (_dir, mut agent, entry, store) = fixture("commands", None).await;
+    agent.start().await.unwrap();
+    agent.send("/compact".into()).await.unwrap();
+    agent.send("/status".into()).await.unwrap();
+    assert!(agent.send("/compact unexpected".into()).await.is_err());
+    assert_eq!(entry.state().0, AgentState::Idle);
+    let rows = store.read(&AgentId("agent".into())).await.unwrap();
+    assert!(rows.iter().any(|row| matches!(&row.body,
+        AgentMessageBody::System { subtype, data }
+        if subtype == "agent_commands" && data["commands"][0]["name"] == "compact")));
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(&row.body,
+        AgentMessageBody::System { subtype, .. } if subtype == "agent_command_result"))
+            .count(),
+        2
+    );
+    agent.stop().await.unwrap();
+}

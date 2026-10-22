@@ -646,6 +646,7 @@ async fn destroy_refuses_a_worktree_path_the_daemon_would_never_have_made() {
             worktree_path: repo.clone(),
             created_at: bondsymphonic_daemon::workspace::now_rfc3339(),
             allowlist: vec![],
+            blocklist: vec![],
             state: WorkspaceState::Ready,
             agents: vec![],
             runs: vec![],

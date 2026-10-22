@@ -84,6 +84,9 @@ pub mod qobject {
         #[qinvokable]
         fn rename_group(self: Pin<&mut GroupModel>, idx: i32, name: QString) -> bool;
 
+        #[qinvokable]
+        fn rename_agent(self: Pin<&mut GroupModel>, workspace_id: QString, name: QString) -> bool;
+
         /// Adds a tab for the `WorkspaceInfo` in `info_json` to the group named
         /// `group_name`, creating that group if it does not exist, and makes it
         /// active. An empty `group_name` is not a group called "": it means the
@@ -249,6 +252,11 @@ pub mod qobject {
         #[qinvokable]
         fn workspace_name(self: &GroupModel, workspace_id: QString) -> QString;
 
+        /// `workspace_id`'s tab adapter word (`claude`, `codex`, `opencode`,
+        /// `terminal`), or empty. The tab menu offers the other harnesses.
+        #[qinvokable]
+        fn workspace_adapter(self: &GroupModel, workspace_id: QString) -> QString;
+
         /// Whether `workspace_id` works directly in its repository's checkout.
         /// The window words Close and the menus from it; false for a workspace
         /// the model does not track.
@@ -350,6 +358,17 @@ pub mod qobject {
         fn set_tab_options(
             self: Pin<&mut GroupModel>,
             workspace_id: QString,
+            options_json: QString,
+        ) -> bool;
+
+        /// Moves the workspace's tab to another harness (`claude`, `codex`,
+        /// `opencode`) with the options its next start uses. False for an
+        /// unknown adapter, a terminal tab, or an untracked workspace.
+        #[qinvokable]
+        fn set_tab_adapter(
+            self: Pin<&mut GroupModel>,
+            workspace_id: QString,
+            adapter: QString,
             options_json: QString,
         ) -> bool;
     }
@@ -640,6 +659,19 @@ impl qobject::GroupModel {
             .rust_mut()
             .workspaces
             .rename_group(idx, &name.to_string());
+        if ok {
+            self.publish();
+        }
+        ok
+    }
+
+    pub fn rename_agent(mut self: Pin<&mut Self>, workspace_id: QString, name: QString) -> bool {
+        let id = WorkspaceId(workspace_id.to_string());
+        let ok = self
+            .as_mut()
+            .rust_mut()
+            .workspaces
+            .rename_agent(&id, &name.to_string());
         if ok {
             self.publish();
         }
@@ -968,6 +1000,17 @@ impl qobject::GroupModel {
         }
     }
 
+    pub fn workspace_adapter(&self, workspace_id: QString) -> QString {
+        let id = WorkspaceId(workspace_id.to_string());
+        self.rust()
+            .workspaces
+            .find(&id)
+            .and_then(|(g, t)| self.rust().workspaces.groups.get(g)?.tabs.get(t))
+            .map_or_else(QString::default, |tab| {
+                QString::from(crate::model::backends::word(tab.adapter))
+            })
+    }
+
     pub fn workspace_name(&self, workspace_id: QString) -> QString {
         let id = WorkspaceId(workspace_id.to_string());
         match self
@@ -1142,6 +1185,27 @@ impl qobject::GroupModel {
         true
     }
 
+    pub fn set_tab_adapter(
+        mut self: Pin<&mut Self>,
+        workspace_id: QString,
+        adapter: QString,
+        options_json: QString,
+    ) -> bool {
+        let Some(adapter) = crate::model::backends::parse(&adapter.to_string()) else {
+            return false;
+        };
+        let id = WorkspaceId(workspace_id.to_string());
+        if !self.as_mut().rust_mut().workspaces.set_tab_adapter(
+            &id,
+            adapter,
+            &options_json.to_string(),
+        ) {
+            return false;
+        }
+        self.publish();
+        true
+    }
+
     fn tab_at(&self, group_idx: i32, tab_idx: i32) -> Option<&AgentTab> {
         let (g, t) = (index(group_idx)?, index(tab_idx)?);
         self.rust().workspaces.groups.get(g)?.tabs.get(t)
@@ -1179,6 +1243,7 @@ mod tests {
         AgentTab {
             workspace_id: WorkspaceId("ws_x".to_owned()),
             name: "x".to_owned(),
+            name_override: None,
             repo_path: "/r".to_owned(),
             branch: "bs/x/work".to_owned(),
             base_branch: "main".to_owned(),
@@ -1225,6 +1290,7 @@ mod tests {
             worktree_path: format!("/wt/{id}"),
             created_at: "2026-09-11T10:00:00Z".to_owned(),
             allowlist: Vec::new(),
+            blocklist: vec![],
             kind: bondsymphonic_proto::WorkspaceKind::Worktree,
             state: WorkspaceState::Ready,
             agents: Vec::new(),

@@ -1,5 +1,6 @@
 #pragma once
 #include <QList>
+#include <QPair>
 #include <QPointer>
 #include <QSet>
 #include <QString>
@@ -50,6 +51,9 @@ public:
     TranscriptModel* model() const;
     void setBackend(const QString &backend);
     QString backend() const { return m_backend; }
+    /// The harnesses this pane may switch to, as (id, label) pairs. The combo
+    /// is hidden while there is nothing to switch between.
+    void setHarnessChoices(const QList<QPair<QString, QString>>& choices);
 
     /// Whether an `agent.start` for this pane is in flight. The prompt box says
     /// "starting the agent" only while this is true, and the two dropdowns are
@@ -161,6 +165,7 @@ signals:
     /// A restart was asked for. The area turns this into the workspace id the
     /// window needs; this view knows only its model.
     void startAgentRequested();
+    void resumeSessionRequested(const QString& session);
 
     /// The user chose a different model or permission mode, and `optionsJson`
     /// is the whole `AgentStartOptions` that choice means -- this tab's own
@@ -171,6 +176,10 @@ signals:
     /// carries the options rather than the choice because the merge needs the
     /// session id, which lives on the model and nowhere the window can see.
     void optionsChanged(const QString& optionsJson);
+    /// The user picked another harness in the composer. The combo snaps back
+    /// to the current one: the switch is the window's to confirm and make, and
+    /// `setBackend` moves the combo once it has happened.
+    void harnessChangeRequested(const QString& backend);
 
     /// The user pressed "Log in to Claude Code…". The window answers by opening
     /// Settings on its Setup section; this view knows nothing about dialogs.
@@ -198,6 +207,8 @@ private:
     void onPermissionRequested();
     void onBusyChanged();
     void onStateChanged();
+    void refreshCommandCatalog();
+    void submitPrompt(const QString& text);
     /// Puts the tab's own options into the two dropdowns. Guarded, because a
     /// combo told what the agent already runs on must not read as the user
     /// asking for a restart.
@@ -318,6 +329,9 @@ private:
     /// the question occurs to them.
     QComboBox* m_modelChoice = nullptr;
     QComboBox* m_permissionChoice = nullptr;
+    /// Which harness answers in this workspace; changing it is a switch.
+    QComboBox* m_harnessChoice = nullptr;
+    void selectHarness();
     /// True while [`applyOptionsToChoices`] is setting the dropdowns. Without
     /// it, showing a tab what it already runs on would restart it.
     bool m_applyingOptions = false;

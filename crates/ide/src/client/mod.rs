@@ -70,6 +70,10 @@ pub const MERGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// ... already exists".
 pub const CREATE_PR_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// A selected-file commit prepares an index, runs the user's hooks, and updates
+/// the real index afterward. Like PR creation, it may outlast an ordinary RPC.
+pub const COMMIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// What `repo.inspect` and `workspace.create` get instead.
 ///
 /// The same two minutes, for the same kind of reason: both walk a repository
@@ -111,10 +115,13 @@ pub fn default_timeout_for(method: &str) -> Duration {
         // merge of the same repository may be holding.
         "workspace.merge" | "workspace.fetch" => MERGE_REQUEST_TIMEOUT,
         "workspace.create_pr" => CREATE_PR_REQUEST_TIMEOUT,
+        "workspace.commit" => COMMIT_REQUEST_TIMEOUT,
         "repo.inspect"
         | "workspace.create"
         | "workspace.restart"
         | "workspace.changes"
+        | "workspace.prepare_commit"
+        | "workspace.ignore_options"
         | "repo.detect_run_configs"
         // A first OpenCode start brings up a companion sandbox, proxy, shim
         // and tunnels, reads the Windows config over a cold `/mnt/c` and runs

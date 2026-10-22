@@ -12,6 +12,8 @@
 #include <QFont>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QDialogButtonBox>
+#include <QPushButton>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -420,6 +422,10 @@ void GroupBar::openGroupMenu(int index, const QPoint& globalPos) {
     }
 }
 
+void GroupBar::setHarnessChoices(const QList<QPair<QString, QString>>& choices) {
+    m_harnessChoices = choices;
+}
+
 void GroupBar::openAgentMenu(int index, const QPoint& globalPos) {
     // Both read before the menu runs, for the reason spelled out in
     // `openGroupMenu`: the id is what gets destroyed and the name is what the
@@ -432,6 +438,24 @@ void GroupBar::openAgentMenu(int index, const QPoint& globalPos) {
 
     QMenu menu(this);
     QAction* newAction = menu.addAction("New agent…");
+    QAction* renameAction = workspaceId.isEmpty() ? nullptr : menu.addAction("Rename agent…");
+    if (renameAction != nullptr) {
+        renameAction->setObjectName(QStringLiteral("GroupBarRenameAgentAction"));
+    }
+    // Every harness but the one running here; a shell tab has no harness.
+    QMenu* harnessMenu = nullptr;
+    const QString adapter = workspaceId.isEmpty() ? QString() : m_model->workspaceAdapter(workspaceId);
+    if (!adapter.isEmpty() && adapter != QLatin1String("terminal") && m_harnessChoices.size() > 1) {
+        harnessMenu = menu.addMenu(QStringLiteral("Switch harness"));
+        harnessMenu->setObjectName(QStringLiteral("GroupBarSwitchHarnessMenu"));
+        for (const auto& [id, label] : m_harnessChoices) {
+            QAction* action = harnessMenu->addAction(label);
+            action->setData(id);
+            action->setCheckable(true);
+            action->setChecked(id == adapter);
+            action->setEnabled(id != adapter);
+        }
+    }
     QAction* destroyAction =
         workspaceId.isEmpty()
             ? nullptr
@@ -448,8 +472,36 @@ void GroupBar::openAgentMenu(int index, const QPoint& globalPos) {
     }
     if (chosen == newAction) {
         emit newAgentRequested();
+    } else if (chosen == renameAction) {
+        const QString currentName = m_model->workspaceName(workspaceId);
+        if (currentName.isEmpty()) {
+            QMessageBox::information(this, QStringLiteral("Rename agent"),
+                QStringLiteral("This agent is no longer open."));
+            return;
+        }
+        QInputDialog dialog(this);
+        dialog.setObjectName(QStringLiteral("RenameAgentDialog"));
+        dialog.setWindowTitle(QStringLiteral("Rename agent"));
+        dialog.setLabelText(QStringLiteral("Agent name:"));
+        dialog.setInputMode(QInputDialog::TextInput);
+        dialog.setTextValue(currentName);
+        const auto validate = [&dialog](const QString& text) {
+            dialog.setOkButtonText(QStringLiteral("Rename"));
+            if (auto* buttons = dialog.findChild<QDialogButtonBox*>()) {
+                buttons->button(QDialogButtonBox::Ok)->setEnabled(!text.trimmed().isEmpty());
+            }
+        };
+        QObject::connect(&dialog, &QInputDialog::textValueChanged, &dialog, validate);
+        validate(dialog.textValue());
+        if (dialog.exec() != QDialog::Accepted) { return; }
+        if (!m_model->renameAgent(workspaceId, dialog.textValue())) {
+            QMessageBox::information(this, QStringLiteral("Rename agent"),
+                QStringLiteral("This agent is no longer open, or its name is blank."));
+        }
     } else if (chosen == destroyAction) {
         emit destroyRequested(workspaceId, workspaceName);
+    } else if (harnessMenu != nullptr && chosen->parent() == harnessMenu) {
+        emit switchHarnessRequested(workspaceId, chosen->data().toString());
     }
 }
 

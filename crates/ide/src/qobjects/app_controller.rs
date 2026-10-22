@@ -562,6 +562,18 @@ pub mod qobject {
         #[qsignal]
         fn agent_started(self: Pin<&mut AppController>, workspace_id: QString, agent_id: QString);
 
+        /// `switch_harness` decided: the workspace's tab is `adapter` from now
+        /// on, with `options_json` for its starts. Emitted after the other
+        /// harnesses' agents were asked to stop and before the target agent
+        /// is attached or started, whose answer is `agent_started` as usual.
+        #[qsignal]
+        fn harness_switched(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            adapter: QString,
+            options_json: QString,
+        );
+
         /// An agent changed state. `state` is the daemon's snake_case word
         /// ("idle", "working", "waiting_permission", "error", "exited") and
         /// `detail` its explanation, or empty.
@@ -802,6 +814,22 @@ pub mod qobject {
         #[qinvokable]
         fn start_agent(self: Pin<&mut AppController>, workspace_id: QString, options_json: QString);
 
+        /// Moves a workspace to another harness (`claude`, `codex`,
+        /// `opencode`): stops the live agents of the others, then attaches to
+        /// a live agent of the target, resumes its latest session, or starts
+        /// it fresh. Answers with `harness_switched` then `agent_started`, or
+        /// `operation_failed("agent.start", ...)`.
+        #[qinvokable]
+        fn switch_harness(self: Pin<&mut AppController>, workspace_id: QString, adapter: QString);
+
+        #[qinvokable]
+        fn resume_agent(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            options_json: QString,
+            session: QString,
+        );
+
         /// Destroy a workspace. Answers with `workspace_destroyed` or
         /// `operation_failed`.
         #[qinvokable]
@@ -845,6 +873,26 @@ pub mod qobject {
         /// answers with `operation_failed("workspace.set_allowlist", ...)`.
         #[qinvokable]
         fn set_allowlist(self: Pin<&mut AppController>, workspace_id: QString, hosts_json: QString);
+
+        #[qinvokable]
+        fn load_network_rules(self: Pin<&mut AppController>, workspace_id: QString);
+
+        #[qinvokable]
+        fn set_network_rules(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            rules_json: QString,
+        );
+
+        #[qsignal]
+        fn network_rules_loaded(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            json: QString,
+        );
+
+        #[qsignal]
+        fn network_rules_saved(self: Pin<&mut AppController>, workspace_id: QString);
 
         /// Translates a Windows path to the WSL path the daemon expects, or
         /// returns an empty string if it is not a translatable path.
@@ -1272,6 +1320,58 @@ pub mod qobject {
             self: Pin<&mut AppController>,
             workspace_id: QString,
             json: QString,
+        );
+
+        /// Working/index changes used by Commit and the PR preflight.
+        #[qsignal]
+        fn commit_prepared(self: Pin<&mut AppController>, workspace_id: QString, json: QString);
+
+        #[qsignal]
+        fn workspace_committed(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            commit: QString,
+        );
+
+        #[qsignal]
+        fn ignore_options_ready(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            json: QString,
+        );
+
+        #[qsignal]
+        fn workspace_ignored(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            pattern: QString,
+        );
+
+        #[qinvokable]
+        fn prepare_commit(self: Pin<&mut AppController>, workspace_id: QString);
+
+        #[qinvokable]
+        fn commit_workspace(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            paths_json: QString,
+            message: QString,
+        );
+
+        #[qinvokable]
+        fn prepare_ignore(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            path: QString,
+            directory: bool,
+        );
+
+        #[qinvokable]
+        fn ignore_workspace(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            path: QString,
+            target: QString,
         );
 
         /// A merge, pull request or discard failed. `op` is the daemon method
@@ -3316,6 +3416,181 @@ impl qobject::AppController {
         );
     }
 
+    pub fn resume_agent(
+        self: Pin<&mut Self>,
+        workspace_id: QString,
+        options_json: QString,
+        session: QString,
+    ) {
+        use crate::model::commands::{resume_target, ResumeTarget};
+        let qt = self.qt_thread();
+        let workspace = WorkspaceId(workspace_id.to_string());
+        let options_json = options_json.to_string();
+        let (adapter, mut options) = match self.resolved_start(&options_json) {
+            Ok(start) => start,
+            Err(message) => {
+                report_agent_failure(
+                    &qt,
+                    workspace.to_string(),
+                    "agent.start",
+                    message,
+                    Some(options_json),
+                );
+                return;
+            }
+        };
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_agent_failure(
+                    &qt,
+                    workspace.to_string(),
+                    "agent.start",
+                    message.to_owned(),
+                    Some(options_json),
+                );
+                return;
+            }
+        };
+        let session = session.to_string();
+        runtime().spawn(async move {
+            let info = match shared
+                .client
+                .request::<WorkspaceInfo>(Request::WorkspaceGet(WorkspaceIdParams {
+                    workspace_id: workspace.clone(),
+                }))
+                .await
+            {
+                Ok(info) => info,
+                Err(error) => {
+                    report_agent_failure(
+                        &qt,
+                        workspace.to_string(),
+                        "agent.start",
+                        error.to_string(),
+                        Some(options_json),
+                    );
+                    return;
+                }
+            };
+            match resume_target(&info.agent_records, adapter, &session) {
+                Ok(ResumeTarget::Attach(agent)) => {
+                    let _ = qt.queue(move |mut q| {
+                        q.as_mut()
+                            .register_agent_backend(agent.to_string(), adapter);
+                        q.agent_started(
+                            QString::from(workspace.as_str()),
+                            QString::from(agent.as_str()),
+                        );
+                    });
+                }
+                Ok(ResumeTarget::Session(session)) => {
+                    options.resume_session = Some(session.clone());
+                    let mut json = serde_json::from_str::<serde_json::Value>(&options_json)
+                        .ok()
+                        .filter(serde_json::Value::is_object)
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    json["resume_session"] = serde_json::json!(session);
+                    start_agent_and_prompt(
+                        shared,
+                        qt,
+                        workspace,
+                        adapter,
+                        options,
+                        json.to_string(),
+                        String::new(),
+                        false,
+                    )
+                    .await;
+                }
+                Err(message) => {
+                    report_agent_failure(&qt, workspace.to_string(), "agent.start", message, None)
+                }
+            }
+        });
+    }
+
+    pub fn switch_harness(self: Pin<&mut Self>, workspace_id: QString, adapter: QString) {
+        let qt = self.qt_thread();
+        let workspace = WorkspaceId(workspace_id.to_string());
+        let word = adapter.to_string();
+        // Refused here, before anything is stopped: a harness that is off in
+        // Settings or missing from the daemon must not cost the running agent.
+        let target = match self.resolved_start(&serde_json::json!({ "adapter": word }).to_string())
+        {
+            Ok((kind, _)) => kind,
+            Err(message) => {
+                report_agent_failure(&qt, workspace.to_string(), "agent.start", message, None);
+                return;
+            }
+        };
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_agent_failure(
+                    &qt,
+                    workspace.to_string(),
+                    "agent.start",
+                    message.to_owned(),
+                    None,
+                );
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            let info = match shared
+                .client
+                .request::<WorkspaceInfo>(Request::WorkspaceGet(WorkspaceIdParams {
+                    workspace_id: workspace.clone(),
+                }))
+                .await
+            {
+                Ok(info) => info,
+                Err(error) => {
+                    report_agent_failure(
+                        &qt,
+                        workspace.to_string(),
+                        "agent.start",
+                        error.to_string(),
+                        None,
+                    );
+                    return;
+                }
+            };
+            let plan = crate::model::commands::plan_harness_switch(&info.agent_records, target);
+            for agent_id in plan.stop {
+                // Best effort: an agent that already ended answers with an
+                // error, and the switch must not stall behind it.
+                if let Err(error) = shared
+                    .client
+                    .request::<serde_json::Value>(Request::AgentStop(AgentIdParams {
+                        agent_id: agent_id.clone(),
+                    }))
+                    .await
+                {
+                    tracing::warn!(%agent_id, %error, "switch harness: stopping the old agent failed");
+                }
+            }
+            let _ = qt.queue(move |mut q| {
+                let id = QString::from(workspace.as_str());
+                let options = QString::from(&plan.options_json);
+                q.as_mut().harness_switched(
+                    id.clone(),
+                    QString::from(crate::model::backends::word(target)),
+                    options.clone(),
+                );
+                match plan.attach {
+                    Some(agent) => {
+                        q.as_mut()
+                            .register_agent_backend(agent.to_string(), target);
+                        q.agent_started(id, QString::from(agent.as_str()));
+                    }
+                    None => q.start_agent(id, options),
+                }
+            });
+        });
+    }
+
     pub fn start_agent(self: Pin<&mut Self>, workspace_id: QString, options_json: QString) {
         let qt = self.qt_thread();
         let workspace = WorkspaceId(workspace_id.to_string());
@@ -3573,6 +3848,99 @@ impl qobject::AppController {
                     });
                 }
                 Err(e) => report_failure(&qt, "repo.detect_run_configs", e.to_string()),
+            }
+        });
+    }
+
+    pub fn load_network_rules(self: Pin<&mut Self>, workspace_id: QString) {
+        let qt = self.qt_thread();
+        let workspace = workspace_id.to_string();
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_workspace_op_failure(&qt, workspace, "workspace.get", message.to_owned());
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            let result = shared
+                .client
+                .request::<WorkspaceInfo>(Request::WorkspaceGet(WorkspaceIdParams {
+                    workspace_id: WorkspaceId(workspace.clone()),
+                }))
+                .await;
+            match result {
+                Ok(info) => {
+                    let json =
+                        serde_json::json!({"allow": info.allowlist, "block": info.blocklist})
+                            .to_string();
+                    let _ = qt.queue(move |q| {
+                        q.network_rules_loaded(QString::from(&workspace), QString::from(&json))
+                    });
+                }
+                Err(e) => {
+                    report_workspace_op_failure(&qt, workspace, "workspace.get", e.to_string())
+                }
+            }
+        });
+    }
+
+    pub fn set_network_rules(self: Pin<&mut Self>, workspace_id: QString, rules_json: QString) {
+        let qt = self.qt_thread();
+        let workspace = workspace_id.to_string();
+        #[derive(serde::Deserialize)]
+        struct Rules {
+            allow: Vec<String>,
+            block: Vec<String>,
+            expected_allow: Vec<String>,
+            expected_block: Vec<String>,
+        }
+        let rules: Rules = match serde_json::from_str(&rules_json.to_string()) {
+            Ok(rules) => rules,
+            Err(e) => {
+                report_workspace_op_failure(
+                    &qt,
+                    workspace,
+                    "workspace.set_network_rules",
+                    e.to_string(),
+                );
+                return;
+            }
+        };
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_workspace_op_failure(
+                    &qt,
+                    workspace,
+                    "workspace.set_network_rules",
+                    message.to_owned(),
+                );
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            let params = WorkspaceSetNetworkRulesParams {
+                workspace_id: WorkspaceId(workspace.clone()),
+                allow: rules.allow,
+                block: rules.block,
+                expected_allow: Some(rules.expected_allow),
+                expected_block: Some(rules.expected_block),
+            };
+            match shared
+                .client
+                .request_raw(Request::WorkspaceSetNetworkRules(params))
+                .await
+            {
+                Ok(_) => {
+                    let _ = qt.queue(move |q| q.network_rules_saved(QString::from(&workspace)));
+                }
+                Err(e) => report_workspace_op_failure(
+                    &qt,
+                    workspace,
+                    "workspace.set_network_rules",
+                    e.to_string(),
+                ),
             }
         });
     }
@@ -4719,6 +5087,220 @@ impl qobject::AppController {
                             &qt,
                             workspace,
                             "workspace.merge",
+                            message,
+                            data,
+                        );
+                    }
+                }
+            },
+        );
+    }
+
+    pub fn prepare_commit(self: Pin<&mut Self>, workspace_id: QString) {
+        let workspace = workspace_id.to_string();
+        let qt = self.qt_thread();
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_workspace_failure(
+                    &qt,
+                    workspace,
+                    "workspace.prepare_commit",
+                    message.to_owned(),
+                    String::new(),
+                );
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            let params = WorkspaceIdParams {
+                workspace_id: WorkspaceId(workspace.clone()),
+            };
+            match shared
+                .client
+                .request::<PrepareCommitResult>(Request::WorkspacePrepareCommit(params))
+                .await
+            {
+                Ok(result) => {
+                    let json = serde_json::to_string(&result).unwrap_or_default();
+                    let _ = qt.queue(move |q| {
+                        q.commit_prepared(QString::from(&workspace), QString::from(&json))
+                    });
+                }
+                Err(error) => {
+                    let (message, data) = failure_parts(&error);
+                    report_workspace_failure(
+                        &qt,
+                        workspace,
+                        "workspace.prepare_commit",
+                        message,
+                        data,
+                    );
+                }
+            }
+        });
+    }
+
+    pub fn commit_workspace(
+        self: Pin<&mut Self>,
+        workspace_id: QString,
+        paths_json: QString,
+        message: QString,
+    ) {
+        let workspace = workspace_id.to_string();
+        let paths: Vec<String> = match serde_json::from_str(&paths_json.to_string()) {
+            Ok(paths) => paths,
+            Err(error) => {
+                report_workspace_failure(
+                    &self.qt_thread(),
+                    workspace,
+                    "workspace.commit",
+                    error.to_string(),
+                    String::new(),
+                );
+                return;
+            }
+        };
+        let params = WorkspaceCommitParams {
+            workspace_id: WorkspaceId(workspace.clone()),
+            paths,
+            message: message.to_string(),
+        };
+        self.workspace_op(
+            "workspace.commit",
+            workspace,
+            |shared, qt, workspace| async move {
+                match shared
+                    .client
+                    .request::<CommitResult>(Request::WorkspaceCommit(params))
+                    .await
+                {
+                    Ok(result) => {
+                        let _ = qt.queue(move |mut q| {
+                            q.as_mut().end_workspace_op(&workspace);
+                            q.workspace_committed(
+                                QString::from(&workspace),
+                                QString::from(&result.commit),
+                            );
+                        });
+                    }
+                    Err(error) => {
+                        let (message, data) = failure_parts(&error);
+                        end_workspace_op_with_failure(
+                            &qt,
+                            workspace,
+                            "workspace.commit",
+                            message,
+                            data,
+                        );
+                    }
+                }
+            },
+        );
+    }
+
+    pub fn prepare_ignore(
+        self: Pin<&mut Self>,
+        workspace_id: QString,
+        path: QString,
+        directory: bool,
+    ) {
+        let workspace = workspace_id.to_string();
+        let qt = self.qt_thread();
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_workspace_failure(
+                    &qt,
+                    workspace,
+                    "workspace.ignore_options",
+                    message.to_owned(),
+                    String::new(),
+                );
+                return;
+            }
+        };
+        let params = WorkspaceIgnoreOptionsParams {
+            workspace_id: WorkspaceId(workspace.clone()),
+            path: path.to_string(),
+            directory,
+        };
+        runtime().spawn(async move {
+            match shared
+                .client
+                .request::<IgnoreOptionsResult>(Request::WorkspaceIgnoreOptions(params))
+                .await
+            {
+                Ok(result) => {
+                    let json = serde_json::to_string(&result).unwrap_or_default();
+                    let _ = qt.queue(move |q| {
+                        q.ignore_options_ready(QString::from(&workspace), QString::from(&json))
+                    });
+                }
+                Err(error) => {
+                    let (message, data) = failure_parts(&error);
+                    report_workspace_failure(
+                        &qt,
+                        workspace,
+                        "workspace.ignore_options",
+                        message,
+                        data,
+                    );
+                }
+            }
+        });
+    }
+
+    pub fn ignore_workspace(
+        self: Pin<&mut Self>,
+        workspace_id: QString,
+        path: QString,
+        target: QString,
+    ) {
+        let workspace = workspace_id.to_string();
+        let target: IgnoreTarget =
+            match serde_json::from_value(serde_json::Value::String(target.to_string())) {
+                Ok(target) => target,
+                Err(error) => {
+                    report_workspace_failure(
+                        &self.qt_thread(),
+                        workspace,
+                        "workspace.ignore",
+                        error.to_string(),
+                        String::new(),
+                    );
+                    return;
+                }
+            };
+        let params = WorkspaceIgnoreParams {
+            workspace_id: WorkspaceId(workspace.clone()),
+            path: path.to_string(),
+            target,
+        };
+        self.workspace_op(
+            "workspace.ignore",
+            workspace,
+            |shared, qt, workspace| async move {
+                match shared
+                    .client
+                    .request::<IgnoreResult>(Request::WorkspaceIgnore(params))
+                    .await
+                {
+                    Ok(result) => {
+                        let _ = qt.queue(move |mut q| {
+                            q.as_mut().end_workspace_op(&workspace);
+                            q.workspace_ignored(
+                                QString::from(&workspace),
+                                QString::from(&result.pattern),
+                            );
+                        });
+                    }
+                    Err(error) => {
+                        let (message, data) = failure_parts(&error);
+                        end_workspace_op_with_failure(
+                            &qt,
+                            workspace,
+                            "workspace.ignore",
                             message,
                             data,
                         );

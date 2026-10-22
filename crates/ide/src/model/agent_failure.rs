@@ -132,9 +132,9 @@ pub fn describe(op: &str, message: &str, options_json: Option<&str>) -> AgentFai
                  log to see what it is waiting on."
             }
             "agent.send" => {
-                "The daemon didn't answer in time, and your message may still reach the agent. \
-                 Check the pane before sending it again; if nothing changes, reconnect or open \
-                 the log."
+                "The daemon didn't confirm delivery in time. Your message may already have reached \
+                 the agent, or may still arrive. Check for a reply before sending it again; if \
+                 nothing changes, reconnect or open the log."
             }
             _ => {
                 "The daemon didn't answer in time. Retry in a moment, or open the log to see \
@@ -239,7 +239,12 @@ pub fn describe(op: &str, message: &str, options_json: Option<&str>) -> AgentFai
     AgentFailure {
         op: op.to_owned(),
         kind,
-        title: title_for(op).to_owned(),
+        title: if op == "agent.send" && kind == FailureKind::Timeout {
+            "Message delivery wasn't confirmed."
+        } else {
+            title_for(op)
+        }
+        .to_owned(),
         detail,
         technical,
         retry,

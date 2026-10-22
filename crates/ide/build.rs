@@ -57,6 +57,8 @@ fn main() {
             "cpp/ChangesToolbar.cpp",
             "cpp/PrDialog.h",
             "cpp/PrDialog.cpp",
+            "cpp/CommitDialog.cpp",
+            "cpp/IgnoreDialog.cpp",
             "cpp/CloseGroupDialog.h",
             "cpp/CloseGroupDialog.cpp",
             "cpp/WorkspaceBanner.h",
@@ -67,6 +69,7 @@ fn main() {
             "cpp/SetupPage.cpp",
             "cpp/SettingsDialog.h",
             "cpp/SettingsDialog.cpp",
+            "cpp/NetworkRulesDialog.cpp",
             "cpp/PromptInput.h",
             "cpp/PromptInput.cpp",
             "cpp/ToolCard.h",
@@ -101,6 +104,8 @@ fn main() {
     // every accent colour would leave the build stale.
     for header in [
         "cpp/Theme.h",
+        "cpp/CommitDialog.h",
+        "cpp/IgnoreDialog.h",
         "cpp/AgentChoices.h",
         "cpp/WorkspaceLabel.h",
         "cpp/Branding.h",

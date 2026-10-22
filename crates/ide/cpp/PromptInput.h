@@ -2,9 +2,12 @@
 #include <QColor>
 #include <QPlainTextEdit>
 #include <QString>
+#include <QJsonArray>
 
 class QEvent;
 class QKeyEvent;
+class QListWidget;
+class QFocusEvent;
 
 /// The box a prompt is typed into, at the foot of a transcript.
 ///
@@ -17,11 +20,15 @@ class PromptInput : public QPlainTextEdit {
 public:
     explicit PromptInput(QWidget* parent = nullptr);
 
-    /// Locks the box while the agent is working and says so in the placeholder.
+    /// Locks the box while there is no agent available to accept messages.
     /// An empty `message` uses the default wording; the transcript passes its
     /// own while it is replaying history.
     void setBusy(bool busy, const QString& message = QString());
     bool isBusy() const;
+    /// Keeps the box editable and explains Enter while a turn is in flight.
+    void setQueueing(bool queueing);
+    /// Commands from the current harness. Replacing this clears stale suggestions.
+    void setCommands(const QJsonArray& commands);
 
 public Q_SLOTS:
     /// Sends whatever is typed, exactly as Enter does. A blank box, or a busy
@@ -35,8 +42,10 @@ Q_SIGNALS:
     void submitted(const QString& text);
 
 protected:
+    bool event(QEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     void changeEvent(QEvent* event) override;
+    void focusOutEvent(QFocusEvent* event) override;
 
 private:
     /// Caps the box at `kVisibleLines` of the current font.
@@ -44,7 +53,14 @@ private:
     /// Applies `m_busy` to the placeholder wording and its colour.
     void refreshPlaceholder();
 
+    void refreshCommands();
+    void completeCommand();
+    QListWidget* m_commandsPopup = nullptr;
+    QJsonArray m_commands;
+    bool m_completionDismissed = false;
+    bool m_completing = false;
     bool m_busy = false;
+    bool m_queueing = false;
     /// What the placeholder says while busy, or empty for the default.
     QString m_busyMessage;
     /// The style's own placeholder colour, kept so the idle box gets it back

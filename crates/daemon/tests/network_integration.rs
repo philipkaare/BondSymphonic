@@ -1029,3 +1029,150 @@ async fn a_sandboxed_process_reaches_the_host_only_through_the_allowlisting_prox
         "the shim must die with the sandbox"
     );
 }
+
+#[tokio::test]
+async fn network_blocks_persist_override_allow_and_do_not_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "blocked").await;
+    c.call(Request::WorkspaceSetNetworkRules(
+        WorkspaceSetNetworkRulesParams {
+            expected_allow: None,
+            expected_block: None,
+            workspace_id: ws.id.clone(),
+            allow: vec!["127.0.0.1".into()],
+            block: vec![],
+        },
+    ))
+    .await
+    .unwrap();
+    c.call(Request::WorkspaceBlockHost(WorkspaceBlockHostParams {
+        workspace_id: ws.id.clone(),
+        host: "127.0.0.1".into(),
+    }))
+    .await
+    .unwrap();
+    // An editor opened before the block must not remove it with a stale save.
+    assert!(c
+        .call(Request::WorkspaceSetNetworkRules(
+            WorkspaceSetNetworkRulesParams {
+                workspace_id: ws.id.clone(),
+                allow: vec!["127.0.0.1".into(), "example.com".into()],
+                block: vec![],
+                expected_allow: Some(vec!["127.0.0.1".into()]),
+                expected_block: Some(vec![]),
+            }
+        ))
+        .await
+        .is_err());
+    c.drain_events();
+    let mut socket = UnixStream::connect(daemon.dirs.run(&ws.id).join("proxy.sock"))
+        .await
+        .unwrap();
+    socket
+        .write_all(b"CONNECT 127.0.0.1:12345 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .unwrap();
+    let reply = read_all(&mut socket).await;
+    assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
+    assert!(
+        reply.contains("blocked by a workspace network rule"),
+        "{reply}"
+    );
+    // Read a response as a barrier so any preceding proxy notices are buffered.
+    c.call(Request::WorkspaceGet(WorkspaceIdParams {
+        workspace_id: ws.id.clone(),
+    }))
+    .await
+    .unwrap();
+    assert!(!c
+        .drain_events()
+        .iter()
+        .any(|(_, e)| e.denied_host().is_some() || e.refused_tunnel_host().is_some()));
+    let saved =
+        bondsymphonic_daemon::workspace::registry::Registry::load(&daemon.dirs.registry_file())
+            .unwrap();
+    assert_eq!(saved.get(&ws.id).unwrap().blocklist, vec!["127.0.0.1"]);
+    // A malformed edit is rejected as a whole.
+    assert!(c
+        .call(Request::WorkspaceSetNetworkRules(
+            WorkspaceSetNetworkRulesParams {
+                expected_allow: None,
+                expected_block: None,
+                workspace_id: ws.id.clone(),
+                allow: vec![],
+                block: vec!["https://bad.example".into()],
+            }
+        ))
+        .await
+        .is_err());
+    assert_eq!(
+        daemon.registry.get(&ws.id).unwrap().allowlist,
+        vec!["127.0.0.1"]
+    );
+    assert_eq!(
+        daemon.registry.get(&ws.id).unwrap().blocklist,
+        vec!["127.0.0.1"]
+    );
+    // Removing the block takes effect without restarting the sandbox.
+    c.call(Request::WorkspaceSetNetworkRules(
+        WorkspaceSetNetworkRulesParams {
+            expected_allow: None,
+            expected_block: None,
+            workspace_id: ws.id.clone(),
+            allow: vec!["127.0.0.1".into()],
+            block: vec![],
+        },
+    ))
+    .await
+    .unwrap();
+    let upstream = ok_server().await;
+    let mut socket = UnixStream::connect(daemon.dirs.run(&ws.id).join("proxy.sock"))
+        .await
+        .unwrap();
+    socket
+        .write_all(
+            format!("GET http://127.0.0.1:{upstream}/ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(read_all(&mut socket).await.starts_with("HTTP/1.1 200 OK"));
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn simultaneous_blocks_both_remain_enforced() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "two-blocks").await;
+    set_allowlist(&mut c, &ws.id, &["127.0.0.1", "127.0.0.2"])
+        .await
+        .unwrap();
+    let (first, second) = tokio::join!(
+        lifecycle::block_host(&daemon, &ws.id, "127.0.0.1"),
+        lifecycle::block_host(&daemon, &ws.id, "127.0.0.2"),
+    );
+    first.unwrap();
+    second.unwrap();
+    for host in ["127.0.0.1", "127.0.0.2"] {
+        let mut socket = UnixStream::connect(daemon.dirs.run(&ws.id).join("proxy.sock"))
+            .await
+            .unwrap();
+        socket
+            .write_all(format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let reply = read_all(&mut socket).await;
+        assert!(
+            reply.contains("blocked by a workspace network rule"),
+            "{reply}"
+        );
+    }
+    cancel.cancel();
+}

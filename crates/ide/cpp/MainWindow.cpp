@@ -10,6 +10,7 @@
 #include "ExplorerDock.h"
 #include "GroupBar.h"
 #include "NewAgentDialog.h"
+#include "NetworkRulesDialog.h"
 #include "RunPanel.h"
 #include "SettingsDialog.h"
 #include "SetupPage.h"
@@ -397,6 +398,20 @@ void MainWindow::buildMenus() {
         m_controller->fetchWorkspace(id);
     });
     m_fetchAction->setObjectName(QStringLiteral("WorkspaceFetchAction"));
+    m_networkRulesAction = workspace->addAction("&Network rules…", this, [this] {
+        const QString id = activeWorkspaceId();
+        if (id.isEmpty()) { return; }
+        if (!m_networkRulesDialog.isNull()) {
+            m_networkRulesDialog->raise();
+            m_networkRulesDialog->activateWindow();
+            return;
+        }
+        auto* dialog = new NetworkRulesDialog(m_controller, id,
+            m_groupModel->workspaceName(id), this);
+        m_networkRulesDialog = dialog;
+        dialog->open();
+    });
+    m_networkRulesAction->setObjectName(QStringLiteral("WorkspaceNetworkRulesAction"));
     workspace->addSeparator();
     // Both go through the handlers the tab's context menu uses, which read the
     // workspace once and put a named question in front of the user. The menu
@@ -502,6 +517,8 @@ void MainWindow::buildCentral() {
     QObject::connect(m_groupBar, &GroupBar::newAgentRequested, this, &MainWindow::onNewAgent);
     QObject::connect(m_groupBar, &GroupBar::destroyRequested, this, &MainWindow::onDestroyRequested);
     QObject::connect(m_groupBar, &GroupBar::closeGroupRequested, this, &MainWindow::onCloseGroup);
+    QObject::connect(m_groupBar, &GroupBar::switchHarnessRequested, this,
+                     &MainWindow::onSwitchHarness);
 
     if (menuTest().contains(QLatin1String("widgets"))) {
         // Not `singleShot(0)`: one of the four values is a tab's text colour,
@@ -1189,10 +1206,36 @@ void MainWindow::connectController() {
     // restarted agent gets the model and permission mode the user chose.
     QObject::connect(m_agentArea, &AgentArea::startAgentRequested, this,
                      &MainWindow::onStartAgentRequested);
+    QObject::connect(m_agentArea, &AgentArea::resumeSessionRequested, this,
+                     [this](const QString& workspaceId, const QString& session) {
+        if (workspaceId != activeWorkspaceId()) { return; }
+        const QJsonObject tab = tabFor(workspaceId);
+        auto* model = m_agentArea->transcriptModel(workspaceId);
+        QJsonObject options = QJsonDocument::fromJson(
+            (model ? model->restartOptionsJson() : tab.value("options_json").toString()).toUtf8()).object();
+        options.insert("adapter", tab.value("adapter"));
+        m_agentArea->setStarting(workspaceId, true, true);
+        m_controller->resumeAgent(workspaceId,
+            QString::fromUtf8(QJsonDocument(options).toJson(QJsonDocument::Compact)), session);
+    });
     // A model or permission mode chosen in the composer. It is answered exactly
     // as a restart is, because it is one: `claude -p` reads both flags when the
     // process starts and there is no way to change either in flight. The
     // options already carry the session id, so the conversation continues.
+    QObject::connect(m_agentArea, &AgentArea::harnessChangeRequested, this,
+                     &MainWindow::onSwitchHarness);
+    // The switch has been decided and the other harnesses' agents asked to
+    // stop. The tab and its pane move over now; `agentStarted` binds the agent.
+    QObject::connect(m_controller, &AppController::harnessSwitched, this,
+                     [this](const QString& workspaceId, const QString& adapter,
+                            const QString& optionsJson) {
+                         m_groupModel->setTabAdapter(workspaceId, adapter, optionsJson);
+                         m_agentArea->setBackend(workspaceId, adapter);
+                         m_agentArea->setOptionsJson(workspaceId, optionsJson);
+                         if (workspaceId == activeWorkspaceId()) {
+                             updateWindowTitle(activeTab());
+                         }
+                     });
     QObject::connect(m_agentArea, &AgentArea::agentOptionsChanged, this,
                      [this](const QString& workspaceId, const QString& optionsJson) {
                          if (workspaceId.isEmpty() || optionsJson.isEmpty()) {
@@ -1257,12 +1300,15 @@ void MainWindow::connectController() {
         const QJsonArray descriptors =
             QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array();
         agentchoices::setDescriptors(descriptors);
+        refreshHarnessChoices();
         for (const QJsonValue &descriptor : descriptors) {
             const QString backend = descriptor.toObject().value("id").toString();
             m_agentArea->setBackendAuth(backend, m_controller->backendLoggedIn(backend),
                                       m_controller->backendAuthFailure(backend));
         }
     });
+    // Before the daemon answers: Settings alone already names the harnesses.
+    refreshHarnessChoices();
     if (menuTest().contains(QLatin1String("backend-auth"))) {
         auto logout = std::make_shared<bool>(false);
         QObject::connect(
@@ -2387,6 +2433,66 @@ void MainWindow::onStartAgentRequested(const QString& workspaceId) {
     m_controller->startAgent(workspaceId, options);
 }
 
+void MainWindow::refreshHarnessChoices() {
+    // The same list the New Agent dialog offers: the daemon's harnesses that
+    // are enabled in Settings. Terminal is not one; a shell is another pane.
+    const QJsonObject enabled = QJsonDocument::fromJson(m_controller->backendSettingsJson().toUtf8())
+                                    .object()
+                                    .value("backends")
+                                    .toObject();
+    QList<QPair<QString, QString>> choices;
+    for (const QJsonValue& value :
+         QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array()) {
+        const QJsonObject descriptor = value.toObject();
+        const QString id = descriptor.value("id").toString();
+        if (enabled.value(id).toObject().value("enabled").toBool()) {
+            choices.append({ id, descriptor.value("label").toString() });
+        }
+    }
+    m_agentArea->setHarnessChoices(choices);
+    m_groupBar->setHarnessChoices(choices);
+}
+
+void MainWindow::onSwitchHarness(const QString& workspaceId, const QString& backend) {
+    const QString current = m_groupModel->workspaceAdapter(workspaceId);
+    if (workspaceId.isEmpty() || backend.isEmpty() || current.isEmpty() || backend == current ||
+        current == QLatin1String("terminal")) {
+        return;
+    }
+    // One start at a time per workspace; a switch is one.
+    if (m_autoStarting.contains(workspaceId)) {
+        return;
+    }
+    const auto label = [](const QString& adapter) {
+        return adapter == QLatin1String("claude")     ? QStringLiteral("Claude Code")
+               : adapter == QLatin1String("codex")    ? QStringLiteral("Codex")
+               : adapter == QLatin1String("opencode") ? QStringLiteral("OpenCode")
+                                                      : adapter;
+    };
+    QMessageBox box(QMessageBox::Question, QStringLiteral("Switch harness"),
+                    QStringLiteral("Switch %1 to %2?")
+                        .arg(m_groupModel->workspaceName(workspaceId), label(backend)),
+                    QMessageBox::Cancel, this);
+    box.setObjectName(QStringLiteral("SwitchHarnessBox"));
+    box.setInformativeText(
+        QStringLiteral("The %1 agent stops, and a turn in progress is cut short. Its conversation "
+                       "is kept and resumes if you switch back. %2 resumes its own latest "
+                       "conversation in this workspace, or starts a new one.")
+            .arg(label(current), label(backend)));
+    QPushButton* proceed = box.addButton(QStringLiteral("Switch"), QMessageBox::AcceptRole);
+    box.setDefaultButton(proceed);
+    box.exec();
+    if (box.clickedButton() != proceed || m_autoStarting.contains(workspaceId)) {
+        return;
+    }
+    // Booked as a start in flight: it keeps every automatic start away, and the
+    // old agent's exit is the replacement it is rather than "The agent
+    // stopped.". `agentStarted` or a failed start clears it.
+    m_autoStarting.insert(workspaceId);
+    m_agentArea->setStarting(workspaceId, true, true);
+    m_controller->switchHarness(workspaceId, backend);
+}
+
 void MainWindow::onCloseGroup(const QString& groupName) {
     if (groupName.isEmpty()) {
         return;
@@ -2695,6 +2801,11 @@ void MainWindow::onRepoInspectFailed(const QString& path, const QString& message
 void MainWindow::onWorkspaceOpFailed(const QString& workspaceId, const QString& op,
                                      const QString& message) {
     noteFailureRouted(message);
+    if (!m_networkRulesDialog.isNull() &&
+        m_networkRulesDialog->property("workspaceId").toString() == workspaceId &&
+        (op == QLatin1String("workspace.get") || op == QLatin1String("workspace.set_network_rules"))) {
+        return; // The rules dialog reports this error beside the editable rules.
+    }
     if (op == QLatin1String("agent.start")) {
         // The pane must stop saying it is starting something. The signal names
         // the workspace, so only the pane that asked comes out of it.
@@ -2947,6 +3058,19 @@ void MainWindow::onActiveTabChanged() {
 }
 
 void MainWindow::updateWindowTitle(const QJsonObject& active) {
+    QString agentTitle = QStringLiteral("Agent");
+    if (!active.isEmpty()) {
+        const QString adapter = active.value("adapter").toString();
+        const QString backend = adapter == QLatin1String("claude") ? QStringLiteral("Claude Code")
+            : adapter == QLatin1String("codex") ? QStringLiteral("Codex")
+            : adapter == QLatin1String("opencode") ? QStringLiteral("OpenCode")
+            : adapter == QLatin1String("terminal") ? QStringLiteral("Terminal") : adapter;
+        // Code points, not literal characters: see the window title below.
+        agentTitle += QStringLiteral(" ") + QChar(0x2014) + QStringLiteral(" %1 ") +
+                      QChar(0x00B7) + QStringLiteral(" %2");
+        agentTitle = agentTitle.arg(backend, active.value("name").toString());
+    }
+    m_agentDock->setWindowTitle(agentTitle);
     const QString name = active.value("name").toString();
     if (name.isEmpty()) {
         setWindowTitle(QStringLiteral("BondSymphonic"));
@@ -3040,6 +3164,7 @@ void MainWindow::updateWorkspaceStatus() {
     const bool live = !active.isEmpty();
     m_restartAgentAction->setEnabled(live);
     m_fetchAction->setEnabled(live);
+    m_networkRulesAction->setEnabled(live);
     m_destroyAction->setEnabled(live);
     // The verb follows the workspace: an in-place one is closed, and nothing
     // of the user's goes with it.
@@ -3103,6 +3228,7 @@ void MainWindow::noteAgentAttention(const QString& agentId, const QString& state
 #include <QFile>
 #include <QFontMetrics>
 #include <QFontMetricsF>
+#include <QTabBar>
 #include <cstdint>
 
 namespace {
@@ -3604,6 +3730,46 @@ extern "C" std::int32_t bs_widget_test_main_window_raises_agent_failures_on_the_
     if (boxes != 1) {
         return 70 + boxes;
     }
+    return 0;
+}
+
+
+extern "C" std::int32_t bs_widget_test_agent_title_follows_selected_tab() {
+    useThrowawayState();
+    WindowFixture fixture;
+    auto* dock = fixture.window.findChild<QDockWidget*>(QStringLiteral("AgentDock"));
+    fixture.groupModel.loadState(QStringLiteral(
+        R"({"groups":[{"id":"g1","name":"Agents","tabs":[]}],"active_group":0,"active_tab":0})"));
+    if (dock == nullptr || dock->windowTitle() != QLatin1String("Agent")) { return 1; }
+    const auto add = [&fixture](const QString& id, const QString& name, const QString& adapter) {
+        const QJsonObject info{
+            {"id", id}, {"name", name}, {"repo_path", "/repo"}, {"base_branch", "main"},
+            {"branch", "bs/test"}, {"worktree_path", "/worktree"}, {"created_at", "now"},
+            {"allowlist", QJsonArray{}}, {"state", "creating"}, {"agents", QJsonArray{}},
+            {"runs", QJsonArray{}}
+        };
+        return fixture.groupModel.addTab(QString::fromUtf8(QJsonDocument(info).toJson()),
+            QStringLiteral("Agents"), adapter, QString(), QString());
+    };
+    if (!add(QStringLiteral("ws_alpha"), QStringLiteral("alpha"), QStringLiteral("claude")) ||
+        !add(QStringLiteral("ws_beta"), QStringLiteral("beta"), QStringLiteral("codex"))) { return 2; }
+    const auto title = [](const QString& backend, const QString& name) {
+        return QStringLiteral("Agent ") + QChar(0x2014) + QLatin1Char(' ') + backend +
+               QLatin1Char(' ') + QChar(0x00B7) + QLatin1Char(' ') + name;
+    };
+    fixture.groupModel.setActive(0, 0);
+    if (dock->windowTitle() != title(QStringLiteral("Claude Code"), QStringLiteral("alpha"))) { return 3; }
+    if (!fixture.groupModel.renameAgent(QStringLiteral("ws_beta"), QStringLiteral("Fix login"))) {
+        return 6;
+    }
+    if (dock->windowTitle() != title(QStringLiteral("Claude Code"), QStringLiteral("alpha"))) { return 7; }
+    fixture.groupModel.setActive(0, 1);
+    if (dock->windowTitle() != title(QStringLiteral("Codex"), QStringLiteral("Fix login"))) { return 4; }
+    auto* tabs = fixture.window.findChild<QTabBar*>(QStringLiteral("GroupBarAgentTabs"));
+    if (tabs == nullptr || !tabs->tabText(1).contains(QLatin1String("Fix login"))) { return 8; }
+    fixture.groupModel.removeWorkspace(QStringLiteral("ws_alpha"));
+    fixture.groupModel.removeWorkspace(QStringLiteral("ws_beta"));
+    if (dock->windowTitle() != QLatin1String("Agent")) { return 5; }
     return 0;
 }
 

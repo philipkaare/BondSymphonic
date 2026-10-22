@@ -13,6 +13,7 @@ fn info(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
         worktree_path: "/w".into(),
         created_at: "t".into(),
         allowlist: vec![],
+        blocklist: vec![],
         kind: bondsymphonic_proto::WorkspaceKind::Worktree,
         state,
         agents: vec![],
@@ -24,6 +25,7 @@ fn tab(id: &str, name: &str) -> AgentTab {
     AgentTab {
         workspace_id: id.into(),
         name: name.into(),
+        name_override: None,
         repo_path: "/r".into(),
         branch: format!("bs/{name}/work"),
         base_branch: "main".into(),
@@ -1366,6 +1368,7 @@ mod in_place_model {
             worktree_path: "/r".into(),
             created_at: "t".into(),
             allowlist: vec![],
+            blocklist: vec![],
             state,
             agents: vec![],
             agent_records: vec![],
@@ -1446,6 +1449,7 @@ mod workspace_warnings {
             worktree_path: "/r".into(),
             created_at: "t".into(),
             allowlist: vec![],
+            blocklist: vec![],
             state,
             agents: vec![],
             agent_records: vec![],
@@ -1550,4 +1554,168 @@ mod workspace_warnings {
         let back = Workspaces::from_json(&model.to_json()).expect("state json parses");
         assert_eq!(back, model);
     }
+}
+
+#[test]
+fn renaming_an_agent_targets_its_workspace_and_survives_refresh_and_restore() {
+    let mut w = Workspaces::new_default();
+    let original = info("ws_one", "agent-1", WorkspaceState::Ready);
+    w.add_tab(0, AgentTab::from_workspace_info(&original));
+    w.add_tab(0, tab("ws_two", "agent-2"));
+    w.set_active(0, 1);
+    assert!(w.rename_agent(&original.id, "  Fix login  "));
+    assert_eq!(w.groups[0].tabs[0].name, "Fix login");
+    assert_eq!(w.groups[0].tabs[1].name, "agent-2");
+    w.apply_workspace_info(&original);
+    assert_eq!(w.groups[0].tabs[0].name, "Fix login");
+    let saved = serde_json::to_string(&w.persisted_groups()).unwrap();
+    let groups: Vec<PersistedGroup> = serde_json::from_str(&saved).unwrap();
+    let restored = Workspaces::from_persisted(&groups, &[original], None);
+    assert_eq!(restored.groups[0].tabs[0].name, "Fix login");
+    assert_eq!(restored.groups[0].tabs[0].branch, "bs/agent-1/work");
+}
+
+#[test]
+fn renaming_an_agent_rejects_blank_names_and_missing_workspaces() {
+    let mut w = Workspaces::new_default();
+    w.add_tab(0, tab("ws_one", "agent-1"));
+    assert!(!w.rename_agent(&"ws_one".into(), " \t\n "));
+    assert!(!w.rename_agent(&"ws_missing".into(), "new name"));
+    assert_eq!(w.groups[0].tabs[0].name, "agent-1");
+}
+
+#[test]
+fn restore_prefers_live_agent_then_saved_conversation_for_latest_harness() {
+    let mut w = info("ws_1", "alpha", WorkspaceState::Ready);
+    let mut saved = agent("saved", AgentAdapterKind::Claude);
+    saved.session_id = Some("conversation".into());
+    let mut live = agent("live", AgentAdapterKind::Claude);
+    live.state = AgentState::Idle;
+    w.agent_records = vec![saved, live, agent("empty", AgentAdapterKind::Claude)];
+    assert_eq!(
+        AgentTab::from_workspace_info(&w).agent_id,
+        Some("live".into())
+    );
+    w.agent_records[1].state = AgentState::Exited;
+    w.agent_records[2].session_id = Some("  ".into());
+    let restored = AgentTab::from_workspace_info(&w);
+    assert_eq!(restored.agent_id, Some("saved".into()));
+    let options: serde_json::Value = serde_json::from_str(&restored.options_json).unwrap();
+    assert_eq!(options["resume_session"], "conversation");
+    w.agent_records
+        .push(agent("other", AgentAdapterKind::Terminal));
+    assert_eq!(
+        AgentTab::from_workspace_info(&w).agent_id,
+        Some("other".into())
+    );
+}
+
+#[test]
+fn refresh_adopts_latest_saved_same_harness_without_overriding_current_live_agent() {
+    let mut w = info("ws_1", "alpha", WorkspaceState::Ready);
+    let old = agent("old", AgentAdapterKind::Claude);
+    w.agent_records = vec![old];
+    let mut model = Workspaces::new_default();
+    model.add_tab(0, AgentTab::from_workspace_info(&w));
+    let mut latest = agent("latest", AgentAdapterKind::Claude);
+    latest.session_id = Some("latest-conversation".into());
+    w.agent_records.push(latest);
+    w.agent_records
+        .push(agent("other", AgentAdapterKind::Terminal));
+    model.apply_workspace_info(&w);
+    let tab = model.active().unwrap();
+    assert_eq!(tab.agent_id, Some("latest".into()));
+    assert_eq!(tab.adapter, AgentAdapterKind::Claude);
+    assert!(tab.options_json.contains("latest-conversation"));
+    w.agent_records[1].state = AgentState::Working;
+    let mut newer = agent("newer", AgentAdapterKind::Claude);
+    newer.state = AgentState::Idle;
+    w.agent_records.push(newer);
+    model.apply_workspace_info(&w);
+    assert_eq!(model.active().unwrap().agent_id, Some("latest".into()));
+    model.set_agent(&w.id, "just-started".into());
+    model.apply_workspace_info(&w);
+    assert_eq!(
+        model.active().unwrap().agent_id,
+        Some("just-started".into())
+    );
+}
+
+#[test]
+fn refresh_seeds_current_session_without_losing_local_options_or_backend_choice() {
+    let mut w = info("ws_1", "alpha", WorkspaceState::Ready);
+    let mut current = agent("current", AgentAdapterKind::Claude);
+    current.state = AgentState::Idle;
+    current.session_id = Some("live-session".into());
+    w.agent_records.push(current);
+    let mut model = Workspaces::new_default();
+    let mut tab = AgentTab::from_workspace_info(&w);
+    tab.options_json = r#"{"model":"local-model","permission_mode":"plan"}"#.into();
+    model.add_tab(0, tab);
+    model.apply_workspace_info(&w);
+    let options: serde_json::Value =
+        serde_json::from_str(&model.active().unwrap().options_json).unwrap();
+    assert_eq!(options["resume_session"], "live-session");
+    assert_eq!(options["model"], "local-model");
+    assert_eq!(options["permission_mode"], "plan");
+
+    let mut terminal = AgentTab::from_workspace_info(&w);
+    terminal.adapter = AgentAdapterKind::Terminal;
+    terminal.agent_id = None;
+    let mut explicit = Workspaces::new_default();
+    explicit.add_tab(0, terminal);
+    explicit.apply_workspace_info(&w);
+    assert_eq!(
+        explicit.active().unwrap().adapter,
+        AgentAdapterKind::Terminal
+    );
+    assert_eq!(explicit.active().unwrap().agent_id, None);
+}
+
+#[test]
+fn failed_empty_launch_does_not_hide_saved_conversation_on_restore_or_refresh() {
+    let mut w = info("ws_1", "alpha", WorkspaceState::Ready);
+    let mut saved = agent("saved", AgentAdapterKind::Claude);
+    saved.session_id = Some("conversation".into());
+    let mut failed = agent("failed", AgentAdapterKind::Claude);
+    failed.state = AgentState::Error;
+    w.agent_records = vec![saved, failed];
+    let restored = AgentTab::from_workspace_info(&w);
+    assert_eq!(restored.agent_id, Some("saved".into()));
+
+    let mut model = Workspaces::new_default();
+    let mut current = restored;
+    current.agent_id = Some("failed".into());
+    current.options_json.clear();
+    model.add_tab(0, current);
+    model.apply_workspace_info(&w);
+    let tab = model.active().unwrap();
+    assert_eq!(tab.agent_id, Some("saved".into()));
+    let options: serde_json::Value = serde_json::from_str(&tab.options_json).unwrap();
+    assert_eq!(options["resume_session"], "conversation");
+}
+
+#[test]
+fn a_harness_switch_moves_the_tab_but_never_to_or_from_a_terminal() {
+    let mut w = Workspaces::new_default();
+    let g = w.add_group("Agents");
+    let mut claude = tab("ws_a", "alpha");
+    claude.adapter = AgentAdapterKind::Claude;
+    claude.options_json = r#"{"model":"claude-x","resume_session":"s"}"#.into();
+    w.add_tab(g, claude);
+    w.add_tab(g, tab("ws_t", "shell"));
+    let id = WorkspaceId("ws_a".into());
+    let codex = r#"{"adapter":"codex"}"#;
+    assert!(w.set_tab_adapter(&id, AgentAdapterKind::Codex, codex));
+    let (gi, ti) = w.find(&id).unwrap();
+    assert_eq!(w.groups[gi].tabs[ti].adapter, AgentAdapterKind::Codex);
+    // The Claude session must not ride along into Codex.
+    assert_eq!(w.groups[gi].tabs[ti].options_json, codex);
+    assert!(!w.set_tab_adapter(&id, AgentAdapterKind::Terminal, ""));
+    assert!(!w.set_tab_adapter(&WorkspaceId("ws_t".into()), AgentAdapterKind::Codex, codex));
+    assert!(!w.set_tab_adapter(
+        &WorkspaceId("ws_gone".into()),
+        AgentAdapterKind::Codex,
+        codex
+    ));
 }

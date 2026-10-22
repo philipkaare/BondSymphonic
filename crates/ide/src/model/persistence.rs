@@ -44,6 +44,9 @@ pub const DEBOUNCE: Duration = Duration::from_millis(500);
 #[serde(default)]
 pub struct PersistedTab {
     pub workspace_id: String,
+    /// A user-chosen agent label; absent for tabs still using the workspace name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_override: Option<String>,
     /// The command a terminal tab runs, or `None` for the default shell.
     pub command: Option<String>,
     /// The run configuration the Run panel opens on for this workspace.

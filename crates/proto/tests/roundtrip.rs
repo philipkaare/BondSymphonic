@@ -942,3 +942,65 @@ fn a_settled_queued_prompt_is_recognisable_after_the_wire() {
         4, 3
     )));
 }
+
+#[test]
+fn network_rule_edits_and_block_decisions_round_trip() {
+    for (method, params) in [
+        (
+            "workspace.set_network_rules",
+            serde_json::json!({
+                "workspace_id": "ws_1", "allow": ["*.example.com"], "block": ["api.example.com"]
+            }),
+        ),
+        (
+            "workspace.block_host",
+            serde_json::json!({"workspace_id": "ws_1", "host": "api.example.com"}),
+        ),
+    ] {
+        let wire = serde_json::json!({"method": method, "params": params});
+        let request: Request = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(request.method_name(), method);
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+    }
+}
+
+#[test]
+fn commit_and_ignore_contracts_roundtrip() {
+    let id: bondsymphonic_proto::WorkspaceId = "ws_edit".into();
+    let requests = [
+        bondsymphonic_proto::Request::WorkspacePrepareCommit(
+            bondsymphonic_proto::WorkspaceIdParams {
+                workspace_id: id.clone(),
+            },
+        ),
+        bondsymphonic_proto::Request::WorkspaceCommit(bondsymphonic_proto::WorkspaceCommitParams {
+            workspace_id: id.clone(),
+            paths: vec!["[literal]*.rs".into()],
+            message: "Commit selected".into(),
+        }),
+        bondsymphonic_proto::Request::WorkspaceIgnoreOptions(
+            bondsymphonic_proto::WorkspaceIgnoreOptionsParams {
+                workspace_id: id.clone(),
+                path: "src/file.rs".into(),
+                directory: false,
+            },
+        ),
+        bondsymphonic_proto::Request::WorkspaceIgnore(bondsymphonic_proto::WorkspaceIgnoreParams {
+            workspace_id: id,
+            path: ".".into(),
+            target: bondsymphonic_proto::IgnoreTarget::Directory,
+        }),
+    ];
+    for request in requests {
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["method"], request.method_name());
+        assert_eq!(
+            serde_json::from_value::<bondsymphonic_proto::Request>(wire).unwrap(),
+            request
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(bondsymphonic_proto::IgnoreTarget::FileType).unwrap(),
+        "file_type"
+    );
+}

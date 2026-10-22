@@ -21,7 +21,7 @@
 use crate::model::app_state::adapter_from_name;
 use crate::model::transcript::{Applied, LiveEvent, NetworkNotice, Transcript};
 use crate::qobjects::app_controller::{on_reconnect, require_connection, runtime, Shared};
-use crate::qobjects::run_panel::add_host_to_allowlist;
+use crate::qobjects::run_panel::{add_host_to_allowlist, block_network_host};
 use bondsymphonic_proto::{
     AgentId, AgentIdParams, AgentMessage, AgentPermissionReplyParams, AgentQueuedPromptParams,
     AgentSendParams, Event, HistoryResult, PermissionDecision, QueuedPromptAction, Request,
@@ -53,6 +53,7 @@ pub mod qobject {
         // "15.9k in · 87 out · context 6% of 258k", and the session's cost
         // only when it reported one. Empty until then, and always for Claude.
         #[qproperty(QString, usage_text)]
+        #[qproperty(QString, commands_json)]
         #[qproperty(i32, turns)]
         #[qproperty(QString, pending_json)]
         #[qproperty(bool, busy)]
@@ -217,6 +218,9 @@ pub mod qobject {
         /// to failed, with the reason).
         #[qinvokable]
         fn allow_denied_host(self: Pin<&mut TranscriptModel>, index: i32);
+
+        #[qinvokable]
+        fn block_denied_host(self: Pin<&mut TranscriptModel>, index: i32);
     }
 
     impl cxx_qt::Threading for TranscriptModel {}
@@ -242,6 +246,7 @@ pub struct TranscriptModelRust {
     state_detail: QString,
     cost_usd: f64,
     usage_text: QString,
+    commands_json: QString,
     turns: i32,
     pending_json: QString,
     busy: bool,
@@ -298,6 +303,7 @@ impl Default for TranscriptModelRust {
             state_detail: QString::from(""),
             cost_usd: 0.0,
             usage_text: QString::from(""),
+            commands_json: QString::from("[]"),
             turns: 0,
             pending_json: QString::from(""),
             busy: false,
@@ -764,6 +770,48 @@ impl qobject::TranscriptModel {
         });
     }
 
+    pub fn block_denied_host(mut self: Pin<&mut Self>, index: i32) {
+        let Ok(i) = usize::try_from(index) else {
+            return;
+        };
+        let workspace = self.as_ref().workspace_id().to_string();
+        if workspace.is_empty() {
+            return;
+        }
+        let Some(host) = self.as_mut().rust_mut().transcript.begin_block(i) else {
+            return;
+        };
+        self.as_mut().item_changed(index);
+        let generation = self.as_ref().rust().generation;
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                let changed = self
+                    .as_mut()
+                    .rust_mut()
+                    .transcript
+                    .finish_block(&host, Err(message.to_owned()));
+                for i in changed {
+                    self.as_mut().item_changed(index_of(i));
+                }
+                return;
+            }
+        };
+        let qt = self.as_ref().qt_thread();
+        runtime().spawn(async move {
+            let result = block_network_host(&shared, &workspace, &host).await;
+            let _ = qt.queue(move |mut q| {
+                if q.as_ref().rust().generation != generation {
+                    return;
+                }
+                let changed = q.as_mut().rust_mut().transcript.finish_block(&host, result);
+                for i in changed {
+                    q.as_mut().item_changed(index_of(i));
+                }
+            });
+        });
+    }
+
     /// Applies the answer to an inline "Allow" and repaints what it changed.
     fn settle_allow(mut self: Pin<&mut Self>, host: &str, result: Result<(), String>) {
         if let Err(message) = &result {
@@ -855,6 +903,9 @@ impl qobject::TranscriptModel {
         self.as_mut().set_cost_usd(cost);
         self.as_mut().set_usage_text(QString::from(&usage));
         self.as_mut().set_turns(turns);
+        let commands = serde_json::to_string(&self.as_ref().rust().transcript.commands)
+            .unwrap_or_else(|_| "[]".to_owned());
+        self.as_mut().set_commands_json(QString::from(&commands));
     }
 
     /// Publishes, answers or clears the pending permission request.

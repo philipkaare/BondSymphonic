@@ -71,6 +71,18 @@ params!(WorkspaceDestroyParams {
     workspace_id: WorkspaceId,
     force: bool
 });
+params!(WorkspaceCommitParams { workspace_id: WorkspaceId, paths: Vec<String>, message: String });
+params!(WorkspaceIgnoreOptionsParams {
+    workspace_id: WorkspaceId,
+    path: String,
+    directory: bool
+});
+params!(WorkspaceIgnoreParams {
+    workspace_id: WorkspaceId,
+    path: String,
+    target: IgnoreTarget
+});
+
 params!(WorkspaceDiffParams {
     workspace_id: WorkspaceId,
     path: String
@@ -81,6 +93,20 @@ params!(WorkspaceCreatePrParams {
     title: String,
     body: String,
     draft: bool
+});
+params!(WorkspaceSetNetworkRulesParams {
+    workspace_id: WorkspaceId,
+    allow: Vec<String>,
+    block: Vec<String>,
+    /// The snapshot an editor loaded. Reject stale edits rather than overwriting newer decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_allow: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_block: Option<Vec<String>>
+});
+params!(WorkspaceBlockHostParams {
+    workspace_id: WorkspaceId,
+    host: String
 });
 params!(WorkspaceSetAllowlistParams { workspace_id: WorkspaceId, hosts: Vec<String> });
 params!(FsPathParams {
@@ -202,6 +228,14 @@ pub enum Request {
     WorkspaceRestart(WorkspaceIdParams),
     #[serde(rename = "workspace.changes")]
     WorkspaceChanges(WorkspaceIdParams),
+    #[serde(rename = "workspace.prepare_commit")]
+    WorkspacePrepareCommit(WorkspaceIdParams),
+    #[serde(rename = "workspace.commit")]
+    WorkspaceCommit(WorkspaceCommitParams),
+    #[serde(rename = "workspace.ignore_options")]
+    WorkspaceIgnoreOptions(WorkspaceIgnoreOptionsParams),
+    #[serde(rename = "workspace.ignore")]
+    WorkspaceIgnore(WorkspaceIgnoreParams),
     #[serde(rename = "workspace.diff")]
     WorkspaceDiff(WorkspaceDiffParams),
     #[serde(rename = "workspace.merge")]
@@ -210,6 +244,10 @@ pub enum Request {
     WorkspaceCreatePr(WorkspaceCreatePrParams),
     #[serde(rename = "workspace.set_allowlist")]
     WorkspaceSetAllowlist(WorkspaceSetAllowlistParams),
+    #[serde(rename = "workspace.set_network_rules")]
+    WorkspaceSetNetworkRules(WorkspaceSetNetworkRulesParams),
+    #[serde(rename = "workspace.block_host")]
+    WorkspaceBlockHost(WorkspaceBlockHostParams),
     /// Fetches the workspace's repository from `origin`, on the host with the
     /// user's own credentials. Agents cannot fetch: their sandbox holds no
     /// credentials and the shared `.git` is read-only to them, so this is how
@@ -293,10 +331,16 @@ impl Request {
             WorkspaceStatus(_) => "workspace.status",
             WorkspaceRestart(_) => "workspace.restart",
             WorkspaceChanges(_) => "workspace.changes",
+            WorkspacePrepareCommit(_) => "workspace.prepare_commit",
+            WorkspaceCommit(_) => "workspace.commit",
+            WorkspaceIgnoreOptions(_) => "workspace.ignore_options",
+            WorkspaceIgnore(_) => "workspace.ignore",
             WorkspaceDiff(_) => "workspace.diff",
             WorkspaceMerge(_) => "workspace.merge",
             WorkspaceCreatePr(_) => "workspace.create_pr",
             WorkspaceSetAllowlist(_) => "workspace.set_allowlist",
+            WorkspaceSetNetworkRules(_) => "workspace.set_network_rules",
+            WorkspaceBlockHost(_) => "workspace.block_host",
             WorkspaceFetch(_) => "workspace.fetch",
             FsListDir(_) => "fs.list_dir",
             FsReadFile(_) => "fs.read_file",
@@ -650,3 +694,35 @@ pub struct OpenCodeProvidersResult {
 /// For methods with no meaningful result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Empty {}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrepareCommitResult {
+    pub files: Vec<GitStatusEntry>,
+    pub ahead: u32,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommitResult {
+    pub commit: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IgnoreTarget {
+    File,
+    Directory,
+    FileType,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IgnoreOption {
+    pub label: String,
+    pub path: String,
+    pub target: IgnoreTarget,
+    pub pattern: String,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IgnoreOptionsResult {
+    pub options: Vec<IgnoreOption>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IgnoreResult {
+    pub pattern: String,
+}
