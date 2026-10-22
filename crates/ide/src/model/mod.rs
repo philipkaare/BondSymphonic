@@ -20,6 +20,7 @@ pub mod commands;
 pub mod diff;
 pub mod editor_buffer;
 pub mod file_tree;
+pub mod mcp;
 pub mod models;
 pub mod persistence;
 pub mod run_config;

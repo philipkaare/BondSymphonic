@@ -11,6 +11,7 @@
 #include "GroupBar.h"
 #include "NewAgentDialog.h"
 #include "NetworkRulesDialog.h"
+#include "WorkspaceMcpDialog.h"
 #include "RunPanel.h"
 #include "SettingsDialog.h"
 #include "SetupPage.h"
@@ -412,6 +413,23 @@ void MainWindow::buildMenus() {
         dialog->open();
     });
     m_networkRulesAction->setObjectName(QStringLiteral("WorkspaceNetworkRulesAction"));
+    // Beside the network rules because it is the same kind of question: what
+    // this one workspace's agents may reach. Hidden for a daemon without MCP
+    // servers; see `onConnectionStateChanged`.
+    m_mcpServersAction = workspace->addAction("&MCP servers…", this, [this] {
+        const QString id = activeWorkspaceId();
+        if (id.isEmpty()) { return; }
+        if (!m_mcpServersDialog.isNull()) {
+            m_mcpServersDialog->raise();
+            m_mcpServersDialog->activateWindow();
+            return;
+        }
+        auto* dialog = new WorkspaceMcpDialog(m_controller, id, m_groupModel->workspaceName(id), this);
+        m_mcpServersDialog = dialog;
+        dialog->open();
+    });
+    m_mcpServersAction->setObjectName(QStringLiteral("WorkspaceMcpServersAction"));
+    m_mcpServersAction->setVisible(false);
     workspace->addSeparator();
     // Both go through the handlers the tab's context menu uses, which read the
     // workspace once and put a named question in front of the user. The menu
@@ -928,6 +946,13 @@ void MainWindow::connectController() {
     QObject::connect(m_controller, &AppController::connectionStateChanged, this, &MainWindow::onConnectionStateChanged);
     QObject::connect(m_controller, &AppController::statusMessageChanged, this, &MainWindow::onConnectionStateChanged);
     QObject::connect(m_controller, &AppController::daemonVersionChanged, this, &MainWindow::onConnectionStateChanged);
+    // An MCP server's browser sign-in. Opened here rather than by the Settings
+    // page that asked, so it still opens if that page has been closed since.
+    QObject::connect(m_controller, &AppController::mcpSignInReady, this,
+                     [](const QString&, const QString& url) {
+                         const QUrl target(url);
+                         if (target.scheme() == QLatin1String("https")) { QDesktopServices::openUrl(target); }
+                     });
     // What the daemon announced by event was said on a connection that is now
     // gone. Forgotten the moment the connection is, rather than on
     // `reconnected`: that signal comes after the new connection's list, and
@@ -1527,6 +1552,9 @@ void MainWindow::updateEditActions() {
 void MainWindow::onConnectionStateChanged() {
     // AppController composes the full text, including the version suffix.
     m_daemonLabel->setText(m_controller->getStatusMessage());
+    // The capabilities arrive with the connection, so this is where the MCP
+    // entry learns whether this daemon has MCP servers at all.
+    m_mcpServersAction->setVisible(m_controller->mcpServersSupported());
 }
 
 void MainWindow::onNewAgent() {
@@ -3165,6 +3193,7 @@ void MainWindow::updateWorkspaceStatus() {
     m_restartAgentAction->setEnabled(live);
     m_fetchAction->setEnabled(live);
     m_networkRulesAction->setEnabled(live);
+    m_mcpServersAction->setEnabled(live);
     m_destroyAction->setEnabled(live);
     // The verb follows the workspace: an in-place one is closed, and nothing
     // of the user's goes with it.

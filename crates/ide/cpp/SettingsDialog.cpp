@@ -1,5 +1,6 @@
 #include "SettingsDialog.h"
 #include "AgentChoices.h"
+#include "McpPage.h"
 #include "SetupPage.h"
 #include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
@@ -64,14 +65,21 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
     // Scrolled, because the setup section brings a terminal and eight
     // prerequisite rows with it and the two fields below must stay reachable
     // on a short screen.
-    m_scroll = new QScrollArea(this);
+    // Two tabs: everything that was the whole dialog, and the MCP servers,
+    // which a daemon that predates them does not get. A tab rather than one
+    // more section, because the server list wants the height and the General
+    // sections are already a long scroll.
+    m_tabs = new QTabWidget(this);
+    m_tabs->setObjectName(QStringLiteral("SettingsTabs"));
+    outer->addWidget(m_tabs, 1);
+    m_scroll = new QScrollArea(m_tabs);
     m_scroll->setWidgetResizable(true);
     m_scroll->setFrameShape(QFrame::NoFrame);
     auto* body = new QWidget(m_scroll);
     auto* bodyLayout = new QVBoxLayout(body);
     bodyLayout->setContentsMargins(0, 0, 0, 0);
     m_scroll->setWidget(body);
-    outer->addWidget(m_scroll, 1);
+    m_tabs->addTab(m_scroll, QStringLiteral("General"));
 
     // First, because it is the section a first run needs and the one the
     // status bar's "Set up…" link points at.
@@ -279,6 +287,23 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
 
     QObject::connect(buttons, &QDialogButtonBox::accepted, this, &SettingsDialog::accept);
     QObject::connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+
+    // Hidden against a daemon that predates the MCP requests (ruling R2), and
+    // put in once one that offers them has said hello.
+    showMcpTab(m_controller->mcpServersSupported());
+    QObject::connect(m_controller, &AppController::daemonVersionChanged, this,
+                     [this] { showMcpTab(m_controller->mcpServersSupported()); });
+}
+
+void SettingsDialog::showMcpTab(bool supported) {
+    if (supported && m_mcpPage == nullptr) {
+        m_mcpPage = new McpPage(m_controller, m_tabs);
+        m_tabs->addTab(m_mcpPage, QStringLiteral("MCP servers"));
+    } else if (!supported && m_mcpPage != nullptr) {
+        m_tabs->removeTab(m_tabs->indexOf(m_mcpPage));
+        m_mcpPage->deleteLater();
+        m_mcpPage = nullptr;
+    }
 }
 
 namespace {
@@ -455,6 +480,7 @@ void SettingsDialog::revealSetup() {
     if (m_setup == nullptr) {
         return;
     }
+    m_tabs->setCurrentWidget(m_scroll);
     m_scroll->ensureWidgetVisible(m_setup);
     m_setup->setFocus();
 }
@@ -890,6 +916,29 @@ extern "C" std::int32_t bs_widget_test_settings_lists_and_tests_opencode_servers
     for (QLabel* label : box->findChildren<QLabel*>())
         sawError |= label->text().contains("config unreadable");
     if (!sawError || box->isHidden()) return 13;
+    return 0;
+}
+
+/// Settings has an "MCP servers" tab holding the server list, but only for a
+/// daemon that offers the MCP requests; and Setup still lands on General.
+extern "C" std::int32_t bs_widget_test_settings_has_mcp_tab() {
+    AppController controller;
+    SettingsDialog dialog(&controller);
+    auto* tabs = dialog.findChild<QTabWidget*>(QStringLiteral("SettingsTabs"));
+    if (tabs == nullptr || tabs->count() != 1 || tabs->tabText(0) != QLatin1String("General")) return 1;
+    // No hello yet, so nothing says the daemon offers them.
+    if (controller.mcpServersSupported() || dialog.findChild<QWidget*>(QStringLiteral("McpPage")) != nullptr) return 2;
+    dialog.showMcpTab(true);
+    if (tabs->count() != 2 || tabs->tabText(1) != QLatin1String("MCP servers")) return 3;
+    auto* page = dynamic_cast<McpPage*>(tabs->widget(1));
+    if (page == nullptr || page->findChild<QWidget*>(QStringLiteral("McpServerList")) == nullptr) return 4;
+    dialog.showMcpTab(true);
+    if (tabs->count() != 2) return 5;
+    tabs->setCurrentIndex(1);
+    dialog.revealSetup();
+    if (tabs->currentIndex() != 0) return 6;
+    dialog.showMcpTab(false);
+    if (tabs->count() != 1) return 7;
     return 0;
 }
 

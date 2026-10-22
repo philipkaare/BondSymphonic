@@ -11,6 +11,7 @@ use crate::client::{ClientError, DaemonClient, LatestOnly};
 use crate::launcher::{self, LaunchSpec};
 use crate::model::app_state::{compose_status, ConnectionState, Workspaces};
 use crate::model::backends;
+use crate::model::mcp::{McpView, OAuthAttempts};
 use crate::model::persistence::{self, StateFile, StateStore};
 use crate::model::transcript::agent_state_word;
 use crate::qobjects::settings::Settings;
@@ -49,6 +50,22 @@ static SHARED: OnceLock<std::sync::Mutex<Option<Shared>>> = OnceLock::new();
 static MODEL_GENERATIONS: OnceLock<std::sync::Mutex<backends::ReplyGenerations>> = OnceLock::new();
 fn model_generations() -> &'static std::sync::Mutex<backends::ReplyGenerations> {
     MODEL_GENERATIONS.get_or_init(Default::default)
+}
+
+/// The MCP listing on screen, shared by the Settings tab and every workspace
+/// dialog. Process-wide because `mcp.list` replies are applied from the
+/// runtime's tasks via the Qt thread, like the model generations above.
+static MCP_VIEW: OnceLock<std::sync::Mutex<McpView>> = OnceLock::new();
+fn mcp_view() -> &'static std::sync::Mutex<McpView> {
+    MCP_VIEW.get_or_init(Default::default)
+}
+
+/// The browser sign-in in flight, and the task listening for its callback,
+/// aborted when a newer Connect or a Disconnect ends the attempt.
+static MCP_SIGN_IN: OnceLock<std::sync::Mutex<(OAuthAttempts, Option<tokio::task::AbortHandle>)>> =
+    OnceLock::new();
+fn mcp_sign_in() -> &'static std::sync::Mutex<(OAuthAttempts, Option<tokio::task::AbortHandle>)> {
+    MCP_SIGN_IN.get_or_init(Default::default)
 }
 
 /// The one `repo.inspect` whose answer is still wanted. Each inspection
@@ -1023,6 +1040,102 @@ pub mod qobject {
             provider: QString,
             json: QString,
         );
+
+        /// Whether the daemon answers the `mcp.*` requests. False before
+        /// `hello` and against a daemon that predates them, where Settings
+        /// has no MCP servers tab and the Workspace menu no "MCP servers…".
+        #[qinvokable]
+        fn mcp_servers_supported(self: &AppController) -> bool;
+
+        /// The newest MCP listing the controller has accepted, in the shape
+        /// `mcp_changed` carries, so a page opened now has something to draw.
+        #[qinvokable]
+        fn mcp_view_json(self: &AppController) -> QString;
+
+        /// Asks the daemon for the MCP registry and statuses. Also sent on
+        /// every `mcp.changed` event and after every MCP change this IDE
+        /// makes; a reply older than the one already shown is dropped.
+        #[qinvokable]
+        fn mcp_list(self: Pin<&mut AppController>);
+
+        /// Saves one server from the editor's form: `{"server": McpServerConfig,
+        /// "secrets": [{"reference", "value", "remove"}], "expected_revision"}`.
+        /// A blank secret value keeps what is stored. The values go no further
+        /// than the request.
+        #[qinvokable]
+        fn mcp_upsert(self: Pin<&mut AppController>, form_json: QString);
+
+        #[qinvokable]
+        fn mcp_remove(self: Pin<&mut AppController>, server_id: QString);
+
+        /// Checks a pasted `mcpServers` document. The answer is an
+        /// `McpImportPreviewResult` in `mcp_operation_finished`.
+        #[qinvokable]
+        fn mcp_import_preview(self: Pin<&mut AppController>, document: QString);
+
+        /// Imports the document with `resolutions_json`, an object from each
+        /// colliding entry's name to the server ID it should take.
+        #[qinvokable]
+        fn mcp_import_apply(
+            self: Pin<&mut AppController>,
+            document: QString,
+            resolutions_json: QString,
+        );
+
+        /// The registry as the daemon exports it: configuration and secret
+        /// references, never values. Arrives as the `json` of
+        /// `mcp_operation_finished("mcp.export", ...)`.
+        #[qinvokable]
+        fn mcp_export(self: Pin<&mut AppController>);
+
+        #[qinvokable]
+        fn mcp_restore_preset(self: Pin<&mut AppController>);
+
+        /// `value` is `inherit`, `enabled` or `disabled`.
+        #[qinvokable]
+        fn mcp_set_override(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            server_id: QString,
+            value: QString,
+        );
+
+        /// Starts a browser sign-in to an OAuth server: a loopback listener on
+        /// `127.0.0.1:<ephemeral>`, `mcp.connect` with its `/callback` as the
+        /// redirect URI, then `mcp_sign_in_ready` with the URL to open. The
+        /// listener takes one callback for this attempt and closes after it or
+        /// after 10 minutes; the outcome is an `mcp.callback` operation.
+        #[qinvokable]
+        fn mcp_connect(self: Pin<&mut AppController>, server_id: QString);
+
+        #[qinvokable]
+        fn mcp_disconnect(self: Pin<&mut AppController>, server_id: QString);
+
+        /// Connects to a remote server from the daemon and lists its tools.
+        #[qinvokable]
+        fn mcp_test(self: Pin<&mut AppController>, server_id: QString);
+
+        /// The listing changed: an `McpListResult` as JSON, `{"error": ...}`
+        /// when the daemon could not list the registry, or `{}` on a new
+        /// connection before its first answer.
+        #[qsignal]
+        fn mcp_changed(self: Pin<&mut AppController>, json: QString);
+
+        /// One MCP request ended. `op` is its method name; `error` is empty on
+        /// success, when `json` is the daemon's answer.
+        #[qsignal]
+        fn mcp_operation_finished(
+            self: Pin<&mut AppController>,
+            op: QString,
+            server_id: QString,
+            json: QString,
+            error: QString,
+        );
+
+        /// The authorization URL of a sign-in, for the window to open in the
+        /// system browser.
+        #[qsignal]
+        fn mcp_sign_in_ready(self: Pin<&mut AppController>, server_id: QString, url: QString);
 
         /// Stores the Anthropic API key in the Windows credential store,
         /// replacing any previous one. Returns whether it was stored.
@@ -2400,6 +2513,11 @@ async fn drain_events(mut events: crate::client::EventStream, router: EventRoute
                     }
                 });
             }
+            // Duplicated or out of order is fine: each one re-lists, and the
+            // view drops a reply older than the one it shows.
+            Event::McpChanged { .. } => {
+                let _ = qt.queue(|q| q.mcp_list());
+            }
             Event::DaemonLog { level, message, .. } => {
                 // At the daemon's own level, not always at `info`: a warning
                 // the daemon thought worth raising is a warning here too, and a
@@ -3193,9 +3311,16 @@ async fn connect_once(
         // State first, then the version, so `apply_daemon_version`
         // recomposes the text as "daemon: connected v<version>".
         q.as_mut().set_state(ConnectionState::Connected);
+        // A new connection may be to another daemon, whose registry
+        // revisions have nothing to do with the last one's.
+        mcp_view().lock().unwrap().reset();
+        q.as_mut().mcp_changed(QString::from("{}"));
         q.as_mut()
             .apply_daemon_version(QString::from(version.as_str()));
-        q.backend_settings_changed();
+        q.as_mut().backend_settings_changed();
+        // Listed now rather than when a page opens, so Settings and the
+        // workspace dialog open on a list instead of "Loading".
+        q.mcp_list();
     });
 
     if first {
@@ -4602,6 +4727,255 @@ impl qobject::AppController {
         true
     }
 
+    pub fn mcp_servers_supported(&self) -> bool {
+        mcp_servers_offered(&self.rust().capabilities.to_string())
+    }
+
+    pub fn mcp_view_json(&self) -> QString {
+        QString::from(&mcp_view().lock().unwrap().to_json())
+    }
+
+    pub fn mcp_list(self: Pin<&mut Self>) {
+        if !self.mcp_servers_supported() {
+            return;
+        }
+        let Ok(shared) = require_connection() else {
+            return;
+        };
+        let qt = self.qt_thread();
+        let connection = connection_generation();
+        let ticket = mcp_view().lock().unwrap().begin_list();
+        runtime().spawn(async move {
+            let result = shared
+                .client
+                .request::<McpListResult>(Request::McpList {})
+                .await;
+            let _ = qt.queue(move |q| {
+                // A reply from a connection that has since been replaced
+                // describes a daemon this view no longer shows.
+                if connection_generation() != connection {
+                    return;
+                }
+                let json = {
+                    let mut view = mcp_view().lock().unwrap();
+                    let applied = match result {
+                        Ok(listing) => view.apply_list(ticket, listing),
+                        Err(e) => view.apply_error(ticket, mcp_error_text(&e)),
+                    };
+                    applied.then(|| view.to_json())
+                };
+                if let Some(json) = json {
+                    q.mcp_changed(QString::from(&json));
+                }
+            });
+        });
+    }
+
+    pub fn mcp_upsert(self: Pin<&mut Self>, form_json: QString) {
+        let form = serde_json::from_str::<crate::model::mcp::ServerForm>(&form_json.to_string());
+        let (server_id, params) = match form {
+            Ok(form) => (
+                form.server.id.0.clone(),
+                crate::model::mcp::upsert_params(form),
+            ),
+            // Not the serde message: it would quote the form, secrets and all.
+            Err(_) => (
+                String::new(),
+                Err("The server form could not be read.".into()),
+            ),
+        };
+        match params {
+            Ok(params) => self.mcp_request("mcp.upsert", server_id, Request::McpUpsert(params)),
+            Err(message) => finish_mcp(&self.qt_thread(), "mcp.upsert", server_id, "", message),
+        }
+    }
+
+    pub fn mcp_remove(self: Pin<&mut Self>, server_id: QString) {
+        let id = server_id.to_string();
+        self.mcp_request(
+            "mcp.remove",
+            id.clone(),
+            Request::McpRemove(McpServerIdParams {
+                server_id: McpServerId(id),
+            }),
+        );
+    }
+
+    pub fn mcp_import_preview(self: Pin<&mut Self>, document: QString) {
+        self.mcp_request(
+            "mcp.import_preview",
+            String::new(),
+            Request::McpImportPreview(McpImportParams {
+                document: McpSecretValue(document.to_string()),
+                resolutions: Default::default(),
+                expected_revision: None,
+            }),
+        );
+    }
+
+    pub fn mcp_import_apply(self: Pin<&mut Self>, document: QString, resolutions_json: QString) {
+        let Ok(resolutions) = serde_json::from_str::<std::collections::BTreeMap<String, McpServerId>>(
+            &resolutions_json.to_string(),
+        ) else {
+            let qt = self.qt_thread();
+            finish_mcp(
+                &qt,
+                "mcp.import_apply",
+                String::new(),
+                "",
+                "The collision choices could not be read.".into(),
+            );
+            return;
+        };
+        self.mcp_request(
+            "mcp.import_apply",
+            String::new(),
+            Request::McpImportApply(McpImportParams {
+                document: McpSecretValue(document.to_string()),
+                resolutions,
+                expected_revision: None,
+            }),
+        );
+    }
+
+    pub fn mcp_export(self: Pin<&mut Self>) {
+        self.mcp_request("mcp.export", String::new(), Request::McpExport {});
+    }
+
+    pub fn mcp_restore_preset(self: Pin<&mut Self>) {
+        self.mcp_request(
+            "mcp.restore_preset",
+            "jira".into(),
+            Request::McpRestorePreset {},
+        );
+    }
+
+    pub fn mcp_set_override(
+        self: Pin<&mut Self>,
+        workspace_id: QString,
+        server_id: QString,
+        value: QString,
+    ) {
+        let id = server_id.to_string();
+        let Ok(value) =
+            serde_json::from_value::<McpWorkspaceOverride>(serde_json::json!(value.to_string()))
+        else {
+            let qt = self.qt_thread();
+            finish_mcp(
+                &qt,
+                "mcp.override",
+                id,
+                "",
+                format!("Unknown override \"{value}\"."),
+            );
+            return;
+        };
+        self.mcp_request(
+            "mcp.override",
+            id.clone(),
+            Request::McpOverride(McpOverrideParams {
+                server_id: McpServerId(id),
+                workspace_id: WorkspaceId(workspace_id.to_string()),
+                value,
+            }),
+        );
+    }
+
+    pub fn mcp_test(self: Pin<&mut Self>, server_id: QString) {
+        let id = server_id.to_string();
+        self.mcp_request(
+            "mcp.test",
+            id.clone(),
+            Request::McpTest(McpTestParams {
+                server_id: McpServerId(id),
+            }),
+        );
+    }
+
+    pub fn mcp_disconnect(self: Pin<&mut Self>, server_id: QString) {
+        let id = server_id.to_string();
+        // A sign-in still waiting for its browser is over: the account it
+        // would bring is the one being disconnected.
+        {
+            let mut sign_in = mcp_sign_in().lock().unwrap();
+            if sign_in.0.server() == Some(id.as_str()) {
+                sign_in.0.cancel_all();
+                if let Some(listener) = sign_in.1.take() {
+                    listener.abort();
+                }
+            }
+        }
+        self.mcp_request(
+            "mcp.disconnect",
+            id.clone(),
+            Request::McpDisconnect(McpServerIdParams {
+                server_id: McpServerId(id),
+            }),
+        );
+    }
+
+    pub fn mcp_connect(self: Pin<&mut Self>, server_id: QString) {
+        let qt = self.qt_thread();
+        let id = server_id.to_string();
+        if !self.mcp_servers_supported() {
+            finish_mcp(&qt, "mcp.connect", id, "", MCP_UNSUPPORTED.into());
+            return;
+        }
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                finish_mcp(&qt, "mcp.connect", id, "", message.into());
+                return;
+            }
+        };
+        let mut sign_in = mcp_sign_in().lock().unwrap();
+        let attempt = sign_in.0.begin(&id);
+        if let Some(previous) = sign_in.1.take() {
+            previous.abort();
+        }
+        let task = runtime().spawn(sign_in_to(shared, qt, id, attempt));
+        sign_in.1 = Some(task.abort_handle());
+    }
+
+    /// Sends one MCP request and reports it as `mcp_operation_finished(op)`.
+    /// Every change re-lists rather than trusting the `mcp.changed` event to
+    /// arrive, which it may do late or twice.
+    fn mcp_request(self: Pin<&mut Self>, op: &'static str, server_id: String, request: Request) {
+        let qt = self.qt_thread();
+        if !self.mcp_servers_supported() {
+            finish_mcp(&qt, op, server_id, "", MCP_UNSUPPORTED.into());
+            return;
+        }
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                finish_mcp(&qt, op, server_id, "", message.into());
+                return;
+            }
+        };
+        let changes = !matches!(op, "mcp.import_preview" | "mcp.export");
+        runtime().spawn(async move {
+            match shared.client.request_raw(request).await {
+                Ok(value) => {
+                    let json = match op {
+                        // The document is a string inside the answer.
+                        "mcp.export" => value
+                            .get("document")
+                            .and_then(|d| d.as_str())
+                            .map(str::to_owned)
+                            .unwrap_or_default(),
+                        _ => value.to_string(),
+                    };
+                    finish_mcp(&qt, op, server_id, &json, String::new());
+                }
+                Err(e) => finish_mcp(&qt, op, server_id, "", mcp_error_text(&e)),
+            }
+            if changes {
+                let _ = qt.queue(|q| q.mcp_list());
+            }
+        });
+    }
+
     pub fn set_api_key(mut self: Pin<&mut Self>, key: QString) -> bool {
         // `key` is moved straight into the credential store and dropped. It is
         // deliberately not logged, not stored on this object, and not echoed
@@ -5462,6 +5836,154 @@ impl qobject::AppController {
 /// is no.
 fn opencode_providers_offered(capabilities: &str) -> bool {
     serde_json::from_str::<Capabilities>(capabilities).is_ok_and(|c| c.opencode_providers)
+}
+
+/// Whether the capabilities `hello` answered with (as JSON) offer the
+/// `mcp.*` requests. An older daemon leaves the field out, which reads false.
+fn mcp_servers_offered(capabilities: &str) -> bool {
+    serde_json::from_str::<Capabilities>(capabilities).is_ok_and(|c| c.mcp_servers)
+}
+
+const MCP_UNSUPPORTED: &str = "This daemon does not support MCP servers.";
+
+/// The sentence an MCP request failed with: the daemon's own message (a
+/// degraded registry names `registry.json` in it), without the `rpc:` prefix.
+fn mcp_error_text(e: &ClientError) -> String {
+    match e {
+        ClientError::Rpc(e) => e.message.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn finish_mcp(qt: &QtHandle, op: &'static str, server_id: String, json: &str, error: String) {
+    let json = json.to_owned();
+    let _ = qt.queue(move |q| {
+        q.mcp_operation_finished(
+            QString::from(op),
+            QString::from(&server_id),
+            QString::from(&json),
+            QString::from(&error),
+        )
+    });
+}
+
+/// One browser sign-in, from the listener's bind to the daemon's answer to
+/// the callback. Ends early, without a word, when a newer attempt has taken
+/// its place: that one reports for both.
+async fn sign_in_to(shared: Shared, qt: QtHandle, id: String, attempt: u64) {
+    use crate::client::oauth_callback::{self, CallbackOutcome};
+    let still_active = || mcp_sign_in().lock().unwrap().0.is_active(attempt);
+    let end = |message: String| {
+        mcp_sign_in().lock().unwrap().0.cancel(attempt);
+        message
+    };
+    let (listener, port) = match oauth_callback::bind().await {
+        Ok(bound) => bound,
+        Err(e) => {
+            let message = end(format!("Could not listen for the browser's sign-in: {e}"));
+            finish_mcp(&qt, "mcp.connect", id, "", message);
+            return;
+        }
+    };
+    let params = McpConnectParams {
+        server_id: McpServerId(id.clone()),
+        redirect_uri: oauth_callback::redirect_uri(port),
+    };
+    let url = match shared
+        .client
+        .request::<McpConnectResult>(Request::McpConnect(params))
+        .await
+    {
+        Ok(result) => result.authorization_url,
+        Err(e) => {
+            let message = end(mcp_error_text(&e));
+            finish_mcp(&qt, "mcp.connect", id, "", message);
+            let _ = qt.queue(|q| q.mcp_list());
+            return;
+        }
+    };
+    if url.is_empty() {
+        // Not an OAuth server: the daemon tested the connection instead, and
+        // it worked. There is nothing for a browser to do.
+        end(String::new());
+        finish_mcp(&qt, "mcp.connect", id, "{}", String::new());
+        let _ = qt.queue(|q| q.mcp_list());
+        return;
+    }
+    let Some(state) = oauth_callback::query_value(&url, "state") else {
+        let message = end("The server's sign-in link carries no state, so its answer could not be told apart from a forged one.".into());
+        finish_mcp(&qt, "mcp.connect", id, "", message);
+        return;
+    };
+    if !mcp_sign_in().lock().unwrap().0.set_state(attempt, state) {
+        return;
+    }
+    {
+        let (id, url) = (id.clone(), url.clone());
+        let _ = qt.queue(move |q| q.mcp_sign_in_ready(QString::from(&id), QString::from(&url)));
+    }
+    finish_mcp(
+        &qt,
+        "mcp.connect",
+        id.clone(),
+        r#"{"waiting":true}"#,
+        String::new(),
+    );
+    let outcome =
+        oauth_callback::wait_for_callback(listener, oauth_callback::CALLBACK_TIMEOUT, |state| {
+            mcp_sign_in()
+                .lock()
+                .unwrap()
+                .0
+                .take(attempt, state)
+                .is_some()
+        })
+        .await;
+    let result = match outcome {
+        None => {
+            if !still_active() {
+                return;
+            }
+            Err(end(
+                "The sign-in was not finished within 10 minutes. Choose Connect to try again."
+                    .into(),
+            ))
+        }
+        Some(CallbackOutcome::Denied { error, .. }) => {
+            // The error code came from the browser's address bar: keep it to
+            // the characters an OAuth error code is made of.
+            let error: String = error
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .take(64)
+                .collect();
+            Err(format!("The sign-in was not completed ({error})."))
+        }
+        Some(CallbackOutcome::Code {
+            state,
+            code,
+            issuer,
+        }) => match require_connection() {
+            Ok(shared) => shared
+                .client
+                .request_raw(Request::McpCallback(McpCallbackParams {
+                    server_id: McpServerId(id.clone()),
+                    state: McpSecretValue(state),
+                    code: McpSecretValue(code),
+                    issuer,
+                }))
+                .await
+                .map(|value| value.to_string())
+                .map_err(|e| mcp_error_text(&e)),
+            Err(message) => Err(message.to_owned()),
+        },
+        Some(CallbackOutcome::NotCallback) => return,
+    };
+    match result {
+        Ok(json) => finish_mcp(&qt, "mcp.callback", id, &json, String::new()),
+        Err(message) => finish_mcp(&qt, "mcp.callback", id, "", message),
+    }
+    let _ = qt.queue(|q| q.mcp_list());
 }
 
 /// A connection test the daemon could not run, in the shape of one it did.

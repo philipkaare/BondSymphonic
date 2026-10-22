@@ -5,6 +5,7 @@
 #include <QJsonArray>
 
 class AppController;
+class McpPage;
 class SetupPage;
 class QCheckBox;
 class QComboBox;
@@ -13,6 +14,7 @@ class QLineEdit;
 class QPushButton;
 class QScrollArea;
 class QSpinBox;
+class QTabWidget;
 class QWidget;
 
 /// Creates and opens `directory`, OpenCode's Windows user configuration
@@ -54,6 +56,11 @@ public:
     /// the window wearing a look the user just declined to keep.
     void reject() override;
 
+    /// Adds the "MCP servers" tab when the daemon offers the MCP requests,
+    /// and takes it away when it does not. Called on construction and again
+    /// whenever the daemon connection changes.
+    void showMcpTab(bool supported);
+
 private:
     /// Points the field's placeholder at whatever the credential store now
     /// says, and greys "Remove key" out when there is nothing to remove.
@@ -65,6 +72,9 @@ private:
     /// The scroller the sections live in, so `revealSetup` can bring the first
     /// one back into view in a dialog the user has scrolled.
     QScrollArea* m_scroll = nullptr;
+    /// General, and MCP servers when the daemon offers them.
+    QTabWidget* m_tabs = nullptr;
+    McpPage* m_mcpPage = nullptr;
   struct BackendControls {
       QString label;
       QCheckBox *enabled;

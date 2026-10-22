@@ -955,6 +955,91 @@ An agent in a sandbox has no GitHub credentials, so BondSymphonic gives it built
 
 ---
 
+## MCP servers
+
+MCP servers give agents more tools: an issue tracker, a database, a search
+service. Open **Settings → MCP servers** to manage them. The tab lists each
+server with a status dot: green is connected, amber is a sign-in in progress,
+red is an error (its reason follows the word), grey is not signed in, not yet
+tested, or a local server, which is only started inside an agent's sandbox. The
+tab and the Workspace menu item below appear only when the daemon supports MCP
+servers; an older daemon shows neither.
+
+Claude Code, Codex and OpenCode agents all get the same servers. The built-in
+git tools keep the reserved name `bondsymphonic`, so no server can use that ID.
+
+### Adding a server
+
+Choose **Add…** and fill in:
+
+- **ID**: 1 to 32 lowercase letters, digits, `-` or `_`, starting with a letter
+  or digit. It cannot be changed later.
+- **Transport**: **Remote (Streamable HTTP)** for a server on the internet, with
+  an `https://` URL, or **Local command in the sandbox (stdio)** for a program
+  installed in the agent's sandbox, with its arguments one per line. Legacy SSE
+  servers and plain `http://` URLs are not supported.
+- **Authentication** for a remote server: none, **Sign in with OAuth**, a
+  **Bearer token**, or **Secret headers**. OAuth discovers the server's sign-in
+  endpoints itself; a client ID, client metadata URL, client secret and scopes
+  are optional, for servers that need them.
+- **Secret variables** for a local server: environment variables whose values
+  are secrets. Put anything else under **Environment** as `NAME=value`.
+- **Enabled**, **On in every workspace** (the workspace default), and which
+  **Agents** get it.
+
+**Test** connects to a remote server from the daemon and lists its tools.
+**Import…** takes a pasted document with an `"mcpServers"` object, as Claude
+Code, Cursor and others write it; **Preview** shows what would be added and any
+entry that cannot be imported, and **Import** stays unavailable until every
+entry whose ID is already in use is resolved, either by replacing the existing
+server or by choosing a new ID. **Export…** shows the configuration with its
+secret references, never the secret values.
+
+### Signing in to Jira
+
+A **Jira (Atlassian)** server is there from the start, using Atlassian's
+official endpoint `https://mcp.atlassian.com/v2/mcp`, on for every agent and
+every workspace. Select it and choose **Connect**: your browser opens
+Atlassian's sign-in page, and when you approve, the browser comes back to a
+page saying you can close the tab, and the status turns green. The IDE listens
+for that return on `127.0.0.1` for this one sign-in, for at most 10 minutes;
+after that, choose **Connect** again. **Disconnect** forgets the sign-in, and
+the server's tools stop working at once. If you remove the Jira server, it
+stays removed until you choose **Restore Jira preset**.
+
+Any other server that signs in with OAuth works the same way. Servers with no
+authentication, a bearer token or secret headers have no sign-in; use **Test**
+to check them. An agent starts even when a server's sign-in is missing or has
+expired: that server's tools just answer that it is not connected.
+
+### Workspace overrides
+
+**Workspace → MCP servers…** chooses, for the current workspace only, whether
+its agents get each server: **Inherit** follows the server's **On in every
+workspace** setting (the label says which way that currently goes), or
+**Enabled** or **Disabled** regardless. A choice is saved as you make it.
+
+### When changes apply
+
+The servers an agent gets are worked out when it starts. A new server, or one
+enabled globally or for a workspace, reaches an agent when that agent next
+starts: restart the agent to pick it up. Disabling a server, disabling it for a
+workspace, removing it or disconnecting it takes effect immediately, and the
+tools of agents already running fail from then on.
+
+### Where secrets live
+
+Tokens, bearer values, header values, client secrets and secret variables are
+stored by the daemon in its private data directory inside WSL
+(`~/.bondsymphonic/mcp/`), never in your repositories. The editor never shows
+a stored value: a secret field starts blank, leaving it blank keeps the stored
+value, and **Remove** (or deleting its row) deletes it. Remote credentials never
+enter an agent's sandbox: the daemon makes the remote calls itself. A local
+server's secrets reach only that server's own process in the sandbox, through a
+private file, never its command line.
+
+---
+
 ## When a workspace cannot run
 
 A tab reading ⏸ or ✕, with the reason in its tooltip, is a workspace whose

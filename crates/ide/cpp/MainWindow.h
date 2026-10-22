@@ -616,6 +616,9 @@ private:
     QAction* m_fetchAction = nullptr;
     QAction* m_networkRulesAction = nullptr;
     QPointer<QDialog> m_networkRulesDialog;
+    /// Workspace > MCP servers…, shown only when the daemon offers them.
+    QAction* m_mcpServersAction = nullptr;
+    QPointer<QDialog> m_mcpServersDialog;
     QAction* m_destroyAction = nullptr;
     QAction* m_closeGroupAction = nullptr;
     /// The two that need a *second* tab to go to rather than merely one tab.
