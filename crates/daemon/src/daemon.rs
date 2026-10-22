@@ -217,6 +217,10 @@ pub struct Daemon {
     /// One allowlisting proxy per live workspace: the only route out of a
     /// sandbox, and the only place the allowlist is enforced.
     pub proxies: crate::net::proxy::ProxyRegistry,
+    pub opencode_providers: Arc<crate::opencode::ProviderStore>,
+    pub mcp: Arc<crate::mcp::McpManager>,
+    pub mcp_remote: Arc<crate::mcp::auth::RemoteMcpManager>,
+    pub mcp_broker: Arc<crate::mcp::broker::McpBroker>,
     pub agent_sandboxes: crate::workspace::agent_sandboxes::AgentSandboxes,
     /// The running runs, which is where `WorkspaceInfo.runs` comes from.
     pub runs: crate::runs::manager::RunManager,
@@ -241,6 +245,16 @@ impl Daemon {
         let registry = Registry::load(&dirs.registry_file())?;
         let agents =
             AgentManager::new(events.clone(), dirs.transcripts.clone(), dirs.agents_file());
+        let opencode_providers = Arc::new(crate::opencode::ProviderStore::load(dirs.root.clone())?);
+        let mcp = Arc::new(
+            crate::mcp::McpManager::load(dirs.root.clone())
+                .map_err(|e| anyhow::anyhow!(e.message))?,
+        );
+        let mcp_remote = Arc::new(crate::mcp::auth::RemoteMcpManager::new(mcp.clone()));
+        let mcp_broker = Arc::new(crate::mcp::broker::McpBroker::new(
+            mcp.clone(),
+            mcp_remote.clone(),
+        ));
         Ok(Arc::new(Self {
             dirs,
             registry,
@@ -254,6 +268,10 @@ impl Daemon {
             agents,
             proxies: crate::net::proxy::ProxyRegistry::default(),
             agent_sandboxes: Default::default(),
+            opencode_providers,
+            mcp,
+            mcp_remote,
+            mcp_broker,
             runs: crate::runs::manager::RunManager::new(events),
             models: crate::models::ModelsCache::new(),
             host: tokio::sync::OnceCell::new(),
@@ -370,6 +388,22 @@ impl Daemon {
         info.agents = info.agent_records.iter().map(|a| a.id.clone()).collect();
         info.runs = self.runs.runs_of(&ws.id);
         info
+    }
+
+    /// Fresh list/get state, including startup restoration and a live sandbox.
+    /// A caller's earlier registry list may predate completion or failure of a
+    /// restore; re-read by ID rather than reusing its persisted Ready record.
+    pub fn workspace_snapshot(&self, id: &WorkspaceId) -> Result<WorkspaceInfo, RpcError> {
+        let mut info = self.workspace_info(&self.workspace(id)?);
+        if info.state == WorkspaceState::Ready {
+            let live = self
+                .sandbox(id)
+                .is_ok_and(|handle| handle.died().is_none_or(|died| !*died.borrow()));
+            if !live {
+                info.state = WorkspaceState::SandboxDown;
+            }
+        }
+        Ok(info)
     }
 
     pub fn emit_state(&self, ws: &Workspace) {

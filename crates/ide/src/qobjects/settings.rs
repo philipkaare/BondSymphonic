@@ -259,6 +259,7 @@ impl Settings {
                 crate::model::backends::BackendSettings {
                     enabled: true,
                     default_model: String::new(),
+                    default_provider_id: String::new(),
                     default_permission_mode: mode.into(),
                 },
             );
@@ -529,6 +530,61 @@ pub fn clear_backend_api_key(kind: bondsymphonic_proto::AgentAdapterKind) -> boo
             false
         }
     }
+}
+
+/// A separate Windows credential entry for each stable OpenCode provider ID.
+/// IDs are encoded so two provider names cannot alias a credential entry.
+pub fn provider_credential_name(id: &str) -> Option<String> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    // Windows credential target names are case-insensitive. Encoding each byte
+    // preserves distinct case-sensitive provider IDs such as Foo and foo.
+    let mut name = String::from("opencode_provider_");
+    for byte in id.bytes() {
+        use std::fmt::Write;
+        write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Some(name)
+}
+
+pub fn provider_api_key(id: &str) -> Option<String> {
+    let name = provider_credential_name(id)?;
+    match keyring::Entry::new(KEYRING_SERVICE, &name).and_then(|e| e.get_password()) {
+        Ok(key) => (!key.is_empty()).then_some(key),
+        Err(keyring::Error::NoEntry) => None,
+        Err(e) => {
+            tracing::warn!("provider credential could not be read: {e}");
+            None
+        }
+    }
+}
+
+pub fn set_provider_api_key(id: &str, key: &str) -> bool {
+    let Some(name) = provider_credential_name(id) else {
+        return false;
+    };
+    if key.is_empty() {
+        return false;
+    }
+    keyring::Entry::new(KEYRING_SERVICE, &name)
+        .and_then(|e| e.set_password(key))
+        .is_ok()
+}
+
+pub fn clear_provider_api_key(id: &str) -> bool {
+    let Some(name) = provider_credential_name(id) else {
+        return false;
+    };
+    matches!(
+        keyring::Entry::new(KEYRING_SERVICE, &name).and_then(|e| e.delete_credential()),
+        Ok(()) | Err(keyring::Error::NoEntry)
+    )
 }
 
 /// Removes the key. Deleting one that is not there is success: the caller asked

@@ -26,7 +26,7 @@ apt-get update -y
 # What the daemon needs at run time: git for worktrees, bubblewrap for the
 # sandbox, python3 for the run configurations the IDE detects, gh for pull
 # requests, and curl/ca-certificates/unzip for the Claude Code installer.
-apt-get install -y git bubblewrap curl ca-certificates python3 socat unzip gh
+apt-get install -y git bubblewrap curl ca-certificates python3 socat unzip gh gpgv
 if [ "$MODE" = "dev" ]; then
   # Only a build needs a C toolchain and pkg-config; cargo links with them.
   apt-get install -y build-essential pkg-config

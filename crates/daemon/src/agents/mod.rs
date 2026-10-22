@@ -15,6 +15,7 @@ pub mod codex_backend;
 pub mod codex_rpc;
 pub mod codex_stream;
 pub mod credentials;
+pub mod opencode_backend;
 pub mod persist;
 pub mod token;
 pub mod token_scan;
@@ -357,6 +358,7 @@ pub struct AgentSink {
     /// written back when it exits: see [`credentials::write_back_login_from`].
     /// `None` in the unit tests below, which have no home.
     home: Option<PathBuf>,
+    mcp: Option<Arc<crate::mcp::broker::McpLaunchLease>>,
 }
 
 impl AgentSink {
@@ -381,6 +383,7 @@ impl AgentSink {
             records: None,
             closed: Arc::new(AtomicBool::new(false)),
             home: None,
+            mcp: None,
         }
     }
 
@@ -397,6 +400,11 @@ impl AgentSink {
     /// written back to the daemon user when the agent exits.
     pub fn with_home(mut self, home: PathBuf) -> Self {
         self.home = Some(home);
+        self
+    }
+
+    pub fn with_mcp(mut self, lease: Arc<crate::mcp::broker::McpLaunchLease>) -> Self {
+        self.mcp = Some(lease);
         self
     }
 
@@ -519,6 +527,9 @@ impl AgentSink {
     /// open, and restores the agent as one that ended when the daemon
     /// restarted -- the alternative being an exit nobody ever announces.
     pub async fn ended(&self) {
+        if let Some(lease) = &self.mcp {
+            lease.close();
+        }
         // Ahead of the record, and ahead of the early returns below: an agent
         // with no record on disk still holds a file descriptor, and a daemon
         // that runs for a week must not keep one per agent it has ever run.
@@ -578,6 +589,7 @@ impl AgentSink {
 /// [`bondsymphonic_proto::AgentSummary`].
 #[derive(Clone, Default)]
 struct StartedWith {
+    provider_id: Option<String>,
     command: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
@@ -586,6 +598,7 @@ struct StartedWith {
 impl StartedWith {
     fn from_options(options: &AgentStartOptions) -> Self {
         Self {
+            provider_id: options.provider_id.clone(),
             command: options.command.clone(),
             model: options.model.clone(),
             permission_mode: options.permission_mode.clone(),
@@ -873,11 +886,105 @@ impl AgentManager {
             .with_data(serde_json::json!({ "reason": REASON_AGENT_STARTING }))
         })?;
         log_phase(&ws.id, "agent.start", "gate", phase);
-        let prepared = backend.prepare(d, &ws, &p.options).await?;
+        // Serialize provider edits with publication of the prepared origin grants.
+        let provider_guard = if p.adapter == AgentAdapterKind::OpenCode {
+            Some(d.opencode_providers.lock_launch_edit().await)
+        } else {
+            None
+        };
+        let mut prepared = backend.prepare(d, &ws, &p.options).await?;
         let phase = Instant::now();
         let handle = d.agent_sandboxes.ensure(d, &ws, backend.as_ref()).await?;
+        if p.adapter == AgentAdapterKind::OpenCode {
+            d.agent_sandboxes
+                .set_provider_endpoints(
+                    &ws.id,
+                    prepared
+                        .options
+                        .provider_id
+                        .as_deref()
+                        .ok_or_else(|| RpcError::invalid_params("OpenCode requires a provider"))?,
+                    prepared.provider_endpoints.clone(),
+                )
+                .await?;
+        }
+        drop(provider_guard);
         log_phase(&ws.id, "agent.start", "sandbox", phase);
         let home = d.dirs.home(&ws.id);
+
+        let run_dir = if p.adapter == AgentAdapterKind::Claude {
+            d.dirs.run(&ws.id)
+        } else {
+            d.dirs
+                .root
+                .join("agent-run")
+                .join(crate::mcp::broker::backend_name(p.adapter))
+                .join(ws.id.as_str())
+        };
+        let sandbox_run_dir = if d.backend.name() == "linux_bwrap" {
+            PathBuf::from("/run/bs")
+        } else {
+            run_dir.clone()
+        };
+        let mut native_files = match p.adapter {
+            AgentAdapterKind::Claude => vec![
+                ws.worktree_path.join(".mcp.json"),
+                home.join(".claude.json"),
+            ],
+            AgentAdapterKind::Codex => vec![d.dirs.root.join("codex-home/config.toml")],
+            AgentAdapterKind::OpenCode => vec![
+                ws.worktree_path.join("opencode.json"),
+                ws.worktree_path.join("opencode.jsonc"),
+                ws.worktree_path.join(".opencode/opencode.json"),
+                ws.worktree_path.join(".opencode/opencode.jsonc"),
+            ],
+            AgentAdapterKind::Terminal => vec![],
+        };
+        let opencode_config = d
+            .dirs
+            .root
+            .join("agent-homes/opencode")
+            .join(ws.id.as_str())
+            .join("config/opencode");
+        if p.adapter == AgentAdapterKind::OpenCode {
+            native_files.extend([
+                opencode_config.join("opencode.json"),
+                opencode_config.join("opencode.jsonc"),
+            ]);
+        }
+        if p.adapter == AgentAdapterKind::Codex {
+            native_files.extend(
+                ws.worktree_path
+                    .ancestors()
+                    .map(|parent| parent.join(".codex/config.toml")),
+            );
+        }
+        let launch = if cfg!(unix) && d.backend.name() == "linux_bwrap" {
+            d.mcp_broker
+                .prepare(
+                    ws.id.clone(),
+                    p.adapter,
+                    handle.clone(),
+                    run_dir,
+                    sandbox_run_dir,
+                    ws.worktree_path.clone(),
+                    &native_files,
+                )
+                .await?
+        } else {
+            crate::mcp::broker::McpLaunchConfig::empty()
+        };
+        for server in &launch.servers {
+            if prepared
+                .mcp_servers
+                .iter()
+                .any(|existing| existing["name"] == server["name"])
+            {
+                return Err(RpcError::invalid_params("MCP native server name collision"));
+            }
+        }
+        crate::mcp::broker::native_supplement(p.adapter, &mut prepared.argv, &launch.servers)?;
+        prepared.mcp_servers.extend(launch.servers);
 
         let id = self.mint_id();
         let entry = Arc::new(AgentEntry::new(ws.id.clone(), p.adapter));
@@ -888,12 +995,14 @@ impl AgentManager {
             ws.id.clone(),
             entry.clone(),
         )
-        .with_records(self.records.clone());
+        .with_records(self.records.clone())
+        .with_mcp(launch.lease);
         let sink = if p.adapter == AgentAdapterKind::Claude {
             sink.with_home(home)
         } else {
             sink
         };
+        let normalized_options = prepared.options.clone();
         let mut adapter = backend.adapter(sink, handle, prepared);
         // The record goes down *before* the process is spawned, and this
         // ordering is the whole of what makes the session id survivable.
@@ -910,13 +1019,13 @@ impl AgentManager {
         // The same ordering means an agent that exits immediately -- a bad
         // flag, no login -- has a record for `ended()` to close, instead of
         // coming back as one the daemon claims to have lost at restart.
-        let started_with = StartedWith::from_options(&p.options);
+        let started_with = StartedWith::from_options(&normalized_options);
         let record = AgentRecord {
             agent_id: id.clone(),
             workspace_id: ws.id.clone(),
             adapter: p.adapter,
             session_id: p.options.resume_session.clone(),
-            options: p.options,
+            options: normalized_options,
             started_at: now_rfc3339(),
             ended_at: None,
         };
@@ -1044,6 +1153,8 @@ impl AgentManager {
                         command: a.started_with.command.clone(),
                         model: a.started_with.model.clone(),
                         permission_mode: a.started_with.permission_mode.clone(),
+
+                        provider_id: a.started_with.provider_id.clone(),
                     },
                 )
             })
@@ -1322,6 +1433,8 @@ mod tests {
                 model: None,
                 permission_mode: None,
                 api_key: None,
+
+                provider_id: None,
             },
             started_at: now_rfc3339(),
             ended_at: None,
@@ -1394,6 +1507,8 @@ mod tests {
                 model: None,
                 permission_mode: None,
                 api_key: None,
+
+                provider_id: None,
             },
             started_at: now_rfc3339(),
             ended_at: None,
@@ -1485,3 +1600,6 @@ mod tests {
         );
     }
 }
+
+pub mod acp;
+pub mod opencode_adapter;

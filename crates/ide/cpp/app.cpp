@@ -26,6 +26,12 @@ std::int32_t run_app() {
     // Parented to the application, so they outlive the window and are destroyed
     // once, on the way out of run_app.
     auto* controller = new AppController(&app);
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, &app, [controller] {
+        // Covers the splash's Quit/Alt+F4 path as well as application-level
+        // exits while the main window is still hidden behind preparation.
+        controller->prepareQuit();
+        controller->flushState();
+    });
     auto* groupModel = new GroupModel(&app);
     auto* fileTreeModel = new FileTreeModel(&app);
     auto* changesModel = new ChangesModel(&app);
@@ -59,22 +65,30 @@ std::int32_t run_app() {
     // with the window for activation.
     SplashScreen* splash = nullptr;
     if (qEnvironmentVariableIsEmpty("BS_SMOKE_SCRIPT")) {
+        app.setQuitOnLastWindowClosed(false);
         splash = new SplashScreen(controller);
+        QObject::connect(splash, &SplashScreen::quitRequested, &app,
+                         [] { QCoreApplication::quit(); });
         splash->show();
     }
 
     MainWindow window(controller, groupModel, fileTreeModel, changesModel, runModel);
-    window.show();
     if (splash != nullptr) {
-        // The window is shown behind the splash; when the splash goes the
-        // window is what the user is looking at, and should be what has focus.
-        // Deleted from the loop rather than from inside its own signal.
-        QObject::connect(splash, &SplashScreen::finished, &window, [&window, splash] {
+        // The window's state is restored while hidden. Only after the splash
+        // has finished do we present it; the temporary quit policy prevents
+        // Qt from ending the app in the instant between hiding one top-level
+        // and showing the other.
+        QObject::connect(splash, &SplashScreen::finished, &window, [&app, &window, splash] {
+            window.show();
             window.raise();
             window.activateWindow();
+            app.setQuitOnLastWindowClosed(true);
             splash->deleteLater();
         });
-        splash->raise();
+    } else {
+        // End-to-end fake-daemon smoke runs keep their original direct window
+        // presentation and have no splash competing for activation.
+        window.show();
     }
     controller->start();
     return app.exec();

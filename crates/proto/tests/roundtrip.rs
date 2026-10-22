@@ -9,6 +9,7 @@ fn backend_selection_is_additive_and_old_replies_still_decode() {
     )
     .unwrap();
     assert!(capabilities.backends.is_empty());
+    assert!(!capabilities.workspace_ready_snapshot);
     let request: Request =
         serde_json::from_str(r#"{"method":"system.list_models","params":{"adapter":"codex"}}"#)
             .unwrap();
@@ -306,6 +307,8 @@ fn agent_start_options_debug_redacts_the_api_key() {
         model: Some("sonnet".into()),
         permission_mode: Some("default".into()),
         api_key: Some("sk-ant-secret-value".into()),
+
+        provider_id: None,
     };
     let printed = format!("{options:?}");
     assert!(
@@ -440,6 +443,8 @@ fn workspace_info_carries_agent_records_beside_the_plain_ids() {
             command: None,
             model: Some("claude-opus-5".into()),
             permission_mode: Some("acceptEdits".into()),
+
+            provider_id: None,
         }],
         ..info
     };
@@ -469,6 +474,8 @@ fn workspace_info_carries_agent_records_beside_the_plain_ids() {
             command: None,
             model: None,
             permission_mode: None,
+
+            provider_id: None,
         }],
         ..full
     };

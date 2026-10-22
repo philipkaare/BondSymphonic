@@ -218,6 +218,7 @@ fn active_tab_json_round_trips() {
 fn a_restored_agent_tab_crosses_the_boundary_with_its_adapter_and_agent() {
     let mut listed = info("ws_1", "alpha", WorkspaceState::Ready);
     listed.agent_records = vec![AgentSummary {
+        provider_id: None,
         id: AgentId("ag_1".to_owned()),
         adapter: AgentAdapterKind::Claude,
         state: AgentState::Exited,
@@ -248,6 +249,7 @@ fn a_restored_agent_tab_crosses_the_boundary_with_its_adapter_and_agent() {
 fn a_restored_codex_tab_restarts_with_its_original_backend_and_choices() {
     let mut listed = info("ws_codex", "codex", WorkspaceState::Ready);
     listed.agent_records.push(AgentSummary {
+        provider_id: None,
         id: AgentId("ag_codex".into()),
         adapter: AgentAdapterKind::Codex,
         state: AgentState::Exited,
@@ -1317,6 +1319,7 @@ fn a_reconnect_re_derives_agent_state_and_drops_a_stale_attention_mark() {
     // The daemon dies and comes back. Both agents are gone; the records say so,
     // and no `agent.state` event will ever be sent about them again.
     let record = |id: &str, state: AgentState| AgentSummary {
+        provider_id: None,
         id: AgentId(id.to_owned()),
         adapter: AgentAdapterKind::Claude,
         state,
@@ -1624,6 +1627,7 @@ mod cpp_widgets {
         fn bs_widget_test_run_menu_drives_the_run_panel() -> i32;
         fn bs_widget_test_new_agent_dialog_always_sends_a_permission_mode() -> i32;
         fn bs_widget_test_settings_offers_the_one_permission_list() -> i32;
+        fn bs_widget_test_mcp_and_opencode_settings_forms() -> i32;
         fn bs_widget_test_transcript_composer_offers_model_and_mode() -> i32;
         fn bs_widget_test_transcript_refill_models_keeps_the_selection() -> i32;
         fn bs_widget_test_transcript_welcomes_an_empty_pane() -> i32;
@@ -1658,7 +1662,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 51] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 52] = [
             // These four build a whole MainWindow, and each begins by pointing
             // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
             // is load-bearing rather than tidy: the state store settles its
@@ -1787,6 +1791,10 @@ mod cpp_widgets {
             (
                 "Settings offers the one permission list",
                 bs_widget_test_settings_offers_the_one_permission_list,
+            ),
+            (
+                "MCP and OpenCode settings use ordinary write-only forms and preview",
+                bs_widget_test_mcp_and_opencode_settings_forms,
             ),
             (
                 "The composer offers a model and a permission mode",

@@ -1039,6 +1039,8 @@ async fn a_claude_agent_streams_a_turn_from_inside_the_sandbox() {
                     model: None,
                     permission_mode: None,
                     api_key: None,
+
+                    provider_id: None,
                 },
             },
         )
@@ -1210,6 +1212,8 @@ async fn an_agent_cannot_redirect_the_settings_copy_out_of_its_own_home() {
                     model: None,
                     permission_mode: None,
                     api_key: None,
+
+                    provider_id: None,
                 },
             },
         )

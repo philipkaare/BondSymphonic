@@ -254,6 +254,32 @@ void MainWindow::commitClose(QCloseEvent* event) {
     QMainWindow::closeEvent(event);
 }
 
+void MainWindow::showEvent(QShowEvent* event) {
+    const bool revealingFloating = !m_deferredFloatingDocks.isEmpty();
+    if (revealingFloating) {
+        m_restoring = true;
+    }
+    QMainWindow::showEvent(event);
+    for (QDockWidget* dock : m_deferredFloatingDocks) {
+        if (dock != nullptr && dock->isFloating()) {
+            dock->show();
+        }
+    }
+    m_deferredFloatingDocks.clear();
+    if (revealingFloating) {
+        m_restoring = false;
+        noteWindowState();
+    }
+    if (m_pendingAutoSetup) {
+        m_pendingAutoSetup = false;
+        QTimer::singleShot(0, this, [this] {
+            if (isVisible() && m_controller->shouldAutoOpenSetup()) {
+                showSetupPage();
+            }
+        });
+    }
+}
+
 void MainWindow::moveEvent(QMoveEvent* event) {
     QMainWindow::moveEvent(event);
     noteWindowState();
@@ -588,7 +614,7 @@ void MainWindow::openSettings(bool onSetup) {
         }
         return;
     }
-    SettingsDialog dialog(m_controller, this);
+    SettingsDialog dialog(m_controller, this, {}, activeWorkspaceId());
     m_settingsDialog = &dialog;
     // Set for every open, not only the automatic one. A user who reaches
     // Settings by hand while a blocking prerequisite is failing must not have
@@ -652,10 +678,18 @@ void MainWindow::onPrereqsChecked(const QString& json) {
     updateWorkspaceStatus();
 
     if (m_controller->shouldAutoOpenSetup()) {
-        // Deferred, because this runs inside the controller's own signal and
-        // `openSettings` spins a nested event loop for the length of the
-        // dialog. Queuing it lets this handler finish first.
-        QTimer::singleShot(0, this, [this] { showSetupPage(); });
+        // The window is constructed behind the splash and stays hidden while
+        // harnesses update. A modal Settings dialog parented to that hidden
+        // window would jump over the splash, so hold the prompt until show.
+        if (!isVisible()) {
+            m_pendingAutoSetup = true;
+        } else {
+            QTimer::singleShot(0, this, [this] {
+                if (isVisible() && m_controller->shouldAutoOpenSetup()) {
+                    showSetupPage();
+                }
+            });
+        }
     }
 }
 
@@ -824,6 +858,11 @@ void MainWindow::buildStatusBar() {
     m_opLabel->setOpenExternalLinks(false);
     m_opLabel->setTextInteractionFlags(Qt::TextBrowserInteraction);
     m_opLabel->setVisible(false);
+    m_updateLabel = new QLabel(this);
+    m_updateLabel->setObjectName("HarnessUpdateLabel");
+    m_updateLabel->setTextFormat(Qt::PlainText);
+    m_updateLabel->setMaximumWidth(320);
+    m_updateLabel->setVisible(false);
     QObject::connect(m_opLabel, &QLabel::linkActivated, this, [this](const QString&) {
         if (!m_opUrl.isEmpty()) {
             QDesktopServices::openUrl(QUrl(m_opUrl));
@@ -847,6 +886,7 @@ void MainWindow::buildStatusBar() {
     statusBar()->addWidget(m_setupLabel);
     statusBar()->addWidget(m_branchLabel);
     statusBar()->addWidget(m_attentionLabel);
+    statusBar()->addPermanentWidget(m_updateLabel);
     statusBar()->addPermanentWidget(m_opLabel);
     statusBar()->addPermanentWidget(m_costLabel);
     updateCostLabel();
@@ -892,6 +932,21 @@ void MainWindow::clearAgentStopped(const QString& workspaceId) {
 }
 
 void MainWindow::connectController() {
+    const auto refreshUpdate = [this] {
+        const QString warning = m_controller->getStartupUpdateWarning();
+        const QString progress = m_controller->getStartupUpdateProgress();
+        if (!warning.isEmpty()) {
+            m_updateLabel->setText(QStringLiteral("Harness update warning"));
+            m_updateLabel->setToolTip(warning);
+        } else {
+            m_updateLabel->setText(progress);
+            m_updateLabel->setToolTip(progress);
+        }
+        m_updateLabel->setVisible(!warning.isEmpty() || !progress.isEmpty());
+    };
+    QObject::connect(m_controller, &AppController::startupUpdateProgressChanged, this, refreshUpdate);
+    QObject::connect(m_controller, &AppController::startupUpdateWarningChanged, this, refreshUpdate);
+    refreshUpdate();
     QObject::connect(m_controller, &AppController::connectionStateChanged, this, &MainWindow::onConnectionStateChanged);
     QObject::connect(m_controller, &AppController::statusMessageChanged, this, &MainWindow::onConnectionStateChanged);
     QObject::connect(m_controller, &AppController::daemonVersionChanged, this, &MainWindow::onConnectionStateChanged);
@@ -927,6 +982,23 @@ void MainWindow::connectController() {
                      [this](const QString& json) {
                          m_groupModel->reconcile(json);
                          noteWorkspaceStates(json);
+                         // A current daemon reports whether a Ready snapshot
+                         // means its sandbox is actually running. A client
+                         // joining after restore has no Ready event to hear,
+                         // so its front tab needs this snapshot to resume.
+                         // Older daemons make no such promise: their persisted
+                         // Ready could precede sandbox restore by minutes.
+                         if (QJsonDocument::fromJson(m_controller->capabilitiesJson().toUtf8())
+                                 .object().value("workspace_ready_snapshot").toBool()) {
+                             for (const QJsonValue& value : QJsonDocument::fromJson(json.toUtf8()).array()) {
+                                 const QJsonObject info = value.toObject();
+                                 if (info.value("state").toString() == QLatin1String("ready")) {
+                                     const QString id = info.value("id").toString();
+                                     if (!id.isEmpty()) m_stateAnnounced.insert(id);
+                                 }
+                             }
+                             armAutoRestart(activeWorkspaceId(), m_previousWorkspaceId);
+                         }
                          resumeUnansweredRestarts(true);
                          // After the reconcile, not the restore: the restore
                          // places the tabs the session file remembered, and it
@@ -1171,7 +1243,23 @@ void MainWindow::connectController() {
             QJsonDocument::fromJson(m_controller->backendDescriptorsJson().toUtf8()).array());
         m_agentArea->setBackendAuth("codex", m_controller->backendLoggedIn("codex"),
                                     m_controller->backendAuthFailure("codex"));
+        const auto active = activeTab();
+        if (active.value("adapter").toString() == "opencode") {
+            const auto options = QJsonDocument::fromJson(active.value("options_json").toString().toUtf8()).object();
+            const QString provider = options.value("provider_id").toString();
+            if (!provider.isEmpty()) m_controller->refreshProviderModels(provider);
+        }
     });
+    QObject::connect(m_controller, &AppController::providerModelsChecked, this,
+                     [this](const QString &provider, const QString &json, qint64) {
+                         QList<agentchoices::Choice> choices;
+                         for (const auto &value : QJsonDocument::fromJson(json.toUtf8()).array()) {
+                             const auto entry = value.toObject();
+                             choices.append({entry.value("label").toString(), entry.value("id").toString()});
+                         }
+                         agentchoices::setModels("opencode:" + provider, choices);
+                         m_agentArea->refillModels();
+                     });
     if (menuTest().contains(QLatin1String("backend-auth"))) {
         auto logout = std::make_shared<bool>(false);
         QObject::connect(
@@ -1799,18 +1887,12 @@ bool MainWindow::mayStartFrontTab(const QString& workspaceId) const {
     if (m_hadWorkspaceProblem.contains(workspaceId)) {
         return false;
     }
-    // And the daemon has said, by event on this connection, what state the
-    // workspace is in. `mayAutoRestart` reads the tab's status, and the tab's
-    // status comes from the `workspace.list` -- which cannot be believed here.
-    // A daemon restores its workspaces one at a time after coming up and lists
-    // one persisted `ready` as `ready` from the first request until its own
-    // restore of it finishes, minutes later for a repository on `/mnt/c`; so
-    // at launch this tab read `Ready` over a sandbox that did not exist, the
-    // `agent.start` sent against it hung until the request timed out, and the
-    // window put up a box titled `agent.start` over the tab. The event a
-    // finished restore emits is the daemon's own word that the workspace is
-    // there, and it is the only word this trigger takes. A selection does not
-    // wait for it: that is the user asking, with the tab in front of them.
+    // And the daemon has confirmed this workspace is ready on this connection:
+    // either by a state event after sandbox restore, or by a Ready snapshot it
+    // explicitly advertises as current. Older daemons list persisted `ready`
+    // even while their sandbox is still restoring, so their list alone cannot
+    // pass this gate. A selection does not wait for the confirmation: that is
+    // the user asking, with the tab in front of them.
     return m_stateAnnounced.contains(workspaceId);
 }
 
@@ -2419,6 +2501,15 @@ void MainWindow::onStateLoaded(const QString& json) {
         // default arrangement -- exactly what a session from before the dock
         // existed should come back as.
         restoreState(windowState, kWindowStateVersion);
+        // Qt makes a floating dock a visible top-level even if its parent
+        // MainWindow has never been shown. During splash preparation that
+        // would expose a piece of the IDE before installation finishes.
+        for (QDockWidget* dock : findChildren<QDockWidget*>(QString(), Qt::FindDirectChildrenOnly)) {
+            if (dock->isFloating() && !dock->isHidden()) {
+                dock->hide();
+                m_deferredFloatingDocks.insert(dock);
+            }
+        }
     }
 
     // Held rather than opened: a workspace's editors are reopened the first
@@ -2453,7 +2544,7 @@ void MainWindow::onStateLoaded(const QString& json) {
 }
 
 void MainWindow::noteWindowState() {
-    if (m_restoring || m_controller == nullptr) {
+    if (m_restoring || !m_deferredFloatingDocks.isEmpty() || m_controller == nullptr) {
         return;
     }
     m_controller->noteWindow(QString::fromLatin1(saveState(kWindowStateVersion).toBase64()),
@@ -2747,6 +2838,11 @@ void MainWindow::onActiveTabChanged() {
     // After the pane exists: the options are what a Restart resumes with, and
     // the transcript that holds them is created by `showWorkspace`.
     m_agentArea->setOptionsJson(workspaceId, active.value("options_json").toString());
+    if (active.value("adapter").toString() == "opencode" && previousWorkspaceId != workspaceId) {
+        const auto options = QJsonDocument::fromJson(active.value("options_json").toString().toUtf8()).object();
+        const QString provider = options.value("provider_id").toString();
+        if (!provider.isEmpty()) m_controller->refreshProviderModels(provider);
+    }
     // The shell tab is a plain login shell in the same sandbox, whatever the
     // tab's adapter is.
     m_shellArea->showWorkspace(workspaceId, "terminal", QString());
@@ -2788,7 +2884,8 @@ void MainWindow::rebindCost() {
 }
 
 void MainWindow::updateCostLabel() {
-    if (activeTab().value("adapter").toString() == "codex") {
+    if (activeTab().value("adapter").toString() == "codex" ||
+        activeTab().value("adapter").toString() == "opencode") {
         m_costLabel->setText("Cost unavailable");
         return;
     }
@@ -3034,6 +3131,15 @@ extern "C" std::int32_t bs_widget_test_main_window_docks_the_agent_pane() {
     // the whole of what Window > Reset layout offers.
     window.addDockWidget(Qt::LeftDockWidgetArea, agent);
     agent->setFloating(true);
+    fixture.controller.noteWindow(QString::fromLatin1(window.saveState(kWindowStateVersion).toBase64()),
+                                  QString::fromLatin1(window.saveGeometry().toBase64()));
+    fixture.controller.flushState();
+    WindowFixture restored;
+    auto* restoredAgent = restored.window.findChild<QDockWidget*>(QStringLiteral("AgentDock"));
+    if (restoredAgent == nullptr || !restoredAgent->isFloating() ||
+        !restored.window.isHidden() || !restoredAgent->isHidden()) {
+        return 10; // persisted floating dock stays hidden until the window is shown
+    }
     window.resetLayout();
     if (agent->isFloating() || window.dockWidgetArea(agent) != Qt::RightDockWidgetArea) {
         return 9;

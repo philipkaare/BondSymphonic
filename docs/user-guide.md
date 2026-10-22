@@ -14,7 +14,7 @@ version; `docs/superpowers/specs/` is the design behind it.
 ### Agent backends
 
 **Settings > Agents** has a tab for each backend the connected daemon supports.
-Claude is enabled initially; Codex is disabled until you enable it. Each tab has
+Claude is enabled initially; Codex and OpenCode are disabled until you enable them. Each tab has
 Enabled, installation/sign-in actions, Default model, Default permissions, and a
 write-only API-key field. Keys are stored separately in Windows Credential
 Manager. An empty field keeps the stored key; Remove key deletes that backend's
@@ -23,8 +23,9 @@ disabled, New Agent offers a terminal. Disabling a backend leaves running agents
 alone and prevents new starts and restarts until it is enabled again.
 
 For Codex, press **Install Codex**, then **Sign in to ChatGPT** and follow the ChatGPT
-device sign-in instructions in the Setup terminal. The installer pins Codex
+device sign-in instructions in the Setup terminal. The initial installer provides Codex
 **0.158.0** and its matching Code Mode helper; both are needed for tools to work.
+Subsequent app launches check for newer stable releases as described below.
 If device sign-in is unavailable on your account, the CLI's browser login is an
 alternative, but its callback must be reachable from the browser. In this WSL
 configuration, signing in with the Windows Codex CLI using the shared WSL
@@ -55,6 +56,85 @@ Existing settings migrate on read: Claude's old default permission mode moves
 into its backend entry, with `default` still becoming `manual`. An existing
 backend entry wins over the old field. A daemon without backend descriptors
 continues to expose Claude only; update the daemon before starting Codex.
+
+#### Harness updates at startup
+
+Every app launch checks installed Claude Code, Codex and OpenCode harnesses for
+the newest stable upstream release before restoring sandboxes. This includes
+disabled backends; absent harnesses stay uninstalled. Reconnecting to the daemon
+does not repeat the update. The regular launcher uses this startup flow.
+
+Updates download into separate staging directories. BondSymphonic verifies vendor
+checksums, Claude's signed release manifest, and the CLI or protocol features the
+adapter needs before selecting the new version. Codex and its helper move together.
+These checks do not send a model prompt or change sign-in credentials. They cannot
+guarantee that every model or tool behavior in a future upstream release will work.
+
+The splash screen displays progress during startup preparation and harness
+updates. The main window opens after this phase; clicking the splash does not
+skip an active update. You can quit from the splash to cancel startup. If a
+download or check fails, the app keeps the previous version and displays a
+warning. App-selected releases live under
+`~/.local/share/bondsymphonic/harnesses` in WSL; the original installation remains
+available. Explicit executable overrides are left alone. For Claude, newest stable
+means the latest published release, rather than its delayed `stable` channel.
+
+#### OpenCode and local model providers
+
+OpenCode drives an OpenAI-compatible model server, such as Ollama, vLLM or
+SGLang. Enable OpenCode in Settings, install the CLI, then add a named provider
+with its base URL and model IDs. Choose whether the endpoint runs on the WSL
+host, Windows host, or a remote machine: the sandbox's own localhost is a
+different machine for networking purposes. Keep any URL path prefix required
+by the provider. Models can be entered manually when discovery is unavailable;
+optional context and output limits belong to the selected model.
+
+Provider API keys are optional and stored separately per provider in Windows
+Credential Manager. A blank key keeps the stored value. Removing one provider's
+key does not change another provider or Claude/Codex credentials. New agents
+retain both provider and model identity; restarting a saved session whose
+provider or model was removed requires correcting that configuration. An
+unreachable local server never falls back to a cloud provider.
+
+OpenCode uses its own home, cache, runtime and proxy. Its configured model
+endpoint grants do not authorize Claude or Codex to contact that endpoint.
+The adapter presents streamed tools and permission requests in the existing
+transcript. Messages submitted during an active prompt are queued; Interrupt
+cancels that prompt. Local dollar costs are not invented.
+
+The initial OpenCode **1.18.33** integration is based on source/protocol inspection
+and deterministic test peers. Live tool execution, file edits, session resume,
+and model-server routing inside bubblewrap still require acceptance testing
+on a machine with WSL and an available model server. The installer refuses
+artifacts without the release's published SHA256 digest.
+
+### MCP servers
+
+Settings manages a shared MCP server registry for the supported agent backends.
+A server can run a command inside the agent's sandbox or connect to a remote
+HTTPS Streamable HTTP endpoint. Remote authentication supports no credentials,
+bearer tokens, custom headers and OAuth. Legacy SSE endpoints are unsupported.
+Server environment secrets and remote credentials are edited without reading
+back stored values; exported configuration contains references, not credentials.
+
+Import previews entries and reports unsupported fields or naming collisions
+before applying changes. Servers can be enabled by backend and by workspace;
+a workspace can inherit the default, enable a server, or disable it. Product
+entries supplement repository MCP configuration without rewriting tracked
+project files. Restart an existing agent to update its displayed tool list
+when its backend cannot refresh that list dynamically.
+
+The Jira preset uses `https://mcp.atlassian.com/v2/mcp` and the same editor and
+authentication controls as any other remote server. It is available across
+workspaces by default, but requires an explicit connection to an Atlassian
+account. A disconnected preset does not block ordinary agent startup. Removing
+the preset keeps it removed until explicitly restored.
+
+OAuth opens the Windows browser and receives its callback on a temporary Windows
+loopback listener. The daemon keeps the verifier and credentials outside agent
+sandboxes. Each bridge connection has its own MCP session; disabling or
+disconnecting a server revokes its access. Live Atlassian account/site access
+must be verified separately from fake-server tests.
 
 ### From a package
 
@@ -143,22 +223,21 @@ Provisioning the distro runs two vendor install scripts straight from the
 network, and this is a deliberate choice rather than an oversight, so it is
 written down here for you to weigh:
 
-- `curl -fsSL https://claude.ai/install.sh | bash` runs on **every**
-  provisioning, the packaged `install.ps1` path included. It installs Claude
-  Code.
+- `curl -fsSL https://claude.ai/install.sh | bash` installs Claude Code when
+  it is missing, including through the packaged `install.ps1` path.
 - `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` runs only in
   developer mode, where a checkout has to build the daemon.
 
-Both are the vendors' own documented install commands, fetched over TLS. Neither
-pins a version and neither checks a published checksum, so each provisioning
-installs whatever those endpoints serve at that moment. The `bs` user inside the
+Both are the vendors' own documented install commands, fetched over TLS. The
+provisioning wrapper does not pin or verify a checksum for either installer
+script before running it. The `bs` user inside the
 distro has passwordless `sudo`, so anything either script installs can reach root
 in the distro. That distro is a full WSL environment: it can read the Windows
 drives under `/mnt`, and it is not the bubblewrap sandbox your agents run inside.
 
-If that is more trust than you want to extend, provision the distro yourself and
-install Claude Code from a version you have pinned and verified; the IDE only
-needs `claude` on the `bs` user's `PATH`.
+You can also provision the distro and install Claude Code yourself. Normal app
+startup subsequently checks installed harnesses for stable updates using the
+separate integrity and compatibility checks described above.
 
 ---
 
@@ -1302,6 +1381,10 @@ nothing when unset, which is every ordinary run.
   `BS_LEGACY_SETTINGS_PATH` is what a migration test points at a fake old file.
 - **`BS_PACKAGED_EXE`**: the built `dist\BondSymphonic\bondsymphonic-ide.exe`
   that `crates/ide/tests/packaged_smoke.rs` exercises. Unset, that test skips.
+- **`BS_SETTINGS_SCREENSHOTS`**: an output directory for the `qobject_smoke`
+  test's `widgets_behave_offscreen` check. Saves the real Settings widgets in
+  light and dark themes at normal and narrow sizes, using synthetic prerequisite
+  data. This test-only hook does not run login or installation commands.
 - **`BS_LOG`**: the `tracing` filter for the IDE's own log stream, which also
 - **`BS_LOG_FILE`**: `0` or empty turns off `%LOCALAPPDATA%\BondSymphonic\logs\ide.log`; unset, the file is written and rotated on every launch.
   carries the daemon's.

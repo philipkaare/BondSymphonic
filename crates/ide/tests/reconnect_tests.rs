@@ -340,6 +340,8 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                         &HelloResult {
                             daemon_version: "0.0.0-fake".into(),
                             capabilities: Capabilities {
+                                workspace_ready_snapshot: false,
+                                mcp: None,
                                 backends: vec![],
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
@@ -667,6 +669,8 @@ async fn fake_daemon_speaking_the_next_protocol() -> (std::net::SocketAddr, Jour
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,

@@ -23,6 +23,8 @@ impl Default for ServerConfig {
         Self {
             bind_port: 0,
             capabilities: Capabilities {
+                workspace_ready_snapshot: false,
+                mcp: None,
                 backends: vec![],
                 sandbox_backend: "noop".into(),
                 git_protect: false,

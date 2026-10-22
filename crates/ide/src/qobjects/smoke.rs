@@ -392,6 +392,7 @@ async fn open_agent(
             workspace_id: workspace_id.clone(),
             adapter: AgentAdapterKind::Claude,
             options: AgentStartOptions {
+                provider_id: None,
                 command: None,
                 resume_session: None,
                 model: None,

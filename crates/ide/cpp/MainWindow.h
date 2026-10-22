@@ -32,6 +32,7 @@ class QMenu;
 class QMoveEvent;
 class QPlainTextEdit;
 class QResizeEvent;
+class QShowEvent;
 class QTabWidget;
 class QTimer;
 class RunPanel;
@@ -64,6 +65,9 @@ protected:
     /// [`commitClose`]. A close the user cancels must leave a fully working
     /// IDE, and there is no way back from `AppController::prepareQuit()`.
     void closeEvent(QCloseEvent* event) override;
+    /// Releases an automatic Setup prompt only after the splash has revealed
+    /// this window, so a modal dialog cannot jump in front of preparation.
+    void showEvent(QShowEvent* event) override;
 
     /// Both record the window's geometry, debounced in Rust, so a window the
     /// user moved or resized comes back where they left it.
@@ -346,8 +350,8 @@ private:
     /// which after a daemon restart is bound to an ended agent record like
     /// every other restored tab. See [`m_frontTabSettled`] and
     /// [`m_agentSeenRunning`] for what keeps that one narrow, and
-    /// [`m_stateAnnounced`] for why it waits for the daemon's own event before
-    /// it believes the workspace is there to start an agent in.
+    /// [`m_stateAnnounced`] for why it waits for a current readiness report
+    /// before it believes the workspace is there to start an agent in.
     void armAutoRestart(const QString& workspaceId, const QString& previousWorkspaceId);
     /// Whether an automatic start for `workspaceId` is allowed at all, asked
     /// once when the timer is armed and again when it fires. Everything that
@@ -493,19 +497,15 @@ private:
     /// Records the state of every `WorkspaceInfo` in `json`, which is one info
     /// object or an array of them.
     void noteWorkspaceStates(const QString& json);
-    /// Workspaces whose state the daemon has announced by a `workspace.state`
-    /// event on the current connection, as opposed to in the answer to a
-    /// `workspace.list`.
+    /// Workspaces whose readiness the daemon has confirmed on this connection:
+    /// a `workspace.state` event, or a Ready `workspace.list` row only when
+    /// Hello advertises `workspace_ready_snapshot`.
     ///
-    /// The list cannot be trusted about whether a workspace is there to start an
-    /// agent in. A daemon restores its workspaces one at a time after it comes
-    /// up and lists a workspace persisted `ready` as `ready` from the first
-    /// request until its own restore finishes -- minutes, for a repository
-    /// reached through `/mnt/c` -- so at launch the opening tab read `Ready`
-    /// with no sandbox behind it, the `agent.start` sent against it hung until
-    /// the request timed out, and the window put up a box saying so. A daemon
-    /// that has finished restoring a workspace says so with an event, and that
-    /// event is what the opening-tab start waits for; see [`mayStartFrontTab`].
+    /// An older daemon's list can report persisted `ready` while restore is
+    /// still running, so that answer alone cannot start the opening tab. A
+    /// current daemon masks restoring workspaces and checks the live sandbox
+    /// before advertising Ready snapshots; this also covers a client joining
+    /// after the final state event was published. See [`mayStartFrontTab`].
     /// Only that trigger reads this: a selection is the user asking, with the
     /// tab in front of them.
     ///
@@ -638,6 +638,7 @@ private:
     /// rather than `showMessage`, which would hide every other status widget
     /// while it was up; rich text, because a pull request's answer is a link.
     QLabel* m_opLabel = nullptr;
+    QLabel* m_updateLabel = nullptr;
     /// The URL behind that line, so the click has something to open.
     QString m_opUrl;
     /// What the sandbox label shows when no tab is selected: normally a dash,
@@ -651,6 +652,10 @@ private:
     /// being built describe nothing the user chose, and recording them would
     /// overwrite the layout that is about to be restored.
     bool m_restoring = true;
+    bool m_pendingAutoSetup = false;
+    /// Floating docks restored while the main window is hidden become their
+    /// own visible top-levels in Qt. Hide them until the splash reveals us.
+    QSet<QDockWidget*> m_deferredFloatingDocks;
     /// Editors to reopen per workspace, from `state.json`, taken out of the map
     /// the first time that workspace's tab is shown. The list is the saved tab
     /// order and is restored in it.

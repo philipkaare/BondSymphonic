@@ -741,6 +741,8 @@ async fn the_full_workspace_chain_from_create_to_a_destroy_that_leaves_nothing()
             model: None,
             permission_mode: None,
             api_key: None,
+
+            provider_id: None,
         },
         started_at: "2026-09-10T10:00:00Z".into(),
         ended_at: None,

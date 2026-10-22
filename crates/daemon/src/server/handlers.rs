@@ -29,6 +29,9 @@ impl Handler for WorkspaceHandler {
             let backends = crate::agents::backend::known_backends();
             hello.capabilities.adapters = crate::agents::backend::runnable_adapters(&backends);
             hello.capabilities.backends = backends.iter().map(|b| b.descriptor()).collect();
+            hello.capabilities.mcp =
+                Some(crate::mcp::broker::capabilities(self.daemon.backend.name()));
+            hello.capabilities.workspace_ready_snapshot = true;
             return ok(hello);
         }
         if !ctx.is_authenticated() {
@@ -36,6 +39,73 @@ impl Handler for WorkspaceHandler {
         }
         let d = &self.daemon;
         match req {
+            Request::McpList {} => ok(d.mcp_broker.list()),
+            Request::McpUpsert(p) => {
+                let result = d.mcp.upsert(p)?;
+                d.mcp_broker.reconcile();
+                ok(result)
+            }
+            Request::McpRemove(p) => {
+                let result = d.mcp.remove(&p.server_id, None)?;
+                d.mcp_broker.revoke(&p.server_id);
+                d.mcp_remote.disconnect(&p.server_id)?;
+                ok(result)
+            }
+            Request::McpImportPreview(p) => ok(d.mcp.import_preview(&p)?),
+            Request::McpImportApply(p) => {
+                let result = d.mcp.import_apply(p)?;
+                d.mcp_broker.reconcile();
+                ok(result)
+            }
+            Request::McpExport {} => ok(d.mcp.export()?),
+            Request::McpRestorePreset {} => ok(d.mcp.restore_preset(None)?),
+            Request::McpOverride(p) => {
+                d.workspace(&p.workspace_id)?;
+                let result = d.mcp.set_override(p, None)?;
+                d.mcp_broker.reconcile();
+                ok(result)
+            }
+            Request::McpConnect(p) => {
+                let result = d.mcp_remote.connect(p).await?;
+                d.mcp_broker.reconcile();
+                ok(result)
+            }
+            Request::McpCallback(p) => {
+                let id = p.server_id.clone();
+                let result = d.mcp_remote.callback(p).await?;
+                d.mcp_broker.set_connected(&id);
+                ok(result)
+            }
+            Request::McpDisconnect(p) => {
+                d.mcp_broker.revoke(&p.server_id);
+                ok(d.mcp_remote.disconnect_and_revoke(&p.server_id).await?)
+            }
+            Request::McpTest(p) => {
+                if !cfg!(unix) || d.backend.name() != "linux_bwrap" {
+                    return Err(RpcError::invalid_params(
+                        "MCP test requires the Linux sandbox bridge",
+                    ));
+                }
+                let ws = d.workspace(&p.workspace_id)?;
+                if ws.state != WorkspaceState::Ready {
+                    return Err(RpcError::invalid_params("workspace is not ready"));
+                }
+                let kind = match p.backend.as_str() {
+                    "claude" => AgentAdapterKind::Claude,
+                    "codex" => AgentAdapterKind::Codex,
+                    "opencode" => AgentAdapterKind::OpenCode,
+                    _ => return Err(RpcError::invalid_params("unsupported MCP backend")),
+                };
+                let _gate = lifecycle::gate(&ws.id).try_lock_owned().map_err(|_| {
+                    RpcError::new(
+                        ErrorCode::Conflict,
+                        "workspace lifecycle operation in progress",
+                    )
+                })?;
+                let backend = crate::agents::backend::backend_for(kind)?;
+                let handle = d.agent_sandboxes.ensure(d, &ws, backend.as_ref()).await?;
+                ok(d.mcp_broker.test(p, handle, ws.worktree_path).await)
+            }
             // Overrides `SystemHandler`'s default (noop-backend) check: the daemon
             // knows which backend it actually started with.
             Request::SystemCheckPrereqs {} => {
@@ -45,6 +115,7 @@ impl Handler for WorkspaceHandler {
                 )
                 .await;
                 items.extend(crate::agents::codex_backend::prerequisites(&d.dirs.root).await);
+                items.extend(crate::agents::opencode_backend::prerequisites().await);
                 ok(CheckPrereqsResult { items })
             }
             // The daemon fetches on the agent's own credentials (or the
@@ -55,7 +126,37 @@ impl Handler for WorkspaceHandler {
                 let backend = crate::agents::backend::backend_for(
                     p.adapter.unwrap_or(AgentAdapterKind::Claude),
                 )?;
-                ok(backend.list_models(d, p.api_key.as_deref()).await?)
+                ok(backend
+                    .list_models(
+                        d,
+                        crate::agents::backend::ModelQuery {
+                            api_key: p.api_key.as_deref(),
+                            provider_id: p.provider_id.as_deref(),
+                        },
+                    )
+                    .await?)
+            }
+            Request::OpenCodeProvidersList {} => ok(d.opencode_providers.snapshot()),
+            Request::OpenCodeProvidersUpsert(p) => {
+                let _guard = d.opencode_providers.lock_launch_edit().await;
+                let provider_id = p.provider.id.clone();
+                let snapshot = d
+                    .opencode_providers
+                    .upsert(p.expected_revision, p.provider)?;
+                d.agent_sandboxes
+                    .revoke_provider_endpoints(&provider_id)
+                    .await?;
+                ok(snapshot)
+            }
+            Request::OpenCodeProvidersRemove(p) => {
+                let _guard = d.opencode_providers.lock_launch_edit().await;
+                let snapshot = d
+                    .opencode_providers
+                    .remove(p.expected_revision, &p.provider_id)?;
+                d.agent_sandboxes
+                    .revoke_provider_endpoints(&p.provider_id)
+                    .await?;
+                ok(snapshot)
             }
             Request::RepoInspect(p) => {
                 ok(crate::git::repo::inspect(&d.git, std::path::Path::new(&p.path)).await?)
@@ -95,10 +196,10 @@ impl Handler for WorkspaceHandler {
                     .registry
                     .list()
                     .iter()
-                    .map(|w| d.workspace_info(w))
+                    .filter_map(|w| d.workspace_snapshot(&w.id).ok())
                     .collect(),
             }),
-            Request::WorkspaceGet(p) => ok(d.workspace_info(&d.workspace(&p.workspace_id)?)),
+            Request::WorkspaceGet(p) => ok(d.workspace_snapshot(&p.workspace_id)?),
             Request::WorkspaceDestroy(p) => {
                 ok(lifecycle::destroy(d, &p.workspace_id, p.force).await?)
             }

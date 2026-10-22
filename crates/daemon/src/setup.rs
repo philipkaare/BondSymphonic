@@ -25,7 +25,7 @@ pub const HOST_BACKEND: &str = "noop";
 
 /// Every action, for callers that need to enumerate them (tests, and any future
 /// listing of what the daemon can fix).
-pub const ALL_ACTIONS: [SetupAction; 10] = [
+pub const ALL_ACTIONS: [SetupAction; 11] = [
     SetupAction::ClaudeLogin,
     SetupAction::GhLogin,
     SetupAction::InstallClaude,
@@ -34,6 +34,7 @@ pub const ALL_ACTIONS: [SetupAction; 10] = [
     SetupAction::GhLogout,
     SetupAction::ClaudeSetupToken,
     SetupAction::InstallCodex,
+    SetupAction::InstallOpenCode,
     SetupAction::CodexLogin,
     SetupAction::CodexLogout,
 ];
@@ -64,6 +65,11 @@ pub fn setup_argv(action: SetupAction) -> Vec<String> {
             "bash",
             "-lc",
             include_str!("../../../scripts/install-codex.sh"),
+        ],
+        SetupAction::InstallOpenCode => &[
+            "bash",
+            "-lc",
+            include_str!("../../../scripts/install-opencode.sh"),
         ],
         SetupAction::CodexLogin => &[
             "codex",

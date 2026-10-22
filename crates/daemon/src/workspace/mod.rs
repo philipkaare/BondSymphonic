@@ -167,6 +167,9 @@ impl DataDirs {
             self.root.join("agent-homes/codex").join(id.as_str()),
             self.root.join("agent-run/codex").join(id.as_str()),
             self.root.join("agent-caches/codex").join(id.as_str()),
+            self.root.join("agent-homes/opencode").join(id.as_str()),
+            self.root.join("agent-run/opencode").join(id.as_str()),
+            self.root.join("agent-caches/opencode").join(id.as_str()),
         ] {
             let _ = std::fs::remove_dir_all(p);
         }

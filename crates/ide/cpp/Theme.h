@@ -146,6 +146,7 @@ inline QPalette explicitPalette(bool dark) {
     p.setColor(QPalette::Base, base);
     p.setColor(QPalette::AlternateBase, dark ? window.lighter(110) : window.darker(103));
     p.setColor(QPalette::Text, text);
+    p.setColor(QPalette::PlaceholderText, dark ? QColor(0xa0, 0xa0, 0xa0) : QColor(0x6a, 0x6a, 0x6a));
     p.setColor(QPalette::Button, window);
     p.setColor(QPalette::ButtonText, text);
     p.setColor(QPalette::ToolTipBase, base);

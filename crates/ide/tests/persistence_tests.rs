@@ -466,8 +466,18 @@ fn the_state_file_sits_beside_the_settings_file_unless_overridden() {
 
     // With nothing overridden the two live in the same directory, and that
     // directory is the flattened one: %APPDATA%\BondSymphonic.
-    let real_settings = Settings::path().expect("a config dir");
-    let real_state = Settings::state_path().expect("a config dir");
+    let real_settings = Settings::path();
+    let real_state = Settings::state_path();
+    // BaseDirs can be unavailable in a restricted Windows profile. That is
+    // part of the production API's Option contract, not a separate state path.
+    assert_eq!(
+        real_settings.is_some(),
+        directories::BaseDirs::new().is_some()
+    );
+    assert_eq!(real_settings.is_some(), real_state.is_some());
+    let (Some(real_settings), Some(real_state)) = (real_settings, real_state) else {
+        return;
+    };
     assert_eq!(real_settings.parent(), real_state.parent());
     assert_eq!(
         real_state.file_name().and_then(|n| n.to_str()),

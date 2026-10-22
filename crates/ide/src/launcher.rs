@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 
 #[derive(Debug, Clone)]
@@ -49,6 +49,230 @@ pub const DAEMON_BUSY_EXIT_CODE: i32 = 2;
 /// another daemon already owns it. [`command_for`] passes no `--data-dir`, so
 /// this is the daemon's own default and must track it.
 pub const DAEMON_DATA_DIR: &str = "~/.bondsymphonic";
+
+/// The daemon bounds each of three harness updates to 120 seconds. Give its
+/// summary ten more seconds to cross WSL before continuing with the installed
+/// versions; a network outage must not hold the IDE open forever.
+const HARNESS_UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(370);
+/// Allow a cold WSL start plus hashing and copying the packaged daemon, while
+/// bounding the whole preparation phase independently of network updates.
+const DAEMON_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const MAX_UPDATE_LINE: usize = 8 * 1024;
+const MAX_UPDATE_LINES: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateProgress {
+    pub message: String,
+    pub warning: bool,
+}
+
+/// Only the first real daemon launch updates harnesses. A fake endpoint has
+/// no WSL distro to update, and reconnects must return to a working session
+/// promptly without another network round trip.
+pub fn needs_startup_update(attempt: u32, fake_endpoint: bool) -> bool {
+    attempt == 0 && !fake_endpoint
+}
+
+async fn bounded_install(
+    install: impl std::future::Future<Output = Result<()>>,
+    budget: std::time::Duration,
+) -> Result<()> {
+    tokio::time::timeout(budget, install)
+        .await
+        .with_context(|| {
+            format!(
+                "daemon preparation timed out after {} seconds; check the WSL distro and retry",
+                budget.as_secs()
+            )
+        })?
+}
+
+async fn first_launch_with<I, IFut, U, UFut, S, SFut, T>(
+    install: I,
+    update: U,
+    spawn: S,
+) -> Result<(T, Option<String>)>
+where
+    I: FnOnce() -> IFut,
+    IFut: std::future::Future<Output = Result<()>>,
+    U: FnOnce() -> UFut,
+    UFut: std::future::Future<Output = Result<Option<String>>>,
+    S: FnOnce() -> SFut,
+    SFut: std::future::Future<Output = Result<T>>,
+{
+    install().await?;
+    let warning = match update().await {
+        Ok(warning) => warning,
+        Err(error) => Some(format!("Harness updates could not complete: {error:#}")),
+    };
+    let daemon = spawn().await?;
+    Ok((daemon, warning))
+}
+
+fn parse_update_progress(line: &str) -> Option<UpdateProgress> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let harness = match value.get("harness")?.as_str()? {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "opencode" => "OpenCode",
+        _ => return None,
+    };
+    let version = value
+        .get("to_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let detail = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    let detail = detail
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(180)
+        .collect::<String>();
+    let version = version
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(40)
+        .collect::<String>();
+    let status = value.get("status")?.as_str()?;
+    let (message, warning) = match status {
+        "checking" => (format!("Checking {harness} for updates…"), false),
+        "updating" => (format!("Updating {harness}…"), false),
+        "updated" => (format!("{harness} updated to {version}"), false),
+        "current" => (format!("{harness} is current"), false),
+        "skipped" => (format!("{harness} update skipped"), false),
+        "warning" => (format!("{harness} update warning: {detail}"), true),
+        _ => return None,
+    };
+    Some(UpdateProgress { message, warning })
+}
+
+fn update_command_for(spec: &LaunchSpec) -> (String, Vec<String>) {
+    let inner = format!(
+        "exec {} update-harnesses --watch-stdin",
+        quoted_distro_path(&spec.daemon_path_in_wsl)
+    );
+    if cfg!(windows) {
+        (
+            "wsl.exe".into(),
+            vec![
+                "-d".into(),
+                spec.distro.clone(),
+                "--".into(),
+                "bash".into(),
+                "-lc".into(),
+                inner,
+            ],
+        )
+    } else {
+        ("bash".into(), vec!["-lc".into(), inner])
+    }
+}
+
+/// Streams the daemon's bounded NDJSON updater protocol. Every failure is
+/// reported to the caller as a warning, so the older installed harnesses can
+/// still be used. The child is killed if the total budget expires.
+pub async fn update_harnesses(
+    spec: &LaunchSpec,
+    mut progress: impl FnMut(UpdateProgress) + Send,
+) -> Result<Option<String>> {
+    progress(UpdateProgress {
+        message: "Checking harness updates…".into(),
+        warning: false,
+    });
+    let (program, args) = update_command_for(spec);
+    let mut child = Command::new(&program)
+        .args(&args)
+        // Keep the pipe open for the duration of the update. On IDE quit the
+        // launch future is dropped, closing stdin so the Linux CLI can cancel
+        // even if the WSL relay outlives its Windows-side child briefly.
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("spawning harness updater with {program}"))?;
+    let mut stdout = child.stdout.take().context("updater has no stdout")?;
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(drain_lines(
+            stderr,
+            |line| tracing::warn!(target: "harness_update", "{line}"),
+        ));
+    }
+    let run = async {
+        let mut chunk = [0_u8; 4096];
+        let mut pending = Vec::new();
+        let mut lines = 0;
+        let mut saw_summary = false;
+        let mut warnings = Vec::new();
+        loop {
+            let count = stdout.read(&mut chunk).await?;
+            if count == 0 {
+                break;
+            }
+            for byte in &chunk[..count] {
+                if *byte == b'\n' {
+                    lines += 1;
+                    if lines > MAX_UPDATE_LINES {
+                        return Err(anyhow!("updater emitted too many progress lines"));
+                    }
+                    let line = String::from_utf8_lossy(&pending);
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if value.get("type").and_then(|v| v.as_str()) == Some("summary") {
+                            saw_summary = true;
+                            if let Some(updates) = value.get("updates").and_then(|v| v.as_array()) {
+                                for update in updates {
+                                    if let Some(record) = parse_update_progress(&update.to_string())
+                                    {
+                                        if record.warning {
+                                            warnings.push(record.message);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if let Some(record) = parse_update_progress(&line) {
+                            if record.warning {
+                                warnings.push(record.message.clone());
+                            }
+                            progress(record);
+                        }
+                    }
+                    pending.clear();
+                } else {
+                    pending.push(*byte);
+                    if pending.len() > MAX_UPDATE_LINE {
+                        return Err(anyhow!("updater progress line exceeded 8 KiB"));
+                    }
+                }
+            }
+        }
+        let status = child.wait().await?;
+        if !status.success() {
+            return Err(anyhow!(
+                "updater exited with {}",
+                status
+                    .code()
+                    .map_or("unknown status".into(), |n| n.to_string())
+            ));
+        }
+        if !saw_summary {
+            return Err(anyhow!("updater ended without a summary"));
+        }
+        warnings.sort();
+        warnings.dedup();
+        Ok::<_, anyhow::Error>(if warnings.is_empty() {
+            None
+        } else {
+            Some(warnings.join("; "))
+        })
+    };
+    tokio::time::timeout(HARNESS_UPDATE_TIMEOUT, run)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "updater timed out after {} seconds",
+                HARNESS_UPDATE_TIMEOUT.as_secs()
+            )
+        })?
+}
 
 /// The daemon closed stdout without ever printing its port line, which means it
 /// exited while starting up. `code` is the exit code when one could be read.
@@ -433,10 +657,17 @@ async fn wsl(spec: &LaunchSpec, script: &str) -> Result<String> {
     let out = if cfg!(windows) {
         Command::new("wsl.exe")
             .args(["-d", &spec.distro, "--", "bash", "-lc", script])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
             .output()
             .await?
     } else {
-        Command::new("bash").args(["-lc", script]).output().await?
+        Command::new("bash")
+            .args(["-lc", script])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await?
     };
     if !out.status.success() {
         return Err(anyhow!(
@@ -480,6 +711,10 @@ fn single_quoted(word: &str) -> String {
 /// `pub(crate)`; the `pub` it used to carry was for the retry that premise
 /// made pointless.
 pub(crate) async fn install_daemon(spec: &LaunchSpec) -> Result<()> {
+    bounded_install(install_daemon_inner(spec), DAEMON_INSTALL_TIMEOUT).await
+}
+
+async fn install_daemon_inner(spec: &LaunchSpec) -> Result<()> {
     let Some(local) = &spec.local_daemon_binary else {
         return Ok(());
     };
@@ -531,6 +766,39 @@ pub(crate) async fn install_daemon(spec: &LaunchSpec) -> Result<()> {
 
 pub async fn launch(spec: &LaunchSpec) -> Result<DaemonProcess> {
     install_daemon(spec).await?;
+    launch_installed(spec).await
+}
+
+/// The first launch performs the update after the packaged daemon is installed,
+/// before starting the daemon that may launch any agent sandbox.
+pub async fn launch_with_harness_update(
+    spec: &LaunchSpec,
+    mut progress: impl FnMut(UpdateProgress) + Send,
+) -> Result<(DaemonProcess, Option<String>)> {
+    first_launch_with(
+        || install_daemon(spec),
+        || async {
+            let result = update_harnesses(spec, &mut progress).await;
+            let warning = match result {
+                Ok(warning) => warning,
+                Err(error) => Some(format!("Harness updates could not complete: {error:#}")),
+            };
+            if let Some(message) = &warning {
+                // Announce before spawning the daemon: a later spawn failure
+                // must not make the updater's warning disappear.
+                progress(UpdateProgress {
+                    message: message.clone(),
+                    warning: true,
+                });
+            }
+            Ok(warning)
+        },
+        || launch_installed(spec),
+    )
+    .await
+}
+
+async fn launch_installed(spec: &LaunchSpec) -> Result<DaemonProcess> {
     let (prog, args) = command_for(spec);
     let mut child = Command::new(&prog)
         .args(&args)
@@ -624,6 +892,102 @@ impl DaemonProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn first_launch_installs_updates_then_spawns_even_when_update_fails() {
+        let steps = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record =
+            |step: &'static str, steps: &std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>| {
+                steps.lock().unwrap().push(step);
+            };
+        let result = first_launch_with(
+            || {
+                record("install", &steps);
+                async { Ok(()) }
+            },
+            || {
+                record("update", &steps);
+                async { Err(anyhow!("offline")) }
+            },
+            || {
+                record("spawn", &steps);
+                async { Ok(42) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.0, 42);
+        assert!(result.1.unwrap().contains("offline"));
+        assert_eq!(*steps.lock().unwrap(), ["install", "update", "spawn"]);
+    }
+
+    #[tokio::test]
+    async fn first_launch_does_not_update_or_spawn_if_install_fails() {
+        let result: Result<(i32, Option<String>)> = first_launch_with(
+            || async { Err(anyhow!("install failed")) },
+            || async {
+                panic!("update after failed install");
+            },
+            || async {
+                panic!("spawn after failed install");
+            },
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("install failed"));
+    }
+
+    #[tokio::test]
+    async fn installation_timeout_cancels_preparation_before_update_or_spawn() {
+        struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = cancelled.clone();
+        let result: Result<(i32, Option<String>)> = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            first_launch_with(
+                || {
+                    bounded_install(
+                        async move {
+                            let _owned_preparation = Dropped(observed);
+                            std::future::pending().await
+                        },
+                        std::time::Duration::from_millis(10),
+                    )
+                },
+                || async { panic!("updates must not run after an install timeout") },
+                || async { panic!("daemon must not spawn after an install timeout") },
+            ),
+        )
+        .await
+        .expect("installation must obey its own shorter deadline");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("daemon preparation timed out"));
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn startup_update_is_once_and_never_uses_the_fake_endpoint() {
+        assert!(needs_startup_update(0, false));
+        assert!(!needs_startup_update(1, false));
+        assert!(!needs_startup_update(0, true));
+    }
+
+    #[test]
+    fn update_progress_parser_accepts_only_bounded_known_records() {
+        let line = r#"{"harness":"codex","status":"updated","from_version":"1.0","to_version":"1.1","message":"Ready"}"#;
+        assert_eq!(
+            parse_update_progress(line).unwrap().message,
+            "Codex updated to 1.1"
+        );
+        assert!(parse_update_progress(r#"{"harness":"unknown","status":"updated"}"#).is_none());
+        assert!(parse_update_progress(r#"{"harness":"codex","status":"unknown"}"#).is_none());
+    }
 
     #[test]
     fn parses_port_line() {

@@ -53,6 +53,7 @@ fn defaults_preserve_explicit_choices_and_credentials_stay_backend_specific() {
     let defaults = BackendSettings {
         enabled: true,
         default_model: "default-model".into(),
+        default_provider_id: String::new(),
         default_permission_mode: "never".into(),
     };
     let explicit = start_options_with_defaults(
@@ -137,6 +138,7 @@ fn choosing_cli_default_does_not_reapply_the_configured_default_model() {
     let defaults = BackendSettings {
         enabled: true,
         default_model: "configured-model".into(),
+        default_provider_id: String::new(),
         default_permission_mode: "never".into(),
     };
     let raw = bondsymphonic_ide::qobjects::transcript_model::restart_options_with(
@@ -152,4 +154,79 @@ fn choosing_cli_default_does_not_reapply_the_configured_default_model() {
             .as_deref(),
         Some("")
     );
+}
+
+#[test]
+fn opencode_defaults_keep_provider_and_model_together() {
+    let mut settings = Settings::default();
+    assert!(!settings.backends["opencode"].enabled);
+    let defaults = settings.backends.get_mut("opencode").unwrap();
+    defaults.enabled = true;
+    defaults.default_provider_id = "local_a".into();
+    defaults.default_model = "qwen-local".into();
+    defaults.default_permission_mode = "ask".into();
+    let restored = Settings::from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
+    let options = start_options_with_defaults("{}", &restored.backends["opencode"]).unwrap();
+    assert_eq!(options.provider_id.as_deref(), Some("local_a"));
+    assert_eq!(options.model.as_deref(), Some("qwen-local"));
+    assert_eq!(options.permission_mode.as_deref(), Some("ask"));
+    let resumed = start_options_with_defaults(
+        r#"{"adapter":"opencode","resume_session":"session-1","model":"qwen-local"}"#,
+        &restored.backends["opencode"],
+    )
+    .unwrap();
+    assert_eq!(
+        resumed.provider_id, None,
+        "a resumed session cannot silently select a new provider"
+    );
+}
+
+#[test]
+fn provider_keys_are_scoped_to_stable_ids() {
+    use bondsymphonic_ide::qobjects::settings::provider_credential_name;
+    assert_ne!(
+        provider_credential_name("local_a"),
+        provider_credential_name("local_b")
+    );
+    assert_ne!(
+        provider_credential_name("Foo")
+            .unwrap()
+            .to_ascii_lowercase(),
+        provider_credential_name("foo")
+            .unwrap()
+            .to_ascii_lowercase()
+    );
+    assert!(provider_credential_name("../other").is_none());
+    assert!(provider_credential_name("").is_none());
+}
+
+#[test]
+fn stale_provider_model_answers_are_rejected_after_a_new_request() {
+    let mut generations = ReplyGenerations::default();
+    let first = generations.begin("opencode:local_a");
+    let other = generations.begin("opencode:local_b");
+    let replacement = generations.begin("opencode:local_a");
+    assert!(!generations.accepts("opencode:local_a", first));
+    assert!(generations.accepts("opencode:local_a", replacement));
+    assert!(generations.accepts("opencode:local_b", other));
+    generations.disconnect();
+    assert!(!generations.accepts("opencode:local_b", other));
+}
+
+#[test]
+fn missing_resume_provider_is_explained_instead_of_using_current_default() {
+    let mut settings = Settings::default();
+    let opencode = settings.backends.get_mut("opencode").unwrap();
+    opencode.enabled = true;
+    opencode.default_provider_id = "new-default".into();
+    opencode.default_model = "new-model".into();
+    let mut descriptor = legacy_descriptors()[0].clone();
+    descriptor.id = AgentAdapterKind::OpenCode;
+    let error = bondsymphonic_ide::model::backends::resolve_start(
+        r#"{"adapter":"opencode","resume_session":"old-session","model":"old-model"}"#,
+        &settings,
+        &[descriptor],
+    )
+    .unwrap_err();
+    assert!(error.contains("original provider"), "{error}");
 }

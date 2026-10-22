@@ -275,10 +275,64 @@ impl DenialGate {
     }
 }
 
+/// Explicit provider permissions belong to one backend listener generation.
+#[derive(Debug, Default, Clone)]
+pub struct EndpointGrants {
+    backend: String,
+    generation: u64,
+    endpoints: Vec<(String, u16)>,
+    cancellations: HashMap<(String, u16), tokio_util::sync::CancellationToken>,
+}
+impl EndpointGrants {
+    pub fn replace(&mut self, backend: &str, generation: u64, endpoints: Vec<(String, u16)>) {
+        let endpoints: Vec<_> = endpoints
+            .into_iter()
+            .map(|(h, p)| (crate::net::allowlist::normalize_host(&h), p))
+            .collect();
+        let same_generation = self.backend == backend && self.generation == generation;
+        self.cancellations.retain(|origin, cancel| {
+            let keep = same_generation && endpoints.contains(origin);
+            if !keep {
+                cancel.cancel();
+            }
+            keep
+        });
+        for origin in &endpoints {
+            self.cancellations.entry(origin.clone()).or_default();
+        }
+        self.backend = backend.into();
+        self.generation = generation;
+        self.endpoints = endpoints;
+    }
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn cancellation_for(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        if self.backend != "opencode" {
+            return None;
+        }
+        self.cancellations
+            .get(&(crate::net::allowlist::normalize_host(host), port))
+            .cloned()
+    }
+    pub fn allows(&self, backend: &str, generation: u64, host: &str, port: u16) -> bool {
+        self.backend == backend
+            && self.generation == generation
+            && self
+                .endpoints
+                .iter()
+                .any(|(h, p)| *p == port && h == &crate::net::allowlist::normalize_host(host))
+    }
+}
+
 /// One workspace's live listener.
 struct Entry {
+    provider_backend: Option<String>,
     /// Swapped under running connections by `workspace.set_allowlist`.
     allow: Arc<RwLock<Allowlist>>,
+    endpoints: Arc<RwLock<EndpointGrants>>,
     socket: PathBuf,
     /// Which call to [`ProxyRegistry::start`] this listener belongs to. A
     /// workspace whose sandbox dies and is restarted has a watcher for each
@@ -307,6 +361,7 @@ pub struct ProxyRegistry {
 #[derive(Clone)]
 struct ConnCtx {
     allow: Arc<RwLock<Allowlist>>,
+    endpoints: Arc<RwLock<EndpointGrants>>,
     events: EventBus,
     workspace: WorkspaceId,
     /// Shared with every other workspace's connections, so one host denied in a
@@ -328,7 +383,7 @@ impl ProxyRegistry {
         allow: Allowlist,
         events: EventBus,
     ) -> Result<u64, RpcError> {
-        self.start_now(id, socket, allow, events)
+        self.start_now(id, socket, allow, events, None)
     }
 
     #[cfg(unix)]
@@ -338,6 +393,7 @@ impl ProxyRegistry {
         socket: &Path,
         allow: Allowlist,
         events: EventBus,
+        provider_backend: Option<&str>,
     ) -> Result<u64, RpcError> {
         // One lock for the whole thing: nothing in here awaits, and a second
         // `start` for the same workspace must not be able to bind over a live
@@ -347,12 +403,23 @@ impl ProxyRegistry {
             .next_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(existing) = entries.get_mut(id) {
+            if existing.provider_backend.as_deref() != provider_backend {
+                return Err(RpcError::new(
+                    bondsymphonic_proto::ErrorCode::Conflict,
+                    "use a separate registry for the OpenCode companion proxy",
+                ));
+            }
             // A listener on the path the caller asked for is the one it wanted,
             // whoever started it; it takes over the new allowlist and the new
             // generation, so the previous owner's watcher can no longer stop it.
             if existing.socket.as_path() == socket {
                 *existing.allow.write() = allow;
                 existing.generation = generation;
+                existing.provider_backend = provider_backend.map(str::to_owned);
+                existing
+                    .endpoints
+                    .write()
+                    .replace("", generation, Vec::new());
                 return Ok(generation);
             }
             // A different path means this is a different listener. Silently
@@ -381,9 +448,11 @@ impl ProxyRegistry {
             let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
         }
         let allow = Arc::new(RwLock::new(allow));
+        let endpoints = Arc::new(RwLock::new(EndpointGrants::default()));
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ConnCtx {
             allow: allow.clone(),
+            endpoints: endpoints.clone(),
             events,
             workspace: id.clone(),
             denials: self.denials.clone(),
@@ -392,7 +461,9 @@ impl ProxyRegistry {
         entries.insert(
             id.clone(),
             Entry {
+                provider_backend: provider_backend.map(str::to_owned),
                 allow,
+                endpoints,
                 socket: socket.to_path_buf(),
                 generation,
                 cancel,
@@ -412,11 +483,59 @@ impl ProxyRegistry {
         _socket: &Path,
         _allow: Allowlist,
         _events: EventBus,
+        _provider_backend: Option<&str>,
     ) -> Result<u64, RpcError> {
         tracing::debug!("the workspace proxy needs a unix socket; not started on this host");
         Ok(self
             .next_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Start a distinct companion listener; never use the workspace listener socket.
+    pub async fn start_opencode(
+        &self,
+        id: &WorkspaceId,
+        socket: &Path,
+        allow: Allowlist,
+        events: EventBus,
+    ) -> Result<u64, RpcError> {
+        self.start_now(id, socket, allow, events, Some("opencode"))
+    }
+
+    /// Install exact origins only on a dedicated OpenCode companion proxy.
+    /// The registry must be owned by that companion, never a shared workspace proxy.
+    pub fn set_provider_endpoints(
+        &self,
+        id: &WorkspaceId,
+        generation: u64,
+        backend: &str,
+        endpoints: Vec<(String, u16)>,
+    ) -> Result<(), RpcError> {
+        if backend != "opencode" || endpoints.iter().any(|(h, p)| !is_valid_host(h) || *p == 0) {
+            return Err(RpcError::invalid_params(
+                "provider endpoints require the OpenCode companion and valid exact hosts and ports",
+            ));
+        }
+        let entries = self.entries.lock();
+        let entry = entries
+            .get(id)
+            .ok_or_else(|| RpcError::not_found("OpenCode companion proxy is not running"))?;
+        if entry.provider_backend.as_deref() != Some("opencode") {
+            return Err(RpcError::invalid_params(
+                "provider grants cannot be installed on a workspace proxy",
+            ));
+        }
+        if entry.generation != generation {
+            return Err(RpcError::new(
+                bondsymphonic_proto::ErrorCode::Conflict,
+                "OpenCode proxy restarted; reapply provider endpoints",
+            ));
+        }
+        entry
+            .endpoints
+            .write()
+            .replace(backend, generation, endpoints);
+        Ok(())
     }
 
     /// Replaces the live allowlist. A tunnel already established keeps the
@@ -611,82 +730,104 @@ async fn serve(mut client: tokio::net::UnixStream, ctx: &ConnCtx) -> std::io::Re
             let _ = client.write_all(&bad_request()).await;
             return Ok(());
         }
-        let Some(mut upstream) = open_upstream(&mut client, ctx, &host, port).await? else {
-            // Refused or unreachable; the answer has been written and says
-            // `Connection: close`.
-            return Ok(());
-        };
-        // Whatever followed the head is already in hand: a TLS ClientHello sent
-        // without waiting for the tunnel's 200, a request body, or the next
-        // request of a pipelining client.
-        buf.drain(..head.head_len);
-        if head.method.eq_ignore_ascii_case("CONNECT") {
-            client
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await?;
-            if !buf.is_empty() {
-                upstream.write_all(&buf).await?;
-            }
-            // From here the connection is pinned to the one host it was
-            // allowed: anything else the client sends still goes there.
-            tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
-            return Ok(());
-        }
-        let Some(framing) = body_framing(&head) else {
-            tracing::debug!(ws = %ctx.workspace, host = %host, "request body framing is not usable; refused");
-            let _ = client.write_all(&bad_request()).await;
-            return Ok(());
-        };
-        upstream.write_all(&origin_form(&head)).await?;
-        let relayed = {
-            let (mut from_client, mut to_client) = client.split();
-            let (mut from_upstream, mut to_upstream) = upstream.split();
-            relay_exchange(
-                &mut from_client,
-                &mut to_client,
-                &mut from_upstream,
-                &mut to_upstream,
-                &mut buf,
-                framing,
-            )
-            .await?
-        };
-        match relayed {
-            Relayed::Done => {}
-            // An upstream that closed without a byte of response would leave
-            // the client waiting on a connection the proxy thinks is idle.
-            Relayed::NoResponse => {
-                tracing::debug!(ws = %ctx.workspace, host = %host, "upstream closed without responding");
-                let _ = client.write_all(&bad_gateway()).await;
-                return Ok(());
-            }
-            // An answer only while there is still a response to be the answer
-            // *to*. Once any of the upstream's response has reached the client,
-            // appending a complete 400 or 408 to it is not an error message but
-            // a second response spliced onto the first, and nothing on the
-            // other end can tell the two apart. The connection closes either
-            // way, so nothing can be confused with a later response.
-            Relayed::BadBody { relayed } => {
-                tracing::debug!(ws = %ctx.workspace, host = %host, relayed, "request body is malformed");
-                if relayed == 0 {
-                    let _ = client.write_all(&bad_request()).await;
+        // Select permission and its lifetime together, before any await. A
+        // concurrent grant replacement cannot give a request an untracked grant.
+        let grant = ctx.endpoints.read().cancellation_for(&host, port);
+        let provider_allowed = grant.is_some();
+        let provider_cancel = grant.unwrap_or_default();
+        let exchange = async {
+            let Some(mut upstream) =
+                open_upstream(&mut client, ctx, &host, port, provider_allowed).await?
+            else {
+                // Refused or unreachable; the answer has been written and says
+                // `Connection: close`.
+                return Ok::<bool, std::io::Error>(false);
+            };
+            // Whatever followed the head is already in hand: a TLS ClientHello sent
+            // without waiting for the tunnel's 200, a request body, or the next
+            // request of a pipelining client.
+            buf.drain(..head.head_len);
+            if head.method.eq_ignore_ascii_case("CONNECT") {
+                client
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await?;
+                if !buf.is_empty() {
+                    upstream.write_all(&buf).await?;
                 }
-                return Ok(());
+                // From here the connection is pinned to the one host it was
+                // allowed: anything else the client sends still goes there.
+                tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+                return Ok::<bool, std::io::Error>(false);
             }
-            Relayed::Stalled { relayed } => {
-                tracing::debug!(ws = %ctx.workspace, host = %host, relayed, "request body stalled; connection ended");
-                if relayed == 0 {
-                    let _ = client.write_all(&request_timeout()).await;
+            let Some(framing) = body_framing(&head) else {
+                tracing::debug!(ws = %ctx.workspace, host = %host, "request body framing is not usable; refused");
+                let _ = client.write_all(&bad_request()).await;
+                return Ok::<bool, std::io::Error>(false);
+            };
+            upstream.write_all(&origin_form(&head)).await?;
+            let relayed = {
+                let (mut from_client, mut to_client) = client.split();
+                let (mut from_upstream, mut to_upstream) = upstream.split();
+                relay_exchange(
+                    &mut from_client,
+                    &mut to_client,
+                    &mut from_upstream,
+                    &mut to_upstream,
+                    &mut buf,
+                    framing,
+                )
+                .await?
+            };
+            match relayed {
+                Relayed::Done => {}
+                // An upstream that closed without a byte of response would leave
+                // the client waiting on a connection the proxy thinks is idle.
+                Relayed::NoResponse => {
+                    tracing::debug!(ws = %ctx.workspace, host = %host, "upstream closed without responding");
+                    let _ = client.write_all(&bad_gateway()).await;
+                    return Ok::<bool, std::io::Error>(false);
                 }
-                return Ok(());
+                // An answer only while there is still a response to be the answer
+                // *to*. Once any of the upstream's response has reached the client,
+                // appending a complete 400 or 408 to it is not an error message but
+                // a second response spliced onto the first, and nothing on the
+                // other end can tell the two apart. The connection closes either
+                // way, so nothing can be confused with a later response.
+                Relayed::BadBody { relayed } => {
+                    tracing::debug!(ws = %ctx.workspace, host = %host, relayed, "request body is malformed");
+                    if relayed == 0 {
+                        let _ = client.write_all(&bad_request()).await;
+                    }
+                    return Ok::<bool, std::io::Error>(false);
+                }
+                Relayed::Stalled { relayed } => {
+                    tracing::debug!(ws = %ctx.workspace, host = %host, relayed, "request body stalled; connection ended");
+                    if relayed == 0 {
+                        let _ = client.write_all(&request_timeout()).await;
+                    }
+                    return Ok::<bool, std::io::Error>(false);
+                }
             }
-        }
-        drop(upstream);
-        if wants_close(&head) {
-            client.shutdown().await?;
-            return Ok(());
+            drop(upstream);
+            if wants_close(&head) {
+                client.shutdown().await?;
+                return Ok::<bool, std::io::Error>(false);
+            }
+            Ok::<bool, std::io::Error>(true)
+        };
+        tokio::select! {
+            biased;
+            _ = provider_cancel.cancelled() => return Ok(()),
+            result = exchange => if !result? { return Ok(()); },
         }
     }
+}
+
+#[cfg(any(unix, test))]
+fn destination_allowed(allow: &Allowlist, provider_allowed: bool, address: IpAddr) -> bool {
+    provider_allowed
+        || !is_private_addr(&address)
+        || allow.allows_literal_addr(&canonical_ip(address))
 }
 
 /// The upstream connection for one request, or `None` once the client has
@@ -702,11 +843,10 @@ async fn open_upstream(
     ctx: &ConnCtx,
     host: &str,
     port: u16,
+    provider_allowed: bool,
 ) -> std::io::Result<Option<tokio::net::TcpStream>> {
     use tokio::io::AsyncWriteExt;
-    // The guard is a temporary of this statement alone: an `RwLock` read held
-    // across the awaits below would block every `set_allowlist` behind a tunnel.
-    let allowed = ctx.allow.read().allows(host);
+    let allowed = provider_allowed || ctx.allow.read().allows(host);
     if !allowed {
         refuse(client, ctx, host, denied_response(host), "network denied").await;
         return Ok(None);
@@ -734,17 +874,15 @@ async fn open_upstream(
             return Ok(None);
         }
     };
-    // A private destination is refused whatever name led to it, unless the
-    // allowlist entry is that literal address: a repository can add a *name* to
-    // the list at creation, but only a person writes `127.0.0.1` down.
+    // Ordinary repository allowlist names cannot authorize private addresses.
+    // An explicit provider grant already matched this companion's exact host
+    // and port, so its configured DNS name can also resolve to a private host.
     let reachable: Vec<std::net::SocketAddr> = {
         let allow = ctx.allow.read();
         resolved
             .iter()
             .copied()
-            .filter(|a| {
-                !is_private_addr(&a.ip()) || allow.allows_literal_addr(&canonical_ip(a.ip()))
-            })
+            .filter(|address| destination_allowed(&allow, provider_allowed, address.ip()))
             .collect()
     };
     if reachable.is_empty() {
@@ -789,6 +927,43 @@ async fn open_upstream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unrelated_provider_changes_preserve_existing_connections() {
+        let mut grants = EndpointGrants::default();
+        grants.replace("opencode", 1, vec![("127.0.0.1".into(), 8000)]);
+        let first = grants.cancellation_for("127.0.0.1", 8000).unwrap();
+        grants.replace(
+            "opencode",
+            1,
+            vec![("127.0.0.1".into(), 8000), ("10.0.0.2".into(), 9000)],
+        );
+        let second = grants.cancellation_for("10.0.0.2", 9000).unwrap();
+        assert!(!first.is_cancelled());
+        grants.replace("opencode", 1, vec![("10.0.0.2".into(), 9000)]);
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+        grants.replace("opencode", 2, vec![("10.0.0.2".into(), 9000)]);
+        assert!(second.is_cancelled());
+        assert!(!grants
+            .cancellation_for("10.0.0.2", 9000)
+            .unwrap()
+            .is_cancelled());
+    }
+
+    #[test]
+    fn only_explicit_provider_origins_can_resolve_to_private_addresses() {
+        let empty = Allowlist::from_strings(&[]);
+        let private = "10.4.3.2".parse().unwrap();
+        assert!(destination_allowed(&empty, true, private));
+        assert!(!destination_allowed(&empty, false, private));
+        let explicit = Allowlist::from_strings(&["10.4.3.2".into()]);
+        assert!(destination_allowed(&explicit, false, private));
+        assert!(destination_allowed(
+            &empty,
+            false,
+            "8.8.8.8".parse().unwrap()
+        ));
+    }
 
     /// The refusal has to tell whoever reads the build log which host was
     /// refused and where to allow it — and nothing else about the daemon.

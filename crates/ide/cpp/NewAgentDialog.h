@@ -2,6 +2,7 @@
 #include <QDialog>
 #include <QString>
 #include <QStringList>
+#include <QJsonArray>
 
 class AppController;
 class GroupModel;
@@ -177,6 +178,9 @@ private:
     /// to type one there is not. Editable because the CLI takes any name and
     /// a new model must not need a new build of the IDE to reach.
     QComboBox* m_claudeModel = nullptr;
+    QComboBox* m_provider = nullptr;
+    QJsonArray m_providers;
+    qint64 m_providerRequest = 0;
     QComboBox* m_permissionMode = nullptr;
     QComboBox* m_runConfig = nullptr;
     /// Names the hosts this repository's own `bondsymphonic.toml` would add to

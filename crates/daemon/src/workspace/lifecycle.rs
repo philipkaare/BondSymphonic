@@ -1195,6 +1195,7 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
     // awaited, `Exited` announced), so the IDE learns the agent is gone. Left
     // until after the sandbox went down they would simply vanish with it, and a
     // client would go on showing an agent that no longer exists.
+    d.mcp_broker.revoke_workspace(id);
     d.agents.stop_all_in(id).await;
     d.agent_sandboxes.stop_workspace(id).await;
     // Before the worktree goes away, so the teardown itself is not reported as a
@@ -1524,6 +1525,7 @@ pub async fn restore(d: &Arc<Daemon>, entry: RestoreEntry) {
 /// about to see is not news.
 async fn tear_down_sandbox(d: &Daemon, id: &WorkspaceId) {
     d.runs.stop_all_in(id).await;
+    d.mcp_broker.revoke_workspace(id);
     d.agents.stop_all_in(id).await;
     d.agent_sandboxes.stop_workspace(id).await;
     d.ptys.close_workspace(id).await;
@@ -1934,6 +1936,8 @@ mod tests {
                         model: None,
                         permission_mode: None,
                         api_key: None,
+
+                        provider_id: None,
                     },
                 },
             ),

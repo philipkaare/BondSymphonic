@@ -368,6 +368,8 @@ mod tests {
                 model: Some("claude-opus-5".into()),
                 permission_mode: None,
                 api_key: Some("sk-ant-secret".into()),
+
+                provider_id: None,
             },
             started_at: "2026-09-10T10:00:00Z".into(),
             ended_at: None,

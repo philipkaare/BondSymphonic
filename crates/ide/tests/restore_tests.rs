@@ -163,6 +163,8 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
                         &HelloResult {
                             daemon_version: "0.0.0-fake".into(),
                             capabilities: Capabilities {
+                                workspace_ready_snapshot: false,
+                                mcp: None,
                                 backends: vec![],
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
@@ -270,6 +272,7 @@ fn workspace() -> WorkspaceInfo {
         // client would read, and the records this one rebuilds the tab from.
         agents: vec![AgentId(AGENT_ID.to_owned())],
         agent_records: vec![AgentSummary {
+            provider_id: None,
             id: AgentId(AGENT_ID.to_owned()),
             adapter: AgentAdapterKind::Claude,
             state: AgentState::Exited,
@@ -620,6 +623,8 @@ mod task_10 {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
@@ -892,6 +897,8 @@ mod task_10_agent_state_race {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,

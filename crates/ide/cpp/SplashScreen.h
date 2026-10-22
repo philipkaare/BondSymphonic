@@ -2,14 +2,16 @@
 #include <QWidget>
 
 class AppController;
+class QCloseEvent;
 class QLabel;
+class QPushButton;
 class QTimer;
 
 /// What the IDE shows from process start until it is ready to be used: the
 /// logo, the name, the version, one line naming the phase the launch is in,
 /// and an indeterminate bar. A top-level of its own, centred on the primary
-/// screen and kept above the window, which is shown behind it right away so
-/// layout and dock restore are unchanged.
+/// screen and kept above the window. The window is constructed behind it for
+/// state restore, then shown when the splash finishes.
 ///
 /// Ready means the controller's connection is `Connected`, the first
 /// `system.check_prereqs` has answered and the first `workspace.list` has
@@ -30,19 +32,23 @@ public:
     explicit SplashScreen(AppController* controller, QWidget* parent = nullptr);
 
     /// Whether the splash has decided it is over: ready, the connection
-    /// broken, the cap reached, or a click. Once true it stays true, and
-    /// `finished` has been emitted exactly once.
+    /// broken, the cap reached, or a click after preparation. Once true it
+    /// stays true, and `finished` has been emitted exactly once.
     bool isDone() const;
 
 signals:
     /// The splash has hidden itself and is not coming back. Whoever built it
     /// raises the window and deletes the splash.
     void finished();
+    /// Quit was explicitly requested while preparation may still be active.
+    /// The application owns shutdown; this must never reveal the main window.
+    void quitRequested();
 
 protected:
-    /// A click anywhere is a way through: a splash that cannot be dismissed
-    /// is a splash the user has to wait out.
+    /// A click dismisses only after daemon installation and harness updates;
+    /// the Quit button and the window close action work during preparation.
     void mousePressEvent(QMouseEvent* event) override;
+    void closeEvent(QCloseEvent* event) override;
     void changeEvent(QEvent* event) override;
     void paintEvent(QPaintEvent* event) override;
 
@@ -54,10 +60,13 @@ private:
     void finish();
     /// The palette-derived colours, re-derived on a theme change.
     void restyle();
+    /// Fits progress text and the temporary Quit button, then recentres.
+    void fitAndCenter();
 
     AppController* m_controller;
     QLabel* m_version = nullptr;
     QLabel* m_status = nullptr;
+    QPushButton* m_quit = nullptr;
     /// See [`kSplashCapMs`] in the source.
     QTimer* m_cap = nullptr;
     /// The first `workspacesListed` has arrived. Latched: the signal fires

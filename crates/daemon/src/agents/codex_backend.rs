@@ -1,7 +1,7 @@
 //! Codex installation, process-only credentials, and uncached model discovery.
 use super::{
     adapter::AgentAdapter,
-    backend::{Backend, PreparedAgent},
+    backend::{Backend, ModelQuery, PreparedAgent},
     codex::{CodexAdapter, TESTED_CODEX_VERSION},
     codex_rpc::{error, CodexRpc},
     AgentSink,
@@ -45,7 +45,8 @@ pub fn host_argv() -> Result<Vec<String>, RpcError> {
             return Ok(args);
         }
     }
-    let path = crate::setup::host_home().join(".local/bin/codex");
+    let path = crate::harness_updates::selected_binary(crate::harness_updates::Harness::Codex)
+        .unwrap_or_else(|| crate::setup::host_home().join(".local/bin/codex"));
     if path.is_file() {
         Ok(vec![path.display().to_string()])
     } else {
@@ -104,7 +105,7 @@ pub async fn prerequisites(root: &Path) -> Vec<PrereqStatus> {
             name: "codex".into(),
             ok: available,
             detail: if available {
-                format!("Codex installed; verified version {TESTED_CODEX_VERSION}")
+                "Codex and matching Code Mode helper installed".into()
             } else {
                 "Codex and matching Code Mode helper required".into()
             },
@@ -231,6 +232,8 @@ impl Backend for CodexBackend {
         argv.extend(config);
         argv.extend(["app-server".into(), "--listen".into(), "stdio://".into()]);
         Ok(PreparedAgent {
+            mcp_servers: Vec::new(),
+            provider_endpoints: Vec::new(),
             argv,
             env,
             cwd: ws.worktree_path.clone(),
@@ -248,8 +251,9 @@ impl Backend for CodexBackend {
     async fn list_models(
         &self,
         d: &Daemon,
-        api_key: Option<&str>,
+        query: ModelQuery<'_>,
     ) -> Result<ListModelsResult, RpcError> {
+        let api_key = query.api_key;
         require_auth(&d.dirs.root, api_key)?;
         let mut argv = host_argv()?;
         let (config, env) = process_config(&d.dirs.root, api_key);

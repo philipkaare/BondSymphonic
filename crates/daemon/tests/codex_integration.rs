@@ -45,6 +45,8 @@ async fn fixture(
     let options: AgentStartOptions =
         serde_json::from_value(serde_json::json!({"resume_session":resume})).unwrap();
     let prepared = PreparedAgent {
+        mcp_servers: vec![],
+        provider_endpoints: vec![],
         argv: vec![
             if cfg!(windows) { "python" } else { "python3" }.into(),
             format!(

@@ -198,6 +198,7 @@ private:
     /// that is empty -- "let Claude Code decide" -- is spelled `-`, which is
     /// how `restartOptionsChoosing` tells it apart from "leave this alone".
     QString chosenModelId() const;
+    QString modelChoiceBackend() const;
     /// Rewrites the welcome's three lines and shows or hides it. Called from
     /// everything that could change any of the four things it says: the
     /// transcript filling or emptying, the dropdowns moving, and the workspace

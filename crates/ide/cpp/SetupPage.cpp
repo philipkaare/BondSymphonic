@@ -64,6 +64,8 @@ constexpr int kMinLinkWidth = 40;
 /// the daemon stored, before the command runs, so it says that too -- a user
 /// with a token who presses it is putting agents back on the refreshing login.
 QString logoutTooltipFor(const QString& action) {
+    if (action == QLatin1String("codex_logout"))
+        return QStringLiteral("Run `codex logout` in a terminal here");
     return action == QLatin1String("claude_logout")
                ? QStringLiteral(
                      "Remove the long-lived token and run `claude auth logout` in a terminal here")
@@ -74,6 +76,8 @@ QString logoutTooltipFor(const QString& action) {
 /// growing an accessor for rows it rebuilds from every check. `bs`-prefixed,
 /// like `bsClaudeLogin` in `TranscriptView.cpp`.
 QString logoutButtonName(const QString& action) {
+    if (action == QLatin1String("codex_logout"))
+        return QStringLiteral("bsCodexLogout");
     return action == QLatin1String("claude_logout") ? QStringLiteral("bsClaudeLogout")
                                                     : QStringLiteral("bsGhLogout");
 }
@@ -350,6 +354,8 @@ void SetupPage::clearRows() {
 }
 
 QString SetupPage::actionFor(const QString& name) {
+    if (name == "opencode")
+        return "install_opencode";
     if (name == "codex")
         return "install_codex";
     if (name == "codex_auth")
@@ -401,6 +407,8 @@ QString SetupPage::tokenActionFor(const QString& name, bool ok, const QString& d
 }
 
 QString SetupPage::buttonTextFor(const QString& action) {
+    if (action == "install_opencode")
+        return "Install OpenCode";
     if (action == "install_codex")
         return "Install Codex";
     if (action == "codex_login")

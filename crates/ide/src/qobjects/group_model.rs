@@ -1324,6 +1324,7 @@ mod tests {
         let mut info = info("ws_1", "alpha");
         let agent = AgentId("ag_1".to_owned());
         info.agent_records = vec![AgentSummary {
+            provider_id: None,
             id: agent.clone(),
             adapter: AgentAdapterKind::Claude,
             state: AgentState::Working,
@@ -1360,6 +1361,7 @@ mod tests {
         let mut waiting = info("ws_1", "alpha");
         let agent = AgentId("ag_1".to_owned());
         waiting.agent_records = vec![AgentSummary {
+            provider_id: None,
             id: agent.clone(),
             adapter: AgentAdapterKind::Claude,
             state: AgentState::WaitingPermission,
@@ -1421,6 +1423,7 @@ mod tests {
         let mut ready = info("ws_1", "alpha");
         let agent = AgentId("ag_1".to_owned());
         ready.agent_records = vec![AgentSummary {
+            provider_id: None,
             id: agent.clone(),
             adapter: AgentAdapterKind::Claude,
             state: AgentState::Exited,

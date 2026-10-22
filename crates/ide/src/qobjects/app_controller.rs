@@ -47,6 +47,7 @@ pub struct Shared {
 static SHARED: OnceLock<std::sync::Mutex<Option<Shared>>> = OnceLock::new();
 
 static MODEL_GENERATIONS: OnceLock<std::sync::Mutex<backends::ReplyGenerations>> = OnceLock::new();
+static SETTINGS_REQUEST_SERIAL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
 fn model_generations() -> &'static std::sync::Mutex<backends::ReplyGenerations> {
     MODEL_GENERATIONS.get_or_init(Default::default)
 }
@@ -167,6 +168,11 @@ pub fn on_connection_lost() {
 /// Set by `prepareQuit`, so a connection ending because the IDE is shutting
 /// down is not mistaken for one that should be reconnected.
 static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static QUIT_CHANNEL: OnceLock<tokio::sync::watch::Sender<bool>> = OnceLock::new();
+
+fn quit_channel() -> &'static tokio::sync::watch::Sender<bool> {
+    QUIT_CHANNEL.get_or_init(|| tokio::sync::watch::channel(false).0)
+}
 
 /// Whether the reconnect loop is already running. There is one daemon
 /// connection per IDE, so a second `start()` -- a stray call from C++, a
@@ -386,6 +392,9 @@ pub mod qobject {
         #[qobject]
         #[qproperty(i32, connection_state)]
         #[qproperty(QString, status_message)]
+        #[qproperty(QString, startup_update_progress)]
+        #[qproperty(QString, startup_update_warning)]
+        #[qproperty(bool, startup_preparing)]
         #[qproperty(QString, daemon_version)]
         /// Whether Claude Code is logged in, from the daemon's last
         /// `system.check_prereqs`. False before the first answer.
@@ -841,6 +850,46 @@ pub mod qobject {
         fn clear_backend_api_key(self: Pin<&mut AppController>, backend: QString) -> bool;
         #[qinvokable]
         fn refresh_backend_models(self: Pin<&mut AppController>, backend: QString);
+        #[qinvokable]
+        fn refresh_provider_models(self: Pin<&mut AppController>, provider_id: QString);
+        #[qsignal]
+        fn provider_models_checked(
+            self: Pin<&mut AppController>,
+            provider_id: QString,
+            json: QString,
+            generation: i64,
+        );
+        /// Typed daemon registry operations. The answer carries the caller's
+        /// serial so a closed or replaced editor can discard an old reply.
+        #[qinvokable]
+        fn settings_rpc(
+            self: Pin<&mut AppController>,
+            method: QString,
+            params: QString,
+            serial: i64,
+        );
+        #[qinvokable]
+        fn next_settings_request_id(self: &AppController) -> i64;
+        #[qinvokable]
+        fn connection_generation_number(self: &AppController) -> i64;
+        #[qsignal]
+        fn settings_rpc_finished(
+            self: Pin<&mut AppController>,
+            method: QString,
+            serial: i64,
+            json: QString,
+            error: QString,
+        );
+        #[qinvokable]
+        fn provider_api_key_set(self: &AppController, provider_id: QString) -> bool;
+        #[qinvokable]
+        fn set_provider_api_key(
+            self: Pin<&mut AppController>,
+            provider_id: QString,
+            key: QString,
+        ) -> bool;
+        #[qinvokable]
+        fn clear_provider_api_key(self: Pin<&mut AppController>, provider_id: QString) -> bool;
         #[qsignal]
         fn backend_settings_changed(self: Pin<&mut AppController>);
         #[qsignal]
@@ -1559,6 +1608,9 @@ pub fn state_after_loss(quitting: bool, fatal: bool, next: u32) -> ConnectionSta
 pub struct AppControllerRust {
     connection_state: i32,
     status_message: QString,
+    startup_update_progress: QString,
+    startup_update_warning: QString,
+    startup_preparing: bool,
     daemon_version: QString,
     /// What `hello` said the daemon supports, as JSON. Empty until connected.
     capabilities: QString,
@@ -1653,6 +1705,9 @@ impl Default for AppControllerRust {
         Self {
             connection_state: ConnectionState::Disconnected.as_i32(),
             status_message: QString::from(ConnectionState::Disconnected.label()),
+            startup_update_progress: QString::from(""),
+            startup_update_warning: QString::from(""),
+            startup_preparing: false,
             daemon_version: QString::from(""),
             capabilities: QString::from(""),
             client: None,
@@ -2097,7 +2152,11 @@ async fn check_prereqs(client: DaemonClient, qt: QtHandle) {
 /// the caller retries. A list full of failing prerequisites is an answer.
 fn prerequisite_enabled(name: &str) -> bool {
     let settings = Settings::load();
-    for id in ["claude", "codex"] {
+    prerequisite_enabled_in(name, &settings)
+}
+
+fn prerequisite_enabled_in(name: &str, settings: &Settings) -> bool {
+    for id in ["claude", "codex", "opencode"] {
         if name == id || name.starts_with(&format!("{id}_")) {
             return settings.backends.get(id).is_some_and(|s| s.enabled);
         }
@@ -2178,7 +2237,7 @@ async fn run_prereq_check(client: &DaemonClient, qt: &QtHandle) -> bool {
 /// tries again regardless.
 async fn fetch_models(client: DaemonClient, qt: QtHandle) {
     let generation = model_generations().lock().unwrap().begin("claude");
-    fetch_backend_models(client, qt, AgentAdapterKind::Claude, generation).await;
+    fetch_backend_models(client, qt, AgentAdapterKind::Claude, generation, None).await;
 }
 
 async fn fetch_backend_models(
@@ -2186,11 +2245,16 @@ async fn fetch_backend_models(
     qt: QtHandle,
     kind: AgentAdapterKind,
     generation: u64,
+    provider_id: Option<String>,
 ) {
     let connection = connection_generation();
     let params = ListModelsParams {
+        provider_id: provider_id.clone(),
         adapter: (kind != AgentAdapterKind::Claude).then_some(kind),
-        api_key: crate::qobjects::settings::backend_api_key(kind),
+        api_key: provider_id
+            .as_deref()
+            .and_then(crate::qobjects::settings::provider_api_key)
+            .or_else(|| crate::qobjects::settings::backend_api_key(kind)),
     };
     let models = match client
         .request::<ListModelsResult>(Request::SystemListModels(params))
@@ -2228,22 +2292,69 @@ async fn fetch_backend_models(
     );
     let _ = qt.queue(move |mut q| {
         if connection_generation() != connection
-            || !model_generations()
-                .lock()
-                .unwrap()
-                .accepts(backends::word(kind), generation)
+            || !model_generations().lock().unwrap().accepts(
+                &model_generation_key(kind, provider_id.as_deref()),
+                generation,
+            )
         {
             return;
         }
         if kind == AgentAdapterKind::Claude {
             q.as_mut().models_checked(QString::from(&json));
         }
-        q.backend_models_checked(
-            QString::from(backends::word(kind)),
-            QString::from(&json),
-            generation as i64,
-        );
+        if let Some(provider) = provider_id {
+            q.provider_models_checked(
+                QString::from(&provider),
+                QString::from(&json),
+                generation as i64,
+            );
+        } else {
+            q.backend_models_checked(
+                QString::from(backends::word(kind)),
+                QString::from(&json),
+                generation as i64,
+            );
+        }
     });
+}
+
+fn model_generation_key(kind: AgentAdapterKind, provider: Option<&str>) -> String {
+    match provider {
+        Some(id) => format!("{}:{id}", backends::word(kind)),
+        None => backends::word(kind).to_owned(),
+    }
+}
+
+/// Parse into a wire type before dispatch. This also prevents UI JSON from
+/// choosing a different RPC method or bypassing a required revision field.
+fn settings_wire_request(method: &str, params: serde_json::Value) -> Result<Request, String> {
+    macro_rules! typed {
+        ($variant:ident, $ty:ty) => {
+            Request::$variant(serde_json::from_value::<$ty>(params).map_err(|e| e.to_string())?)
+        };
+    }
+    Ok(match method {
+        "opencode.providers.list" => Request::OpenCodeProvidersList {},
+        "opencode.providers.upsert" => {
+            typed!(OpenCodeProvidersUpsert, OpenCodeProviderUpsertParams)
+        }
+        "opencode.providers.remove" => {
+            typed!(OpenCodeProvidersRemove, OpenCodeProviderRemoveParams)
+        }
+        "mcp.list" => Request::McpList {},
+        "mcp.upsert" => typed!(McpUpsert, McpUpsertParams),
+        "mcp.remove" => typed!(McpRemove, McpServerIdParams),
+        "mcp.import_preview" => typed!(McpImportPreview, McpImportParams),
+        "mcp.import_apply" => typed!(McpImportApply, McpImportParams),
+        "mcp.export" => Request::McpExport {},
+        "mcp.restore_preset" => Request::McpRestorePreset {},
+        "mcp.override" => typed!(McpOverride, McpOverrideParams),
+        "mcp.connect" => typed!(McpConnect, McpConnectParams),
+        "mcp.callback" => typed!(McpCallback, McpCallbackParams),
+        "mcp.disconnect" => typed!(McpDisconnect, McpServerIdParams),
+        "mcp.test" => typed!(McpTest, McpTestParams),
+        _ => return Err("Unsupported settings action".into()),
+    })
 }
 
 /// One prerequisite check, as the answers the UI actually asks for.
@@ -2280,6 +2391,7 @@ fn start_options_with_default(options_json: &str, default_mode: &str) -> AgentSt
     // `Default`, and a literal turns a future proto change into a compile
     // error here instead of a panic in the running IDE.
     let unset = || AgentStartOptions {
+        provider_id: None,
         command: None,
         resume_session: None,
         model: None,
@@ -2316,6 +2428,36 @@ async fn start_agent_and_prompt(
     options: AgentStartOptions,
     initial_prompt: String,
 ) {
+    if adapter == AgentAdapterKind::OpenCode {
+        let provider_id = options.provider_id.as_deref().unwrap_or_default();
+        let provider_exists = shared
+            .client
+            .request::<ProviderSnapshot>(Request::OpenCodeProvidersList {})
+            .await
+            .map(|snapshot| {
+                snapshot
+                    .providers
+                    .iter()
+                    .any(|provider| provider.id == provider_id)
+            });
+        match provider_exists {
+            Ok(true) => {}
+            Ok(false) => {
+                report_workspace_op_failure(&qt, workspace.to_string(), "agent.start",
+                    format!("OpenCode provider '{provider_id}' was removed. Restore it in Settings to resume this session."));
+                return;
+            }
+            Err(error) => {
+                report_workspace_op_failure(
+                    &qt,
+                    workspace.to_string(),
+                    "agent.start",
+                    format!("OpenCode providers could not be checked: {error}"),
+                );
+                return;
+            }
+        }
+    }
     let params = AgentStartParams {
         workspace_id: workspace.clone(),
         adapter,
@@ -2654,7 +2796,43 @@ async fn connect_once(
             if first {
                 let _ = qt.queue(|q| q.set_state(ConnectionState::Launching));
             }
-            let daemon = launcher::launch(spec).await.map_err(|e| {
+            let launch = if launcher::needs_startup_update(attempt, false) {
+                let progress_qt = qt.clone();
+                let mut quit = quit_channel().subscribe();
+                let result = tokio::select! {
+                    result = launcher::launch_with_harness_update(spec, move |progress| {
+                    let message = progress.message;
+                    let warning = progress.warning;
+                    let _ = progress_qt.queue(move |mut q| {
+                        q.as_mut()
+                            .set_startup_update_progress(QString::from(message.as_str()));
+                        if warning {
+                            q.set_startup_update_warning(QString::from(message.as_str()));
+                        }
+                    });
+                    }) => result,
+                    _ = async {
+                        if *quit.borrow_and_update() { return; }
+                        let _ = quit.changed().await;
+                    } => return Err(ConnectFailure::Retryable("the IDE is quitting".into())),
+                };
+                let warning = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|(_, warning)| warning.clone());
+                let _ = qt.queue(move |mut q| {
+                    q.as_mut().set_startup_update_progress(QString::from(""));
+                    if let Some(warning) = warning {
+                        q.as_mut()
+                            .set_startup_update_warning(QString::from(warning.as_str()));
+                    }
+                    q.set_startup_preparing(false);
+                });
+                result.map(|(daemon, _)| daemon)
+            } else {
+                launcher::launch(spec).await
+            };
+            let daemon = launch.map_err(|e| {
                 // A daemon that exited during start-up carries its exit code
                 // out with it, and code 2 -- the data directory is another
                 // daemon's -- is not something a relaunch can get past.
@@ -2776,6 +2954,11 @@ impl qobject::AppController {
             tracing::warn!("start() called again; the daemon connection is already supervised");
             return;
         }
+        // This property changes on the Qt thread before the runtime begins
+        // installing the daemon. A slow WSL launch must not leave a gap in
+        // which the splash's ordinary click/cap can reveal an unready window.
+        self.as_mut()
+            .set_startup_preparing(launcher::test_endpoint().is_none());
         let qt = self.as_ref().qt_thread();
         let settings = Settings::load();
         let spec = LaunchSpec {
@@ -3450,7 +3633,14 @@ impl qobject::AppController {
                 ));
             }
         }
-        options.api_key = crate::qobjects::settings::backend_api_key(kind);
+        options.api_key = if kind == AgentAdapterKind::OpenCode {
+            options
+                .provider_id
+                .as_deref()
+                .and_then(crate::qobjects::settings::provider_api_key)
+        } else {
+            crate::qobjects::settings::backend_api_key(kind)
+        };
         Ok((kind, options))
     }
 
@@ -3635,7 +3825,105 @@ impl qobject::AppController {
             self.qt_thread(),
             kind,
             generation,
+            None,
         ));
+    }
+
+    pub fn settings_rpc(self: Pin<&mut Self>, method: QString, params: QString, serial: i64) {
+        let method = method.to_string();
+        let parsed = serde_json::from_str::<serde_json::Value>(&params.to_string());
+        let request = parsed
+            .map_err(|e| e.to_string())
+            .and_then(|value| settings_wire_request(&method, value));
+        let client = require_connection()
+            .map(|shared| shared.client)
+            .map_err(|e| e.to_string());
+        let qt = self.qt_thread();
+        let connection = connection_generation();
+        runtime().spawn(async move {
+            let result = match (request, client) {
+                (Ok(request), Ok(client)) => {
+                    client.request_raw(request).await.map_err(|e| e.to_string())
+                }
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            };
+            let _ = qt.queue(move |q| {
+                if connection_generation() != connection {
+                    return;
+                }
+                match result {
+                    Ok(value) => q.settings_rpc_finished(
+                        QString::from(&method),
+                        serial,
+                        QString::from(&value.to_string()),
+                        QString::from(""),
+                    ),
+                    Err(error) => q.settings_rpc_finished(
+                        QString::from(&method),
+                        serial,
+                        QString::from(""),
+                        QString::from(&error),
+                    ),
+                }
+            });
+        });
+    }
+
+    pub fn connection_generation_number(&self) -> i64 {
+        connection_generation() as i64
+    }
+
+    pub fn next_settings_request_id(&self) -> i64 {
+        SETTINGS_REQUEST_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn refresh_provider_models(self: Pin<&mut Self>, provider_id: QString) {
+        let id = provider_id.to_string();
+        if id.is_empty() {
+            return;
+        }
+        let generation = model_generations()
+            .lock()
+            .unwrap()
+            .begin(&model_generation_key(AgentAdapterKind::OpenCode, Some(&id)));
+        let Ok(shared) = require_connection() else {
+            return;
+        };
+        runtime().spawn(fetch_backend_models(
+            shared.client,
+            self.qt_thread(),
+            AgentAdapterKind::OpenCode,
+            generation,
+            Some(id),
+        ));
+    }
+
+    pub fn provider_api_key_set(&self, provider_id: QString) -> bool {
+        crate::qobjects::settings::provider_api_key(&provider_id.to_string()).is_some()
+    }
+
+    pub fn set_provider_api_key(self: Pin<&mut Self>, provider_id: QString, key: QString) -> bool {
+        let id = provider_id.to_string();
+        let ok = crate::qobjects::settings::set_provider_api_key(&id, &key.to_string());
+        if ok {
+            model_generations()
+                .lock()
+                .unwrap()
+                .begin(&model_generation_key(AgentAdapterKind::OpenCode, Some(&id)));
+        }
+        ok
+    }
+
+    pub fn clear_provider_api_key(self: Pin<&mut Self>, provider_id: QString) -> bool {
+        let id = provider_id.to_string();
+        let ok = crate::qobjects::settings::clear_provider_api_key(&id);
+        if ok {
+            model_generations()
+                .lock()
+                .unwrap()
+                .begin(&model_generation_key(AgentAdapterKind::OpenCode, Some(&id)));
+        }
+        ok
     }
 
     pub fn set_api_key(mut self: Pin<&mut Self>, key: QString) -> bool {
@@ -3793,6 +4081,7 @@ impl qobject::AppController {
         // change its mind, and a way back would only be a way for a stray
         // caller to re-arm the reconnect loop during teardown.
         QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
+        quit_channel().send_modify(|quitting| *quitting = true);
         tracing::info!("the IDE is quitting; the daemon will not be relaunched");
     }
 
@@ -4256,6 +4545,25 @@ const UNKNOWN_SUMMARY: &str = r#"{"dirty":false,"changed_files":-1}"#;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn optional_backend_prerequisites_follow_the_enabled_setting() {
+        let mut settings = super::Settings::default();
+        for id in ["codex", "opencode"] {
+            settings.backends.get_mut(id).unwrap().enabled = false;
+            assert!(!super::prerequisite_enabled_in(id, &settings));
+            assert!(!super::prerequisite_enabled_in(
+                &format!("{id}_install"),
+                &settings
+            ));
+            settings.backends.get_mut(id).unwrap().enabled = true;
+            assert!(super::prerequisite_enabled_in(id, &settings));
+            assert!(super::prerequisite_enabled_in(
+                &format!("{id}_install"),
+                &settings
+            ));
+        }
+        assert!(super::prerequisite_enabled_in("sandbox", &settings));
+    }
     #[test]
     fn changing_codex_credentials_retires_only_the_codex_failure_override() {
         let mut state = super::AppControllerRust {

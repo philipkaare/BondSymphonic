@@ -843,6 +843,8 @@ async fn fake_daemon() -> (std::net::SocketAddr, Journals) {
                         &HelloResult {
                             daemon_version: "0.0.0-fake".into(),
                             capabilities: Capabilities {
+                                workspace_ready_snapshot: false,
+                                mcp: None,
                                 backends: vec![],
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
@@ -1809,6 +1811,8 @@ mod menu_targets {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
@@ -2142,6 +2146,8 @@ mod task_16 {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
@@ -2565,6 +2571,8 @@ mod sandbox_retry {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
@@ -2688,6 +2696,7 @@ mod sandbox_retry {
     fn workspace(state: WorkspaceState) -> WorkspaceInfo {
         let mut info = super::workspace(WORKSPACE, NAME, state, &[]);
         let record = AgentSummary {
+            provider_id: None,
             id: AgentId(OLD_AGENT.to_owned()),
             adapter: AgentAdapterKind::Claude,
             state: AgentState::Exited,
@@ -2873,6 +2882,8 @@ mod sandbox_remove_dirty {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
@@ -3253,6 +3264,8 @@ mod sandbox_retry_followups {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
@@ -3383,6 +3396,7 @@ mod sandbox_retry_followups {
     fn workspace(state: WorkspaceState, agent: AgentState) -> WorkspaceInfo {
         let mut info = super::workspace(WORKSPACE, NAME, state, &[]);
         let record = AgentSummary {
+            provider_id: None,
             id: AgentId(AGENT.to_owned()),
             adapter: AgentAdapterKind::Claude,
             state: agent,
@@ -3527,6 +3541,8 @@ mod seam_targets {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
@@ -3693,6 +3709,7 @@ mod sandbox_retry_destroying {
     fn workspace(state: WorkspaceState) -> WorkspaceInfo {
         let mut info = super::workspace(WORKSPACE, "going", state, &[]);
         let record = AgentSummary {
+            provider_id: None,
             id: AgentId(AGENT.to_owned()),
             adapter: AgentAdapterKind::Claude,
             state: AgentState::Exited,
@@ -3742,6 +3759,8 @@ mod sandbox_retry_destroying {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
@@ -3984,6 +4003,8 @@ mod in_place_close {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
@@ -4218,6 +4239,8 @@ mod in_place_breach_detail {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
@@ -4412,6 +4435,13 @@ mod agent_auto_restart {
         /// workspace does, and what put a box titled `agent.start` over a
         /// user's window.
         StaleReady,
+        /// The daemon finished restoring before this IDE connected. Its
+        /// truthful Ready snapshot is the only readiness announcement this
+        /// connection will ever receive.
+        ReadySnapshot,
+        /// A current snapshot says the sandbox is still restoring; a later
+        /// Ready event is required before starting the opening tab's agent.
+        CreatingSnapshot,
         /// The opening tab again: the first `agent.start` is refused with a
         /// `SandboxError`, the way a start against a sandbox that is not there
         /// is, and the daemon then announces the workspace ready.
@@ -4603,6 +4633,66 @@ mod agent_auto_restart {
     }
 
     #[test]
+    fn joining_an_already_ready_daemon_starts_the_front_tabs_ended_agent() {
+        if bondsymphonic_ide::testing::skip_without_qt("ready snapshot at join") {
+            return;
+        }
+        let run = run_ide(Scenario::ReadySnapshot);
+        assert!(
+            !run.out.contains("BS_MENU_TEST select-tab"),
+            "{}",
+            run.context
+        );
+        assert!(
+            !run.journal.iter().any(|line| line == SENT_READY),
+            "{}",
+            run.context
+        );
+        assert!(
+            run.out.lines().any(|line| line.starts_with(AUTO_STARTED)),
+            "{}",
+            run.context
+        );
+        assert_eq!(
+            run.journal
+                .iter()
+                .filter(|line| line.starts_with("agent.start"))
+                .collect::<Vec<_>>(),
+            [&format!("agent.start:{DEAD_WORKSPACE}:{SESSION}")],
+            "{}",
+            run.context
+        );
+    }
+
+    #[test]
+    fn a_current_creating_snapshot_waits_for_ready_before_starting() {
+        if bondsymphonic_ide::testing::skip_without_qt("creating snapshot at join") {
+            return;
+        }
+        let run = run_ide(Scenario::CreatingSnapshot);
+        let starts_and_event: Vec<String> = run
+            .journal
+            .iter()
+            .filter(|line| line.starts_with("agent.start") || *line == SENT_READY)
+            .cloned()
+            .collect();
+        assert_eq!(
+            starts_and_event,
+            [
+                SENT_READY.to_owned(),
+                format!("agent.start:{DEAD_WORKSPACE}:{SESSION}")
+            ],
+            "{}",
+            run.context
+        );
+        assert!(
+            run.out.lines().any(|line| line.starts_with(AUTO_STARTED)),
+            "{}",
+            run.context
+        );
+    }
+
+    #[test]
     fn an_automatic_start_the_daemon_refuses_is_tried_again_when_the_workspace_is_ready() {
         if bondsymphonic_ide::testing::skip_without_qt("refused automatic start retries") {
             return;
@@ -4702,6 +4792,8 @@ mod agent_auto_restart {
             Scenario::ExitBurst => "burst",
             Scenario::FrontTab => "front",
             Scenario::StaleReady => "stale",
+            Scenario::ReadySnapshot => "ready-snapshot",
+            Scenario::CreatingSnapshot => "creating-snapshot",
             Scenario::StartRefused => "refused",
         };
         let config = std::env::temp_dir().join(format!("bs-auto-{}-{tag}", std::process::id()));
@@ -4722,9 +4814,11 @@ mod agent_auto_restart {
             // is about a selection: a trigger that only fires on the tab in
             // front proves nothing from the tab in front.
             active_workspace: Some(match scenario {
-                Scenario::FrontTab | Scenario::StaleReady | Scenario::StartRefused => {
-                    DEAD_WORKSPACE.to_owned()
-                }
+                Scenario::FrontTab
+                | Scenario::StaleReady
+                | Scenario::ReadySnapshot
+                | Scenario::CreatingSnapshot
+                | Scenario::StartRefused => DEAD_WORKSPACE.to_owned(),
                 _ => LIVE_WORKSPACE.to_owned(),
             }),
             ..StateFile::default()
@@ -4743,9 +4837,11 @@ mod agent_auto_restart {
             // A step that reports and presses nothing: the window has to be in
             // an announcing mood for the automatic start to say so, and no seam
             // may touch the selection.
-            Scenario::FrontTab | Scenario::StaleReady | Scenario::StartRefused => {
-                "sandbox-banner".to_owned()
-            }
+            Scenario::FrontTab
+            | Scenario::StaleReady
+            | Scenario::ReadySnapshot
+            | Scenario::CreatingSnapshot
+            | Scenario::StartRefused => "sandbox-banner".to_owned(),
         };
         let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
             .env("QT_QPA_PLATFORM", "offscreen")
@@ -4882,6 +4978,11 @@ mod agent_auto_restart {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: matches!(
+                                        scenario,
+                                        Scenario::ReadySnapshot | Scenario::CreatingSnapshot
+                                    ),
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
@@ -4951,7 +5052,9 @@ mod agent_auto_restart {
                             // start's own delay, so a start sent on the list's
                             // word lands well before the marker.
                             let listed = match scenario {
-                                Scenario::FrontTab | Scenario::StartRefused => {
+                                Scenario::FrontTab
+                                | Scenario::CreatingSnapshot
+                                | Scenario::StartRefused => {
                                     delay = Duration::from_millis(1_500);
                                     announce = Some(SENT_READY);
                                     after.push(ready_event());
@@ -5027,12 +5130,16 @@ mod agent_auto_restart {
                             id,
                             &HistoryResult {
                                 messages: vec![],
-                                state: if p.agent_id.0 == LIVE_AGENT {
+                                state: if p.agent_id.0 == LIVE_AGENT || p.agent_id.0 == NEW_AGENT {
                                     AgentState::Idle
                                 } else {
                                     AgentState::Exited
                                 },
-                                detail: None,
+                                detail: (scenario == Scenario::ReadySnapshot
+                                    && p.agent_id.0 == DEAD_AGENT)
+                                    .then(|| {
+                                        "the agent ended before the daemon restarted".to_owned()
+                                    }),
                             },
                         )),
                         Request::FsListDir(_) => {
@@ -5165,6 +5272,7 @@ mod agent_auto_restart {
     ) -> WorkspaceInfo {
         let mut info = super::workspace(id, name, WorkspaceState::Ready, &[]);
         let record = AgentSummary {
+            provider_id: None,
             id: AgentId(agent.to_owned()),
             adapter: AgentAdapterKind::Claude,
             state,
@@ -5378,6 +5486,8 @@ mod front_tab_after_destroy {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
@@ -5487,6 +5597,7 @@ mod front_tab_after_destroy {
     fn next() -> WorkspaceInfo {
         let mut info = super::workspace(NEXT, NEXT_NAME, WorkspaceState::Ready, &[]);
         let record = AgentSummary {
+            provider_id: None,
             id: AgentId(NEXT_AGENT.to_owned()),
             adapter: AgentAdapterKind::Claude,
             state: AgentState::Exited,
@@ -5806,6 +5917,8 @@ mod claude_auth_override {
                             &HelloResult {
                                 daemon_version: "0.0.0-fake".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,
@@ -5962,6 +6075,7 @@ mod claude_auth_override {
     fn workspace() -> WorkspaceInfo {
         let mut info = super::workspace(WORKSPACE, NAME, WorkspaceState::Ready, &[]);
         let record = AgentSummary {
+            provider_id: None,
             id: AgentId(AGENT.to_owned()),
             adapter: AgentAdapterKind::Claude,
             state: AgentState::Idle,

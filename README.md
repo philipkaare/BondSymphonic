@@ -28,10 +28,19 @@ Design: `docs/superpowers/specs/`. Plans: `docs/superpowers/plans/`.
   a data-dir instance lock, the daemon suite matched to its spec, an IDE job in CI,
   `package.ps1`, and this guide.
 
-Agent backends: Claude Code and Codex, plus a plain terminal. Enable Codex under
-Settings > Agents, install it there, then sign in to ChatGPT or store an OpenAI
-API key. Each backend has its own sandbox, proxy, credentials and defaults.
-See [agent backend setup](docs/user-guide.md#agent-backends).
+Agent backends: Claude Code, Codex and opt-in OpenCode, plus a plain terminal.
+Enable an optional backend under Settings > Agents and install it from Setup.
+OpenCode uses explicitly configured OpenAI-compatible providers and models;
+provider keys are stored separately in the Windows credential store. Its CLI
+initial installer uses source candidate 1.18.33; live model and WSL acceptance
+remain unverified in this development environment.
+Each backend has its own sandbox, proxy, credentials and defaults.
+On startup, installed harnesses are checked for newer stable releases before
+sandboxes start. Updates require integrity and compatibility checks; failures
+keep the previous version and show a warning. See
+[startup updates](docs/user-guide.md#harness-updates-at-startup).
+See [agent backend setup](docs/user-guide.md#agent-backends) and
+[MCP server configuration](docs/user-guide.md#mcp-servers).
 Known limits are listed per area in the [user guide](docs/user-guide.md).
 
 ## Quick start (Windows 11)

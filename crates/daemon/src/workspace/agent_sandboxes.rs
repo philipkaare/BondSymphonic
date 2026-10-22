@@ -22,6 +22,7 @@ fn backend_name(kind: AgentAdapterKind) -> &'static str {
     match kind {
         AgentAdapterKind::Claude => "claude",
         AgentAdapterKind::Codex => "codex",
+        AgentAdapterKind::OpenCode => "opencode",
         AgentAdapterKind::Terminal => "terminal",
     }
 }
@@ -77,6 +78,18 @@ async fn build_spec(
     if d.backend.name() == "linux_bwrap" {
         spec.ro_binds.extend(backend.ro_binds());
     }
+    if kind == AgentAdapterKind::OpenCode {
+        // A WSL-local provider is reached through this companion's proxy.
+        // The workspace default bypasses loopback for its own port bridge,
+        // which would instead send provider requests to the sandbox loopback.
+        for (key, value) in &mut spec.env {
+            if key == "NO_PROXY" || key == "no_proxy" {
+                value.clear();
+            }
+        }
+        spec.rw_binds.push((spec.home.clone(), spec.home.clone()));
+        spec.rw_binds.push((cache.clone(), cache));
+    }
     if kind == AgentAdapterKind::Codex {
         let home = d.dirs.root.join("codex-home");
         spec.rw_binds.push((home.clone(), home));
@@ -104,6 +117,40 @@ struct Entry {
     proxy: Arc<ProxyRegistry>,
     generation: u64,
     extra_hosts: Vec<String>,
+    provider_endpoints: HashMap<String, Vec<(String, u16)>>,
+}
+
+fn effective_provider_endpoints(
+    grants: &HashMap<String, Vec<(String, u16)>>,
+) -> Vec<(String, u16)> {
+    let mut providers: Vec<_> = grants.keys().collect();
+    providers.sort();
+    let mut effective = Vec::new();
+    for provider in providers {
+        for endpoint in &grants[provider] {
+            if !effective.contains(endpoint) {
+                effective.push(endpoint.clone());
+            }
+        }
+    }
+    effective
+}
+
+fn with_provider_endpoints(
+    existing: &HashMap<String, Vec<(String, u16)>>,
+    provider_id: &str,
+    endpoints: Option<Vec<(String, u16)>>,
+) -> HashMap<String, Vec<(String, u16)>> {
+    let mut candidate = existing.clone();
+    match endpoints.filter(|endpoints| !endpoints.is_empty()) {
+        Some(endpoints) => {
+            candidate.insert(provider_id.to_owned(), endpoints);
+        }
+        None => {
+            candidate.remove(provider_id);
+        }
+    }
+    candidate
 }
 
 #[derive(Default)]
@@ -208,14 +255,25 @@ impl AgentSandboxes {
         }
         let proxy = state.proxies.entry(kind).or_default().clone();
         let extra = backend.extra_hosts();
-        let generation = proxy
-            .start(
-                &ws.id,
-                &spec.run_dir.join(lifecycle::PROXY_SOCKET_FILE),
-                companion_allowlist(ws, &extra),
-                d.events.clone(),
-            )
-            .await?;
+        let generation = if kind == AgentAdapterKind::OpenCode {
+            proxy
+                .start_opencode(
+                    &ws.id,
+                    &spec.run_dir.join(lifecycle::PROXY_SOCKET_FILE),
+                    companion_allowlist(ws, &extra),
+                    d.events.clone(),
+                )
+                .await?
+        } else {
+            proxy
+                .start(
+                    &ws.id,
+                    &spec.run_dir.join(lifecycle::PROXY_SOCKET_FILE),
+                    companion_allowlist(ws, &extra),
+                    d.events.clone(),
+                )
+                .await?
+        };
         let mut startup = Startup {
             proxy: proxy.clone(),
             id: ws.id.clone(),
@@ -243,6 +301,7 @@ impl AgentSandboxes {
                 proxy,
                 generation,
                 extra_hosts: extra,
+                provider_endpoints: HashMap::new(),
             },
         );
         startup.committed = true;
@@ -310,6 +369,59 @@ impl AgentSandboxes {
                 }
             }
         });
+    }
+
+    pub async fn set_provider_endpoints(
+        &self,
+        id: &WorkspaceId,
+        provider_id: &str,
+        endpoints: Vec<(String, u16)>,
+    ) -> Result<(), RpcError> {
+        let mut state = self.inner.lock().await;
+        let key = AgentSandboxKey {
+            workspace_id: id.clone(),
+            adapter: AgentAdapterKind::OpenCode,
+        };
+        let entry = state
+            .live
+            .get_mut(&key)
+            .ok_or_else(|| RpcError::not_found("OpenCode companion is not running"))?;
+        let candidate =
+            with_provider_endpoints(&entry.provider_endpoints, provider_id, Some(endpoints));
+        let effective = effective_provider_endpoints(&candidate);
+        // Windows test/development mode has no Unix-socket proxy. Its
+        // companion uses native host networking and needs no endpoint grant.
+        if cfg!(not(unix)) {
+            entry.provider_endpoints = candidate;
+            return Ok(());
+        }
+        entry
+            .proxy
+            .set_provider_endpoints(id, entry.generation, "opencode", effective)?;
+        entry.provider_endpoints = candidate;
+        Ok(())
+    }
+    pub async fn revoke_provider_endpoints(&self, provider_id: &str) -> Result<(), RpcError> {
+        let mut state = self.inner.lock().await;
+        for (key, entry) in &mut state.live {
+            if key.adapter == AgentAdapterKind::OpenCode {
+                if !entry.provider_endpoints.contains_key(provider_id) {
+                    continue;
+                }
+                let candidate =
+                    with_provider_endpoints(&entry.provider_endpoints, provider_id, None);
+                if cfg!(unix) {
+                    entry.proxy.set_provider_endpoints(
+                        &key.workspace_id,
+                        entry.generation,
+                        "opencode",
+                        effective_provider_endpoints(&candidate),
+                    )?;
+                }
+                entry.provider_endpoints = candidate;
+            }
+        }
+        Ok(())
     }
 
     pub async fn set_allowlist(&self, ws: &Workspace) {
@@ -387,4 +499,24 @@ async fn start_shim(id: &WorkspaceId, handle: &Arc<dyn SandboxHandle>) -> Result
         let _ = sandbox.shutdown().await;
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::{effective_provider_endpoints, with_provider_endpoints};
+    use std::collections::HashMap;
+    #[test]
+    fn removing_one_provider_preserves_other_and_shared_origins() {
+        let first = vec![("127.0.0.1".into(), 11434)];
+        let second = vec![("10.0.0.2".into(), 8000), first[0].clone()];
+        let grants = with_provider_endpoints(&HashMap::new(), "first", Some(first));
+        let grants = with_provider_endpoints(&grants, "second", Some(second.clone()));
+        assert_eq!(effective_provider_endpoints(&grants).len(), 2);
+        let grants = with_provider_endpoints(&grants, "first", None);
+        assert_eq!(effective_provider_endpoints(&grants), second);
+        assert!(
+            effective_provider_endpoints(&with_provider_endpoints(&grants, "second", None))
+                .is_empty()
+        );
+    }
 }

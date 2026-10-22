@@ -3,12 +3,14 @@
 #include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include <QEvent>
+#include <QCloseEvent>
 #include <QFont>
 #include <QGuiApplication>
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QProgressBar>
+#include <QPushButton>
 #include <QScreen>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -108,6 +110,9 @@ SplashScreen::SplashScreen(AppController* controller, QWidget* parent)
 
     m_status = new QLabel(this);
     m_status->setObjectName(QStringLiteral("SplashStatus"));
+    m_status->setTextFormat(Qt::PlainText);
+    m_status->setWordWrap(true);
+    m_status->setMaximumWidth(480);
     m_status->setAlignment(Qt::AlignHCenter);
     layout->addWidget(m_status);
 
@@ -119,6 +124,13 @@ SplashScreen::SplashScreen(AppController* controller, QWidget* parent)
     busy->setTextVisible(false);
     layout->addWidget(busy);
 
+    m_quit = new QPushButton(QStringLiteral("Quit"), this);
+    m_quit->setObjectName(QStringLiteral("SplashQuit"));
+    m_quit->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    layout->addWidget(m_quit, 0, Qt::AlignHCenter);
+    m_quit->hide();
+    connect(m_quit, &QPushButton::clicked, this, &SplashScreen::quitRequested);
+
     restyle();
 
     m_cap = new QTimer(this);
@@ -129,6 +141,8 @@ SplashScreen::SplashScreen(AppController* controller, QWidget* parent)
     m_cap->start();
 
     connect(m_controller, &AppController::connectionStateChanged, this, &SplashScreen::refresh);
+    connect(m_controller, &AppController::startupUpdateProgressChanged, this, &SplashScreen::refresh);
+    connect(m_controller, &AppController::startupPreparingChanged, this, &SplashScreen::refresh);
     connect(m_controller, &AppController::prereqsAnsweredChanged, this, &SplashScreen::refresh);
     connect(m_controller, &AppController::workspacesListed, this, [this](const QString&) {
         m_workspacesListed = true;
@@ -148,10 +162,7 @@ SplashScreen::SplashScreen(AppController* controller, QWidget* parent)
     // resting one and the first decision is made on the first change.
     refresh();
 
-    adjustSize();
-    if (QScreen* screen = QGuiApplication::primaryScreen()) {
-        move(screen->availableGeometry().center() - rect().center());
-    }
+    fitAndCenter();
 }
 
 bool SplashScreen::isDone() const {
@@ -160,6 +171,18 @@ bool SplashScreen::isDone() const {
 
 void SplashScreen::refresh() {
     if (m_done) {
+        return;
+    }
+    const bool preparing = m_controller->getStartupPreparing();
+    m_quit->setVisible(preparing);
+    if (preparing) {
+        // This begins before WSL installation has emitted a progress line.
+        // Neither a stale Ready/error nor the ordinary 30-second cap may put
+        // the main window on screen while an update is still in flight.
+        m_cap->stop();
+        const QString progress = m_controller->getStartupUpdateProgress();
+        m_status->setText(progress.isEmpty() ? QStringLiteral("Preparing the daemon…") : progress);
+        fitAndCenter();
         return;
     }
     const int state = m_controller->getConnectionState();
@@ -174,11 +197,22 @@ void SplashScreen::refresh() {
         finish();
         return;
     }
+    if (!m_cap->isActive()) {
+        m_cap->start(kSplashCapMs);
+    }
     m_status->setText(phaseText(state, prereqsAnswered));
+    fitAndCenter();
+}
+
+void SplashScreen::fitAndCenter() {
+    adjustSize();
+    if (QScreen* screen = QGuiApplication::primaryScreen()) {
+        move(screen->availableGeometry().center() - rect().center());
+    }
 }
 
 void SplashScreen::finish() {
-    if (m_done) {
+    if (m_done || m_controller->getStartupPreparing()) {
         return;
     }
     m_done = true;
@@ -189,7 +223,17 @@ void SplashScreen::finish() {
 
 void SplashScreen::mousePressEvent(QMouseEvent* event) {
     event->accept();
-    finish();
+    if (!m_controller->getStartupPreparing()) {
+        finish();
+    }
+}
+
+void SplashScreen::closeEvent(QCloseEvent* event) {
+    // Alt+F4 or the OS close action is an explicit exit, including while the
+    // preparation phase is locked. It must not emit finished and expose the
+    // hidden main window on the way out.
+    emit quitRequested();
+    event->accept();
 }
 
 void SplashScreen::changeEvent(QEvent* event) {
@@ -224,6 +268,8 @@ void SplashScreen::paintEvent(QPaintEvent* event) {
 // See the note in `EditorArea.cpp`. `bs_widget_test_begin` must have run first.
 #if defined(BS_WIDGET_TESTS)
 #include <QCoreApplication>
+#include <QDir>
+#include <QPixmap>
 #include <cstdint>
 
 namespace {
@@ -245,6 +291,17 @@ QLabel* statusOf(const SplashScreen& splash) {
 
 QTimer* capOf(const SplashScreen& splash) {
     return splash.findChild<QTimer*>(QStringLiteral("SplashCap"));
+}
+
+bool captureSplash(SplashScreen& splash, const QString& name) {
+    const QString directory = qEnvironmentVariable("BS_STARTUP_UPDATE_SCREENSHOTS");
+    if (directory.isEmpty()) return true;
+    if (!QDir().mkpath(directory)) return false;
+    splash.adjustSize();
+    QPixmap image(splash.size());
+    image.fill(Qt::transparent);
+    splash.render(&image);
+    return image.save(directory + QLatin1Char('/') + name);
 }
 
 } // namespace
@@ -363,6 +420,69 @@ extern "C" std::int32_t bs_widget_test_splash_closes_when_the_ide_is_ready() {
         if (!splash.isDone()) {
             return 15;
         }
+    }
+    {
+        // Preparation starts before installation has produced an updater
+        // progress line. Neither the normal cap nor a click can reveal the
+        // window in that interval, including after a premature Ready/error.
+        AppController controller;
+        SplashScreen splash(&controller);
+        const int restingHeight = splash.height();
+        controller.setStartupPreparing(true);
+        auto* quit = splash.findChild<QPushButton*>(QStringLiteral("SplashQuit"));
+        if (capOf(splash)->isActive() || statusOf(splash)->text() != QStringLiteral("Preparing the daemon…") ||
+            quit == nullptr || quit->isHidden() || splash.height() <= restingHeight) return 22;
+        int quitRequests = 0;
+        QObject::connect(&splash, &SplashScreen::quitRequested, &splash, [&quitRequests] { ++quitRequests; });
+        quit->click();
+        QCloseEvent close;
+        QCoreApplication::sendEvent(&splash, &close);
+        if (quitRequests != 2 || splash.isDone()) return 28;
+        fireCap(capOf(splash));
+        const QPointF at(1, 1);
+        QMouseEvent press(QEvent::MouseButtonPress, at, at, at, Qt::LeftButton, Qt::LeftButton,
+                          Qt::NoModifier);
+        QCoreApplication::sendEvent(&splash, &press);
+        controller.setConnectionState(kConnectionError);
+        if (splash.isDone()) return 23;
+        controller.setStartupPreparing(false);
+        if (!splash.isDone()) return 24;
+    }
+    {
+        AppController controller;
+        SplashScreen splash(&controller);
+        controller.setStartupPreparing(true);
+        controller.setConnectionState(kConnectionConnected);
+        controller.setPrereqsAnswered(true);
+        controller.workspacesListed(QStringLiteral("[]"));
+        if (splash.isDone()) return 25;
+        controller.setStartupPreparing(false);
+        if (!splash.isDone()) return 26;
+    }
+    {
+        // Network checks can take longer than the normal splash cap. Their
+        // live progress keeps the splash visible, while a click still works.
+        AppController controller;
+        SplashScreen splash(&controller);
+        controller.setStartupPreparing(true);
+        controller.setStartupUpdateProgress(QStringLiteral("Updating Codex…"));
+        if (statusOf(splash)->text() != QStringLiteral("Updating Codex…") || capOf(splash)->isActive()) {
+            return 16;
+        }
+        if (!captureSplash(splash, QStringLiteral("startup-update-progress.png"))) return 19;
+        controller.setStartupUpdateProgress(QString());
+        if (statusOf(splash)->text() != QStringLiteral("Preparing the daemon…") || capOf(splash)->isActive()) {
+            return 17;
+        }
+        controller.setStartupUpdateProgress(QStringLiteral("<b> Offline update failed; continuing with the installed harnesses. ") + QString(240, QLatin1Char('x')));
+        if (statusOf(splash)->textFormat() != Qt::PlainText ||
+            !statusOf(splash)->wordWrap() || statusOf(splash)->maximumWidth() > 480) {
+            return 18;
+        }
+        if (!captureSplash(splash, QStringLiteral("startup-update-warning-long.png"))) return 20;
+        if (splash.width() > 640) return 21;
+        controller.setStartupPreparing(false);
+        if (statusOf(splash)->text() != QStringLiteral("Launching the daemon…") || !capOf(splash)->isActive()) return 27;
     }
     return 0;
 }

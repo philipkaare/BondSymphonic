@@ -11,6 +11,7 @@ class QComboBox;
 class QLineEdit;
 class QPushButton;
 class QScrollArea;
+class ProviderPage;
 
 /// The application settings: setup and logins, the Anthropic API key, what
 /// permission mode a new agent starts on, and which palette the application
@@ -31,7 +32,8 @@ class SettingsDialog : public QDialog {
     Q_OBJECT
 public:
   explicit SettingsDialog(AppController *controller, QWidget *parent = nullptr,
-                          const QJsonArray &descriptors = QJsonArray());
+                          const QJsonArray &descriptors = QJsonArray(),
+                          const QString &workspaceId = QString());
 
     /// Scrolls the Setup section into view and gives it the focus. What
     /// `MainWindow::showSetupPage` calls, so the status-bar "Set up…" link and
@@ -64,6 +66,7 @@ private:
       QPushButton *removeKey;
       QComboBox *model;
       QComboBox *mode;
+      QComboBox *provider = nullptr;
   };
   QMap<QString, BackendControls> m_backends;
   QJsonObject m_settings;

@@ -295,6 +295,69 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     });
     form->addRow("Model:", m_claudeModel);
 
+    m_provider = new QComboBox(this);
+    m_provider->setObjectName("NewAgentOpenCodeProvider");
+    form->addRow("Provider:", m_provider);
+    QObject::connect(m_provider, &QComboBox::currentIndexChanged, this, [this] {
+        if (adapter() != "opencode") return;
+        QList<agentchoices::Choice> choices;
+        const QString providerId = m_provider->currentData().toString();
+        for (const auto &value : m_providers) {
+            const auto provider = value.toObject();
+            if (provider.value("id").toString() != providerId) continue;
+            for (const auto &modelValue : provider.value("models").toArray()) {
+                const auto model = modelValue.toObject();
+                choices.append({model.value("name").toString(), model.value("id").toString()});
+            }
+        }
+        agentchoices::setModels("opencode", choices);
+        agentchoices::fillModelCombo(m_claudeModel, QString(), "opencode");
+        if (!providerId.isEmpty()) m_controller->refreshProviderModels(providerId);
+        updateOkEnabled();
+    });
+    QObject::connect(m_controller, &AppController::providerModelsChecked, this,
+        [this](const QString &providerId, const QString &json, qint64) {
+            if (adapter() != "opencode" || m_provider->currentData().toString() != providerId) return;
+            QList<agentchoices::Choice> choices;
+            for (const auto &value : QJsonDocument::fromJson(json.toUtf8()).array()) {
+                const auto choice = value.toObject();
+                choices.append({choice.value("label").toString(), choice.value("id").toString()});
+            }
+            agentchoices::setModels("opencode", choices);
+            agentchoices::fillModelCombo(m_claudeModel, chosenModel(), "opencode");
+            updateOkEnabled();
+        });
+    QObject::connect(m_controller, &AppController::settingsRpcFinished, this,
+        [this](const QString &method, qint64 serial, const QString &json, const QString &error) {
+            if (method != "opencode.providers.list" || serial != m_providerRequest) return;
+            if (!error.isEmpty()) { m_status->setText("OpenCode providers could not be loaded: " + error); return; }
+            m_providers = QJsonDocument::fromJson(json.toUtf8()).object().value("providers").toArray();
+            const QString selected = m_provider->currentData().toString();
+            const QString saved = QJsonDocument::fromJson(m_controller->backendSettingsJson().toUtf8())
+                .object().value("backends").toObject().value("opencode").toObject()
+                .value("default_provider_id").toString();
+            m_provider->blockSignals(true); m_provider->clear();
+            for (const auto &value : m_providers) {
+                const auto provider = value.toObject();
+                m_provider->addItem(provider.value("name").toString(), provider.value("id").toString());
+            }
+            const QString wanted = selected.isEmpty() ? saved : selected;
+            const int index = m_provider->findData(wanted);
+            m_provider->setCurrentIndex(index >= 0 ? index : (wanted.isEmpty() ? 0 : -1));
+            m_provider->blockSignals(false);
+            if (m_provider->currentIndex() >= 0) {
+                const int index = m_provider->currentIndex();
+                m_provider->setCurrentIndex(-1);
+                m_provider->setCurrentIndex(index);
+                if (wanted == saved) {
+                    const auto defaults = QJsonDocument::fromJson(m_controller->backendSettingsJson().toUtf8())
+                        .object().value("backends").toObject().value("opencode").toObject();
+                    agentchoices::fillModelCombo(m_claudeModel, defaults.value("default_model").toString(), "opencode");
+                }
+            }
+            updateOkEnabled();
+        });
+
     m_permissionMode = new QComboBox(this);
     m_permissionMode->setObjectName(QStringLiteral("NewAgentPermissionMode"));
     m_permissionMode->setToolTip("What this agent asks before it acts. Settings is where the "
@@ -438,6 +501,7 @@ QString NewAgentDialog::optionsJson() const {
     }
     QJsonObject options;
     options.insert("adapter", adapter());
+    if (adapter() == "opencode") options.insert("provider_id", m_provider->currentData().toString());
     const QString model = chosenModel();
     // Empty explicitly chooses the CLI default, overriding a configured model.
         options.insert("model", model);
@@ -726,6 +790,7 @@ void NewAgentDialog::onAdapterChanged() {
     const bool agent = adapter() != QString::fromUtf8(kTerminalAdapter);
     m_form->setRowVisible(m_command, !agent);
     m_form->setRowVisible(m_claudeModel, agent);
+    m_form->setRowVisible(m_provider, adapter() == "opencode");
     m_form->setRowVisible(m_permissionMode, agent);
     m_form->setRowVisible(m_initialPrompt, agent);
     const auto defaults = QJsonDocument::fromJson(m_controller->backendSettingsJson().toUtf8())
@@ -743,7 +808,10 @@ void NewAgentDialog::onAdapterChanged() {
         m_form->setRowVisible(note, agent);
     }
     if (agent)
-        m_controller->refreshBackendModels(adapter());
+        if (adapter() == "opencode") {
+            m_providerRequest = m_controller->nextSettingsRequestId();
+            m_controller->settingsRpc("opencode.providers.list", "{}", m_providerRequest);
+        } else m_controller->refreshBackendModels(adapter());
     updateOkEnabled();
 }
 
@@ -820,7 +888,9 @@ void NewAgentDialog::updateOkEnabled() {
                            caps.value("adapters").toArray().contains(adapter());
     m_adapter->setToolTip(available ? QString()
                                     : "Install this backend in Settings before creating an agent.");
-    const bool ok = available && !path.isEmpty() && path == m_pendingPath && !m_inspectPending &&
+    const bool providerReady = adapter() != "opencode" ||
+        (!m_provider->currentData().toString().isEmpty() && !chosenModel().isEmpty());
+    const bool ok = available && providerReady && !path.isEmpty() && path == m_pendingPath && !m_inspectPending &&
                     !m_inspectFailed && (inPlace() || !baseBranch().isEmpty()) &&
                     !group().isEmpty() && m_controller->validateWorkspaceName(name()).isEmpty();
     m_buttons->button(QDialogButtonBox::Ok)->setEnabled(ok);

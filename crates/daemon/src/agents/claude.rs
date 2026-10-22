@@ -157,6 +157,11 @@ pub fn pinned_claude_path() -> PathBuf {
 /// put the binary somewhere else, with anything under `/mnt/` refused for the
 /// reason [`pinned_claude_path`] gives.
 pub fn host_claude_bin() -> Option<PathBuf> {
+    if let Some(binary) =
+        crate::harness_updates::selected_binary(crate::harness_updates::Harness::Claude)
+    {
+        return Some(binary);
+    }
     let usable = |p: &std::path::Path| p.is_file() && !p.starts_with("/mnt/");
     if let Ok(real) = std::fs::canonicalize(pinned_claude_path()) {
         if usable(&real) {
@@ -1380,6 +1385,8 @@ settings = \"s.json\"
             model: None,
             permission_mode: None,
             api_key: None,
+
+            provider_id: None,
         };
         // The flag assertions run under the hook, so they say nothing about
         // whether this host has Claude Code installed.
@@ -1390,6 +1397,8 @@ settings = \"s.json\"
             model: None,
             permission_mode: Some(mode.to_owned()),
             api_key: None,
+
+            provider_id: None,
         };
         assert!(claude_argv(&options("default"), BWRAP).is_ok());
         assert!(claude_argv(&options("manual"), BWRAP).is_ok());

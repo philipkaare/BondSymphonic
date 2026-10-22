@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 pub struct BackendSettings {
     pub enabled: bool,
     pub default_model: String,
+    /// OpenCode's model only has meaning together with its provider.
+    pub default_provider_id: String,
     pub default_permission_mode: String,
 }
 
@@ -18,6 +20,7 @@ pub fn default_settings() -> BTreeMap<String, BackendSettings> {
     [
         ("claude", true, "bypassPermissions"),
         ("codex", false, "never"),
+        ("opencode", false, "allow"),
     ]
     .into_iter()
     .map(|(id, enabled, mode)| {
@@ -26,6 +29,7 @@ pub fn default_settings() -> BTreeMap<String, BackendSettings> {
             BackendSettings {
                 enabled,
                 default_model: String::new(),
+                default_provider_id: String::new(),
                 default_permission_mode: mode.into(),
             },
         )
@@ -36,6 +40,7 @@ pub fn word(kind: AgentAdapterKind) -> &'static str {
     match kind {
         AgentAdapterKind::Claude => "claude",
         AgentAdapterKind::Codex => "codex",
+        AgentAdapterKind::OpenCode => "opencode",
         AgentAdapterKind::Terminal => "terminal",
     }
 }
@@ -43,6 +48,7 @@ pub fn parse(word: &str) -> Option<AgentAdapterKind> {
     match word {
         "claude" => Some(AgentAdapterKind::Claude),
         "codex" => Some(AgentAdapterKind::Codex),
+        "opencode" => Some(AgentAdapterKind::OpenCode),
         "terminal" => Some(AgentAdapterKind::Terminal),
         _ => None,
     }
@@ -51,7 +57,7 @@ pub fn credential_name(kind: AgentAdapterKind) -> Option<&'static str> {
     match kind {
         AgentAdapterKind::Claude => Some("anthropic_api_key"),
         AgentAdapterKind::Codex => Some("openai_api_key"),
-        AgentAdapterKind::Terminal => None,
+        AgentAdapterKind::Terminal | AgentAdapterKind::OpenCode => None,
     }
 }
 
@@ -64,7 +70,7 @@ pub fn permission_reply(
     if !allow {
         return (PermissionDecision::Deny, false);
     }
-    if kind == AgentAdapterKind::Codex && session {
+    if (kind == AgentAdapterKind::Codex || kind == AgentAdapterKind::OpenCode) && session {
         return (PermissionDecision::AllowForSession, false);
     }
     (
@@ -96,6 +102,12 @@ pub fn start_options_with_defaults(
             .map_err(|e| e.to_string())?;
     if options.model.is_none() && !defaults.default_model.is_empty() {
         options.model = Some(defaults.default_model.clone());
+    }
+    if options.provider_id.is_none()
+        && options.resume_session.is_none()
+        && !defaults.default_provider_id.is_empty()
+    {
+        options.provider_id = Some(defaults.default_provider_id.clone());
     }
     if options.permission_mode.is_none() && !defaults.default_permission_mode.is_empty() {
         options.permission_mode = Some(defaults.default_permission_mode.clone());
@@ -129,7 +141,13 @@ pub fn resolve_start(
         .get(id)
         .filter(|s| s.enabled)
         .ok_or_else(|| format!("Enable {id} in Settings before starting an agent"))?;
-    Ok((kind, start_options_with_defaults(raw, defaults)?))
+    let options = start_options_with_defaults(raw, defaults)?;
+    if kind == AgentAdapterKind::OpenCode
+        && options.provider_id.as_deref().is_none_or(str::is_empty)
+    {
+        return Err("This OpenCode session has no provider. Choose its original provider in Settings before starting it.".into());
+    }
+    Ok((kind, options))
 }
 
 pub fn legacy_descriptors() -> Vec<BackendDescriptor> {

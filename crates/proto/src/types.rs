@@ -5,6 +5,12 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Capabilities {
+    /// Workspace list/get mask startup restoration and never report Ready
+    /// without a current sandbox. Older daemons omit this capability.
+    #[serde(default)]
+    pub workspace_ready_snapshot: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<crate::McpCapabilities>,
     pub sandbox_backend: String, // "linux_bwrap" | "noop"
     pub git_protect: bool,
     pub adapters: Vec<AgentAdapterKind>,
@@ -17,6 +23,8 @@ pub struct Capabilities {
 pub enum AgentAdapterKind {
     Claude,
     Codex,
+    #[serde(rename = "opencode")]
+    OpenCode,
     Terminal,
 }
 
@@ -82,6 +90,8 @@ pub enum SetupAction {
     /// as `CLAUDE_CODE_OAUTH_TOKEN`.
     ClaudeSetupToken,
     InstallCodex,
+    #[serde(rename = "install_opencode")]
+    InstallOpenCode,
     CodexLogin,
     CodexLogout,
 }
@@ -210,6 +220,8 @@ pub struct AgentSummary {
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
 }
@@ -359,6 +371,8 @@ pub struct AgentStartOptions {
     pub resume_session: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     #[serde(default)]
     pub permission_mode: Option<String>,
     #[serde(default)]
@@ -378,6 +392,7 @@ impl std::fmt::Debug for AgentStartOptions {
             .field("command", &self.command)
             .field("resume_session", &self.resume_session)
             .field("model", &self.model)
+            .field("provider_id", &self.provider_id)
             .field("permission_mode", &self.permission_mode)
             .field("api_key", &self.api_key.as_ref().map(|_| RedactedApiKey))
             .finish()

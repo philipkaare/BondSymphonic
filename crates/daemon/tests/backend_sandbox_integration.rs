@@ -48,7 +48,11 @@ impl Backend for TestCodex {
     ) -> Box<dyn AgentAdapter> {
         unreachable!()
     }
-    async fn list_models(&self, _: &Daemon, _: Option<&str>) -> Result<ListModelsResult, RpcError> {
+    async fn list_models(
+        &self,
+        _: &Daemon,
+        _: bondsymphonic_daemon::agents::backend::ModelQuery<'_>,
+    ) -> Result<ListModelsResult, RpcError> {
         unreachable!()
     }
 }

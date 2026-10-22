@@ -418,6 +418,7 @@ fn ending_an_operation_that_never_began_is_not_a_change() {
 
 fn agent(id: &str, adapter: AgentAdapterKind) -> AgentSummary {
     AgentSummary {
+        provider_id: None,
         id: AgentId(id.to_owned()),
         adapter,
         state: AgentState::Exited,

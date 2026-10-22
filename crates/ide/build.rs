@@ -28,6 +28,7 @@ fn main() {
         // for QAction, ...) and is not linked implicitly by cxx-qt-build.
         .qt_module("Gui")
         .qt_module("Widgets")
+        .qt_module("Network")
         .file("src/ffi.rs")
         .file("src/qobjects/app_controller.rs")
         .file("src/qobjects/group_model.rs")
@@ -67,6 +68,10 @@ fn main() {
             "cpp/SetupPage.cpp",
             "cpp/SettingsDialog.h",
             "cpp/SettingsDialog.cpp",
+            "cpp/ProviderPage.h",
+            "cpp/ProviderPage.cpp",
+            "cpp/McpPage.h",
+            "cpp/McpPage.cpp",
             "cpp/PromptInput.h",
             "cpp/PromptInput.cpp",
             "cpp/ToolCard.h",

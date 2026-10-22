@@ -696,7 +696,7 @@ void TranscriptView::updateWelcome() {
     // the restarted agent coming back with it.
     const QString model = chosenModelId();
     QStringList what{
-        agentchoices::labelForModel(model == QStringLiteral("-") ? QString() : model, m_backend),
+        agentchoices::labelForModel(model == QStringLiteral("-") ? QString() : model, modelChoiceBackend()),
         agentchoices::labelForPermissionMode(m_permissionChoice->currentData().toString(),
                                              m_backend)};
     if (!m_welcomeOrigin.isEmpty()) {
@@ -720,11 +720,12 @@ void TranscriptView::applyOptionsToChoices() {
     // the CLI's own default is that same mode, spelled its other way.
     const QString mode = options.value(QStringLiteral("permission_mode")).toString();
     m_applyingOptions = true;
-    agentchoices::fillModelCombo(m_modelChoice, model, m_backend);
+    agentchoices::fillModelCombo(m_modelChoice, model, modelChoiceBackend());
     agentchoices::fillPermissionCombo(
         m_permissionChoice,
         mode.isEmpty()
-            ? (m_backend == "codex" ? QStringLiteral("never")
+            ? (m_backend == "opencode" ? QStringLiteral("allow") :
+               m_backend == "codex" ? QStringLiteral("never")
                                     : QString::fromUtf8(agentchoices::defaultPermissionMode()))
             : mode,
         m_backend);
@@ -741,6 +742,13 @@ QString TranscriptView::chosenModelId() const {
     return id.isEmpty() ? QStringLiteral("-") : id;
 }
 
+QString TranscriptView::modelChoiceBackend() const {
+    if (m_backend != "opencode" || m_model.isNull()) return m_backend;
+    const auto options = QJsonDocument::fromJson(m_model->getOptionsJson().toUtf8()).object();
+    const QString provider = options.value("provider_id").toString();
+    return provider.isEmpty() ? m_backend : "opencode:" + provider;
+}
+
 void TranscriptView::refillModels() {
     // Captured off the combo as it stands, not off `chosenModelId`: that one
     // rewrites "let Claude Code decide" to `-` for the options bridge, and a
@@ -751,7 +759,7 @@ void TranscriptView::refillModels() {
     // new list's first entry is on the way to `selected`, and each of those
     // stops is a `currentIndexChanged` this pane must not read as a restart.
     m_applyingOptions = true;
-    agentchoices::fillModelCombo(m_modelChoice, selected, m_backend);
+    agentchoices::fillModelCombo(m_modelChoice, selected, modelChoiceBackend());
     m_applyingOptions = false;
     updateWelcome();
 }
@@ -775,7 +783,7 @@ void TranscriptView::emitOptionsChanged() {
     // still fail, and what answers afterwards would be the old agent.
     // `onStateChanged` posts it when a different agent id arrives, which is the
     // switch having actually taken place.
-    m_pendingSwitch = agentchoices::labelForModel(model, m_backend) + QStringLiteral(" · ") +
+    m_pendingSwitch = agentchoices::labelForModel(model, modelChoiceBackend()) + QStringLiteral(" · ") +
                       agentchoices::labelForPermissionMode(mode, m_backend);
     emit optionsChanged(m_model->restartOptionsChoosing(model, mode));
 }

@@ -72,6 +72,8 @@ fn options() -> AgentStartOptions {
         model: None,
         permission_mode: None,
         api_key: None,
+
+        provider_id: None,
     }
 }
 

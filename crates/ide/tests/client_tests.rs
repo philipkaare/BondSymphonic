@@ -32,6 +32,8 @@ async fn fake_daemon(token: &'static str) -> std::net::SocketAddr {
                         &HelloResult {
                             daemon_version: "9.9.9".into(),
                             capabilities: Capabilities {
+                                workspace_ready_snapshot: false,
+                                mcp: None,
                                 backends: vec![],
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
@@ -102,6 +104,8 @@ async fn fake_daemon_signaling_eof(
                         &HelloResult {
                             daemon_version: "9.9.9".into(),
                             capabilities: Capabilities {
+                                workspace_ready_snapshot: false,
+                                mcp: None,
                                 backends: vec![],
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
@@ -146,6 +150,8 @@ async fn fake_daemon_delayed_prereqs(token: &'static str) -> std::net::SocketAdd
                         &HelloResult {
                             daemon_version: "9.9.9".into(),
                             capabilities: Capabilities {
+                                workspace_ready_snapshot: false,
+                                mcp: None,
                                 backends: vec![],
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
@@ -304,6 +310,8 @@ async fn fake_daemon_silent_after_hello(token: &'static str) -> std::net::Socket
                         &HelloResult {
                             daemon_version: "9.9.9".into(),
                             capabilities: Capabilities {
+                                workspace_ready_snapshot: false,
+                                mcp: None,
                                 backends: vec![],
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
@@ -352,6 +360,8 @@ async fn fake_daemon_flooding_events(token: &'static str) -> std::net::SocketAdd
                         &HelloResult {
                             daemon_version: "9.9.9".into(),
                             capabilities: Capabilities {
+                                workspace_ready_snapshot: false,
+                                mcp: None,
                                 backends: vec![],
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
@@ -631,6 +641,8 @@ async fn fake_daemon_speaking(token: &'static str, answer: MismatchAnswer) -> st
                         &HelloResult {
                             daemon_version: "9.9.9".into(),
                             capabilities: Capabilities {
+                                workspace_ready_snapshot: false,
+                                mcp: None,
                                 backends: vec![],
                                 sandbox_backend: "noop".into(),
                                 git_protect: false,
@@ -761,6 +773,8 @@ mod review_fixes_task_7 {
                             &HelloResult {
                                 daemon_version: "9.9.9".into(),
                                 capabilities: Capabilities {
+                                    workspace_ready_snapshot: false,
+                                    mcp: None,
                                     backends: vec![],
                                     sandbox_backend: "noop".into(),
                                     git_protect: false,

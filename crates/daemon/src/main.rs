@@ -34,6 +34,19 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Update installed agent harnesses before starting the daemon.
+    UpdateHarnesses {
+        /// Cancel when the launching IDE closes stdin.
+        #[arg(long)]
+        watch_stdin: bool,
+    },
+    /// Internal: connect a native MCP stdio client to its assigned broker.
+    McpBridge {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        token: String,
+    },
     /// Internal: run as the init process inside a sandbox. Not for direct use.
     SandboxInit {
         /// Unix socket to listen on, inside the sandbox.
@@ -69,6 +82,29 @@ enum Cmd {
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.cmd {
+        Some(Cmd::UpdateHarnesses { watch_stdin }) => {
+            let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
+            let result = tokio::runtime::Runtime::new()?.block_on(
+                bondsymphonic_daemon::harness_updates::run_cli(&data_dir, watch_stdin),
+            );
+            if result.as_ref().err().is_some_and(|error| {
+                matches!(
+                    error.downcast_ref::<InstanceLockError>(),
+                    Some(InstanceLockError::Busy(_))
+                )
+            }) {
+                eprintln!("{}", result.unwrap_err());
+                std::process::exit(BUSY_EXIT_CODE);
+            }
+            return result;
+        }
+        Some(Cmd::McpBridge {
+            ref socket,
+            ref token,
+        }) => {
+            return tokio::runtime::Runtime::new()?
+                .block_on(bondsymphonic_daemon::mcp::bridge::run(socket, token));
+        }
         #[cfg(target_os = "linux")]
         Some(Cmd::SandboxInit { ref socket }) => return sandbox::init::run(socket),
         #[cfg(not(target_os = "linux"))]
@@ -87,17 +123,19 @@ fn main() -> Result<()> {
     tokio::runtime::Runtime::new()?.block_on(serve(args))
 }
 
+fn default_data_dir() -> PathBuf {
+    directories::BaseDirs::new()
+        .map(|b| b.home_dir().join(".bondsymphonic"))
+        .unwrap_or_else(|| PathBuf::from(".bondsymphonic"))
+}
+
 async fn serve(args: Args) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(args.log_level.clone())
         .with_writer(std::io::stderr)
         .init();
 
-    let data_dir = args.data_dir.clone().unwrap_or_else(|| {
-        directories::BaseDirs::new()
-            .map(|b| b.home_dir().join(".bondsymphonic"))
-            .unwrap_or_else(|| PathBuf::from(".bondsymphonic"))
-    });
+    let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
     std::fs::create_dir_all(&data_dir)?;
 
     // Before anything in the data directory is read or written, and before the
@@ -128,6 +166,9 @@ async fn serve(args: Args) -> Result<()> {
     } else {
         "linux_bwrap"
     };
+    // Pin immutable bundles for this daemon's lifetime, including when another
+    // data directory sharing this HOME updates its managed selection later.
+    bondsymphonic_daemon::harness_updates::freeze_managed_binaries();
     let backend = sandbox::backend_for(backend_name);
     tracing::info!(
         ?data_dir,
@@ -138,6 +179,10 @@ async fn serve(args: Args) -> Result<()> {
     // `backend_for` downgrades an unsupported name to noop, so the running
     // backend's own name is what gets advertised.
     let capabilities = Capabilities {
+        workspace_ready_snapshot: false,
+        mcp: Some(bondsymphonic_daemon::mcp::broker::capabilities(
+            backend.name(),
+        )),
         backends: bondsymphonic_daemon::agents::backend::descriptors(),
         sandbox_backend: backend.name().into(),
         git_protect: backend.name() == "linux_bwrap",
@@ -202,6 +247,7 @@ async fn serve(args: Args) -> Result<()> {
     });
 
     server.run(shutdown).await?;
+    daemon.mcp_broker.shutdown();
     // The agents' record writes still queued -- a session id reported a moment
     // ago above all -- are what the next daemon restores the agents from, and
     // the queue does not outlive this function. First, before the sandboxes:

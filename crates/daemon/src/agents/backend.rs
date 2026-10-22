@@ -7,7 +7,15 @@ use async_trait::async_trait;
 use bondsymphonic_proto::*;
 use std::{path::PathBuf, sync::Arc};
 
+#[derive(Clone, Copy, Default)]
+pub struct ModelQuery<'a> {
+    pub api_key: Option<&'a str>,
+    pub provider_id: Option<&'a str>,
+}
+
 pub struct PreparedAgent {
+    pub mcp_servers: Vec<serde_json::Value>,
+    pub provider_endpoints: Vec<(String, u16)>,
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: PathBuf,
@@ -44,7 +52,7 @@ pub trait Backend: Send + Sync {
     async fn list_models(
         &self,
         d: &Daemon,
-        api_key: Option<&str>,
+        query: ModelQuery<'_>,
     ) -> Result<ListModelsResult, RpcError>;
 }
 
@@ -53,11 +61,16 @@ pub fn backend_for(kind: AgentAdapterKind) -> Result<Arc<dyn Backend>, RpcError>
         AgentAdapterKind::Claude => Ok(Arc::new(ClaudeBackend)),
         AgentAdapterKind::Terminal => Err(RpcError::invalid_params("terminal agents use pty.open")),
         AgentAdapterKind::Codex => Ok(Arc::new(CodexBackend)),
+        AgentAdapterKind::OpenCode => Ok(Arc::new(super::opencode_backend::OpenCodeBackend)),
     }
 }
 
 pub fn known_backends() -> Vec<Arc<dyn Backend>> {
-    vec![Arc::new(ClaudeBackend), Arc::new(CodexBackend)]
+    vec![
+        Arc::new(ClaudeBackend),
+        Arc::new(CodexBackend),
+        Arc::new(super::opencode_backend::OpenCodeBackend),
+    ]
 }
 
 pub fn runnable_adapters(backends: &[Arc<dyn Backend>]) -> Vec<AgentAdapterKind> {

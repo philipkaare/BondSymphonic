@@ -2,7 +2,7 @@
 use super::{
     adapter::AgentAdapter,
     agent_auth_env,
-    backend::{Backend, PreparedAgent},
+    backend::{Backend, ModelQuery, PreparedAgent},
     claude::{self, ClaudeAdapter},
     credentials, off_the_runtime, AgentSink,
 };
@@ -93,9 +93,15 @@ impl Backend for ClaudeBackend {
         })
         .await
         .unwrap_or(None);
-        let env = agent_auth_env(options.api_key.as_deref(), token);
+        let mut env = agent_auth_env(options.api_key.as_deref(), token);
+        env.extend([
+            ("DISABLE_AUTOUPDATER".into(), "1".into()),
+            ("DISABLE_UPDATES".into(), "1".into()),
+        ]);
 
         Ok(PreparedAgent {
+            mcp_servers: Vec::new(),
+            provider_endpoints: Vec::new(),
             argv,
             env,
             cwd: ws.worktree_path.clone(),
@@ -119,8 +125,9 @@ impl Backend for ClaudeBackend {
     async fn list_models(
         &self,
         d: &Daemon,
-        api_key: Option<&str>,
+        query: ModelQuery<'_>,
     ) -> Result<ListModelsResult, RpcError> {
+        let api_key = query.api_key;
         crate::models::list_models(d, api_key).await
     }
 }
