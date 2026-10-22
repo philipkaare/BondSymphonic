@@ -231,7 +231,11 @@ pub fn prepare_servers(
                     registry::ListenerKind::Server(cfg.id.clone()),
                 ),
                 McpTransportConfig::Stdio { .. } => {
-                    exec::write_env_file(&d.mcp_servers, cfg, run_dir).map(|_| ())
+                    exec::write_env_file(&d.mcp_servers, cfg, run_dir).map(|_| {
+                        // So that disabling or removing the server deletes
+                        // the file (`McpRegistry::reconcile`).
+                        d.mcp.note_env_dir(ws, run_dir);
+                    })
                 }
             };
             match prepared {

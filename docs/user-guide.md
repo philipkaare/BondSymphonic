@@ -1026,9 +1026,11 @@ workspace** setting (the label says which way that currently goes), or
 
 The servers an agent gets are worked out when it starts. A new server, or one
 enabled globally or for a workspace, reaches an agent when that agent next
-starts: restart the agent to pick it up. Disabling a server, disabling it for a
-workspace, removing it or disconnecting it takes effect immediately, and the
-tools of agents already running fail from then on.
+starts: restart the agent to pick it up. For a remote server, disabling it,
+disabling it for a workspace, removing it or disconnecting it takes effect
+immediately, and the tools of agents already running fail from then on. A
+local server that is already running keeps running until its agent restarts;
+disabling or removing it does delete its secrets file from disk at once.
 
 ### Where secrets live
 
@@ -1038,8 +1040,11 @@ stored by the daemon in its private data directory inside WSL
 a stored value: a secret field starts blank, leaving it blank keeps the stored
 value, and **Remove** (or deleting its row) deletes it. Remote credentials never
 enter an agent's sandbox: the daemon makes the remote calls itself. A local
-server's secrets reach only that server's own process in the sandbox, through a
-private file, never its command line.
+server's secrets are handed to its process through a private file, never its
+command line, and are kept out of logs and transcripts. They are still
+readable inside that agent's sandbox while it runs, because the server runs
+there as the same user as the agent, so do not paste a secret into a local
+server that you would not let the agent see.
 
 ---
 

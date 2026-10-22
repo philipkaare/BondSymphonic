@@ -10,8 +10,12 @@
 //!   for the workspace: see [`McpRegistry::reconcile`].
 
 use crate::daemon::Daemon;
+use crate::mcp::exec;
 use crate::mcp::servers::McpServers;
-use bondsymphonic_proto::{McpServerId, McpWorkspaceOverride, RpcError, WorkspaceId};
+use bondsymphonic_proto::{
+    McpRegistrySnapshot, McpServerId, McpTransportConfig, McpWorkspaceOverride, RpcError,
+    WorkspaceId,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Weak;
@@ -44,6 +48,10 @@ struct Listener {
 #[derive(Default)]
 pub struct McpRegistry {
     listeners: parking_lot::Mutex<HashMap<PathBuf, Listener>>,
+    /// Run directories that got a local server's env file, with the workspace
+    /// they belong to: a local server has no listener, so [`Self::reconcile`]
+    /// finds its secret file through these.
+    env_dirs: parking_lot::Mutex<HashMap<PathBuf, WorkspaceId>>,
 }
 
 impl McpRegistry {
@@ -194,6 +202,14 @@ impl McpRegistry {
         self.stop_matching(|p, _| p.parent() == Some(dir));
     }
 
+    /// Records that `run_dir` (of one of `ws`'s sandboxes) holds a local
+    /// server's env file, so that [`Self::reconcile`] can delete it again.
+    pub fn note_env_dir(&self, ws: &WorkspaceId, run_dir: &Path) {
+        self.env_dirs
+            .lock()
+            .insert(run_dir.to_path_buf(), ws.clone());
+    }
+
     /// Stops `server`'s listeners in every sandbox.
     pub fn stop_server(&self, server: &McpServerId) {
         self.stop_where(|l| matches!(&l.kind, ListenerKind::Server(s) if s == server));
@@ -218,18 +234,7 @@ impl McpRegistry {
             let ListenerKind::Server(server) = &listener.kind else {
                 continue;
             };
-            let on = snapshot
-                .servers
-                .iter()
-                .find(|s| &s.id == server)
-                .is_some_and(|s| {
-                    s.enabled
-                        && match snapshot.workspace_override(&listener.workspace, server) {
-                            McpWorkspaceOverride::Inherit => s.default_workspace_enabled,
-                            McpWorkspaceOverride::Enabled => true,
-                            McpWorkspaceOverride::Disabled => false,
-                        }
-                });
+            let on = server_on(&snapshot, &listener.workspace, server);
             let logged_in = servers.has_login(server);
             let logged_out = listener.logged_in && !logged_in;
             listener.logged_in = logged_in;
@@ -241,7 +246,52 @@ impl McpRegistry {
             tracing::info!(ws = %ws, server = %server.as_str(), "stopping MCP server socket");
             self.stop_server_in(&ws, &server);
         }
+        self.remove_off_env_files(&snapshot);
     }
+
+    /// Deletes the env file of every local server that is removed, disabled
+    /// or off for the workspace from each run directory it was written to. A
+    /// running server process keeps its environment, but its secret no longer
+    /// stays on disk (until now: until the next agent start there, or
+    /// forever in a stopped workspace).
+    fn remove_off_env_files(&self, snapshot: &McpRegistrySnapshot) {
+        let mut dirs = self.env_dirs.lock();
+        dirs.retain(|run_dir, ws| {
+            let Ok(entries) = std::fs::read_dir(run_dir.join(exec::ENV_DIR)) else {
+                // The directory is gone (workspace destroyed): forget it.
+                return false;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let on = snapshot.servers.iter().any(|s| {
+                    matches!(s.transport, McpTransportConfig::Stdio { .. })
+                        && name.to_str() == Some(exec::env_file_name(&s.id).as_str())
+                        && server_on(snapshot, ws, &s.id)
+                });
+                if !on {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+            true
+        });
+    }
+}
+
+/// Whether `server` is enabled and on for `ws`: the registry's own switches,
+/// not whether it has a login.
+fn server_on(snapshot: &McpRegistrySnapshot, ws: &WorkspaceId, server: &McpServerId) -> bool {
+    snapshot
+        .servers
+        .iter()
+        .find(|s| &s.id == server)
+        .is_some_and(|s| {
+            s.enabled
+                && match snapshot.workspace_override(ws, server) {
+                    McpWorkspaceOverride::Inherit => s.default_workspace_enabled,
+                    McpWorkspaceOverride::Enabled => true,
+                    McpWorkspaceOverride::Disabled => false,
+                }
+        })
 }
 
 /// The session for one accepted connection, or `None` once the daemon is
@@ -372,5 +422,68 @@ mod tests {
         servers.remove(&jira).unwrap();
         registry.reconcile(&servers);
         assert_eq!(paths(&registry), ["a-tools"]);
+    }
+
+    /// A local server that is removed, disabled or turned off for a workspace
+    /// loses its env file (and with it its secrets) from the run directories
+    /// it was written to; one that stays on keeps it.
+    #[test]
+    fn reconcile_deletes_env_files_of_local_servers_that_went_off() {
+        use bondsymphonic_proto::{McpServerConfig, McpUpsertParams};
+        let dir = tempfile::tempdir().unwrap();
+        let servers = McpServers::load(&dir.path().join("data")).unwrap();
+        let local = |id: &str| McpServerConfig {
+            id: id.into(),
+            name: id.into(),
+            transport: McpTransportConfig::Stdio {
+                command: "server".into(),
+                args: vec![],
+                env: Default::default(),
+                secret_env: vec![],
+            },
+            enabled: true,
+            default_workspace_enabled: true,
+            enabled_backends: vec!["claude".into()],
+        };
+        for id in ["keep", "off", "gone", "ws_off"] {
+            servers
+                .upsert(McpUpsertParams {
+                    server: local(id),
+                    secrets: vec![],
+                    expected_revision: None,
+                })
+                .unwrap();
+        }
+        let registry = McpRegistry::default();
+        let run = dir.path().join("run");
+        for id in ["keep", "off", "gone", "ws_off"] {
+            exec::write_env_file(&servers, &local(id), &run).unwrap();
+        }
+        registry.note_env_dir(&"a".into(), &run);
+        let present = |id: &str| run.join("mcp-env").join(format!("{id}.env")).exists();
+
+        registry.reconcile(&servers);
+        assert!(["keep", "off", "gone", "ws_off"].iter().all(|i| present(i)));
+
+        let mut off = local("off");
+        off.enabled = false;
+        servers
+            .upsert(McpUpsertParams {
+                server: off,
+                secrets: vec![],
+                expected_revision: None,
+            })
+            .unwrap();
+        servers.remove(&"gone".into()).unwrap();
+        servers
+            .set_override(McpOverrideParams {
+                server_id: "ws_off".into(),
+                workspace_id: "a".into(),
+                value: McpWorkspaceOverride::Disabled,
+            })
+            .unwrap();
+        registry.reconcile(&servers);
+        assert!(present("keep"));
+        assert!(!present("off") && !present("gone") && !present("ws_off"));
     }
 }
