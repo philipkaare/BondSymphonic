@@ -20,6 +20,13 @@
 //! `initialize` once over stdio and never will again. A request that failed
 //! that way is retried once on the new session, except `tools/call`, which
 //! may have had effects and is answered with an error asking for a retry.
+//!
+//! A server with no login yet (the Jira preset before Connect) still gets a
+//! working handshake: the broker answers `initialize` itself, with no tools
+//! and `tools.listChanged`, and `tools/list` with an empty list. Failing it
+//! instead would make the CLI drop the server until the agent restarts. Once
+//! a login appears, the broker initializes upstream and sends the client
+//! `notifications/tools/list_changed`.
 
 use super::transport::{self, RemoteSession, MAX_BODY};
 use super::McpServers;
@@ -70,10 +77,11 @@ type Calls = Arc<parking_lot::Mutex<HashMap<String, tokio::task::AbortHandle>>>;
 
 /// Ends the connection's work when `serve` returns or is dropped (the
 /// listener stopped): in-flight requests, and with them their curl
-/// processes, and the writer.
+/// processes, the writer and the login watcher.
 struct ConnectionGuard {
     calls: Calls,
     writer: tokio::task::AbortHandle,
+    watcher: tokio::task::AbortHandle,
     session: Arc<RemoteSession>,
 }
 
@@ -84,6 +92,7 @@ impl Drop for ConnectionGuard {
             call.abort();
         }
         self.writer.abort();
+        self.watcher.abort();
     }
 }
 
@@ -94,6 +103,13 @@ struct Handshake {
     initialize: Option<Value>,
     /// Whether the client has sent `notifications/initialized`.
     initialized: bool,
+    /// The server had no login when the client initialized, so the broker
+    /// answered for it and the upstream session does not exist yet.
+    local: bool,
+    /// The login (generation, and whether one exists) at the last failed
+    /// try to reach the upstream while `local`: a status tick tries again
+    /// only once it changed, never in a loop on a refused login.
+    attempted: (u64, bool),
 }
 
 /// One connection's broker: its upstream session and what renewing it needs.
@@ -101,6 +117,8 @@ struct Broker {
     servers: Arc<McpServers>,
     server: McpServerId,
     session: Arc<RemoteSession>,
+    /// Messages to the client.
+    out: mpsc::UnboundedSender<Value>,
     /// Held while the handshake runs upstream, so concurrent requests that
     /// all found the session expired renew it once.
     handshake: tokio::sync::Mutex<Handshake>,
@@ -111,6 +129,13 @@ impl Broker {
         self.servers
             .server(&self.server)
             .map_or_else(|| self.server.as_str().to_owned(), |s| s.name)
+    }
+
+    fn login(&self) -> (u64, bool) {
+        (
+            self.servers.generation(&self.server),
+            self.servers.has_login(&self.server),
+        )
     }
 
     /// A request's answer: the upstream's messages, or one error reply
@@ -129,6 +154,37 @@ impl Broker {
         }
     }
 
+    /// The broker's own `initialize` result while the server has no login: a
+    /// valid server with no tools yet, which promises `tools/list_changed`.
+    /// A CLI whose server failed `initialize` would drop it for good; this
+    /// one keeps it, and the tools arrive once the user connects.
+    fn local_initialize(&self, request: &Value) -> Value {
+        let version = request
+            .pointer("/params/protocolVersion")
+            .and_then(Value::as_str)
+            .filter(|v| transport::SUPPORTED_VERSIONS.contains(v))
+            .unwrap_or(transport::PROTOCOL_VERSION);
+        let name = self.name();
+        json!({"jsonrpc": "2.0", "id": request["id"], "result": {
+            "protocolVersion": version,
+            "capabilities": {"tools": {"listChanged": true}},
+            "serverInfo": {"name": name, "version": env!("CARGO_PKG_VERSION")},
+            "instructions": not_connected_message(&name),
+        }})
+    }
+
+    /// A request's answer while the server has no login: no tools, and
+    /// "not connected" for anything that needs the server.
+    fn local_answer(&self, id: &Value, method: Option<&str>) -> Vec<Value> {
+        let result = |result: Value| vec![json!({"jsonrpc": "2.0", "id": id, "result": result})];
+        match method {
+            Some("tools/list") => result(json!({"tools": []})),
+            // A liveness check the CLI may send: the broker is alive.
+            Some("ping") => result(json!({})),
+            _ => self.answer(id, Err(transport::error("not connected"))),
+        }
+    }
+
     /// A successful upstream `initialize` is what proves a login works.
     fn mark_connected(&self, generation: u64) {
         if self.servers.status(&self.server).state != McpConnectionState::Connected {
@@ -141,75 +197,145 @@ impl Broker {
         }
     }
 
-    /// The client's `initialize`: forwarded, and kept for renewals.
-    async fn initialize(&self, message: Value) -> Result<Vec<Value>, RpcError> {
+    /// The client's `initialize`: forwarded, and kept for renewals. Without
+    /// a login the broker answers it itself.
+    async fn initialize(&self, message: Value) -> Vec<Value> {
+        let id = message["id"].clone();
         let mut handshake = self.handshake.lock().await;
         handshake.initialize = Some(message.clone());
-        let generation = self.servers.generation(&self.server);
-        let result = self.session.request(message).await;
-        if result.is_ok() {
-            self.mark_connected(generation);
+        let login = self.login();
+        let result = self.session.request(message.clone()).await;
+        match &result {
+            Ok(_) => self.mark_connected(login.0),
+            Err(e) if is_not_connected(e) => {
+                handshake.local = true;
+                handshake.attempted = login;
+                return vec![self.local_initialize(&message)];
+            }
+            Err(_) => {}
         }
-        result
+        self.answer(&id, result)
     }
 
-    /// Initializes the upstream session again from the client's handshake,
-    /// unless it already is (another request renewed it first) or the
-    /// client never initialized.
-    async fn renew(&self) -> Result<(), RpcError> {
-        let handshake = self.handshake.lock().await;
+    /// Brings the upstream session up from the client's handshake: after the
+    /// server expired it, or, while answering locally, once a login appears.
+    /// `Ok(false)` while there is still no login. Nothing to do when it is
+    /// up already (another request renewed it first) or the client never
+    /// initialized.
+    ///
+    /// A `proactive` renewal (a status or registry tick) only leaves local
+    /// answering, and only for a login that changed since the last try.
+    async fn renew(&self, proactive: bool) -> Result<bool, RpcError> {
+        let mut handshake = self.handshake.lock().await;
         let Some(initialize) = handshake.initialize.clone() else {
-            return Ok(());
+            return Ok(true);
         };
         if self.session.is_initialized() {
-            return Ok(());
+            return Ok(true);
         }
-        let generation = self.servers.generation(&self.server);
-        self.session.request(initialize).await?;
-        self.mark_connected(generation);
-        if handshake.initialized {
+        let login = self.login();
+        if proactive && (!handshake.local || handshake.attempted == login) {
+            return Ok(!handshake.local);
+        }
+        match self.session.request(initialize).await {
+            Ok(_) => self.mark_connected(login.0),
+            Err(e) if handshake.local && is_not_connected(&e) => {
+                handshake.attempted = login;
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        }
+        let initialized = if handshake.initialized {
             self.session
                 .request(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
-                .await?;
+                .await
+                .map(drop)
+        } else {
+            Ok(())
+        };
+        // The client was told there were no tools: now there are.
+        if std::mem::take(&mut handshake.local) {
+            let _ = self
+                .out
+                .send(json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}));
         }
-        Ok(())
+        initialized.map(|()| true)
     }
 
-    /// One client request, renewing an expired session on the way.
+    /// One client request, renewing the upstream session on the way.
     async fn call(&self, message: Value) -> Vec<Value> {
         let id = message.get("id").cloned().unwrap_or(Value::Null);
-        let tool_call = message.get("method").and_then(Value::as_str) == Some("tools/call");
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        // `Some` when the request is answered without the upstream.
+        let settled = |renewed: Result<bool, RpcError>| match renewed {
+            Ok(true) => None,
+            Ok(false) => Some(self.local_answer(&id, method.as_deref())),
+            Err(e) => Some(self.answer(&id, Err(e))),
+        };
+        if let Some(answer) = settled(self.renew(false).await) {
+            return answer;
+        }
         let result = match self.session.request(message.clone()).await {
             // The server dropped the session: this request reached it, but
             // was refused. Anything but a tool call is safe to send again.
-            Err(e) if is(&e, "session_expired") => match self.renew().await {
-                Ok(()) if tool_call => {
+            Err(e) if is(&e, "session_expired") => {
+                if let Some(answer) = settled(self.renew(false).await) {
+                    return answer;
+                }
+                if method.as_deref() == Some("tools/call") {
                     return vec![error_reply(
                         &id,
                         SESSION_RESET,
                         &session_reset_message(&self.name()),
-                    )]
+                    )];
                 }
-                Ok(()) => self.session.request(message).await,
-                Err(e) => Err(e),
-            },
+                self.session.request(message).await
+            }
             // Another request's 404 left the session uninitialized before
             // this one was sent: nothing went upstream, so it may be sent.
-            Err(e) if is(&e, "session not initialized") => match self.renew().await {
-                Ok(()) => self.session.request(message).await,
-                Err(e) => Err(e),
-            },
+            Err(e) if is(&e, "session not initialized") => {
+                if let Some(answer) = settled(self.renew(false).await) {
+                    return answer;
+                }
+                self.session.request(message).await
+            }
             result => result,
         };
         self.answer(&id, result)
     }
 
-    /// A notification, or the client's reply to a server request.
+    /// A notification, or the client's reply to a server request. While
+    /// answering locally there is no upstream session to tell.
     async fn notify(&self, message: Value) {
-        if message.get("method").and_then(Value::as_str) == Some("notifications/initialized") {
-            self.handshake.lock().await.initialized = true;
+        let local = {
+            let mut handshake = self.handshake.lock().await;
+            if message.get("method").and_then(Value::as_str) == Some("notifications/initialized") {
+                handshake.initialized = true;
+            }
+            handshake.local
+        };
+        if !local {
+            let _ = self.session.request(message).await;
         }
-        let _ = self.session.request(message).await;
+    }
+
+    /// Leaves local answering as soon as a login appears, so the client
+    /// hears `tools/list_changed` without having to ask first.
+    async fn watch_login(
+        self: Arc<Self>,
+        mut status: tokio::sync::watch::Receiver<u64>,
+        mut registry: tokio::sync::watch::Receiver<u64>,
+    ) {
+        loop {
+            tokio::select! {
+                changed = status.changed() => if changed.is_err() { return },
+                changed = registry.changed() => if changed.is_err() { return },
+            }
+            let _ = self.renew(true).await;
+        }
     }
 }
 
@@ -241,17 +367,22 @@ where
         }
     });
     let calls: Calls = Arc::default();
-    let guard = ConnectionGuard {
-        calls: calls.clone(),
-        writer: writer_task.abort_handle(),
-        session: session.clone(),
-    };
+    // Subscribed before anything is read, so no login is missed.
+    let (status, registry) = (servers.subscribe_status(), servers.subscribe());
     let broker = Arc::new(Broker {
         servers,
         server,
-        session,
+        session: session.clone(),
+        out: out_tx.clone(),
         handshake: Default::default(),
     });
+    let watcher = tokio::spawn(broker.clone().watch_login(status, registry));
+    let guard = ConnectionGuard {
+        calls: calls.clone(),
+        writer: writer_task.abort_handle(),
+        watcher: watcher.abort_handle(),
+        session: session.clone(),
+    };
     let send = |messages: Vec<Value>| {
         for m in messages {
             let _ = out_tx.send(m);
@@ -293,12 +424,11 @@ where
             // Initialization runs to completion before anything after it is
             // read, so `notifications/initialized` and the first requests
             // reach the server in the order the client sent them.
-            (Some("initialize"), Some(id)) => {
+            (Some("initialize"), Some(_)) => {
                 if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) {
                     params.insert("capabilities".into(), json!({}));
                 }
-                let result = broker.initialize(message).await;
-                send(broker.answer(&id, result));
+                send(broker.initialize(message).await);
             }
             (Some(_), Some(id)) => {
                 let mut in_flight = calls.lock();
@@ -343,10 +473,14 @@ where
             _ => broker.notify(message).await,
         }
     }
-    // The client is done: what is still upstream will never be read.
+    // The client is done: what is still upstream will never be read. Every
+    // holder of the broker (and its sender) goes, so the writer can finish.
+    session.close();
+    watcher.abort();
     for (_, call) in calls.lock().drain() {
         call.abort();
     }
+    drop(broker);
     drop(out_tx);
     let _ = writer_task.await;
     drop(guard);
@@ -664,6 +798,125 @@ mod tests {
             .await;
         assert_eq!(refused["id"], "over");
         assert_eq!(refused["error"]["code"], -32000, "{refused}");
+    }
+
+    fn oauth() -> McpServerConfig {
+        remote(
+            "oauth",
+            McpAuthConfig::OAuth {
+                client_id: None,
+                client_metadata_url: None,
+                client_secret: None,
+                scopes: vec![],
+            },
+        )
+    }
+
+    /// Stores a valid OAuth login for `oauth`, the way a sign-in does, but
+    /// without the status tick that follows one.
+    fn log_in(servers: &McpServers) {
+        let token = json!({"access": "tok", "refresh": null, "expires": 4_000_000_000u64,
+            "issuer": "https://example.com", "endpoint": "https://example.com/token",
+            "client_id": "c", "scopes": []});
+        servers
+            .set_secret(
+                &"oauth".into(),
+                super::super::auth::TOKEN_SECRET,
+                Some(bondsymphonic_proto::McpSecretValue(token.to_string())),
+            )
+            .unwrap();
+    }
+
+    /// Without a login the broker plays the server: a valid handshake with
+    /// no tools, and "not connected" only for what needs the server.
+    async fn initialize_unconnected(c: &mut Client) {
+        let init = c.initialize().await;
+        assert_eq!(init["id"], 1);
+        assert_eq!(
+            init["result"]["capabilities"]["tools"]["listChanged"], true,
+            "{init}"
+        );
+        assert_eq!(init["result"]["serverInfo"]["name"], "Remote oauth");
+        assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+    }
+
+    #[tokio::test]
+    async fn unconnected_server_is_answered_locally() {
+        let (_d, _s, upstream, mut c) = connect(oauth());
+        initialize_unconnected(&mut c).await;
+        let list = c
+            .rpc(json!({"jsonrpc":"2.0","id":"two","method":"tools/list"}))
+            .await;
+        assert_eq!(
+            list,
+            json!({"jsonrpc":"2.0","id":"two","result":{"tools":[]}})
+        );
+        let call = c
+            .rpc(json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+                "params":{"name":"echo","arguments":{"text":"hi"}}}))
+            .await;
+        assert_eq!(call["id"], 3);
+        assert_eq!(
+            call["error"],
+            json!({"code": NOT_CONNECTED, "message": not_connected_message("Remote oauth")})
+        );
+        assert!(upstream.seen.lock().is_empty(), "no login, no HTTP");
+    }
+
+    #[tokio::test]
+    async fn a_login_brings_the_tools_to_a_running_client() {
+        let (_d, servers, upstream, mut c) = connect(oauth());
+        initialize_unconnected(&mut c).await;
+        log_in(&servers);
+        servers.status_changed();
+        // Unasked: the broker connects upstream and says the tools changed.
+        let changed = c.next().await;
+        assert_eq!(
+            changed,
+            json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"})
+        );
+        assert_eq!(
+            upstream.methods(),
+            ["initialize", "notifications/initialized"]
+        );
+        let list = c
+            .rpc(json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}))
+            .await;
+        assert_eq!(list["result"]["tools"][0]["name"], "echo", "{list}");
+        let call = c
+            .rpc(json!({"jsonrpc":"2.0","id":5,"method":"tools/call",
+                "params":{"name":"echo","arguments":{"text":"hi"}}}))
+            .await;
+        assert_eq!(call["result"]["content"][0]["text"], "hi", "{call}");
+        let seen = upstream.seen.lock();
+        assert_eq!(seen[0].2["params"]["clientInfo"]["name"], "cli");
+        assert!(seen
+            .iter()
+            .skip(1)
+            .all(|(_, s, _)| s.as_deref() == Some("s-1")));
+        assert_eq!(
+            servers.status(&"oauth".into()).state,
+            McpConnectionState::Connected
+        );
+    }
+
+    #[tokio::test]
+    async fn a_login_is_picked_up_by_the_next_request() {
+        let (_d, servers, upstream, mut c) = connect(oauth());
+        initialize_unconnected(&mut c).await;
+        // No tick: the next request finds the login itself.
+        log_in(&servers);
+        c.send(json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}))
+            .await;
+        let changed = c.next().await;
+        assert_eq!(changed["method"], "notifications/tools/list_changed");
+        let list = c.next().await;
+        assert_eq!(list["id"], 4);
+        assert_eq!(list["result"]["tools"][0]["name"], "echo", "{list}");
+        assert_eq!(
+            upstream.methods(),
+            ["initialize", "notifications/initialized", "tools/list"]
+        );
     }
 
     #[tokio::test]

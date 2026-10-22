@@ -32,8 +32,10 @@ struct Listener {
     cancel: CancellationToken,
     /// For a server listener: whether the server had an OAuth login when
     /// last looked at. A login that goes away stops the listener; one that
-    /// never existed does not (its tools answer "not connected" until the
-    /// user connects, and then just work).
+    /// never existed does not: the broker answers the client's handshake
+    /// itself with no tools, and once the user connects it initializes
+    /// upstream and sends `tools/list_changed`. A CLI that refreshes its tool
+    /// list then gets the tools; one that does not needs an agent restart.
     logged_in: bool,
 }
 

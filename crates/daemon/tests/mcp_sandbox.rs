@@ -324,24 +324,38 @@ async fn override_disabled_stops_only_that_workspace() {
 }
 
 #[tokio::test]
-async fn unconnected_server_answers_32001() {
+async fn unconnected_server_answers_locally() {
     let dir = tempfile::tempdir().unwrap();
     let (_, _, d, cancel) = start_daemon(&dir.path().join("data")).await;
     // The Jira preset is seeded on first start and has no login yet.
     let socket = listen(&d, dir.path(), "ws-a", "jira");
     let mut c = Conn::open(&socket).await;
-    let expected = json!({
-        "code": -32001,
-        "message": "Jira (Atlassian) is not connected — connect it in Settings › MCP servers",
-    });
+    // The broker answers the handshake itself, so the CLI keeps the server.
     let init = c.initialize().await;
     assert_eq!(init["id"], 1);
-    assert_eq!(init["error"], expected, "{init}");
+    assert_eq!(
+        init["result"]["capabilities"]["tools"]["listChanged"], true,
+        "{init}"
+    );
+    assert_eq!(init["result"]["serverInfo"]["name"], "Jira (Atlassian)");
     let list = c
         .rpc(json!({"jsonrpc":"2.0","id":"two","method":"tools/list"}))
         .await;
     assert_eq!(list["id"], "two");
-    assert_eq!(list["error"], expected, "{list}");
+    assert_eq!(list["result"], json!({"tools": []}), "{list}");
+    let call = c
+        .rpc(json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"getJiraIssue","arguments":{}}}))
+        .await;
+    assert_eq!(call["id"], 3);
+    assert_eq!(
+        call["error"],
+        json!({
+            "code": -32001,
+            "message": "Jira (Atlassian) is not connected — connect it in Settings › MCP servers",
+        }),
+        "{call}"
+    );
     // A missing login is a failed tool, not a closed socket.
     assert!(socket.exists());
     cancel.cancel();
@@ -469,7 +483,7 @@ fn bwrap_available() -> bool {
 /// An agent starts under the real sandbox with the default registry, whose
 /// Jira preset has never been connected: the start succeeds, the agent's MCP
 /// config names `jira` beside the git tools, and the socket it names is there
-/// and answers "not connected" rather than being left out.
+/// and completes the handshake with no tools rather than being left out.
 #[tokio::test]
 async fn unauthenticated_preset_does_not_block_start() {
     use bondsymphonic_daemon::sandbox::backend_for;
@@ -578,7 +592,15 @@ async fn unauthenticated_preset_does_not_block_start() {
 
     let socket = d.dirs.run(&ws.id).join("mcp-jira.sock");
     let mut c = Conn::open(&socket).await;
-    assert_eq!(c.initialize().await["error"]["code"], -32001);
+    let init = c.initialize().await;
+    assert_eq!(
+        init["result"]["capabilities"]["tools"]["listChanged"], true,
+        "{init}"
+    );
+    let list = c
+        .rpc(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+        .await;
+    assert_eq!(list["result"], json!({"tools": []}), "{list}");
 
     lifecycle::destroy(&d, &ws.id, true).await.unwrap();
     gone(&socket).await;

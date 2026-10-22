@@ -1010,7 +1010,10 @@ stays removed until you choose **Restore Jira preset**.
 Any other server that signs in with OAuth works the same way. Servers with no
 authentication, a bearer token or secret headers have no sign-in; use **Test**
 to check them. An agent starts even when a server's sign-in is missing or has
-expired: that server's tools just answer that it is not connected.
+expired. A server that was never connected shows up in the agent with no
+tools, and anything that needs it answers that it is not connected. When you
+then connect it, running agents pick it up if their CLI refreshes its tool
+list; otherwise restart the agent to get the server's tools.
 
 ### Workspace overrides
 

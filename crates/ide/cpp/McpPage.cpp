@@ -442,7 +442,8 @@ void McpPage::operationFinished(const QString& op, const QString& serverId, cons
                                                "stays open for 10 minutes.").arg(name)
                               : QStringLiteral("%1 is connected.").arg(name));
     } else if (op == QLatin1String("mcp.callback")) {
-        m_status->setText(QStringLiteral("Signed in to %1.").arg(name));
+        m_status->setText(QStringLiteral("Signed in to %1. Running agents pick it up if their CLI refreshes "
+                                         "its tool list; otherwise restart the agent.").arg(name));
     } else if (op == QLatin1String("mcp.disconnect")) {
         m_status->setText(QStringLiteral("Disconnected %1.").arg(name));
     } else if (op == QLatin1String("mcp.test")) {

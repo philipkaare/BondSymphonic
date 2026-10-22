@@ -28,7 +28,7 @@ pub const MAX_BODY: usize = 4 * 1024 * 1024;
 pub const MAX_HEADERS: usize = 32 * 1024;
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
 /// Streamable HTTP protocol revisions this client speaks.
-const SUPPORTED_VERSIONS: [&str; 3] = ["2025-03-26", "2025-06-18", PROTOCOL_VERSION];
+pub(crate) const SUPPORTED_VERSIONS: [&str; 3] = ["2025-03-26", "2025-06-18", PROTOCOL_VERSION];
 /// curl's `--max-time` for an ordinary request, and for a `POST` whose reply
 /// may be a long-running tool call streamed as events.
 const MAX_TIME: Duration = Duration::from_secs(60);
