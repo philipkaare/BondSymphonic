@@ -515,9 +515,7 @@ pub async fn block_host(d: &Daemon, id: &WorkspaceId, host: &str) -> Result<Empt
         })
         .await?;
     if !ws.blocklist.contains(&host) {
-        return Err(RpcError::invalid_params(
-            "the workspace block list is full",
-        ));
+        return Err(RpcError::invalid_params("the workspace block list is full"));
     }
     apply_network_rules(d, &ws).await;
     Ok(Empty {})

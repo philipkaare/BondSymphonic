@@ -351,3 +351,283 @@ async fn the_daemons_git_does_not_honour_a_planted_replacement() {
         "the daemon's git followed a planted refs/replace"
     );
 }
+
+#[tokio::test]
+async fn selected_commit_keeps_unrelated_staging_and_treats_paths_literally() {
+    use bondsymphonic_daemon::workspace::editing;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (d, id) = in_place_on(dir.path(), &repo, "main").await;
+    std::fs::write(repo.join("unrelated.txt"), "staged version\n").unwrap();
+    common::git_ok(&repo, &["add", "unrelated.txt"]);
+    std::fs::write(repo.join("unrelated.txt"), "working version\n").unwrap();
+    std::fs::write(repo.join("[chosen]*.txt"), "literal\n").unwrap();
+    std::fs::remove_file(repo.join("README.md")).unwrap();
+    let before = common::git_out(&repo, &["ls-files", "--stage", "unrelated.txt"]);
+    let prepared = editing::prepare_commit(&d, &id).await.unwrap();
+    assert_eq!(prepared.ahead, 0);
+    assert_eq!(prepared.files.len(), 3);
+    let committed = editing::commit(
+        &d,
+        &WorkspaceCommitParams {
+            workspace_id: id.clone(),
+            paths: vec!["[chosen]*.txt".into(), "README.md".into()],
+            message: "Selected change".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        committed.commit,
+        common::git_out(&repo, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        before,
+        common::git_out(&repo, &["ls-files", "--stage", "unrelated.txt"])
+    );
+    assert_eq!(
+        common::git_out(&repo, &["show", "HEAD:[chosen]*.txt"]),
+        "literal"
+    );
+    assert!(Git::new()
+        .run(&repo, &["cat-file", "-e", "HEAD:README.md"])
+        .await
+        .is_err());
+    assert!(Git::new()
+        .run(&repo, &["cat-file", "-e", "HEAD:unrelated.txt"])
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn ignore_preview_matches_append_and_keeps_tracked_files() {
+    use bondsymphonic_daemon::workspace::editing;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (d, id) = in_place_on(dir.path(), &repo, "main").await;
+    std::fs::create_dir(repo.join("a [x]")).unwrap();
+    std::fs::write(repo.join("a [x]/draft.tmp"), "draft").unwrap();
+    std::fs::write(repo.join(".gitignore"), b"# preserve\r\n").unwrap();
+    let options = editing::ignore_options(
+        &d,
+        &WorkspaceIgnoreOptionsParams {
+            workspace_id: id.clone(),
+            path: "a [x]/draft.tmp".into(),
+            directory: false,
+        },
+    )
+    .await
+    .unwrap()
+    .options;
+    assert_eq!(options.len(), 4);
+    assert!(options
+        .iter()
+        .any(|o| o.path == "." && o.pattern == "/*\n!/.gitignore"));
+    for option in [&options[0], &options[3]] {
+        let p = WorkspaceIgnoreParams {
+            workspace_id: id.clone(),
+            path: option.path.clone(),
+            target: option.target,
+        };
+        assert_eq!(
+            editing::ignore(&d, &p).await.unwrap().pattern,
+            option.pattern
+        );
+        let once = std::fs::read(repo.join(".gitignore")).unwrap();
+        editing::ignore(&d, &p).await.unwrap();
+        assert_eq!(std::fs::read(repo.join(".gitignore")).unwrap(), once);
+    }
+    assert!(common::git_out(&repo, &["check-ignore", "a [x]/draft.tmp"]).contains("draft.tmp"));
+    editing::ignore(
+        &d,
+        &WorkspaceIgnoreParams {
+            workspace_id: id.clone(),
+            path: ".".into(),
+            target: IgnoreTarget::Directory,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(Git::new()
+        .run(&repo, &["check-ignore", ".gitignore"])
+        .await
+        .is_err());
+    assert_eq!(
+        common::git_out(&repo, &["ls-files", "README.md"]),
+        "README.md"
+    );
+    assert!(std::fs::read(repo.join(".gitignore"))
+        .unwrap()
+        .starts_with(b"# preserve\r\n"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ignore_refuses_symlink_output_and_commit_runs_no_hooks() {
+    use bondsymphonic_daemon::workspace::editing;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (d, id) = in_place_on(dir.path(), &repo, "main").await;
+    let outside = dir.path().join("outside");
+    std::fs::write(&outside, "keep").unwrap();
+    symlink(&outside, repo.join(".gitignore")).unwrap();
+    assert!(editing::ignore(
+        &d,
+        &WorkspaceIgnoreParams {
+            workspace_id: id.clone(),
+            path: "README.md".into(),
+            target: IgnoreTarget::File
+        }
+    )
+    .await
+    .is_err());
+    assert_eq!(std::fs::read_to_string(outside).unwrap(), "keep");
+    let hook = repo.join(".git/hooks/pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\necho 'hook refused' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(repo.join("README.md"), "changed").unwrap();
+    let before = common::git_out(&repo, &["rev-parse", "HEAD"]);
+    // The hook would refuse; the commit succeeding proves it never ran. An
+    // agent can write whatever a hook executes, and the daemon is unsandboxed.
+    editing::commit(
+        &d,
+        &WorkspaceCommitParams {
+            workspace_id: id,
+            paths: vec!["README.md".into()],
+            message: "Attempt".into(),
+        },
+    )
+    .await
+    .expect("a pre-commit hook must not run for a daemon commit");
+    assert_ne!(common::git_out(&repo, &["rev-parse", "HEAD"]), before);
+}
+
+#[tokio::test]
+async fn selected_staged_rename_commits_both_paths_and_preserves_other_staging() {
+    use bondsymphonic_daemon::workspace::editing;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (d, id) = in_place_on(dir.path(), &repo, "main").await;
+    std::fs::create_dir(repo.join("destination")).unwrap();
+    common::git_ok(&repo, &["mv", "README.md", "destination/moved.md"]);
+    std::fs::write(repo.join("other.txt"), "other").unwrap();
+    common::git_ok(&repo, &["add", "other.txt"]);
+    let before = common::git_out(&repo, &["ls-files", "--stage", "other.txt"]);
+    editing::commit(
+        &d,
+        &WorkspaceCommitParams {
+            workspace_id: id,
+            paths: vec!["destination/moved.md".into()],
+            message: "Rename selected".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        common::git_out(&repo, &["ls-tree", "-r", "--name-only", "HEAD"]),
+        "destination/moved.md"
+    );
+    assert_eq!(
+        before,
+        common::git_out(&repo, &["ls-files", "--stage", "other.txt"])
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ignore_refuses_fifo_without_waiting_for_a_writer() {
+    use bondsymphonic_daemon::workspace::editing;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (d, id) = in_place_on(dir.path(), &repo, "main").await;
+    let path =
+        std::ffi::CString::new(repo.join(".gitignore").as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    assert!(editing::ignore(
+        &d,
+        &WorkspaceIgnoreParams {
+            workspace_id: id,
+            path: "README.md".into(),
+            target: IgnoreTarget::File
+        }
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn prepare_commit_reports_staged_gitlinks_without_entering_submodules() {
+    use bondsymphonic_daemon::workspace::editing;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (d, id) = in_place_on(dir.path(), &repo, "main").await;
+    let sha = common::git_out(&repo, &["rev-parse", "HEAD"]);
+    common::git_ok(
+        &repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{sha},embedded"),
+        ],
+    );
+    // No checkout or child repository exists: this is an index-only gitlink.
+    let prepared = editing::prepare_commit(&d, &id).await.unwrap();
+    assert!(prepared
+        .files
+        .iter()
+        .any(|f| f.path == "embedded" && f.staged && f.status == FileStatus::Added));
+}
+
+#[tokio::test]
+async fn partial_commit_refuses_in_progress_operations_without_changing_index_or_head() {
+    use bondsymphonic_daemon::workspace::editing;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let (d, id) = in_place_on(dir.path(), &repo, "main").await;
+    std::fs::write(repo.join("README.md"), "selected").unwrap();
+    std::fs::write(repo.join("resolved.txt"), "resolution").unwrap();
+    common::git_ok(&repo, &["add", "resolved.txt"]);
+    let before = common::git_out(&repo, &["rev-parse", "HEAD"]);
+    let index = std::fs::read(repo.join(".git/index")).unwrap();
+    for marker in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "REBASE_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+    ] {
+        let path = repo.join(".git").join(marker);
+        if marker.contains("rebase-") || marker == "sequencer" {
+            std::fs::create_dir(&path).unwrap();
+        } else {
+            std::fs::write(&path, format!("{before}\n")).unwrap();
+        }
+        let error = editing::commit(
+            &d,
+            &WorkspaceCommitParams {
+                workspace_id: id.clone(),
+                paths: vec!["README.md".into()],
+                message: "Must preserve operation".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.message.contains("in progress"),
+            "{marker}: {}",
+            error.message
+        );
+        assert_eq!(common::git_out(&repo, &["rev-parse", "HEAD"]), before);
+        assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), index);
+        assert!(path.exists());
+        if path.is_dir() {
+            std::fs::remove_dir(path).unwrap();
+        } else {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+}

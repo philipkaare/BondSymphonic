@@ -147,7 +147,6 @@ impl OpenCodeStream {
                 out
             }
             "tool_call" | "tool_call_update" => self.tool(update),
-            "available_commands_update" => vec![command_metadata(&update)],
             // Not a row: it is folded into the turn's usage when it ends.
             "usage_update" => {
                 self.usage = Some(update);
@@ -155,7 +154,10 @@ impl OpenCodeStream {
             }
             // Bookkeeping, replayed history and plans: none of it is the
             // conversation, and most of it arrives once per step.
-            "current_mode_update"
+            // The command catalogue is metadata the adapter forwards itself
+            // (`command_metadata`), before replay and idle filtering.
+            "available_commands_update"
+            | "current_mode_update"
             | "config_option_update"
             | "user_message_chunk"
             | "plan" => vec![],
@@ -579,11 +581,21 @@ mod command_tests {
 
     #[test]
     fn commands_are_normalized_into_replayable_metadata() {
-        let rows = OpenCodeStream::default().ingest(json!({
+        let row = command_metadata(&json!({
             "sessionUpdate":"available_commands_update",
-            "availableCommands":[{"name":"review","description":"Review changes","input":{"hint":"target"}}]
+            "availableCommands":[
+                {"name":"review","description":"Review changes","input":{"hint":"target"}},
+                {"name":"/two words","description":"refused"}
+            ]
         }));
-        assert!(matches!(&rows[..], [AgentMessageBody::System { subtype, data }]
-            if subtype == "agent_commands" && data["commands"][0] == json!({"name":"review","description":"Review changes","argument_hint":"target"})));
+        assert_eq!(
+            row,
+            AgentMessageBody::System {
+                subtype: "agent_commands".into(),
+                data: json!({"commands":[
+                    {"name":"review","description":"Review changes","argument_hint":"target"}
+                ]})
+            }
+        );
     }
 }

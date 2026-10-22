@@ -770,7 +770,8 @@ impl AgentAdapter for OpenCodeAdapter {
                     if text(&frame, "method") == "session/update"
                         && text(&p["update"], "sessionUpdate") == "available_commands_update"
                     {
-                        sink.message(super::opencode_stream::command_metadata(&p["update"])).await;
+                        sink.message(super::opencode_stream::command_metadata(&p["update"]))
+                            .await;
                         continue;
                     }
                     if replaying.load(Ordering::SeqCst)

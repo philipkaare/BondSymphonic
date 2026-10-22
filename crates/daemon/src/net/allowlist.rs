@@ -693,7 +693,9 @@ mod block_rule_tests {
     fn blocks_override_wildcards_and_backend_origins() {
         let rules = Allowlist::from_strings(&["*.example.com".into(), "127.0.0.1".into()])
             .with_blocks(&["API.EXAMPLE.COM.".into(), "127.0.0.1".into()])
-            .with_origins(vec![Origin::from_url("http://api.example.com:8080").unwrap()]);
+            .with_origins(vec![
+                Origin::from_url("http://api.example.com:8080").unwrap()
+            ]);
         assert!(!rules.allows("api.example.com"));
         assert!(!rules.allows_origin("api.example.com", 8080));
         assert!(!rules.allows_literal_addr(&"127.0.0.1".parse().unwrap()));

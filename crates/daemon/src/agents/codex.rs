@@ -36,7 +36,9 @@ fn local_command(input: &str) -> Result<Option<&str>, RpcError> {
         _ => return Ok(None),
     };
     if words.next().is_some() {
-        return Err(RpcError::invalid_params(format!("/{command} takes no arguments")));
+        return Err(RpcError::invalid_params(format!(
+            "/{command} takes no arguments"
+        )));
     }
     Ok(Some(command))
 }
@@ -147,7 +149,9 @@ impl CodexAdapter {
             Some(result) => result,
             None => rpc.call("thread/start", params).await?,
         };
-        self.model = result["model"].as_str().map(str::to_owned)
+        self.model = result["model"]
+            .as_str()
+            .map(str::to_owned)
             .or_else(|| self.prepared.options.model.clone());
         self.thread = text(&result["thread"], "id").into();
         if self.thread.is_empty() {
@@ -160,13 +164,15 @@ impl CodexAdapter {
         if resuming {
             self.sink.session_id(self.thread.clone()).await;
         }
-        self.sink.message(AgentMessageBody::System {
-            subtype: "agent_commands".into(),
-            data: json!({"commands":[
-                {"name":"compact","description":"Compact the current thread context"},
-                {"name":"status","description":"Show current thread and model"}
-            ]}),
-        }).await;
+        self.sink
+            .message(AgentMessageBody::System {
+                subtype: "agent_commands".into(),
+                data: json!({"commands":[
+                    {"name":"compact","description":"Compact the current thread context"},
+                    {"name":"status","description":"Show current thread and model"}
+                ]}),
+            })
+            .await;
         Ok(())
     }
 }
@@ -327,22 +333,32 @@ impl AgentAdapter for CodexAdapter {
             if command == "compact" {
                 let state = self.state.lock();
                 if state.active.is_some() || !state.approvals.is_empty() {
-                    return Err(error("Wait for the current Codex turn to finish before compacting"));
+                    return Err(error(
+                        "Wait for the current Codex turn to finish before compacting",
+                    ));
                 }
             }
-            self.sink.message(AgentMessageBody::UserText { text: text.clone() }).await;
+            self.sink
+                .message(AgentMessageBody::UserText { text: text.clone() })
+                .await;
             let message = match command {
                 "compact" => {
-                    rpc.call("thread/compact/start", json!({"threadId":self.thread})).await?;
+                    rpc.call("thread/compact/start", json!({"threadId":self.thread}))
+                        .await?;
                     "Context compaction started.".to_owned()
                 }
-                _ => format!("Thread: {}\nModel: {}", self.thread,
-                    self.model.as_deref().unwrap_or("server default")),
+                _ => format!(
+                    "Thread: {}\nModel: {}",
+                    self.thread,
+                    self.model.as_deref().unwrap_or("server default")
+                ),
             };
-            self.sink.message(AgentMessageBody::System {
-                subtype: "agent_command_result".into(),
-                data: json!({"command":command,"message":message}),
-            }).await;
+            self.sink
+                .message(AgentMessageBody::System {
+                    subtype: "agent_command_result".into(),
+                    data: json!({"command":command,"message":message}),
+                })
+                .await;
             return Ok(());
         }
         let active = {

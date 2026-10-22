@@ -500,9 +500,10 @@ impl AgentTab {
         // `agent_records` rather than `agents`: the bare ids beside it say
         // nothing about the adapter, and a daemon too old to send the records
         // leaves them empty, which is the terminal tab this built before.
-        let agent = info.agent_records.last().and_then(|latest| {
-            preferred_agent(info, latest.adapter)
-        });
+        let agent = info
+            .agent_records
+            .last()
+            .and_then(|latest| preferred_agent(info, latest.adapter));
         AgentTab {
             workspace_id: info.id.clone(),
             name: info.name.clone(),
@@ -531,10 +532,22 @@ impl AgentTab {
 /// Records are oldest first. Keep selection within the chosen harness so a
 /// saved conversation from another adapter cannot change a tab's backend.
 fn preferred_agent(info: &WorkspaceInfo, adapter: AgentAdapterKind) -> Option<&AgentSummary> {
-    let matching = || info.agent_records.iter().rev().filter(|a| a.adapter == adapter);
+    let matching = || {
+        info.agent_records
+            .iter()
+            .rev()
+            .filter(|a| a.adapter == adapter)
+    };
     matching()
-        .find(|a| matches!(a.state, AgentState::Idle | AgentState::Working | AgentState::WaitingPermission))
-        .or_else(|| matching().find(|a| a.session_id.as_ref().is_some_and(|s| !s.trim().is_empty())))
+        .find(|a| {
+            matches!(
+                a.state,
+                AgentState::Idle | AgentState::Working | AgentState::WaitingPermission
+            )
+        })
+        .or_else(|| {
+            matching().find(|a| a.session_id.as_ref().is_some_and(|s| !s.trim().is_empty()))
+        })
         .or_else(|| matching().next())
 }
 
@@ -669,7 +682,11 @@ impl Workspaces {
                 // exist only in `state.json`, so this is the one place they can
                 // come back from.
                 if let Some(saved) = persisted.tab(id) {
-                    if let Some(name) = saved.name_override.as_ref().filter(|n| !n.trim().is_empty()) {
+                    if let Some(name) = saved
+                        .name_override
+                        .as_ref()
+                        .filter(|n| !n.trim().is_empty())
+                    {
                         tab.name = name.clone();
                         tab.name_override = Some(name.clone());
                     }
@@ -1026,14 +1043,22 @@ impl Workspaces {
     pub fn apply_workspace_info(&mut self, info: &WorkspaceInfo) -> Option<(usize, usize)> {
         let (g, t) = self.find(&info.id)?;
         let tab = &mut self.groups[g].tabs[t];
-        let current = tab.agent_id.as_ref().and_then(|id| {
-            info.agent_records.iter().find(|a| &a.id == id)
-        });
+        let current = tab
+            .agent_id
+            .as_ref()
+            .and_then(|id| info.agent_records.iter().find(|a| &a.id == id));
         // A current live agent belongs to this tab even if another record is
         // newer. An id missing from the snapshot may have just been started;
         // wait for a snapshot that knows it before replacing it.
         let selected = match current {
-            Some(agent) if matches!(agent.state, AgentState::Idle | AgentState::Working | AgentState::WaitingPermission) => Some(agent),
+            Some(agent)
+                if matches!(
+                    agent.state,
+                    AgentState::Idle | AgentState::Working | AgentState::WaitingPermission
+                ) =>
+            {
+                Some(agent)
+            }
             _ if tab.agent_id.is_none() || current.is_some() => preferred_agent(info, tab.adapter),
             _ => None,
         };
@@ -1043,12 +1068,18 @@ impl Workspaces {
                 tab.agent_status = Some(TabStatus::from_agent_state(&agent.state));
                 tab.agent_detail.clear();
                 tab.options_json = restart_options_json(agent);
-            } else if agent.session_id.as_ref().is_some_and(|s| !s.trim().is_empty()) {
+            } else if agent
+                .session_id
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
                 // Seed resume while transcript replay is still catching up,
                 // preserving local model/permission choices and other options.
-                let mut options = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
-                    &tab.options_json,
-                ).unwrap_or_default();
+                let mut options =
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                        &tab.options_json,
+                    )
+                    .unwrap_or_default();
                 options.insert("resume_session".into(), serde_json::json!(agent.session_id));
                 tab.options_json = serde_json::Value::Object(options).to_string();
             }

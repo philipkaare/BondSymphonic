@@ -19,7 +19,36 @@ pub async fn create_pr(
     body: &str,
     draft: bool,
 ) -> Result<CreatePrResult, RpcError> {
+    let gate = crate::workspace::lifecycle::gate(id);
+    let _gate = gate.lock().await;
     let ws = d.workspace(id)?;
+    if ws.kind == bondsymphonic_proto::WorkspaceKind::InPlace {
+        return Err(crate::workspace::in_place::nothing_to_merge());
+    }
+    if ws.state != WorkspaceState::Ready {
+        return Err(RpcError::invalid_params(format!(
+            "workspace {} is not ready",
+            ws.id
+        )));
+    }
+    {
+        // Release before push_branch, which takes this same repository lock.
+        let lock = crate::git::repo_lock(&ws.repo_path);
+        let _guard = lock.lock().await;
+        let status = crate::workspace::editing::prepare_locked(d, &ws).await?;
+        if !status.files.is_empty() {
+            return Err(RpcError::invalid_params(
+                "Commit working changes before creating a pull request",
+            )
+            .with_data(serde_json::json!({"reason":"uncommitted_changes"})));
+        }
+        if status.ahead == 0 {
+            return Err(RpcError::invalid_params(
+                "There are no commits ahead of the base branch to publish",
+            )
+            .with_data(serde_json::json!({"reason":"no_commits"})));
+        }
+    }
     push_branch(d, &ws, false).await?;
 
     let mut args: Vec<String> = [

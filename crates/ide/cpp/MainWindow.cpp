@@ -2986,7 +2986,10 @@ void MainWindow::updateWindowTitle(const QJsonObject& active) {
             : adapter == QLatin1String("codex") ? QStringLiteral("Codex")
             : adapter == QLatin1String("opencode") ? QStringLiteral("OpenCode")
             : adapter == QLatin1String("terminal") ? QStringLiteral("Terminal") : adapter;
-        agentTitle += QStringLiteral(" — %1 · %2").arg(backend, active.value("name").toString());
+        // Code points, not literal characters: see the window title below.
+        agentTitle += QStringLiteral(" ") + QChar(0x2014) + QStringLiteral(" %1 ") +
+                      QChar(0x00B7) + QStringLiteral(" %2");
+        agentTitle = agentTitle.arg(backend, active.value("name").toString());
     }
     m_agentDock->setWindowTitle(agentTitle);
     const QString name = active.value("name").toString();
@@ -3671,14 +3674,18 @@ extern "C" std::int32_t bs_widget_test_agent_title_follows_selected_tab() {
     };
     if (!add(QStringLiteral("ws_alpha"), QStringLiteral("alpha"), QStringLiteral("claude")) ||
         !add(QStringLiteral("ws_beta"), QStringLiteral("beta"), QStringLiteral("codex"))) { return 2; }
+    const auto title = [](const QString& backend, const QString& name) {
+        return QStringLiteral("Agent ") + QChar(0x2014) + QLatin1Char(' ') + backend +
+               QLatin1Char(' ') + QChar(0x00B7) + QLatin1Char(' ') + name;
+    };
     fixture.groupModel.setActive(0, 0);
-    if (dock->windowTitle() != QLatin1String("Agent — Claude Code · alpha")) { return 3; }
+    if (dock->windowTitle() != title(QStringLiteral("Claude Code"), QStringLiteral("alpha"))) { return 3; }
     if (!fixture.groupModel.renameAgent(QStringLiteral("ws_beta"), QStringLiteral("Fix login"))) {
         return 6;
     }
-    if (dock->windowTitle() != QLatin1String("Agent — Claude Code · alpha")) { return 7; }
+    if (dock->windowTitle() != title(QStringLiteral("Claude Code"), QStringLiteral("alpha"))) { return 7; }
     fixture.groupModel.setActive(0, 1);
-    if (dock->windowTitle() != QLatin1String("Agent — Codex · Fix login")) { return 4; }
+    if (dock->windowTitle() != title(QStringLiteral("Codex"), QStringLiteral("Fix login"))) { return 4; }
     auto* tabs = fixture.window.findChild<QTabBar*>(QStringLiteral("GroupBarAgentTabs"));
     if (tabs == nullptr || !tabs->tabText(1).contains(QLatin1String("Fix login"))) { return 8; }
     fixture.groupModel.removeWorkspace(QStringLiteral("ws_alpha"));

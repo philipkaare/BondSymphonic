@@ -3,18 +3,22 @@
 #include "Theme.h"
 #include "WorkspaceLabel.h"
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
+#include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
+#include <QAction>
 #include <QChar>
 #include <QColor>
 #include <QEvent>
 #include <QFont>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QItemSelectionModel>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
 #include <QList>
+#include <QMenu>
 #include <QPalette>
 #include <QResizeEvent>
 #include <QSizePolicy>
@@ -97,6 +101,7 @@ ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, AppContr
     m_items = new QStandardItemModel(this);
     m_items->setColumnCount(1);
     m_files = new QTreeView(tabs);
+    m_files->setObjectName(QStringLiteral("ExplorerFilesView"));
     m_files->setModel(m_items);
     m_files->setHeaderHidden(true);
     m_files->setUniformRowHeights(true);
@@ -137,6 +142,29 @@ ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, AppContr
     changesLayout->addWidget(m_changesToolbar);
     changesLayout->addWidget(m_changesView, 1);
     tabs->addTab(changesTab, QStringLiteral("Changes"));
+    m_selectionView = m_files;
+    for (QTreeView* view : { m_files, m_changesView }) {
+        view->setSelectionMode(QAbstractItemView::ExtendedSelection);
+        view->setSelectionBehavior(QAbstractItemView::SelectRows);
+        view->setContextMenuPolicy(Qt::CustomContextMenu);
+        QObject::connect(view, &QWidget::customContextMenuRequested, this,
+                         [this, view](const QPoint& position) { showContextMenu(view, position); });
+        QObject::connect(view->selectionModel(), &QItemSelectionModel::selectionChanged, this,
+                         [this, view] { updateSelection(view); });
+        QObject::connect(view->selectionModel(), &QItemSelectionModel::currentChanged, this,
+                         [this, view] { updateSelection(view); });
+    }
+    QObject::connect(tabs, &QTabWidget::currentChanged, this, [this](int index) {
+        m_selectionView = index == 0 ? m_files : m_changesView;
+        updateSelection(m_selectionView);
+    });
+    if (controller != nullptr) {
+        const auto refreshIfCurrent = [this](const QString& id, const QString&) {
+            if (id == m_workspaceId) refresh();
+        };
+        QObject::connect(controller, &AppController::workspaceCommitted, this, refreshIfCurrent);
+        QObject::connect(controller, &AppController::workspaceIgnored, this, refreshIfCurrent);
+    }
     bodyLayout->addWidget(tabs, 1);
     setWidget(body);
 
@@ -157,6 +185,51 @@ ExplorerDock::ExplorerDock(FileTreeModel* model, ChangesModel* changes, AppContr
 
     // The empty state, so the strip is never blank before the first tab.
     setWorkspaceHeader(QString(), QString(), QString(), QString(), QString());
+}
+
+void ExplorerDock::updateSelection(QTreeView* view) {
+    if (view != m_selectionView) return;
+    QModelIndex current = view->currentIndex().siblingAtColumn(0);
+    QStringList paths;
+    for (const QModelIndex& index : view->selectionModel()->selectedRows(0)) {
+        const QString path = index.data(kPathRole).toString();
+        if (!path.isEmpty()) {
+            paths.append(path);
+            if (!current.isValid() || !view->selectionModel()->isSelected(current)) current = index;
+        }
+    }
+    const QString path = current.data(kPathRole).toString();
+    m_changesToolbar->setSelection(paths.contains(path) ? path : QString(),
+                                  current.data(kIsDirRole).toBool(), paths);
+}
+
+void ExplorerDock::showContextMenu(QTreeView* view, const QPoint& position) {
+    const QModelIndex index = view->indexAt(position).siblingAtColumn(0);
+    const QString path = index.data(kPathRole).toString();
+    if (path.isEmpty()) return;
+    if (!view->selectionModel()->isRowSelected(index.row(), index.parent())) {
+        view->selectionModel()->setCurrentIndex(index, QItemSelectionModel::ClearAndSelect |
+                                                       QItemSelectionModel::Rows);
+    }
+    QStringList paths;
+    for (const QModelIndex& selected : view->selectionModel()->selectedRows(0)) {
+        const QString selectedPath = selected.data(kPathRole).toString();
+        if (!selectedPath.isEmpty()) paths.append(selectedPath);
+    }
+    const bool directory = index.data(kIsDirRole).toBool();
+    const QString workspaceId = m_workspaceId;
+    QMenu menu(this);
+    const QString ellipsis(QChar(0x2026));
+    QAction* commit = menu.addAction(QStringLiteral("Commit") + ellipsis);
+    QAction* ignore = menu.addAction(QStringLiteral("Ignore") + ellipsis);
+    commit->setEnabled(m_changesToolbar->commitAction()->isEnabled());
+    ignore->setEnabled(commit->isEnabled());
+    const QAction* chosen = menu.exec(view->viewport()->mapToGlobal(position));
+    // The menu owns captured paths. Never spend its answer on a workspace
+    // that became active while the menu's nested event loop was running.
+    if (workspaceId != m_workspaceId) return;
+    if (chosen == commit) m_changesToolbar->commitSelected(paths);
+    if (chosen == ignore) m_changesToolbar->ignoreSelected(path, directory);
 }
 
 ChangesToolbar* ExplorerDock::changesToolbar() const {
@@ -704,6 +777,42 @@ extern "C" std::int32_t bs_widget_test_explorer_changes_say_they_are_loading() {
     if (rows->rowCount() != 0) {
         return 12;
     }
+    return 0;
+}
+
+/// File and Changes selections both drive Ignore, but a hidden tree's refresh
+/// must not erase the visible tree's selection.
+extern "C" std::int32_t bs_widget_test_explorer_editing_selection() {
+    AppController controller;
+    FileTreeModel files;
+    ChangesModel changes;
+    ExplorerDock dock(&files, &changes, &controller);
+    dock.setWorkspace(QStringLiteral("ws_1"));
+    dock.setWorkspaceHeader(QStringLiteral("alpha"), QStringLiteral("bs/alpha"),
+                            QStringLiteral("/r"), QStringLiteral("main"), QStringLiteral("/w"));
+    auto* fileView = dock.findChild<QTreeView*>(QStringLiteral("ExplorerFilesView"));
+    auto* changeView = dock.findChild<QTreeView*>(QStringLiteral("ExplorerChangesView"));
+    auto* tabs = dock.findChild<QTabWidget*>();
+    if (fileView == nullptr || changeView == nullptr || tabs == nullptr) return 1;
+    if (fileView->contextMenuPolicy() != Qt::CustomContextMenu ||
+        changeView->contextMenuPolicy() != Qt::CustomContextMenu) return 2;
+    auto* fileRows = qobject_cast<QStandardItemModel*>(fileView->model());
+    if (fileRows == nullptr) return 3;
+    fileRows->clear();
+    auto* directory = new QStandardItem(QStringLiteral("src"));
+    directory->setData(QStringLiteral("src"), ExplorerDock::kPathRole);
+    directory->setData(true, ExplorerDock::kIsDirRole);
+    fileRows->appendRow(directory);
+    fileView->setCurrentIndex(fileRows->index(0, 0));
+    if (!dock.changesToolbar()->ignoreAction()->isEnabled()) return 4;
+    changes.changesLoaded(QStringLiteral("[{\"path\":\"a.rs\",\"status\":\"modified\"}]"));
+    tabs->setCurrentIndex(1);
+    changeView->setCurrentIndex(changeView->model()->index(0, 0));
+    if (!dock.changesToolbar()->ignoreAction()->isEnabled()) return 5;
+    fileRows->clear();
+    if (!dock.changesToolbar()->ignoreAction()->isEnabled()) return 6;
+    changes.changesLoaded(QStringLiteral("[]"));
+    if (dock.changesToolbar()->ignoreAction()->isEnabled()) return 7;
     return 0;
 }
 

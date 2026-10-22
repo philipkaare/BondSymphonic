@@ -1592,15 +1592,22 @@ fn restore_prefers_live_agent_then_saved_conversation_for_latest_harness() {
     let mut live = agent("live", AgentAdapterKind::Claude);
     live.state = AgentState::Idle;
     w.agent_records = vec![saved, live, agent("empty", AgentAdapterKind::Claude)];
-    assert_eq!(AgentTab::from_workspace_info(&w).agent_id, Some("live".into()));
+    assert_eq!(
+        AgentTab::from_workspace_info(&w).agent_id,
+        Some("live".into())
+    );
     w.agent_records[1].state = AgentState::Exited;
     w.agent_records[2].session_id = Some("  ".into());
     let restored = AgentTab::from_workspace_info(&w);
     assert_eq!(restored.agent_id, Some("saved".into()));
     let options: serde_json::Value = serde_json::from_str(&restored.options_json).unwrap();
     assert_eq!(options["resume_session"], "conversation");
-    w.agent_records.push(agent("other", AgentAdapterKind::Terminal));
-    assert_eq!(AgentTab::from_workspace_info(&w).agent_id, Some("other".into()));
+    w.agent_records
+        .push(agent("other", AgentAdapterKind::Terminal));
+    assert_eq!(
+        AgentTab::from_workspace_info(&w).agent_id,
+        Some("other".into())
+    );
 }
 
 #[test]
@@ -1613,7 +1620,8 @@ fn refresh_adopts_latest_saved_same_harness_without_overriding_current_live_agen
     let mut latest = agent("latest", AgentAdapterKind::Claude);
     latest.session_id = Some("latest-conversation".into());
     w.agent_records.push(latest);
-    w.agent_records.push(agent("other", AgentAdapterKind::Terminal));
+    w.agent_records
+        .push(agent("other", AgentAdapterKind::Terminal));
     model.apply_workspace_info(&w);
     let tab = model.active().unwrap();
     assert_eq!(tab.agent_id, Some("latest".into()));
@@ -1627,7 +1635,10 @@ fn refresh_adopts_latest_saved_same_harness_without_overriding_current_live_agen
     assert_eq!(model.active().unwrap().agent_id, Some("latest".into()));
     model.set_agent(&w.id, "just-started".into());
     model.apply_workspace_info(&w);
-    assert_eq!(model.active().unwrap().agent_id, Some("just-started".into()));
+    assert_eq!(
+        model.active().unwrap().agent_id,
+        Some("just-started".into())
+    );
 }
 
 #[test]
@@ -1642,7 +1653,8 @@ fn refresh_seeds_current_session_without_losing_local_options_or_backend_choice(
     tab.options_json = r#"{"model":"local-model","permission_mode":"plan"}"#.into();
     model.add_tab(0, tab);
     model.apply_workspace_info(&w);
-    let options: serde_json::Value = serde_json::from_str(&model.active().unwrap().options_json).unwrap();
+    let options: serde_json::Value =
+        serde_json::from_str(&model.active().unwrap().options_json).unwrap();
     assert_eq!(options["resume_session"], "live-session");
     assert_eq!(options["model"], "local-model");
     assert_eq!(options["permission_mode"], "plan");
@@ -1653,7 +1665,10 @@ fn refresh_seeds_current_session_without_losing_local_options_or_backend_choice(
     let mut explicit = Workspaces::new_default();
     explicit.add_tab(0, terminal);
     explicit.apply_workspace_info(&w);
-    assert_eq!(explicit.active().unwrap().adapter, AgentAdapterKind::Terminal);
+    assert_eq!(
+        explicit.active().unwrap().adapter,
+        AgentAdapterKind::Terminal
+    );
     assert_eq!(explicit.active().unwrap().agent_id, None);
 }
 

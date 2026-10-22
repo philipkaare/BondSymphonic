@@ -328,7 +328,12 @@ async fn slash_commands_use_native_compaction_and_local_status() {
     assert!(rows.iter().any(|row| matches!(&row.body,
         AgentMessageBody::System { subtype, data }
         if subtype == "agent_commands" && data["commands"][0]["name"] == "compact")));
-    assert_eq!(rows.iter().filter(|row| matches!(&row.body,
-        AgentMessageBody::System { subtype, .. } if subtype == "agent_command_result")).count(), 2);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(&row.body,
+        AgentMessageBody::System { subtype, .. } if subtype == "agent_command_result"))
+            .count(),
+        2
+    );
     agent.stop().await.unwrap();
 }

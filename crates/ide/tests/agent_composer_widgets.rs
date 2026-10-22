@@ -16,7 +16,10 @@ fn agent_header_and_working_composer() {
     }
     unsafe { bs_widget_test_begin() };
     let completion = unsafe { bs_widget_test_prompt_command_completion() };
-    assert_eq!(completion, 0, "Command completion failed at step {completion}");
+    assert_eq!(
+        completion, 0,
+        "Command completion failed at step {completion}"
+    );
     let resume = unsafe { bs_widget_test_resume_command_selects_session() };
     assert_eq!(resume, 0, "Resume command failed at step {resume}");
     let composer = unsafe { bs_widget_test_working_agent_keeps_composer_editable() };

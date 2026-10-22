@@ -385,12 +385,22 @@ pub async fn add_host_to_allowlist(
         .map_err(|e| format!("workspace.set_allowlist failed: {e}"))
 }
 
-pub async fn block_network_host(shared: &Shared, workspace: &str, host: &str) -> Result<(), String> {
-    shared.client.request_raw(Request::WorkspaceBlockHost(
-        bondsymphonic_proto::WorkspaceBlockHostParams {
-            workspace_id: WorkspaceId(workspace.to_owned()), host: host.to_owned(),
-        }
-    )).await.map(|_| ()).map_err(|e| e.to_string())
+pub async fn block_network_host(
+    shared: &Shared,
+    workspace: &str,
+    host: &str,
+) -> Result<(), String> {
+    shared
+        .client
+        .request_raw(Request::WorkspaceBlockHost(
+            bondsymphonic_proto::WorkspaceBlockHostParams {
+                workspace_id: WorkspaceId(workspace.to_owned()),
+                host: host.to_owned(),
+            },
+        ))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Detects the configurations of `worktree` and lists `workspace`'s runs, then

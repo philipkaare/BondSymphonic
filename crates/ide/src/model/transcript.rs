@@ -524,11 +524,14 @@ impl Transcript {
             // turn, a silent model, messages an interrupt discarded. One with
             // nothing to offer -- all a daemon before the structure wrote --
             // is a plain line.
-            AgentMessageBody::System { subtype, data } if subtype == "agent_command_result" => {
-                self.push(TranscriptItem::System {
-                    text: data.get("message").and_then(Value::as_str).unwrap_or_default().to_owned(),
-                })
-            }
+            AgentMessageBody::System { subtype, data } if subtype == "agent_command_result" => self
+                .push(TranscriptItem::System {
+                    text: data
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                }),
             AgentMessageBody::System { subtype, data } if subtype == "opencode_notice" => {
                 match AgentNotice::from_message(&msg.body) {
                     Some(notice)
@@ -1107,7 +1110,9 @@ impl Transcript {
                 continue;
             }
             match &result {
-                Ok(()) if !matches!(*status, DenialStatus::Allowed | DenialStatus::AlwaysBlocked) => {
+                Ok(())
+                    if !matches!(*status, DenialStatus::Allowed | DenialStatus::AlwaysBlocked) =>
+                {
                     *status = DenialStatus::Allowed;
                     error.clear();
                     changed.push(i);

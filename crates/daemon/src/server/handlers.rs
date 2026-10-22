@@ -128,6 +128,14 @@ impl Handler for WorkspaceHandler {
             Request::WorkspaceBlockHost(p) => {
                 ok(lifecycle::block_host(d, &p.workspace_id, &p.host).await?)
             }
+            Request::WorkspacePrepareCommit(p) => {
+                ok(crate::workspace::editing::prepare_commit(d, &p.workspace_id).await?)
+            }
+            Request::WorkspaceCommit(p) => ok(crate::workspace::editing::commit(d, &p).await?),
+            Request::WorkspaceIgnoreOptions(p) => {
+                ok(crate::workspace::editing::ignore_options(d, &p).await?)
+            }
+            Request::WorkspaceIgnore(p) => ok(crate::workspace::editing::ignore(d, &p).await?),
             Request::WorkspaceChanges(p) => ok(changes::changes(d, &p.workspace_id).await?),
             Request::WorkspaceDiff(p) => ok(changes::diff(d, &p.workspace_id, &p.path).await?),
             // Merging runs as the daemon in the main repository, never in the

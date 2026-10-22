@@ -116,6 +116,8 @@ protected:
     void changeEvent(QEvent* event) override;
 
 private:
+    void updateSelection(QTreeView* view);
+    void showContextMenu(QTreeView* view, const QPoint& position);
     void onExpanded(const QModelIndex& index);
     void onDoubleClicked(const QModelIndex& index);
     void onEntriesLoaded(const QString& path, const QString& entriesJson);
@@ -164,6 +166,7 @@ private:
     /// Merge, Rebase, Squash, Create PR and Discard, above the changed files.
     ChangesToolbar* m_changesToolbar = nullptr;
     QTreeView* m_files = nullptr;
+    QTreeView* m_selectionView = nullptr;
     QStandardItemModel* m_items = nullptr;
     QTreeView* m_changesView = nullptr;
     QStandardItemModel* m_changeItems = nullptr;

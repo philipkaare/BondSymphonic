@@ -468,3 +468,109 @@ async fn push_branch_refuses_a_workspace_branch_turned_into_a_symref() {
     }
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn create_pr_preflight_refuses_dirty_or_empty_without_pushing() {
+    let _guard = ENV.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, origin) = init_repo_with_origin(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "preflight").await;
+    let error = bondsymphonic_daemon::git::pr::create_pr(&daemon, &ws.id, "T", "B", false)
+        .await
+        .unwrap_err();
+    assert_eq!(error.data.as_ref().unwrap()["reason"], "no_commits");
+    std::fs::write(
+        Path::new(&ws.worktree_path).join("loose.txt"),
+        "uncommitted",
+    )
+    .unwrap();
+    let error = bondsymphonic_daemon::git::pr::create_pr(&daemon, &ws.id, "T", "B", false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.data.as_ref().unwrap()["reason"],
+        "uncommitted_changes"
+    );
+    assert!(
+        !common::git_out(&origin, &["for-each-ref", "--format=%(refname)"])
+            .contains("bs/preflight")
+    );
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn prepare_commit_excludes_branch_commits_and_directory_commit_selects_only_that_directory() {
+    use bondsymphonic_daemon::workspace::editing;
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, _origin) = init_repo_with_origin(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "selected-dir").await;
+    commit_in_ws(&daemon, &ws, "already-committed.txt", "Branch work").await;
+    let root = Path::new(&ws.worktree_path);
+    std::fs::create_dir(root.join("folder [x]")).unwrap();
+    std::fs::write(root.join("folder [x]/new.txt"), "new").unwrap();
+    std::fs::write(root.join("outside.txt"), "outside").unwrap();
+    let prepared = editing::prepare_commit(&daemon, &ws.id).await.unwrap();
+    assert_eq!(prepared.ahead, 1);
+    assert_eq!(prepared.files.len(), 2);
+    assert!(!prepared
+        .files
+        .iter()
+        .any(|f| f.path == "already-committed.txt"));
+    editing::commit(
+        &daemon,
+        &WorkspaceCommitParams {
+            workspace_id: ws.id.clone(),
+            paths: vec!["folder [x]".into()],
+            message: "Directory work".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let prepared = editing::prepare_commit(&daemon, &ws.id).await.unwrap();
+    assert_eq!(prepared.ahead, 2);
+    assert_eq!(
+        prepared
+            .files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["outside.txt"]
+    );
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn commit_refuses_workspace_branch_redirected_to_the_users_branch() {
+    use bondsymphonic_daemon::workspace::editing;
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, _origin) = init_repo_with_origin(dir.path());
+    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "redirected").await;
+    let before = common::git_out(&repo, &["rev-parse", "main"]);
+    common::git_ok(
+        &repo,
+        &[
+            "symbolic-ref",
+            &format!("refs/heads/{}", ws.branch),
+            "refs/heads/main",
+        ],
+    );
+    std::fs::write(Path::new(&ws.worktree_path).join("new.txt"), "new").unwrap();
+    assert!(editing::commit(
+        &daemon,
+        &WorkspaceCommitParams {
+            workspace_id: ws.id,
+            paths: vec!["new.txt".into()],
+            message: "Must refuse".into()
+        }
+    )
+    .await
+    .is_err());
+    assert_eq!(before, common::git_out(&repo, &["rev-parse", "main"]));
+    cancel.cancel();
+}

@@ -203,7 +203,10 @@ fn always_block_settles_denials_and_a_failure_can_be_retried() {
     t.note_network_denied(&denied("blocked.example"));
     assert_eq!(t.begin_block(0), Some("blocked.example".into()));
     assert_eq!(t.begin_block(0), None);
-    assert_eq!(t.finish_block("blocked.example", Err("disk full".into())), vec![0]);
+    assert_eq!(
+        t.finish_block("blocked.example", Err("disk full".into())),
+        vec![0]
+    );
     assert_eq!(denial_at(&t, 0).2, DenialStatus::Failed);
     assert_eq!(denial_at(&t, 0).3, "disk full");
     assert_eq!(t.begin_block(0), Some("blocked.example".into()));

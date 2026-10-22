@@ -19,22 +19,41 @@ pub fn from_system(subtype: &str, data: &Value) -> Option<Vec<Command>> {
         _ => return None,
     };
     let mut seen = HashSet::new();
-    Some(entries.iter().take(512).filter_map(|entry| {
-        let name = entry.as_str().or_else(|| entry.get("name")?.as_str())?
-            .trim_start_matches('/');
-        if name.is_empty() || name.len() > 128
-            || name.chars().any(|c| c.is_whitespace() || c.is_control() || c == '/')
-            || !seen.insert(name.to_owned()) {
-            return None;
-        }
-        Some(Command {
-            name: name.to_owned(),
-            description: entry.get("description").and_then(Value::as_str)
-                .unwrap_or_default().chars().take(1024).collect(),
-            argument_hint: entry.get("argument_hint").and_then(Value::as_str)
-                .map(|s| s.chars().take(256).collect()),
-        })
-    }).collect())
+    Some(
+        entries
+            .iter()
+            .take(512)
+            .filter_map(|entry| {
+                let name = entry
+                    .as_str()
+                    .or_else(|| entry.get("name")?.as_str())?
+                    .trim_start_matches('/');
+                if name.is_empty()
+                    || name.len() > 128
+                    || name
+                        .chars()
+                        .any(|c| c.is_whitespace() || c.is_control() || c == '/')
+                    || !seen.insert(name.to_owned())
+                {
+                    return None;
+                }
+                Some(Command {
+                    name: name.to_owned(),
+                    description: entry
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .chars()
+                        .take(1024)
+                        .collect(),
+                    argument_hint: entry
+                        .get("argument_hint")
+                        .and_then(Value::as_str)
+                        .map(|s| s.chars().take(256).collect()),
+                })
+            })
+            .collect(),
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,19 +71,30 @@ pub fn resume_target(
 ) -> Result<ResumeTarget, String> {
     use bondsymphonic_proto::AgentState;
     let requested = requested.trim();
-    let matching = || records.iter().rev().filter(|record| record.adapter == adapter);
+    let matching = || {
+        records
+            .iter()
+            .rev()
+            .filter(|record| record.adapter == adapter)
+    };
     if let Some(live) = matching().find(|record| {
-        matches!(record.state, AgentState::Idle | AgentState::Working | AgentState::WaitingPermission)
-            && (requested.is_empty()
-            || record.session_id.as_deref() == Some(requested))
+        matches!(
+            record.state,
+            AgentState::Idle | AgentState::Working | AgentState::WaitingPermission
+        ) && (requested.is_empty() || record.session_id.as_deref() == Some(requested))
     }) {
         return Ok(ResumeTarget::Attach(live.id.clone()));
     }
     if !requested.is_empty() {
         return Ok(ResumeTarget::Session(requested.to_owned()));
     }
-    matching().find_map(|record| record.session_id.as_ref()
-        .filter(|id| !id.trim().is_empty())
-        .map(|id| ResumeTarget::Session(id.clone())))
+    matching()
+        .find_map(|record| {
+            record
+                .session_id
+                .as_ref()
+                .filter(|id| !id.trim().is_empty())
+                .map(|id| ResumeTarget::Session(id.clone()))
+        })
         .ok_or_else(|| "No saved session is available for this agent yet.".to_owned())
 }

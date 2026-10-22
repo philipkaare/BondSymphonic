@@ -1,5 +1,6 @@
 pub mod agent_sandboxes;
 pub mod changes;
+pub mod editing;
 pub mod in_place;
 pub mod lifecycle;
 pub mod registry;
