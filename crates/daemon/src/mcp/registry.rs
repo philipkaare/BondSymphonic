@@ -46,7 +46,8 @@ pub struct McpRegistry {
 
 impl McpRegistry {
     /// Serves `kind` for `id` on `socket`, replacing whatever listened there
-    /// before (a restarted sandbox reuses its run directory).
+    /// before (a restarted sandbox reuses its run directory) -- except a live
+    /// listener for the same server and workspace, which is kept.
     ///
     /// The socket is `0600`: the sandbox runs as the daemon's user, and nobody
     /// else on the host has any business driving the workspace's git or the
@@ -72,6 +73,21 @@ impl McpRegistry {
         // One lock across replace-and-bind, so two starts on the same path
         // cannot interleave and leave a listener nobody can stop.
         let mut listeners = self.listeners.lock();
+        // A server socket is started at every agent start, and every agent of
+        // the backend in that sandbox shares it: replacing a live one would
+        // close the sessions of the agents already running, and their bridge
+        // never reconnects. So a live one for the same workspace and server is
+        // kept as it is. (`reconcile` and the stops take care of a server
+        // that went away.) The tools socket is only started with its sandbox,
+        // and a restarted sandbox's replaces the old one, as before.
+        if matches!(kind, ListenerKind::Server(_))
+            && listeners.get(socket).is_some_and(|old| {
+                &old.workspace == id && old.kind == kind && !old.cancel.is_cancelled()
+            })
+            && socket.exists()
+        {
+            return Ok(());
+        }
         if let Some(old) = listeners.remove(socket) {
             old.cancel.cancel();
         }

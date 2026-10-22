@@ -583,3 +583,51 @@ async fn unauthenticated_preset_does_not_block_start() {
     lifecycle::destroy(&d, &ws.id, true).await.unwrap();
     gone(&socket).await;
 }
+
+/// A second agent start in the same sandbox prepares the same servers again,
+/// and must not cut off the agents already running: their connections to a
+/// server socket survive, because the live listener is kept, not rebound.
+#[tokio::test]
+async fn a_second_start_keeps_running_agents_sessions() {
+    use bondsymphonic_daemon::workspace::lifecycle;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (url, _) = upstream().await;
+    let (_, _, d, cancel) = start_daemon(&dir.path().join("data")).await;
+    upsert(&d.mcp_servers, remote("remote", &url), vec![]);
+    let repo = common::init_repo(dir.path());
+    let ws = lifecycle::create(
+        &d,
+        WorkspaceCreateParams {
+            repo_path: repo.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: "two".into(),
+            init_if_missing: false,
+            in_place: false,
+        },
+    )
+    .await
+    .unwrap();
+    let run = dir.path().join("agent-run");
+    let first =
+        bondsymphonic_daemon::mcp::prepare_servers(&d, &ws.id, AgentAdapterKind::Claude, &run);
+    assert!(first.iter().any(|s| s.id.as_str() == "remote"), "{first:?}");
+    let socket = run.join(server_socket_file(&"remote".into()));
+    let mut c = Conn::open(&socket).await;
+    assert_eq!(c.initialize().await["result"]["serverInfo"]["name"], "fake");
+
+    let second =
+        bondsymphonic_daemon::mcp::prepare_servers(&d, &ws.id, AgentAdapterKind::Claude, &run);
+    assert_eq!(first, second);
+    let list = c
+        .rpc(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+        .await;
+    assert_eq!(list["result"]["tools"][0]["name"], "echo", "{list}");
+    // And the socket still takes new agents.
+    let mut new = Conn::open(&socket).await;
+    assert_eq!(
+        new.initialize().await["result"]["serverInfo"]["name"],
+        "fake"
+    );
+    cancel.cancel();
+}
