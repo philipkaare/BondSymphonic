@@ -325,6 +325,22 @@ long-lived token** (see [below](#a-long-lived-token-for-agents)). Pressing one
 runs that command in a terminal pane in the dialog, on the host rather than inside a sandbox, because a login has to
 write to your home directory. When the command exits the checks re-run.
 
+**Logging in to Claude Code is two steps, run one after the other.** Agents
+cannot start on the ordinary login alone, so **Log in to Claude Code** is step 1
+of 2: once the re-check sees the login worked, step 2, the long-lived token
+(`claude setup-token`), starts by itself in the same pane. You approve it in the
+browser the same way and paste the code again. The line above the terminal says
+which step is running, and ends with *Done: Claude Code is signed in, and agents
+use the long-lived token.* If the login did not work, step 2 does not start and
+the line says so. If the token was not saved, the line points at **Set up
+long-lived token** to try again.
+
+**GitHub opens its page in your desktop browser.** `gh auth login` prints a
+one-time code and the device page's URL. The IDE opens that URL on the desktop
+(see the sign-in link below). `gh`'s own *Press Enter to open … in your browser*
+does nothing visible, because there is no browser in the distro. It no longer
+reports *Failed opening a web browser*.
+
 **Log out again from the same place.** A check that is *passing* carries a
 button too — **Log out of Claude Code** or **Log out of GitHub** — which runs
 `claude auth logout` or `gh auth logout` in the same terminal pane. You want it
@@ -368,9 +384,9 @@ Use the row when the automatic open did not work, or when you want to finish the
 sign-in on another machine. The row goes away when the terminal exits, because
 the URL it carried is spent.
 
-**Paste the code with Ctrl+V.** The code the browser gives back is too long to
+**Paste the code with Ctrl+V (⌘V on a Mac).** The code the browser gives back is too long to
 read off a screen and type in again, so the terminal pane takes a paste:
-**Ctrl+V**, **Ctrl+Shift+V** or **Shift+Insert**, and right-clicking the pane
+**Ctrl+V**, **Ctrl+Shift+V** or **Shift+Insert** (on a Mac, **⌘V**), and right-clicking the pane
 offers **Paste** as well. Every terminal in the IDE takes one, not just this
 pane. AltGr characters are unaffected -- Windows reports AltGr as Ctrl+Alt, and
 a paste is Ctrl without Alt.
@@ -424,9 +440,12 @@ new agents start with.
 
 ### A long-lived token for agents
 
-The `claude_auth` row carries a second button, **Set up long-lived token**,
-beside whichever of **Log in to Claude Code** or **Log out of Claude Code**
-the row already offers. It disappears once the row's own detail says the
+**Log in to Claude Code** sets this up as its second step (see
+[above](#first-run-and-settings--setup)), so you normally never press this button
+yourself. The `claude_auth` row carries it anyway, as **Set up long-lived
+token**, beside whichever of **Log in to Claude Code** or **Log out of Claude
+Code** the row already offers, for renewing the token or retrying a step 2
+that did not finish. It disappears once the row's own detail says the
 token is already there, and comes back if you ever log out again.
 
 **What it is.** A token good for one year, which agents use instead of your
@@ -1103,6 +1122,14 @@ to take a word, and copy with **Ctrl+Shift+C**, **Ctrl+Insert** or right-click
 interrupt when nothing is -- so it still stops a runaway command, and pressing
 it twice always does. Typing clears the selection, because the text it was made
 on is about to move.
+
+**On a Mac, ⌘C and ⌘V.** **⌘C** always copies, even with nothing selected, and
+never interrupts. **⌘V** pastes. The Control key is the terminal's Control, so
+**⌃C** is the interrupt and **⌃D**, **⌃R** and the rest reach the program as
+they would in Terminal.app. Other ⌘ chords belong to the IDE and are not sent to the
+program. The **Edit** menu's Cut, Copy, Paste, Undo and Select All act on
+whatever has the focus (a terminal, the prompt box, a field in a dialog), not
+only on the editor.
 
 **Questions the terminal is asked are answered.** Programs ask a terminal where
 the cursor is, what it is and what colours it uses, and they stop reading input

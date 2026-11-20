@@ -569,11 +569,18 @@ private:
     /// `shortcut` is printed beside the item and deliberately not registered:
     /// `QPlainTextEdit` already implements all six itself while it has the
     /// focus, and a window-wide copy of Ctrl+C would be taken out of the
-    /// terminal pane's keyboard before it ever got there.
+    /// terminal pane's keyboard before it ever got there. (The macOS menu bar
+    /// registers it anyway, from the label; see `updateEditActions`.)
+    ///
+    /// `slot` is the name of the slot it runs, which every Qt text widget
+    /// spells the same way: `undo`, `redo`, `cut`, `copy`, `paste`, `selectAll`.
     void addEditAction(QMenu* menu, const QString& text, QKeySequence::StandardKey shortcut,
-                       void (QPlainTextEdit::*slot)());
-    void forwardToEditor(void (QPlainTextEdit::*slot)());
-    /// Greys the Edit items out when the current tab is not an editor.
+                       const char* slot);
+    /// Runs `slot` on the widget with the focus -- a terminal, the prompt, a
+    /// field in a dialog -- or, when nothing editable has it, on the editor in
+    /// front.
+    void forwardEdit(const char* slot);
+    /// Keeps the Edit items live: what they act on is decided when they run.
     void updateEditActions();
 
     AppController* m_controller;

@@ -15,6 +15,7 @@
 #include "RunPanel.h"
 #include "SettingsDialog.h"
 #include "SetupPage.h"
+#include "TerminalWidget.h"
 #include "Theme.h"
 #include "WorkspaceBanner.h"
 #include "WorkspaceLabel.h"
@@ -44,6 +45,7 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QMetaObject>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QTabBar>
@@ -339,14 +341,14 @@ void MainWindow::buildMenus() {
     file->addAction("E&xit", this, &QWidget::close);
 
     auto* edit = menuBar()->addMenu("&Edit");
-    addEditAction(edit, "&Undo", QKeySequence::Undo, &QPlainTextEdit::undo);
-    addEditAction(edit, "&Redo", QKeySequence::Redo, &QPlainTextEdit::redo);
+    addEditAction(edit, "&Undo", QKeySequence::Undo, "undo");
+    addEditAction(edit, "&Redo", QKeySequence::Redo, "redo");
     edit->addSeparator();
-    addEditAction(edit, "Cu&t", QKeySequence::Cut, &QPlainTextEdit::cut);
-    addEditAction(edit, "&Copy", QKeySequence::Copy, &QPlainTextEdit::copy);
-    addEditAction(edit, "&Paste", QKeySequence::Paste, &QPlainTextEdit::paste);
+    addEditAction(edit, "Cu&t", QKeySequence::Cut, "cut");
+    addEditAction(edit, "&Copy", QKeySequence::Copy, "copy");
+    addEditAction(edit, "&Paste", QKeySequence::Paste, "paste");
     edit->addSeparator();
-    addEditAction(edit, "Select &All", QKeySequence::SelectAll, &QPlainTextEdit::selectAll);
+    addEditAction(edit, "Select &All", QKeySequence::SelectAll, "selectAll");
 
     auto* view = menuBar()->addMenu("&View");
     view->addAction("&Swap editor and agent", this, [this] {
@@ -1524,28 +1526,51 @@ void MainWindow::connectController() {
 }
 
 void MainWindow::addEditAction(QMenu* menu, const QString& text,
-                               QKeySequence::StandardKey shortcut,
-                               void (QPlainTextEdit::*slot)()) {
+                               QKeySequence::StandardKey shortcut, const char* slot) {
     // The sequence goes in the label after a tab, which the menu draws
     // right-aligned exactly where a registered shortcut would appear. Setting
     // it as the action's shortcut instead would register it window-wide.
     QAction* action = menu->addAction(
         text + QLatin1Char('\t') + QKeySequence(shortcut).toString(QKeySequence::NativeText), this,
-        [this, slot] { forwardToEditor(slot); });
+        [this, slot] { forwardEdit(slot); });
     m_editActions.append(action);
 }
 
-void MainWindow::forwardToEditor(void (QPlainTextEdit::*slot)()) {
-    EditorWidget* editor = m_editorArea->currentEditor();
-    if (editor != nullptr) {
-        (editor->view()->*slot)();
+void MainWindow::forwardEdit(const char* slot) {
+    const QByteArray name(slot);
+    QWidget* focus = QApplication::focusWidget();
+    // A terminal has no text cursor to cut at or undo, and its copy and paste
+    // are its own: the paste is written to the program, not inserted.
+    if (auto* terminal = qobject_cast<TerminalWidget*>(focus)) {
+        if (name == "copy") {
+            terminal->copySelection();
+        } else if (name == "paste") {
+            terminal->pasteFromClipboard();
+        }
+        return;
+    }
+    // Any other text field -- the prompt, a line edit in a dialog, the editor
+    // itself -- has the same six slots under the same names.
+    if (focus != nullptr &&
+        focus->metaObject()->indexOfMethod(QByteArray(name + "()").constData()) >= 0) {
+        QMetaObject::invokeMethod(focus, slot);
+        return;
+    }
+    // Nothing editable has the focus -- the Explorer, a button: the menu is
+    // about the editor in front, as it always was.
+    if (EditorWidget* editor = m_editorArea->currentEditor()) {
+        QMetaObject::invokeMethod(editor->view(), slot);
     }
 }
 
 void MainWindow::updateEditActions() {
-    const bool live = m_editorArea->currentEditor() != nullptr;
+    // Always live. On macOS the native menu bar turns these labels' shortcuts
+    // into key equivalents and takes ⌘C and ⌘V before any widget sees them, so
+    // a disabled item -- or one that only knew about the editor -- was a copy
+    // and paste that did nothing in the prompt, the terminals and the
+    // sign-in terminal. `forwardEdit` sends each to whatever has the focus.
     for (QAction* action : m_editActions) {
-        action->setEnabled(live);
+        action->setEnabled(true);
     }
 }
 

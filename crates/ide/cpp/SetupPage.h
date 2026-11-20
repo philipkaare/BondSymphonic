@@ -221,6 +221,14 @@ private:
     /// The terminal's process ended, so whatever it was fixing is either fixed
     /// or not: ask the daemon rather than guessing.
     void onTerminalExited();
+    /// Moves the Claude sign-in on once the check after one of its steps has
+    /// answered: a login that worked goes straight on to the long-lived token,
+    /// and the token's own ending says whether agents can now sign in.
+    ///
+    /// Two steps because agents cannot start on the login alone, and offering
+    /// the token as a second button left users signed in, ticked, and with
+    /// every agent failing until they found it.
+    void advanceClaudeSignIn();
 
     /// The terminal's current grid, which the pane keeps on the session.
     int terminalCols() const;
@@ -297,6 +305,13 @@ private:
     /// back yet: the rows describe a machine that may since have changed.
     bool m_awaitingCheck = false;
     std::function<bool(const QString& action)> m_confirm;
+    /// Where the two-step Claude sign-in is: the login running, the token
+    /// running, or no flow at all.
+    enum class ClaudeStep { None, Login, Token };
+    ClaudeStep m_claudeStep = ClaudeStep::None;
+    /// The current step's terminal has exited, so the next answer is the one
+    /// that says how it went.
+    bool m_claudeStepExited = false;
     /// See [`ranAction`]. Set when an action's terminal is opened and never
     /// cleared: the page is destroyed with the dialog that asks.
     bool m_ranAction = false;

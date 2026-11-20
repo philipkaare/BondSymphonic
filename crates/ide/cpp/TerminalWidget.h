@@ -94,6 +94,9 @@ public:
     int rowsParseCount() const;
 
 protected:
+    /// Claims the copy and paste shortcuts as a `ShortcutOverride`, so they
+    /// reach `keyPressEvent` rather than a window or menu shortcut.
+    bool event(QEvent* event) override;
     void paintEvent(QPaintEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     /// Left button: starts a selection, and takes the focus. Anything else is

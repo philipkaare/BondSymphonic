@@ -90,6 +90,20 @@ const QString kTokenButtonTooltip = QStringLiteral(
     "Run `claude setup-token` in a terminal here; agents then use that token instead of your "
     "login");
 
+/// The daemon's `claude_auth` detail when the long-lived token is what the row
+/// stands on. The same sentence `tokenActionFor` reads.
+const QString kLongLivedTokenDetail = QStringLiteral("long-lived token");
+
+/// The keys the terminal note names, as this platform spells them: on a Mac
+/// the paste is ⌘V and the interrupt is the Control key, not ⌘.
+#if defined(Q_OS_MACOS)
+const QString kPasteKeys = QStringLiteral("⌘V");
+const QString kStopKeys = QStringLiteral("⌃C");
+#else
+const QString kPasteKeys = QStringLiteral("Ctrl+V");
+const QString kStopKeys = QStringLiteral("Ctrl+C");
+#endif
+
 } // namespace
 
 SetupPage::SetupPage(AppController* controller, QWidget* parent)
@@ -314,6 +328,57 @@ void SetupPage::applyPrereqs(const QString& json) {
     }
     m_rowsLayout->addStretch(1);
     refreshBackendActions();
+    advanceClaudeSignIn();
+}
+
+void SetupPage::advanceClaudeSignIn() {
+    // Only the answer to the check a sign-in step's exit asked for moves the
+    // flow on. Any other answer -- one that lands while the login is still
+    // waiting for its code -- says nothing about how that step ended.
+    if (m_claudeStep == ClaudeStep::None || !m_claudeStepExited) {
+        return;
+    }
+    const ClaudeStep step = m_claudeStep;
+    m_claudeStep = ClaudeStep::None;
+    m_claudeStepExited = false;
+    const auto auth = m_items.constFind(QStringLiteral("claude_auth"));
+    const bool ok = auth != m_items.constEnd() && auth->value("ok").toBool();
+    const QString detail = ok ? auth->value("detail").toString() : QString();
+    const QString done =
+        QStringLiteral("Done: Claude Code is signed in, and agents use the long-lived token.");
+    if (step == ClaudeStep::Login) {
+        if (!ok) {
+            setTerminalNote(QStringLiteral(
+                "The login did not finish, so step 2 -- the long-lived token -- did not start. "
+                "Press “%1” to try again.")
+                                .arg(buttonTextFor(QStringLiteral("claude_login"))));
+            return;
+        }
+        const QString token = tokenActionFor(QStringLiteral("claude_auth"), ok, detail);
+        if (token.isEmpty()) {
+            // Already standing on a token: there is no second step to take.
+            setTerminalNote(done);
+            return;
+        }
+        // Straight on to the token, which is what agents actually sign in
+        // with: the login on its own leaves the row ticked and every agent
+        // that starts failing, which is the half-finished state this flow is
+        // here to stop anybody stopping in.
+        m_claudeStep = ClaudeStep::Token;
+        runAction(token);
+        if (m_pendingAction != token) {
+            // Refused -- the CLI went missing, say. The button is on the row.
+            m_claudeStep = ClaudeStep::None;
+        }
+        return;
+    }
+    if (ok && detail == kLongLivedTokenDetail) {
+        setTerminalNote(done);
+    } else {
+        setTerminalNote(QStringLiteral("The long-lived token was not saved, and agents need it to "
+                                       "sign in. Press “%1” to try again.")
+                            .arg(buttonTextFor(QStringLiteral("claude_setup_token"))));
+    }
 }
 
 void SetupPage::setBackendSettings(const QJsonObject &settings) {
@@ -465,7 +530,7 @@ QString SetupPage::tokenActionFor(const QString& name, bool ok, const QString& d
     // one whenever the detail is not already the token's own sentence, which
     // is the daemon's way of saying `~/.bondsymphonic/claude-oauth-token` is
     // there and this row is standing on it already.
-    if (!ok || detail != QLatin1String("long-lived token")) {
+    if (!ok || detail != kLongLivedTokenDetail) {
         return QStringLiteral("claude_setup_token");
     }
     return QString();
@@ -827,6 +892,16 @@ void SetupPage::runAction(const QString& action) {
         return;
     }
     m_pendingAction = action;
+    // A Claude login is the first of two steps: the token comes next, started
+    // by `advanceClaudeSignIn` once the login is seen to have worked. Anything
+    // else started by hand ends a flow that was under way.
+    if (action == QLatin1String("claude_login")) {
+        m_claudeStep = ClaudeStep::Login;
+    } else if (!(action == QLatin1String("claude_setup_token") &&
+                 m_claudeStep == ClaudeStep::Token)) {
+        m_claudeStep = ClaudeStep::None;
+    }
+    m_claudeStepExited = false;
     // From here the machine may be a different one by the time the dialog is
     // closed, which is the whole of what `ranAction` answers.
     m_ranAction = true;
@@ -844,8 +919,20 @@ void SetupPage::runAction(const QString& action) {
     // The paste is named here because the one question this terminal asks
     // that cannot be typed is the sign-in code, and a shortcut nobody is
     // told about is a shortcut nobody finds.
-    setTerminalNote(QString("Running %1. Answer its questions here; Ctrl+V pastes, Ctrl+C stops it.")
-                        .arg(actionName(action)));
+    const QString keys =
+        QStringLiteral("Answer its questions here; %1 pastes, %2 stops it.").arg(kPasteKeys, kStopKeys);
+    if (m_claudeStep == ClaudeStep::Login) {
+        setTerminalNote(QStringLiteral("Running %1 -- step 1 of 2. %2 Step 2 then sets up the "
+                                       "long-lived token agents sign in with.")
+                            .arg(actionName(action), keys));
+    } else if (m_claudeStep == ClaudeStep::Token) {
+        setTerminalNote(QStringLiteral("Running %1 -- step 2 of 2: the token agents sign in with. "
+                                       "Approve it in the browser as you did the login and paste "
+                                       "the code here; the token is saved by itself. %2")
+                            .arg(actionName(action), keys));
+    } else {
+        setTerminalNote(QStringLiteral("Running %1. %2").arg(actionName(action), keys));
+    }
     m_terminal->setVisible(true);
     m_terminalHost->setVisible(true);
     // Deferred by one turn of the event loop: the pane has only just been
@@ -1001,7 +1088,10 @@ void SetupPage::onTerminalExited() {
     // worked or not that URL is spent, and offering it afterwards would send
     // the user to a page that answers with an expired code.
     clearLink();
-    m_terminalLabel->setText("Finished. Re-checking…");
+    m_claudeStepExited = m_claudeStep != ClaudeStep::None;
+    m_terminalLabel->setText(m_claudeStep == ClaudeStep::Login
+                                 ? QStringLiteral("Step 1 finished. Checking the login…")
+                                 : QStringLiteral("Finished. Re-checking…"));
     // Dead until the answer is back: the rows still describe the machine
     // from before the terminal ran.
     m_awaitingCheck = true;
@@ -1740,6 +1830,83 @@ extern "C" std::int32_t bs_widget_test_setup_page_holds_sign_out_without_its_cli
         R"([{"name":"codex","ok":true,"detail":"installed"},{"name":"codex_auth","ok":true,"detail":"signed in"}])"));
     if (!signOut->isEnabled()) {
         return 4;
+    }
+    return 0;
+}
+
+/// The Claude sign-in is one flow of two steps. A login on its own leaves the
+/// row ticked and every agent failing until the long-lived token exists, so a
+/// login that worked goes straight on to the token, and one that did not says
+/// so instead of starting it.
+extern "C" std::int32_t bs_widget_test_setup_page_runs_the_claude_sign_in_in_two_steps() {
+    AppController controller;
+    SetupPage page(&controller);
+    page.setPtyCloser([](const QString&) {});
+    auto anyLabelStartingWith = [&page](const char* prefix) {
+        for (QLabel* label : page.findChildren<QLabel*>()) {
+            if (label->text().startsWith(QLatin1String(prefix))) {
+                return true;
+            }
+        }
+        return false;
+    };
+    controller.prereqsChecked(QString::fromUtf8(kClaudeAuthMissing));
+    QPushButton* login = buttonSaying(page, "Log in to Claude Code");
+    if (login == nullptr) {
+        return 1;
+    }
+    login->click();
+    if (!terminalNote(page).contains(QLatin1String("step 1 of 2"))) {
+        return 2;
+    }
+    controller.setupPtyOpened(QStringLiteral("claude_login"), QStringLiteral("pty_1"));
+    // An answer while the login is still running moves nothing on.
+    controller.prereqsChecked(QString::fromUtf8(kClaudeAuthMissing));
+    if (!terminalNote(page).contains(QLatin1String("step 1 of 2"))) {
+        return 3;
+    }
+    TerminalSession* session = page.findChild<TerminalSession*>();
+    if (session == nullptr) {
+        return 4;
+    }
+    session->exitedSignal();
+    controller.prereqsChecked(QString::fromUtf8(kClaudeAuthLoggedIn));
+    // Step 2 started by itself: its note is up, and its reply is this page's.
+    if (!terminalNote(page).contains(QLatin1String("step 2 of 2"))) {
+        return 5;
+    }
+    controller.setupPtyOpened(QStringLiteral("claude_setup_token"), QStringLiteral("pty_2"));
+    session->exitedSignal();
+    controller.prereqsChecked(QString::fromUtf8(kClaudeAuthLongLivedToken));
+    if (!anyLabelStartingWith("Done:")) {
+        return 6;
+    }
+
+    // A login that did not work stops there, and says so.
+    SetupPage failed(&controller);
+    failed.setPtyCloser([](const QString&) {});
+    controller.prereqsChecked(QString::fromUtf8(kClaudeAuthMissing));
+    QPushButton* again = buttonSaying(failed, "Log in to Claude Code");
+    if (again == nullptr) {
+        return 7;
+    }
+    again->click();
+    controller.setupPtyOpened(QStringLiteral("claude_login"), QStringLiteral("pty_3"));
+    TerminalSession* failedSession = failed.findChild<TerminalSession*>();
+    if (failedSession == nullptr) {
+        return 8;
+    }
+    failedSession->exitedSignal();
+    controller.prereqsChecked(QString::fromUtf8(kClaudeAuthMissing));
+    if (terminalNote(failed).contains(QLatin1String("step 2 of 2"))) {
+        return 9;
+    }
+    bool said = false;
+    for (QLabel* label : failed.findChildren<QLabel*>()) {
+        said = said || label->text().startsWith(QLatin1String("The login did not finish"));
+    }
+    if (!said) {
+        return 10;
     }
     return 0;
 }
