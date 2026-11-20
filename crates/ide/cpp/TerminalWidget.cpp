@@ -71,6 +71,15 @@ QColor spanColour(const QString& hex, const QColor& fallback) {
     return parsed.isValid() ? parsed : fallback;
 }
 
+/// Qt on macOS reports ⌘ as `ControlModifier` and the Control key as
+/// `MetaModifier`. Every shortcut below reads "Control" the Qt way, which is ⌘
+/// there; what goes to the program is translated back in `keyPressEvent`.
+#if defined(Q_OS_MACOS)
+constexpr bool kMac = true;
+#else
+constexpr bool kMac = false;
+#endif
+
 /// Whether this key press is the user asking to paste rather than something
 /// to send to the program.
 ///
@@ -106,6 +115,13 @@ bool isCopyShortcut(const QKeyEvent* event) {
     if (modifiers.testFlag(Qt::AltModifier)) {
         return false;
     }
+    // ⌘C, which Qt reports as Control on a Mac. It is never the interrupt
+    // there -- that is the Control key, which Qt calls Meta -- so it copies
+    // whether or not anything is selected, and with nothing selected it is a
+    // copy of nothing rather than a ^C into a sign-in that is half done.
+    if (kMac && event->key() == Qt::Key_C && modifiers.testFlag(Qt::ControlModifier)) {
+        return true;
+    }
     if (event->key() == Qt::Key_C && modifiers.testFlag(Qt::ControlModifier) &&
         modifiers.testFlag(Qt::ShiftModifier)) {
         return true;
@@ -116,7 +132,8 @@ bool isCopyShortcut(const QKeyEvent* event) {
 /// Whether this is a plain Ctrl+C -- the interrupt, unless there is something
 /// selected to copy instead.
 bool isPlainCtrlC(const QKeyEvent* event) {
-    return event->key() == Qt::Key_C && event->modifiers() == Qt::ControlModifier;
+    // Not on a Mac, where Qt's Control+C is ⌘C and always a copy.
+    return !kMac && event->key() == Qt::Key_C && event->modifiers() == Qt::ControlModifier;
 }
 
 /// Whether this press is a modifier on its own.
@@ -616,11 +633,41 @@ void TerminalWidget::keyPressEvent(QKeyEvent* event) {
     // Typing is the end of a selection: the text it was made on is about to
     // move, and a highlight left behind would be over whatever scrolled into
     // its place. A modifier on its own is not typing -- see `isModifierKey`.
+    int modifiers = event->modifiers().toInt();
+    if (kMac) {
+        // A ⌘ chord is the application's, never the program's: sent on as
+        // Control it would reach the terminal as a control code -- ⌘W as ^W,
+        // deleting a word -- which no Mac terminal does.
+        if (event->modifiers().testFlag(Qt::ControlModifier)) {
+            QWidget::keyPressEvent(event);
+            return;
+        }
+        // The Control key, which Qt calls Meta here, is what the program
+        // means by Control: ^C, ^D, ^R.
+        if (event->modifiers().testFlag(Qt::MetaModifier)) {
+            modifiers = (modifiers & ~int(Qt::MetaModifier)) | int(Qt::ControlModifier);
+        }
+    }
     if (!isModifierKey(event)) {
         m_session->clearSelection();
     }
-    m_session->writeKey(event->key(), event->modifiers().toInt(), event->text());
+    m_session->writeKey(event->key(), modifiers, event->text());
     event->accept();
+}
+
+bool TerminalWidget::event(QEvent* event) {
+    // Claimed before any shortcut can have it. The window's own actions --
+    // and on a Mac the native menu's -- would otherwise take the copy and the
+    // paste first and act on some other widget, and a paste that never
+    // arrives is a sign-in code that never arrives.
+    if (event->type() == QEvent::ShortcutOverride) {
+        const auto* key = static_cast<QKeyEvent*>(event);
+        if (isPasteShortcut(key) || isCopyShortcut(key) || isPlainCtrlC(key)) {
+            event->accept();
+            return true;
+        }
+    }
+    return QWidget::event(event);
 }
 
 void TerminalWidget::contextMenuEvent(QContextMenuEvent* event) {
@@ -629,7 +676,8 @@ void TerminalWidget::contextMenuEvent(QContextMenuEvent* event) {
     // in the middle of a login.
     QMenu menu(this);
     QAction* copy = menu.addAction(QStringLiteral("Copy"));
-    copy->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_C));
+    copy->setShortcut(kMac ? QKeySequence(QKeySequence::Copy)
+                           : QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_C));
     copy->setEnabled(hasSelection());
     QObject::connect(copy, &QAction::triggered, this, [this] { copySelection(); });
     QAction* paste = menu.addAction(QStringLiteral("Paste"));
@@ -859,6 +907,15 @@ extern "C" std::int32_t bs_widget_test_terminal_pastes_the_clipboard() {
     QCoreApplication::sendEvent(&widget, &again);
     if (pasted.size() != 3) {
         return 6;
+    }
+
+    // The paste shortcut is claimed before any window shortcut can take it:
+    // the Edit menu's Paste would otherwise act on the editor instead.
+    QKeyEvent claim(QEvent::ShortcutOverride, Qt::Key_V, Qt::ControlModifier);
+    claim.ignore();
+    QCoreApplication::sendEvent(&widget, &claim);
+    if (!claim.isAccepted()) {
+        return 8;
     }
 
     // One announcement per paste, each carrying the length: three pastes of

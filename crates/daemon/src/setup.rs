@@ -176,6 +176,13 @@ pub fn setup_env(root: &Path, action: SetupAction) -> Vec<(String, String)> {
             }
             crate::agents::opencode_backend::host_env(root, None)
         }
+        // `gh auth login` offers to open the device page itself, and in the
+        // distro there is no browser for it to open: it said "Failed opening a
+        // web browser" over a login that was working, because the IDE had
+        // already opened the same link on the desktop the moment it was
+        // printed. `true` takes the URL and succeeds, so the page the IDE
+        // opened is the only one and the terminal says nothing about failing.
+        SetupAction::GhLogin => vec![("GH_BROWSER".into(), "true".into())],
         _ => vec![],
     }
 }
@@ -347,6 +354,20 @@ mod tests {
         assert!(env
             .iter()
             .any(|(k, v)| k == "OPENCODE_DISABLE_PROJECT_CONFIG" && v == "1"));
+    }
+
+    /// The GitHub sign-in never tries to open a browser in the distro: the
+    /// IDE opens the link it prints on the desktop, and gh's own attempt could
+    /// only fail there and say so over a login that is going fine.
+    #[test]
+    fn the_github_sign_in_leaves_the_browser_to_the_ide() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = setup_env(dir.path(), SetupAction::GhLogin);
+        assert!(
+            env.iter().any(|(k, v)| k == "GH_BROWSER" && v == "true"),
+            "{env:?}"
+        );
+        assert!(setup_env(dir.path(), SetupAction::GhLogout).is_empty());
     }
 
     #[test]
