@@ -1,0 +1,446 @@
+diff -ruN a/MaxQ-app/src/QcAI.Api/Controllers/ReviewLogController.cs b/MaxQ-app/src/QcAI.Api/Controllers/ReviewLogController.cs
+--- a/MaxQ-app/src/QcAI.Api/Controllers/ReviewLogController.cs	2026-11-20 16:11:38.636283800 +0100
++++ b/MaxQ-app/src/QcAI.Api/Controllers/ReviewLogController.cs	2026-11-20 17:31:56.088018209 +0100
+@@ -1,3 +1,4 @@
++using System.Text.Json;
+ using Microsoft.AspNetCore.Authorization;
+ using Microsoft.AspNetCore.Mvc;
+ using Microsoft.EntityFrameworkCore;
+@@ -386,15 +387,15 @@
+             .Select(d => d.Run.Id)
+             .ToList();
+ 
+-        var analysisFreshness = new Dictionary<Guid, bool>();
+         var snapshots = new RequirementAnalysisSnapshotService(Db);
+         var drawnAnalysisRunIds = latestCrossCheck
+             .Where(pair => currentVersion.ContainsKey(pair.Key.Source) && currentVersion.ContainsKey(pair.Key.Target))
+             .Select(pair => pair.Value.Run.Id)
+             .Concat(latestReverse.Where(pair => currentVersion.ContainsKey(pair.Key)).Select(pair => pair.Value.Run.Id))
+-            .Distinct();
+-        foreach (var runId in drawnAnalysisRunIds)
+-            analysisFreshness[runId] = await snapshots.IsRunFreshAsync(runId, ct);
++            .Distinct()
++            .ToList();
++        // One batched check, not one per run: see AreRunsFreshAsync for what the difference costs.
++        var analysisFreshness = await snapshots.AreRunsFreshAsync(drawnAnalysisRunIds, ct);
+ 
+         // --- what those runs produced ---
+         var outcomeRows = await RunMapOutcomeQuery.For(Db, drawnRunIds).ToListAsync(ct);
+@@ -429,12 +430,20 @@
+         var scopeRows = await (from observation in Db.RequirementReviewObservations.AsNoTracking()
+             join item in Db.RequirementReviewItems.AsNoTracking() on observation.ItemId equals item.Id
+             where item.ProjectId == projectId && drawnRunIds.Contains(observation.RunId)
+-            select observation).ToListAsync(ct);
++            // The columns the stat boxes read and no others. InputSnapshotJson in particular holds
++            // every requirement in the project, once per observation: selecting the entity pulled
++            // all of that back, and parsing it was the price of reading each row's findings.
++            select new
++            {
++                observation.RunId, observation.ItemId, observation.Succeeded, observation.IsComplete,
++                observation.IsFresh, observation.Applied, observation.FindingsJson,
++            }).ToListAsync(ct);
+         var scopeOutcomes = scopeRows.GroupBy(o => o.RunId).ToDictionary(g => g.Key, g =>
+             g.GroupBy(o => o.ItemId).Select(subject =>
+             {
+                 var complete = subject.All(o => o.Succeeded && o.IsComplete && o.IsFresh && o.Applied);
+-                var findings = subject.SelectMany(o => RequirementReviewReadProjection.Observation(o).Findings).ToList();
++                var findings = subject.SelectMany(o =>
++                    JsonSerializer.Deserialize<List<RequirementReviewFindingEvidence>>(o.FindingsJson) ?? []).ToList();
+                 var verdict = !complete ? AiVerdict.Unreviewed : findings.Count == 0 ? AiVerdict.Correct
+                     : findings.Any(f => f.Category == RequirementReviewFindingCategory.IncorrectMapping) ? AiVerdict.Incorrect : AiVerdict.Partial;
+                 return verdict;
+diff -ruN a/MaxQ-app/src/QcAI.Api/Services/Review/RequirementAnalysisSnapshotService.cs b/MaxQ-app/src/QcAI.Api/Services/Review/RequirementAnalysisSnapshotService.cs
+--- a/MaxQ-app/src/QcAI.Api/Services/Review/RequirementAnalysisSnapshotService.cs	2026-11-20 16:11:38.633283396 +0100
++++ b/MaxQ-app/src/QcAI.Api/Services/Review/RequirementAnalysisSnapshotService.cs	2026-11-20 17:31:56.088018209 +0100
+@@ -136,13 +136,71 @@
+         }
+         catch (InvalidOperationException) { return false; } // Deleted subject/project.
+     }
+-    public async Task<bool> IsRunFreshAsync(Guid runId, CancellationToken ct = default)
++    public async Task<bool> IsRunFreshAsync(Guid runId, CancellationToken ct = default) =>
++        (await AreRunsFreshAsync([runId], ct))[runId];
++
++    /// <summary>Whether each run's captured inputs still match the project, for many runs at once.
++    /// Every requested id is in the answer.
++    ///
++    /// Same verdict as asking <see cref="IsFreshAsync(RequirementAnalysisSnapshot, CancellationToken)"/>
++    /// of every input, at a different price. A run has one input per requirement it judged, and each
++    /// input's snapshot holds every requirement in the project; answering them one by one re-read
++    /// the whole project from the database once per input, after first pulling every stored
++    /// snapshot back just to learn which requirement it was about. On a project with a few
++    /// thousand requirements and a handful of runs that is tens of thousands of queries and
++    /// gigabytes of JSON behind one dashboard figure. Here the stored snapshots stay in the
++    /// database (only their fingerprints come back), the project is read once, and a requirement
++    /// that several runs judged is fingerprinted once.</summary>
++    public async Task<Dictionary<Guid, bool>> AreRunsFreshAsync(IReadOnlyCollection<Guid> runIds, CancellationToken ct = default)
+     {
+-        var inputs = await db.RequirementAnalysisInputs.AsNoTracking().Where(x => x.RunId == runId).ToListAsync(ct);
+-        if (inputs.Count == 0 || inputs.Any(x => !IsRestorable(x))) return false; // A capture still in flight is not a fresh run.
+-        foreach (var input in inputs)
+-            if (!await IsFreshAsync(Restore(input), ct)) return false;
+-        return true;
++        var result = runIds.Distinct().ToDictionary(id => id, _ => false);
++        if (result.Count == 0) return result;
++        var ids = result.Keys.ToList();
++        var inputs = await db.RequirementAnalysisInputs.AsNoTracking().Where(x => ids.Contains(x.RunId))
++            .Select(x => new { x.RunId, x.ProjectId, x.RequirementId, x.Fingerprint, Restorable = x.SnapshotJson != "" })
++            .ToListAsync(ct);
++
++        foreach (var project in inputs.GroupBy(x => x.ProjectId))
++        {
++            ProjectState? state = null;
++            ILookup<Guid, AnalysisMapping>? mappingsByRequirement = null;
++            var current = new Dictionary<Guid, string?>(); // requirement -> its fingerprint now; null once it is gone
++            foreach (var run in project.GroupBy(x => x.RunId))
++            {
++                // A capture still in flight is not a fresh run.
++                if (run.Any(x => !x.Restorable)) continue;
++                var fresh = true;
++                foreach (var input in run)
++                {
++                    if (!current.TryGetValue(input.RequirementId, out var fingerprint))
++                    {
++                        if (state == null)
++                        {
++                            try { state = await ReadProjectAsync(project.Key, ct); }
++                            catch (InvalidOperationException) { break; } // Deleted project: nothing here is fresh.
++                            var requirementIds = state.RequirementIds.ToArray();
++                            var mappings = await db.RequirementMappings.AsNoTracking()
++                                .Where(m => requirementIds.Contains(m.SourceRequirementId) && requirementIds.Contains(m.TargetRequirementId))
++                                .Select(m => new AnalysisMapping(m.Id, m.SourceRequirementId, m.TargetRequirementId, m.InternalVersion)).ToListAsync(ct);
++                            // A mapping belongs to both of its ends — once, when they are the same requirement.
++                            mappingsByRequirement = mappings
++                                .SelectMany(m => m.SourceRequirementId == m.TargetRequirementId
++                                    ? new[] { (Key: m.SourceRequirementId, Mapping: m) }
++                                    : new[] { (Key: m.SourceRequirementId, Mapping: m), (Key: m.TargetRequirementId, Mapping: m) })
++                                .ToLookup(x => x.Key, x => x.Mapping);
++                        }
++                        fingerprint = state.RequirementIds.Contains(input.RequirementId)
++                            ? Hash(JsonSerializer.Serialize(Build(state, input.RequirementId, mappingsByRequirement![input.RequirementId])))
++                            : null; // Deleted subject.
++                        current[input.RequirementId] = fingerprint;
++                    }
++                    if (fingerprint != input.Fingerprint) { fresh = false; break; }
++                }
++                if (state == null) break;
++                result[run.Key] = fresh;
++            }
++        }
++        return result;
+     }
+     public Task<bool> IsFreshAsync(string snapshotJson, string fingerprint, CancellationToken ct = default)
+     {
+@@ -155,35 +213,55 @@
+     }
+     private async Task<RequirementAnalysisSnapshot> ReadAsync(AiReviewRun run, Guid requirementId, int topK, CancellationToken ct)
+     {
+-        var companyId = await db.Projects.AsNoTracking().Where(p => p.Id == run.ProjectId).Select(p => p.CompanyId).SingleAsync(ct);
+-        var sets = await db.RequirementSets.AsNoTracking().Where(s => s.ProjectId == run.ProjectId)
+-            .Select(s => new AnalysisSet(s.Id, s.Name, s.IsActive, s.InternalVersion)).ToListAsync(ct);
+-        var setIds = sets.Select(s => s.Id).ToArray();
+-        var reqs = await db.Requirements.AsNoTracking().Where(r => setIds.Contains(r.RequirementSetId)).ToListAsync(ct);
+-        if (!reqs.Any(r => r.Id == requirementId)) throw new InvalidOperationException("Subject unavailable");
+-        var ids = reqs.Select(r => r.Id).ToArray();
++        var state = await ReadProjectAsync(run.ProjectId, ct);
++        if (!state.RequirementIds.Contains(requirementId)) throw new InvalidOperationException("Subject unavailable");
++        var ids = state.Requirements.Select(r => r.Id).ToArray();
+         var mappings = await db.RequirementMappings.AsNoTracking()
+             .Where(m => (m.SourceRequirementId == requirementId || m.TargetRequirementId == requirementId)
+                 && ids.Contains(m.SourceRequirementId) && ids.Contains(m.TargetRequirementId))
+             .Select(m => new AnalysisMapping(m.Id, m.SourceRequirementId, m.TargetRequirementId, m.InternalVersion)).ToListAsync(ct);
++        return Build(state, requirementId, mappings);
++    }
++
++    /// <summary>Everything a snapshot holds that does not depend on which requirement it is for.
++    /// Read once and shared by every snapshot built from it — see <see cref="AreRunsFreshAsync"/>.</summary>
++    private sealed record ProjectState(Guid ProjectId, Guid CompanyId, AnalysisSet[] Sets,
++        AnalysisRequirement[] Requirements, HashSet<Guid> RequirementIds, AnalysisConfiguration Configuration);
++
++    private async Task<ProjectState> ReadProjectAsync(Guid projectId, CancellationToken ct)
++    {
++        var companyId = await db.Projects.AsNoTracking().Where(p => p.Id == projectId).Select(p => p.CompanyId).SingleAsync(ct);
++        var sets = await db.RequirementSets.AsNoTracking().Where(s => s.ProjectId == projectId)
++            .Select(s => new AnalysisSet(s.Id, s.Name, s.IsActive, s.InternalVersion)).ToListAsync(ct);
++        var setIds = sets.Select(s => s.Id).ToArray();
++        // Only the columns a snapshot records: the rest of the row is not evidence and need not travel.
++        var reqs = await db.Requirements.AsNoTracking().Where(r => setIds.Contains(r.RequirementSetId))
++            .Select(r => new { r.Id, r.RequirementSetId, r.ExternalId, r.Title, r.Description, r.InternalVersion }).ToListAsync(ct);
+         // All eligible provider identities (including embedding defaults) are material; credentials never enter evidence.
+         var providers = await db.AiProviderConfigs.AsNoTracking().Where(c => c.CompanyId == null || c.CompanyId == companyId)
+             .Select(c => new { c.Id, c.ProviderType, c.ModelId, c.BaseUrl, c.IsDefault, c.DefaultForEmbedding, c.DefaultForValidation }).ToListAsync(ct);
+-        var defaults = await db.ProjectReviewDefaults.AsNoTracking().SingleOrDefaultAsync(d => d.ProjectId == run.ProjectId, ct);
++        var defaults = await db.ProjectReviewDefaults.AsNoTracking().SingleOrDefaultAsync(d => d.ProjectId == projectId, ct);
+         var companyTopK = await AiReviewJobs.ResolveCandidateTopKAsync(db, companyId, null);
+         var overrides = await db.PromptTemplateOverrides.AsNoTracking().Where(p => p.CompanyId == companyId
+             && (p.Key.StartsWith("crosscheck.") || p.Key.StartsWith("reversecoverage.")))
+             .Select(p => new { p.Key, p.Template }).ToListAsync(ct);
+-        return new RequirementAnalysisSnapshot
+-        {
+-            ProjectId = run.ProjectId, CompanyId = companyId, RequirementId = requirementId,
+-            Sets = sets.OrderBy(s => s.Id).ToArray(),
+-            Requirements = reqs.OrderBy(r => r.Id).Select(r => new AnalysisRequirement(r.Id, r.RequirementSetId,
++        return new ProjectState(projectId, companyId, sets.OrderBy(s => s.Id).ToArray(),
++            reqs.OrderBy(r => r.Id).Select(r => new AnalysisRequirement(r.Id, r.RequirementSetId,
+                 r.ExternalId, r.Title, r.Description, r.InternalVersion, FindingFingerprint.TextHash(r.Title, r.Description))).ToArray(),
+-            Mappings = mappings.OrderBy(m => m.Id).ToArray(),
+-            Configuration = new(1, defaults?.CandidateTopK ?? companyTopK, defaults?.AiProviderConfigId, defaults?.Sensitivity ?? 50, defaults?.CustomGuidance,
+-                JsonSerializer.Serialize(new { Providers = providers.OrderBy(p => p.Id), Prompts = overrides.OrderBy(p => p.Key, StringComparer.Ordinal) }))
+-        };
++            reqs.Select(r => r.Id).ToHashSet(),
++            new(1, defaults?.CandidateTopK ?? companyTopK, defaults?.AiProviderConfigId, defaults?.Sensitivity ?? 50, defaults?.CustomGuidance,
++                JsonSerializer.Serialize(new { Providers = providers.OrderBy(p => p.Id), Prompts = overrides.OrderBy(p => p.Key, StringComparer.Ordinal) })));
+     }
++
++    /// <summary>The one place a snapshot is put together, so the capture, the single freshness check
++    /// and the batched one cannot come to serialize — and therefore fingerprint — differently.</summary>
++    private static RequirementAnalysisSnapshot Build(ProjectState state, Guid requirementId, IEnumerable<AnalysisMapping> mappings) => new()
++    {
++        ProjectId = state.ProjectId, CompanyId = state.CompanyId, RequirementId = requirementId,
++        Sets = state.Sets,
++        Requirements = state.Requirements,
++        Mappings = mappings.OrderBy(m => m.Id).ToArray(),
++        Configuration = state.Configuration
++    };
+     public static string Hash(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
+ }
+diff -ruN a/MaxQ-app/src/QcAI.Client/Shared/RunMap.razor b/MaxQ-app/src/QcAI.Client/Shared/RunMap.razor
+--- a/MaxQ-app/src/QcAI.Client/Shared/RunMap.razor	2026-11-20 16:11:38.630282992 +0100
++++ b/MaxQ-app/src/QcAI.Client/Shared/RunMap.razor	2026-11-20 17:31:56.087018137 +0100
+@@ -140,19 +140,35 @@
+     [Parameter] public Guid ProjectId { get; set; }
+     private RunMapLayout? _layout;
+     private RunMapDto? _lastMap;
++    private Guid _lastProjectId;
++    private Dictionary<Guid, string> _setNames = new();
+     private ElementReference _scroll;
+     private bool _initialScrollPending;
++    private bool _changed = true;
+ 
++    // The figure is a function of (Map, ProjectId) and nothing else, and a map DTO is replaced,
++    // never edited in place. Map is a reference-typed parameter, so Blazor hands it back on EVERY
++    // render of the page around it — a click, a modal opening, a keystroke in the edit dialog —
++    // and laying the figure out again each time, then diffing a few thousand elements that cannot
++    // have changed, is what made the whole page answer late. Same instance in, same figure out:
++    // skip both.
+     protected override void OnParametersSet()
+     {
++        _changed = !ReferenceEquals(Map, _lastMap) || ProjectId != _lastProjectId;
++        if (!_changed) return;
++
++        _lastProjectId = ProjectId;
++        if (ReferenceEquals(Map, _lastMap)) return;
++
++        _lastMap = Map;
+         _layout = RunMapLayout.Compute(Map);
+-        if (!ReferenceEquals(Map, _lastMap))
+-        {
+-            _lastMap = Map;
+-            _initialScrollPending = true;
+-        }
++        _setNames = new Dictionary<Guid, string>(Map.Nodes.Count);
++        foreach (var node in Map.Nodes) _setNames.TryAdd(node.SetId, node.Name);
++        _initialScrollPending = true;
+     }
+ 
++    protected override bool ShouldRender() => _changed;
++
+     protected override async Task OnAfterRenderAsync(bool firstRender)
+     {
+         if (!_initialScrollPending || _layout is not { Nodes.Count: > 0 } layout) return;
+@@ -163,8 +179,8 @@
+     private static string Px(double value) => value.ToString(System.Globalization.CultureInfo.InvariantCulture) + "px";
+     private string EdgeSubject(RunMapEdgeDto edge)
+     {
+-        var source = Map.Nodes.FirstOrDefault(n => n.SetId == edge.SourceSetId)?.Name ?? "Specification";
+-        var target = Map.Nodes.FirstOrDefault(n => n.SetId == edge.TargetSetId)?.Name ?? "Specification";
++        var source = _setNames.GetValueOrDefault(edge.SourceSetId) ?? "Specification";
++        var target = _setNames.GetValueOrDefault(edge.TargetSetId) ?? "Specification";
+         return edge.EdgeKind == RunMapEdgeKind.Validation ? source : $"{source} → {target}";
+     }
+     private static string RectStyle(MapRect rect) => $"left:{Px(rect.X)};top:{Px(rect.Y)};width:{Px(rect.W)};height:{Px(rect.H)}";
+diff -ruN a/MaxQ-app/src/QcAI.Shared/RunMapLayout.cs b/MaxQ-app/src/QcAI.Shared/RunMapLayout.cs
+--- a/MaxQ-app/src/QcAI.Shared/RunMapLayout.cs	2026-11-20 16:11:38.627282588 +0100
++++ b/MaxQ-app/src/QcAI.Shared/RunMapLayout.cs	2026-11-20 17:31:56.086018064 +0100
+@@ -148,7 +148,8 @@
+         var byId = placedNodes.ToDictionary(n => n.Node.SetId);
+ 
+         // Nodes are the first occupants, so no stat box is ever placed over a specification.
+-        var occupied = placedNodes.Select(n => n.Box).ToList();
++        var occupied = new Occupancy();
++        occupied.AddRange(placedNodes.Select(n => n.Box));
+ 
+         var completedPairs = map.Edges.Where(e => e.EdgeKind == RunMapEdgeKind.CrossCheck
+                 && AiReviewStatuses.IsSuccessful(e.Status) && e.RunId is not null
+@@ -283,45 +284,147 @@
+ 
+     /// <summary>Finds the closest free box to the arrow's anchor on an eight-pixel grid. Distance
+     /// is measured to the box boundary, not to a preferred position on one side of the arrow.
+-    /// Equal distances favor centering on the anchor, then the upper/left position. Every step away
+-    /// from the centered origin has nondecreasing priority, so the first free box is the nearest
+-    /// grid position without scanning the entire canvas. Curve obstacles include stroke padding.</summary>
+-    private static MapRect Place(List<MapRect> occupied, (double X, double Y) anchor, double height)
++    /// Equal distances favor centering on the anchor, then the upper/left position. Curve
++    /// obstacles include stroke padding.
++    ///
++    /// The answer is the free grid position with the smallest (distance, centering, y, x), and it
++    /// is computed rather than searched for. Walking outwards from the anchor one step at a time
++    /// and testing each position against everything on the figure looks cheap and is not: on a
++    /// busy map the nearest free spot is routinely a thousand pixels away, which is tens of
++    /// thousands of positions per box, each tested against tens of thousands of reserved
++    /// rectangles — minutes for forty specifications, on the thread that paints the page. Instead
++    /// every reserved rectangle marks, once, the grid positions it rules out (a rectangle of them,
++    /// so four writes into a difference table), one pass turns the table into "blocked or free",
++    /// and the same pass keeps the best free position. Cost is the number of rectangles plus the
++    /// number of grid positions, per box.</summary>
++    private static MapRect Place(Occupancy occupied, (double X, double Y) anchor, double height)
+     {
+         const double step = 8;
++        const double pad = 4;
+         var origin = new MapRect(Math.Max(Margin, anchor.X - StatW / 2),
+             Math.Max(Margin, anchor.Y - height / 2), StatW, height);
+-        var queue = new PriorityQueue<(int X, int Y), (double Distance, double Center, int Y, int X)>();
+-        var visited = new HashSet<(int X, int Y)>();
+ 
+         MapRect Box(int x, int y) => origin with { X = origin.X + x * step, Y = origin.Y + y * step };
+ 
+-        void Enqueue(int x, int y)
++        // The smallest grid index whose coordinate reaches a limit. Estimated by division, then
++        // settled by the comparison itself, so a boundary decided in floating point is decided
++        // the same way here as where the box is finally tested.
++        static int FirstAtLeast(double from, double limit)
+         {
+-            var box = Box(x, y);
+-            if (box.X < Margin || box.Y < Margin || !visited.Add((x, y))) return;
+-            var dx = anchor.X - Math.Clamp(anchor.X, box.X, box.Right);
+-            var dy = anchor.Y - Math.Clamp(anchor.Y, box.Y, box.Bottom);
+-            var cx = anchor.X - box.CenterX;
+-            var cy = anchor.Y - box.CenterY;
+-            queue.Enqueue((x, y), (dx * dx + dy * dy, cx * cx + cy * cy, y, x));
++            var i = (int)Math.Ceiling((limit - from) / step);
++            while (from + (i - 1) * step >= limit) i--;
++            while (from + i * step < limit) i++;
++            return i;
+         }
+ 
+-        Enqueue(0, 0);
+-        while (queue.TryDequeue(out var offset, out _))
++        // The grid indices at which a box of the given size comes within the padding of the span
++        // [low, high] on one axis — MapRect.Overlaps, one axis at a time, in its own arithmetic.
++        static (int Lo, int Hi) Reach(double low, double high, double from, double size)
+         {
+-            var box = Box(offset.X, offset.Y);
+-            if (!occupied.Any(o => o.Overlaps(box, 4)))
++            var lo = (int)Math.Floor((low - pad - size - from) / step);
++            while (low - pad < (from + (lo - 1) * step) + size) lo--;
++            while (!(low - pad < (from + lo * step) + size)) lo++;
++            var hi = (int)Math.Ceiling((high + pad - from) / step);
++            while ((from + (hi + 1) * step) - pad < high) hi++;
++            while (!((from + hi * step) - pad < high)) hi--;
++            return (lo, hi);
++        }
++
++        // Nothing may sit left of or above the margin. To the right and below, the grid runs one
++        // position past everything reserved (and past the anchor): that last column and row are
++        // free whatever happens, and anything beyond them is farther away than they are.
++        var xMin = FirstAtLeast(origin.X, Margin);
++        var yMin = FirstAtLeast(origin.Y, Margin);
++        var xMax = Math.Max(0, FirstAtLeast(origin.X, Math.Max(occupied.MaxRight + pad, anchor.X))) + 1;
++        var yMax = Math.Max(0, FirstAtLeast(origin.Y, Math.Max(occupied.MaxBottom + pad, anchor.Y))) + 1;
++        var stride = xMax - xMin + 2;
++        var rows = yMax - yMin + 2;
++        var blocked = occupied.Scratch(stride * rows);
++
++        foreach (var o in occupied.Rects)
++        {
++            var (x0, x1) = Reach(o.X, o.Right, origin.X, StatW);
++            var (y0, y1) = Reach(o.Y, o.Bottom, origin.Y, height);
++            x0 = Math.Max(x0, xMin); x1 = Math.Min(x1, xMax);
++            y0 = Math.Max(y0, yMin); y1 = Math.Min(y1, yMax);
++            if (x0 > x1 || y0 > y1) continue;
++            blocked[(y0 - yMin) * stride + (x0 - xMin)]++;
++            blocked[(y0 - yMin) * stride + (x1 + 1 - xMin)]--;
++            blocked[(y1 + 1 - yMin) * stride + (x0 - xMin)]--;
++            blocked[(y1 + 1 - yMin) * stride + (x1 + 1 - xMin)]++;
++        }
++
++        var found = false;
++        var best = origin;
++        double bestDistance = 0, bestCenter = 0;
++        for (var y = yMin; y <= yMax; y++)
++        {
++            var row = (y - yMin) * stride;
++            var boxY = origin.Y + y * step;
++            var dy = anchor.Y - Math.Clamp(anchor.Y, boxY, boxY + height);
++            var running = 0;
++            for (var x = xMin; x <= xMax; x++)
+             {
+-                occupied.Add(box);
+-                return box;
++                // Running sum along the row plus the finished row above: how many reserved
++                // rectangles rule this position out.
++                running += blocked[row + (x - xMin)];
++                var count = running + (y > yMin ? blocked[row - stride + (x - xMin)] : 0);
++                blocked[row + (x - xMin)] = count;
++                if (count != 0) continue;
++
++                var box = Box(x, y);
++                var dx = anchor.X - Math.Clamp(anchor.X, box.X, box.Right);
++                var distance = dx * dx + dy * dy;
++                if (found && distance > bestDistance) continue;
++                var cx = anchor.X - box.CenterX;
++                var cy = anchor.Y - box.CenterY;
++                var center = cx * cx + cy * cy;
++                // Rows and columns are visited in ascending order, so on a full tie the position
++                // already held is the upper, then the left one, and it stays.
++                if (found && distance == bestDistance && center >= bestCenter) continue;
++                found = true;
++                best = box;
++                bestDistance = distance;
++                bestCenter = center;
+             }
+-            Enqueue(offset.X - 1, offset.Y);
+-            Enqueue(offset.X + 1, offset.Y);
+-            Enqueue(offset.X, offset.Y - 1);
+-            Enqueue(offset.X, offset.Y + 1);
+         }
+-        throw new InvalidOperationException("The unbounded map must have room for a statistics box.");
++
++        if (!found) throw new InvalidOperationException("The unbounded map must have room for a statistics box.");
++        occupied.Add(best);
++        return best;
++    }
++
++    /// <summary>Everything a stat box must stay off: the nodes, every curve's padded samples, and
++    /// the boxes already placed.</summary>
++    private sealed class Occupancy
++    {
++        private readonly List<MapRect> _rects = new();
++        private int[] _scratch = Array.Empty<int>();
++
++        public IReadOnlyList<MapRect> Rects => _rects;
++        public double MaxRight { get; private set; }
++        public double MaxBottom { get; private set; }
++
++        public void Add(MapRect rect)
++        {
++            _rects.Add(rect);
++            MaxRight = Math.Max(MaxRight, rect.Right);
++            MaxBottom = Math.Max(MaxBottom, rect.Bottom);
++        }
++
++        public void AddRange(IEnumerable<MapRect> rects)
++        {
++            foreach (var rect in rects) Add(rect);
++        }
++
++        /// <summary>A zeroed table of at least <paramref name="length"/> cells, reused from one
++        /// placement to the next rather than allocated for each.</summary>
++        public int[] Scratch(int length)
++        {
++            if (_scratch.Length < length) _scratch = new int[length];
++            else Array.Clear(_scratch, 0, length);
++            return _scratch;
++        }
+     }
+ 
+     private static string Leader((double X, double Y) anchor, MapRect box) =>
