@@ -64,20 +64,41 @@ pub fn run() -> ! {
     let real = real_git();
     let mut cmd = Command::new(&real);
     cmd.args(&args);
-    // Never inherited as such. A hook git runs inside the workspace calls
-    // `git` with these already set by the shim around its parent; that call
-    // decides for itself, the same way, like every other.
+    // Somebody else's choice is left exactly as it is: a test harness, a
+    // build tool, or git itself handing a hook a push's quarantined objects
+    // all set `GIT_OBJECT_DIRECTORY` on purpose, and the shim stripping it
+    // sent their objects to the wrong store.
+    if set_elsewhere(
+        std::env::var_os(GIT_OBJECTS).as_deref(),
+        std::env::var_os(OBJECTS_ENV).as_deref(),
+    ) {
+        exec(cmd, &real);
+    }
+    // The shim's own, inherited from the shim around a parent git (a hook
+    // inside the workspace calling `git`): that call decides for itself, the
+    // same way, like every other.
     cmd.env_remove(GIT_OBJECTS).env_remove(GIT_ALTERNATES);
     if let Some((objects, alternates)) = routing(&real, &args) {
         cmd.env(GIT_OBJECTS, objects)
             .env(GIT_ALTERNATES, alternates);
     }
+    exec(cmd, &real)
+}
+
+fn exec(mut cmd: Command, real: &Path) -> ! {
     let error = cmd.exec();
     eprintln!(
         "git (BondSymphonic shim): could not run {}: {error}",
         real.display()
     );
     std::process::exit(127)
+}
+
+/// Whether `GIT_OBJECT_DIRECTORY` was set by something other than the shim:
+/// it is set, and not to the workspace's private directory, which is the only
+/// value the shim ever gives it.
+pub fn set_elsewhere(inherited: Option<&OsStr>, ours: Option<&OsStr>) -> bool {
+    inherited.is_some_and(|value| Some(value) != ours)
 }
 
 /// The two object directories when `args` is a command on the workspace's own
@@ -153,6 +174,17 @@ mod tests {
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    /// An object directory the shim did not choose is left alone; one it did
+    /// is decided again.
+    #[test]
+    fn only_the_shims_own_object_directory_is_redecided() {
+        let ours = Some(OsStr::new("/data/objects/ws_1"));
+        assert!(!set_elsewhere(None, ours));
+        assert!(!set_elsewhere(ours, ours));
+        assert!(set_elsewhere(Some(OsStr::new("/tmp/quarantine")), ours));
+        assert!(set_elsewhere(Some(OsStr::new("/tmp/x")), None));
     }
 
     #[test]
