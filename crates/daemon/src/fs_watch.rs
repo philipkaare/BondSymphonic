@@ -84,6 +84,9 @@ enum Msg {
     /// A directory that appeared inside the tree and, on a per-directory
     /// backend, needs a watch of its own.
     NewDir(PathBuf),
+    /// One of the workspace's git state files changed: see
+    /// [`Watchers::enable_with_git`].
+    Git,
 }
 
 /// One workspace's watch: the task that registers it and then coalesces its
@@ -150,6 +153,29 @@ impl Watchers {
     /// known the reply has gone. The IDE does nothing with the reply but log a
     /// failure, and the log is where one now appears.
     pub fn enable(&self, id: WorkspaceId, root: PathBuf, events: EventBus) {
+        self.enable_with_git(id, root, Vec::new(), events);
+    }
+
+    /// [`Watchers::enable`], also watching `git_files`: the files that hold
+    /// the workspace's git state (`HEAD`, the index, the reflog, branch refs).
+    ///
+    /// A commit, a `git add`, a reset or a rebase changes what the Changes
+    /// list should show without writing a single file in the worktree, so the
+    /// tree's own events never told the IDE to look again: the list went on
+    /// showing the state before the agent's last git command. A change to one
+    /// of these publishes an `fs.changed` naming no path, which is "the
+    /// workspace changed, look again" to the Changes list and nothing to an
+    /// editor, which only reloads for its own path.
+    ///
+    /// Each file's directory is watched on its own, not recursively, and a
+    /// directory that does not exist (a ref that is only packed) is skipped.
+    pub fn enable_with_git(
+        &self,
+        id: WorkspaceId,
+        root: PathBuf,
+        git_files: Vec<PathBuf>,
+        events: EventBus,
+    ) {
         let mut active = self.active.lock();
         if active.contains_key(&id) {
             return;
@@ -164,6 +190,7 @@ impl Watchers {
             Arc::clone(&self.active),
             id.clone(),
             root,
+            git_files,
             events,
             generation,
             settled_tx,
@@ -238,6 +265,7 @@ async fn register(
     active: Active,
     id: WorkspaceId,
     root: PathBuf,
+    git_files: Vec<PathBuf>,
     events: EventBus,
     generation: u64,
     settled: watch::Sender<()>,
@@ -263,7 +291,7 @@ async fn register(
             // aborted meanwhile, tokio drops the pair unread the moment the closure
             // returns, watcher first and sender after it, so `registered` resolves
             // only once nothing is left watching.
-            (build(&id, root, coverage), settled)
+            (build(&id, root, coverage, git_files), settled)
         })
         .await
     };
@@ -365,8 +393,29 @@ fn coverage(root: &Path) -> Coverage {
 /// `root` and covers as much of the tree as `coverage` says. Every call in
 /// here can stall on the filesystem, which is why none of it runs on a
 /// runtime worker.
-fn build(id: &WorkspaceId, root: PathBuf, coverage: Coverage) -> Result<Built, RpcError> {
+fn build(
+    id: &WorkspaceId,
+    root: PathBuf,
+    coverage: Coverage,
+    git_files: Vec<PathBuf>,
+) -> Result<Built, RpcError> {
     let (tx, rx) = mpsc::unbounded_channel::<Msg>();
+    // Each git file by the canonical form of its directory, which is how the
+    // backend will report it, and the directories themselves to watch.
+    let git_files: Vec<PathBuf> = git_files
+        .iter()
+        .filter_map(|f| {
+            let dir = f.parent()?.canonicalize().ok()?;
+            Some(dir.join(f.file_name()?))
+        })
+        .collect();
+    let mut git_dirs: Vec<PathBuf> = git_files
+        .iter()
+        .filter_map(|f| f.parent().map(Path::to_path_buf))
+        .collect();
+    git_dirs.sort();
+    git_dirs.dedup();
+    let cb_git = git_files.clone();
     // The callback runs on notify's own thread, so it does the cheap part and
     // hands the result to the coalescing task. Filtering here rather than at
     // publish time is what keeps a `cargo build` inside the worktree from waking
@@ -377,6 +426,9 @@ fn build(id: &WorkspaceId, root: PathBuf, coverage: Coverage) -> Result<Built, R
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         match res {
             Ok(ev) if is_change(&ev.kind) => {
+                if ev.paths.iter().any(|p| cb_git.contains(p)) {
+                    let _ = tx.send(Msg::Git);
+                }
                 if PER_DIRECTORY && may_create_directory(&ev.kind) {
                     for p in &ev.paths {
                         if is_new_directory(&cb_root, p) {
@@ -421,6 +473,13 @@ fn build(id: &WorkspaceId, root: PathBuf, coverage: Coverage) -> Result<Built, R
         watcher
             .watch(&root, RecursiveMode::Recursive)
             .map_err(|e| RpcError::internal(format!("fs.watch {}: {e}", root.display())))?;
+    }
+    // Wherever they are -- the main repository's `.git` for a worktree
+    // workspace, which is not under the worktree at all, or the ignored `.git`
+    // inside an in-place one -- and whatever `coverage` said about the tree:
+    // a few directories, never walked.
+    for dir in &git_dirs {
+        watch_quietly(&mut watcher, dir);
     }
     Ok(Built { root, watcher, rx })
 }
@@ -514,14 +573,15 @@ async fn coalesce(
 ) {
     while let Some(first) = rx.recv().await {
         let mut batch = Vec::new();
-        absorb(&root, &mut watcher, first, &mut batch).await;
+        let mut git = false;
+        absorb(&root, &mut watcher, first, &mut batch, &mut git).await;
         let deadline = tokio::time::sleep(DEBOUNCE);
         tokio::pin!(deadline);
         loop {
             tokio::select! {
                 _ = &mut deadline => break,
                 more = rx.recv() => match more {
-                    Some(msg) => absorb(&root, &mut watcher, msg, &mut batch).await,
+                    Some(msg) => absorb(&root, &mut watcher, msg, &mut batch, &mut git).await,
                     // The watcher is gone: publish what we have and stop.
                     None => break,
                 },
@@ -533,7 +593,9 @@ async fn coalesce(
         // and a new directory arrives alongside its own creation.
         batch.sort();
         batch.dedup();
-        if !batch.is_empty() {
+        // A git state change with no file of its own still publishes: an
+        // empty `fs.changed` is "look again" to the Changes list.
+        if !batch.is_empty() || git {
             events.publish(Some(id.clone()), Event::FsChanged { paths: batch });
         }
     }
@@ -543,9 +605,16 @@ async fn coalesce(
 /// watched, and whatever the walk found is reported too: anything written
 /// into the directory before its watch was in place would otherwise have
 /// gone unheard.
-async fn absorb(root: &Path, watcher: &mut RecommendedWatcher, msg: Msg, batch: &mut Vec<String>) {
+async fn absorb(
+    root: &Path,
+    watcher: &mut RecommendedWatcher,
+    msg: Msg,
+    batch: &mut Vec<String>,
+    git: &mut bool,
+) {
     match msg {
         Msg::Changed(paths) => batch.extend(paths),
+        Msg::Git => *git = true,
         Msg::NewDir(dir) => {
             let walked = tokio::task::spawn_blocking(move || walk(&dir))
                 .await
@@ -1012,7 +1081,7 @@ mod tests {
         let walks_before = counters::WALKS.load(Ordering::SeqCst);
         #[cfg(target_os = "linux")]
         let watches_before = inotify_watch_count();
-        let root_only = build(&id, root.clone(), Coverage::RootOnly).unwrap();
+        let root_only = build(&id, root.clone(), Coverage::RootOnly, Vec::new()).unwrap();
         assert_eq!(
             counters::WALKS.load(Ordering::SeqCst) - walks_before,
             0,
@@ -1029,7 +1098,7 @@ mod tests {
 
         // The same tree with the ordinary coverage, for contrast: this is what
         // the classification saves.
-        let tree = build(&id, root.clone(), Coverage::Tree).unwrap();
+        let tree = build(&id, root.clone(), Coverage::Tree, Vec::new()).unwrap();
         assert_eq!(
             counters::WALKS.load(Ordering::SeqCst) - walks_before,
             usize::from(PER_DIRECTORY),

@@ -1179,8 +1179,13 @@ shell reloads an unmodified tab silently, keeping the caret and the scroll
 position; on a tab with unsaved edits a bar offers reload or keep.
 
 **Changes** lists the files that differ from the workspace's base branch with
-their status and their +/- counts, and follows the worktree without your
-pressing Refresh. Double-clicking a row opens a side-by-side diff: aligned rows,
+their status and their +/- counts. That includes committed work, so it is not the
+same list as `git status`, which forgets a file once it is committed. It follows
+the worktree without your pressing Refresh, and it follows git as well: a
+commit, a `git add`, a reset or a rebase by the agent refreshes it even when no
+file in the worktree changed, and so does the base branch moving. Files under a
+directory named `node_modules` or `target` are not watched, and neither is a
+checkout on a 9P mount; Refresh brings those in. Double-clicking a row opens a side-by-side diff: aligned rows,
 green and red tints, two line-number columns, scrolling synchronised in both
 axes, and the same highlighting as the editor. A diff does not reload when the
 file changes underneath it — close it and open it again.
