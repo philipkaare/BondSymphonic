@@ -266,7 +266,8 @@ fn base_env(spec: &SandboxSpec, user: &str) -> Vec<(String, String)> {
         ("USER".to_string(), user.to_string()),
         (
             "PATH".to_string(),
-            format!("{home_in}/.local/bin:{home_in}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+            // The git shim first, so `git` is always it. See `git_shim`.
+            format!("{}:{home_in}/.local/bin:{home_in}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", super::git_shim::SHIM_DIR),
         ),
         ("TERM".to_string(), "xterm-256color".into()),
         ("LANG".to_string(), "C.UTF-8".into()),
@@ -306,6 +307,12 @@ pub fn bwrap_args(
     if exe_is_hidden(spec, self_exe) {
         a.extend(["--ro-bind".into(), s(self_exe), s(&exe_in)]);
     }
+    // `git`, linked to the daemon, which runs as the git shim under that
+    // name. In `/opt`, which is always a tmpfs here, so the link is the
+    // sandbox's own and nothing on the host is touched.
+    let shim_dir = super::git_shim::SHIM_DIR;
+    a.extend(["--dir".into(), shim_dir.into()]);
+    a.extend(["--symlink".into(), s(&exe_in), format!("{shim_dir}/git")]);
     for (h, sb) in &spec.ro_binds {
         a.extend(["--ro-bind".into(), s(h), s(sb)]);
     }
@@ -865,10 +872,18 @@ mod tests {
         };
         assert_eq!(set("HOME").as_deref(), Some("/home/bs"), "{s}");
         assert_eq!(set("USER").as_deref(), Some("bs"), "{s}");
+        // The git shim first, then the workspace home's own bin directories.
         assert!(
-            set("PATH").is_some_and(|p| p.starts_with("/home/bs/.local/bin:")),
+            set("PATH").is_some_and(|p| p.starts_with("/opt/bs/bin:/home/bs/.local/bin:")),
             "{s}"
         );
+        // And `git` in that first directory is the daemon, after the `/opt`
+        // tmpfs it is created in.
+        assert!(
+            s.contains("--symlink /usr/bin/bondsymphonic-daemon /opt/bs/bin/git"),
+            "{s}"
+        );
+        assert!(pos(&args, "--tmpfs /opt ").unwrap() < pos(&args, "--dir /opt/bs/bin").unwrap());
         assert_eq!(set("TERM").as_deref(), Some("xterm-256color"), "{s}");
         assert_eq!(set("LANG").as_deref(), Some("C.UTF-8"), "{s}");
         // The spec's own variables (git, proxy, workspace id) reach init too.
