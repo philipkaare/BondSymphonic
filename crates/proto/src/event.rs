@@ -120,6 +120,11 @@ pub const EVENT_DROP_PREFIX: &str = "events dropped: ";
 /// offering "Allow host" cannot drift away from the line the daemon sends.
 pub const NETWORK_DENIED_PREFIX: &str = "network denied: ";
 
+/// How long the daemon's proxy holds a connection to a host that is not
+/// allowed, waiting for the user to allow it, before it refuses. The IDE's
+/// network bar counts down from the same number; the agents are told it too.
+pub const NETWORK_APPROVAL_WAIT_SECS: u64 = 90;
+
 /// Prefix of the warning the daemon sends when an OpenCode companion's proxy
 /// refused one of its model-server tunnels: a host the workspace allowlist
 /// cannot fix, so the notice offers nothing to allow. Built by

@@ -279,6 +279,9 @@ impl DenialGate {
 struct Entry {
     /// Swapped under running connections by `workspace.set_allowlist`.
     allow: Arc<RwLock<Allowlist>>,
+    /// See [`ConnCtx::changed`].
+    #[cfg_attr(not(unix), allow(dead_code))]
+    changed: Arc<tokio::sync::Notify>,
     socket: PathBuf,
     /// Which call to [`ProxyRegistry::start`] this listener belongs to. A
     /// workspace whose sandbox dies and is restarted has a watcher for each
@@ -290,7 +293,6 @@ struct Entry {
 }
 
 /// The proxies, one per live workspace.
-#[derive(Default)]
 pub struct ProxyRegistry {
     entries: Mutex<HashMap<WorkspaceId, Entry>>,
     /// Handed out by [`ProxyRegistry::start`], never reused.
@@ -306,6 +308,56 @@ pub struct ProxyRegistry {
     /// runs), the backend for a companion's. `None` publishes the notice
     /// without attribution.
     backend: Option<AgentAdapterKind>,
+    /// How long a connection to a host that is not allowed is held for the
+    /// user to allow it. See [`approval_wait`].
+    #[cfg_attr(not(unix), allow(dead_code))]
+    approval_wait: Duration,
+}
+
+impl Default for ProxyRegistry {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::default(),
+            next_generation: Default::default(),
+            denials: Arc::default(),
+            backend: None,
+            approval_wait: approval_wait(),
+        }
+    }
+}
+
+/// How long a connection to a host the workspace has not allowed is held
+/// open, waiting for the user, before it is refused:
+/// [`bondsymphonic_proto::NETWORK_APPROVAL_WAIT_SECS`].
+///
+/// The refusal used to be immediate, and the IDE's offer to allow the host
+/// came after the request had already failed: the agent saw a 403, gave up or
+/// went another way, and an Allow pressed a second later helped nobody. Held,
+/// the same Allow lets the very request through.
+///
+/// `BS_NETWORK_APPROVAL_WAIT_MS` overrides it, which is for the test suites:
+/// most of them are about the refusal, and would otherwise wait out the whole
+/// wait in every test that is refused.
+pub fn approval_wait() -> Duration {
+    std::env::var("BS_NETWORK_APPROVAL_WAIT_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(
+            bondsymphonic_proto::NETWORK_APPROVAL_WAIT_SECS,
+        ))
+}
+
+/// The refusal sent when the user was asked and did not allow the host in
+/// time.
+pub fn unanswered_response(host: &str, waited: Duration) -> Vec<u8> {
+    text_response(
+        "403 Forbidden",
+        &format!(
+            "host {host} is not in this workspace's allowlist; the user was asked to allow it and did not within {} seconds. Ask the user to allow {host} in the IDE (or add it to bondsymphonic.toml [network] allow) before trying again\n",
+            waited.as_secs()
+        ),
+    )
 }
 
 /// What one connection needs to decide where it may go and to say so.
@@ -320,6 +372,11 @@ struct ConnCtx {
     denials: Arc<DenialGate>,
     /// See [`ProxyRegistry::backend`].
     backend: Option<AgentAdapterKind>,
+    /// Woken whenever the workspace's rules change, so a connection held for
+    /// the user's answer re-checks at once rather than at its deadline.
+    changed: Arc<tokio::sync::Notify>,
+    /// See [`approval_wait`].
+    approval_wait: Duration,
 }
 
 impl ProxyRegistry {
@@ -329,6 +386,13 @@ impl ProxyRegistry {
             backend: Some(backend),
             ..Self::default()
         }
+    }
+
+    /// The same registry holding refused connections for `wait` instead; see
+    /// [`approval_wait`]. Zero refuses at once.
+    pub fn with_approval_wait(mut self, wait: Duration) -> Self {
+        self.approval_wait = wait;
+        self
     }
 
     /// Whose sandbox these proxies serve, as their notices say.
@@ -373,6 +437,7 @@ impl ProxyRegistry {
             // generation, so the previous owner's watcher can no longer stop it.
             if existing.socket.as_path() == socket {
                 *existing.allow.write() = allow;
+                existing.changed.notify_waiters();
                 existing.generation = generation;
                 return Ok(generation);
             }
@@ -402,6 +467,7 @@ impl ProxyRegistry {
             let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
         }
         let allow = Arc::new(RwLock::new(allow));
+        let changed = Arc::new(tokio::sync::Notify::new());
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ConnCtx {
             allow: allow.clone(),
@@ -409,12 +475,15 @@ impl ProxyRegistry {
             workspace: id.clone(),
             denials: self.denials.clone(),
             backend: self.backend,
+            changed: changed.clone(),
+            approval_wait: self.approval_wait,
         };
         tokio::spawn(accept_loop(listener, ctx, cancel.clone()));
         entries.insert(
             id.clone(),
             Entry {
                 allow,
+                changed,
                 socket: socket.to_path_buf(),
                 generation,
                 cancel,
@@ -448,6 +517,9 @@ impl ProxyRegistry {
     pub fn set_allowlist(&self, id: &WorkspaceId, allow: Allowlist) {
         if let Some(entry) = self.entries.lock().get(id) {
             *entry.allow.write() = allow;
+            // A connection waiting for the user's answer re-checks now: the
+            // change may be that answer.
+            entry.changed.notify_waiters();
         }
     }
 
@@ -578,10 +650,21 @@ async fn refuse(
         } else {
             tracing::debug!(ws = %ctx.workspace, host = %host, "{why}: endpoint not in the agent's config (already reported)");
         }
-    } else if ctx.denials.admit(&ctx.workspace, host) {
-        tracing::warn!(ws = %ctx.workspace, host = %host, "{why}");
+    } else {
         // Published before the refusal is written, so a client that reacts to
         // the 403 by asking the daemon something cannot outrun its own event.
+        announce_denial(ctx, host, why);
+    }
+    let _ = client.write_all(&body).await;
+}
+
+/// Publishes a denial of `host`, unless it was already reported for this
+/// workspace inside [`DENIAL_INTERVAL`]. What the IDE offers Allow on, and,
+/// for a connection held for the answer, what it shows the countdown for.
+#[cfg(unix)]
+fn announce_denial(ctx: &ConnCtx, host: &str, why: &str) {
+    if ctx.denials.admit(&ctx.workspace, host) {
+        tracing::warn!(ws = %ctx.workspace, host = %host, "{why}");
         let denial = match ctx.backend {
             Some(backend) => Event::network_denied_by(host, backend),
             None => Event::network_denied(host),
@@ -590,7 +673,6 @@ async fn refuse(
     } else {
         tracing::debug!(ws = %ctx.workspace, host = %host, "{why} (already reported)");
     }
-    let _ = client.write_all(&body).await;
 }
 
 /// One client connection, from its first request to its last.
@@ -847,11 +929,41 @@ async fn open_upstream(
     // across the awaits below would block every `set_allowlist` behind a tunnel.
     // An origin a backend's own config names is checked with its port, and may
     // be private: see `Origin`.
-    let (allowed, granted, blocked) = {
+    let decide = || {
         let allow = ctx.allow.read();
         let granted = allow.allows_origin(host, port);
         (granted || allow.allows(host), granted, allow.blocks(host))
     };
+    let (mut allowed, mut granted, mut blocked) = decide();
+    // A host nobody has decided about yet is held while the user is asked:
+    // the denial goes out now, and the connection waits for an Allow or a
+    // Block until `approval_wait` runs out. A tunnel the backend's own config
+    // must name is not the user's to allow, so it is refused at once.
+    if !allowed && !blocked && !tunnel && !ctx.approval_wait.is_zero() {
+        announce_denial(ctx, host, "network denied: waiting for the user");
+        let deadline = tokio::time::Instant::now() + ctx.approval_wait;
+        loop {
+            // Registered before the rules are read again, so a change made in
+            // between still wakes this.
+            let changed = ctx.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            (allowed, granted, blocked) = decide();
+            if allowed || blocked {
+                break;
+            }
+            tokio::select! {
+                _ = &mut changed => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    tracing::info!(ws = %ctx.workspace, host = %host, "network denied: the user did not answer");
+                    client
+                        .write_all(&unanswered_response(host, ctx.approval_wait))
+                        .await?;
+                    return Ok(None);
+                }
+            }
+        }
+    }
     if blocked {
         // An explicit user decision is enforced silently on every retry.
         client

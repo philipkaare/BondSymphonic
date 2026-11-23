@@ -78,6 +78,8 @@ fn main() {
             "cpp/ToolCard.cpp",
             "cpp/PermissionBar.h",
             "cpp/PermissionBar.cpp",
+            "cpp/NetworkBar.h",
+            "cpp/NetworkBar.cpp",
             "cpp/TranscriptView.h",
             "cpp/TranscriptView.cpp",
             "cpp/CodeView.h",

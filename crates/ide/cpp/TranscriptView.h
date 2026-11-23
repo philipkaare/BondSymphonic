@@ -7,6 +7,7 @@
 #include <QStringList>
 #include <QWidget>
 
+class NetworkBar;
 class PermissionBar;
 class PromptInput;
 class TranscriptModel;
@@ -205,6 +206,8 @@ private:
     void onItemAppended(int index);
     void onItemChanged(int index);
     void onPermissionRequested();
+    /// Redraws the network bar from the model's `networkJson`.
+    void onNetworkChanged();
     void onBusyChanged();
     void onStateChanged();
     void refreshCommandCatalog();
@@ -244,7 +247,6 @@ private:
     /// The frame for a host the proxy blocked: the sentence, how many times,
     /// and the "Allow for this workspace" button or where allowing it got to.
     /// Rebuilt rather than repainted when the item changes.
-    QWidget* makeDenialFrame(const QJsonObject& item, int index);
     /// A notice: its sentence and a button per action it offers. Interrupt
     /// only while `live`.
     QWidget* makeNoticeFrame(const QJsonObject& item);
@@ -313,6 +315,8 @@ private:
     QWidget* m_progress = nullptr;
     QLabel* m_progressText = nullptr;
     PermissionBar* m_permission = nullptr;
+    /// See `NetworkBar`.
+    NetworkBar* m_network = nullptr;
     /// The prompt box and its three buttons as one widget, so the login gate
     /// can replace the lot without touching any of them.
     QWidget* m_composer = nullptr;

@@ -1268,20 +1268,35 @@ says why: `failed` with the exit code and its last lines if it never came ready,
 Bridging is raw bytes both ways, so WebSockets and hot reload work over the same
 port.
 
-**The allowlist toast.** A sandbox has only loopback in its network namespace;
-everything goes through a per-workspace proxy that checks the host against an
-allowlist and refuses anything else with a 403. The default list covers
-Anthropic, npm, PyPI, crates.io and GitHub. When a connection is refused, the
-Run panel shows a toast on that workspace: **Blocked network access to
-`<host>`**, with **Allow host**, **Always block** and **Dismiss**. Allow host adds the host to
-that workspace's allowlist and the daemon puts the new list in front of the
-proxy at once — the next attempt goes through with nothing restarted — and
-writes it into the registry, so it survives a daemon restart.
+**Hosts that are not allowed wait for you.** A sandbox has only loopback in its
+network namespace; everything goes through a per-workspace proxy that checks the
+host against an allowlist. The default list covers Anthropic, npm, PyPI,
+crates.io and GitHub. A connection to any other host is *held* for 90 seconds
+while you are asked, instead of being refused straight away:
 
-**Always block** saves an explicit block for that workspace and suppresses future
-network notices for the host. The same choice is available on inline network
-notices in an agent's transcript. Block rules override allowed hosts and backend
-model-server grants.
+- **The network bar.** When the agent asked, the request appears on a bar pinned
+  above the agent's prompt box, beside the permission bar, so it stays in view
+  while the agent keeps working. It shows *The agent wants to reach `<host>` … It
+  is waiting for you: 1:23 left*, with **Allow**, **Always block** and ✕. There
+  is one row per host, and repeats count up on it.
+- **Allow** adds the host to that workspace's allowlist. The daemon puts the new
+  list in front of the proxy at once, so *the waiting request itself* goes
+  through, and saves it in the registry so it survives a daemon restart.
+- **Always block** saves an explicit block for the workspace. The waiting
+  request is refused at once, and later ones for that host are refused silently.
+  Block rules override allowed hosts and backend model-server grants.
+- **✕** stops asking. The request is refused when its 90 seconds run out.
+- **No answer.** After 90 seconds the request fails with a 403 that says the user
+  was asked and did not allow the host.
+- **What the agents are told.** Agents are told, in their instructions, that a
+  request to a host that is not allowed waits up to 90 seconds for the user.
+  They are told not to cancel or retry it while it waits, and, if it is refused,
+  to tell you which host they need rather than working around it.
+- **The Run panel toast.** A request no agent's pane takes (one from a run or a
+  terminal, or from a tab that is not showing that agent) still gets the Run
+  panel toast on that workspace: **Blocked network access to `<host>`**, with
+  **Allow host**, **Always block** and **Dismiss**. The request waits for that
+  toast's answer the same way.
 
 Open **Workspace → Network rules…** to edit the workspace's effective allowed and
 blocked hosts, one host or `*.example.com` wildcard per line. **Save** validates

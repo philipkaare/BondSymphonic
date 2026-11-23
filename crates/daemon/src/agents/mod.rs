@@ -666,16 +666,21 @@ impl Agent {
     }
 }
 
-/// What every sandboxed agent is told about git remotes, appended to its own
-/// instructions (`--append-system-prompt` for Claude Code,
-/// `developerInstructions` for Codex).
+/// What every sandboxed agent is told about git remotes and the network,
+/// appended to its own instructions (`--append-system-prompt` for Claude
+/// Code, `developerInstructions` for Codex).
+///
+/// The network half exists because a request to a host that is not allowed
+/// is held while the user is asked (see `net::proxy::approval_wait`). An
+/// agent that is not told takes the silent wait for a hang and kills the
+/// command, or works around a host the user was about to allow.
 ///
 /// Without it an agent whose `git fetch` fails concludes the machine is not
 /// logged in to GitHub and asks the user to run `gh auth login` -- which would
 /// only log in a sandbox home the daemon throws away. The sandbox holds no
 /// credentials by design; the `bondsymphonic` MCP tools (`crate::mcp`) do the
 /// remote work on the host and name what they offer here.
-pub const SANDBOX_GIT_NOTE: &str = "You are running inside a BondSymphonic sandbox that holds no Git or GitHub credentials, so plain \
+pub const SANDBOX_NOTE: &str = "You are running inside a BondSymphonic sandbox that holds no Git or GitHub credentials, so plain \
 `git fetch`, `git pull`, `git push` and `gh` cannot authenticate, and logging in from inside the \
 sandbox does not help. Use the `bondsymphonic` MCP tools instead: git_fetch (update origin/*), \
 git_push (push this workspace's branch; force uses --force-with-lease), pr_create and pr_update \
@@ -686,7 +691,12 @@ a pull request are limited to this workspace's own branch; reading pull requests
 issues, and commenting, work across the repository. In an in-place workspace there is no branch \
 of its own to push: pushing and opening pull requests are done by the user from their own \
 checkout. If a tool says GitHub is not logged in, or that the GitHub CLI is not installed, tell \
-the user to fix it under Settings > Setup.";
+the user to fix it under Settings > Setup. \
+Network access from this sandbox goes through an allowlist. A request to a host that is not on it \
+is held for up to 90 seconds while the user is asked to allow it: the command is waiting for the \
+user, not hung, so do not cancel it, retry it or switch to another approach while it waits. If \
+the user does not allow the host in time, the request fails with a 403 that says so; then tell \
+the user which host you need and why, rather than working around it.";
 
 /// The state detail a restored agent carries, for an agent that was still
 /// running when the daemon went and for one that had already ended.
@@ -1312,6 +1322,16 @@ mod tests {
                 )]
             );
         }
+    }
+
+    /// The agents are told the same wait the proxy holds a connection for.
+    #[test]
+    fn the_sandbox_note_states_the_proxys_wait() {
+        let wait = format!(
+            "held for up to {} seconds",
+            bondsymphonic_proto::NETWORK_APPROVAL_WAIT_SECS
+        );
+        assert!(SANDBOX_NOTE.contains(&wait), "{SANDBOX_NOTE}");
     }
 
     #[test]

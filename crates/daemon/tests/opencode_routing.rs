@@ -207,7 +207,7 @@ mod unix {
         let id = WorkspaceId("ws_routing".into());
         let up = ok_server().await;
         let other = ok_server().await;
-        let proxy = ProxyRegistry::default();
+        let proxy = ProxyRegistry::default().with_approval_wait(std::time::Duration::ZERO);
         proxy
             .start(
                 &id,
@@ -273,7 +273,7 @@ mod unix {
         let sock = dir.path().join("proxy.sock");
         let id = WorkspaceId("ws_tunnel".into());
         let up = ok_server().await;
-        let proxy = ProxyRegistry::default();
+        let proxy = ProxyRegistry::default().with_approval_wait(std::time::Duration::ZERO);
         proxy
             .start(
                 &id,
@@ -431,6 +431,7 @@ async fn an_opencode_sandbox_reaches_a_host_loopback_server_its_config_names() {
     }
     let dir = tempfile::tempdir().unwrap();
     let repo = common::init_repo(dir.path());
+    common::no_approval_wait();
     let daemon = Daemon::new(
         DataDirs::new(dir.path().join("data")),
         backend_for("linux_bwrap"),
@@ -644,6 +645,7 @@ async fn live_opencode_run_reaches_a_host_loopback_model_server() {
         bondsymphonic_daemon::agents::opencode_config::USER_CONFIG_ROOT_ENV,
         &native,
     );
+    common::no_approval_wait();
     let daemon = Daemon::new(
         DataDirs::new(dir.path().join("data")),
         backend_for("linux_bwrap"),
@@ -744,7 +746,7 @@ async fn a_refused_tunnel_does_not_offer_to_allow_the_host() {
     let id = WorkspaceId("ws_quiet".into());
     let events = EventBus::new(100);
     let mut rx = events.subscribe();
-    let proxy = ProxyRegistry::default();
+    let proxy = ProxyRegistry::default().with_approval_wait(std::time::Duration::ZERO);
     // The companion's proxy: it holds the grants of OpenCode's config.
     let grants = vec![Origin::new("localhost", 1).unwrap()];
     proxy
@@ -817,7 +819,7 @@ async fn marked_connect(
     let id = WorkspaceId("ws_marked".into());
     let events = EventBus::new(100);
     let mut rx = events.subscribe();
-    let proxy = ProxyRegistry::default();
+    let proxy = ProxyRegistry::default().with_approval_wait(std::time::Duration::ZERO);
     proxy.start(&id, &sock, allow, events).await.unwrap();
     let mut c = tokio::net::UnixStream::connect(&sock).await.unwrap();
     c.write_all(
