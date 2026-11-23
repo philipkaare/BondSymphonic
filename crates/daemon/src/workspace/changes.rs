@@ -61,6 +61,11 @@ fn normalise_eol(s: String) -> String {
 pub async fn changes(d: &Daemon, id: &WorkspaceId) -> Result<ChangesResult, RpcError> {
     let ws = d.workspace(id)?;
     let (git, base) = measuring(d, &ws).await?;
+    // Reads only. `git status` otherwise rewrites the index whenever it
+    // refreshes a file's cached stat, and the index is one of the files
+    // `fs.watch` follows (see `git_state_files`): every refresh would announce
+    // a change that asks for another refresh.
+    let git = git.with_env("GIT_OPTIONAL_LOCKS", "0");
     let cwd = ws.worktree_path.clone();
 
     // Three reads of one commit range, asked at once. None of them looks at
@@ -135,6 +140,48 @@ pub async fn changes(d: &Daemon, id: &WorkspaceId) -> Result<ChangesResult, RpcE
     Ok(ChangesResult {
         files: merge_changes(tracked, &counts, untracked),
     })
+}
+
+/// The files that hold `ws`'s git state, for `fs.watch` to follow beside the
+/// worktree: what moves when the agent commits, stages, resets, checks out or
+/// rebases, none of which need write a file in the worktree, and what moves
+/// when the base branch does. See [`crate::fs_watch::Watchers::enable_with_git`].
+///
+/// A worktree workspace's are in the main repository's `.git`: its own gitdir
+/// (`worktrees/<id>`) for `HEAD`, the index and the reflog, and the two branch
+/// refs and `packed-refs` in the common directory. An in-place workspace's are
+/// in its own `.git`, where the reflog stands in for the branch ref nobody can
+/// name in advance.
+pub async fn git_state_files(d: &Daemon, ws: &Workspace) -> Vec<std::path::PathBuf> {
+    match ws.kind {
+        WorkspaceKind::Worktree => {
+            let Ok(layout) = layout_for(d, ws).await else {
+                return Vec::new();
+            };
+            let gitdir = layout.worktree_gitdir();
+            let refs = layout.git_common.join("refs").join("heads");
+            vec![
+                gitdir.join("HEAD"),
+                gitdir.join("index"),
+                gitdir.join("logs").join("HEAD"),
+                refs.join(&ws.branch),
+                refs.join(&ws.base_branch),
+                layout.git_common.join("packed-refs"),
+            ]
+        }
+        WorkspaceKind::InPlace => {
+            let git = ws.worktree_path.join(".git");
+            if !git.is_dir() {
+                return Vec::new();
+            }
+            vec![
+                git.join("HEAD"),
+                git.join("index"),
+                git.join("logs").join("HEAD"),
+                git.join("packed-refs"),
+            ]
+        }
+    }
 }
 
 /// Base text (the base's version, empty if the path did not exist there) and

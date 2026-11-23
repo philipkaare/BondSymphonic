@@ -47,7 +47,9 @@ async fn refused(
     let proxy = match backend {
         Some(kind) => ProxyRegistry::for_backend(kind),
         None => ProxyRegistry::default(),
-    };
+    }
+    // Refused at once: these are about what the refusal says.
+    .with_approval_wait(std::time::Duration::ZERO);
     proxy.start(&id, &sock, allow, events).await.unwrap();
     let mut c = tokio::net::UnixStream::connect(&sock).await.unwrap();
     c.write_all(request.as_bytes()).await.unwrap();

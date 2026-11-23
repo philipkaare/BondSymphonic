@@ -381,7 +381,7 @@ pub fn claude_argv(
         argv.push("--allowedTools".to_owned());
         argv.push(crate::mcp::claude_allowed_tools());
         argv.push("--append-system-prompt".to_owned());
-        argv.push(super::SANDBOX_GIT_NOTE.to_owned());
+        argv.push(super::SANDBOX_NOTE.to_owned());
     }
     Ok(argv)
 }
@@ -1486,7 +1486,7 @@ settings = \"s.json\"
         let sandboxed = claude_argv(&plain, BWRAP, &[]).unwrap();
         assert_eq!(
             &sandboxed[sandboxed.len() - 2..],
-            ["--append-system-prompt", crate::agents::SANDBOX_GIT_NOTE]
+            ["--append-system-prompt", crate::agents::SANDBOX_NOTE]
         );
         assert!(!claude_argv(&plain, NOOP, &[])
             .unwrap()

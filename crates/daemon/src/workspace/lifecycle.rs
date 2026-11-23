@@ -137,13 +137,24 @@ pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
     // Read-only *after* the read-write bind of its parent gitdir, or the parent
     // would put the writable original straight back on top of it.
     let late_ro_binds = vec![same(&layout.config_worktree())];
+    // Under bubblewrap `git` is the shim, which routes only the workspace's
+    // own repository to the private objects. Elsewhere there is no shim to
+    // read the routing, so git is told directly, for every repository.
+    #[cfg(unix)]
+    let git_env = if d.backend.name() == BWRAP_BACKEND {
+        layout.sandbox_git_routing_env()
+    } else {
+        layout.sandbox_git_env()
+    };
+    #[cfg(not(unix))]
+    let git_env = layout.sandbox_git_env();
     finish_spec(
         d,
         ws,
         rw_binds,
         vec![same(&layout.git_common)],
         late_ro_binds,
-        layout.sandbox_git_env(),
+        git_env,
     )
 }
 

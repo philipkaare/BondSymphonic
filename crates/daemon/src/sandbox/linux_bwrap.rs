@@ -52,8 +52,8 @@ impl Default for BwrapBackend {
 /// The daemon binary that `bwrap` executes as `sandbox-init`.
 ///
 /// `current_exe()` is the *test* binary under `cargo test`, so an explicit
-/// `BS_DAEMON_EXE` wins, then a `bondsymphonic-daemon` next to the running
-/// executable or one directory up (integration tests live in `target/*/deps`).
+/// `BS_DAEMON_EXE` wins, then the nearest `bondsymphonic-daemon` beside the
+/// running executable or in a directory above it -- see [`daemon_near`].
 fn daemon_exe() -> PathBuf {
     if let Some(p) = std::env::var_os("BS_DAEMON_EXE") {
         return PathBuf::from(p);
@@ -62,18 +62,29 @@ fn daemon_exe() -> PathBuf {
         Ok(p) => p,
         Err(_) => return "bondsymphonic-daemon".into(),
     };
-    let candidates = [
-        current.parent().map(|d| d.join("bondsymphonic-daemon")),
-        current
-            .parent()
-            .and_then(|d| d.parent())
-            .map(|d| d.join("bondsymphonic-daemon")),
-    ];
-    candidates
-        .into_iter()
-        .flatten()
+    daemon_near(&current).unwrap_or(current)
+}
+
+/// How many directories above the running executable [`daemon_near`] looks.
+const DAEMON_SEARCH_DEPTH: usize = 5;
+
+/// The `bondsymphonic-daemon` file nearest to `exe`: in its own directory, or
+/// in one of the few above it.
+///
+/// In production that is the daemon itself. Under `cargo test` it is the
+/// daemon binary Cargo built for the integration tests, which is not beside
+/// the test binary: Cargo's old layout put tests in `target/<profile>/deps`,
+/// one level below it, and the newer build-dir layout puts them in
+/// `target/<profile>/build/<package>/<hash>/out`, four levels below. Without
+/// it the fallback is the test harness itself, which `bwrap` then runs as
+/// `sandbox-init` and which dies on `--socket` -- every sandbox failing to
+/// start within its 5 s.
+fn daemon_near(exe: &Path) -> Option<PathBuf> {
+    exe.ancestors()
+        .skip(1)
+        .take(DAEMON_SEARCH_DEPTH)
+        .map(|dir| dir.join("bondsymphonic-daemon"))
         .find(|p| p.is_file())
-        .unwrap_or(current)
 }
 
 fn whoami() -> String {
@@ -255,7 +266,8 @@ fn base_env(spec: &SandboxSpec, user: &str) -> Vec<(String, String)> {
         ("USER".to_string(), user.to_string()),
         (
             "PATH".to_string(),
-            format!("{home_in}/.local/bin:{home_in}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+            // The git shim first, so `git` is always it. See `git_shim`.
+            format!("{}:{home_in}/.local/bin:{home_in}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", super::git_shim::SHIM_DIR),
         ),
         ("TERM".to_string(), "xterm-256color".into()),
         ("LANG".to_string(), "C.UTF-8".into()),
@@ -295,6 +307,12 @@ pub fn bwrap_args(
     if exe_is_hidden(spec, self_exe) {
         a.extend(["--ro-bind".into(), s(self_exe), s(&exe_in)]);
     }
+    // `git`, linked to the daemon, which runs as the git shim under that
+    // name. In `/opt`, which is always a tmpfs here, so the link is the
+    // sandbox's own and nothing on the host is touched.
+    let shim_dir = super::git_shim::SHIM_DIR;
+    a.extend(["--dir".into(), shim_dir.into()]);
+    a.extend(["--symlink".into(), s(&exe_in), format!("{shim_dir}/git")]);
     for (h, sb) in &spec.ro_binds {
         a.extend(["--ro-bind".into(), s(h), s(sb)]);
     }
@@ -525,6 +543,36 @@ impl SandboxHandle for BwrapHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both of Cargo's layouts: tests in `target/<profile>/deps`, and tests in
+    /// `target/<profile>/build/<package>/<hash>/out`. Either way the daemon
+    /// Cargo built is found, not the test binary asking.
+    #[test]
+    fn the_daemon_is_found_above_a_test_binary_in_either_cargo_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("target").join("debug");
+        let deps = profile.join("deps");
+        let out = profile
+            .join("build")
+            .join("bondsymphonic-daemon")
+            .join("0123abcd")
+            .join("out");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let daemon = profile.join("bondsymphonic-daemon");
+        std::fs::write(&daemon, b"").unwrap();
+        assert_eq!(
+            daemon_near(&deps.join("sandbox_it-1")),
+            Some(daemon.clone())
+        );
+        assert_eq!(daemon_near(&out.join("sandbox_it-1")), Some(daemon));
+        // A directory named like the daemon -- `build/bondsymphonic-daemon` --
+        // is not mistaken for it, and nothing at all is `None`.
+        let empty = tempfile::tempdir().unwrap();
+        let lone = empty.path().join("bondsymphonic-daemon").join("x");
+        std::fs::create_dir_all(&lone).unwrap();
+        assert_eq!(daemon_near(&lone.join("test")), None);
+    }
 
     /// The cheap guard for what the module documentation explains: every fork
     /// goes to one thread this process owns, whichever task asked and whatever
@@ -824,10 +872,18 @@ mod tests {
         };
         assert_eq!(set("HOME").as_deref(), Some("/home/bs"), "{s}");
         assert_eq!(set("USER").as_deref(), Some("bs"), "{s}");
+        // The git shim first, then the workspace home's own bin directories.
         assert!(
-            set("PATH").is_some_and(|p| p.starts_with("/home/bs/.local/bin:")),
+            set("PATH").is_some_and(|p| p.starts_with("/opt/bs/bin:/home/bs/.local/bin:")),
             "{s}"
         );
+        // And `git` in that first directory is the daemon, after the `/opt`
+        // tmpfs it is created in.
+        assert!(
+            s.contains("--symlink /usr/bin/bondsymphonic-daemon /opt/bs/bin/git"),
+            "{s}"
+        );
+        assert!(pos(&args, "--tmpfs /opt ").unwrap() < pos(&args, "--dir /opt/bs/bin").unwrap());
         assert_eq!(set("TERM").as_deref(), Some("xterm-256color"), "{s}");
         assert_eq!(set("LANG").as_deref(), Some("C.UTF-8"), "{s}");
         // The spec's own variables (git, proxy, workspace id) reach init too.

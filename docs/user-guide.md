@@ -325,6 +325,22 @@ long-lived token** (see [below](#a-long-lived-token-for-agents)). Pressing one
 runs that command in a terminal pane in the dialog, on the host rather than inside a sandbox, because a login has to
 write to your home directory. When the command exits the checks re-run.
 
+**Logging in to Claude Code is two steps, run one after the other.** Agents
+cannot start on the ordinary login alone, so **Log in to Claude Code** is step 1
+of 2: once the re-check sees the login worked, step 2, the long-lived token
+(`claude setup-token`), starts by itself in the same pane. You approve it in the
+browser the same way and paste the code again. The line above the terminal says
+which step is running, and ends with *Done: Claude Code is signed in, and agents
+use the long-lived token.* If the login did not work, step 2 does not start and
+the line says so. If the token was not saved, the line points at **Set up
+long-lived token** to try again.
+
+**GitHub opens its page in your desktop browser.** `gh auth login` prints a
+one-time code and the device page's URL. The IDE opens that URL on the desktop
+(see the sign-in link below). `gh`'s own *Press Enter to open … in your browser*
+does nothing visible, because there is no browser in the distro. It no longer
+reports *Failed opening a web browser*.
+
 **Log out again from the same place.** A check that is *passing* carries a
 button too — **Log out of Claude Code** or **Log out of GitHub** — which runs
 `claude auth logout` or `gh auth logout` in the same terminal pane. You want it
@@ -368,9 +384,9 @@ Use the row when the automatic open did not work, or when you want to finish the
 sign-in on another machine. The row goes away when the terminal exits, because
 the URL it carried is spent.
 
-**Paste the code with Ctrl+V.** The code the browser gives back is too long to
+**Paste the code with Ctrl+V (⌘V on a Mac).** The code the browser gives back is too long to
 read off a screen and type in again, so the terminal pane takes a paste:
-**Ctrl+V**, **Ctrl+Shift+V** or **Shift+Insert**, and right-clicking the pane
+**Ctrl+V**, **Ctrl+Shift+V** or **Shift+Insert** (on a Mac, **⌘V**), and right-clicking the pane
 offers **Paste** as well. Every terminal in the IDE takes one, not just this
 pane. AltGr characters are unaffected -- Windows reports AltGr as Ctrl+Alt, and
 a paste is Ctrl without Alt.
@@ -424,9 +440,12 @@ new agents start with.
 
 ### A long-lived token for agents
 
-The `claude_auth` row carries a second button, **Set up long-lived token**,
-beside whichever of **Log in to Claude Code** or **Log out of Claude Code**
-the row already offers. It disappears once the row's own detail says the
+**Log in to Claude Code** sets this up as its second step (see
+[above](#first-run-and-settings--setup)), so you normally never press this button
+yourself. The `claude_auth` row carries it anyway, as **Set up long-lived
+token**, beside whichever of **Log in to Claude Code** or **Log out of Claude
+Code** the row already offers, for renewing the token or retrying a step 2
+that did not finish. It disappears once the row's own detail says the
 token is already there, and comes back if you ever log out again.
 
 **What it is.** A token good for one year, which agents use instead of your
@@ -947,7 +966,10 @@ and a terminal tab has no harness to switch.
 
 The pane replays the whole transcript from the daemon whenever it attaches, so
 an IDE restarted while the daemon kept running finds its tabs where it left
-them.
+them. A resumed agent (a Restart, the automatic start of a stopped tab, or a
+change of model or permission mode) is a new agent, but its transcript starts
+with the whole conversation it resumes. The tab therefore keeps the history
+it had rather than starting empty.
 
 ### What agents can do with git and GitHub
 
@@ -1104,6 +1126,14 @@ interrupt when nothing is -- so it still stops a runaway command, and pressing
 it twice always does. Typing clears the selection, because the text it was made
 on is about to move.
 
+**On a Mac, ⌘C and ⌘V.** **⌘C** always copies, even with nothing selected, and
+never interrupts. **⌘V** pastes. The Control key is the terminal's Control, so
+**⌃C** is the interrupt and **⌃D**, **⌃R** and the rest reach the program as
+they would in Terminal.app. Other ⌘ chords belong to the IDE and are not sent to the
+program. The **Edit** menu's Cut, Copy, Paste, Undo and Select All act on
+whatever has the focus (a terminal, the prompt box, a field in a dialog), not
+only on the editor.
+
 **Questions the terminal is asked are answered.** Programs ask a terminal where
 the cursor is, what it is and what colours it uses, and they stop reading input
 until the answer comes back. `gh auth login` does this before each of its
@@ -1149,8 +1179,13 @@ shell reloads an unmodified tab silently, keeping the caret and the scroll
 position; on a tab with unsaved edits a bar offers reload or keep.
 
 **Changes** lists the files that differ from the workspace's base branch with
-their status and their +/- counts, and follows the worktree without your
-pressing Refresh. Double-clicking a row opens a side-by-side diff: aligned rows,
+their status and their +/- counts. That includes committed work, so it is not the
+same list as `git status`, which forgets a file once it is committed. It follows
+the worktree without your pressing Refresh, and it follows git as well: a
+commit, a `git add`, a reset or a rebase by the agent refreshes it even when no
+file in the worktree changed, and so does the base branch moving. Files under a
+directory named `node_modules` or `target` are not watched, and neither is a
+checkout on a 9P mount; Refresh brings those in. Double-clicking a row opens a side-by-side diff: aligned rows,
 green and red tints, two line-number columns, scrolling synchronised in both
 axes, and the same highlighting as the editor. A diff does not reload when the
 file changes underneath it — close it and open it again.
@@ -1238,20 +1273,35 @@ says why: `failed` with the exit code and its last lines if it never came ready,
 Bridging is raw bytes both ways, so WebSockets and hot reload work over the same
 port.
 
-**The allowlist toast.** A sandbox has only loopback in its network namespace;
-everything goes through a per-workspace proxy that checks the host against an
-allowlist and refuses anything else with a 403. The default list covers
-Anthropic, npm, PyPI, crates.io and GitHub. When a connection is refused, the
-Run panel shows a toast on that workspace: **Blocked network access to
-`<host>`**, with **Allow host**, **Always block** and **Dismiss**. Allow host adds the host to
-that workspace's allowlist and the daemon puts the new list in front of the
-proxy at once — the next attempt goes through with nothing restarted — and
-writes it into the registry, so it survives a daemon restart.
+**Hosts that are not allowed wait for you.** A sandbox has only loopback in its
+network namespace; everything goes through a per-workspace proxy that checks the
+host against an allowlist. The default list covers Anthropic, npm, PyPI,
+crates.io and GitHub. A connection to any other host is *held* for 90 seconds
+while you are asked, instead of being refused straight away:
 
-**Always block** saves an explicit block for that workspace and suppresses future
-network notices for the host. The same choice is available on inline network
-notices in an agent's transcript. Block rules override allowed hosts and backend
-model-server grants.
+- **The network bar.** When the agent asked, the request appears on a bar pinned
+  above the agent's prompt box, beside the permission bar, so it stays in view
+  while the agent keeps working. It shows *The agent wants to reach `<host>` … It
+  is waiting for you: 1:23 left*, with **Allow**, **Always block** and ✕. There
+  is one row per host, and repeats count up on it.
+- **Allow** adds the host to that workspace's allowlist. The daemon puts the new
+  list in front of the proxy at once, so *the waiting request itself* goes
+  through, and saves it in the registry so it survives a daemon restart.
+- **Always block** saves an explicit block for the workspace. The waiting
+  request is refused at once, and later ones for that host are refused silently.
+  Block rules override allowed hosts and backend model-server grants.
+- **✕** stops asking. The request is refused when its 90 seconds run out.
+- **No answer.** After 90 seconds the request fails with a 403 that says the user
+  was asked and did not allow the host.
+- **What the agents are told.** Agents are told, in their instructions, that a
+  request to a host that is not allowed waits up to 90 seconds for the user.
+  They are told not to cancel or retry it while it waits, and, if it is refused,
+  to tell you which host they need rather than working around it.
+- **The Run panel toast.** A request no agent's pane takes (one from a run or a
+  terminal, or from a tab that is not showing that agent) still gets the Run
+  panel toast on that workspace: **Blocked network access to `<host>`**, with
+  **Allow host**, **Always block** and **Dismiss**. The request waits for that
+  toast's answer the same way.
 
 Open **Workspace → Network rules…** to edit the workspace's effective allowed and
 blocked hosts, one host or `*.example.com` wildcard per line. **Save** validates

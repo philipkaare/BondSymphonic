@@ -48,7 +48,26 @@ impl Layout {
     pub fn config_worktree(&self) -> PathBuf {
         self.worktree_gitdir().join("config.worktree")
     }
+    /// The same routing for a sandbox that runs the git shim
+    /// ([`crate::sandbox::git_shim`]): under names git does not read, so only
+    /// a command on the workspace's own repository is routed to the private
+    /// directory, and every other repository works as plain git.
+    #[cfg(unix)]
+    pub fn sandbox_git_routing_env(&self) -> Vec<(String, String)> {
+        use crate::sandbox::git_shim::{ALTERNATES_ENV, COMMON_ENV, OBJECTS_ENV};
+        vec![
+            (COMMON_ENV.into(), path_arg(&self.git_common)),
+            (OBJECTS_ENV.into(), path_arg(&self.objects_dir)),
+            (
+                ALTERNATES_ENV.into(),
+                path_arg(&self.git_common.join("objects")),
+            ),
+        ]
+    }
     /// Env for git *inside* the sandbox: new objects go to the private dir.
+    ///
+    /// For every git in it, whatever repository it is in, so only for a
+    /// backend without the git shim: see [`Layout::sandbox_git_routing_env`].
     pub fn sandbox_git_env(&self) -> Vec<(String, String)> {
         vec![
             ("GIT_OBJECT_DIRECTORY".into(), path_arg(&self.objects_dir)),

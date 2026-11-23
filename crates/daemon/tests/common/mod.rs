@@ -294,6 +294,13 @@ impl Client {
     }
 }
 
+/// Refuses a host that is not allowed at once rather than holding the
+/// connection for the user's answer, which no test here gives. The suites are
+/// about the refusal; the hold has tests of its own (`network_approval.rs`).
+pub fn no_approval_wait() {
+    std::env::set_var("BS_NETWORK_APPROVAL_WAIT_MS", "0");
+}
+
 /// Binds a server on an ephemeral port with a workspace handler over `root`.
 pub async fn start_daemon(root: &std::path::Path) -> (u16, String, Arc<Daemon>, CancellationToken) {
     start_daemon_with_backend(root, backend_for("noop")).await
@@ -310,6 +317,7 @@ pub async fn start_daemon_with_backend(
     root: &std::path::Path,
     backend: Arc<dyn SandboxBackend>,
 ) -> (u16, String, Arc<Daemon>, CancellationToken) {
+    no_approval_wait();
     let server = Server::bind(ServerConfig::default()).await.unwrap();
     let daemon = Daemon::new(DataDirs::new(root), backend, server.event_bus()).unwrap();
     let system = SystemHandler {

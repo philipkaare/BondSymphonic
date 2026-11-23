@@ -101,6 +101,12 @@ enum Cmd {
 /// the port forwarder are ordinary async programs, so each builds a runtime of
 /// its own.
 fn main() -> Result<()> {
+    // Run as `git`: the sandbox's git shim, linked to this binary. Before
+    // clap, which would read git's arguments as this program's.
+    #[cfg(unix)]
+    if sandbox::git_shim::invoked_as_git() {
+        sandbox::git_shim::run();
+    }
     let args = Args::parse();
     match args.cmd {
         #[cfg(target_os = "linux")]

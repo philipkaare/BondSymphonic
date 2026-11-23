@@ -321,6 +321,102 @@ async fn bwrap_workspace_protects_main_branch_and_shared_objects() {
     lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
 }
 
+/// Only the workspace's own repository is routed to its private objects.
+/// The routing used to be two git variables set for every process in the
+/// sandbox, which made any other repository unreadable (`bad object HEAD`)
+/// and put a repository the agent made itself -- `git init` in `/tmp`, a test
+/// suite's scratch repo -- into the workspace's object store. Now `git` is
+/// the shim, and a different repository is plain git.
+#[tokio::test]
+async fn git_in_a_bwrap_workspace_routes_only_the_workspace_repository() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let daemon = Daemon::new(
+        DataDirs::new(dir.path().join("data")),
+        backend_for("linux_bwrap"),
+        server.event_bus(),
+    )
+    .unwrap();
+    let ws = lifecycle::create(
+        &daemon,
+        WorkspaceCreateParams {
+            repo_path: repo.to_string_lossy().into(),
+            base_branch: "main".into(),
+            name: "route".into(),
+            init_if_missing: false,
+            in_place: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+    let handle = daemon.sandbox(&ws.id).unwrap();
+    let wt = ws.worktree_path.clone();
+
+    // Nothing sets git's own object variables for the whole sandbox any more.
+    let (code, out) = run_in(&handle, "env | grep '^GIT_' || true").await;
+    assert_eq!(code, 0, "{out}");
+    assert!(out.trim().is_empty(), "git variables leaked: {out}");
+
+    // The workspace still commits, into its private objects.
+    let (code, out) = run_in(
+        &handle,
+        &format!(
+            "cd '{wt}' && git -c user.name=a -c user.email=a@a commit -q --allow-empty -m routed && git rev-parse HEAD"
+        ),
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    let commit = out.trim().to_owned();
+    let layout = lifecycle::layout_for(&daemon, &daemon.workspace(&ws.id).unwrap())
+        .await
+        .unwrap();
+    let loose = |root: &std::path::Path| root.join(&commit[..2]).join(&commit[2..]);
+    assert!(
+        loose(&layout.objects_dir).is_file(),
+        "the workspace commit is not in the private objects"
+    );
+
+    // A repository of the agent's own is plain git: it commits, reads its
+    // history back, and keeps its objects in its own `.git`.
+    let (code, out) = run_in(
+        &handle,
+        "set -e; git init -q /tmp/other; cd /tmp/other; \
+         git -c user.name=a -c user.email=a@a commit -q --allow-empty -m mine; \
+         git log --format=%s -1; git rev-parse HEAD; \
+         find .git/objects -type f | wc -l",
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.first().copied(), Some("mine"), "{out}");
+    let other = lines[1].to_owned();
+    let own_objects: usize = lines[2].trim().parse().unwrap();
+    assert!(own_objects >= 2, "the new repo kept no objects: {out}");
+    let other_loose = layout.objects_dir.join(&other[..2]).join(&other[2..]);
+    assert!(
+        !other_loose.exists(),
+        "another repository's commit landed in the workspace's objects"
+    );
+
+    // And `git -C` from inside the worktree into that repository is routed by
+    // the repository it names, not the directory it was typed in.
+    let (code, out) = run_in(
+        &handle,
+        &format!("cd '{wt}' && git -C /tmp/other log --format=%s -1"),
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.trim(), "mine");
+
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+}
+
 /// The real Claude Code binary has to be reachable *inside* a workspace
 /// sandbox, which is the one thing the fake `claude` the rest of the suite runs
 /// can never show.
@@ -1762,11 +1858,10 @@ async fn nothing_from_the_daemon_environment_reaches_bwrap_or_init() {
         "{out}"
     );
     assert!(
-        lines
-            .next()
-            .is_some_and(|p| p.starts_with(&format!("/home/{user}/.local/bin:"))
-                && p.ends_with(":/usr/bin:/sbin:/bin")),
-        "PATH must be the one the backend sets: {out}"
+        lines.next().is_some_and(|p| p
+            .starts_with(&format!("/opt/bs/bin:/home/{user}/.local/bin:"))
+            && p.ends_with(":/usr/bin:/sbin:/bin")),
+        "PATH must be the one the backend sets, the git shim first: {out}"
     );
     handle.shutdown().await.unwrap();
 }

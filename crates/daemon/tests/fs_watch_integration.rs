@@ -73,9 +73,15 @@ async fn reading_the_worktree_is_not_a_change_but_writing_it_is() {
 
     // A plain read, then the two ways git reads the whole worktree: directly,
     // and through the `workspace.changes` request that closed the loop.
+    //
+    // `--no-optional-locks`: a plain `git status` may rewrite the index to
+    // refresh its stat cache, and the index is git state the watch follows
+    // now (see `git_state_changes_are_announced_without_paths`). That is one
+    // refresh, not a loop: the daemon's own status, the one a refresh runs,
+    // never writes it.
     std::fs::read(worktree.join("README.md")).unwrap();
     let st = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["--no-optional-locks", "status", "--porcelain"])
         .current_dir(&worktree)
         .status()
         .unwrap();
@@ -300,11 +306,13 @@ async fn ignored_directories_are_not_watched_and_new_directories_are() {
         installed >= 1,
         "the watch did not land within the settle time"
     );
-    // The worktree, src/, and the root's own entry: three, and a handful of
-    // slack for anything else the fixture leaves in the tree. `< SUBDIRS`
-    // would let 199 leaked watches through and still pass.
+    // The worktree, src/, and the root's own entry: three; the directories of
+    // the workspace's git state files (its gitdir and reflog, the branch ref
+    // directories and the common dir): five more; and a handful of slack for
+    // anything else the fixture leaves in the tree. `< SUBDIRS` would let 199
+    // leaked watches through and still pass.
     assert!(
-        installed <= 10,
+        installed <= 16,
         "enabling the watch installed {installed} inotify watches; a watch per directory under          node_modules/ would be about {SUBDIRS}"
     );
 
@@ -440,4 +448,62 @@ async fn enabling_a_big_tree_does_not_block_other_workspaces_watches() {
         "enable took {enable_took:?} and disable {disable_took:?}: nothing that merely \
          schedules a task or aborts one costs that, however loaded the host is"
     );
+}
+
+/// What the agent's `git status` says moves without a file in the worktree
+/// changing: a commit, a `git add`. The Changes list used to hear nothing of
+/// either and went on showing the state before the agent's last git command.
+/// The watch follows the workspace's git state files too, and a change there
+/// is an `fs.changed` naming no path -- while the Changes list's own refresh,
+/// which runs `git status`, announces nothing.
+#[tokio::test]
+async fn git_state_changes_are_announced_without_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    let (port, token, _daemon, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "gitstate").await;
+    let worktree = std::path::Path::new(&ws.worktree_path).to_path_buf();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=a", "-c", "user.email=a@a"])
+            .args(args)
+            .current_dir(&worktree)
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+
+    // Written before the watch, so its own event cannot be mistaken for the
+    // ones this test is about.
+    std::fs::write(worktree.join("new.txt"), "x\n").unwrap();
+    watch(&mut c, &ws.id).await;
+
+    // The Changes list's refresh is a read, git's included.
+    c.call(Request::WorkspaceChanges(WorkspaceIdParams {
+        workspace_id: ws.id.clone(),
+    }))
+    .await
+    .unwrap();
+    assert_eq!(
+        wait_for_fs_changed(&mut c, &ws.id, Duration::from_millis(800)).await,
+        None,
+        "a workspace.changes call announced a change of its own"
+    );
+
+    git(&["add", "new.txt"]);
+    let staged = wait_for_fs_changed(&mut c, &ws.id, Duration::from_secs(5))
+        .await
+        .expect("git add was not announced");
+    assert!(staged.is_empty(), "{staged:?}");
+
+    git(&["commit", "-q", "-m", "add new"]);
+    let committed = wait_for_fs_changed(&mut c, &ws.id, Duration::from_secs(5))
+        .await
+        .expect("the commit was not announced");
+    assert!(committed.is_empty(), "{committed:?}");
+
+    cancel.cancel();
 }

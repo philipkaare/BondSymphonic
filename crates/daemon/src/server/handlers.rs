@@ -310,9 +310,14 @@ impl Handler for WorkspaceHandler {
             }
             Request::FsWatch(p) => {
                 if p.enable {
-                    let root = d.workspace(&p.workspace_id)?.worktree_path;
-                    d.watchers
-                        .enable(p.workspace_id.clone(), root, d.events.clone());
+                    let ws = d.workspace(&p.workspace_id)?;
+                    let git = crate::workspace::changes::git_state_files(d, &ws).await;
+                    d.watchers.enable_with_git(
+                        p.workspace_id.clone(),
+                        ws.worktree_path,
+                        git,
+                        d.events.clone(),
+                    );
                 } else {
                     d.watchers.disable(&p.workspace_id);
                 }

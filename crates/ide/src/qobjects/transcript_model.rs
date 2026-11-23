@@ -56,6 +56,9 @@ pub mod qobject {
         #[qproperty(QString, commands_json)]
         #[qproperty(i32, turns)]
         #[qproperty(QString, pending_json)]
+        // The network bar's rows (`Transcript::network_json`): connections the
+        // workspace's proxy is holding for the user, and what became of them.
+        #[qproperty(QString, network_json)]
         #[qproperty(bool, busy)]
         // The `AgentStartOptions` the tab was created with, as the New Agent
         // dialog built them, or empty. The model never sends them anywhere; it
@@ -196,10 +199,10 @@ pub mod qobject {
         #[qinvokable]
         fn expand_earlier(self: Pin<&mut TranscriptModel>) -> bool;
 
-        /// Shows a network notice from `backend`'s sandbox in this
-        /// transcript, whose pane runs a `pane_adapter` agent, coalesced with
-        /// this turn's item for the same host. False, changing nothing, when
-        /// the notice is not this agent's to show (see
+        /// Puts a network notice from `backend`'s sandbox on this pane's
+        /// network bar, whose pane runs a `pane_adapter` agent, folded into
+        /// the row for the same host. False, changing nothing, when the
+        /// notice is not this agent's to show (see
         /// `Transcript::takes_denial`); the caller then falls back to the
         /// toast.
         #[qinvokable]
@@ -212,15 +215,24 @@ pub mod qobject {
             pane_adapter: QString,
         ) -> bool;
 
-        /// The inline "Allow for this workspace" on item `index`: adds its
-        /// host to the workspace allowlist, as the toast's "Allow host" does,
-        /// and moves every item for that host to allowed (or the one clicked
-        /// to failed, with the reason).
+        /// The network bar's "Allow" on `host`'s row: adds the host to the
+        /// workspace allowlist, as the toast's "Allow host" does. The proxy
+        /// is holding the request, so this lets it through.
         #[qinvokable]
-        fn allow_denied_host(self: Pin<&mut TranscriptModel>, index: i32);
+        fn allow_denied_host(self: Pin<&mut TranscriptModel>, host: QString);
 
+        /// "Always block" on `host`'s row: adds it to the workspace's block
+        /// rules, which also ends the held request at once.
         #[qinvokable]
-        fn block_denied_host(self: Pin<&mut TranscriptModel>, index: i32);
+        fn block_denied_host(self: Pin<&mut TranscriptModel>, host: QString);
+
+        /// Takes `host`'s row off the bar without answering.
+        #[qinvokable]
+        fn dismiss_network_request(self: Pin<&mut TranscriptModel>, host: QString);
+
+        /// Drops the rows whose time is up. The bar calls it on its tick.
+        #[qinvokable]
+        fn expire_network_requests(self: Pin<&mut TranscriptModel>);
     }
 
     impl cxx_qt::Threading for TranscriptModel {}
@@ -249,6 +261,7 @@ pub struct TranscriptModelRust {
     commands_json: QString,
     turns: i32,
     pending_json: QString,
+    network_json: QString,
     busy: bool,
     options_json: QString,
     /// The state of record. Every property above is derived from it.
@@ -306,6 +319,7 @@ impl Default for TranscriptModelRust {
             commands_json: QString::from("[]"),
             turns: 0,
             pending_json: QString::from(""),
+            network_json: QString::from("[]"),
             busy: false,
             options_json: QString::from(""),
             transcript,
@@ -467,6 +481,8 @@ impl qobject::TranscriptModel {
         self.as_mut().set_workspace_id(workspace_id);
         self.as_mut().set_agent_id(agent_id.clone());
         self.as_mut().set_pending_json(QString::from(""));
+        // The bar's rows were the last agent's held connections.
+        self.as_mut().set_network_json(QString::from("[]"));
         self.as_mut().set_busy(true);
         self.as_mut().publish_totals();
 
@@ -727,27 +743,46 @@ impl qobject::TranscriptModel {
         {
             return false;
         }
-        let applied = self
+        let changed = self
             .as_mut()
             .rust_mut()
             .transcript
-            .note_network_denied(&notice);
-        self.announce(applied);
+            .note_network_denied(&notice, now_ms());
+        if changed {
+            self.publish_network();
+        }
         true
     }
 
-    pub fn allow_denied_host(mut self: Pin<&mut Self>, index: i32) {
-        let Ok(i) = usize::try_from(index) else {
-            return;
-        };
+    /// Republishes the network bar's rows.
+    fn publish_network(mut self: Pin<&mut Self>) {
+        let json = self.as_ref().rust().transcript.network_json();
+        self.as_mut().set_network_json(QString::from(&json));
+    }
+
+    pub fn dismiss_network_request(mut self: Pin<&mut Self>, host: QString) {
+        let host = host.to_string();
+        if self.as_mut().rust_mut().transcript.dismiss_network(&host) {
+            self.publish_network();
+        }
+    }
+
+    pub fn expire_network_requests(mut self: Pin<&mut Self>) {
+        if self.as_mut().rust_mut().transcript.expire_network(now_ms()) {
+            self.publish_network();
+        }
+    }
+
+    pub fn allow_denied_host(mut self: Pin<&mut Self>, host: QString) {
+        let host = host.to_string();
         let workspace = self.as_ref().workspace_id().to_string();
         if workspace.is_empty() {
             return;
         }
-        let Some(host) = self.as_mut().rust_mut().transcript.begin_allow(i) else {
+        if !self.as_mut().rust_mut().transcript.begin_allow(&host) {
             return;
-        };
-        self.as_mut().item_changed(index);
+        }
+        self.as_mut().publish_network();
         let generation = self.as_ref().rust().generation;
         let shared = match require_connection() {
             Ok(shared) => shared,
@@ -770,29 +805,26 @@ impl qobject::TranscriptModel {
         });
     }
 
-    pub fn block_denied_host(mut self: Pin<&mut Self>, index: i32) {
-        let Ok(i) = usize::try_from(index) else {
-            return;
-        };
+    pub fn block_denied_host(mut self: Pin<&mut Self>, host: QString) {
+        let host = host.to_string();
         let workspace = self.as_ref().workspace_id().to_string();
         if workspace.is_empty() {
             return;
         }
-        let Some(host) = self.as_mut().rust_mut().transcript.begin_block(i) else {
+        if !self.as_mut().rust_mut().transcript.begin_block(&host) {
             return;
-        };
-        self.as_mut().item_changed(index);
+        }
+        self.as_mut().publish_network();
         let generation = self.as_ref().rust().generation;
         let shared = match require_connection() {
             Ok(shared) => shared,
             Err(message) => {
-                let changed = self
-                    .as_mut()
-                    .rust_mut()
-                    .transcript
-                    .finish_block(&host, Err(message.to_owned()));
-                for i in changed {
-                    self.as_mut().item_changed(index_of(i));
+                if self.as_mut().rust_mut().transcript.finish_block(
+                    &host,
+                    Err(message.to_owned()),
+                    now_ms(),
+                ) {
+                    self.publish_network();
                 }
                 return;
             }
@@ -804,9 +836,12 @@ impl qobject::TranscriptModel {
                 if q.as_ref().rust().generation != generation {
                     return;
                 }
-                let changed = q.as_mut().rust_mut().transcript.finish_block(&host, result);
-                for i in changed {
-                    q.as_mut().item_changed(index_of(i));
+                if q.as_mut()
+                    .rust_mut()
+                    .transcript
+                    .finish_block(&host, result, now_ms())
+                {
+                    q.publish_network();
                 }
             });
         });
@@ -817,23 +852,13 @@ impl qobject::TranscriptModel {
         if let Err(message) = &result {
             tracing::warn!("transcript: allow {host}: {message}");
         }
-        let changed = self
+        if self
             .as_mut()
             .rust_mut()
             .transcript
-            .finish_allow(host, result);
-        for i in changed {
-            self.as_mut().item_changed(index_of(i));
-        }
-    }
-
-    /// Raises the signal for one change to the item list.
-    fn announce(self: Pin<&mut Self>, applied: Applied) {
-        match applied {
-            Applied::Appended(i) => self.item_appended(index_of(i)),
-            Applied::Changed(i) => self.item_changed(index_of(i)),
-            Applied::Reset => self.reset_items(),
-            Applied::Nothing => {}
+            .finish_allow(host, result, now_ms())
+        {
+            self.publish_network();
         }
     }
 
@@ -1220,6 +1245,15 @@ fn live_event(event: Event, agent: &AgentId) -> Option<LiveEvent> {
         } if &agent_id == agent => Some(LiveEvent::State(state, detail)),
         _ => None,
     }
+}
+
+/// Milliseconds since the Unix epoch: the clock the network bar's deadlines
+/// are kept in, which is the one `QDateTime::currentMSecsSinceEpoch` reads.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 /// A transcript index as Qt sees it. Indices come from a `Vec` the same

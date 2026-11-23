@@ -1,6 +1,7 @@
 #include "TranscriptView.h"
 #include "AgentChoices.h"
 #include "CodeView.h"
+#include "NetworkBar.h"
 #include "PermissionBar.h"
 #include "PromptInput.h"
 #include "Theme.h"
@@ -16,6 +17,7 @@
 #include <QFontMetrics>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QDateTime>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -69,10 +71,6 @@ constexpr int kCoalesceMs = 50;
 /// `applySmallGrey`, which is the same observation from the other side.
 const char* kKindResult = "result";
 const char* kKindSystem = "system";
-
-/// A host the proxy blocked while this agent was working. See
-/// `TranscriptItem::NetworkDenied`.
-const char* kKindNetworkDenied = "network_denied";
 
 /// MULTIPLICATION SIGN, for a host blocked more than once. A code point for
 /// the same reason as the middle dot above.
@@ -233,6 +231,12 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     m_progress->hide();
     outer->addWidget(m_progress);
 
+    // Connections the proxy is holding for an answer, pinned here rather than
+    // inline so they cannot scroll away while the agent goes on working. See
+    // `NetworkBar`.
+    m_network = new NetworkBar(this);
+    outer->addWidget(m_network);
+
     m_permission = new PermissionBar(this);
     outer->addWidget(m_permission);
 
@@ -374,6 +378,28 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
                      &TranscriptView::onPermissionRequested);
     QObject::connect(model, &TranscriptModel::permissionCleared, this,
                      [this] { m_permission->clear(); });
+    QObject::connect(model, &TranscriptModel::networkJsonChanged, this,
+                     &TranscriptView::onNetworkChanged);
+    QObject::connect(m_network, &NetworkBar::allowRequested, this, [this](const QString& host) {
+        if (!m_model.isNull()) {
+            m_model->allowDeniedHost(host);
+        }
+    });
+    QObject::connect(m_network, &NetworkBar::blockRequested, this, [this](const QString& host) {
+        if (!m_model.isNull()) {
+            m_model->blockDeniedHost(host);
+        }
+    });
+    QObject::connect(m_network, &NetworkBar::dismissRequested, this, [this](const QString& host) {
+        if (!m_model.isNull()) {
+            m_model->dismissNetworkRequest(host);
+        }
+    });
+    QObject::connect(m_network, &NetworkBar::expireRequested, this, [this] {
+        if (!m_model.isNull()) {
+            m_model->expireNetworkRequests();
+        }
+    });
     // A failed request is not this view's to report: the model's
     // `requestFailed` goes to the banner over the pane, which puts it in
     // plain words and offers to send it again. The frames are left exactly as
@@ -563,6 +589,13 @@ void TranscriptView::onPermissionRequested() {
         return;
     }
     m_permission->show(pending);
+}
+
+void TranscriptView::onNetworkChanged() {
+    if (m_model.isNull()) {
+        return;
+    }
+    m_network->setRequests(QJsonDocument::fromJson(m_model->getNetworkJson().toUtf8()).array());
 }
 
 void TranscriptView::onBusyChanged() {
@@ -1054,9 +1087,6 @@ QWidget* TranscriptView::makeFrame(const QJsonObject& item, int index) {
         });
         return frame;
     }
-    if (kind == QString::fromUtf8(kKindNetworkDenied)) {
-        return makeDenialFrame(item, index);
-    }
     if (kind == QStringLiteral("notice")) {
         return makeNoticeFrame(item);
     }
@@ -1101,83 +1131,6 @@ QWidget* TranscriptView::makeFrame(const QJsonObject& item, int index) {
         label->setMinimumWidth(1);
     }
     label->setText(bodyText(item));
-    return frame;
-}
-
-QWidget* TranscriptView::makeDenialFrame(const QJsonObject& item, int index) {
-    const QString host = item.value(QStringLiteral("host")).toString();
-    const QString status = item.value(QStringLiteral("status")).toString();
-    const bool allowable = item.value(QStringLiteral("allowable")).toBool();
-    const bool allowed = status == QLatin1String("allowed");
-    const bool alwaysBlocked = status == QLatin1String("always_blocked");
-    const int count = item.value(QStringLiteral("count")).toInt();
-
-    auto* frame = new QFrame(m_scroll->widget());
-    frame->setObjectName(QStringLiteral("TranscriptNetworkDenied"));
-    frame->setProperty(kKindProperty, QString::fromUtf8(kKindNetworkDenied));
-    frame->setFrameShape(QFrame::StyledPanel);
-    frame->setAutoFillBackground(true);
-    QPalette framePalette = frame->palette();
-    // Amber while it is in the way, green once it no longer is: the colour
-    // is the first thing that says whether this still needs an answer.
-    framePalette.setColor(QPalette::Window,
-                          codeview::wash(palette().base().color(),
-                                         allowed ? theme::added() : theme::changed(),
-                                         codeview::kWashAmount));
-    frame->setPalette(framePalette);
-    auto* layout = new QHBoxLayout(frame);
-    layout->setContentsMargins(6, 4, 6, 4);
-
-    QString text = item.value(QStringLiteral("text")).toString();
-    if (count > 1) {
-        text += QStringLiteral(" (") + QChar(kTimes) + QString::number(count) + QStringLiteral(")");
-    }
-    if (allowed) {
-        text += QStringLiteral("\nAllowed for this workspace. The agent can reach %1 on its next try.")
-                    .arg(host);
-    } else if (alwaysBlocked) {
-        text += QStringLiteral("\nAlways blocked for this workspace. Edit this in Workspace → Network rules…");
-    } else if (status == QLatin1String("failed")) {
-        text += QStringLiteral("\nCould not save the network decision: %1")
-                    .arg(item.value(QStringLiteral("error")).toString());
-    }
-    auto* label = new QLabel(text, frame);
-    label->setObjectName(QString::fromUtf8(kBodyName));
-    label->setTextFormat(Qt::PlainText);
-    label->setWordWrap(true);
-    label->setMinimumWidth(1);
-    label->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    layout->addWidget(label, 1);
-
-    if (allowable && !allowed && !alwaysBlocked) {
-        const bool allowing = status == QLatin1String("allowing");
-        auto* button = new QPushButton(
-            allowing ? QStringLiteral("Saving") + QChar(kEllipsis)
-                     : status == QLatin1String("failed") ? QStringLiteral("Try again")
-                                                         : QStringLiteral("Allow for this workspace"),
-            frame);
-        button->setObjectName(QStringLiteral("TranscriptAllowHost"));
-        button->setToolTip(
-            QStringLiteral("Add %1 to this workspace's network allowlist").arg(host));
-        button->setEnabled(!allowing);
-        layout->addWidget(button, 0, Qt::AlignTop);
-        QObject::connect(button, &QPushButton::clicked, this, [this, index] {
-            if (!m_model.isNull()) {
-                // Answers with `itemChanged`, which rebuilds this frame.
-                m_model->allowDeniedHost(index);
-            }
-        });
-    }
-    if (!allowed && !alwaysBlocked) {
-        auto* block = new QPushButton(QStringLiteral("Always block"), frame);
-        block->setObjectName(QStringLiteral("TranscriptBlockHost"));
-        block->setToolTip(QStringLiteral("Always block %1 for this workspace").arg(host));
-        block->setEnabled(status != QLatin1String("allowing"));
-        layout->addWidget(block, 0, Qt::AlignTop);
-        QObject::connect(block, &QPushButton::clicked, this, [this, index] {
-            if (!m_model.isNull()) { m_model->blockDeniedHost(index); }
-        });
-    }
     return frame;
 }
 
@@ -1322,11 +1275,9 @@ void TranscriptView::updateFrame(int index, const QJsonObject& item) {
             return;
         }
     } else if (frame->property(kKindProperty).toString() == kind &&
-               kind != QString::fromUtf8(kKindNetworkDenied) && kind != QStringLiteral("notice") &&
-               kind != QStringLiteral("queued")) {
+               kind != QStringLiteral("notice") && kind != QStringLiteral("queued")) {
         // A notice or a queued message changes its buttons, not its text, so
-        // those two are rebuilt below rather than relabelled here; a denial
-        // changes both.
+        // those two are rebuilt below rather than relabelled here.
         QLabel* label = bodyLabel(frame);
         if (label != nullptr) {
             if (kind == QStringLiteral("assistant")) {
@@ -2129,95 +2080,38 @@ extern "C" std::int32_t bs_widget_test_transcript_gate_shows_the_cli_auth_failur
     return 0;
 }
 
-namespace {
-
-/// One blocked-host item as the model serialises it.
-QString denialItem(const QString& status, int count, bool allowable) {
-    QJsonObject item;
-    item.insert(QStringLiteral("kind"), QStringLiteral("network_denied"));
-    item.insert(QStringLiteral("host"), QStringLiteral("blocked.example"));
-    item.insert(QStringLiteral("count"), count);
-    item.insert(QStringLiteral("allowable"), allowable);
-    item.insert(QStringLiteral("text"),
-                QStringLiteral("Blocked a connection to blocked.example"));
-    item.insert(QStringLiteral("status"), status);
-    item.insert(QStringLiteral("error"), QStringLiteral("daemon said no"));
-    return QString::fromUtf8(QJsonDocument(item).toJson(QJsonDocument::Compact));
-}
-
-} // namespace
-
-/// A host the proxy blocked is a line in the agent's own transcript with its
-/// own Allow button, and the line says where allowing it got to: blocked (with
-/// how many times), allowing, failed with the reason, and allowed with no
-/// button left. A refused tunnel is shown the same way but never offers Allow.
-extern "C" std::int32_t bs_widget_test_transcript_shows_a_blocked_host_inline() {
+/// A connection the proxy is holding shows on the network bar at the bottom of
+/// the pane, not inline among the items, and the bar follows the model's
+/// `networkJson`: up while there are rows, down when they have gone.
+extern "C" std::int32_t bs_widget_test_transcript_shows_waiting_requests_in_the_network_bar() {
     TranscriptModel model;
     TranscriptView view(&model);
     view.resize(480, 320);
-    const auto button = [&view]() -> QPushButton* {
-        QWidget* frame = view.frameAt(0);
-        return frame == nullptr
-                   ? nullptr
-                   : frame->findChild<QPushButton*>(QStringLiteral("TranscriptAllowHost"));
-    };
-    const auto blockButton = [&view]() -> QPushButton* {
-        QWidget* frame = view.frameAt(0);
-        return frame == nullptr ? nullptr
-            : frame->findChild<QPushButton*>(QStringLiteral("TranscriptBlockHost"));
-    };
-    const auto text = [&view]() -> QString {
-        QLabel* label = bodyLabel(view.frameAt(0));
-        return label == nullptr ? QString() : label->text();
-    };
-
-    view.setTestItems(QStringList{ denialItem(QStringLiteral("blocked"), 3, true) });
-    model.resetItems();
-    if (view.frameCount() != 1 || button() == nullptr || blockButton() == nullptr) {
+    view.show();
+    auto* bar = view.findChild<NetworkBar*>(QStringLiteral("TranscriptNetworkBar"));
+    if (bar == nullptr || bar->isVisible()) {
         return 1;
     }
-    if (!button()->isEnabled() || button()->text() != QLatin1String("Allow for this workspace")) {
+    const double until = static_cast<double>(QDateTime::currentMSecsSinceEpoch() + 80'000);
+    QJsonArray rows;
+    rows.append(QJsonObject{ { "host", "blocked.example" },
+                             { "count", 1 },
+                             { "allowable", true },
+                             { "text", "" },
+                             { "status", "blocked" },
+                             { "error", "" },
+                             { "until_ms", until } });
+    model.setNetworkJson(QString::fromUtf8(QJsonDocument(rows).toJson(QJsonDocument::Compact)));
+    if (!bar->isVisible() || view.frameCount() != 0) {
         return 2;
     }
-    if (!text().contains(QChar(kTimes) + QStringLiteral("3"))) {
+    if (bar->findChildren<QWidget*>(QStringLiteral("NetworkBarRow")).size() != 1) {
         return 3;
     }
-
-    // Changes repaint in place, through the same coalesced path as any item.
-    view.setTestItems(QStringList{ denialItem(QStringLiteral("allowing"), 3, true) });
-    model.itemChanged(0);
-    settle();
-    if (button() == nullptr || button()->isEnabled() || blockButton()->isEnabled()) {
+    model.setNetworkJson(QStringLiteral("[]"));
+    if (bar->isVisible()) {
         return 4;
     }
-
-    view.setTestItems(QStringList{ denialItem(QStringLiteral("failed"), 3, true) });
-    model.itemChanged(0);
-    settle();
-    if (button() == nullptr || !button()->isEnabled() || !text().contains("daemon said no")) {
-        return 5;
-    }
-
-    view.setTestItems(QStringList{ denialItem(QStringLiteral("allowed"), 3, true) });
-    model.itemChanged(0);
-    settle();
-    if (view.frameCount() != 1 || button() != nullptr) {
-        return 6;
-    }
-    if (!text().contains(QLatin1String("Allowed for this workspace"))) {
-        return 7;
-    }
-
-    view.setTestItems(QStringList{ denialItem(QStringLiteral("blocked"), 1, false) });
-    model.resetItems();
-    if (button() != nullptr || text().contains(QChar(kTimes))) {
-        return 8;
-    }
-    if (blockButton() == nullptr || !blockButton()->isEnabled()) { return 9; }
-    view.setTestItems(QStringList{ denialItem(QStringLiteral("always_blocked"), 1, true) });
-    model.resetItems();
-    if (button() != nullptr || blockButton() != nullptr ||
-        !text().contains(QLatin1String("Always blocked for this workspace"))) { return 10; }
     return 0;
 }
 

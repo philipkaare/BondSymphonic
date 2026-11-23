@@ -2028,3 +2028,97 @@ async fn an_agent_start_reports_its_phases_in_order() {
     }
     cancel.cancel();
 }
+
+/// A resumed agent's transcript is the whole conversation. The resume is a new
+/// agent with a new id, and the IDE re-binds the tab to it and replays its
+/// history: before this the old conversation flashed up from the stopped
+/// agent's replay and vanished when the new agent's empty one arrived. Its
+/// numbering carries on from the copy, because a client drops any message
+/// numbered at or below the last one it has, and a resume of a session no
+/// agent here ever had starts empty, as before.
+#[tokio::test]
+async fn a_resumed_agent_continues_the_transcript_it_resumes() {
+    let _guard = ENV.lock().await;
+    let Some(py) = python() else {
+        eprintln!("SKIP: no python interpreter");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo(dir.path());
+    use_fake_claude(py, "simple_turn.ndjson");
+    let (port, token, _d, cancel) = start_daemon(dir.path()).await;
+    let mut c = Client::connect(port, &token).await;
+    let ws = create_ws(&mut c, &repo, "resume-history").await;
+
+    let first = start_agent(&mut c, &ws.id).await;
+    let events = next_agent_events(&mut c, &first, 5, Duration::from_secs(20)).await;
+    assert!(
+        states(&events).contains(&AgentState::Idle),
+        "the first turn never finished: {events:?}"
+    );
+    c.call(Request::AgentStop(AgentIdParams {
+        agent_id: first.clone(),
+    }))
+    .await
+    .unwrap();
+    let before = history_of(&mut c, &first).await.messages;
+    assert!(!before.is_empty());
+
+    let start = |session: &str| {
+        let mut resumed = options();
+        resumed.resume_session = Some(session.into());
+        Request::AgentStart(AgentStartParams {
+            workspace_id: ws.id.clone(),
+            adapter: AgentAdapterKind::Claude,
+            options: resumed,
+        })
+    };
+    let v = c.call(start("sess-1")).await.unwrap();
+    let second = serde_json::from_value::<AgentStartResult>(v)
+        .unwrap()
+        .agent_id;
+    let _ = next_agent_events(&mut c, &second, 5, Duration::from_secs(20)).await;
+    let after = history_of(&mut c, &second).await.messages;
+    assert!(
+        after.len() > before.len(),
+        "the resumed agent said nothing of its own: {after:?}"
+    );
+    assert_eq!(
+        after[..before.len()]
+            .iter()
+            .map(|m| (m.seq, format!("{:?}", m.body)))
+            .collect::<Vec<_>>(),
+        before
+            .iter()
+            .map(|m| (m.seq, format!("{:?}", m.body)))
+            .collect::<Vec<_>>(),
+        "the resumed transcript does not start with the one it resumes"
+    );
+    assert!(
+        after.windows(2).all(|w| w[0].seq < w[1].seq),
+        "the numbering does not carry on: {:?}",
+        after.iter().map(|m| m.seq).collect::<Vec<_>>()
+    );
+    c.call(Request::AgentStop(AgentIdParams {
+        agent_id: second.clone(),
+    }))
+    .await
+    .unwrap();
+
+    // A session nobody here had: nothing to carry over.
+    let v = c.call(start("sess-unknown")).await.unwrap();
+    let third = serde_json::from_value::<AgentStartResult>(v)
+        .unwrap()
+        .agent_id;
+    let own = next_agent_events(&mut c, &third, 5, Duration::from_secs(20)).await;
+    let history = history_of(&mut c, &third).await.messages;
+    assert_eq!(
+        history.first().map(|m| m.seq),
+        Some(1),
+        "a fresh session started on a copied transcript: {own:?}"
+    );
+    let _ = c
+        .call(Request::AgentStop(AgentIdParams { agent_id: third }))
+        .await;
+    cancel.cancel();
+}

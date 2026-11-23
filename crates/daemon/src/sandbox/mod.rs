@@ -7,6 +7,8 @@
 
 #[cfg(target_os = "linux")]
 pub mod exec_client;
+#[cfg(unix)]
+pub mod git_shim;
 #[cfg(target_os = "linux")]
 pub mod init;
 #[cfg(target_os = "linux")]
