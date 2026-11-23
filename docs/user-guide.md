@@ -663,7 +663,7 @@ holds no worktree, so `git worktree list` does not show it, and **Close
 workspace…** removes it again. Deleting `.git/worktrees` by hand while a
 workspace is open still stops it, as replacing any other protected entry does.
 
-**The Changes tab shows changes against `HEAD`.** Merge, Rebase, Squash,
+**No branch of its own.** Merge, Rebase, Squash,
 Create PR and Discard are all shaped around a workspace branch this kind does
 not have, so none of them appear, on the toolbar or the Workspace menu, for a
 workspace working directly in a checkout.
@@ -1178,14 +1178,15 @@ While a file is open the IDE watches it. A change made on disk by an agent or a
 shell reloads an unmodified tab silently, keeping the caret and the scroll
 position; on a tab with unsaved edits a bar offers reload or keep.
 
-**Changes** lists the files that differ from the workspace's base branch with
-their status and their +/- counts. That includes committed work, so it is not the
-same list as `git status`, which forgets a file once it is committed. It follows
-the worktree without your pressing Refresh, and it follows git as well: a
-commit, a `git add`, a reset or a rebase by the agent refreshes it even when no
-file in the worktree changed, and so does the base branch moving. Files under a
-directory named `node_modules` or `target` are not watched, and neither is a
-checkout on a 9P mount; Refresh brings those in. Double-clicking a row opens a side-by-side diff: aligned rows,
+**Changes** is `git status`: the files with changes not yet committed (staged,
+unstaged or untracked), with their status and their +/- counts against `HEAD`.
+It is the same list the agent sees, and the one **Commit…** and **Ignore…** act
+on. Once something is committed it leaves the list. It follows the worktree
+without your pressing Refresh, and it follows git as well: a commit, a
+`git add`, a reset or a rebase by the agent refreshes it even when no file in
+the worktree changed. Files under a directory named `node_modules` or `target`
+are not watched, and neither is a checkout on a 9P mount; Refresh brings those
+in. Double-clicking a row diffs the file against its committed version. The diff is side by side: aligned rows,
 green and red tints, two line-number columns, scrolling synchronised in both
 axes, and the same highlighting as the editor. A diff does not reload when the
 file changes underneath it — close it and open it again.
