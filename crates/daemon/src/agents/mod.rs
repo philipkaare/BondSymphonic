@@ -187,6 +187,36 @@ impl TranscriptStore {
         }
     }
 
+    /// Starts `to`'s transcript with everything `from` said, and returns the
+    /// last sequence number copied (0 when `from` said nothing).
+    ///
+    /// What makes a resumed conversation read as one conversation. A resume
+    /// is a new agent with a new id, and a transcript is kept per id, so
+    /// without this the pane that re-binds to the new agent replays an empty
+    /// history: the old conversation flashes up from the stopped agent's
+    /// replay and is gone the moment the new one's arrives. The caller carries
+    /// the sequence on from the returned number, because a client drops any
+    /// message whose number is not above the last it has seen.
+    ///
+    /// `to` must not have spoken yet: this writes the file whole.
+    pub async fn seed(&self, to: &AgentId, from: &AgentId) -> std::io::Result<u64> {
+        let messages = self.read(from).await?;
+        let Some(last) = messages.iter().map(|m| m.seq).max() else {
+            return Ok(0);
+        };
+        let mut text = String::new();
+        for msg in &messages {
+            text.push_str(&serde_json::to_string(msg).map_err(std::io::Error::other)?);
+            text.push('\n');
+        }
+        if !self.dir_made.load(Ordering::Relaxed) {
+            tokio::fs::create_dir_all(&self.dir).await?;
+            self.dir_made.store(true, Ordering::Relaxed);
+        }
+        tokio::fs::write(self.path(to), text).await?;
+        Ok(last)
+    }
+
     /// The whole transcript, oldest first. An agent that has never spoken (or
     /// whose file is gone) reads as empty; a line that will not parse is
     /// logged and skipped, so one bad line never hides the rest.
@@ -938,6 +968,21 @@ impl AgentManager {
 
         let id = self.mint_id();
         let entry = Arc::new(AgentEntry::new(ws.id.clone(), p.adapter));
+        // A resume continues a conversation, so its transcript does too: the
+        // new agent's starts with the one it resumes, before it can say
+        // anything of its own, and its numbering carries on from there.
+        if let Some(session) = p.options.resume_session.as_deref() {
+            if let Some(from) = self.resumed_from(&ws.id, p.adapter, session) {
+                let phase = Instant::now();
+                match self.store.seed(&id, &from).await {
+                    Ok(last) => entry.seq.store(last, Ordering::SeqCst),
+                    Err(e) => {
+                        warn!(agent = %id, from = %from, error = %e, "could not carry the resumed transcript over")
+                    }
+                }
+                log_phase(&ws.id, "agent.start", "seed_transcript", phase);
+            }
+        }
         let sink = AgentSink::new(
             self.events.clone(),
             self.store.clone(),
@@ -994,6 +1039,9 @@ impl AgentManager {
         let spawned = adapter.start().await;
         log_phase(&ws.id, "agent.start", "adapter.start", phase);
         if let Err(e) = spawned {
+            // The copy `seed` made, if it made one: nothing ever ran under
+            // this id, so nothing should be left on disk under it either.
+            self.store.remove(&id);
             let records = self.records.clone();
             let gone = id.clone();
             off_the_runtime("taking back a failed start's record", move || {
@@ -1069,6 +1117,29 @@ impl AgentManager {
         };
         adapter.lock().await.stop().await?;
         Ok(Empty {})
+    }
+
+    /// The agent a start with `resume_session = session` continues: the most
+    /// recent one in `ws`, of the same backend, whose session that is. `None`
+    /// for a session no agent this daemon knows of ever had -- a resume typed
+    /// in by hand, or one whose workspace was rebuilt -- which then starts on
+    /// an empty transcript as it always did.
+    fn resumed_from(
+        &self,
+        ws: &WorkspaceId,
+        adapter: AgentAdapterKind,
+        session: &str,
+    ) -> Option<AgentId> {
+        self.agents
+            .lock()
+            .iter()
+            .filter(|(_, a)| {
+                &a.entry.workspace_id == ws
+                    && a.entry.adapter == adapter
+                    && a.entry.session_id.lock().as_deref() == Some(session)
+            })
+            .max_by_key(|(_, a)| a.ordinal)
+            .map(|(id, _)| id.clone())
     }
 
     pub async fn history(&self, p: AgentIdParams) -> Result<HistoryResult, RpcError> {

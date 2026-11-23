@@ -966,7 +966,10 @@ and a terminal tab has no harness to switch.
 
 The pane replays the whole transcript from the daemon whenever it attaches, so
 an IDE restarted while the daemon kept running finds its tabs where it left
-them.
+them. A resumed agent (a Restart, the automatic start of a stopped tab, or a
+change of model or permission mode) is a new agent, but its transcript starts
+with the whole conversation it resumes. The tab therefore keeps the history
+it had rather than starting empty.
 
 ### What agents can do with git and GitHub
 
