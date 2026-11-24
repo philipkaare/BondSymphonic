@@ -51,6 +51,21 @@ last daemon binary), `-NoSetup` (fail instead of installing prerequisites).
 Signing in to Claude Code and GitHub happens inside the IDE, on its setup page — never
 by typing a login command into a terminal yourself.
 
+## Quick start (macOS, experimental)
+
+```sh
+./launch.sh
+```
+
+The daemon needs Linux, so on a Mac it runs in a [Lima](https://lima-vm.io) VM named
+`bondsymphonic` in place of the WSL distro. The script installs what is missing through
+Homebrew (rustup, Qt 6, CMake, Ninja, Lima), creates and provisions the VM
+(`scripts/setup-lima.sh`, reusing `setup-wsl.sh`), builds the daemon inside it
+(`scripts/build-daemon.sh`) and starts the IDE, which runs the daemon through
+`limactl shell`. The VM mounts your home directory at the same path, so the checkout and
+the repositories you open must live under `~`. Switches: `--debug`, `--release`,
+`--skip-daemon`, `--no-setup`, as on Windows.
+
 ## Install from a package
 
 If somebody handed you a `BondSymphonic-<version>-win64.zip` rather than the source:

@@ -443,20 +443,44 @@ pub fn command_for(spec: &LaunchSpec) -> Result<(String, Vec<String>)> {
             }
         };
     }
+    Ok(distro_shell(&spec.distro, inner))
+}
+
+/// The program and arguments that run `script` under `bash -lc` inside the
+/// distro: `wsl.exe` on Windows, the Lima VM of the same name on macOS (the
+/// daemon needs Linux, and `scripts/setup-lima.sh` builds that VM with the
+/// home directory mounted at the same path), and a local `bash` on Linux.
+///
+/// `limactl shell` runs from `/` because it otherwise tries to `cd` into the
+/// host's working directory, which outside the home mount does not exist.
+fn distro_shell(distro: &str, script: String) -> (String, Vec<String>) {
     if cfg!(windows) {
-        Ok((
+        (
             "wsl.exe".into(),
             vec![
                 "-d".into(),
-                spec.distro.clone(),
+                distro.into(),
                 "--".into(),
                 "bash".into(),
                 "-lc".into(),
-                inner,
+                script,
             ],
-        ))
+        )
+    } else if cfg!(target_os = "macos") {
+        (
+            "limactl".into(),
+            vec![
+                "shell".into(),
+                "--workdir".into(),
+                "/".into(),
+                distro.into(),
+                "bash".into(),
+                "-lc".into(),
+                script,
+            ],
+        )
     } else {
-        Ok(("bash".into(), vec!["-lc".into(), inner]))
+        ("bash".into(), vec!["-lc".into(), script])
     }
 }
 
@@ -464,14 +488,8 @@ pub fn command_for(spec: &LaunchSpec) -> Result<(String, Vec<String>)> {
 /// Everything goes through `bash -lc`, so stdout is the script's own UTF-8 bytes
 /// rather than the UTF-16 that `wsl.exe` uses for its own diagnostics.
 async fn wsl(spec: &LaunchSpec, script: &str) -> Result<String> {
-    let out = if cfg!(windows) {
-        Command::new("wsl.exe")
-            .args(["-d", &spec.distro, "--", "bash", "-lc", script])
-            .output()
-            .await?
-    } else {
-        Command::new("bash").args(["-lc", script]).output().await?
-    };
+    let (prog, args) = distro_shell(&spec.distro, script.to_owned());
+    let out = Command::new(&prog).args(&args).output().await?;
     if !out.status.success() {
         return Err(anyhow!(
             "wsl command failed: {}\n{}",
@@ -996,6 +1014,33 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn builds_lima_command_line() {
+        let spec = LaunchSpec {
+            distro: "bondsymphonic".into(),
+            daemon_path_in_wsl: "~/.bondsymphonic/bin/bondsymphonic-daemon".into(),
+            local_daemon_binary: None,
+            log_level: "debug".into(),
+            opencode_config_root: None,
+        };
+        let (prog, args) = command_for(&spec).unwrap();
+        assert_eq!(prog, "limactl");
+        assert_eq!(
+            args,
+            vec![
+                "shell",
+                "--workdir",
+                "/",
+                "bondsymphonic",
+                "bash",
+                "-lc",
+                "exec ~/'.bondsymphonic/bin/bondsymphonic-daemon' --log-level 'debug'"
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn builds_wsl_command_line() {
         let spec = LaunchSpec {
             distro: "bondsymphonic".into(),
