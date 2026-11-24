@@ -6284,6 +6284,271 @@ mod one_start_per_create {
     }
 }
 
+/// A restart stops the agent it replaces, and waits for that, before it
+/// starts the next one.
+///
+/// Restart, and a model or permission-mode change, used to send `agent.start`
+/// for the replacement and leave the old agent running beside it in the same
+/// worktree, out of sight of the tab. The fake daemon answers `agent.stop` only
+/// after a pause, the way the real one answers once the process has gone, and
+/// the replacement's start must not arrive before that answer has.
+mod restart_stops_the_old_agent {
+    use super::*;
+
+    const WORKSPACE: &str = "ws_restart1";
+    const OLD_AGENT: &str = "ag_restart_old";
+    const NEW_AGENT: &str = "ag_restart_new";
+    const STOP_DELAY: Duration = Duration::from_millis(800);
+    const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+    type Journal = Arc<Mutex<Vec<(String, Instant)>>>;
+
+    #[test]
+    fn a_restart_stops_the_running_agent_before_it_starts_the_next() {
+        if bondsymphonic_ide::testing::skip_without_qt("restart stops the old agent") {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let (addr, journal) = rt.block_on(fake_daemon());
+
+        let config = std::env::temp_dir().join(format!("bs-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config);
+        std::fs::create_dir_all(&config).expect("config dir");
+        let script = format!("create_agent,wait,restart={WORKSPACE}:{OLD_AGENT},quit");
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bondsymphonic-ide"))
+            .env("QT_QPA_PLATFORM", "offscreen")
+            .env("BS_DAEMON_ADDR", addr.to_string())
+            .env("BS_DAEMON_TOKEN", TOKEN)
+            .env("BS_SMOKE_SCRIPT", script)
+            .env("BS_SETTINGS_PATH", config.join("settings.json"))
+            .env("BS_STATE_PATH", config.join("state.json"))
+            .env("BS_LOG_DIR", config.join("logs"))
+            .env("BS_LOG", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the IDE binary starts");
+
+        let out = drain(child.stdout.take().expect("stdout is piped"));
+        let err = drain(child.stderr.take().expect("stderr is piped"));
+        let status = wait_for(&mut child, RUN_LIMIT);
+        let (out, err) = (
+            out.recv().expect("the stdout drain thread is alive"),
+            err.recv().expect("the stderr drain thread is alive"),
+        );
+        let seen = journal.lock().expect("journal mutex").clone();
+        let methods: Vec<&str> = seen.iter().map(|(m, _)| m.as_str()).collect();
+        let context =
+            format!("requests: {methods:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
+        let status = status
+            .unwrap_or_else(|| panic!("the IDE did not exit within {RUN_LIMIT:?}\n{context}"));
+        assert!(status.success(), "the IDE exited with {status}\n{context}");
+
+        let at = |method: &str, nth: usize| {
+            seen.iter()
+                .filter(|(m, _)| m == method)
+                .nth(nth)
+                .map(|(_, t)| *t)
+                .unwrap_or_else(|| panic!("no {method} #{nth}\n{context}"))
+        };
+        let first_start = at("agent.start", 0);
+        let stop = at("agent.stop:ag_restart_old", 0);
+        let second_start = at("agent.start", 1);
+        assert!(
+            first_start < stop,
+            "the stop came before the agent it stops\n{context}"
+        );
+        assert!(
+            second_start >= stop + STOP_DELAY - Duration::from_millis(100),
+            "the replacement was started {:?} after the stop, before the stop had answered \
+             ({STOP_DELAY:?})\n{context}",
+            second_start - stop
+        );
+
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    async fn fake_daemon() -> (std::net::SocketAddr, Journal) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+        let recorded = journal.clone();
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = recorded.clone();
+                let starts = starts.clone();
+                tokio::spawn(async move {
+                    let (r, w) = stream.into_split();
+                    let w = Arc::new(tokio::sync::Mutex::new(w));
+                    let mut r = BufReader::new(r);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match r.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        let ClientMessage::Request { id, request } =
+                            codec::decode(line.trim_end()).expect("decode");
+                        let name = match &request {
+                            Request::AgentStop(p) => format!("agent.stop:{}", p.agent_id.0),
+                            other => other.method_name().to_owned(),
+                        };
+                        recorded
+                            .lock()
+                            .expect("journal mutex")
+                            .push((name, Instant::now()));
+                        let mut later: Vec<ServerMessage> = Vec::new();
+                        let mut delay = Duration::ZERO;
+                        let reply = match request {
+                            Request::Hello(p) if p.token == TOKEN => Some(ServerMessage::ok(
+                                id,
+                                &HelloResult {
+                                    daemon_version: "0.0.0-fake".into(),
+                                    capabilities: Capabilities {
+                                        backends: vec![],
+                                        opencode_providers: false,
+                                        mcp_servers: false,
+                                        sandbox_backend: "noop".into(),
+                                        git_protect: false,
+                                        adapters: vec![
+                                            AgentAdapterKind::Claude,
+                                            AgentAdapterKind::Terminal,
+                                        ],
+                                    },
+                                    protocol_version: Some(PROTOCOL_VERSION),
+                                },
+                            )),
+                            Request::Hello(_) => {
+                                Some(ServerMessage::err(id, RpcError::unauthorized()))
+                            }
+                            Request::SystemCheckPrereqs {} => Some(ServerMessage::ok(
+                                id,
+                                &CheckPrereqsResult {
+                                    items: vec![PrereqStatus {
+                                        name: "claude_auth".into(),
+                                        ok: true,
+                                        detail: "logged in to Claude".into(),
+                                        fix_hint: None,
+                                    }],
+                                },
+                            )),
+                            Request::WorkspaceList {} => Some(ServerMessage::ok(
+                                id,
+                                &WorkspaceListResult { workspaces: vec![] },
+                            )),
+                            Request::WorkspaceCreate(p) => Some(ServerMessage::ok(
+                                id,
+                                &super::workspace(WORKSPACE, &p.name, WorkspaceState::Ready, &[]),
+                            )),
+                            Request::AgentStart(_) => {
+                                let n = starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                let agent = if n == 0 { OLD_AGENT } else { NEW_AGENT };
+                                Some(ServerMessage::ok(
+                                    id,
+                                    &AgentStartResult {
+                                        agent_id: AgentId(agent.to_owned()),
+                                    },
+                                ))
+                            }
+                            // Answered once the process has gone, as the real
+                            // daemon does, with the exit published first.
+                            Request::AgentStop(p) => {
+                                delay = STOP_DELAY;
+                                later.push(ServerMessage::event(
+                                    Some(WorkspaceId(WORKSPACE.to_owned())),
+                                    Event::AgentStateChanged {
+                                        agent_id: p.agent_id.clone(),
+                                        state: AgentState::Exited,
+                                        detail: None,
+                                    },
+                                ));
+                                later.push(ServerMessage::ok(id, &Empty {}));
+                                None
+                            }
+                            Request::AgentHistory(_) => Some(ServerMessage::ok(
+                                id,
+                                &HistoryResult {
+                                    messages: vec![],
+                                    state: AgentState::Idle,
+                                    detail: None,
+                                },
+                            )),
+                            Request::FsListDir(_) => {
+                                Some(ServerMessage::ok(id, &ListDirResult { entries: vec![] }))
+                            }
+                            Request::FsWatch(_) => Some(ServerMessage::ok(id, &Empty {})),
+                            Request::WorkspaceChanges(_) => {
+                                Some(ServerMessage::ok(id, &ChangesResult { files: vec![] }))
+                            }
+                            Request::WorkspaceStatus(_) => Some(ServerMessage::ok(
+                                id,
+                                &WorkspaceStatusResult { entries: vec![] },
+                            )),
+                            Request::RepoDetectRunConfigs(_) => Some(ServerMessage::ok(
+                                id,
+                                &DetectRunConfigsResult {
+                                    configs: vec![],
+                                    network_allow: vec![],
+                                    warnings: vec![],
+                                },
+                            )),
+                            Request::RunList(_) => {
+                                Some(ServerMessage::ok(id, &RunListResult { runs: vec![] }))
+                            }
+                            other => Some(ServerMessage::err(
+                                id,
+                                RpcError::internal(format!(
+                                    "not implemented: {}",
+                                    other.method_name()
+                                )),
+                            )),
+                        };
+                        if let Some(reply) = reply {
+                            if w.lock()
+                                .await
+                                .write_all(codec::encode(&reply).as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        if later.is_empty() {
+                            continue;
+                        }
+                        let w = w.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let mut w = w.lock().await;
+                            for message in later {
+                                if w.write_all(codec::encode(&message).as_bytes())
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        });
+
+        (addr, journal)
+    }
+}
+
 /// An OpenCode agent gets a pane it can be used through.
 ///
 /// `AgentArea` used to build a transcript only for Claude and Codex; every

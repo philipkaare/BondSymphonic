@@ -708,7 +708,9 @@ async fn the_full_workspace_chain_from_create_to_a_destroy_that_leaves_nothing()
         "the commit must start out in the workspace's private object store"
     );
 
-    // `workspace.changes` sees it.
+    // `workspace.changes` is `git status`: the committed file is not on it,
+    // and work not yet committed is.
+    std::fs::write(wt.join("scratch.txt"), "not yet\n").unwrap();
     let changed: ChangesResult = serde_json::from_value(
         c.call(Request::WorkspaceChanges(WorkspaceIdParams {
             workspace_id: ws.id.clone(),
@@ -718,13 +720,20 @@ async fn the_full_workspace_chain_from_create_to_a_destroy_that_leaves_nothing()
     )
     .unwrap();
     assert!(
+        !changed.files.iter().any(|f| f.path == "feature.txt"),
+        "a committed file is listed: {:?}",
+        changed.files
+    );
+    assert!(
         changed
             .files
             .iter()
-            .any(|f| f.path == "feature.txt" && f.status == FileStatus::Added),
+            .any(|f| f.path == "scratch.txt" && f.status == FileStatus::Untracked),
         "{:?}",
         changed.files
     );
+    // Gone again: the destroy below is the clean-worktree path.
+    std::fs::remove_file(wt.join("scratch.txt")).unwrap();
 
     // Records and a transcript, as an agent that ran in this workspace would
     // have left them. Written through the same file the daemon uses, so the

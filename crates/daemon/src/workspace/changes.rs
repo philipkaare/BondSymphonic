@@ -1,8 +1,14 @@
-//! `workspace.changes` and `workspace.diff`: what a workspace changed: a
-//! worktree workspace relative to the merge-base of its base branch, an
-//! in-place one relative to `HEAD`. Computed with git and read through the
-//! pinned `worktree_git` (or [`InPlaceLayout::git`]) so an agent-writable
-//! worktree cannot steer git.
+//! `workspace.changes` and `workspace.diff`: what a workspace has not yet
+//! committed, relative to `HEAD` -- the list `git status` gives, which is the
+//! one the agent sees and the one Commit and Ignore act on. Computed with git
+//! and read through the pinned `worktree_git` (or [`InPlaceLayout::git`]) so
+//! an agent-writable worktree cannot steer git.
+//!
+//! A worktree workspace's list used to be measured from where its branch left
+//! the base, committed work included. That is a branch diff, a different
+//! question: a file the agent had committed stayed on the list with Commit and
+//! Ignore offered on it, and the list never matched the `git status` the agent
+//! reported.
 
 use crate::daemon::Daemon;
 use crate::git::Git;
@@ -14,34 +20,17 @@ use bondsymphonic_proto::{
 };
 use std::collections::HashMap;
 
-/// The commit a workspace is measured against: where its branch left the base.
-async fn merge_base(git: &Git, ws: &Workspace) -> Result<String, RpcError> {
-    let out = git
-        .run(&ws.worktree_path, &["merge-base", &ws.base_branch, "HEAD"])
-        .await?;
-    Ok(out.stdout.trim().to_string())
-}
-
 /// The pinned git for `ws`'s tree and the commit (or tree) its changes are
-/// measured against.
-///
-/// A worktree workspace is measured from where its branch left the base: its
-/// commits are the work. An in-place workspace has no branch of its own, so its
-/// changes are what `git status` would show -- staged, unstaged and untracked,
-/// against `HEAD` -- whatever the agent has committed or switched to since.
+/// measured against: `HEAD`, for both kinds, so the changes are what `git
+/// status` shows -- staged, unstaged and untracked -- whatever the agent has
+/// committed or switched to since.
 async fn measuring(d: &Daemon, ws: &Workspace) -> Result<(Git, String), RpcError> {
-    match ws.kind {
-        WorkspaceKind::InPlace => {
-            let git = InPlaceLayout::new(&ws.worktree_path, &d.dirs.no_hooks()).git();
-            let base = in_place::diff_base(&git, &ws.worktree_path).await?;
-            Ok((git, base))
-        }
-        WorkspaceKind::Worktree => {
-            let git = layout_for(d, ws).await?.worktree_git();
-            let base = merge_base(&git, ws).await?;
-            Ok((git, base))
-        }
-    }
+    let git = match ws.kind {
+        WorkspaceKind::InPlace => InPlaceLayout::new(&ws.worktree_path, &d.dirs.no_hooks()).git(),
+        WorkspaceKind::Worktree => layout_for(d, ws).await?.worktree_git(),
+    };
+    let base = in_place::diff_base(&git, &ws.worktree_path).await?;
+    Ok((git, base))
 }
 
 /// Line endings belong to the checkout, not to the change: git stores blobs with
@@ -144,12 +133,12 @@ pub async fn changes(d: &Daemon, id: &WorkspaceId) -> Result<ChangesResult, RpcE
 
 /// The files that hold `ws`'s git state, for `fs.watch` to follow beside the
 /// worktree: what moves when the agent commits, stages, resets, checks out or
-/// rebases, none of which need write a file in the worktree, and what moves
-/// when the base branch does. See [`crate::fs_watch::Watchers::enable_with_git`].
+/// rebases, none of which need write a file in the worktree. See
+/// [`crate::fs_watch::Watchers::enable_with_git`].
 ///
 /// A worktree workspace's are in the main repository's `.git`: its own gitdir
-/// (`worktrees/<id>`) for `HEAD`, the index and the reflog, and the two branch
-/// refs and `packed-refs` in the common directory. An in-place workspace's are
+/// (`worktrees/<id>`) for `HEAD`, the index and the reflog, and its branch ref
+/// and `packed-refs` in the common directory. An in-place workspace's are
 /// in its own `.git`, where the reflog stands in for the branch ref nobody can
 /// name in advance.
 pub async fn git_state_files(d: &Daemon, ws: &Workspace) -> Vec<std::path::PathBuf> {
@@ -165,7 +154,6 @@ pub async fn git_state_files(d: &Daemon, ws: &Workspace) -> Vec<std::path::PathB
                 gitdir.join("index"),
                 gitdir.join("logs").join("HEAD"),
                 refs.join(&ws.branch),
-                refs.join(&ws.base_branch),
                 layout.git_common.join("packed-refs"),
             ]
         }

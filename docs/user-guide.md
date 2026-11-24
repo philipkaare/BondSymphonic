@@ -663,7 +663,7 @@ holds no worktree, so `git worktree list` does not show it, and **Close
 workspace…** removes it again. Deleting `.git/worktrees` by hand while a
 workspace is open still stops it, as replacing any other protected entry does.
 
-**The Changes tab shows changes against `HEAD`.** Merge, Rebase, Squash,
+**No branch of its own.** Merge, Rebase, Squash,
 Create PR and Discard are all shaped around a workspace branch this kind does
 not have, so none of them appear, on the toolbar or the Workspace menu, for a
 workspace working directly in a checkout.
@@ -922,11 +922,25 @@ and a terminal tab has no harness to switch.
 - **Interrupt** abandons the current turn and leaves the agent alive. It is the
   only one of the old three buttons left, because ending a turn acts on the
   conversation rather than on the process.
+- **New session** (beside Interrupt) starts the same agent on a new conversation.
+  It asks first. Then it stops the running agent and starts a new one with the
+  same harness, model and permission mode but no memory of the conversation,
+  and the tab shows the new one. Files and commits in the workspace are not
+  touched.
+- **Starting.** While an agent starts, a progress bar above the prompt box says
+  what it is doing ("Starting the sandbox") and steps through the three phases
+  a start has (preparing, the sandbox, launching), then gives way to the agent.
+- **Links.** Web addresses in the conversation, in your messages and in the
+  agent's answers, are links. Clicking one opens it in your browser; only
+  `http`, `https` and `mailto` links open.
 - **Restart.** An agent that exits on its own puts the reason in a banner
   offering **Restart agent**, and the same action is in **Workspace > Restart
   agent** (`Ctrl+Shift+R`) and in Settings' Agents section. Restart starts a new
   agent with `--resume` pointed at the session id, so the conversation continues
-  rather than beginning again. The session id is read out of the transcript, and
+  rather than beginning again. An agent that is still running is stopped first,
+  so two never work side by side in one worktree; the same goes for a model or
+  permission-mode change, `/resume` and New session. The session id is read out
+  of the transcript, and
   when the transcript cannot supply one — a damaged or truncated history — the
   id the daemon recorded for that agent is used instead.
 - **Selecting a tab whose agent has stopped starts it again**, half a second
@@ -1178,14 +1192,15 @@ While a file is open the IDE watches it. A change made on disk by an agent or a
 shell reloads an unmodified tab silently, keeping the caret and the scroll
 position; on a tab with unsaved edits a bar offers reload or keep.
 
-**Changes** lists the files that differ from the workspace's base branch with
-their status and their +/- counts. That includes committed work, so it is not the
-same list as `git status`, which forgets a file once it is committed. It follows
-the worktree without your pressing Refresh, and it follows git as well: a
-commit, a `git add`, a reset or a rebase by the agent refreshes it even when no
-file in the worktree changed, and so does the base branch moving. Files under a
-directory named `node_modules` or `target` are not watched, and neither is a
-checkout on a 9P mount; Refresh brings those in. Double-clicking a row opens a side-by-side diff: aligned rows,
+**Changes** is `git status`: the files with changes not yet committed (staged,
+unstaged or untracked), with their status and their +/- counts against `HEAD`.
+It is the same list the agent sees, and the one **Commit…** and **Ignore…** act
+on. Once something is committed it leaves the list. It follows the worktree
+without your pressing Refresh, and it follows git as well: a commit, a
+`git add`, a reset or a rebase by the agent refreshes it even when no file in
+the worktree changed. Files under a directory named `node_modules` or `target`
+are not watched, and neither is a checkout on a 9P mount; Refresh brings those
+in. Double-clicking a row diffs the file against its committed version. The diff is side by side: aligned rows,
 green and red tints, two line-number columns, scrolling synchronised in both
 axes, and the same highlighting as the editor. A diff does not reload when the
 file changes underneath it — close it and open it again.

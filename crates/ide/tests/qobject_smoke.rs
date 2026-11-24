@@ -1644,6 +1644,7 @@ mod cpp_widgets {
         fn bs_widget_test_close_group_closes_an_in_place_workspace_plainly() -> i32;
         fn bs_widget_test_setup_page_offers_a_logout_for_a_live_session() -> i32;
         fn bs_widget_test_setup_page_offers_the_long_lived_token() -> i32;
+        fn bs_widget_test_transcript_links_and_new_session() -> i32;
         fn bs_widget_test_setup_page_runs_the_claude_sign_in_in_two_steps() -> i32;
         fn bs_widget_test_explorer_changes_say_they_are_loading() -> i32;
         fn bs_widget_test_transcript_gate_says_it_is_checking_first() -> i32;
@@ -1681,7 +1682,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 71] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 72] = [
             // These four build a whole MainWindow, and each begins by pointing
             // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
             // is load-bearing rather than tidy: the state store settles its
@@ -1878,6 +1879,10 @@ mod cpp_widgets {
             (
                 "SetupPage offers the long-lived token beside the login/logout, until it has one",
                 bs_widget_test_setup_page_offers_the_long_lived_token,
+            ),
+            (
+                "TranscriptView links web addresses and asks before a new session",
+                bs_widget_test_transcript_links_and_new_session,
             ),
             (
                 "SetupPage goes from the Claude login straight on to the long-lived token",

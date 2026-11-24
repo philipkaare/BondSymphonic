@@ -13,15 +13,20 @@ const BINARY_EDITED: &[u8] = &[
     0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0x00, 0x02, 0x03,
 ];
 
+/// The Changes list is `git status`: what is not yet committed, against
+/// `HEAD`. Work the agent has committed is not on it, a file edited again
+/// after its commit shows only the uncommitted part, and a diff's base side is
+/// the committed version.
 #[tokio::test]
-async fn changes_and_diff_report_committed_uncommitted_and_untracked_files() {
+async fn changes_and_diff_report_uncommitted_work_against_head() {
     let dir = tempfile::tempdir().unwrap();
     let repo = init_repo(dir.path());
-    // Files that exist at the merge-base, so a rename and a delete in the
-    // workspace are visible to git as a rename and a delete rather than as an
-    // add of something it has never seen.
+    // Files that exist at `HEAD`, so a rename and a delete in the workspace
+    // are visible to git as a rename and a delete rather than as an add of
+    // something it has never seen.
     std::fs::write(repo.join("old.rs"), "one\ntwo\nthree\n").unwrap();
     std::fs::write(repo.join("doomed.txt"), "x\ny\n").unwrap();
+    std::fs::write(repo.join("moving.txt"), "m\n").unwrap();
     std::fs::write(repo.join("img.png"), BINARY).unwrap();
     std::fs::write(repo.join("crlf.txt"), "a\nb\n").unwrap();
     std::fs::create_dir(repo.join("sub")).unwrap();
@@ -52,11 +57,13 @@ async fn changes_and_diff_report_committed_uncommitted_and_untracked_files() {
     };
 
     // A committed edit and a committed rename, then uncommitted work on top: an
-    // edit, a new file, a deletion, a binary edit, and a CRLF rewrite.
+    // edit, a staged rename, a new file, a deletion, a binary edit, and a CRLF
+    // rewrite.
     std::fs::write(wt.join("README.md"), "hello\nworld\n").unwrap();
     git(&["mv", "old.rs", "new.rs"]);
     commit_all(&wt, &env, "work");
     std::fs::write(wt.join("README.md"), "hello\nworld\nagain\n").unwrap();
+    git(&["mv", "moving.txt", "moved.txt"]);
     std::fs::write(wt.join("notes.txt"), "a\nb\nc\n").unwrap();
     std::fs::remove_file(wt.join("doomed.txt")).unwrap();
     std::fs::write(wt.join("img.png"), BINARY_EDITED).unwrap();
@@ -76,26 +83,37 @@ async fn changes_and_diff_report_committed_uncommitted_and_untracked_files() {
             .unwrap_or_else(|| panic!("{p} listed, got {:?}", res.files))
     };
 
+    // Only the line added since the commit.
     let readme = file("README.md");
     assert_eq!(readme.status, FileStatus::Modified);
-    assert_eq!((readme.additions, readme.deletions), (2, 0));
+    assert_eq!((readme.additions, readme.deletions), (1, 0));
+
+    // Committed work is not on the list at all: `git status` does not show it,
+    // and there is nothing left in it to commit or ignore.
+    assert!(
+        !res.files
+            .iter()
+            .any(|f| f.path == "new.rs" || f.path == "old.rs"),
+        "a committed rename is listed: {:?}",
+        res.files
+    );
 
     let notes = file("notes.txt");
     assert_eq!(notes.status, FileStatus::Untracked);
     assert_eq!((notes.additions, notes.deletions), (3, 0));
 
-    // A real `git mv`, reported against the new path only, with no phantom
-    // untracked entry for the old one.
-    let renamed = file("new.rs");
+    // A real `git mv`, not yet committed, reported against the new path only,
+    // with no phantom untracked entry for the old one.
+    let renamed = file("moved.txt");
     assert_eq!(renamed.status, FileStatus::Renamed);
     assert_eq!((renamed.additions, renamed.deletions), (0, 0));
     assert!(
-        !res.files.iter().any(|f| f.path == "old.rs"),
+        !res.files.iter().any(|f| f.path == "moving.txt"),
         "the old path is gone, got {:?}",
         res.files
     );
 
-    // A real delete of a tracked file, counted from the merge-base version.
+    // A real delete of a tracked file, counted from the committed version.
     let doomed = file("doomed.txt");
     assert_eq!(doomed.status, FileStatus::Deleted);
     assert_eq!((doomed.additions, doomed.deletions), (0, 2));
@@ -105,12 +123,13 @@ async fn changes_and_diff_report_committed_uncommitted_and_untracked_files() {
     assert_eq!(img.status, FileStatus::Modified);
     assert_eq!((img.additions, img.deletions), (0, 0));
 
+    // The base side is the committed version, not the base branch's.
     let d = diff(&mut c, &ws.id, "README.md").await;
-    assert_eq!(d.base_text, "hello\n");
+    assert_eq!(d.base_text, "hello\nworld\n");
     assert_eq!(d.work_text, "hello\nworld\nagain\n");
     assert!(!d.truncated, "a two-line file is not truncated");
 
-    // A file that does not exist at the merge-base has an empty base side.
+    // A file that does not exist at `HEAD` has an empty base side.
     let d = diff(&mut c, &ws.id, "notes.txt").await;
     assert_eq!(d.base_text, "");
     assert_eq!(d.work_text, "a\nb\nc\n");
@@ -313,7 +332,7 @@ async fn diff(c: &mut Client, ws: &WorkspaceId, path: &str) -> DiffResult {
 /// default and renders each non-ASCII byte as an octal escape inside double
 /// quotes. The IDE opens what this list gives it, so a quoted name is a file it
 /// cannot find; the daemon turns the option off for every path-listing call.
-/// Both a committed change and an untracked file are checked, because they come
+/// Both a tracked change and an untracked file are checked, because they come
 /// from two different commands (`git diff` and `git status`).
 #[tokio::test]
 async fn non_ascii_paths_are_reported_the_way_they_are_spelled_on_disk() {
@@ -324,17 +343,12 @@ async fn non_ascii_paths_are_reported_the_way_they_are_spelled_on_disk() {
     std::fs::write(repo.join(TRACKED), "fælles\n").unwrap();
     commit_all(&repo, &[], "base");
 
-    let (port, token, daemon, cancel) = start_daemon(&dir.path().join("data")).await;
+    let (port, token, _daemon, cancel) = start_daemon(&dir.path().join("data")).await;
     let mut c = Client::connect(port, &token).await;
     let ws = create_ws(&mut c, &repo, "utf8").await;
     let wt = std::path::Path::new(&ws.worktree_path).to_path_buf();
-    let env = lifecycle::layout_for(&daemon, &daemon.workspace(&ws.id).unwrap())
-        .await
-        .unwrap()
-        .sandbox_git_env();
 
     std::fs::write(wt.join(TRACKED), "fælles\nnyt\n").unwrap();
-    commit_all(&wt, &env, "edit");
     std::fs::write(wt.join(UNTRACKED), "hej\n").unwrap();
 
     let res: ChangesResult = serde_json::from_value(
@@ -348,7 +362,7 @@ async fn non_ascii_paths_are_reported_the_way_they_are_spelled_on_disk() {
     let paths: Vec<&str> = res.files.iter().map(|f| f.path.as_str()).collect();
     assert!(
         paths.contains(&TRACKED),
-        "the committed change must keep its name: {paths:?}"
+        "the tracked change must keep its name: {paths:?}"
     );
     assert!(
         paths.contains(&UNTRACKED),

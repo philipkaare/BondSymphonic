@@ -404,6 +404,32 @@ async fn git_in_a_bwrap_workspace_routes_only_the_workspace_repository() {
         "another repository's commit landed in the workspace's objects"
     );
 
+    // An object directory somebody set on purpose -- git does, for a hook
+    // handed a push's quarantined objects -- is theirs, not the shim's to
+    // replace: the object lands where they said, even from inside the
+    // worktree, whose own routing would have sent it elsewhere.
+    let (code, out) = run_in(
+        &handle,
+        &format!(
+            "set -e; mkdir -p /tmp/quarantine; cd '{wt}'; \
+             echo held | GIT_OBJECT_DIRECTORY=/tmp/quarantine git hash-object -w --stdin; \
+             find /tmp/quarantine -type f | wc -l"
+        ),
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    let held: Vec<&str> = out.lines().collect();
+    assert_eq!(held.get(1).map(|n| n.trim()), Some("1"), "{out}");
+    let blob = held[0].trim();
+    assert!(
+        !layout
+            .objects_dir
+            .join(&blob[..2])
+            .join(&blob[2..])
+            .exists(),
+        "an object directory set on purpose was overridden"
+    );
+
     // And `git -C` from inside the worktree into that repository is routed by
     // the repository it names, not the directory it was typed in.
     let (code, out) = run_in(

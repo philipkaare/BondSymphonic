@@ -839,12 +839,42 @@ pub mod qobject {
         #[qinvokable]
         fn switch_harness(self: Pin<&mut AppController>, workspace_id: QString, adapter: QString);
 
+        /// A new conversation with the same agent: stops `agent_id` (when
+        /// there is one), waits for that, then starts `options_json` without
+        /// its `resume_session` -- the same harness, model and permission
+        /// mode, remembering nothing. Answers like `start_agent`:
+        /// `agent_started`, or `operation_failed("agent.start", ...)`.
         #[qinvokable]
+        fn new_session(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            agent_id: QString,
+            options_json: QString,
+        );
+
+        /// A restart that replaces `agent_id` (Restart, or a model or
+        /// permission-mode change): stops it, waits for that, then starts
+        /// `options_json` as given -- with its `resume_session`, so the
+        /// conversation continues. An empty `agent_id`, or one that has
+        /// already ended, just starts. Answers like `start_agent`.
+        #[qinvokable]
+        fn restart_agent(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            agent_id: QString,
+            options_json: QString,
+        );
+
+        #[qinvokable]
+        ///
+        /// `current_agent` is the agent the tab is showing, or empty. Unless
+        /// it is the one being attached to, it is stopped first.
         fn resume_agent(
             self: Pin<&mut AppController>,
             workspace_id: QString,
             options_json: QString,
             session: QString,
+            current_agent: QString,
         );
 
         /// Destroy a workspace. Answers with `workspace_destroyed` or
@@ -2823,6 +2853,29 @@ pub struct StartAgentFailure {
     pub workspace_removed: bool,
 }
 
+/// Stops the agent a restart, a new session or a `/resume` is replacing, and
+/// waits for it: the daemon answers `agent.stop` once the process has gone.
+///
+/// Every one of those used to start the replacement beside it instead. An old
+/// agent left running goes on working in the same worktree, out of sight of
+/// the tab that now shows the new one. Best effort, like a harness switch's:
+/// an agent that already ended answers with an error, and what replaces it
+/// must not stall behind that. An empty `agent` is nothing to stop.
+async fn stop_replaced_agent(shared: &Shared, agent: &str, why: &str) {
+    if agent.is_empty() {
+        return;
+    }
+    if let Err(error) = shared
+        .client
+        .request::<serde_json::Value>(Request::AgentStop(AgentIdParams {
+            agent_id: AgentId(agent.to_owned()),
+        }))
+        .await
+    {
+        tracing::warn!(%agent, %error, "{why}: stopping the agent it replaces failed");
+    }
+}
+
 /// Only a newly created workspace belongs to the agent-start transaction, and
 /// only an error the daemon itself returned rolls it back. A timeout or a lost
 /// connection says nothing about the start: the daemon may still be bringing
@@ -3546,7 +3599,9 @@ impl qobject::AppController {
         workspace_id: QString,
         options_json: QString,
         session: QString,
+        current_agent: QString,
     ) {
+        let current = current_agent.to_string();
         use crate::model::commands::{resume_target, ResumeTarget};
         let qt = self.qt_thread();
         let workspace = WorkspaceId(workspace_id.to_string());
@@ -3598,7 +3653,16 @@ impl qobject::AppController {
                     return;
                 }
             };
-            match resume_target(&info.agent_records, adapter, &session) {
+            let target = resume_target(&info.agent_records, adapter, &session);
+            // The agent the tab is leaving goes first, unless it is the one
+            // being attached to.
+            let leaving = match &target {
+                Ok(ResumeTarget::Attach(agent)) if agent.as_str() == current => "",
+                Ok(_) => current.as_str(),
+                Err(_) => "",
+            };
+            stop_replaced_agent(&shared, leaving, "resume").await;
+            match target {
                 Ok(ResumeTarget::Attach(agent)) => {
                     let _ = qt.queue(move |mut q| {
                         q.as_mut()
@@ -3712,6 +3776,67 @@ impl qobject::AppController {
                     }
                     None => q.start_agent(id, options),
                 }
+            });
+        });
+    }
+
+    pub fn new_session(
+        self: Pin<&mut Self>,
+        workspace_id: QString,
+        agent_id: QString,
+        options_json: QString,
+    ) {
+        let options = crate::model::agent_failure::fresh_start_options(&options_json.to_string());
+        self.replace_agent(
+            workspace_id.to_string(),
+            agent_id.to_string(),
+            options,
+            "new session",
+        );
+    }
+
+    pub fn restart_agent(
+        self: Pin<&mut Self>,
+        workspace_id: QString,
+        agent_id: QString,
+        options_json: QString,
+    ) {
+        self.replace_agent(
+            workspace_id.to_string(),
+            agent_id.to_string(),
+            options_json.to_string(),
+            "restart",
+        );
+    }
+
+    /// Stops `agent` (when there is one), waits for that, then starts
+    /// `options` in `workspace` the way `start_agent` does. `why` names the
+    /// caller in the log.
+    fn replace_agent(
+        self: Pin<&mut Self>,
+        workspace: String,
+        agent: String,
+        options: String,
+        why: &'static str,
+    ) {
+        let qt = self.qt_thread();
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_agent_failure(
+                    &qt,
+                    workspace,
+                    "agent.start",
+                    message.to_owned(),
+                    Some(options),
+                );
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            stop_replaced_agent(&shared, &agent, why).await;
+            let _ = qt.queue(move |q| {
+                q.start_agent(QString::from(&workspace), QString::from(&options));
             });
         });
     }

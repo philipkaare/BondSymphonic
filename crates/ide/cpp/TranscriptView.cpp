@@ -26,7 +26,10 @@
 #include <QLineEdit>
 #include <QPalette>
 #include <QPlainTextEdit>
+#include <QDesktopServices>
+#include <QMessageBox>
 #include <QProgressBar>
+#include <QUrl>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QTextCursor>
@@ -154,6 +157,80 @@ QString bodyText(const QJsonObject& item) {
 /// `setText`, so rendering a half-written answer costs that for each delta and
 /// throws the result away a few milliseconds later. Plain text says the same
 /// words; the formatting lands with the last one.
+/// How many steps a start has on the progress bar: the daemon's three phases.
+constexpr int kStartSteps = 3;
+
+/// Where on the progress bar the daemon's `phase` puts a start, or 0 for a
+/// phase it has not named yet (the bar then only says something is moving).
+int startStep(const QString& phase) {
+    if (phase == QLatin1String("prepare")) {
+        return 1;
+    }
+    if (phase == QLatin1String("sandbox")) {
+        return 2;
+    }
+    if (phase == QLatin1String("launch") || phase == QLatin1String("resume")) {
+        return 3;
+    }
+    return 0;
+}
+
+/// `text`, which is plain, as rich text with every web address in it a link.
+///
+/// Everything else is escaped, so a message that happens to contain markup is
+/// still shown as the characters it is. Punctuation a sentence puts after an
+/// address -- "see https://example.com." -- stays out of the link.
+QString linkified(const QString& text) {
+    static const QRegularExpression url(QStringLiteral(R"(https?://[^\s<>"']+)"));
+    QString html;
+    qsizetype last = 0;
+    auto matches = url.globalMatch(text);
+    while (matches.hasNext()) {
+        const QRegularExpressionMatch match = matches.next();
+        QString address = match.captured(0);
+        while (!address.isEmpty() && QStringLiteral(".,;:!?)]}'\"").contains(address.back())) {
+            address.chop(1);
+        }
+        if (address.isEmpty()) {
+            continue;
+        }
+        html += text.mid(last, match.capturedStart(0) - last).toHtmlEscaped();
+        html += QStringLiteral("<a href=\"%1\">%1</a>").arg(address.toHtmlEscaped());
+        last = match.capturedStart(0) + address.size();
+    }
+    html += text.mid(last).toHtmlEscaped();
+    return QStringLiteral("<span style=\"white-space: pre-wrap\">") + html +
+           QStringLiteral("</span>");
+}
+
+/// Opens a link from the conversation in the desktop browser, which puts it in
+/// a new tab. Web and mail addresses only: a Markdown link can name anything,
+/// and a `file:` or custom-scheme one an agent wrote is not something a click
+/// in a chat should run.
+void openLink(const QString& link) {
+    const QUrl url(link);
+    const QString scheme = url.scheme().toLower();
+    if (url.isValid() && (scheme == QLatin1String("http") || scheme == QLatin1String("https") ||
+                          scheme == QLatin1String("mailto"))) {
+        QDesktopServices::openUrl(url);
+    }
+}
+
+/// Makes `label`'s links clickable, opening through [`openLink`], while its
+/// text stays selectable for copying.
+void enableLinks(QLabel* label) {
+    label->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::LinksAccessibleByMouse);
+    label->setOpenExternalLinks(false);
+    QObject::connect(label, &QLabel::linkActivated, label, &openLink);
+}
+
+/// What a text frame's label shows for `item`: a user's message as rich text
+/// with its addresses linked (see [`linkified`]), anything else as `bodyText`
+/// in whatever format the label was given.
+QString labelText(const QString& kind, const QJsonObject& item) {
+    return kind == QLatin1String("user") ? linkified(bodyText(item)) : bodyText(item);
+}
+
 Qt::TextFormat assistantFormat(const QJsonObject& item) {
     return item.value(QStringLiteral("streaming")).toBool() ? Qt::PlainText : Qt::MarkdownText;
 }
@@ -220,14 +297,16 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     m_progressText = new QLabel(m_progress);
     m_progressText->setTextFormat(Qt::PlainText);
     m_progressText->setWordWrap(true);
-    m_progressText->setEnabled(false);
     progressLayout->addWidget(m_progressText);
-    auto* bar = new QProgressBar(m_progress);
-    // Indeterminate: nothing reports how far a start has got.
-    bar->setRange(0, 0);
-    bar->setTextVisible(false);
-    bar->setMaximumHeight(fontMetrics().height() / 2 + 2);
-    progressLayout->addWidget(bar);
+    // A full bar, not a hairline under grey text: what the pane is doing while
+    // a start is in flight is the one thing it has to say, and it used to read
+    // like another line of the conversation. Stepped once the daemon names a
+    // phase (see `startStep`), moving but empty until it has.
+    m_progressBar = new QProgressBar(m_progress);
+    m_progressBar->setObjectName(QStringLiteral("bsAgentProgressBar"));
+    m_progressBar->setRange(0, 0);
+    m_progressBar->setTextVisible(false);
+    progressLayout->addWidget(m_progressBar);
     m_progress->hide();
     outer->addWidget(m_progress);
 
@@ -280,6 +359,25 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
                                       QString::fromUtf8(agentchoices::defaultPermissionMode()));
     m_interrupt = new QPushButton(QStringLiteral("Interrupt"), m_composer);
     m_interrupt->setToolTip(QStringLiteral("End this turn; the agent stays alive"));
+    m_newSession = new QPushButton(QStringLiteral("New session"), m_composer);
+    m_newSession->setObjectName(QStringLiteral("TranscriptNewSession"));
+    m_newSession->setToolTip(QStringLiteral(
+        "Stop this agent and start the same one on a new conversation, with no memory of "
+        "this one"));
+    m_confirmNewSession = [this] {
+        QMessageBox box(QMessageBox::Question, QStringLiteral("Start a new session?"),
+                        QStringLiteral("Start a new session with this agent?"),
+                        QMessageBox::Cancel, this);
+        box.setInformativeText(QStringLiteral(
+            "The running agent is stopped and a new one starts with the same harness, model "
+            "and permission mode, but with no memory of this conversation, and this tab "
+            "shows the new one.\n\nThe files and commits in the workspace are not touched."));
+        QPushButton* start =
+            box.addButton(QStringLiteral("Start new session"), QMessageBox::AcceptRole);
+        box.setDefaultButton(QMessageBox::Cancel);
+        box.exec();
+        return box.clickedButton() == start;
+    };
     // Both combos share what is left after Interrupt, and both may shrink well
     // below the width their longest entry wants -- "Default (Claude Code
     // decides)" is a wide thing to demand of a dock somebody has dragged narrow.
@@ -292,6 +390,7 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     choices->addWidget(m_modelChoice, 1);
     choices->addWidget(m_permissionChoice, 1);
     choices->addWidget(m_interrupt, 0);
+    choices->addWidget(m_newSession, 0);
     bottom->addLayout(choices, 0);
     outer->addWidget(m_composer);
 
@@ -431,6 +530,11 @@ TranscriptView::TranscriptView(TranscriptModel* model, QWidget* parent)
     QObject::connect(m_interrupt, &QPushButton::clicked, this, [this] {
         if (!m_model.isNull()) {
             m_model->interrupt();
+        }
+    });
+    QObject::connect(m_newSession, &QPushButton::clicked, this, [this] {
+        if (m_confirmNewSession()) {
+            emit newSessionRequested();
         }
     });
     // The tab's options are set on the model after this view is built, and
@@ -679,16 +783,28 @@ void TranscriptView::setStarting(bool starting, bool restarting) {
         m_startFromAgentId = agentId;
     } else {
         m_startProgress.clear();
+        m_startPhase.clear();
     }
     onStateChanged();
 }
 
-void TranscriptView::setStartProgress(const QString& label) {
-    if (m_startProgress == label) {
+void TranscriptView::setStartProgress(const QString& label, const QString& phase) {
+    if (m_startProgress == label && m_startPhase == phase) {
         return;
     }
     m_startProgress = label;
+    m_startPhase = phase;
     onStateChanged();
+}
+
+void TranscriptView::setNewSessionConfirmer(std::function<bool()> confirm) {
+    if (confirm) {
+        m_confirmNewSession = std::move(confirm);
+    }
+}
+
+QPair<int, int> TranscriptView::progressStep() const {
+    return { m_progressBar->value() < 0 ? 0 : m_progressBar->value(), m_progressBar->maximum() };
 }
 
 void TranscriptView::setWorkspaceDown(bool down) {
@@ -837,7 +953,20 @@ void TranscriptView::onStateChanged() {
                                  : m_starting && m_restarting ? QStringLiteral("Restarting the agent")
                                                               : QStringLiteral("Starting the agent")) +
                             QChar(kEllipsis));
+    const int step = m_starting ? startStep(m_startPhase) : 0;
+    if (step == 0) {
+        m_progressBar->setRange(0, 0);
+        m_progressBar->setTextVisible(false);
+    } else {
+        m_progressBar->setRange(0, kStartSteps);
+        m_progressBar->setValue(step);
+        m_progressBar->setFormat(QStringLiteral("Step %v of %m"));
+        m_progressBar->setTextVisible(true);
+    }
     m_progress->setVisible(comingBack);
+    // A fresh conversation needs a harness to start one in, and nothing else
+    // in flight: a start already on its way would race it.
+    m_newSession->setEnabled(!m_starting && !busy && !m_workspaceDown);
     m_interrupt->setEnabled(!noAgent && !m_starting && !busy && working);
     // Shut only while a start is already in flight or the history is still
     // being replayed. A pane whose agent has exited keeps them open on purpose:
@@ -1114,12 +1243,17 @@ QWidget* TranscriptView::makeFrame(const QJsonObject& item, int index) {
                               codeview::wash(palette().base().color(), theme::renamed(),
                                              codeview::kWashAmount));
         frame->setPalette(framePalette);
-        label->setTextFormat(Qt::PlainText);
+        // Rich text built from the plain message, so an address in it is a
+        // link; see `linkified`.
+        label->setTextFormat(Qt::RichText);
+        enableLinks(label);
     } else if (kind == QStringLiteral("assistant")) {
         // The answer is Markdown, and Qt renders it: code spans, lists and
         // emphasis are the shape the model writes in. Not while it is still
-        // arriving, though; see `assistantFormat`.
+        // arriving, though; see `assistantFormat`. Its links -- written as
+        // Markdown links or as bare addresses -- open in the browser.
         label->setTextFormat(assistantFormat(item));
+        enableLinks(label);
     } else {
         applySmallGrey(label, kind == QStringLiteral("system"));
         label->setTextFormat(Qt::PlainText);
@@ -1130,7 +1264,7 @@ QWidget* TranscriptView::makeFrame(const QJsonObject& item, int index) {
         // column stay the pane's width; the word itself is clipped instead.
         label->setMinimumWidth(1);
     }
-    label->setText(bodyText(item));
+    label->setText(labelText(kind, item));
     return frame;
 }
 
@@ -1289,7 +1423,7 @@ void TranscriptView::updateFrame(int index, const QJsonObject& item) {
                     label->setTextFormat(format);
                 }
             }
-            label->setText(bodyText(item));
+            label->setText(labelText(kind, item));
             return;
         }
     }
@@ -1792,8 +1926,9 @@ extern "C" std::int32_t bs_widget_test_transcript_hides_the_small_grey_lines() {
     }
     // The slots the hidden items keep are what holds the rest in place: the
     // prompt after them must still be the prompt and not the answer.
+    // Contained rather than equal: a prompt is rich text, for its links.
     QLabel* last = bodyLabel(view.frameAt(3));
-    if (last == nullptr || last->text() != QLatin1String("and again")) {
+    if (last == nullptr || !last->text().contains(QLatin1String("and again"))) {
         return 3;
     }
     if (view.frameAt(1) != nullptr || view.frameAt(2) != nullptr) {
@@ -2188,10 +2323,22 @@ extern "C" std::int32_t bs_widget_test_transcript_names_the_start_phase() {
     if (!view.progressShown() || !view.progressText().startsWith(QLatin1String("Starting the agent"))) {
         return 1;
     }
-    view.setStartProgress(QStringLiteral("Starting the sandbox"));
+    // No phase named yet: the bar moves but claims no step.
+    if (view.progressStep() != qMakePair(0, 0)) {
+        return 5;
+    }
+    view.setStartProgress(QStringLiteral("Starting the sandbox"), QStringLiteral("sandbox"));
     if (!view.progressShown() ||
         view.progressText() != QStringLiteral("Starting the sandbox") + QChar(kEllipsis)) {
         return 2;
+    }
+    // The phase steps the bar: the sandbox is the second of three.
+    if (view.progressStep() != qMakePair(2, 3)) {
+        return 6;
+    }
+    view.setStartProgress(QStringLiteral("Resuming"), QStringLiteral("resume"));
+    if (view.progressStep() != qMakePair(3, 3)) {
+        return 7;
     }
     view.setStartProgress(QStringLiteral("Preparing OpenCode"));
     if (!view.progressText().startsWith(QLatin1String("Preparing OpenCode"))) {
@@ -2201,6 +2348,74 @@ extern "C" std::int32_t bs_widget_test_transcript_names_the_start_phase() {
     view.setStarting(true);
     if (!view.progressText().startsWith(QLatin1String("Starting the agent"))) {
         return 4;
+    }
+    return 0;
+}
+
+/// Web addresses in the conversation are links: in a user's plain message,
+/// where they are found and linked with everything else escaped, and in an
+/// answer's Markdown. "New session" asks first, and does nothing when the
+/// answer is no.
+extern "C" std::int32_t bs_widget_test_transcript_links_and_new_session() {
+    TranscriptModel model;
+    TranscriptView view(&model);
+    view.resize(480, 320);
+    view.setTestItems(QStringList{
+        QStringLiteral(R"json({"kind":"user","text":"see https://example.com/a?b=1. and <b>this</b>"})json"),
+        QStringLiteral(R"json({"kind":"assistant","text":"read [the docs](https://example.com/docs)","streaming":false})json"),
+    });
+    model.resetItems();
+    QLabel* user = bodyLabel(view.frameAt(0));
+    if (user == nullptr || user->textFormat() != Qt::RichText) {
+        return 1;
+    }
+    // The address is a link without the full stop after it, and the markup
+    // the user typed is shown as the characters it is.
+    if (!user->text().contains(QLatin1String(
+            R"(<a href="https://example.com/a?b=1">https://example.com/a?b=1</a>.)")) ||
+        !user->text().contains(QLatin1String("&lt;b&gt;this&lt;/b&gt;"))) {
+        return 2;
+    }
+    QLabel* answer = bodyLabel(view.frameAt(1));
+    for (QLabel* label : { user, answer }) {
+        if (label == nullptr || label->openExternalLinks() ||
+            !label->textInteractionFlags().testFlag(Qt::LinksAccessibleByMouse) ||
+            !label->textInteractionFlags().testFlag(Qt::TextSelectableByMouse)) {
+            return 3;
+        }
+    }
+
+    auto* button = view.findChild<QPushButton*>(QStringLiteral("TranscriptNewSession"));
+    if (button == nullptr) {
+        return 4;
+    }
+    int asked = 0;
+    bool answerYes = false;
+    view.setNewSessionConfirmer([&asked, &answerYes] {
+        ++asked;
+        return answerYes;
+    });
+    int requested = 0;
+    QObject::connect(&view, &TranscriptView::newSessionRequested, &view,
+                     [&requested] { ++requested; });
+    model.setAgentId(QStringLiteral("ag_one"));
+    model.setState(QStringLiteral("idle"));
+    if (!button->isEnabled()) {
+        return 5;
+    }
+    button->click();
+    if (asked != 1 || requested != 0) {
+        return 6;
+    }
+    answerYes = true;
+    button->click();
+    if (asked != 2 || requested != 1) {
+        return 7;
+    }
+    // Not while a start is already on its way.
+    view.setStarting(true);
+    if (button->isEnabled()) {
+        return 8;
     }
     return 0;
 }

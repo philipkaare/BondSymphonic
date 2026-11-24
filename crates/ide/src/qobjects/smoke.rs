@@ -285,6 +285,9 @@ pub(crate) async fn run(steps: Vec<String>, mut client: DaemonClient, qt: QtHand
                 Ok(())
             }
             "quit" => quit(&qt).await,
+            other if other.starts_with("restart=") => {
+                restart(&qt, &other["restart=".len()..]).await
+            }
             other => Err(format!("unknown step {other:?}")),
         };
         if let Err(e) = outcome {
@@ -323,6 +326,26 @@ async fn create_agent(qt: &QtHandle, repo: &str) -> Result<(), String> {
     })
     .map_err(|_| "the Qt thread is gone".to_owned())?;
     tokio::time::sleep(CREATE_SETTLE).await;
+    Ok(())
+}
+
+/// `restart=<workspace>:<agent>`: the controller's restart of that agent, as a
+/// Restart or a model change sends it -- stop the agent, wait, start again --
+/// then a settle for the stop and the start to go out.
+async fn restart(qt: &QtHandle, target: &str) -> Result<(), String> {
+    let (workspace, agent) = target
+        .split_once(':')
+        .ok_or_else(|| format!("`restart` takes <workspace>:<agent>, got {target:?}"))?;
+    let (workspace, agent) = (workspace.to_owned(), agent.to_owned());
+    qt.queue(move |q| {
+        q.restart_agent(
+            QString::from(&workspace),
+            QString::from(&agent),
+            QString::from(r#"{"adapter":"claude"}"#),
+        )
+    })
+    .map_err(|_| "the Qt thread is gone".to_owned())?;
+    tokio::time::sleep(WAIT_SETTLE).await;
     Ok(())
 }
 
