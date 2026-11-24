@@ -1241,9 +1241,13 @@ void MainWindow::connectController() {
         QJsonObject options = QJsonDocument::fromJson(
             (model ? model->restartOptionsJson() : tab.value("options_json").toString()).toUtf8()).object();
         options.insert("adapter", tab.value("adapter"));
+        // Booked like any start this window sends: the agent it replaces is
+        // stopped first, and its exit is then not a stop of its own.
+        m_autoStarting.insert(workspaceId);
         m_agentArea->setStarting(workspaceId, true, true);
         m_controller->resumeAgent(workspaceId,
-            QString::fromUtf8(QJsonDocument(options).toJson(QJsonDocument::Compact)), session);
+            QString::fromUtf8(QJsonDocument(options).toJson(QJsonDocument::Compact)), session,
+            model != nullptr ? model->getAgentId() : QString());
     });
     // A model or permission mode chosen in the composer. It is answered exactly
     // as a restart is, because it is one: `claude -p` reads both flags when the
@@ -1270,7 +1274,14 @@ void MainWindow::connectController() {
                          }
                          m_groupModel->setTabOptions(workspaceId, optionsJson);
                          m_agentArea->setStarting(workspaceId, true, true);
-                         m_controller->startAgent(workspaceId, optionsJson);
+                         // The running agent is stopped first, and its exit is
+                         // then the agent being replaced (`onAgentExited` reads
+                         // the booking) rather than one that stopped by itself.
+                         m_autoStarting.insert(workspaceId);
+                         TranscriptModel* model = m_agentArea->transcriptModel(workspaceId);
+                         m_controller->restartAgent(
+                             workspaceId, model != nullptr ? model->getAgentId() : QString(),
+                             optionsJson);
                      });
     // The small grey lines are a setting, so a pane built at any point after
     // this has to be born with the answer rather than showing them until the
@@ -2513,7 +2524,13 @@ void MainWindow::onStartAgentRequested(const QString& workspaceId) {
     TranscriptModel* model = m_agentArea->transcriptModel(workspaceId);
     const QString options = model == nullptr ? tab.value("options_json").toString()
                                              : model->restartOptionsJson();
-    m_controller->startAgent(workspaceId, options);
+    // A Restart over an agent that is still running replaces it: stopped
+    // first, so the two never run side by side in one worktree, and booked so
+    // its exit reads as the agent being replaced. Over one that has already
+    // ended the stop is a no-op and this is the start it always was.
+    m_autoStarting.insert(workspaceId);
+    m_controller->restartAgent(workspaceId, model != nullptr ? model->getAgentId() : QString(),
+                               options);
 }
 
 void MainWindow::refreshHarnessChoices() {

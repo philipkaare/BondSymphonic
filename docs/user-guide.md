@@ -937,7 +937,10 @@ and a terminal tab has no harness to switch.
   offering **Restart agent**, and the same action is in **Workspace > Restart
   agent** (`Ctrl+Shift+R`) and in Settings' Agents section. Restart starts a new
   agent with `--resume` pointed at the session id, so the conversation continues
-  rather than beginning again. The session id is read out of the transcript, and
+  rather than beginning again. An agent that is still running is stopped first,
+  so two never work side by side in one worktree; the same goes for a model or
+  permission-mode change, `/resume` and New session. The session id is read out
+  of the transcript, and
   when the transcript cannot supply one — a damaged or truncated history — the
   id the daemon recorded for that agent is used instead.
 - **Selecting a tab whose agent has stopped starts it again**, half a second
