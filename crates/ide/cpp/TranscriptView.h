@@ -6,6 +6,7 @@
 #include <QString>
 #include <QStringList>
 #include <QWidget>
+#include <functional>
 
 class NetworkBar;
 class PermissionBar;
@@ -66,7 +67,19 @@ public:
     /// What the start in flight is doing, in the daemon's words ("Starting
     /// the sandbox"), or empty for the plain "Starting the agent". Shown on
     /// the progress row while [`setStarting`] says a start is in flight.
-    void setStartProgress(const QString& label);
+    ///
+    /// `phase` is the daemon's name for it (`prepare`, `sandbox`, `launch`,
+    /// `resume`), which is what moves the bar under the words on: "Step 2 of
+    /// 3" rather than a bar that only says something is happening.
+    void setStartProgress(const QString& label, const QString& phase = QString());
+
+    /// Replaces the question "New session" asks before it acts. The default
+    /// is a message box; this is the seam a test answers through.
+    void setNewSessionConfirmer(std::function<bool()> confirm);
+
+    /// The start progress bar, for the tests: its step and how many there
+    /// are, or (0, 0) while it only says something is happening.
+    QPair<int, int> progressStep() const;
 
     /// Whether the workspace behind this pane cannot run -- its sandbox is
     /// down or never started. The prompt box says so instead of offering to
@@ -167,6 +180,9 @@ signals:
     /// window needs; this view knows only its model.
     void startAgentRequested();
     void resumeSessionRequested(const QString& session);
+    /// "New session", confirmed: stop this agent and start the same harness,
+    /// model and permission mode on a conversation of its own.
+    void newSessionRequested();
 
     /// The user chose a different model or permission mode, and `optionsJson`
     /// is the whole `AgentStartOptions` that choice means -- this tab's own
@@ -314,6 +330,9 @@ private:
     /// a start in flight, or a restored agent the window is about to start.
     QWidget* m_progress = nullptr;
     QLabel* m_progressText = nullptr;
+    class QProgressBar* m_progressBar = nullptr;
+    QPushButton* m_newSession = nullptr;
+    std::function<bool()> m_confirmNewSession;
     PermissionBar* m_permission = nullptr;
     /// See `NetworkBar`.
     NetworkBar* m_network = nullptr;
@@ -363,6 +382,8 @@ private:
     bool m_restarting = false;
     /// See [`setStartProgress`].
     QString m_startProgress;
+    /// See [`setStartProgress`]: the daemon's name for the phase, or empty.
+    QString m_startPhase;
     /// See [`setWorkspaceDown`].
     bool m_workspaceDown = false;
     /// See [`setClaudeLoggedIn`]. True until told otherwise, so a view built

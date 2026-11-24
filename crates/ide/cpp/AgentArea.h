@@ -71,6 +71,9 @@ signals:
     /// conversation. The window knows which request that was.
     void agentFailureRetryRequested(const QString& workspaceId);
     void agentStartFreshRequested(const QString& workspaceId);
+    /// The pane's "New session", confirmed: stop the agent and start the same
+    /// one on a conversation of its own.
+    void newSessionRequested(const QString& workspaceId);
 
     /// A banner's Open log was pressed.
     void openLogRequested();
@@ -176,7 +179,9 @@ public:
     /// What the `agent.start` in flight for `workspaceId` is doing, in the
     /// daemon's words ("Starting the sandbox"). Shown on the pane's progress
     /// row while it says it is starting, and forgotten when the start ends.
-    void setStartProgress(const QString& workspaceId, const QString& label);
+    /// `phase` is the daemon's name for it, which steps the pane's bar.
+    void setStartProgress(const QString& workspaceId, const QString& label,
+                          const QString& phase = QString());
 
     /// Takes it down again, without emitting `bannerDismissed`. What a
     /// successful operation on that workspace does to the banner its last
@@ -328,6 +333,8 @@ private:
     /// See [`setStartProgress`]: the latest phase of each start in flight,
     /// kept for a pane built while the start is still going.
     QHash<QString, QString> m_startProgress;
+    /// The same starts' phase names, beside their labels.
+    QHash<QString, QString> m_startPhase;
     /// See [`setShowMeta`]. True until the window says otherwise, which is the
     /// setting's own default.
     bool m_showMeta = true;

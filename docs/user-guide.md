@@ -922,6 +922,17 @@ and a terminal tab has no harness to switch.
 - **Interrupt** abandons the current turn and leaves the agent alive. It is the
   only one of the old three buttons left, because ending a turn acts on the
   conversation rather than on the process.
+- **New session** (beside Interrupt) starts the same agent on a new conversation.
+  It asks first. Then it stops the running agent and starts a new one with the
+  same harness, model and permission mode but no memory of the conversation,
+  and the tab shows the new one. Files and commits in the workspace are not
+  touched.
+- **Starting.** While an agent starts, a progress bar above the prompt box says
+  what it is doing ("Starting the sandbox") and steps through the three phases
+  a start has (preparing, the sandbox, launching), then gives way to the agent.
+- **Links.** Web addresses in the conversation, in your messages and in the
+  agent's answers, are links. Clicking one opens it in your browser; only
+  `http`, `https` and `mailto` links open.
 - **Restart.** An agent that exits on its own puts the reason in a banner
   offering **Restart agent**, and the same action is in **Workspace > Restart
   agent** (`Ctrl+Shift+R`) and in Settings' Agents section. Restart starts a new

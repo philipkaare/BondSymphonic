@@ -217,13 +217,15 @@ void AgentArea::raiseAgentFailure(WorkspaceBanner* banner, const QString& failur
                              failure.value(QStringLiteral("open_log")).toBool());
 }
 
-void AgentArea::setStartProgress(const QString& workspaceId, const QString& label) {
+void AgentArea::setStartProgress(const QString& workspaceId, const QString& label,
+                                 const QString& phase) {
     if (workspaceId.isEmpty()) {
         return;
     }
     m_startProgress.insert(workspaceId, label);
+    m_startPhase.insert(workspaceId, phase);
     if (TranscriptView* view = m_transcripts.value(workspaceId)) {
-        view->setStartProgress(label);
+        view->setStartProgress(label, phase);
     }
 }
 
@@ -301,6 +303,7 @@ void AgentArea::setStarting(const QString& workspaceId, bool starting, bool rest
     // Each start reports its own phases; what the last one reached says
     // nothing about this one, nor about a pane that is no longer starting.
     m_startProgress.remove(workspaceId);
+    m_startPhase.remove(workspaceId);
     if (TranscriptView* view = m_transcripts.value(workspaceId)) {
         view->setStartProgress(QString());
     }
@@ -346,6 +349,8 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
         addWidget(makePage(workspaceId, view));
         QObject::connect(view, &TranscriptView::startAgentRequested, this,
                          [this, workspaceId] { emit startAgentRequested(workspaceId); });
+        QObject::connect(view, &TranscriptView::newSessionRequested, this,
+                         [this, workspaceId] { emit newSessionRequested(workspaceId); });
         QObject::connect(view, &TranscriptView::resumeSessionRequested, this,
                          [this, workspaceId](const QString& session) {
                              emit resumeSessionRequested(workspaceId, session);
@@ -371,7 +376,8 @@ TranscriptView* AgentArea::ensureTranscript(const QString& workspaceId, const QS
         // A start that began before this pane existed -- which is every
         // workspace created with an agent, since the tab is shown first.
         view->setStarting(m_starting.contains(workspaceId), m_restarting.contains(workspaceId));
-        view->setStartProgress(m_startProgress.value(workspaceId));
+        view->setStartProgress(m_startProgress.value(workspaceId),
+                               m_startPhase.value(workspaceId));
         // Built with the gate the area already knows about, rather than with a
         // composer that is taken away a moment later.
         view->setClaudeLoggedIn(m_claudeLoggedIn);

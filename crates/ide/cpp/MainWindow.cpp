@@ -1419,12 +1419,42 @@ void MainWindow::connectController() {
                      &MainWindow::onAgentFailureRetry);
     QObject::connect(m_agentArea, &AgentArea::agentStartFreshRequested, this,
                      &MainWindow::onAgentStartFresh);
+    // "New session", already confirmed on the pane: the same agent on a
+    // conversation of its own.
+    QObject::connect(m_agentArea, &AgentArea::newSessionRequested, this,
+                     [this](const QString& workspaceId) {
+        if (workspaceId.isEmpty() || m_autoStarting.contains(workspaceId)) {
+            return;
+        }
+        TranscriptModel* model = m_agentArea->transcriptModel(workspaceId);
+        const QJsonObject tab = tabFor(workspaceId);
+        QJsonObject options = QJsonDocument::fromJson(
+            (model != nullptr ? model->restartOptionsJson() : tab.value("options_json").toString())
+                .toUtf8()).object();
+        // Never the session this one was: that is what a new session is not.
+        options.remove(QStringLiteral("resume_session"));
+        const QString fresh =
+            QString::fromUtf8(QJsonDocument(options).toJson(QJsonDocument::Compact));
+        // The tab keeps it too, so a later Restart resumes the new
+        // conversation rather than the one left behind.
+        m_groupModel->setTabOptions(workspaceId, fresh);
+        m_agentArea->setOptionsJson(workspaceId, fresh);
+        // Booked like any start the window sends: the old agent's exit, which
+        // the stop is about to cause, is then the agent being replaced rather
+        // than one that stopped by itself (see `onAgentExited`), and cleared
+        // the same way -- `agentStarted` or an `agent.start` failure.
+        m_autoStarting.insert(workspaceId);
+        m_agentArea->setStarting(workspaceId, true);
+        m_controller->newSession(workspaceId, model != nullptr ? model->getAgentId() : QString(),
+                                 fresh);
+    });
     QObject::connect(m_agentArea, &AgentArea::openLogRequested, this,
                      &MainWindow::openLogFolder);
     // What a slow start is doing, on the pane that is waiting for it.
     QObject::connect(m_controller, &AppController::agentStartProgress, this,
-                     [this](const QString& workspaceId, const QString&, const QString& label) {
-                         m_agentArea->setStartProgress(workspaceId, label);
+                     [this](const QString& workspaceId, const QString& phase,
+                            const QString& label) {
+                         m_agentArea->setStartProgress(workspaceId, label, phase);
                      });
     QObject::connect(m_controller, &AppController::agentStateChanged, this,
                      [this](const QString& agentId, const QString& state, const QString& detail) {

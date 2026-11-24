@@ -839,6 +839,19 @@ pub mod qobject {
         #[qinvokable]
         fn switch_harness(self: Pin<&mut AppController>, workspace_id: QString, adapter: QString);
 
+        /// A new conversation with the same agent: stops `agent_id` (when
+        /// there is one), waits for that, then starts `options_json` without
+        /// its `resume_session` -- the same harness, model and permission
+        /// mode, remembering nothing. Answers like `start_agent`:
+        /// `agent_started`, or `operation_failed("agent.start", ...)`.
+        #[qinvokable]
+        fn new_session(
+            self: Pin<&mut AppController>,
+            workspace_id: QString,
+            agent_id: QString,
+            options_json: QString,
+        );
+
         #[qinvokable]
         fn resume_agent(
             self: Pin<&mut AppController>,
@@ -3712,6 +3725,53 @@ impl qobject::AppController {
                     }
                     None => q.start_agent(id, options),
                 }
+            });
+        });
+    }
+
+    pub fn new_session(
+        self: Pin<&mut Self>,
+        workspace_id: QString,
+        agent_id: QString,
+        options_json: QString,
+    ) {
+        let qt = self.qt_thread();
+        let workspace = workspace_id.to_string();
+        let agent = agent_id.to_string();
+        let options = crate::model::agent_failure::fresh_start_options(&options_json.to_string());
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_agent_failure(
+                    &qt,
+                    workspace,
+                    "agent.start",
+                    message.to_owned(),
+                    Some(options),
+                );
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            // Stopped first and waited for: an old agent still running beside
+            // the new one would go on working in the same worktree, out of
+            // sight of the tab that now shows the new conversation.
+            if !agent.is_empty() {
+                if let Err(error) = shared
+                    .client
+                    .request::<serde_json::Value>(Request::AgentStop(AgentIdParams {
+                        agent_id: AgentId(agent.clone()),
+                    }))
+                    .await
+                {
+                    // Best effort, like a harness switch's: one that already
+                    // ended answers with an error, and the new session must not
+                    // stall behind it.
+                    tracing::warn!(%agent, %error, "new session: stopping the old agent failed");
+                }
+            }
+            let _ = qt.queue(move |q| {
+                q.start_agent(QString::from(&workspace), QString::from(&options));
             });
         });
     }
