@@ -158,3 +158,37 @@ async fn the_daemons_drop_notice_is_recognised_off_the_wire() {
     // writes `[output dropped]` into every open terminal.
     assert_eq!(event.dropped_event_count(), Some(9));
 }
+
+/// A new daemon build is offered once: when it differs from the one the
+/// running daemon was launched from, has stopped changing (the same on two
+/// polls, so a binary still being copied in is never installed half-written),
+/// and has not been offered already.
+#[test]
+fn a_new_daemon_build_is_offered_once_it_has_settled() {
+    use bondsymphonic_ide::qobjects::app_controller::{is_new_build, BuildFingerprint};
+    let at = |secs: u64, len: u64| {
+        Some(BuildFingerprint {
+            len,
+            modified: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+        })
+    };
+    let launched = at(100, 10);
+    // The build the daemon runs: nothing new.
+    assert!(!is_new_build(launched, launched, launched, None));
+    // A build landing: not on the poll that first sees it...
+    assert!(!is_new_build(launched, launched, at(200, 5), None));
+    // ...nor while it is still growing...
+    assert!(!is_new_build(launched, at(200, 5), at(201, 12), None));
+    // ...but once it has held still for a poll.
+    assert!(is_new_build(launched, at(201, 12), at(201, 12), None));
+    // Offered already: not again.
+    assert!(!is_new_build(
+        launched,
+        at(201, 12),
+        at(201, 12),
+        at(201, 12)
+    ));
+    // No binary at all is nothing to offer; a first one after none is.
+    assert!(!is_new_build(launched, None, None, None));
+    assert!(is_new_build(None, at(300, 9), at(300, 9), None));
+}

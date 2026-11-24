@@ -12,7 +12,7 @@ use crate::model::app_state::{
 };
 use crate::model::persistence::{PersistedGroup, PersistedGroups};
 use crate::model::transcript::parse_agent_state;
-use bondsymphonic_proto::{AgentId, WorkspaceId, WorkspaceInfo, WorkspaceState};
+use bondsymphonic_proto::{AgentAdapterKind, AgentId, WorkspaceId, WorkspaceInfo, WorkspaceState};
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -240,6 +240,18 @@ pub mod qobject {
         /// unknown workspace.
         #[qinvokable]
         fn agent_needs_start(self: &GroupModel, workspace_id: QString) -> bool;
+
+        /// How many tabs have an agent in the middle of something: working,
+        /// or waiting for a permission answer. What a daemon update waits for
+        /// to reach zero.
+        #[qinvokable]
+        fn busy_agent_count(self: &GroupModel) -> i32;
+
+        /// The workspaces whose tab has a live agent (idle, working or
+        /// waiting), as a JSON array of ids: the ones a daemon update brings
+        /// back afterwards.
+        #[qinvokable]
+        fn live_agent_workspaces_json(self: &GroupModel) -> QString;
 
         /// The workspace whose tab is running `agent_id`, or empty. The window
         /// gets agent state events keyed by agent, and the attention calls
@@ -985,6 +997,36 @@ impl qobject::GroupModel {
         workspaces
             .find(&id)
             .is_some_and(|(g, t)| workspaces.groups[g].tabs[t].agent_needs_start())
+    }
+
+    pub fn busy_agent_count(&self) -> i32 {
+        let busy = self
+            .rust()
+            .workspaces
+            .groups
+            .iter()
+            .flat_map(|g| g.tabs.iter())
+            .filter(|t| {
+                matches!(
+                    t.agent_status,
+                    Some(TabStatus::Working | TabStatus::WaitingPermission)
+                )
+            })
+            .count();
+        i32::try_from(busy).unwrap_or(i32::MAX)
+    }
+
+    pub fn live_agent_workspaces_json(&self) -> QString {
+        let live: Vec<String> = self
+            .rust()
+            .workspaces
+            .groups
+            .iter()
+            .flat_map(|g| g.tabs.iter())
+            .filter(|t| !t.agent_needs_start() && t.adapter != AgentAdapterKind::Terminal)
+            .map(|t| t.workspace_id.0.clone())
+            .collect();
+        QString::from(&serde_json::to_string(&live).unwrap_or_else(|_| "[]".to_owned()))
     }
 
     pub fn agent_workspace_id(&self, agent_id: QString) -> QString {

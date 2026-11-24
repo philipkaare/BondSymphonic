@@ -502,6 +502,9 @@ private:
     /// new one has listed the workspaces, since a start sent before that
     /// fails for want of a connection.
     QHash<QString, bool> m_restartUnanswered;
+    /// A new daemon build is ready and has not been applied yet; see
+    /// `tryApplyDaemonUpdate`.
+    bool m_daemonUpdatePending = false;
     /// The daemon's own word for each workspace's state ("ready",
     /// "destroying", ...), from the last `WorkspaceInfo` the window was handed.
     /// The tab cannot say it: a workspace being destroyed and a running one
@@ -558,6 +561,13 @@ private:
     /// running now. `listed` is true when a fresh `workspace.list` is what
     /// says so, which is the one proof a lost connection is back.
     void resumeUnansweredRestarts(bool listed);
+    /// Applies a pending daemon update when nothing would be cut off by it:
+    /// no agent working or waiting for a permission answer, and no start in
+    /// flight. Otherwise says it is waiting, and is asked again on every
+    /// agent state change. Before it applies, every workspace with a live
+    /// agent is booked in `m_restartUnanswered`, so the agent is resumed once
+    /// the restarted daemon has that workspace running again.
+    void tryApplyDaemonUpdate();
     /// Takes down the "The agent stopped." layer on `workspaceId`, and only
     /// that one.
     void clearAgentStopped(const QString& workspaceId);

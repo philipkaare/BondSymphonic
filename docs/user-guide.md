@@ -1458,6 +1458,25 @@ What you have to do by hand:
 
 ---
 
+## A new daemon build while the IDE runs
+
+The IDE watches the daemon binary it installs from (`target/daemon/bondsymphonic-daemon`,
+which `scripts/build-daemon.sh` and `build-daemon.ps1` write). When a new build lands
+there and stops changing, the IDE applies it by itself:
+
+- **It waits for quiet.** Restarting the daemon ends every agent and every sandbox, so
+  the update waits until no agent is working or waiting for a permission answer, and no
+  agent is being started. The status bar says it is waiting, and how many agents are busy.
+- **Then it restarts the daemon** the way it recovers from a lost one: the new binary is
+  installed into the VM or distro, the daemon starts, and every pane re-attaches. Each
+  sandbox is started fresh from the new binary.
+- **The agents come back.** Every agent that was running is started again with
+  `--resume` once its workspace is running, so its conversation and its history continue.
+
+Terminals and runs end with the old daemon, as they do on any daemon restart.
+
+---
+
 ## Troubleshooting
 
 **"daemon: protocol mismatch (daemon M, IDE N)".** The IDE and the daemon are

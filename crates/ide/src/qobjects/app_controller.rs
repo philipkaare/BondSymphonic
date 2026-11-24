@@ -202,6 +202,84 @@ static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// other's connection.
 static SUPERVISING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Woken by [`AppController::apply_daemon_update`]: the connection `supervise`
+/// is holding ends, and the relaunch that follows installs the new build.
+fn update_requested() -> &'static tokio::sync::Notify {
+    static NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+/// What identifies one build of the daemon binary on disk: its size and when
+/// it was last written. Hashing it, as `install_daemon` does, is for deciding
+/// whether to copy; this only has to notice that a build happened, and is
+/// asked every few seconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuildFingerprint {
+    pub len: u64,
+    pub modified: Option<std::time::SystemTime>,
+}
+
+impl BuildFingerprint {
+    /// The fingerprint of the file at `path`, or `None` when there is none.
+    pub fn of(path: &std::path::Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        meta.is_file().then(|| Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+/// The build the running daemon was launched from, recorded at each launch.
+/// `None` inside: there was no local build to install.
+fn launched_build() -> &'static std::sync::Mutex<Option<Option<BuildFingerprint>>> {
+    static LAUNCHED: OnceLock<std::sync::Mutex<Option<Option<BuildFingerprint>>>> = OnceLock::new();
+    LAUNCHED.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// How often the local daemon binary is looked at for a new build.
+const BUILD_POLL: Duration = Duration::from_secs(3);
+
+/// Whether a build seen now is one to offer: different from the one the
+/// running daemon was launched from, the same as one poll ago (so a binary
+/// still being copied into place is never installed half-written), and not
+/// the one already offered.
+pub fn is_new_build(
+    launched: Option<BuildFingerprint>,
+    previous: Option<BuildFingerprint>,
+    current: Option<BuildFingerprint>,
+    offered: Option<BuildFingerprint>,
+) -> bool {
+    current.is_some() && current != launched && current == previous && current != offered
+}
+
+/// Watches the local daemon binary for the IDE's whole life and says when a
+/// new build of it is ready. Nothing is applied here: see
+/// [`AppController::apply_daemon_update`].
+async fn watch_daemon_build(path: std::path::PathBuf, qt: QtHandle) {
+    let mut previous = BuildFingerprint::of(&path);
+    let mut offered: Option<BuildFingerprint> = None;
+    loop {
+        tokio::time::sleep(BUILD_POLL).await;
+        if quitting() {
+            return;
+        }
+        let current = BuildFingerprint::of(&path);
+        // Nothing to compare with until a daemon has been launched.
+        let launched = *launched_build().lock().expect("launched build");
+        if let Some(launched) = launched {
+            if is_new_build(launched, previous, current, offered) {
+                tracing::info!(path = %path.display(), "a new daemon build is ready");
+                offered = current;
+                if qt.queue(|q| q.daemon_update_available()).is_err() {
+                    return;
+                }
+            }
+        }
+        previous = current;
+    }
+}
+
 /// Whether the IDE is on its way out. The reconnect loop checks this at every
 /// step it could act on, so a daemon shut down by an exiting IDE is never
 /// relaunched behind it.
@@ -751,6 +829,20 @@ pub mod qobject {
         /// anything a loss disabled.
         #[qsignal]
         fn reconnected(self: Pin<&mut AppController>, generation: i64);
+
+        /// The daemon binary this IDE installs from has changed since the
+        /// running daemon was launched: a new build is ready. The window
+        /// decides when to apply it (`apply_daemon_update`), since applying
+        /// it restarts the daemon and every agent with it.
+        #[qsignal]
+        fn daemon_update_available(self: Pin<&mut AppController>);
+
+        /// Restarts the daemon onto the new build: the connection is ended
+        /// the way a lost one is, and the relaunch installs the new binary
+        /// first. Every pane re-attaches as after any reconnect; bringing the
+        /// agents back is the window's.
+        #[qinvokable]
+        fn apply_daemon_update(self: Pin<&mut AppController>);
 
         /// Launch the daemon inside WSL and connect to it.
         #[qinvokable]
@@ -3107,6 +3199,13 @@ async fn supervise(spec: LaunchSpec, qt: QtHandle, process: ProcessHandle) {
             _ = &mut drain => ConnectFailure::Retryable(
                 "the daemon's event stream ended".to_owned(),
             ),
+            // A new build, applied: ended like a lost connection, so the
+            // reaping and relaunch below are the ones every loss gets, and the
+            // relaunch installs the new binary before it starts it.
+            () = update_requested().notified() => {
+                drain.abort();
+                ConnectFailure::Retryable("restarting the daemon onto the new build".to_owned())
+            }
             verdict = wait_for_process(&process) => {
                 // The stream has not ended yet, but nothing will answer on it.
                 drain.abort();
@@ -3329,6 +3428,13 @@ async fn connect_once(
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], daemon.port));
             let token = daemon.token.clone();
             *process.lock().await = Some(daemon);
+            // The build this daemon was installed from: what a later build is
+            // told apart from. Read after the launch, which installed it.
+            let build = spec
+                .local_daemon_binary
+                .as_deref()
+                .and_then(BuildFingerprint::of);
+            *launched_build().lock().expect("launched build") = Some(build);
             (addr, token)
         }
     };
@@ -3340,28 +3446,28 @@ async fn connect_once(
     }
 
     let (client, hello, events) = match connect_when_forwarded(addr, &token).await {
-            Ok(connected) => connected,
-            Err(e) => {
-                // A daemon we just launched but cannot talk to. Reaped here
-                // rather than left as an orphan behind every failed attempt.
-                let orphan = process.lock().await.take();
-                if let Some(orphan) = orphan {
-                    orphan.shutdown().await;
-                }
-                let ClientError::ProtocolMismatch { daemon, client } = e else {
-                    return Err(ConnectFailure::Retryable(format!(
-                        "daemon: connect failed: {e}"
-                    )));
-                };
-                // Nothing to try again and nothing to reinstall: `launcher::launch`
-                // already installs the daemon this IDE ships with before every
-                // spawn, so the copy in the distro is the copy beside the IDE and
-                // running that step again would change nothing. The pair really
-                // cannot talk, so this stops rather than backing off against a
-                // refusal that would be identical every time.
-                return Err(ConnectFailure::Fatal(mismatch_status(daemon, client)));
+        Ok(connected) => connected,
+        Err(e) => {
+            // A daemon we just launched but cannot talk to. Reaped here
+            // rather than left as an orphan behind every failed attempt.
+            let orphan = process.lock().await.take();
+            if let Some(orphan) = orphan {
+                orphan.shutdown().await;
             }
-        };
+            let ClientError::ProtocolMismatch { daemon, client } = e else {
+                return Err(ConnectFailure::Retryable(format!(
+                    "daemon: connect failed: {e}"
+                )));
+            };
+            // Nothing to try again and nothing to reinstall: `launcher::launch`
+            // already installs the daemon this IDE ships with before every
+            // spawn, so the copy in the distro is the copy beside the IDE and
+            // running that step again would change nothing. The pair really
+            // cannot talk, so this stops rather than backing off against a
+            // refusal that would be identical every time.
+            return Err(ConnectFailure::Fatal(mismatch_status(daemon, client)));
+        }
+    };
 
     // Published before any event is dispatched, so a QObject woken by the
     // first `workspaces_listed` -- or by the generation change this publish
@@ -3463,6 +3569,9 @@ impl qobject::AppController {
         // is running now rather than the one that was running at start-up.
         let process: ProcessHandle = std::sync::Arc::new(tokio::sync::Mutex::new(None));
         self.as_mut().rust_mut().process = Some(process.clone());
+        if let Some(path) = spec.local_daemon_binary.clone() {
+            runtime().spawn(watch_daemon_build(path, qt.clone()));
+        }
         runtime().spawn(supervise(spec, qt, process));
     }
 
@@ -3803,6 +3912,11 @@ impl qobject::AppController {
                 }
             });
         });
+    }
+
+    pub fn apply_daemon_update(self: Pin<&mut Self>) {
+        tracing::info!("applying the new daemon build");
+        update_requested().notify_waiters();
     }
 
     pub fn new_session(
