@@ -3251,6 +3251,32 @@ fn mismatch_status(daemon: u32, client: u32) -> String {
     )
 }
 
+/// How long a refused connection to a daemon that has already printed its port
+/// is retried. On macOS the daemon runs in a Lima VM, and Lima forwards a guest
+/// port to the host only once its guest agent has noticed the listener, a second
+/// or two after the daemon printed it; until then the host refuses.
+const FORWARD_WAIT: Duration = Duration::from_secs(20);
+
+/// [`DaemonClient::connect`], retried while the host refuses the connection and
+/// [`FORWARD_WAIT`] has not run out. Any other error is returned at once.
+async fn connect_when_forwarded(
+    addr: std::net::SocketAddr,
+    token: &str,
+) -> Result<(DaemonClient, HelloResult, crate::client::EventStream), ClientError> {
+    let deadline = tokio::time::Instant::now() + FORWARD_WAIT;
+    loop {
+        match DaemonClient::connect(addr, token, env!("CARGO_PKG_VERSION")).await {
+            Err(ClientError::Io(e))
+                if e.kind() == std::io::ErrorKind::ConnectionRefused
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// One launch-connect-resync cycle. `attempt` is 0 for the first connection of
 /// the run and counts the reconnects after that.
 ///
@@ -3313,8 +3339,7 @@ async fn connect_once(
         let _ = qt.queue(|q| q.set_state(ConnectionState::Connecting));
     }
 
-    let (client, hello, events) =
-        match DaemonClient::connect(addr, &token, env!("CARGO_PKG_VERSION")).await {
+    let (client, hello, events) = match connect_when_forwarded(addr, &token).await {
             Ok(connected) => connected,
             Err(e) => {
                 // A daemon we just launched but cannot talk to. Reaped here
