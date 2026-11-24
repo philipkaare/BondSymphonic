@@ -692,6 +692,15 @@ issues, and commenting, work across the repository. In an in-place workspace the
 of its own to push: pushing and opening pull requests are done by the user from their own \
 checkout. If a tool says GitHub is not logged in, or that the GitHub CLI is not installed, tell \
 the user to fix it under Settings > Setup. \
+In a worktree workspace, the repository's shared .git is read-only apart from your own branches: \
+those under the prefix of the branch the workspace started on (bs/<workspace>/...). Create, \
+switch between and delete them freely -- for work based on a remote branch, git_fetch and then \
+`git switch -c bs/<workspace>/<topic> origin/<branch>`; the new branch does not track its remote, \
+so compare with origin/<branch> by name. git_push and pr_create publish the branch you are on; \
+give pr_create a base to open the pull request against a branch other than the workspace's \
+base. Other branches, tags, `git stash` and the repository's own git config cannot be written \
+here: commit or use a branch of your own instead of stashing, and use `git config --global` \
+for settings. \
 Network access from this sandbox goes through an allowlist. A request to a host that is not on it \
 is held for up to 90 seconds while the user is asked to allow it: the command is waiting for the \
 user, not hung, so do not cancel it, retry it or switch to another approach while it waits. If \

@@ -1273,19 +1273,34 @@ pub async fn destroy(d: &Daemon, id: &WorkspaceId, force: bool) -> Result<Empty,
                     .is_empty())
             },
             async {
-                if !repo::branch_exists(&d.git, &ws.repo_path, &ws.branch).await? {
-                    return Ok(false);
+                // Every branch of the workspace's own, not only the one it
+                // was created with: the agent may have moved its work to
+                // another, and the destroy removes them all.
+                let git = layout.daemon_git();
+                let mut branches = match crate::workspace::branches::own_prefix(&ws) {
+                    Some(prefix) => {
+                        crate::workspace::branches::branches_under(&git, &ws.repo_path, &prefix)
+                            .await?
+                    }
+                    None => Vec::new(),
+                };
+                if branches.is_empty()
+                    && repo::branch_exists(&d.git, &ws.repo_path, &ws.branch).await?
+                {
+                    branches.push(ws.branch.clone());
                 }
-                Ok(!layout
-                    .daemon_git()
-                    .run(
-                        &ws.repo_path,
-                        &["rev-list", &format!("{}..{}", ws.base_branch, ws.branch)],
-                    )
-                    .await?
-                    .stdout
-                    .trim()
-                    .is_empty())
+                for branch in &branches {
+                    let ahead = git
+                        .run(
+                            &ws.repo_path,
+                            &["rev-list", &format!("{}..{}", ws.base_branch, branch)],
+                        )
+                        .await?;
+                    if !ahead.stdout.trim().is_empty() {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
             },
         )?;
         if dirty || unmerged {

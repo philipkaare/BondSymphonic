@@ -36,6 +36,11 @@ pub const COMMON_ENV: &str = "BS_GIT_COMMON_DIR";
 pub const OBJECTS_ENV: &str = "BS_GIT_OBJECT_DIRECTORY";
 /// What `GIT_ALTERNATE_OBJECT_DIRECTORIES` becomes for it.
 pub const ALTERNATES_ENV: &str = "BS_GIT_ALTERNATE_OBJECT_DIRECTORIES";
+/// The prefix of the workspace's own branches, `bs/<name>/`: the ones its
+/// agent may create, switch between and delete.
+pub const PREFIX_ENV: &str = "BS_GIT_BRANCH_PREFIX";
+/// The branch the workspace was created with, which is never deleted.
+pub const BRANCH_ENV: &str = "BS_GIT_WORKSPACE_BRANCH";
 
 const GIT_OBJECTS: &str = "GIT_OBJECT_DIRECTORY";
 const GIT_ALTERNATES: &str = "GIT_ALTERNATE_OBJECT_DIRECTORIES";
@@ -79,10 +84,176 @@ pub fn run() -> ! {
     // same way, like every other.
     cmd.env_remove(GIT_OBJECTS).env_remove(GIT_ALTERNATES);
     if let Some((objects, alternates)) = routing(&real, &args) {
-        cmd.env(GIT_OBJECTS, objects)
+        // Deleting one of the workspace's own branches is done here: git
+        // insists on locking the shared `packed-refs` for every deletion, and
+        // that file is read-only in the sandbox even when the branch is not.
+        if let Some(delete) = branch_deletion(&args) {
+            std::process::exit(delete_own_branches(&real, &delete, &objects, &alternates));
+        }
+        // A branch made from a remote one (`git switch -c <name> origin/x`)
+        // would otherwise set up tracking, which is written to the
+        // repository's config -- read-only here -- and fails the whole
+        // command. The branch is made untracked instead; the agent compares
+        // with `origin/x` by name, and pushes through its tools.
+        let mut routed = Command::new(&real);
+        routed
+            .args(["-c", "branch.autoSetupMerge=false"])
+            .args(&args)
+            .env_remove(GIT_OBJECTS)
+            .env_remove(GIT_ALTERNATES)
+            .env(GIT_OBJECTS, objects)
             .env(GIT_ALTERNATES, alternates);
+        exec(routed, &real);
     }
     exec(cmd, &real)
+}
+
+/// A `git branch -d|-D|--delete [-f] <name>...` the shim carries out itself.
+#[derive(Debug, PartialEq)]
+pub struct BranchDeletion {
+    pub globals: Vec<OsString>,
+    pub force: bool,
+    pub names: Vec<String>,
+}
+
+/// `args` as a branch deletion, or `None` for anything else -- including a
+/// deletion with an option this does not know, which is then git's to answer.
+pub fn branch_deletion(args: &[OsString]) -> Option<BranchDeletion> {
+    let (globals, command) = split_globals(args);
+    if command?.to_str()? != "branch" {
+        return None;
+    }
+    let rest = &args[globals.len() + 1..];
+    let (mut delete, mut force, mut names) = (false, false, Vec::new());
+    for arg in rest {
+        let arg = arg.to_str()?;
+        match arg {
+            "-d" | "--delete" => delete = true,
+            "-D" => (delete, force) = (true, true),
+            "-f" | "--force" => force = true,
+            _ if arg.starts_with("--") => return None,
+            _ if arg.starts_with('-') && arg.len() > 1 => {
+                for flag in arg[1..].chars() {
+                    match flag {
+                        'd' => delete = true,
+                        'D' => (delete, force) = (true, true),
+                        'f' => force = true,
+                        _ => return None,
+                    }
+                }
+            }
+            _ => names.push(arg.to_owned()),
+        }
+    }
+    (delete && !names.is_empty()).then(|| BranchDeletion {
+        globals: globals.to_vec(),
+        force,
+        names,
+    })
+}
+
+/// Deletes `request`'s branches the way `git branch -d` would, as far as the
+/// sandbox allows: only the workspace's own, never the one it was created
+/// with nor the one checked out, and with `-d` only when merged into `HEAD`.
+/// Returns the exit code, 1 when any branch was refused.
+fn delete_own_branches(
+    real: &Path,
+    request: &BranchDeletion,
+    objects: &OsStr,
+    alternates: &OsStr,
+) -> i32 {
+    let prefix = std::env::var(PREFIX_ENV).unwrap_or_default();
+    let own = std::env::var(BRANCH_ENV).unwrap_or_default();
+    let common = PathBuf::from(std::env::var_os(COMMON_ENV).unwrap_or_default());
+    let git = |args: &[&str]| {
+        Command::new(real)
+            .args(&request.globals)
+            .args(args)
+            .env(GIT_OBJECTS, objects)
+            .env(GIT_ALTERNATES, alternates)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    let head = git(&["symbolic-ref", "-q", "HEAD"]).unwrap_or_default();
+    let mut code = 0;
+    for name in &request.names {
+        let mut refuse = |why: String| {
+            eprintln!("error: {why}");
+            code = 1;
+        };
+        if prefix.is_empty() || !is_own_branch(&prefix, name) {
+            refuse(format!(
+                "cannot delete branch '{name}': only this workspace's own branches \
+                 ({prefix}...) can be deleted in its sandbox"
+            ));
+            continue;
+        }
+        if *name == own {
+            refuse(format!(
+                "cannot delete branch '{name}': it is the branch this workspace was created with"
+            ));
+            continue;
+        }
+        let full = format!("refs/heads/{name}");
+        let Some(sha) = git(&["rev-parse", "--verify", "-q", &full]) else {
+            refuse(format!("branch '{name}' not found."));
+            continue;
+        };
+        if head == full {
+            refuse(format!("cannot delete branch '{name}': it is checked out"));
+            continue;
+        }
+        if !request.force && git(&["merge-base", "--is-ancestor", &sha, "HEAD"]).is_none() {
+            refuse(format!(
+                "the branch '{name}' is not fully merged.\nIf you are sure you want to \
+                 delete it, run 'git branch -D {name}'."
+            ));
+            continue;
+        }
+        let file = common.join("refs").join("heads").join(name);
+        if !file.is_file() {
+            refuse(format!(
+                "cannot delete branch '{name}': it is packed in the repository's shared \
+                 refs, which this sandbox cannot rewrite; ask the user to delete it"
+            ));
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&file) {
+            refuse(format!("cannot delete branch '{name}': {e}"));
+            continue;
+        }
+        let _ = std::fs::remove_file(common.join("logs").join("refs").join("heads").join(name));
+        // Directories a nested name made (`bs/<name>/fix/a`), as git leaves
+        // none behind; never the workspace's own directory.
+        let root = common
+            .join("refs")
+            .join("heads")
+            .join(prefix.trim_end_matches('/'));
+        let mut dir = file.parent().map(Path::to_path_buf);
+        while let Some(d) = dir.filter(|d| d.starts_with(&root) && *d != root) {
+            if std::fs::remove_dir(&d).is_err() {
+                break;
+            }
+            dir = d.parent().map(Path::to_path_buf);
+        }
+        let short = sha.get(..7).unwrap_or(&sha);
+        println!("Deleted branch {name} (was {short}).");
+    }
+    code
+}
+
+/// Whether `name` is under `prefix` with a name of its own, and nothing in it
+/// that could reach outside the prefix's directory.
+pub fn is_own_branch(prefix: &str, name: &str) -> bool {
+    name.len() > prefix.len()
+        && name.starts_with(prefix)
+        && !name
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
 }
 
 fn exec(mut cmd: Command, real: &Path) -> ! {
@@ -174,6 +345,49 @@ mod tests {
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn a_branch_deletion_is_recognised_and_anything_else_is_not() {
+        let deletion = branch_deletion(&os(&["branch", "-d", "bs/a/x", "bs/a/y"])).unwrap();
+        assert!(!deletion.force);
+        assert_eq!(deletion.names, ["bs/a/x", "bs/a/y"]);
+        assert!(
+            branch_deletion(&os(&["branch", "-D", "bs/a/x"]))
+                .unwrap()
+                .force
+        );
+        assert!(
+            branch_deletion(&os(&["branch", "--delete", "--force", "bs/a/x"]))
+                .unwrap()
+                .force
+        );
+        assert!(
+            branch_deletion(&os(&["branch", "-df", "bs/a/x"]))
+                .unwrap()
+                .force
+        );
+        let with_globals = branch_deletion(&os(&["-C", "/w", "branch", "-d", "bs/a/x"])).unwrap();
+        assert_eq!(with_globals.globals, os(&["-C", "/w"]));
+        // Not a deletion, or one with an option this does not know: git's.
+        assert_eq!(branch_deletion(&os(&["branch", "bs/a/x"])), None);
+        assert_eq!(branch_deletion(&os(&["branch", "-d"])), None);
+        assert_eq!(
+            branch_deletion(&os(&["branch", "-d", "-r", "origin/x"])),
+            None
+        );
+        assert_eq!(branch_deletion(&os(&["switch", "-d", "x"])), None);
+    }
+
+    #[test]
+    fn only_names_inside_the_prefix_are_own_branches() {
+        assert!(is_own_branch("bs/a/", "bs/a/x"));
+        assert!(is_own_branch("bs/a/", "bs/a/fix/x"));
+        assert!(!is_own_branch("bs/a/", "bs/a/"));
+        assert!(!is_own_branch("bs/a/", "bs/ab/x"));
+        assert!(!is_own_branch("bs/a/", "bs/a/../../main"));
+        assert!(!is_own_branch("bs/a/", "bs/a//x"));
+        assert!(!is_own_branch("bs/a/", "main"));
     }
 
     /// An object directory the shim did not choose is left alone; one it did

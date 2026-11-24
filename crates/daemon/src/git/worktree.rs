@@ -54,7 +54,14 @@ impl Layout {
     /// directory, and every other repository works as plain git.
     #[cfg(unix)]
     pub fn sandbox_git_routing_env(&self) -> Vec<(String, String)> {
-        use crate::sandbox::git_shim::{ALTERNATES_ENV, COMMON_ENV, OBJECTS_ENV};
+        use crate::sandbox::git_shim::{
+            ALTERNATES_ENV, BRANCH_ENV, COMMON_ENV, OBJECTS_ENV, PREFIX_ENV,
+        };
+        let prefix = self
+            .branch
+            .rsplit_once('/')
+            .map(|(parent, _)| format!("{parent}/"))
+            .unwrap_or_default();
         vec![
             (COMMON_ENV.into(), path_arg(&self.git_common)),
             (OBJECTS_ENV.into(), path_arg(&self.objects_dir)),
@@ -62,6 +69,8 @@ impl Layout {
                 ALTERNATES_ENV.into(),
                 path_arg(&self.git_common.join("objects")),
             ),
+            (PREFIX_ENV.into(), prefix),
+            (BRANCH_ENV.into(), self.branch.clone()),
         ]
     }
     /// Env for git *inside* the sandbox: new objects go to the private dir.
@@ -1052,22 +1061,41 @@ fn regex_escape(text: &str) -> String {
 /// the user's own checkout, say. Deleting it under them would leave that
 /// checkout on a branch that does not exist, so it is refused as it used to be.
 async fn remove_branch(git: &Git, layout: &Layout) -> Result<(), RpcError> {
-    if repo::branch_exists(git, &layout.repo, &layout.branch).await? {
+    // The workspace's other branches first -- the ones its agent made under
+    // the same prefix (see `workspace::branches`) -- the same way, then its
+    // own. Each is refused if somebody else has it checked out.
+    if let Some((parent, _)) = layout.branch.rsplit_once('/') {
+        let prefix = format!("{parent}/");
+        for branch in crate::workspace::branches::branches_under(git, &layout.repo, &prefix).await?
+        {
+            if branch != layout.branch {
+                remove_one_branch(git, layout, &branch).await?;
+            }
+        }
+    }
+    remove_one_branch(git, layout, &layout.branch).await?;
+    let _ = std::fs::remove_dir(layout.ref_dir());
+    let _ = std::fs::remove_dir_all(layout.reflog_dir());
+    Ok(())
+}
+
+async fn remove_one_branch(git: &Git, layout: &Layout, branch: &str) -> Result<(), RpcError> {
+    if repo::branch_exists(git, &layout.repo, branch).await? {
         let listed = git
             .run(&layout.repo, &["worktree", "list", "--porcelain"])
             .await?;
-        if let Some(other) = checked_out_at(&listed.stdout, &layout.branch) {
+        if let Some(other) = checked_out_at(&listed.stdout, branch) {
             return Err(RpcError::new(
                 ErrorCode::Conflict,
                 format!(
                     "branch {} is checked out at {other}, so it was left alone",
-                    layout.branch
+                    branch
                 ),
             ));
         }
-        let full = format!("refs/heads/{}", layout.branch);
+        let full = format!("refs/heads/{}", branch);
         git.run(&layout.repo, &["update-ref", "-d", &full]).await?;
-        let section = format!("branch.{}", layout.branch);
+        let section = format!("branch.{}", branch);
         let has_section = git
             .run(
                 &layout.repo,
@@ -1089,7 +1117,5 @@ async fn remove_branch(git: &Git, layout: &Layout) -> Result<(), RpcError> {
             .await?;
         }
     }
-    let _ = std::fs::remove_dir(layout.ref_dir());
-    let _ = std::fs::remove_dir_all(layout.reflog_dir());
     Ok(())
 }

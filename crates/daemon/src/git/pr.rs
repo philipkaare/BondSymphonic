@@ -50,6 +50,8 @@ pub async fn create_pr(
         }
     }
     push_branch(d, &ws, false).await?;
+    // The head is the branch `push_branch` just published.
+    let ws = crate::workspace::branches::on_active_branch(d, &ws).await?;
 
     let mut args: Vec<String> = [
         "pr",
@@ -138,6 +140,10 @@ pub async fn push_branch(d: &Daemon, ws: &Workspace, force: bool) -> Result<(), 
         )));
     }
     let layout = layout_for(d, ws).await?;
+    // The branch the worktree is on now, when it is one of the workspace's
+    // own; see `workspace::branches`. Everything below -- the symref refusal,
+    // the explicit destination -- holds for it exactly as for the original.
+    let ws = &crate::workspace::branches::on_active_branch(d, ws).await?;
     // `daemon_push_git`, not `daemon_git`: the push must still run the
     // repository's `pre-push` hook, because that is how `git-lfs` uploads the
     // objects the pushed commits point at. See [`Layout::daemon_push_git`].

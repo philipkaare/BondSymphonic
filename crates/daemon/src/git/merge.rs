@@ -66,6 +66,10 @@ pub async fn merge(
         )));
     }
     let layout = layout_for(d, &ws).await?;
+    // The branch the worktree is on now, when it is one of the workspace's
+    // own: the agent may have moved its work to another (see
+    // `workspace::branches`).
+    let ws = crate::workspace::branches::on_active_branch(d, &ws).await?;
     let git = layout.daemon_git();
 
     // One merge at a time per repository. Two merges of two workspaces of the
