@@ -84,6 +84,14 @@ struct Token {
     scopes: Vec<String>,
     #[serde(default)]
     revocation: Option<Revocation>,
+    /// The secret the authorization server issued this client when it was
+    /// registered for the login, if it issued one, and how to present it.
+    /// Kept with the token -- in the secret store, never in the
+    /// configuration -- because refresh and revocation need it again.
+    #[serde(default)]
+    client_secret: Option<String>,
+    #[serde(default)]
+    client_auth: Option<String>,
 }
 impl Token {
     fn parse(value: Option<McpSecretValue>) -> Option<Self> {
@@ -109,6 +117,20 @@ struct Attempt {
     scopes: Vec<String>,
     issuer_required: bool,
     revocation: Option<Revocation>,
+    /// See [`Registration`]: the secret a dynamic registration issued, and
+    /// how the server wants it presented.
+    client_secret: Option<String>,
+    client_auth: Option<String>,
+}
+
+/// What dynamic client registration produced: the client ID, and, when the
+/// authorization server insists on a confidential client (Atlassian's does,
+/// whatever was asked for), the secret it issued and the token endpoint
+/// authentication method it assigned.
+struct Registration {
+    client_id: String,
+    client_secret: Option<String>,
+    client_auth: Option<String>,
 }
 
 #[derive(Default)]
@@ -419,7 +441,6 @@ impl McpServers {
         }
         let authorize = endpoint(&metadata, "authorization_endpoint")?;
         let token_endpoint = endpoint(&metadata, "token_endpoint")?;
-        let revocation = revocation_metadata(&metadata, config);
         let mut requested_scopes = scopes.clone();
         if let Some(scope) = challenge_fields.get("scope") {
             for s in scope.split_whitespace() {
@@ -428,11 +449,11 @@ impl McpServers {
                 }
             }
         }
-        let client_id = if let Some(id) = client_id {
+        let registration = if let Some(id) = client_id {
             if id.is_empty() || id.len() > 2048 {
                 return Err(error("invalid OAuth client ID"));
             }
-            id.clone()
+            Registration::configured(id.clone())
         } else if let Some(metadata_url) = client_metadata_url {
             HttpsUrl::parse(metadata_url)?;
             if !metadata
@@ -444,10 +465,13 @@ impl McpServers {
                     "OAuth client metadata unsupported; configure client ID",
                 ));
             }
-            metadata_url.clone()
+            Registration::configured(metadata_url.clone())
         } else {
             self.register(&metadata, &redirect_uri).await?
         };
+        let client_id = registration.client_id.clone();
+        let revocation =
+            revocation_metadata(&metadata, config, registration.client_auth.as_deref());
         let state_value = random_secret();
         let verifier = random_secret();
         let code_challenge = URL_SAFE_NO_PAD.encode(sha256(verifier.as_bytes())?);
@@ -484,14 +508,22 @@ impl McpServers {
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 revocation,
+                client_secret: registration.client_secret,
+                client_auth: registration.client_auth,
             },
             authorization_url,
         ))
     }
 
-    /// Dynamic client registration as a public client. A server that insists
-    /// on issuing a client secret needs a configured confidential client.
-    async fn register(&self, metadata: &Value, redirect_uri: &str) -> Result<String, RpcError> {
+    /// Dynamic client registration, asking to be a public client. A server
+    /// that issues a secret anyway -- Atlassian's does -- gets a confidential
+    /// client: the secret is used for this login's code exchange and, kept
+    /// with the token, for its refreshes and revocation.
+    async fn register(
+        &self,
+        metadata: &Value,
+        redirect_uri: &str,
+    ) -> Result<Registration, RpcError> {
         let registration = endpoint(metadata, "registration_endpoint")?;
         let body = serde_json::to_vec(&json!({
             "client_name": "BondSymphonic",
@@ -514,17 +546,46 @@ impl McpServers {
         }
         let body: Value = serde_json::from_slice(&response.body)
             .map_err(|_| error("invalid OAuth registration"))?;
-        if body.get("client_secret").is_some() {
-            return Err(error(
-                "OAuth registration requires configured confidential client",
-            ));
-        }
-        Ok(body
+        let client_id = body
             .get("client_id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty() && id.len() <= 2048)
             .ok_or_else(|| error("OAuth client ID missing"))?
-            .to_owned())
+            .to_owned();
+        let secret = match body.get("client_secret") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s))
+                if !s.is_empty() && s.len() <= 4096 && !s.chars().any(char::is_control) =>
+            {
+                Some(s.clone())
+            }
+            Some(_) => return Err(error("invalid OAuth registration")),
+        };
+        // RFC 7591: an omitted method is `client_secret_basic`.
+        let method = body
+            .get("token_endpoint_auth_method")
+            .and_then(Value::as_str)
+            .unwrap_or(if secret.is_some() {
+                "client_secret_basic"
+            } else {
+                "none"
+            });
+        match (secret, method) {
+            (_, "none") => Ok(Registration {
+                client_id,
+                client_secret: None,
+                client_auth: None,
+            }),
+            (Some(secret), "client_secret_basic" | "client_secret_post") => Ok(Registration {
+                client_id,
+                client_secret: Some(secret),
+                client_auth: Some(method.to_owned()),
+            }),
+            _ => Err(error(
+                "OAuth registration assigned an unsupported client authentication; configure \
+                 client ID",
+            )),
+        }
     }
 
     /// Completes a login: the state must match, the issuer too (and be
@@ -595,20 +656,26 @@ impl McpServers {
             ("resource", resource),
             ("scope", &scope),
         ];
-        let secret = self.client_secret(&config, attempt.generation)?;
-        if let Some(secret) = &secret {
-            fields.push(("client_secret", secret));
-        }
+        let credential = self.credential(
+            &config,
+            attempt.generation,
+            attempt.client_secret.as_deref(),
+            attempt.client_auth.as_deref(),
+        )?;
+        let headers = present_credential(&mut fields, &attempt.client_id, credential.as_ref());
         let mut token = self
             .exchange(
                 &attempt.endpoint,
                 &fields,
+                headers,
                 &attempt.issuer,
                 &attempt.client_id,
                 &attempt.scopes,
             )
             .await?;
         token.revocation = attempt.revocation.clone();
+        token.client_secret = attempt.client_secret.clone();
+        token.client_auth = attempt.client_auth.clone();
         self.set_secret_at(
             id,
             attempt.generation,
@@ -647,22 +714,50 @@ impl McpServers {
         ))
     }
 
+    /// The client credential for a token request: the secret a dynamic
+    /// registration issued (`dynamic`, presented the way the server assigned,
+    /// `method`), or else the configured client secret, sent in the form as
+    /// it always has been. `None` for a public client.
+    fn credential(
+        &self,
+        config: &McpServerConfig,
+        generation: u64,
+        dynamic: Option<&str>,
+        method: Option<&str>,
+    ) -> Result<Option<Credential>, RpcError> {
+        if let Some(secret) = dynamic {
+            return Ok(Some(Credential {
+                secret: secret.to_owned(),
+                basic: method != Some("client_secret_post"),
+            }));
+        }
+        Ok(self
+            .client_secret(config, generation)?
+            .map(|secret| Credential {
+                secret,
+                basic: false,
+            }))
+    }
+
     async fn exchange(
         &self,
         endpoint: &str,
         fields: &[(&str, &str)],
+        extra_headers: Vec<(String, String)>,
         issuer: &str,
         client_id: &str,
         scopes: &[String],
     ) -> Result<Token, RpcError> {
+        let mut headers = vec![(
+            "Content-Type".into(),
+            "application/x-www-form-urlencoded".into(),
+        )];
+        headers.extend(extra_headers);
         let response = self
             .http_request(HttpRequest {
                 method: "POST".into(),
                 url: endpoint.into(),
-                headers: vec![(
-                    "Content-Type".into(),
-                    "application/x-www-form-urlencoded".into(),
-                )],
+                headers,
                 body: form(fields).into_bytes(),
             })
             .await?;
@@ -717,6 +812,8 @@ impl McpServers {
             client_id: client_id.into(),
             scopes: scopes.to_vec(),
             revocation: None,
+            client_secret: None,
+            client_auth: None,
         })
     }
 
@@ -752,12 +849,13 @@ impl McpServers {
         };
         let secret = match revocation.auth_method.as_str() {
             "none" => None,
-            "client_secret_post" | "client_secret_basic" => {
-                match self.client_secret(&config, generation) {
+            "client_secret_post" | "client_secret_basic" => match &token.client_secret {
+                Some(secret) => Some(secret.clone()),
+                None => match self.client_secret(&config, generation) {
                     Ok(Some(secret)) => Some(secret),
                     _ => return,
-                }
-            }
+                },
+            },
             _ => return,
         };
         let mut tokens = vec![];
@@ -908,14 +1006,18 @@ impl McpServers {
             ("resource", resource),
             ("scope", scope.as_str()),
         ];
-        let secret = self.client_secret(config, generation)?;
-        if let Some(secret) = &secret {
-            fields.push(("client_secret", secret));
-        }
+        let credential = self.credential(
+            config,
+            generation,
+            token.client_secret.as_deref(),
+            token.client_auth.as_deref(),
+        )?;
+        let headers = present_credential(&mut fields, &token.client_id, credential.as_ref());
         let mut replacement = self
             .exchange(
                 &token.endpoint,
                 &fields,
+                headers,
                 &token.issuer,
                 &token.client_id,
                 &token.scopes,
@@ -925,6 +1027,8 @@ impl McpServers {
             replacement.refresh = token.refresh;
         }
         replacement.revocation = token.revocation;
+        replacement.client_secret = token.client_secret;
+        replacement.client_auth = token.client_auth;
         // Stored only if nothing (disconnect, edit, removal) happened since.
         self.set_secret_at(id, generation, TOKEN_SECRET, Some(replacement.to_secret()?))
             .map_err(|_| error("OAuth refresh invalidated"))?;
@@ -935,18 +1039,26 @@ impl McpServers {
     }
 }
 
-fn revocation_metadata(metadata: &Value, config: &McpServerConfig) -> Option<Revocation> {
+/// `registered` is the token endpoint authentication method a dynamic
+/// registration assigned along with a client secret, or `None`. The
+/// revocation endpoint is asked the same way when it accepts that.
+fn revocation_metadata(
+    metadata: &Value,
+    config: &McpServerConfig,
+    registered: Option<&str>,
+) -> Option<Revocation> {
     let endpoint = endpoint(metadata, "revocation_endpoint").ok()?;
-    let confidential = matches!(
-        remote(config),
-        Ok((
-            _,
-            McpAuthConfig::OAuth {
-                client_secret: Some(_),
-                ..
-            }
-        ))
-    );
+    let confidential = registered.is_some()
+        || matches!(
+            remote(config),
+            Ok((
+                _,
+                McpAuthConfig::OAuth {
+                    client_secret: Some(_),
+                    ..
+                }
+            ))
+        );
     // RFC 8414 defaults omitted authentication metadata to client_secret_basic.
     let methods = metadata.get("revocation_endpoint_auth_methods_supported");
     let supported = |method: &str| match methods {
@@ -955,8 +1067,9 @@ fn revocation_metadata(metadata: &Value, config: &McpServerConfig) -> Option<Rev
         _ => false,
     };
     let method = if confidential {
-        ["client_secret_post", "client_secret_basic"]
+        registered
             .into_iter()
+            .chain(["client_secret_post", "client_secret_basic"])
             .find(|m| supported(m))?
     } else if supported("none") {
         "none"
@@ -967,6 +1080,52 @@ fn revocation_metadata(metadata: &Value, config: &McpServerConfig) -> Option<Rev
         endpoint,
         auth_method: method.into(),
     })
+}
+
+impl Registration {
+    /// A client the user configured (an ID, or a metadata document URL): no
+    /// registration happened, so no secret came with it.
+    fn configured(client_id: String) -> Self {
+        Self {
+            client_id,
+            client_secret: None,
+            client_auth: None,
+        }
+    }
+}
+
+/// A client secret and whether it goes in an HTTP Basic header
+/// (`client_secret_basic`) rather than in the form (`client_secret_post`).
+struct Credential {
+    secret: String,
+    basic: bool,
+}
+
+/// Presents `credential` on a token request: added to `fields`, or returned
+/// as the `Authorization` header to send. RFC 6749 §2.3.1: the ID and secret
+/// are form-encoded before they are joined and base64-encoded.
+fn present_credential<'a>(
+    fields: &mut Vec<(&'a str, &'a str)>,
+    client_id: &str,
+    credential: Option<&'a Credential>,
+) -> Vec<(String, String)> {
+    match credential {
+        None => vec![],
+        Some(c) if !c.basic => {
+            fields.push(("client_secret", c.secret.as_str()));
+            vec![]
+        }
+        Some(c) => {
+            let pair = format!("{}:{}", encode(client_id), encode(&c.secret));
+            vec![(
+                "Authorization".into(),
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(pair)
+                ),
+            )]
+        }
+    }
 }
 
 /// A discovered endpoint, admitted by the same URL policy as the server.
