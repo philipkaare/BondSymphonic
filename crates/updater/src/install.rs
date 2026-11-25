@@ -218,7 +218,7 @@ exit 0
 
 mod mac {
     use super::*;
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     /// The Team ID line of `codesign -dv` (which writes to stderr).
     pub(crate) fn team_id(codesign_dv_stderr: &str) -> Option<String> {
@@ -316,6 +316,7 @@ mod mac {
         log: &Path,
     ) -> Result<(), InstallError> {
         use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
         let log = std::fs::File::create(log)?;
         Command::new("/bin/sh")
             .arg("-c")
