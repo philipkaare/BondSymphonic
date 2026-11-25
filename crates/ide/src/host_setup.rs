@@ -157,11 +157,13 @@ fn wsl_has_distro(distro: &str) -> bool {
 /// `wsl.exe`'s own output is UTF-16LE; anything else is read as UTF-8.
 pub fn decode_wsl_output(bytes: &[u8]) -> String {
     // ASCII text in UTF-16LE has a NUL in every odd byte; UTF-8 has none.
-    let utf16 = bytes.len() % 2 == 0 && bytes.iter().skip(1).step_by(2).any(|&b| b == 0);
+    let utf16 = bytes.len().is_multiple_of(2) && bytes.iter().skip(1).step_by(2).any(|&b| b == 0);
     if utf16 {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
             .collect();
         String::from_utf16_lossy(&units).replace('\u{feff}', "")
     } else {
