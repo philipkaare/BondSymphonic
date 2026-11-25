@@ -449,7 +449,7 @@ pub async fn create(layout: &Layout, base_branch: &str) -> Result<(), CreateFail
 /// The reason every workspace worktree is locked with, as `git worktree list`
 /// shows it to whoever wonders why.
 pub const LOCK_REASON: &str =
-    "BondSymphonic manages this worktree from WSL; do not prune or remove it by hand";
+    "BondSymphonic manages this worktree; do not prune or remove it by hand";
 
 /// Locks the workspace's worktree registration.
 ///

@@ -927,9 +927,14 @@ and a terminal tab has no harness to switch.
   same harness, model and permission mode but no memory of the conversation,
   and the tab shows the new one. Files and commits in the workspace are not
   touched.
-- **Starting.** While an agent starts, a progress bar above the prompt box says
-  what it is doing ("Starting the sandbox") and steps through the three phases
-  a start has (preparing, the sandbox, launching), then gives way to the agent.
+- **Starting.** A progress bar above the prompt box is up from the moment a
+  start, restart or resume begins until the agent is ready for a prompt. It says
+  what is happening and steps through a start's three phases (preparing, the
+  sandbox, launching or resuming). Then it says *Loading the conversation…*
+  while the history replays and *Connecting to the agent…* until the agent
+  reports in. A replay with no start behind it, when a tab opens or after a
+  reconnect, shows the bar too. It goes when the agent is idle, working or
+  waiting for you. If the agent fails instead, a banner says so.
 - **Links.** Web addresses in the conversation, in your messages and in the
   agent's answers, are links. Clicking one opens it in your browser; only
   `http`, `https` and `mailto` links open.
@@ -1001,7 +1006,8 @@ server with a status dot: green is connected, amber is a sign-in in progress,
 red is an error (its reason follows the word), grey is not signed in, not yet
 tested, or a local server, which is only started inside an agent's sandbox. The
 tab and the Workspace menu item below appear only when the daemon supports MCP
-servers; an older daemon shows neither.
+servers; an older daemon shows neither. On a Mac, Settings is
+**BondSymphonic › Preferences…** (⌘,) rather than File › Settings….
 
 Claude Code, Codex and OpenCode agents all get the same servers. The built-in
 git tools keep the reserved name `bondsymphonic`, so no server can use that ID.
@@ -1055,10 +1061,13 @@ list; otherwise restart the agent to get the server's tools.
 
 ### Workspace overrides
 
-**Workspace → MCP servers…** chooses, for the current workspace only, whether
-its agents get each server: **Inherit** follows the server's **On in every
-workspace** setting (the label says which way that currently goes), or
+While a workspace is in front, the server list in **Settings → MCP servers** has
+one more column, **In \<workspace\>**. It chooses, for that workspace only,
+whether its agents get each server: **Inherit** follows the server's **On in
+every workspace** setting (the label says which way that currently goes), or
 **Enabled** or **Disabled** regardless. A choice is saved as you make it.
+**Workspace → MCP servers…** opens Settings on this tab; it is the same list,
+not a second window.
 
 ### When changes apply
 

@@ -160,6 +160,9 @@ QString bodyText(const QJsonObject& item) {
 /// How many steps a start has on the progress bar: the daemon's three phases.
 constexpr int kStartSteps = 3;
 
+/// The longest the progress row waits for a started agent to be ready.
+constexpr int kSettleLimitMs = 60'000;
+
 /// Where on the progress bar the daemon's `phase` puts a start, or 0 for a
 /// phase it has not named yet (the bar then only says something is moving).
 int startStep(const QString& phase) {
@@ -777,6 +780,16 @@ void TranscriptView::setStarting(bool starting, bool restarting) {
     if (m_starting == starting && m_restarting == restarting && (!starting || m_startFromAgentId == agentId)) {
         return;
     }
+    // The start answered with an agent, attached before this was called:
+    // until that agent is ready the row stays, as "connecting". A start that
+    // failed attached nothing new, and the row goes with it.
+    if (!starting) {
+        if (!m_settling && m_starting && !agentId.isEmpty() && agentId != m_startFromAgentId) {
+            beginSettling();
+        }
+    } else {
+        m_settling = false;
+    }
     m_starting = starting;
     m_restarting = starting && restarting;
     if (starting) {
@@ -795,6 +808,20 @@ void TranscriptView::setStartProgress(const QString& label, const QString& phase
     m_startProgress = label;
     m_startPhase = phase;
     onStateChanged();
+}
+
+void TranscriptView::beginSettling() {
+    m_settling = true;
+    m_settleReplaying = false;
+    const int generation = ++m_settleGeneration;
+    // A safety limit, not the expected end: an agent that never reports a
+    // state must not leave a moving bar over the pane for good.
+    QTimer::singleShot(kSettleLimitMs, this, [this, generation] {
+        if (m_settling && m_settleGeneration == generation) {
+            m_settling = false;
+            onStateChanged();
+        }
+    });
 }
 
 void TranscriptView::setNewSessionConfirmer(std::function<bool()> confirm) {
@@ -908,6 +935,25 @@ void TranscriptView::onStateChanged() {
     // cannot strand the pane on "starting" forever.
     if (m_starting && agentId != m_startFromAgentId) {
         m_starting = false;
+        if (!agentId.isEmpty()) {
+            beginSettling();
+        }
+    }
+    // Ready: the conversation is replayed and the agent has said it is idle,
+    // working or waiting on the user. Or it never will be -- it exited or
+    // failed, the workspace went down, or the pane let go of it -- and the
+    // banner, not a moving bar, is what says so.
+    if (m_settling) {
+        m_settleReplaying = m_settleReplaying || busy;
+        // The state is only this agent's once its conversation has replayed.
+        const bool replayed = m_settleReplaying && !busy;
+        const bool ready = replayed && (state == QLatin1String("idle") || working ||
+                                        state == QLatin1String("waiting_permission"));
+        const bool failed = agentId.isEmpty() || m_workspaceDown ||
+                            (replayed && (exited || state == QString::fromUtf8(kStateError)));
+        if (ready || failed) {
+            m_settling = false;
+        }
     }
     // A different agent is attached than the one a switch was asked for from:
     // the restart landed, and what answers the user has changed. Said here
@@ -921,10 +967,15 @@ void TranscriptView::onStateChanged() {
     // Coming back by itself: a start is in flight, or this is an agent a daemon
     // restart left behind and the window is about to start it again. The pane
     // says so over a moving bar instead of reporting the old exit as an error.
-    const bool comingBack = m_starting || (!m_workspaceDown && restartPending());
+    // Replaying a conversation is part of getting an agent ready too, whatever
+    // asked for it -- a start, the tab being opened, a reconnect: the pane is
+    // not usable until it is done, so the row says so.
+    const bool replaying = busy && !agentId.isEmpty();
+    const bool comingBack = m_starting || m_settling || replaying ||
+                            (!m_workspaceDown && restartPending());
     // The box is shut whenever there is no running agent to read it: text
     // typed into it then would be sent nowhere.
-    if (m_starting) {
+    if (m_starting || m_settling) {
         m_input->setBusy(true, (m_restarting ? QStringLiteral("restarting the agent") : QStringLiteral("starting the agent")) + QChar(kEllipsis));
     } else if (m_workspaceDown) {
         // Before "no agent": both are true, and only this one says what to do.
@@ -948,12 +999,15 @@ void TranscriptView::onStateChanged() {
     // The daemon's own words for the phase the start is in, once it has said
     // any: a first Codex or OpenCode start can take tens of seconds, and
     // "Starting the sandbox" says what they are spent on.
-    m_progressText->setText((m_starting && !m_startProgress.isEmpty()
-                                 ? m_startProgress
-                                 : m_starting && m_restarting ? QStringLiteral("Restarting the agent")
-                                                              : QStringLiteral("Starting the agent")) +
-                            QChar(kEllipsis));
-    const int step = m_starting ? startStep(m_startPhase) : 0;
+    m_progressText->setText(
+        (m_starting && !m_startProgress.isEmpty() && !m_settling ? m_startProgress
+         : replaying                                            ? QStringLiteral("Loading the conversation")
+         : m_settling                                           ? QStringLiteral("Connecting to the agent")
+         : m_starting && m_restarting               ? QStringLiteral("Restarting the agent")
+                                                    : QStringLiteral("Starting the agent")) +
+        QChar(kEllipsis));
+    // The last step while the agent it started gets ready.
+    const int step = m_settling ? kStartSteps : m_starting ? startStep(m_startPhase) : 0;
     if (step == 0) {
         m_progressBar->setRange(0, 0);
         m_progressBar->setTextVisible(false);
@@ -966,13 +1020,13 @@ void TranscriptView::onStateChanged() {
     m_progress->setVisible(comingBack);
     // A fresh conversation needs a harness to start one in, and nothing else
     // in flight: a start already on its way would race it.
-    m_newSession->setEnabled(!m_starting && !busy && !m_workspaceDown);
+    m_newSession->setEnabled(!m_starting && !m_settling && !busy && !m_workspaceDown);
     m_interrupt->setEnabled(!noAgent && !m_starting && !busy && working);
     // Shut only while a start is already in flight or the history is still
     // being replayed. A pane whose agent has exited keeps them open on purpose:
     // choosing the model it should come back on is a reasonable way to ask for
     // it back.
-    const bool choosable = !m_starting && !busy && !m_workspaceDown;
+    const bool choosable = !m_starting && !m_settling && !busy && !m_workspaceDown;
     m_modelChoice->setEnabled(choosable);
     m_permissionChoice->setEnabled(choosable);
     m_harnessChoice->setEnabled(choosable);
@@ -1977,12 +2031,37 @@ extern "C" std::int32_t bs_widget_test_transcript_shows_progress_while_the_agent
         return 9;
     }
 
-    // The new agent answers: no row, an open box.
+    // The new agent answers and is attached, the way `attach` does it: the
+    // id first, with the previous agent's state still on the model. Not ready
+    // yet, so the row stays -- the old "exited" says nothing about this one.
     model.setAgentId(QStringLiteral("ag_new"));
+    if (!view.progressShown() || !view.inputLocked()) {
+        return 10;
+    }
+    // Its conversation replays: the row says so.
+    model.setBusy(true);
+    if (!view.progressShown() ||
+        !view.progressText().startsWith(QLatin1String("Loading the conversation"))) {
+        return 11;
+    }
+    // Replayed, and the agent idle: ready. No row, an open box.
     model.setState(QStringLiteral("idle"));
     model.setStateDetail(QString());
+    model.setBusy(false);
     if (view.progressShown() || !view.bannerText().isEmpty() || view.inputLocked()) {
         return 4;
+    }
+
+    // A replay nobody started -- the tab opening, a reconnect -- shows the row
+    // for as long as it lasts too.
+    model.setBusy(true);
+    if (!view.progressShown() ||
+        !view.progressText().startsWith(QLatin1String("Loading the conversation"))) {
+        return 12;
+    }
+    model.setBusy(false);
+    if (view.progressShown()) {
+        return 13;
     }
 
     // An agent that really stopped is news: the banner says why, there is no

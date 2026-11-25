@@ -4,6 +4,7 @@ pub mod daemon;
 pub mod fs;
 pub mod fs_watch;
 pub mod git;
+pub mod host;
 pub mod ids;
 pub mod mcp;
 pub mod models;

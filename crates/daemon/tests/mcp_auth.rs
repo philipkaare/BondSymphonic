@@ -881,3 +881,123 @@ async fn beginning_account_replacement_cannot_restore_old_account_on_restart() {
     assert!(reopen(&d, p).auth_headers(&id()).await.is_err());
     assert!(!files(&d).contains("ACCESS_SENTINEL"));
 }
+
+/// An authorization server that registers clients dynamically and insists on
+/// a confidential one whatever is asked for -- as Atlassian's does -- issuing
+/// a secret and assigning `method` (`None`: the field omitted, which RFC 7591
+/// makes `client_secret_basic`). Everything else is `inner`'s.
+struct Registering {
+    inner: Arc<Peer>,
+    method: Option<&'static str>,
+}
+#[async_trait]
+impl HttpClient for Registering {
+    async fn send(&self, r: HttpRequest, c: CancellationToken) -> Result<HttpResponse, RpcError> {
+        let body = if r.url.contains(".well-known/oauth-authorization-server")
+            || r.url.contains(".well-known/openid-configuration")
+        {
+            json!({
+                "issuer": "https://auth.example.com",
+                "authorization_endpoint": "https://auth.example.com/authorize",
+                "token_endpoint": "https://auth.example.com/token",
+                "registration_endpoint": "https://auth.example.com/register",
+                "revocation_endpoint": "https://auth.example.com/revoke",
+                "revocation_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+                "code_challenge_methods_supported": ["S256"],
+            })
+        } else if r.url.ends_with("/register") {
+            let mut issued = json!({
+                "client_id": "dyn-client",
+                "client_secret": "DYN_CLIENT_SECRET_SENTINEL",
+            });
+            if let Some(method) = self.method {
+                issued["token_endpoint_auth_method"] = json!(method);
+            }
+            issued
+        } else if r.url.ends_with("/revoke") {
+            json!({})
+        } else {
+            return self.inner.send(r, c).await;
+        };
+        self.inner.requests.lock().unwrap().push(r);
+        Ok(HttpResponse {
+            status: if body.get("client_id").is_some() {
+                201
+            } else {
+                200
+            },
+            headers: vec![],
+            body: serde_json::to_vec(&body).unwrap(),
+        })
+    }
+}
+
+/// A registration that comes back with a client secret is used, not refused:
+/// the code exchange, the refresh and the revocation all authenticate with
+/// it, the way the server assigned, and it is never written anywhere but the
+/// private secrets file.
+#[tokio::test]
+async fn a_registration_that_issues_a_secret_is_used_as_a_confidential_client() {
+    use base64::Engine as _;
+    for method in [
+        None,
+        Some("client_secret_basic"),
+        Some("client_secret_post"),
+    ] {
+        let (dir, m, peer) = setup_with(0, None, |p| {
+            Arc::new(Registering { inner: p, method }) as Arc<dyn HttpClient>
+        });
+        // No client ID configured: the login registers one.
+        let mut config = server(&m);
+        if let McpTransportConfig::Http {
+            auth: McpAuthConfig::OAuth { client_id, .. },
+            ..
+        } = &mut config.transport
+        {
+            *client_id = None;
+        }
+        upsert(&m, config, vec![]);
+
+        m.callback(login_begin(&m).await).await.unwrap();
+        assert_eq!(
+            m.status(&id()).state,
+            McpConnectionState::Connected,
+            "{method:?}"
+        );
+        m.auth_headers(&id()).await.unwrap(); // Expired at once: a refresh.
+        m.disconnect(&id()).await.unwrap();
+
+        let requests = peer.requests.lock().unwrap().clone();
+        let authenticated: Vec<&HttpRequest> = requests
+            .iter()
+            .filter(|r| r.url.ends_with("/token") || r.url.ends_with("/revoke"))
+            .collect();
+        // Two token requests (the exchange and the refresh) and two
+        // revocations (refresh and access token).
+        assert_eq!(authenticated.len(), 4, "{method:?}");
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode("dyn-client:DYN_CLIENT_SECRET_SENTINEL")
+        );
+        for r in authenticated {
+            let body = String::from_utf8_lossy(&r.body).into_owned();
+            assert!(
+                body.contains("client_id=dyn-client"),
+                "{method:?} {}",
+                r.url
+            );
+            let header = r
+                .headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && *v == basic);
+            let form = body.contains("client_secret=DYN_CLIENT_SECRET_SENTINEL");
+            if method == Some("client_secret_post") {
+                assert!(form && !header, "{method:?} {}", r.url);
+            } else {
+                assert!(header && !form, "{method:?} {}", r.url);
+            }
+        }
+        assert!(!files(&dir).contains("SENTINEL"), "{method:?}");
+    }
+}

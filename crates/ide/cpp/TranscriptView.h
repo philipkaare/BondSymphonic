@@ -380,6 +380,21 @@ private:
     /// See [`setStarting`].
     bool m_starting = false;
     bool m_restarting = false;
+    /// A start has answered and its agent is attached, but is not ready yet:
+    /// the conversation is still being replayed, or the agent has not said
+    /// what state it is in. The progress row stays up through this, and goes
+    /// once the agent is idle, working or waiting on the user -- or has
+    /// failed, which its banner says instead.
+    bool m_settling = false;
+    /// Whether the settling agent's conversation has started replaying. Until
+    /// it has, the pane's state is still the previous agent's -- `exited`, or
+    /// `idle` after a model change -- and says nothing about this one.
+    bool m_settleReplaying = false;
+    /// Bumped each time settling starts, so the safety limit set for one
+    /// settle cannot end a later one.
+    int m_settleGeneration = 0;
+    /// Starts settling, with its safety limit.
+    void beginSettling();
     /// See [`setStartProgress`].
     QString m_startProgress;
     /// See [`setStartProgress`]: the daemon's name for the phase, or empty.

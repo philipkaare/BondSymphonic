@@ -20,7 +20,10 @@ class QTreeWidget;
 class QWidget;
 
 /// Settings' "MCP servers" tab: the user's MCP servers with a status dot each,
-/// and Add / Edit / Remove / Connect / Disconnect / Test / Import / Export.
+/// and Add / Edit / Remove / Connect / Disconnect / Test / Import / Export --
+/// and, while a workspace is in front, a column choosing whether that
+/// workspace's agents get each server. The one place MCP servers are managed:
+/// Workspace › "MCP servers…" opens this tab rather than a window of its own.
 ///
 /// The daemon owns the registry. This page draws the controller's listing
 /// (`mcpChanged`), which already dropped replies older than the one on
@@ -29,6 +32,10 @@ class QWidget;
 class McpPage : public QWidget {
 public:
     explicit McpPage(AppController* controller, QWidget* parent = nullptr);
+
+    /// The workspace whose overrides the last column shows and sets, or an
+    /// empty id for none, which hides the column.
+    void setWorkspace(const QString& workspaceId, const QString& workspaceName);
 
 private:
     void showListing(const QString& json);
@@ -56,6 +63,12 @@ private:
     QJsonArray m_servers;
     QJsonArray m_statuses;
     qint64 m_revision = -1;
+    /// See [`setWorkspace`].
+    QString m_workspaceId;
+    QString m_workspaceName;
+    QLabel* m_workspaceNote;
+    /// The listing on screen, redrawn when the workspace changes.
+    QString m_lastListing;
 };
 
 /// Adds or edits one server. Secret fields are write-only: they start blank

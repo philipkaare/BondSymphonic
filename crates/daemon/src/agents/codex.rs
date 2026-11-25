@@ -117,7 +117,7 @@ impl CodexAdapter {
         rpc.notify("initialized", json!({})).await?;
         // `developerInstructions` is on both `thread/start` and `thread/resume`
         // (checked against the 0.160.0 schema), so a resumed thread is told too.
-        let mut params = json!({"cwd":self.prepared.cwd, "approvalPolicy": self.prepared.options.permission_mode.as_deref().unwrap_or("never"), "sandbox":"danger-full-access", "developerInstructions": super::SANDBOX_NOTE});
+        let mut params = json!({"cwd":self.prepared.cwd, "approvalPolicy": self.prepared.options.permission_mode.as_deref().unwrap_or("never"), "sandbox":"danger-full-access", "developerInstructions": super::sandbox_note()});
         if let Some(model) = self
             .prepared
             .options

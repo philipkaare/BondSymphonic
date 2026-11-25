@@ -190,8 +190,9 @@ pub fn route(base_url: Option<&str>, grants: &[Origin]) -> Route {
         Some(target) => Route {
             kind: SandboxRoute::Tunnelled,
             note: Some(format!(
-                "Loopback: carried from the sandbox to {} in the WSL distribution.",
-                target.authority()
+                "Loopback: carried from the sandbox to {} in {}.",
+                target.authority(),
+                crate::host::os().linux_env()
             )),
             target: Some(target),
         },
@@ -423,6 +424,24 @@ const WINDOWS_HINT: &str = "A server running on Windows is reached through local
 WSL mirrored networking; otherwise put the Windows host's address in the baseURL (see the user \
 guide's \"Local and LAN model servers\").";
 
+/// The same advice for a Mac: Lima gives the VM the host as
+/// `host.lima.internal`, and its own `localhost` is the VM's.
+const MAC_HINT: &str = "A server running on your Mac is not the Lima VM's localhost: put \
+host.lima.internal in the baseURL instead (see the user guide's \"Local and LAN model servers\").";
+
+/// The hint for a loopback server that refused, for the user's machine.
+fn loopback_hint() -> &'static str {
+    loopback_hint_for(crate::host::os())
+}
+
+fn loopback_hint_for(host: crate::host::HostOs) -> &'static str {
+    match host {
+        crate::host::HostOs::MacOs => MAC_HINT,
+        crate::host::HostOs::Windows => WINDOWS_HINT,
+        crate::host::HostOs::Linux | crate::host::HostOs::Unknown => "",
+    }
+}
+
 async fn probe(
     config_home: &Path,
     auth_json: &Path,
@@ -492,7 +511,10 @@ async fn test_url(
 ) -> OpenCodeProviderTest {
     let at = target.authority();
     let refused_hint = if target.is_loopback() {
-        format!(" {WINDOWS_HINT}")
+        match loopback_hint() {
+            "" => String::new(),
+            hint => format!(" {hint}"),
+        }
     } else {
         String::new()
     };
@@ -508,9 +530,10 @@ async fn test_url(
             return answer(
                 ProviderTestOutcome::DnsFailure,
                 format!(
-                    "{} does not resolve from the WSL distribution, so a sandboxed agent cannot \
-                     reach it: check the host name in the baseURL.",
-                    target.host()
+                    "{} does not resolve from {}, so a sandboxed agent cannot reach it: check \
+                     the host name in the baseURL.",
+                    target.host(),
+                    crate::host::os().linux_env()
                 ),
             )
         }
@@ -524,7 +547,8 @@ async fn test_url(
                 ProviderTestOutcome::Timeout,
                 format!(
                     "Connecting to {at} timed out: nothing answered. Check the address, and that \
-                     a firewall lets WSL reach it.{refused_hint}"
+                     a firewall lets {} reach it.{refused_hint}",
+                    crate::host::os().linux_env()
                 ),
             )
         }
@@ -1136,7 +1160,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_listening_is_a_refusal_with_the_windows_hint() {
+    async fn nothing_listening_is_a_refusal_with_the_hosts_hint() {
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
@@ -1151,7 +1175,23 @@ mod tests {
             "{}",
             result.message
         );
-        assert!(result.message.contains("mirrored"), "{}", result.message);
+        // With the hint for the machine the IDE runs on, none when unknown.
+        assert!(
+            result.message.contains(loopback_hint()),
+            "{}",
+            result.message
+        );
+    }
+
+    /// The loopback advice is the one that is true on the user's machine:
+    /// WSL's mirrored networking on Windows, Lima's host name on a Mac.
+    #[test]
+    fn the_loopback_hint_is_the_hosts_own() {
+        use crate::host::HostOs;
+        assert!(loopback_hint_for(HostOs::Windows).contains("mirrored"));
+        assert!(loopback_hint_for(HostOs::MacOs).contains("host.lima.internal"));
+        assert!(!loopback_hint_for(HostOs::MacOs).contains("Windows"));
+        assert!(loopback_hint_for(HostOs::Unknown).is_empty());
     }
 
     #[tokio::test]

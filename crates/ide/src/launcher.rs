@@ -416,6 +416,18 @@ pub fn windows_path_to_wsl(p: &Path) -> Option<String> {
 }
 
 /// The shell wrapper lets `~` expand and picks up the user's PATH from .bashrc.
+/// The machine this IDE runs on, as the daemon's `BS_HOST_OS` names it
+/// (`crate::host` in the daemon). The daemon runs in Linux whichever it is, so
+/// this is the only way it knows where to send a user: File › Settings… on
+/// Windows, the BondSymphonic menu on a Mac.
+pub const HOST_OS: &str = if cfg!(windows) {
+    "windows"
+} else if cfg!(target_os = "macos") {
+    "macos"
+} else {
+    "linux"
+};
+
 pub fn command_for(spec: &LaunchSpec) -> Result<(String, Vec<String>)> {
     // Both halves quoted. The line travels to `bash -lc` as one string, so a
     // daemon installed under a path with a space in it -- which is what
@@ -423,7 +435,7 @@ pub fn command_for(spec: &LaunchSpec) -> Result<(String, Vec<String>)> {
     // suggests -- would otherwise start the first half of its own path with the
     // second half as a stray argument.
     let mut inner = format!(
-        "exec {} --log-level {}",
+        "BS_HOST_OS={HOST_OS} exec {} --log-level {}",
         quoted_distro_path(&spec.daemon_path_in_wsl),
         single_quoted(&spec.log_level)
     );
@@ -1034,7 +1046,7 @@ mod tests {
                 "bondsymphonic",
                 "bash",
                 "-lc",
-                "exec ~/'.bondsymphonic/bin/bondsymphonic-daemon' --log-level 'debug'"
+                "BS_HOST_OS=macos exec ~/'.bondsymphonic/bin/bondsymphonic-daemon' --log-level 'debug'"
             ]
         );
     }
@@ -1059,7 +1071,7 @@ mod tests {
                 "--",
                 "bash",
                 "-lc",
-                "exec ~/'.bondsymphonic/bin/bondsymphonic-daemon' --log-level 'debug'"
+                "BS_HOST_OS=windows exec ~/'.bondsymphonic/bin/bondsymphonic-daemon' --log-level 'debug'"
             ]
         );
     }
@@ -1080,8 +1092,10 @@ mod tests {
         };
         let (_prog, args) = command_for(&spec).unwrap();
         assert_eq!(
-            args.last().map(String::as_str),
-            Some("exec '/opt/my dir/daemon' --log-level 'debug'")
+            args.last().cloned(),
+            Some(format!(
+                "BS_HOST_OS={HOST_OS} exec '/opt/my dir/daemon' --log-level 'debug'"
+            ))
         );
     }
 
@@ -1095,7 +1109,12 @@ mod tests {
             opencode_config_root: Some(PathBuf::from(r"C:\Users\O'Neil Smith\.config")),
         };
         let (_, args) = command_for(&spec).unwrap();
-        assert_eq!(args.last().unwrap(), "BS_OPENCODE_CONFIG_ROOT='/mnt/c/Users/O'\\''Neil Smith/.config' exec '/opt/daemon' --log-level 'info'");
+        assert_eq!(
+            args.last().unwrap(),
+            &format!(
+                "BS_OPENCODE_CONFIG_ROOT='/mnt/c/Users/O'\\''Neil Smith/.config' BS_HOST_OS={HOST_OS} exec '/opt/daemon' --log-level 'info'"
+            )
+        );
     }
 
     #[test]

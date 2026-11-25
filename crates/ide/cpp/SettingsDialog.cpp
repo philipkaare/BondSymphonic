@@ -298,6 +298,7 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
 void SettingsDialog::showMcpTab(bool supported) {
     if (supported && m_mcpPage == nullptr) {
         m_mcpPage = new McpPage(m_controller, m_tabs);
+        m_mcpPage->setWorkspace(m_workspaceId, m_workspaceName);
         m_tabs->addTab(m_mcpPage, QStringLiteral("MCP servers"));
     } else if (!supported && m_mcpPage != nullptr) {
         m_tabs->removeTab(m_tabs->indexOf(m_mcpPage));
@@ -474,6 +475,20 @@ void SettingsDialog::showOpenCodeProviderTest(const QString& provider, const QSt
                           : QStringLiteral("API key from %1.").arg(key));
     tip << QStringLiteral("Took %1 ms.").arg(answer.value(QStringLiteral("elapsed_ms")).toInt());
     it->result->setToolTip(tip.join(QLatin1Char('\n')));
+}
+
+void SettingsDialog::revealMcp() {
+    if (m_mcpPage != nullptr) {
+        m_tabs->setCurrentWidget(m_mcpPage);
+    }
+}
+
+void SettingsDialog::setWorkspace(const QString& workspaceId, const QString& workspaceName) {
+    m_workspaceId = workspaceId;
+    m_workspaceName = workspaceName;
+    if (m_mcpPage != nullptr) {
+        m_mcpPage->setWorkspace(workspaceId, workspaceName);
+    }
 }
 
 void SettingsDialog::revealSetup() {

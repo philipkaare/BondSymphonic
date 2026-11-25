@@ -680,6 +680,9 @@ impl Agent {
 /// only log in a sandbox home the daemon throws away. The sandbox holds no
 /// credentials by design; the `bondsymphonic` MCP tools (`crate::mcp`) do the
 /// remote work on the host and name what they offer here.
+///
+/// A template: [`sandbox_note`] is what agents are given, with `{settings}`
+/// filled in for the user's machine and a sentence about it in front.
 pub const SANDBOX_NOTE: &str = "You are running inside a BondSymphonic sandbox that holds no Git or GitHub credentials, so plain \
 `git fetch`, `git pull`, `git push` and `gh` cannot authenticate, and logging in from inside the \
 sandbox does not help. Use the `bondsymphonic` MCP tools instead: git_fetch (update origin/*), \
@@ -691,7 +694,7 @@ a pull request are limited to this workspace's own branch; reading pull requests
 issues, and commenting, work across the repository. In an in-place workspace there is no branch \
 of its own to push: pushing and opening pull requests are done by the user from their own \
 checkout. If a tool says GitHub is not logged in, or that the GitHub CLI is not installed, tell \
-the user to fix it under Settings > Setup. \
+the user to fix it under {settings} › Setup. \
 In a worktree workspace, the repository's shared .git is read-only apart from your own branches: \
 those under the prefix of the branch the workspace started on (bs/<workspace>/...). Create, \
 switch between and delete them freely -- for work based on a remote branch, git_fetch and then \
@@ -706,6 +709,24 @@ is held for up to 90 seconds while the user is asked to allow it: the command is
 user, not hung, so do not cancel it, retry it or switch to another approach while it waits. If \
 the user does not allow the host in time, the request fails with a 403 that says so; then tell \
 the user which host you need and why, rather than working around it.";
+
+/// [`SANDBOX_NOTE`] for the machine the user runs the IDE on (see
+/// [`crate::host`]): where Settings is, which modifier its shortcuts use and
+/// what the Linux this sandbox runs in is called, so what an agent tells the
+/// user to do is what they can actually find.
+pub fn sandbox_note() -> String {
+    sandbox_note_for(crate::host::os())
+}
+
+pub fn sandbox_note_for(host: crate::host::HostOs) -> String {
+    let note = SANDBOX_NOTE.replace("{settings}", host.settings());
+    let about = host.agent_sentence();
+    if about.is_empty() {
+        note
+    } else {
+        format!("{about} {note}")
+    }
+}
 
 /// The state detail a restored agent carries, for an agent that was still
 /// running when the daemon went and for one that had already ended.
@@ -1341,6 +1362,27 @@ mod tests {
             bondsymphonic_proto::NETWORK_APPROVAL_WAIT_SECS
         );
         assert!(SANDBOX_NOTE.contains(&wait), "{SANDBOX_NOTE}");
+    }
+
+    /// What an agent tells the user to open is where it is on their machine.
+    #[test]
+    fn the_sandbox_note_points_at_the_users_own_menus() {
+        use crate::host::HostOs;
+        let mac = sandbox_note_for(HostOs::MacOs);
+        assert!(
+            mac.contains("BondSymphonic › Preferences… (⌘,) › Setup"),
+            "{mac}"
+        );
+        assert!(mac.contains("Lima VM") && !mac.contains("File ›"), "{mac}");
+        let windows = sandbox_note_for(HostOs::Windows);
+        assert!(windows.contains("File › Settings… › Setup"), "{windows}");
+        assert!(
+            windows.contains("WSL") && !windows.contains("⌘"),
+            "{windows}"
+        );
+        let unknown = sandbox_note_for(HostOs::Unknown);
+        assert!(unknown.contains("under Settings › Setup"), "{unknown}");
+        assert!(!unknown.contains("{settings}"), "{unknown}");
     }
 
     #[test]

@@ -220,6 +220,11 @@ McpPage::McpPage(AppController* controller, QWidget* parent)
     note->setObjectName(QStringLiteral("McpApplyNote"));
     layout->addWidget(note);
 
+    m_workspaceNote = plainLabel(QString(), this);
+    m_workspaceNote->setObjectName(QStringLiteral("McpWorkspaceNote"));
+    m_workspaceNote->hide();
+    layout->addWidget(m_workspaceNote);
+
     m_registryError = plainLabel(QStringLiteral("Loading MCP servers…"), this);
     m_registryError->setObjectName(QStringLiteral("McpRegistryError"));
     layout->addWidget(m_registryError);
@@ -342,7 +347,20 @@ QJsonObject McpPage::server(const QString& id) const {
     return QJsonObject();
 }
 
+void McpPage::setWorkspace(const QString& workspaceId, const QString& workspaceName) {
+    m_workspaceId = workspaceId;
+    m_workspaceName = workspaceName.isEmpty() ? workspaceId : workspaceName;
+    m_workspaceNote->setVisible(!m_workspaceId.isEmpty());
+    m_workspaceNote->setText(
+        QStringLiteral("The last column is for the workspace in front, %1, only: whether its "
+                       "agents get each server. Inherit follows the server's own \"On in every "
+                       "workspace\" setting. A choice there is saved as you make it.")
+            .arg(m_workspaceName));
+    showListing(m_lastListing);
+}
+
 void McpPage::showListing(const QString& json) {
+    m_lastListing = json;
     const QJsonObject listing = parse(json);
     const QString selected = selectedId();
     if (!listing.contains(QStringLiteral("registry"))) {
@@ -366,6 +384,16 @@ void McpPage::showListing(const QString& json) {
     m_registryError->hide();
     m_list->show();
     m_list->clear();
+    const bool perWorkspace = !m_workspaceId.isEmpty();
+    m_list->setColumnCount(perWorkspace ? 5 : 4);
+    QStringList headers{QStringLiteral("Server"), QStringLiteral("ID"),
+                        QStringLiteral("Transport"), QStringLiteral("Status")};
+    if (perWorkspace) {
+        headers.append(QStringLiteral("In %1").arg(m_workspaceName));
+    }
+    m_list->setHeaderLabels(headers);
+    const QJsonObject overrides =
+        registry.value("overrides").toObject().value(m_workspaceId).toObject();
     bool haveJira = false;
     for (const auto& value : m_servers) {
         const QJsonObject s = value.toObject();
@@ -388,6 +416,33 @@ void McpPage::showListing(const QString& json) {
         item->setText(3, look.text);
         item->setToolTip(3, look.text);
         if (id == selected) { item->setSelected(true); }
+        if (perWorkspace) {
+            // What the workspace dialog used to hold: this one workspace's
+            // override, saved as it is chosen.
+            auto* choice = new QComboBox(m_list);
+            choice->setObjectName(QStringLiteral("McpWorkspaceOverride_") + id);
+            const bool byDefault = s.value("default_workspace_enabled").toBool(true);
+            choice->addItem(byDefault ? QStringLiteral("Inherit (on)")
+                                      : QStringLiteral("Inherit (off)"),
+                            QStringLiteral("inherit"));
+            choice->addItem(QStringLiteral("Enabled"), QStringLiteral("enabled"));
+            choice->addItem(QStringLiteral("Disabled"), QStringLiteral("disabled"));
+            choice->setCurrentIndex(
+                qMax(0, choice->findData(overrides.value(id).toString(QStringLiteral("inherit")))));
+            if (!s.value("enabled").toBool(true)) {
+                // Off everywhere: nothing a workspace chooses turns it on.
+                choice->setEnabled(false);
+                choice->setToolTip(QStringLiteral("Disabled for every workspace; enable it with "
+                                                  "Edit… first."));
+            }
+            m_list->setItemWidget(item, 4, choice);
+            const QString workspace = m_workspaceId;
+            connect(choice, &QComboBox::currentIndexChanged, this, [this, choice, id, workspace] {
+                if (m_controller.isNull()) { return; }
+                m_status->setText(QStringLiteral("Saving…"));
+                m_controller->mcpSetOverride(workspace, id, choice->currentData().toString());
+            });
+        }
     }
     m_restoreJira->setVisible(!haveJira);
     updateButtons();
@@ -420,16 +475,20 @@ void McpPage::operationFinished(const QString& op, const QString& serverId, cons
                                 const QString& error) {
     const QString name = server(serverId).value("name").toString(serverId);
     if (!error.isEmpty()) {
-        // The editor, the import dialog and the workspace dialog say their own
-        // failures beside their fields.
+        // The editor and the import dialog say their own failures beside
+        // their fields.
         if (op != QLatin1String("mcp.upsert") && op != QLatin1String("mcp.import_preview") &&
-            op != QLatin1String("mcp.import_apply") && op != QLatin1String("mcp.override")) {
+            op != QLatin1String("mcp.import_apply")) {
             m_status->setText(error);
         }
         return;
     }
     if (op == QLatin1String("mcp.upsert")) {
         m_status->setText(QStringLiteral("Saved %1. New or enabled servers apply when an agent next starts.").arg(name));
+    } else if (op == QLatin1String("mcp.override")) {
+        m_status->setText(QStringLiteral("Saved %1 for %2. Turning a server on applies when an "
+                                         "agent next starts; turning it off stops its tools at once.")
+                              .arg(name, m_workspaceName));
     } else if (op == QLatin1String("mcp.remove")) {
         m_status->setText(QStringLiteral("Removed %1.").arg(serverId));
     } else if (op == QLatin1String("mcp.restore_preset")) {
@@ -1186,6 +1245,48 @@ extern "C" std::int32_t bs_widget_test_mcp_import_preview_before_apply() {
         QStringLiteral(R"({"servers":[],"issues":[{"entry":"entry 1","field":"type","reason":"SSE servers are not supported"}],"collisions":[]})"), "");
     if (apply->isEnabled()) return 13;
     if (!dialog.findChild<QLabel*>(QStringLiteral("McpImportSummary"))->text().contains("SSE")) return 14;
+    return 0;
+}
+
+/// The workspace in front gets a column on the MCP servers tab -- what used to
+/// be a window of its own under Workspace: each server's override for that
+/// workspace, worded with the server's default, another workspace's overrides
+/// not this one's, and nothing at all while no workspace is in front.
+extern "C" std::int32_t bs_widget_test_mcp_page_sets_workspace_overrides() {
+    AppController controller;
+    McpPage page(&controller);
+    const QString listing = QStringLiteral(R"({"registry":{"revision":2,"servers":[)"
+        R"({"id":"jira","name":"Jira Atlassian","transport":{"type":"http","url":"https://mcp.atlassian.com/v2/mcp","auth":{"type":"oauth"}},"enabled":true,"default_workspace_enabled":true,"enabled_backends":["claude"]},)"
+        R"({"id":"quiet","name":"Quiet","transport":{"type":"http","url":"https://q.example/mcp","auth":{"type":"none"}},"enabled":true,"default_workspace_enabled":false,"enabled_backends":["claude"]},)"
+        R"({"id":"off","name":"Off","transport":{"type":"stdio","command":"npx"},"enabled":false,"default_workspace_enabled":true,"enabled_backends":["claude"]}],)"
+        R"("overrides":{"ws_mcp":{"off":"disabled"},"ws_other":{"jira":"disabled"}}},"statuses":[]})");
+    emit controller.mcpChanged(listing);
+    auto* list = page.findChild<QTreeWidget*>(QStringLiteral("McpServerList"));
+    if (list == nullptr || list->columnCount() != 4) return 1;
+    if (page.findChild<QComboBox*>(QStringLiteral("McpWorkspaceOverride_jira")) != nullptr) return 2;
+
+    page.setWorkspace(QStringLiteral("ws_mcp"), QStringLiteral("Mcp"));
+    if (list->columnCount() != 5 || list->headerItem()->text(4) != QLatin1String("In Mcp")) return 3;
+    auto* note = page.findChild<QLabel*>(QStringLiteral("McpWorkspaceNote"));
+    if (note == nullptr || note->isHidden() || !note->text().contains(QLatin1String("Mcp"))) return 4;
+    auto* jira = page.findChild<QComboBox*>(QStringLiteral("McpWorkspaceOverride_jira"));
+    auto* quiet = page.findChild<QComboBox*>(QStringLiteral("McpWorkspaceOverride_quiet"));
+    auto* off = page.findChild<QComboBox*>(QStringLiteral("McpWorkspaceOverride_off"));
+    if (!jira || !quiet || !off) return 5;
+    if (jira->currentData().toString() != "inherit" || jira->currentText() != "Inherit (on)") return 6;
+    if (quiet->currentData().toString() != "inherit" || quiet->currentText() != "Inherit (off)") return 7;
+    // A server off everywhere: its override shows, and cannot turn it on.
+    if (off->currentData().toString() != "disabled" || off->isEnabled()) return 8;
+    // A choice is sent as it is made; with no daemon here the page says it
+    // is saving, and then what the daemon answered.
+    auto* status = page.findChild<QLabel*>(QStringLiteral("McpStatus"));
+    quiet->setCurrentIndex(quiet->findData("enabled"));
+    if (status == nullptr || !status->text().startsWith(QLatin1String("Saving"))) return 9;
+    emit controller.mcpOperationFinished("mcp.override", "quiet", "", "MCP server not found");
+    if (status->text() != QLatin1String("MCP server not found")) return 10;
+
+    page.setWorkspace(QString(), QString());
+    if (list->columnCount() != 4 || !note->isHidden()) return 11;
     return 0;
 }
 
