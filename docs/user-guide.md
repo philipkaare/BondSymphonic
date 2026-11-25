@@ -1001,8 +1001,8 @@ server with a status dot: green is connected, amber is a sign-in in progress,
 red is an error (its reason follows the word), grey is not signed in, not yet
 tested, or a local server, which is only started inside an agent's sandbox. The
 tab and the Workspace menu item below appear only when the daemon supports MCP
-servers; an older daemon shows neither. On a Mac, Settings is in the
-**BondSymphonic** menu (⌘,) rather than under File.
+servers; an older daemon shows neither. On a Mac, Settings is
+**BondSymphonic › Preferences…** (⌘,) rather than File › Settings….
 
 Claude Code, Codex and OpenCode agents all get the same servers. The built-in
 git tools keep the reserved name `bondsymphonic`, so no server can use that ID.

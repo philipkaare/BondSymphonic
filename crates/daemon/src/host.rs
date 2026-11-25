@@ -4,7 +4,8 @@
 //! The daemon always runs in Linux -- a WSL distribution under Windows, a Lima
 //! VM on a Mac -- so nothing it can see says which. It matters wherever the
 //! daemon tells a person (or an agent that will tell one) where to go: Settings
-//! is under File on Windows and in the BondSymphonic menu on a Mac, shortcuts
+//! is File › Settings… on Windows and BondSymphonic › Preferences… on a Mac (Qt
+//! moves the item into the app menu and gives it the Mac name), shortcuts
 //! use Ctrl on one and ⌘ on the other, and "the WSL distribution" is wrong on
 //! a Mac. An IDE that did not say -- an older one, or a test -- gets wording
 //! that is true on both.
@@ -43,7 +44,7 @@ impl HostOs {
     pub fn settings(self) -> &'static str {
         match self {
             Self::Windows | Self::Linux => "File › Settings…",
-            Self::MacOs => "BondSymphonic › Settings… (⌘,)",
+            Self::MacOs => "BondSymphonic › Preferences… (⌘,)",
             Self::Unknown => "Settings",
         }
     }

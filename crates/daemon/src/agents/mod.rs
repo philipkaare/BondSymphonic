@@ -1370,7 +1370,7 @@ mod tests {
         use crate::host::HostOs;
         let mac = sandbox_note_for(HostOs::MacOs);
         assert!(
-            mac.contains("BondSymphonic › Settings… (⌘,) › Setup"),
+            mac.contains("BondSymphonic › Preferences… (⌘,) › Setup"),
             "{mac}"
         );
         assert!(mac.contains("Lima VM") && !mac.contains("File ›"), "{mac}");
