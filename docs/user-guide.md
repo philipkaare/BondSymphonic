@@ -927,9 +927,14 @@ and a terminal tab has no harness to switch.
   same harness, model and permission mode but no memory of the conversation,
   and the tab shows the new one. Files and commits in the workspace are not
   touched.
-- **Starting.** While an agent starts, a progress bar above the prompt box says
-  what it is doing ("Starting the sandbox") and steps through the three phases
-  a start has (preparing, the sandbox, launching), then gives way to the agent.
+- **Starting.** A progress bar above the prompt box is up from the moment a
+  start, restart or resume begins until the agent is ready for a prompt. It says
+  what is happening and steps through a start's three phases (preparing, the
+  sandbox, launching or resuming). Then it says *Loading the conversation…*
+  while the history replays and *Connecting to the agent…* until the agent
+  reports in. A replay with no start behind it, when a tab opens or after a
+  reconnect, shows the bar too. It goes when the agent is idle, working or
+  waiting for you. If the agent fails instead, a banner says so.
 - **Links.** Web addresses in the conversation, in your messages and in the
   agent's answers, are links. Clicking one opens it in your browser; only
   `http`, `https` and `mailto` links open.
