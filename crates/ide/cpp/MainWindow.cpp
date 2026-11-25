@@ -26,6 +26,7 @@
 #include "bondsymphonic-ide/src/qobjects/run_panel.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/terminal_session.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/transcript_model.cxxqt.h"
+#include "bondsymphonic-ide/src/qobjects/update_controller.cxxqt.h"
 #include <QAction>
 #include <QActionGroup>
 #include <QApplication>
@@ -253,6 +254,11 @@ void MainWindow::commitClose(QCloseEvent* event) {
     // WSL for an IDE on its way out -- and `flushState` second, because a
     // change made in the last half second is still on its debounce timer and
     // there is no half second left. Nothing between the two can refuse.
+    // A downloaded update goes in now, whichever way the IDE is closing: the
+    // helper waits for this process to exit before touching anything.
+    if (m_updates != nullptr) {
+        m_updates->installOnExit(m_restartForUpdate);
+    }
     m_controller->prepareQuit();
     m_controller->flushState();
     QMainWindow::closeEvent(event);
@@ -903,6 +909,43 @@ void MainWindow::buildStatusBar() {
     statusBar()->addPermanentWidget(m_opLabel);
     statusBar()->addPermanentWidget(m_costLabel);
     updateCostLabel();
+
+    // Far right, and only while a downloaded update is waiting: it installs on
+    // quit anyway, so this is an offer to do it now, not a demand.
+    m_updateButton = new QPushButton(this);
+    m_updateButton->setObjectName(QStringLiteral("UpdateButton"));
+    m_updateButton->setFlat(true);
+    m_updateButton->setCursor(Qt::PointingHandCursor);
+    m_updateButton->setVisible(false);
+    statusBar()->addPermanentWidget(m_updateButton);
+    connect(m_updateButton, &QPushButton::clicked, this, [this] { restartForUpdate(); });
+    m_updates = qApp->findChild<UpdateController*>(QString(), Qt::FindDirectChildrenOnly);
+    if (m_updates != nullptr) {
+        connect(m_updates, &UpdateController::statusChanged, this, [this] { refreshUpdateButton(); });
+        // Queued: the request can come from inside the Settings dialog's own
+        // event loop, and the window must not close until that has returned.
+        connect(m_updates, &UpdateController::restartRequested, this,
+                [this] { restartForUpdate(); }, Qt::QueuedConnection);
+    }
+}
+
+void MainWindow::refreshUpdateButton() {
+    const QString version = m_updates != nullptr ? m_updates->readyVersion() : QString();
+    m_updateButton->setVisible(!version.isEmpty());
+    m_updateButton->setText(QStringLiteral("Restart to update to %1").arg(version));
+    m_updateButton->setToolTip(QStringLiteral(
+        "Version %1 is downloaded. It installs when you quit; this restarts BondSymphonic now "
+        "to install it.")
+                                   .arg(version));
+}
+
+void MainWindow::restartForUpdate() {
+    m_restartForUpdate = true;
+    // `close` answers false for a close that was refused or is still waiting
+    // for saves to land; only the refusal cancels the restart.
+    if (!close() && m_closeState != CloseState::WaitingForSaves) {
+        m_restartForUpdate = false;
+    }
 }
 
 void MainWindow::showOperationMessage(const QString& text, const QString& url) {

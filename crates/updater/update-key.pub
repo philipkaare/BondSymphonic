@@ -1,0 +1,5 @@
+# The minisign public key every release manifest must be signed with.
+#
+# Replace this whole file with the .pub file `minisign -G` writes (see
+# docs/releasing.md). Until then the updater reports that this build has no
+# update key and never downloads anything.

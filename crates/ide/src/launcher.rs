@@ -134,7 +134,9 @@ fn resolve_daemon_binary(exe: &Path, override_path: Option<&std::ffi::OsStr>) ->
         }
     }
     let dir = exe.parent()?;
-    let packaged = dir.join(DAEMON_FILE_NAME);
+    let packaged = packaged_resource_dir(exe)
+        .unwrap_or_else(|| dir.to_path_buf())
+        .join(DAEMON_FILE_NAME);
     // `?` on the grandparent only after the packaged path is built, so an exe
     // sitting at the root of a volume can still find a packaged daemon beside
     // it even though it has no `..\daemon` to look in.
@@ -184,6 +186,74 @@ fn mtime(path: &Path) -> std::time::SystemTime {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+/// Where a packaged build keeps the files it ships beside the executable:
+/// `Contents/Resources` when the executable is inside a macOS app bundle
+/// (code signing wants only Mach-O code in `Contents/MacOS`, and the daemon
+/// is a Linux ELF), and `None` everywhere else, where they sit beside the exe.
+pub fn packaged_resource_dir(exe: &Path) -> Option<PathBuf> {
+    bondsymphonic_updater::install::bundle_of(exe).map(|b| b.join("Contents").join("Resources"))
+}
+
+/// The `limactl` this IDE drives the macOS VM with, in order: the copy
+/// bundled inside the app (`Contents/Resources/lima/bin`), Homebrew's on
+/// Apple Silicon and on Intel, and finally whatever `PATH` finds. The
+/// Homebrew paths are spelled out because an app started from Finder gets
+/// launchd's `PATH`, which has neither.
+pub fn limactl() -> PathBuf {
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|exe| packaged_resource_dir(&exe))
+        .map(|r| r.join("lima").join("bin").join("limactl"));
+    bundled
+        .into_iter()
+        .chain(
+            ["/opt/homebrew/bin/limactl", "/usr/local/bin/limactl"]
+                .into_iter()
+                .map(PathBuf::from),
+        )
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("limactl"))
+}
+
+/// Copies `local` to a folder under the home directory when it is not under
+/// it already, and returns the path to install from.
+///
+/// The macOS VM mounts only the home directory, so a daemon inside
+/// `/Applications/BondSymphonic.app` is invisible to the `sha256sum` and `cp`
+/// that [`install_daemon`] runs inside it. The copy is skipped when one of
+/// the same size and modification order is already there.
+fn stage_for_vm(local: &Path) -> Result<PathBuf> {
+    let Some(dirs) = directories::BaseDirs::new() else {
+        return Ok(local.to_path_buf());
+    };
+    if local.starts_with(dirs.home_dir()) {
+        return Ok(local.to_path_buf());
+    }
+    // `~/Library/Caches/BondSymphonic`: no space in it, unlike Application
+    // Support, so it survives every quoting layer between here and the VM.
+    let dir = dirs.cache_dir().join("BondSymphonic").join("daemon");
+    let staged = dir.join(DAEMON_FILE_NAME);
+    let same = |a: &Path, b: &Path| -> bool {
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.len() == b.len() && mtime_of(&b) >= mtime_of(&a),
+            _ => false,
+        }
+    };
+    if !same(local, &staged) {
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let tmp = dir.join(format!("{DAEMON_FILE_NAME}.tmp"));
+        std::fs::copy(local, &tmp)
+            .with_context(|| format!("copying {} to {}", local.display(), tmp.display()))?;
+        std::fs::rename(&tmp, &staged)?;
+        tracing::info!(from = %local.display(), to = %staged.display(), "staged the daemon for the VM");
+    }
+    Ok(staged)
+}
+
+fn mtime_of(meta: &std::fs::Metadata) -> std::time::SystemTime {
+    meta.modified().unwrap_or(std::time::UNIX_EPOCH)
 }
 
 /// Test hook: a loopback `host:port` to connect to instead of starting a daemon.
@@ -453,7 +523,7 @@ pub fn command_for(spec: &LaunchSpec) -> Result<(String, Vec<String>)> {
 ///
 /// `limactl shell` runs from `/` because it otherwise tries to `cd` into the
 /// host's working directory, which outside the home mount does not exist.
-fn distro_shell(distro: &str, script: String) -> (String, Vec<String>) {
+pub(crate) fn distro_shell(distro: &str, script: String) -> (String, Vec<String>) {
     if cfg!(windows) {
         (
             "wsl.exe".into(),
@@ -468,7 +538,7 @@ fn distro_shell(distro: &str, script: String) -> (String, Vec<String>) {
         )
     } else if cfg!(target_os = "macos") {
         (
-            "limactl".into(),
+            limactl().to_string_lossy().into_owned(),
             vec![
                 "shell".into(),
                 "--workdir".into(),
@@ -516,7 +586,7 @@ fn quoted_distro_path(path: &str) -> String {
 /// One single-quoted shell word. A single quote inside it is closed, escaped
 /// and reopened (`'\''`), which is the only way to carry one through single
 /// quotes and is why this is not an inline `format!`.
-fn single_quoted(word: &str) -> String {
+pub(crate) fn single_quoted(word: &str) -> String {
     format!("'{}'", word.replace('\'', r"'\''"))
 }
 
@@ -538,8 +608,13 @@ pub(crate) async fn install_daemon(spec: &LaunchSpec) -> Result<()> {
     if !local.exists() {
         return Ok(());
     }
+    let local = if cfg!(target_os = "macos") {
+        stage_for_vm(local)?
+    } else {
+        local.clone()
+    };
     // `local` is a Linux ELF binary on a DrvFs mount, so both hashes are taken inside WSL.
-    let src = wsl_path(local, &spec.distro).map_err(|why| anyhow!(why))?;
+    let src = wsl_path(&local, &spec.distro).map_err(|why| anyhow!(why))?;
     let dst = quoted_distro_path(&spec.daemon_path_in_wsl);
     let tmp = quoted_distro_path(&format!("{}.tmp", spec.daemon_path_in_wsl));
     // The parent directory is derived here rather than with `dirname` in the shell, so
@@ -1024,7 +1099,8 @@ mod tests {
             opencode_config_root: None,
         };
         let (prog, args) = command_for(&spec).unwrap();
-        assert_eq!(prog, "limactl");
+        // Bundled, Homebrew's, or bare for PATH to find: see `limactl()`.
+        assert!(prog.ends_with("limactl"), "{prog}");
         assert_eq!(
             args,
             vec![

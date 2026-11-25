@@ -22,6 +22,7 @@ require-qt = []
 
 [dependencies]
 bondsymphonic-proto = { path = "../proto" }
+bondsymphonic-updater = { path = "../updater" }
 cxx = "1"
 cxx-qt = "0.10"
 # Default features only: `qt_full` would pull in QtQml and QtQuickControls2,

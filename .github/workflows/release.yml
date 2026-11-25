@@ -1,0 +1,294 @@
+name: release
+
+# Every commit that lands on main and passes CI becomes a release:
+#
+#   v<major>.<minor>.<n>      a tag on that commit (scripts/release/next-version.py)
+#   BondSymphonic-<v>-windows-x64-setup.exe    Inno Setup, per-user
+#   BondSymphonic-<v>-macos-arm64.dmg          signed and notarized
+#   BondSymphonic-<v>-macos-arm64.zip          the same app, for the updater
+#   latest.json + latest.json.minisig          what installed IDEs poll
+#
+# Installed IDEs fetch latest.json from the newest release, check its minisign
+# signature against the key compiled into them, and install the package it
+# names if its SHA-256 matches. See docs/releasing.md for the secrets this
+# needs; without MINISIGN_SECRET_KEY nothing is released at all, and without
+# the Apple secrets the release has no macOS packages.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One release at a time, in order. A run queued behind another releases
+# whatever is then the tip of main (see `prepare`).
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-24.04
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      version: ${{ steps.decide.outputs.version }}
+      sha: ${{ steps.decide.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - id: decide
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          HAS_KEY: ${{ secrets.MINISIGN_SECRET_KEY != '' }}
+        run: |
+          set -euo pipefail
+          release=true
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::warning::MINISIGN_SECRET_KEY is not set: nothing can be signed, so nothing is released. See docs/releasing.md."
+            release=false
+          fi
+          if ! grep -q '^untrusted comment:' crates/updater/update-key.pub; then
+            echo "::warning::crates/updater/update-key.pub holds no key: the IDE could not verify a release. See docs/releasing.md."
+            release=false
+          fi
+          # Only the tip of main. CI runs for two quick pushes can finish out of
+          # order, and the older commit must not become the newer version.
+          tip="$(git rev-parse origin/main)"
+          if [ "$tip" != "$SHA" ]; then
+            echo "::notice::$SHA is no longer the tip of main ($tip); that commit's run releases it."
+            release=false
+          fi
+          if [ -n "$(git tag --points-at "$SHA" --list 'v*')" ]; then
+            echo "::notice::$SHA is already released as $(git tag --points-at "$SHA" --list 'v*')."
+            release=false
+          fi
+          version="$(python3 scripts/release/next-version.py)"
+          echo "release: $release, version: $version, commit: $SHA"
+          {
+            echo "release=$release"
+            echo "version=$version"
+            echo "sha=$SHA"
+          } >> "$GITHUB_OUTPUT"
+
+  # The Linux daemon, for each architecture a release ships: x86_64 for the
+  # WSL distro, aarch64 for the Lima VM on Apple Silicon. Built on Ubuntu
+  # 24.04, which is what both of those run, so the glibc matches.
+  daemon:
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Stamp the version
+        run: python3 scripts/release/set-version.py "${{ needs.prepare.outputs.version }}"
+      - name: Build the daemon
+        run: cargo build --release -p bondsymphonic-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daemon-${{ matrix.arch }}
+          path: target/release/bondsymphonic-daemon
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    needs: [prepare, daemon]
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Qt 6.9.2 (msvc2022_64)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.9.2'
+          arch: 'win64_msvc2022_64'
+          cache: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-windows
+      - name: Point QMAKE at the installed Qt
+        shell: pwsh
+        run: |
+          $qtBin = Join-Path $env:QT_ROOT_DIR 'bin'
+          $qmake = Join-Path $qtBin 'qmake.exe'
+          if (-not (Test-Path $qmake)) { throw "qmake not found at $qmake (QT_ROOT_DIR=$env:QT_ROOT_DIR)" }
+          "QMAKE=$qmake" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $qtBin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Stamp the version
+        run: python scripts/release/set-version.py "$env:VERSION"
+      - uses: actions/download-artifact@v4
+        with:
+          name: daemon-x86_64
+          path: target/daemon
+      - name: Package dist\BondSymphonic
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\package.ps1" -SkipDaemon -SkipZip
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "installing Inno Setup failed" }
+          }
+          & $iscc "/DAppVersion=$env:VERSION" "/DSourceDir=$env:GITHUB_WORKSPACE\dist\BondSymphonic" "/DOutputDir=$env:GITHUB_WORKSPACE\dist" installer\windows\BondSymphonic.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/BondSymphonic-*-windows-x64-setup.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    needs: [prepare, daemon]
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      HAS_APPLE: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.APPLE_API_KEY_P8 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Qt 6.9.2 (macOS)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.9.2'
+          host: mac
+          target: desktop
+          arch: clang_64
+          cache: true
+      - name: Point QMAKE at the installed Qt
+        run: |
+          qmake="$QT_ROOT_DIR/bin/qmake"
+          test -x "$qmake" || { echo "qmake not found at $qmake" >&2; exit 1; }
+          echo "QMAKE=$qmake" >> "$GITHUB_ENV"
+          "$qmake" -query QT_VERSION
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-macos
+      - name: Stamp the version
+        run: python3 scripts/release/set-version.py "$VERSION"
+      - uses: actions/download-artifact@v4
+        with:
+          name: daemon-aarch64
+          path: target/daemon
+      - name: Import the Developer ID certificate and the notary key
+        if: env.HAS_APPLE == 'true'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(openssl rand -hex 24)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+          test -n "$identity" || { echo "no Developer ID Application identity in MACOS_CERTIFICATE_P12" >&2; exit 1; }
+          umask 077
+          printf '%s\n' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/notary.p8"
+          {
+            echo "MACOS_SIGN_IDENTITY=$identity"
+            echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary.p8"
+            echo "NOTARY_KEY_ID=$APPLE_API_KEY_ID"
+            echo "NOTARY_ISSUER=$APPLE_API_ISSUER_ID"
+          } >> "$GITHUB_ENV"
+      - name: Package BondSymphonic.app
+        run: scripts/package-macos.sh --version "$VERSION"
+      - name: No Apple secrets, so no macOS packages in this release
+        if: env.HAS_APPLE != 'true'
+        run: echo "::warning::MACOS_CERTIFICATE_P12 / APPLE_API_KEY_P8 are not set; the app was built and ad-hoc signed but is not published. See docs/releasing.md."
+      - uses: actions/upload-artifact@v4
+        if: env.HAS_APPLE == 'true'
+        with:
+          name: release-macos
+          path: |
+            dist/BondSymphonic-*-macos-arm64.dmg
+            dist/BondSymphonic-*-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [prepare, windows, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Write latest.json
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          args=()
+          for f in dist/BondSymphonic-*-windows-x64-setup.exe; do args+=(--asset "windows-x86_64=$f"); done
+          for f in dist/BondSymphonic-*-macos-arm64.zip; do args+=(--asset "macos-aarch64=$f"); done
+          python3 scripts/release/make-manifest.py --version "$VERSION" --repo "$GITHUB_REPOSITORY" \
+            --commit "$SHA" "${args[@]}" --out dist/latest.json
+      - name: Sign latest.json
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          key="$RUNNER_TEMP/release.key"
+          ( umask 077; printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key" )
+          minisign -S -s "$key" -m dist/latest.json -t "BondSymphonic $VERSION"
+          rm -f "$key"
+          # Against the key the IDE is built with: a release the IDE would
+          # reject must not be published.
+          minisign -V -p crates/updater/update-key.pub -m dist/latest.json
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*.exe dist/*.dmg dist/*.zip dist/latest.json dist/latest.json.minisig)
+          gh release create "v$VERSION" "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "BondSymphonic $VERSION" \
+            --generate-notes \
+            --latest

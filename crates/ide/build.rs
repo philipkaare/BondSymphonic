@@ -38,6 +38,8 @@ fn main() {
         .file("src/qobjects/changes_model.rs")
         .file("src/qobjects/transcript_model.rs")
         .file("src/qobjects/run_panel.rs")
+        .file("src/qobjects/host_setup.rs")
+        .file("src/qobjects/update_controller.rs")
         // Not a QObject: three free functions the `BS_MENU_TEST` seam in
         // `GroupBar` and `MainWindow` calls, so the model fixtures a menu step
         // installs are built in Rust rather than in a widget.
@@ -98,6 +100,10 @@ fn main() {
             "cpp/MainWindow.cpp",
             "cpp/SplashScreen.h",
             "cpp/SplashScreen.cpp",
+            "cpp/HostSetupDialog.h",
+            "cpp/HostSetupDialog.cpp",
+            "cpp/UpdatesSection.h",
+            "cpp/UpdatesSection.cpp",
             "cpp/app.cpp",
             "cpp/Branding.cpp",
         ])

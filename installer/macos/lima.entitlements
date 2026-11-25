@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The bundled limactl runs the VM through Apple's Virtualization framework,
+     which a hardened-runtime binary may only use with this entitlement. It is
+     the one Lima's own release signs limactl with (vz.entitlements). -->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.virtualization</key>
+    <true/>
+</dict>
+</plist>

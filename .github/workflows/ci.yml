@@ -47,10 +47,12 @@ jobs:
           exit 1
       - name: Format
         run: cargo fmt --all -- --check
-      - name: Test proto and daemon
-        run: cargo test -p bondsymphonic-proto -p bondsymphonic-daemon
-      - name: Clippy proto and daemon
-        run: cargo clippy -p bondsymphonic-proto -p bondsymphonic-daemon --all-targets -- -D warnings
+      # The updater is Qt-free precisely so this job can test it: manifest
+      # signatures, version comparison, download verification.
+      - name: Test proto, daemon and updater
+        run: cargo test -p bondsymphonic-proto -p bondsymphonic-daemon -p bondsymphonic-updater
+      - name: Clippy proto, daemon and updater
+        run: cargo clippy -p bondsymphonic-proto -p bondsymphonic-daemon -p bondsymphonic-updater --all-targets -- -D warnings
 
   # The IDE only builds on Windows: cxx-qt against the msvc2022_64 Qt kit, the
   # keyring against the Windows credential store. This job also covers proto on
@@ -101,6 +103,19 @@ jobs:
       # rather than through the runner's default pwsh.
       - name: Package dist\BondSymphonic
         run: powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\package.ps1" -NoDaemon
+      # The release workflow builds the real installer; this only proves the
+      # script still compiles against the folder package.ps1 stages, so a
+      # broken .iss fails here rather than on main after the merge.
+      - name: Compile the installer script
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "installing Inno Setup failed" }
+          }
+          & $iscc "/DAppVersion=0.0.0" "/DSourceDir=$env:GITHUB_WORKSPACE\dist\BondSymphonic" "/DOutputDir=$env:RUNNER_TEMP" installer\windows\BondSymphonic.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
       # `require-qt` turns each test's "QMAKE unset, skipping" escape hatch into
       # a panic. Without it a runner that lost its Qt installation would report
       # a green job in which every test that needs the runtime did nothing.
@@ -110,9 +125,46 @@ jobs:
       - name: Test proto and the IDE
         env:
           BS_PACKAGED_EXE: ${{ github.workspace }}\dist\BondSymphonic\bondsymphonic-ide.exe
-        run: cargo test -p bondsymphonic-proto -p bondsymphonic-ide --features bondsymphonic-ide/require-qt
+        run: cargo test -p bondsymphonic-proto -p bondsymphonic-updater -p bondsymphonic-ide --features bondsymphonic-ide/require-qt
       # The same feature as the test step, so clippy lints the configuration
       # this job actually runs: with `require-qt` off, the `cfg!` branch that
       # turns a Qt-less skip into a panic is never linted at all.
       - name: Clippy the IDE
-        run: cargo clippy -p bondsymphonic-ide --all-targets --features bondsymphonic-ide/require-qt -- -D warnings
+        run: cargo clippy -p bondsymphonic-ide -p bondsymphonic-updater --all-targets --features bondsymphonic-ide/require-qt -- -D warnings
+
+  # The IDE on Apple Silicon, packaged the way a release packages it, minus
+  # the daemon (Linux only) and the Developer ID signature (a secret CI does
+  # not get). Releases need this job green, so a change that breaks the macOS
+  # build or the bundle is caught on the pull request.
+  macos-ide:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "clippy" }
+      - name: Install Qt 6.9.2 (macOS)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.9.2'
+          host: mac
+          target: desktop
+          arch: clang_64
+          cache: true
+      - name: Point QMAKE at the installed Qt
+        run: |
+          qmake="$QT_ROOT_DIR/bin/qmake"
+          test -x "$qmake" || { echo "qmake not found at $qmake" >&2; exit 1; }
+          echo "QMAKE=$qmake" >> "$GITHUB_ENV"
+          "$qmake" -query QT_VERSION
+      - uses: Swatinem/rust-cache@v2
+      - name: Test the updater
+        run: cargo test -p bondsymphonic-updater
+      - name: Clippy the updater
+        run: cargo clippy -p bondsymphonic-updater --all-targets -- -D warnings
+      - name: Build the IDE (release)
+        run: cargo build -p bondsymphonic-ide --release
+      - name: Package BondSymphonic.app (ad-hoc signed, no daemon)
+        run: scripts/package-macos.sh --skip-build --no-daemon
+      - name: The packaged IDE starts
+        run: dist/BondSymphonic.app/Contents/MacOS/bondsymphonic-ide --version

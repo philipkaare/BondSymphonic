@@ -215,6 +215,15 @@ pub fn clamp_font_size(size: u32) -> u32 {
     size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
 }
 
+/// Whether updates are checked for, downloaded and installed without being
+/// asked. They are: a settings file that predates the switch belongs to a
+/// build that had no updater, and the user who installed it wants it current.
+pub const DEFAULT_UPDATES_AUTOMATIC: bool = true;
+
+fn default_updates_automatic() -> bool {
+    DEFAULT_UPDATES_AUTOMATIC
+}
+
 fn default_ui_font_size() -> u32 {
     DEFAULT_UI_FONT_SIZE
 }
@@ -262,6 +271,11 @@ pub struct Settings {
     /// The point size of the fixed-pitch font everything code-shaped is set in.
     #[serde(default = "default_code_font_size")]
     pub code_font_size: u32,
+    /// Automatic: check for a new release on start and every few hours,
+    /// download it in the background, and install it when the IDE exits.
+    /// Manual: nothing happens until Settings > Updates > Check now.
+    #[serde(default = "default_updates_automatic")]
+    pub updates_automatic: bool,
 }
 
 impl Default for Settings {
@@ -279,6 +293,7 @@ impl Default for Settings {
             show_agent_meta: DEFAULT_SHOW_AGENT_META,
             ui_font_size: DEFAULT_UI_FONT_SIZE,
             code_font_size: DEFAULT_CODE_FONT_SIZE,
+            updates_automatic: DEFAULT_UPDATES_AUTOMATIC,
         }
     }
 }

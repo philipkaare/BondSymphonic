@@ -183,7 +183,53 @@ rejected API key, an interrupt while it retries), and `opencode run` inside the
 WSL sandbox reaching the mock on the host's loopback through the config's base
 URL. A real local model (Ollama, vLLM) has not been run yet.
 
-### From a package
+### From the installer (recommended)
+
+Releases are on the [releases page](https://github.com/philipkaare/BondSymphonic/releases):
+`BondSymphonic-<version>-windows-x64-setup.exe` for Windows 11, and
+`BondSymphonic-<version>-macos-arm64.dmg` for Apple Silicon Macs.
+
+- **Windows**: the installer puts BondSymphonic in
+  `%LOCALAPPDATA%\Programs\BondSymphonic` for your user only, without asking
+  for administrator rights. It is not code-signed yet, so SmartScreen may stop
+  it; choose *More info > Run anyway*.
+- **macOS**: drag the app from the disk image to Applications. The app is
+  signed and notarized, and it carries its own copy of Lima.
+
+**First start.** The IDE checks the Linux environment the daemon runs in, and
+sets it up before launching the daemon if it is missing:
+
+- **Windows**: it creates and provisions the `bondsymphonic` WSL distro, using
+  the same `setup-wsl.ps1 -Runtime` the zip's `install.ps1` runs.
+- **macOS**: it creates the `bondsymphonic` Lima VM (Ubuntu 24.04, with your
+  home folder mounted) and provisions it.
+
+A *Setting up BondSymphonic* window shows each step and the commands' output.
+The first time, expect a download of about a gigabyte and a few minutes. If WSL
+itself is not installed, the window offers **Install WSL…**, which asks for
+administrator permission; Windows usually has to restart afterwards, and the
+setup carries on at the next start. On a machine that is already set up, the
+check takes a moment and no window appears. On macOS the check also starts a
+VM left stopped by a reboot. **Continue without it** starts the IDE anyway;
+agents cannot run until the setup is done.
+
+**Updates.** An installed copy updates itself. It checks for a new release
+when it starts and every six hours, downloads it in the background, and
+installs it when you quit. **Restart to update to <version>** in the status
+bar (and in Settings) installs it straight away and starts the new version.
+The new daemon goes into the distro or VM as part of the same restart. Every
+release is signed, and an update whose signature or checksum does not match is
+discarded.
+
+**Settings > General > Updates** shows the version you are running and what
+the updater is doing. Clear **Download and install updates automatically** to
+switch to manual updates: nothing is checked or downloaded until you click
+**Check now**. A copy that was not installed by the installer (a source build,
+or the zip below) reports new releases but never installs them.
+[releasing.md](releasing.md) describes the release pipeline and where the
+updater's log is kept.
+
+### From a zip
 
 You were handed a `BondSymphonic-<version>-win64.zip`.
 
@@ -1694,7 +1740,11 @@ nothing when unset, which is every ordinary run.
   connect straight to that address with that handshake token instead of starting
   a daemon through `wsl.exe`. Only loopback addresses are accepted, since the
   protocol carries file contents and PTY traffic; anything else is reported and
-  ignored rather than guessed at.
+  ignored rather than guessed at. With it set, the first-run setup of the WSL
+  distro or Lima VM is skipped and the updater never runs.
+- **`BS_SKIP_HOST_SETUP`** (any non-empty value): skip the first-run check and
+  setup of the WSL distro or Lima VM and launch the daemon straight away, as
+  the IDE did before it set itself up.
 - **`BS_DAEMON_BINARY`**: the daemon binary to install into the distro, ahead of
   the packaged copy beside the exe and the dev copy in `target\daemon\`. A path
   that does not exist is still used, with a warning — a caller who set it meant
