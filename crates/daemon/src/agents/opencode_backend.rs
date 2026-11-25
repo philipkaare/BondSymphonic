@@ -53,7 +53,8 @@ fn unmapped_config_error(reason: Option<&std::ffi::OsStr>) -> Option<std::io::Er
     Some(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         format!(
-            "The Windows OpenCode config folder cannot be reached from WSL: {}",
+            "Your OpenCode config folder cannot be reached from {}: {}",
+            crate::host::os().linux_env(),
             reason.to_string_lossy()
         ),
     ))
@@ -155,7 +156,10 @@ pub fn host_argv() -> Result<Vec<String>, RpcError> {
     }
     Err(RpcError::new(
         ErrorCode::PrereqMissing,
-        "Install OpenCode in Settings > Agents",
+        format!(
+            "Install OpenCode in {} › Agents",
+            crate::host::os().settings()
+        ),
     ))
 }
 
@@ -199,7 +203,7 @@ pub async fn prerequisites(root: &Path) -> Vec<PrereqStatus> {
 impl Backend for OpenCodeBackend {
     fn descriptor(&self) -> BackendDescriptor {
         BackendDescriptor { id: AgentAdapterKind::OpenCode, label: "OpenCode".into(), permission_modes: vec![BackendChoice { id: "yolo".into(), label: "YOLO (sandboxed)".into() }, BackendChoice { id: "ask".into(), label: "Ask before tools".into() }], default_permission_mode: "ask".into(),
-            permission_note: "OpenCode uses its own sandbox, provider sign-in and configuration. Models use provider/model IDs. Configure providers, local servers included, in the Windows user opencode.json shown in Settings; only servers named there can be reached. No API key is required for unauthenticated local servers.".into(), credential_label: "OpenAI API key".into(), prerequisite_names: vec!["opencode".into(), "opencode_auth".into(), "opencode_config".into()], setup_actions: vec![SetupAction::InstallOpencode, SetupAction::UninstallOpencode, SetupAction::OpencodeLogin, SetupAction::OpencodeLogout] }
+            permission_note: "OpenCode uses its own sandbox, provider sign-in and configuration. Models use provider/model IDs. Configure providers, local servers included, in your own opencode.json, whose folder Settings shows; only servers named there can be reached. No API key is required for unauthenticated local servers.".into(), credential_label: "OpenAI API key".into(), prerequisite_names: vec!["opencode".into(), "opencode_auth".into(), "opencode_config".into()], setup_actions: vec![SetupAction::InstallOpencode, SetupAction::UninstallOpencode, SetupAction::OpencodeLogin, SetupAction::OpencodeLogout] }
     }
     fn binary(&self) -> Option<PathBuf> {
         host_argv().ok().map(|args| PathBuf::from(&args[0]))
@@ -250,7 +254,10 @@ impl Backend for OpenCodeBackend {
             self.binary().ok_or_else(|| {
                 RpcError::new(
                     ErrorCode::PrereqMissing,
-                    "Install OpenCode in Settings > Agents",
+                    format!(
+                        "Install OpenCode in {} › Agents",
+                        crate::host::os().settings()
+                    ),
                 )
             })?;
             vec!["/opt/bs/opencode".into()]
@@ -429,7 +436,7 @@ mod tests {
     #[test]
     fn the_note_points_local_providers_at_the_windows_user_config() {
         let note = OpenCodeBackend.descriptor().permission_note;
-        assert!(note.contains("Windows user"), "{note}");
+        assert!(note.contains("your own opencode.json"), "{note}");
         assert!(!note.to_lowercase().contains("repository config"), "{note}");
     }
 }

@@ -48,7 +48,10 @@ const MAX_IN_FLIGHT: usize = 64;
 /// What an agent's tool call says when the server needs a login: the user
 /// fixes it in Settings, not in the agent.
 pub fn not_connected_message(name: &str) -> String {
-    format!("{name} is not connected — connect it in Settings › MCP servers")
+    format!(
+        "{name} is not connected — connect it in {} › MCP servers",
+        crate::host::os().settings()
+    )
 }
 
 /// What a `tools/call` says when the server expired the session under it.
