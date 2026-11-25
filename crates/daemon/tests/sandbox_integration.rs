@@ -12,7 +12,7 @@ use bondsymphonic_daemon::server::{Server, ServerConfig};
 use bondsymphonic_daemon::workspace::{lifecycle, DataDirs};
 use bondsymphonic_proto::{
     AgentAdapterKind, AgentMessageBody, AgentStartOptions, AgentStartParams, AgentState, Event,
-    ServerMessage, WorkspaceCreateParams, WorkspaceState,
+    MergeMode, ServerMessage, WorkspaceCreateParams, WorkspaceState,
 };
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -441,6 +441,131 @@ async fn git_in_a_bwrap_workspace_routes_only_the_workspace_repository() {
     assert_eq!(out.trim(), "mine");
 
     lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+}
+
+/// An agent manages its own branches: everything under its workspace's
+/// prefix (`bs/<name>/`). It can start one from a remote branch -- which
+/// would set up tracking in the read-only repository config if the shim let
+/// it -- commit on it, and delete it again, which git itself cannot do here
+/// because it locks the shared `packed-refs`. What the daemon merges is the
+/// branch the worktree is on. Anything outside the prefix, the branch the
+/// workspace was created with, the one checked out and an unmerged one without
+/// `-D` are all refused.
+#[tokio::test]
+async fn an_agent_manages_its_own_branches_and_merge_takes_the_one_it_is_on() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    // A branch "fetched" from origin, as `git_fetch` leaves one.
+    let host_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        )
+    };
+    assert!(host_git(&["update-ref", "refs/remotes/origin/upstream", "main"]).0);
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let daemon = Daemon::new(
+        DataDirs::new(dir.path().join("data")),
+        backend_for("linux_bwrap"),
+        server.event_bus(),
+    )
+    .unwrap();
+    let ws = lifecycle::create(
+        &daemon,
+        WorkspaceCreateParams {
+            repo_path: repo.to_string_lossy().into(),
+            name: "br".into(),
+            base_branch: "main".into(),
+            init_if_missing: false,
+            in_place: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+    let handle = daemon.sandbox(&ws.id).unwrap();
+    let wt = ws.worktree_path.clone();
+    let sh = |script: &str| format!("cd '{wt}' && {script} 2>&1");
+
+    // A branch of its own from the remote one, and a commit on it.
+    let (code, out) = run_in(
+        &handle,
+        &sh(
+            "git switch -q -c bs/br/topic origin/upstream && echo t > topic.txt && \
+             git add topic.txt && git -c user.name=a -c user.email=a@a commit -q -m topic && \
+             git symbolic-ref --short HEAD",
+        ),
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.trim(), "bs/br/topic");
+    let w = daemon.workspace(&ws.id).unwrap();
+    assert_eq!(
+        bondsymphonic_daemon::workspace::branches::active_branch(&daemon, &w)
+            .await
+            .unwrap(),
+        "bs/br/topic"
+    );
+
+    // Refused: a branch outside the prefix, the one checked out, and the one
+    // the workspace was created with.
+    let (code, out) = run_in(&handle, &sh("git branch elsewhere")).await;
+    assert_ne!(code, 0, "{out}");
+    let (code, out) = run_in(&handle, &sh("git branch -D bs/br/topic")).await;
+    assert_ne!(code, 0, "{out}");
+    assert!(out.contains("checked out"), "{out}");
+    let (code, out) = run_in(&handle, &sh("git branch -D bs/br/work")).await;
+    assert_ne!(code, 0, "{out}");
+    assert!(out.contains("created with"), "{out}");
+    let (code, out) = run_in(&handle, &sh("git branch -D main")).await;
+    assert_ne!(code, 0, "{out}");
+    assert!(out.contains("own branches"), "{out}");
+
+    // Merge takes the branch the worktree is on.
+    bondsymphonic_daemon::git::merge::merge(&daemon, &ws.id, MergeMode::Merge, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        host_git(&["show", "main:topic.txt"]),
+        (true, "t".to_owned())
+    );
+
+    // Back on the workspace branch, which does not contain the topic commit:
+    // `-d` refuses it as unmerged, `-D` deletes it for real.
+    let (code, out) = run_in(
+        &handle,
+        &sh("git switch -q bs/br/work && git branch -d bs/br/topic"),
+    )
+    .await;
+    assert_ne!(code, 0, "{out}");
+    assert!(out.contains("not fully merged"), "{out}");
+    let (code, out) = run_in(&handle, &sh("git branch -D bs/br/topic")).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("Deleted branch bs/br/topic"), "{out}");
+    assert!(!host_git(&["rev-parse", "--verify", "-q", "refs/heads/bs/br/topic"]).0);
+    assert!(host_git(&["rev-parse", "--verify", "-q", "refs/heads/bs/br/work"]).0);
+
+    // A branch the agent leaves behind goes with the workspace, as its own
+    // branch always did.
+    let (code, out) = run_in(&handle, &sh("git branch bs/br/left/behind")).await;
+    assert_eq!(code, 0, "{out}");
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+    let (_, left) = host_git(&["for-each-ref", "--format=%(refname)", "refs/heads/bs/br"]);
+    assert!(
+        left.is_empty(),
+        "the workspace's branches outlived it: {left}"
+    );
 }
 
 /// The real Claude Code binary has to be reachable *inside* a workspace

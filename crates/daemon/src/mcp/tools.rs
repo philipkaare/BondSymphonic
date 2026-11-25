@@ -356,7 +356,12 @@ impl WorkspaceTools {
         // state the workspace is in.
         let call = parse(name, &args)?;
         let (d, ws) = self.current()?;
-        let b = ws.branch.as_str();
+        // The branch the worktree is on now, when it is the workspace's own:
+        // what `git_push` publishes and `pr_*` act on.
+        let active = crate::workspace::branches::active_branch(&d, &ws)
+            .await
+            .map_err(failed)?;
+        let b = active.as_str();
         match call {
             Call::Fetch => {
                 let r = fetch::fetch_repo(&ws.repo_path, &d.dirs.no_hooks())

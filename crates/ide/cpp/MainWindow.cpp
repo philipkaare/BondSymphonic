@@ -1227,6 +1227,7 @@ void MainWindow::connectController() {
                          clearAgentStopped(workspaceId);
                          rebindCost();
                          reportAgentStartedForTest(workspaceId);
+                         tryApplyDaemonUpdate();
                      });
     // A transcript pane with no agent -- a restored session, or one whose agent
     // exited -- offers to start one. The options are the tab's own, so a
@@ -1472,7 +1473,15 @@ void MainWindow::connectController() {
                          m_groupModel->setAgentStatus(agentId, state, detail);
                          noteAgentAttention(agentId, state);
                          onAgentExited(agentId, state, detail);
+                         // An agent that has finished its turn may be the last
+                         // thing a pending daemon update was waiting for.
+                         tryApplyDaemonUpdate();
                      });
+    // A new daemon build: applied as soon as no agent would be cut off by it.
+    QObject::connect(m_controller, &AppController::daemonUpdateAvailable, this, [this] {
+        m_daemonUpdatePending = true;
+        tryApplyDaemonUpdate();
+    });
     // The daemon discarded events, so every terminal has a hole in it and says so.
     QObject::connect(m_controller, &AppController::outputDropped, this, [this](::std::int64_t) {
         for (TerminalSession* session : m_agentArea->sessions()) {
@@ -2438,6 +2447,37 @@ void MainWindow::resumeUnansweredRestarts(bool listed) {
         m_restartUnanswered.remove(workspaceId);
         resumeAgentAfterRestart(workspaceId);
     }
+}
+
+void MainWindow::tryApplyDaemonUpdate() {
+    if (!m_daemonUpdatePending) {
+        return;
+    }
+    // Restarting the daemon ends every agent with it. One in the middle of a
+    // turn, or waiting on the user, would lose that turn; one being started
+    // would race the restart. The update waits for all of them.
+    const int busy = m_groupModel->busyAgentCount();
+    if (busy > 0 || !m_autoStarting.isEmpty()) {
+        statusBar()->showMessage(
+            busy > 0 ? QStringLiteral("A new daemon build is ready; it is applied once no agent "
+                                      "is working (%1 busy).")
+                           .arg(busy)
+                     : QStringLiteral("A new daemon build is ready; it is applied once the agent "
+                                      "starting now is up."));
+        return;
+    }
+    m_daemonUpdatePending = false;
+    // Every agent that is running now comes back afterwards, resuming its
+    // conversation, once the new daemon reports its workspace running: the
+    // same booking a workspace Retry makes, waiting for a fresh workspace list
+    // because the connection is about to go.
+    for (const QJsonValue& value :
+         QJsonDocument::fromJson(m_groupModel->liveAgentWorkspacesJson().toUtf8()).array()) {
+        m_restartUnanswered.insert(value.toString(), true);
+    }
+    statusBar()->showMessage(QStringLiteral(
+        "Updating to the new daemon build; agents resume once it is back."));
+    m_controller->applyDaemonUpdate();
 }
 
 void MainWindow::resumeAgentAfterRestart(const QString& workspaceId) {

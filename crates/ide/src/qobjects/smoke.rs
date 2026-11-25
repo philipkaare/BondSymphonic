@@ -288,6 +288,17 @@ pub(crate) async fn run(steps: Vec<String>, mut client: DaemonClient, qt: QtHand
             other if other.starts_with("restart=") => {
                 restart(&qt, &other["restart=".len()..]).await
             }
+            "daemon_update" => {
+                // What the build watcher says when a new daemon build has
+                // settled; the window decides what to do with it.
+                match qt.queue(|q| q.daemon_update_available()) {
+                    Ok(()) => {
+                        tokio::time::sleep(WAIT_SETTLE).await;
+                        Ok(())
+                    }
+                    Err(_) => Err("the Qt thread is gone".to_owned()),
+                }
+            }
             other => Err(format!("unknown step {other:?}")),
         };
         if let Err(e) = outcome {

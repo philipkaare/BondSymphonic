@@ -989,6 +989,8 @@ it had rather than starting empty.
 
 An agent in a sandbox has no GitHub credentials, so BondSymphonic gives it built-in tools that run on your machine instead. Through them an agent can fetch, push its own workspace's branch, open and update that branch's pull request, comment on pull requests, read CI status and failed logs, and read issues. Nothing hands the agent your GitHub token. Pushing and opening or editing a pull request are limited to the agent's own workspace branch; reading pull requests, CI runs and issues, and commenting on pull requests, work across the whole repository. In an in-place workspace the agent works on your own checkout and has no branch of its own, so pushing and opening pull requests are left to you, from that checkout. With Claude Code the read-only tools (fetch, viewing pull requests, CI logs and issues) run without asking and the others follow the agent's permission mode; Codex asks, or does not, according to its own approval setting. A push runs your repository's own `pre-push` hook on your machine, as your own push would (that is how Git LFS uploads files). A plain `git push`, `git fetch` or `gh` typed inside an agent will not work, by design. To use the tools, install the GitHub CLI and log in to GitHub under Settings > Setup.
 
+**Branches an agent can manage.** In a worktree workspace your repository's `.git` is read-only to the agent, apart from the workspace's own branches: everything under the prefix of the branch it was created with (`bs/<name>/…`). The agent can create, switch between and delete those (`git branch -d` works there even though git alone could not, because the sandbox does it for git), and can start one from a remote branch after a fetch, as in `git switch -c bs/<name>/topic origin/feature`. Such a branch does not track its remote, since tracking would be written to your repository's config. Push, Create PR, Merge, Rebase and Squash all take the branch the workspace is on now, when it is one of its own, and the workspace's original branch otherwise. The agent's `pr_create` tool can open the pull request against another base branch. Your other branches, tags, `git stash` and the repository's own config stay read-only. Destroying the workspace removes all of its branches.
+
 ---
 
 ## MCP servers
@@ -1453,6 +1455,25 @@ What you have to do by hand:
 - **Agents.** A restored agent is `exited` and answers history and nothing else.
   Press **Restart agent**: it starts a new one with `--resume` on the recorded
   session id, so the conversation continues.
+
+---
+
+## A new daemon build while the IDE runs
+
+The IDE watches the daemon binary it installs from (`target/daemon/bondsymphonic-daemon`,
+which `scripts/build-daemon.sh` and `build-daemon.ps1` write). When a new build lands
+there and stops changing, the IDE applies it by itself:
+
+- **It waits for quiet.** Restarting the daemon ends every agent and every sandbox, so
+  the update waits until no agent is working or waiting for a permission answer, and no
+  agent is being started. The status bar says it is waiting, and how many agents are busy.
+- **Then it restarts the daemon** the way it recovers from a lost one: the new binary is
+  installed into the VM or distro, the daemon starts, and every pane re-attaches. Each
+  sandbox is started fresh from the new binary.
+- **The agents come back.** Every agent that was running is started again with
+  `--resume` once its workspace is running, so its conversation and its history continue.
+
+Terminals and runs end with the old daemon, as they do on any daemon restart.
 
 ---
 

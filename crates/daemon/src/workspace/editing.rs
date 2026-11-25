@@ -171,12 +171,19 @@ async fn check_commit_branch(git: &Git, ws: &Workspace) -> Result<(), RpcError> 
             &["symbolic-ref", "--no-recurse", "-q", "HEAD"],
         )
         .await;
+    // Any of the workspace's own branches: the agent may have moved its work
+    // to another (see `workspace::branches`). Not a branch of the user's, which
+    // the sandbox cannot commit to either.
     if ws.kind == WorkspaceKind::Worktree
-        && head.as_ref().map(|o| o.stdout.trim()).ok()
-            != Some(format!("refs/heads/{}", ws.branch).as_str())
+        && !head.as_ref().ok().is_some_and(|o| {
+            o.stdout
+                .trim()
+                .strip_prefix("refs/heads/")
+                .is_some_and(|b| crate::workspace::branches::is_own(ws, b))
+        })
     {
         return Err(RpcError::invalid_params(
-            "workspace HEAD no longer names its own branch",
+            "workspace HEAD is not on one of its own branches",
         ));
     }
     if let Ok(head) = head {
