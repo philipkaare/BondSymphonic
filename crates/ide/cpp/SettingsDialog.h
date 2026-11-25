@@ -49,6 +49,14 @@ public:
     /// the top of a form.
     void revealSetup();
 
+    /// Brings the "MCP servers" tab to the front, when the daemon offers it.
+    /// What Workspace › "MCP servers…" opens.
+    void revealMcp();
+
+    /// The workspace in front, whose MCP overrides the MCP servers tab shows
+    /// beside the servers; an empty id for none.
+    void setWorkspace(const QString& workspaceId, const QString& workspaceName);
+
     void accept() override;
 
     /// Puts the palette and the text sizes back to the stored choice. Both
@@ -75,6 +83,9 @@ private:
     /// General, and MCP servers when the daemon offers them.
     QTabWidget* m_tabs = nullptr;
     McpPage* m_mcpPage = nullptr;
+    /// See [`setWorkspace`], kept for an MCP tab added later.
+    QString m_workspaceId;
+    QString m_workspaceName;
   struct BackendControls {
       QString label;
       QCheckBox *enabled;

@@ -11,7 +11,6 @@
 #include "GroupBar.h"
 #include "NewAgentDialog.h"
 #include "NetworkRulesDialog.h"
-#include "WorkspaceMcpDialog.h"
 #include "RunPanel.h"
 #include "SettingsDialog.h"
 #include "SetupPage.h"
@@ -418,17 +417,11 @@ void MainWindow::buildMenus() {
     // Beside the network rules because it is the same kind of question: what
     // this one workspace's agents may reach. Hidden for a daemon without MCP
     // servers; see `onConnectionStateChanged`.
+    // Settings' MCP servers tab, which carries this workspace's column: one
+    // place for the servers and for what each workspace gets of them.
     m_mcpServersAction = workspace->addAction("&MCP servers…", this, [this] {
-        const QString id = activeWorkspaceId();
-        if (id.isEmpty()) { return; }
-        if (!m_mcpServersDialog.isNull()) {
-            m_mcpServersDialog->raise();
-            m_mcpServersDialog->activateWindow();
-            return;
-        }
-        auto* dialog = new WorkspaceMcpDialog(m_controller, id, m_groupModel->workspaceName(id), this);
-        m_mcpServersDialog = dialog;
-        dialog->open();
+        if (activeWorkspaceId().isEmpty()) { return; }
+        openSettings(false, true);
     });
     m_mcpServersAction->setObjectName(QStringLiteral("WorkspaceMcpServersAction"));
     m_mcpServersAction->setVisible(false);
@@ -629,8 +622,15 @@ void MainWindow::showSetupPage() { openSettings(true); }
 
 void MainWindow::onSettings() { openSettings(false); }
 
-void MainWindow::openSettings(bool onSetup) {
+void MainWindow::openSettings(bool onSetup, bool onMcp) {
+    const QString workspaceId = activeWorkspaceId();
+    const QString workspaceName =
+        workspaceId.isEmpty() ? QString() : m_groupModel->workspaceName(workspaceId);
     if (!m_settingsDialog.isNull()) {
+        m_settingsDialog->setWorkspace(workspaceId, workspaceName);
+        if (onMcp) {
+            m_settingsDialog->revealMcp();
+        }
         // Already up. A prerequisite re-check arrives every time a setup
         // terminal exits, so without this the dialog the user is logging in
         // through would collect a second one on top of it.
@@ -643,6 +643,10 @@ void MainWindow::openSettings(bool onSetup) {
     }
     SettingsDialog dialog(m_controller, this);
     m_settingsDialog = &dialog;
+    dialog.setWorkspace(workspaceId, workspaceName);
+    if (onMcp) {
+        dialog.revealMcp();
+    }
     // Set for every open, not only the automatic one. A user who reaches
     // Settings by hand while a blocking prerequisite is failing must not have
     // it thrown back at them the moment they close it either.

@@ -1001,7 +1001,8 @@ server with a status dot: green is connected, amber is a sign-in in progress,
 red is an error (its reason follows the word), grey is not signed in, not yet
 tested, or a local server, which is only started inside an agent's sandbox. The
 tab and the Workspace menu item below appear only when the daemon supports MCP
-servers; an older daemon shows neither.
+servers; an older daemon shows neither. On a Mac, Settings is in the
+**BondSymphonic** menu (⌘,) rather than under File.
 
 Claude Code, Codex and OpenCode agents all get the same servers. The built-in
 git tools keep the reserved name `bondsymphonic`, so no server can use that ID.
@@ -1055,10 +1056,13 @@ list; otherwise restart the agent to get the server's tools.
 
 ### Workspace overrides
 
-**Workspace → MCP servers…** chooses, for the current workspace only, whether
-its agents get each server: **Inherit** follows the server's **On in every
-workspace** setting (the label says which way that currently goes), or
+While a workspace is in front, the server list in **Settings → MCP servers** has
+one more column, **In \<workspace\>**. It chooses, for that workspace only,
+whether its agents get each server: **Inherit** follows the server's **On in
+every workspace** setting (the label says which way that currently goes), or
 **Enabled** or **Disabled** regardless. A choice is saved as you make it.
+**Workspace → MCP servers…** opens Settings on this tab; it is the same list,
+not a second window.
 
 ### When changes apply
 

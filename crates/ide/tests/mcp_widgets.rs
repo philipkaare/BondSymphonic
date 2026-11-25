@@ -1,5 +1,5 @@
-//! The MCP servers settings tab, its server editor and import dialog, and the
-//! per-workspace "MCP servers…" dialog, offscreen. Its own binary, so it builds
+//! The MCP servers settings tab -- with its column for the workspace in front --
+//! its server editor and import dialog, offscreen. Its own binary, so it builds
 //! its own offscreen `QApplication` and never touches the state store.
 
 use bondsymphonic_ide::testing::skip_without_qt;
@@ -10,7 +10,7 @@ extern "C" {
     fn bs_widget_test_mcp_page_lists_servers() -> i32;
     fn bs_widget_test_mcp_secret_editor_is_write_only() -> i32;
     fn bs_widget_test_mcp_import_preview_before_apply() -> i32;
-    fn bs_widget_test_workspace_dialog_shows_inherit() -> i32;
+    fn bs_widget_test_mcp_page_sets_workspace_overrides() -> i32;
 }
 
 /// One test, because the widget hooks share one leaked `QApplication`, and the
@@ -36,8 +36,8 @@ fn mcp_widgets() {
             bs_widget_test_mcp_import_preview_before_apply,
         ),
         (
-            "workspace_dialog_shows_inherit",
-            bs_widget_test_workspace_dialog_shows_inherit,
+            "mcp_page_sets_workspace_overrides",
+            bs_widget_test_mcp_page_sets_workspace_overrides,
         ),
     ];
     for (name, step) in steps {

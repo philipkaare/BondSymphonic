@@ -122,7 +122,9 @@ private:
     /// call while one is up raises the one that is up rather than stacking a
     /// second: a prerequisite re-check arrives every time a setup terminal
     /// exits, and each of those would otherwise open another dialog.
-    void openSettings(bool onSetup);
+    /// `onMcp` opens it on the MCP servers tab, for Workspace › "MCP
+    /// servers…".
+    void openSettings(bool onSetup, bool onMcp = false);
     /// Decides, from the daemon's prerequisite list, between opening Settings
     /// on Setup, a status-bar warning with a way there, and neither.
     void onPrereqsChecked(const QString& json);
@@ -635,7 +637,6 @@ private:
     QPointer<QDialog> m_networkRulesDialog;
     /// Workspace > MCP servers…, shown only when the daemon offers them.
     QAction* m_mcpServersAction = nullptr;
-    QPointer<QDialog> m_mcpServersDialog;
     QAction* m_destroyAction = nullptr;
     QAction* m_closeGroupAction = nullptr;
     /// The two that need a *second* tab to go to rather than merely one tab.
