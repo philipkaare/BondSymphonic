@@ -33,6 +33,17 @@ impl Layout {
             .unwrap_or_default();
         self.git_common.join("worktrees").join(base)
     }
+    /// The worktree's view of the shared `.git`, inside its own git directory.
+    /// See [`crate::sandbox::git_shim::refresh_common_view`].
+    pub fn common_view(&self) -> PathBuf {
+        self.worktree_gitdir()
+            .join(crate::sandbox::git_shim::COMMON_VIEW)
+    }
+    /// The file in the worktree's git directory that names its common
+    /// directory. Git in the sandbox reads a daemon-owned one in its place.
+    pub fn commondir_file(&self) -> PathBuf {
+        self.worktree_gitdir().join("commondir")
+    }
     /// Subpaths of the main `.git` that must be bind-mounted read-write into the sandbox.
     pub fn rw_git_paths(&self) -> Vec<PathBuf> {
         vec![self.worktree_gitdir(), self.ref_dir(), self.reflog_dir()]
@@ -52,18 +63,27 @@ impl Layout {
     /// ([`crate::sandbox::git_shim`]): under names git does not read, so only
     /// a command on the workspace's own repository is routed to the private
     /// directory, and every other repository works as plain git.
+    ///
+    /// `viewed` when the sandbox's `commondir` names [`Layout::common_view`]:
+    /// git then reports the view as the repository's common directory, and
+    /// the shim keeps it current from the shared `.git`.
     #[cfg(unix)]
-    pub fn sandbox_git_routing_env(&self) -> Vec<(String, String)> {
+    pub fn sandbox_git_routing_env(&self, viewed: bool) -> Vec<(String, String)> {
         use crate::sandbox::git_shim::{
-            ALTERNATES_ENV, BRANCH_ENV, COMMON_ENV, OBJECTS_ENV, PREFIX_ENV,
+            ALTERNATES_ENV, BRANCH_ENV, COMMON_ENV, OBJECTS_ENV, PREFIX_ENV, REAL_COMMON_ENV,
         };
         let prefix = self
             .branch
             .rsplit_once('/')
             .map(|(parent, _)| format!("{parent}/"))
             .unwrap_or_default();
-        vec![
-            (COMMON_ENV.into(), path_arg(&self.git_common)),
+        let common = if viewed {
+            self.common_view()
+        } else {
+            self.git_common.clone()
+        };
+        let mut env = vec![
+            (COMMON_ENV.into(), path_arg(&common)),
             (OBJECTS_ENV.into(), path_arg(&self.objects_dir)),
             (
                 ALTERNATES_ENV.into(),
@@ -71,7 +91,11 @@ impl Layout {
             ),
             (PREFIX_ENV.into(), prefix),
             (BRANCH_ENV.into(), self.branch.clone()),
-        ]
+        ];
+        if viewed {
+            env.push((REAL_COMMON_ENV.into(), path_arg(&self.git_common)));
+        }
+        env
     }
     /// Env for git *inside* the sandbox: new objects go to the private dir.
     ///

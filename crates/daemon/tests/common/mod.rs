@@ -34,6 +34,13 @@ pub fn init_repo(dir: &Path) -> PathBuf {
     git(&["config", "user.name", "t"]);
     git(&["config", "user.email", "t@t"]);
     git(&["config", "commit.gpgsign", "false"]);
+    // No background maintenance. Since git 2.47 the auto-maintenance after a
+    // commit detaches, and holds `.git/objects/maintenance.lock` for as long as
+    // it runs: a test that lists or compares `.git` right after an agent's
+    // commit -- the in-place ones do -- met the lock, or a file gone between
+    // listing and reading it. Hosted CI runners carry such a git.
+    git(&["config", "maintenance.auto", "false"]);
+    git(&["config", "gc.auto", "0"]);
     std::fs::write(repo.join("README.md"), "hello\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-q", "-m", "init"]);

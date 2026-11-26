@@ -11,6 +11,13 @@
 //! The fetch runs in the main repository with hooks pinned to the daemon's
 //! empty directory, like every other daemon-side git operation that is not a
 //! push (see [`crate::git::worktree::Layout::daemon_git`]).
+//!
+//! It also runs with every worktree workspace's private object store of the
+//! repository as an alternate. An agent's branches live in the shared
+//! `refs/heads/bs/<name>/`, but the commits on them are in its workspace's own
+//! store until they are pushed or merged; to plain git in the main repository
+//! such a branch names an object that is not there, and `git fetch` -- which
+//! reads every local ref -- stops with `fatal: bad object refs/heads/bs/...`.
 
 use crate::daemon::Daemon;
 use crate::git::{path_arg, Git};
@@ -35,7 +42,22 @@ fn last_fetched() -> &'static parking_lot::Mutex<HashMap<PathBuf, Instant>> {
 /// recently it was fetched.
 pub async fn fetch(d: &Daemon, id: &WorkspaceId) -> Result<FetchResult, RpcError> {
     let ws = d.workspace(id)?;
-    fetch_repo(&ws.repo_path, &d.dirs.no_hooks()).await
+    let stores = private_stores(d, &ws.repo_path);
+    fetch_repo(&ws.repo_path, &d.dirs.no_hooks(), &stores).await
+}
+
+/// The private object stores of every workspace of `repo` that has one, so a
+/// daemon-side git in the main repository can read the objects its agents'
+/// branches point at. In-place workspaces have none.
+pub fn private_stores(d: &Daemon, repo: &Path) -> Vec<PathBuf> {
+    let key = crate::git::repo::canonical_ish(repo);
+    d.registry
+        .list()
+        .iter()
+        .filter(|ws| crate::git::repo::canonical_ish(&ws.repo_path) == key)
+        .map(|ws| d.dirs.objects(&ws.id))
+        .filter(|dir| dir.is_dir())
+        .collect()
 }
 
 /// The fetch a workspace gets when it becomes `Ready`, in the background.
@@ -43,7 +65,7 @@ pub async fn fetch(d: &Daemon, id: &WorkspaceId) -> Result<FetchResult, RpcError
 /// Skipped when the repository was fetched within [`AUTO_FETCH_INTERVAL`].
 /// Failures only go to the log: the workspace is up either way, and an offline
 /// laptop must not turn every start into an error.
-pub fn spawn_auto_fetch(repo: PathBuf, no_hooks: PathBuf) {
+pub fn spawn_auto_fetch(repo: PathBuf, no_hooks: PathBuf, stores: Vec<PathBuf>) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
@@ -61,7 +83,7 @@ pub fn spawn_auto_fetch(repo: PathBuf, no_hooks: PathBuf) {
             // repository coming up at the same moment do not queue behind it.
             last.insert(key, Instant::now());
         }
-        match fetch_repo(&repo, &no_hooks).await {
+        match fetch_repo(&repo, &no_hooks, &stores).await {
             Ok(r) if r.has_origin => {
                 tracing::info!(repo = %repo.display(), updated = r.updated, "fetched origin")
             }
@@ -74,9 +96,22 @@ pub fn spawn_auto_fetch(repo: PathBuf, no_hooks: PathBuf) {
 }
 
 /// Fetches `origin` into `repo`, under the repository's lock so it never
-/// races a merge or a push of the same repository.
-pub async fn fetch_repo(repo: &Path, no_hooks: &Path) -> Result<FetchResult, RpcError> {
-    let git = host_git(no_hooks);
+/// races a merge or a push of the same repository. `stores` are the
+/// workspaces' private object stores ([`private_stores`]).
+pub async fn fetch_repo(
+    repo: &Path,
+    no_hooks: &Path,
+    stores: &[PathBuf],
+) -> Result<FetchResult, RpcError> {
+    let mut git = host_git(no_hooks);
+    if !stores.is_empty() {
+        if let Ok(joined) = std::env::join_paths(stores) {
+            git = git.with_env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                joined.to_string_lossy().into_owned(),
+            );
+        }
+    }
     let lock = crate::git::repo_lock(repo);
     let _guard = lock.lock().await;
     let remotes = git.run(repo, &["remote"]).await?;
@@ -161,7 +196,7 @@ mod tests {
             .success();
         assert!(ok);
         let hooks = tempfile::tempdir().unwrap();
-        let r = fetch_repo(dir.path(), hooks.path()).await.unwrap();
+        let r = fetch_repo(dir.path(), hooks.path(), &[]).await.unwrap();
         assert!(!r.has_origin);
         assert_eq!(r.updated, 0);
     }
@@ -199,10 +234,80 @@ mod tests {
         git(upstream.path(), &["branch", "feature"]);
 
         let hooks = tempfile::tempdir().unwrap();
-        let r = fetch_repo(clone.path(), hooks.path()).await.unwrap();
+        let r = fetch_repo(clone.path(), hooks.path(), &[]).await.unwrap();
         assert!(r.has_origin);
         assert_eq!(r.updated, 2, "main moved and feature is new");
-        let again = fetch_repo(clone.path(), hooks.path()).await.unwrap();
+        let again = fetch_repo(clone.path(), hooks.path(), &[]).await.unwrap();
         assert_eq!(again.updated, 0);
+    }
+
+    /// An agent's branch is in the shared refs, but its commit is only in the
+    /// workspace's private store. Plain git in the main repository cannot
+    /// fetch at all then; with the store as an alternate it can.
+    #[tokio::test]
+    async fn a_branch_whose_commit_is_in_a_private_store_does_not_stop_the_fetch() {
+        let git = |dir: &Path, args: &[&str], env: &[(&str, &Path)]| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t");
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        let upstream = tempfile::tempdir().unwrap();
+        git(upstream.path(), &["init", "-q", "-b", "main"], &[]);
+        git(
+            upstream.path(),
+            &["commit", "-q", "--allow-empty", "-m", "one"],
+            &[],
+        );
+        let clone = tempfile::tempdir().unwrap();
+        git(
+            clone.path(),
+            &["clone", "-q", &path_arg(upstream.path()), "."],
+            &[],
+        );
+        // What the sandbox does: a commit into the private store, and the
+        // branch written to the shared refs.
+        let store = tempfile::tempdir().unwrap();
+        let main_objects = clone.path().join(".git/objects");
+        let routed = [
+            ("GIT_OBJECT_DIRECTORY", store.path()),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", main_objects.as_path()),
+        ];
+        let tree = git(clone.path(), &["write-tree"], &routed);
+        let commit = git(
+            clone.path(),
+            &["commit-tree", &tree, "-p", "HEAD", "-m", "agent"],
+            &routed,
+        );
+        git(
+            clone.path(),
+            &["update-ref", "refs/heads/bs/agent/work", &commit],
+            &routed,
+        );
+        git(
+            upstream.path(),
+            &["commit", "-q", "--allow-empty", "-m", "two"],
+            &[],
+        );
+
+        let hooks = tempfile::tempdir().unwrap();
+        let plain = fetch_repo(clone.path(), hooks.path(), &[]).await;
+        assert!(
+            plain.is_err(),
+            "plain git is expected to refuse; if it no longer does, the alternate is moot"
+        );
+        let r = fetch_repo(clone.path(), hooks.path(), &[store.path().to_path_buf()])
+            .await
+            .unwrap();
+        assert_eq!(r.updated, 1, "main moved");
     }
 }

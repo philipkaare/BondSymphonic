@@ -568,6 +568,120 @@ async fn an_agent_manages_its_own_branches_and_merge_takes_the_one_it_is_on() {
     );
 }
 
+/// A cherry-pick and a revert finish inside the sandbox, which git before
+/// 2.48 could not: it locks the shared `packed-refs` to delete the worktree's
+/// `CHERRY_PICK_HEAD`, in a `.git` the sandbox cannot write. The sandbox's
+/// `commondir` names the worktree's view instead, and the agent cannot point
+/// it anywhere else; the host's `.git` gets nothing new.
+#[tokio::test]
+async fn a_cherry_pick_finishes_in_a_bwrap_workspace() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let host_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "host git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    // Two commits on another branch to pick from, all refs packed as in a
+    // fresh clone.
+    host_git(&["switch", "-q", "-c", "feature"]);
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    host_git(&["add", "a.txt"]);
+    host_git(&["commit", "-q", "-m", "a"]);
+    std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+    host_git(&["add", "b.txt"]);
+    host_git(&["commit", "-q", "-m", "b"]);
+    host_git(&["switch", "-q", "main"]);
+    host_git(&["pack-refs", "--all"]);
+
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let daemon = Daemon::new(
+        DataDirs::new(dir.path().join("data")),
+        backend_for("linux_bwrap"),
+        server.event_bus(),
+    )
+    .unwrap();
+    let ws = lifecycle::create(
+        &daemon,
+        WorkspaceCreateParams {
+            repo_path: repo.to_string_lossy().into(),
+            name: "cp".into(),
+            base_branch: "main".into(),
+            init_if_missing: false,
+            in_place: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+    let before: std::collections::BTreeSet<_> = std::fs::read_dir(repo.join(".git"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    let handle = daemon.sandbox(&ws.id).unwrap();
+    let wt = ws.worktree_path.clone();
+    let sh = |script: &str| format!("cd '{wt}' && {script} 2>&1");
+    let ident = "-c user.name=a -c user.email=a@a";
+    let gitdir = format!("{}/.git/worktrees", repo.display());
+
+    let (code, out) = run_in(&handle, &sh(&format!("git {ident} cherry-pick feature~1"))).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("packed-refs.lock"), "{out}");
+    let (code, out) = run_in(
+        &handle,
+        &sh(&format!(
+            "git {ident} cherry-pick feature && git {ident} revert --no-edit HEAD && \
+             ls \"$(git rev-parse --git-dir)\""
+        )),
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("CHERRY_PICK_HEAD"), "left behind: {out}");
+    assert!(!out.contains("REVERT_HEAD"), "left behind: {out}");
+    let (code, out) = run_in(&handle, &sh("git log --format=%s -3")).await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.trim(), "Revert \"b\"\nb\na");
+
+    // The agent cannot repoint the worktree, and the host's own commondir is
+    // what git wrote.
+    let (code, out) = run_in(
+        &handle,
+        &sh("echo /tmp > \"$(git rev-parse --git-dir)/commondir\" && echo wrote"),
+    )
+    .await;
+    assert_ne!(code, 0, "{out}");
+    let host_commondir = std::fs::read_dir(&gitdir)
+        .unwrap()
+        .map(|e| e.unwrap().path().join("commondir"))
+        .find(|p| p.is_file())
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(host_commondir).unwrap().trim(),
+        "../.."
+    );
+    let after: std::collections::BTreeSet<_> = std::fs::read_dir(repo.join(".git"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(before, after, "the host's .git got new entries");
+
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+}
+
 /// The real Claude Code binary has to be reachable *inside* a workspace
 /// sandbox, which is the one thing the fake `claude` the rest of the suite runs
 /// can never show.

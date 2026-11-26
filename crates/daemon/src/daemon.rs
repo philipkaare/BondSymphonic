@@ -465,7 +465,11 @@ impl Daemon {
         // restarted -- passes here, and each is a moment its agent is about to
         // look at `origin/*`, which it has no way to fetch itself.
         if ready {
-            crate::git::fetch::spawn_auto_fetch(ws.repo_path.clone(), self.dirs.no_hooks());
+            crate::git::fetch::spawn_auto_fetch(
+                ws.repo_path.clone(),
+                self.dirs.no_hooks(),
+                crate::git::fetch::private_stores(self, &ws.repo_path),
+            );
         }
         Ok(ws)
     }

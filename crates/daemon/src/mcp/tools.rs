@@ -381,7 +381,8 @@ impl WorkspaceTools {
         let b = active.as_str();
         match call {
             Call::Fetch => {
-                let r = fetch::fetch_repo(&ws.repo_path, &d.dirs.no_hooks())
+                let stores = fetch::private_stores(&d, &ws.repo_path);
+                let r = fetch::fetch_repo(&ws.repo_path, &d.dirs.no_hooks(), &stores)
                     .await
                     .map_err(failed)?;
                 Ok(if !r.has_origin {
