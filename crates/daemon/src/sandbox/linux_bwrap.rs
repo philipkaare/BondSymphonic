@@ -267,7 +267,15 @@ fn base_env(spec: &SandboxSpec, user: &str) -> Vec<(String, String)> {
         (
             "PATH".to_string(),
             // The git shim first, so `git` is always it. See `git_shim`.
-            format!("{}:{home_in}/.local/bin:{home_in}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", super::git_shim::SHIM_DIR),
+            // Beside `.cargo/bin`, with the other directories in the home:
+            // where the shared tools' installers leave their programs.
+            {
+                let extra: String = crate::workspace::shared_tools::EXTRA_PATH_DIRS
+                    .iter()
+                    .map(|rel| format!(":{home_in}/{rel}"))
+                    .collect();
+                format!("{}:{home_in}/.local/bin:{home_in}/.cargo/bin{extra}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", super::git_shim::SHIM_DIR)
+            },
         ),
         ("TERM".to_string(), "xterm-256color".into()),
         ("LANG".to_string(), "C.UTF-8".into()),

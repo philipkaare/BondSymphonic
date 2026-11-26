@@ -10,7 +10,7 @@ use crate::ids::new_id;
 use crate::net::allowlist::{Allowlist, HostPattern};
 use crate::sandbox::{SandboxCommand, SandboxHandle, SandboxSpec};
 use crate::workspace::in_place::{self, InPlaceLayout, IGNORE_SUBMODULES};
-use crate::workspace::{now_rfc3339, Workspace};
+use crate::workspace::{now_rfc3339, shared_tools, Workspace};
 use bondsymphonic_proto::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -203,6 +203,16 @@ fn finish_spec(
     // a workspace that cannot host an agent.
     if d.backend.name() == BWRAP_BACKEND {
         ro_binds.extend(crate::agents::claude::claude_ro_bind());
+        // After the cache and before anything a caller adds: what agents
+        // installed on this repository, over the same paths in this home.
+        rw_binds.extend(shared_tools::binds(d, ws, &home_in_sandbox));
+        env.push((
+            "DOTNET_ROOT".into(),
+            home_in_sandbox
+                .join(".dotnet")
+                .to_string_lossy()
+                .into_owned(),
+        ));
     }
     env.push(("BS_WORKSPACE".into(), ws.id.to_string()));
     // Only where the sandbox actually has a network namespace of its own. The
@@ -232,6 +242,11 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
         d.dirs.run(&ws.id),
     ] {
         std::fs::create_dir_all(p).map_err(|e| RpcError::io(&e))?;
+    }
+    // Before the spec, which binds the shared directories over these: once
+    // bound, what is left in the home is out of sight.
+    if d.backend.name() == BWRAP_BACKEND {
+        shared_tools::adopt_private(d, ws);
     }
     log_phase(&ws.id, "start_sandbox", "create_dirs", phase);
     let phase = Instant::now();

@@ -1052,6 +1052,92 @@ async fn bwrap_workspace(
     (daemon, ws, layout)
 }
 
+/// What one agent installs is there for the next agent on the same
+/// repository, and only for it: the installers' own directories are shared
+/// per repository, the rest of the home is not, and another repository's
+/// workspaces see none of it.
+#[tokio::test]
+async fn installed_tools_are_shared_by_the_workspaces_of_one_repository() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let other_parent = dir.path().join("other");
+    let other = common::init_repo(&other_parent);
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let daemon = Daemon::new(
+        DataDirs::new(dir.path().join("data")),
+        backend_for("linux_bwrap"),
+        server.event_bus(),
+    )
+    .unwrap();
+    let create = |repo: std::path::PathBuf, name: &'static str| {
+        let daemon = daemon.clone();
+        async move {
+            let ws = lifecycle::create(
+                &daemon,
+                WorkspaceCreateParams {
+                    repo_path: repo.to_string_lossy().into(),
+                    base_branch: "main".into(),
+                    name: name.into(),
+                    init_if_missing: false,
+                    in_place: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(ws.state, WorkspaceState::Ready, "{:?}", ws.state);
+            ws
+        }
+    };
+    let first = create(repo.clone(), "tools-a").await;
+    let second = create(repo.clone(), "tools-b").await;
+    let elsewhere = create(other.clone(), "tools-c").await;
+
+    let (code, out) = run_in(
+        &daemon.sandbox(&first.id).unwrap(),
+        "mkdir -p ~/.dotnet ~/.local/bin && echo sdk > ~/.dotnet/marker \
+         && printf '#!/bin/sh\necho shared-tool\n' > ~/.local/bin/bs-shared-tool \
+         && chmod +x ~/.local/bin/bs-shared-tool && echo private > ~/private-marker \
+         && echo \"$DOTNET_ROOT\"",
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    let user = std::env::var("USER").unwrap_or_else(|_| "bs".into());
+    assert!(out.contains(&format!("/home/{user}/.dotnet")), "{out}");
+
+    let (code, out) = run_in(
+        &daemon.sandbox(&second.id).unwrap(),
+        "cat ~/.dotnet/marker; bs-shared-tool; [ -e ~/private-marker ] && echo LEAKED || echo private-kept",
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines, ["sdk", "shared-tool", "private-kept"], "{out}");
+
+    let (_, out) = run_in(
+        &daemon.sandbox(&elsewhere.id).unwrap(),
+        "[ -e ~/.dotnet/marker ] && echo LEAKED || echo absent",
+    )
+    .await;
+    assert_eq!(
+        out.trim(),
+        "absent",
+        "another repository saw the tools: {out}"
+    );
+
+    for ws in [&first, &second, &elsewhere] {
+        lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+    }
+    // Destroying every workspace leaves the repository's tools for the next.
+    assert!(std::fs::read_dir(dir.path().join("data/tools"))
+        .unwrap()
+        .flatten()
+        .any(|e| e.path().join(".dotnet/marker").exists()));
+}
+
 /// The read-only bind has to hold against every way of replacing a file, while
 /// leaving the rest of the gitdir writable — git cannot work otherwise.
 #[tokio::test]
