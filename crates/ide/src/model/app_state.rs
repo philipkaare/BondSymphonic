@@ -535,6 +535,21 @@ impl AgentTab {
     }
 }
 
+/// Where the item at `i` ends up when the one at `from` is taken out and put
+/// back at `to`: the moved item itself goes to `to`, and those it passed over
+/// shift one place towards where it came from.
+pub fn moved_index(i: usize, from: usize, to: usize) -> usize {
+    if i == from {
+        to
+    } else if from < i && i <= to {
+        i - 1
+    } else if to <= i && i < from {
+        i + 1
+    } else {
+        i
+    }
+}
+
 /// Records are oldest first. Keep selection within the chosen harness so a
 /// saved conversation from another adapter cannot change a tab's backend.
 fn preferred_agent(info: &WorkspaceInfo, adapter: AgentAdapterKind) -> Option<&AgentSummary> {
@@ -982,6 +997,39 @@ impl Workspaces {
             return true;
         }
         self.ensure_active_valid();
+        true
+    }
+
+    /// Moves the tab at `from` in group `group` to position `to` in the same
+    /// group, as dragging it along the agent row does. The active selection
+    /// stays on the tab it was on. False for an index that is not there, or a
+    /// move to where it already is.
+    pub fn move_tab(&mut self, group: usize, from: usize, to: usize) -> bool {
+        let Some(grp) = self.groups.get_mut(group) else {
+            return false;
+        };
+        if from == to || from >= grp.tabs.len() || to >= grp.tabs.len() {
+            return false;
+        }
+        let tab = grp.tabs.remove(from);
+        grp.tabs.insert(to, tab);
+        if self.active_group == group {
+            self.active_tab = moved_index(self.active_tab, from, to);
+        }
+        true
+    }
+
+    /// Moves the group at `from` to position `to`, as dragging its tab along
+    /// the group row does. The active selection stays on the same tab. False
+    /// for an index that is not there, or a move to where it already is.
+    pub fn move_group(&mut self, from: usize, to: usize) -> bool {
+        let len = self.groups.len();
+        if from == to || from >= len || to >= len {
+            return false;
+        }
+        let group = self.groups.remove(from);
+        self.groups.insert(to, group);
+        self.active_group = moved_index(self.active_group, from, to);
         true
     }
 

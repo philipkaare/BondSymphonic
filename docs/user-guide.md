@@ -567,6 +567,12 @@ The dialog also warns when the repository has uncommitted changes.
 Each workspace is one tab in the group bar. Groups are just tabs of tabs; a
 workspace the daemon has that no group claims lands in **Unsorted**.
 
+Drag to rearrange: drag an agent tab along its row to reorder the agents in a
+group, or drag a group tab along the group row to reorder the groups. To move
+an agent to another group, drag its tab up out of the row onto that group's
+tab; the group lights up while the agent is over it, and the agent joins the
+end of it. The arrangement is saved like any other change to the groups.
+
 A tab reads `agent-4 · BondSymphonic @ main` — the agent's name, the repository
 it is working in and the branch it forked from. Not its own branch: every
 workspace gets one called `bs/<name>/work`, which is the agent's name spelled a

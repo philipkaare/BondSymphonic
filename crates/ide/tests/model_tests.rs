@@ -1750,3 +1750,42 @@ fn the_agents_task_follows_the_workspace_info() {
     let json = serde_json::to_value(w.active().unwrap()).unwrap();
     assert!(json.get("task").is_none());
 }
+
+/// Dragging reorders tabs and groups; the tab in front stays in front.
+#[test]
+fn moving_tabs_and_groups_keeps_the_active_tab() {
+    let mut w = Workspaces::new_default();
+    let g = w.add_group("Two");
+    w.add_tab(0, tab("ws_a", "a"));
+    w.add_tab(0, tab("ws_b", "b"));
+    w.add_tab(0, tab("ws_c", "c"));
+    w.add_tab(g, tab("ws_d", "d"));
+    assert!(w.set_active(0, 0));
+    let names = |w: &Workspaces, g: usize| {
+        w.groups[g]
+            .tabs
+            .iter()
+            .map(|t| t.name.clone())
+            .collect::<Vec<_>>()
+    };
+
+    assert!(w.move_tab(0, 0, 2));
+    assert_eq!(names(&w, 0), ["b", "c", "a"]);
+    assert_eq!(w.active().unwrap().name, "a");
+    assert!(w.move_tab(0, 2, 1));
+    assert_eq!(names(&w, 0), ["b", "a", "c"]);
+    assert_eq!(w.active().unwrap().name, "a");
+    assert!(!w.move_tab(0, 1, 1));
+    assert!(!w.move_tab(0, 0, 3));
+    assert!(!w.move_tab(5, 0, 1));
+
+    assert!(w.move_group(0, 1));
+    assert_eq!(w.groups[0].name, "Two");
+    assert_eq!(w.active().unwrap().name, "a");
+    assert!(!w.move_group(0, 2));
+
+    assert_eq!(moved_index(0, 0, 2), 2);
+    assert_eq!(moved_index(1, 0, 2), 0);
+    assert_eq!(moved_index(2, 3, 1), 3);
+    assert_eq!(moved_index(4, 3, 1), 4);
+}
