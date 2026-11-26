@@ -32,6 +32,7 @@ class QLabel;
 class QMenu;
 class QMoveEvent;
 class QPlainTextEdit;
+class QPushButton;
 class QResizeEvent;
 class QTabWidget;
 class QTimer;
@@ -39,6 +40,7 @@ class RunPanel;
 class RunPanelModel;
 class SettingsDialog;
 class TranscriptModel;
+class UpdateController;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -94,6 +96,13 @@ private:
     /// the user cancels at the unsaved-editors prompt would otherwise leave a
     /// running IDE whose reconnect loop never relaunches the daemon again.
     void commitClose(QCloseEvent* event);
+
+    /// Closes the window, through the usual unsaved-editors question, and
+    /// has the ready update installed and the new version started once the
+    /// IDE has exited. A cancelled close cancels the restart with it.
+    void restartForUpdate();
+    /// Shows "Restart to update" in the status bar while a download is ready.
+    void refreshUpdateButton();
 
     /// Watches the editor area until nothing is dirty, then closes the window.
     /// A failed write cancels the wait instead: the edit is still only in the
@@ -720,6 +729,13 @@ private:
     /// The same for the token summary Codex and OpenCode tabs show instead.
     QMetaObject::Connection m_usageWatch;
     CloseState m_closeState = CloseState::Idle;
+    /// The updater `app.cpp` parents to the application; null in the widget
+    /// tests, which build a window without one.
+    UpdateController* m_updates = nullptr;
+    QPushButton* m_updateButton = nullptr;
+    /// Set by `restartForUpdate` for the close it starts: `commitClose` then
+    /// asks for the new version to be started after the update is installed.
+    bool m_restartForUpdate = false;
     /// The two connections `armCloseAfterSaves` makes, so they can be dropped
     /// again whichever way the wait ends.
     QList<QMetaObject::Connection> m_closeWatch;

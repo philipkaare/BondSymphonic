@@ -7,6 +7,7 @@
 class AppController;
 class McpPage;
 class SetupPage;
+class UpdatesSection;
 class QCheckBox;
 class QComboBox;
 class QLabel;
@@ -105,6 +106,7 @@ private:
     /// The interface and code text sizes, in points.
     QSpinBox* m_uiFontSize = nullptr;
     QSpinBox* m_codeFontSize = nullptr;
+    UpdatesSection* m_updates = nullptr;
 
     /// The OpenCode tab's list of model servers: built empty and hidden, and
     /// shown when the daemon answers `opencode.list_providers` -- which a

@@ -1,6 +1,7 @@
 pub mod client;
 pub mod ffi;
 pub mod highlight;
+pub mod host_setup;
 pub mod launcher;
 pub mod logfile;
 pub mod model;

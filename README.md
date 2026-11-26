@@ -66,9 +66,32 @@ Homebrew (rustup, Qt 6, CMake, Ninja, Lima), creates and provisions the VM
 the repositories you open must live under `~`. Switches: `--debug`, `--release`,
 `--skip-daemon`, `--no-setup`, as on Windows.
 
-## Install from a package
+## Install
 
-If somebody handed you a `BondSymphonic-<version>-win64.zip` rather than the source:
+Download the newest build from the
+[releases page](https://github.com/philipkaare/BondSymphonic/releases). Every commit on
+`main` that passes CI is released there.
+
+- **Windows 11**: run `BondSymphonic-<version>-windows-x64-setup.exe`. It installs for
+  your user only and needs no administrator rights. The installer is not code-signed yet,
+  so SmartScreen may say "Windows protected your PC"; choose *More info > Run anyway*.
+- **macOS (Apple Silicon)**: open `BondSymphonic-<version>-macos-arm64.dmg` and drag
+  BondSymphonic to Applications. Lima comes inside the app, so you don't need Homebrew.
+
+On first start the IDE sets up the Linux environment it runs agents in: the
+`bondsymphonic` WSL distro on Windows, or a Lima VM of the same name on macOS. A dialog
+shows the progress. If WSL itself is missing, the dialog offers to install it; that needs
+administrator permission and usually a restart.
+
+After that, BondSymphonic updates itself. It downloads new releases in the background and
+installs them when you quit, or straight away with **Restart to update**. Releases are
+signed, and the IDE refuses any update whose signature or checksum does not match. Switch
+to manual updates under **Settings > General > Updates**. [docs/releasing.md](docs/releasing.md)
+explains how the releases are built and checked.
+
+## Install from a zip
+
+If somebody handed you a `BondSymphonic-<version>-win64.zip` rather than the installer:
 
 ```powershell
 Expand-Archive BondSymphonic-0.1.0-win64.zip -DestinationPath C:\Tools

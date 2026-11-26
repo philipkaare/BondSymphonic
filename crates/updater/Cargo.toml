@@ -1,0 +1,25 @@
+[package]
+name = "bondsymphonic-updater"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Qt-free on purpose: everything that decides whether an update is genuine --
+# the manifest signature, the version comparison, the download hash -- builds
+# and is tested on the Linux CI runner, where the IDE itself cannot build.
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+minisign-verify = "0.3"
+sha2 = "0.10"
+# rustls with ring needs nothing but a C compiler, and the platform verifier
+# trusts what the OS trusts -- including the root a corporate TLS-inspecting
+# proxy installs, which a bundled webpki root list would reject.
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
+
+[dev-dependencies]
+minisign = "0.10"
+tempfile = "3"

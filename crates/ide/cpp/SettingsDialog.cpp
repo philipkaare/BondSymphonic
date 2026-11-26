@@ -3,7 +3,9 @@
 #include "McpPage.h"
 #include "SetupPage.h"
 #include "Theme.h"
+#include "UpdatesSection.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
+#include "bondsymphonic-ide/src/qobjects/update_controller.cxxqt.h"
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
@@ -282,6 +284,21 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
     QObject::connect(m_uiFontSize, &QSpinBox::valueChanged, this, previewFonts);
     QObject::connect(m_codeFontSize, &QSpinBox::valueChanged, this, previewFonts);
 
+    // The one updater there is, parented to the application in `app.cpp`.
+    // Found rather than passed in, so the dialog's many constructions in the
+    // widget tests stay as they are; there it is null and the section says so.
+    auto* updater = qApp->findChild<UpdateController*>(QString(), Qt::FindDirectChildrenOnly);
+    m_updates = new UpdatesSection(updater, body);
+    bodyLayout->addWidget(m_updates);
+    // OK first, so the settings edited alongside are kept; a save that fails
+    // leaves the dialog open and nothing restarts.
+    QObject::connect(m_updates, &UpdatesSection::restartClicked, this, [this, updater] {
+        accept();
+        if (result() == QDialog::Accepted && updater != nullptr) {
+            updater->requestRestart();
+        }
+    });
+
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     outer->addWidget(buttons);
 
@@ -543,6 +560,7 @@ void SettingsDialog::accept() {
         return;
     }
     m_controller->setShowAgentMeta(m_showMeta->isChecked());
+    m_updates->apply();
     m_controller->setTheme(m_theme->currentData().toString());
     m_controller->setFontSizes(m_uiFontSize->value(), m_codeFontSize->value());
     QDialog::accept();

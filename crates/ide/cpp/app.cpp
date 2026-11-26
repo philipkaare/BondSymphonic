@@ -1,5 +1,6 @@
 #include "app.h"
 #include "Branding.h"
+#include "HostSetupDialog.h"
 #include "MainWindow.h"
 #include "SplashScreen.h"
 #include "Theme.h"
@@ -7,7 +8,9 @@
 #include "bondsymphonic-ide/src/qobjects/changes_model.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/file_tree.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/group_model.cxxqt.h"
+#include "bondsymphonic-ide/src/qobjects/host_setup.cxxqt.h"
 #include "bondsymphonic-ide/src/qobjects/run_panel.cxxqt.h"
+#include "bondsymphonic-ide/src/qobjects/update_controller.cxxqt.h"
 #include <QApplication>
 #include <QObject>
 #include <QStyleHints>
@@ -32,6 +35,10 @@ std::int32_t run_app() {
     // One for the whole application, like the Changes model: a run keeps
     // running, and keeps printing, while the user is looking at another tab.
     auto* runModel = new RunPanelModel(&app);
+    // Before the window, which finds both by type among the application's
+    // children rather than taking them as constructor arguments.
+    auto* hostSetup = new HostSetup(&app);
+    auto* updates = new UpdateController(&app);
     // After the controller, because the choice is a setting and the controller
     // is what reads the settings file; before the window, so nothing is ever
     // built against a palette it is about to be told to stop wearing.
@@ -79,6 +86,13 @@ std::int32_t run_app() {
         });
         splash->raise();
     }
-    controller->start();
+    // The daemon launches once the Linux it runs in is there: on a first run
+    // that means the WSL distro or Lima VM is created and provisioned first,
+    // in a dialog that shows it happening. On a machine already set up the
+    // check takes a moment and the dialog never appears.
+    new HostSetupDialog(hostSetup, &window);
+    QObject::connect(hostSetup, &HostSetup::ready, controller, [controller] { controller->start(); });
+    hostSetup->start();
+    updates->start();
     return app.exec();
 }
