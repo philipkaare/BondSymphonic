@@ -93,6 +93,9 @@ public:
 
 private:
     void browse();
+    /// From GitHub…: clone a repository fresh and put its checkout in the
+    /// repository field.
+    void cloneFromGithub();
     /// Rebuilds the Recent menu from the controller's list, most recent first,
     /// and disables the button when there is nothing to offer. The paths are
     /// the ones a create succeeded with, so this is the list of repositories

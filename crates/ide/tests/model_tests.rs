@@ -19,6 +19,7 @@ fn info(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
         agents: vec![],
         agent_records: vec![],
         runs: vec![],
+        task: None,
     }
 }
 fn tab(id: &str, name: &str) -> AgentTab {
@@ -43,6 +44,7 @@ fn tab(id: &str, name: &str) -> AgentTab {
         op_error: None,
         attention: String::new(),
         workspace_problem: None,
+        task: None,
     }
 }
 
@@ -1374,6 +1376,7 @@ mod in_place_model {
             agent_records: vec![],
             runs: vec![],
             kind,
+            task: None,
         }
     }
 
@@ -1455,6 +1458,7 @@ mod workspace_warnings {
             agent_records: vec![],
             runs: vec![],
             kind: WorkspaceKind::InPlace,
+            task: None,
         }
     }
 
@@ -1718,4 +1722,31 @@ fn a_harness_switch_moves_the_tab_but_never_to_or_from_a_terminal() {
         AgentAdapterKind::Codex,
         codex
     ));
+}
+
+/// The agent's task arrives with the workspace's state, on a new tab and on an
+/// existing one, a clear clears it, and it is saved with the tab.
+#[test]
+fn the_agents_task_follows_the_workspace_info() {
+    let mut with_task = info("ws_1", "a", WorkspaceState::Ready);
+    with_task.task = Some("Fixing the login flow".into());
+    assert_eq!(
+        AgentTab::from_workspace_info(&with_task).task.as_deref(),
+        Some("Fixing the login flow")
+    );
+
+    let mut w = Workspaces::new_default();
+    w.add_tab(0, tab("ws_1", "a"));
+    w.apply_workspace_info(&with_task);
+    assert_eq!(
+        w.active().unwrap().task.as_deref(),
+        Some("Fixing the login flow")
+    );
+    let json = serde_json::to_value(w.active().unwrap()).unwrap();
+    assert_eq!(json["task"], "Fixing the login flow");
+
+    w.apply_workspace_info(&info("ws_1", "a", WorkspaceState::Ready));
+    assert_eq!(w.active().unwrap().task, None);
+    let json = serde_json::to_value(w.active().unwrap()).unwrap();
+    assert!(json.get("task").is_none());
 }

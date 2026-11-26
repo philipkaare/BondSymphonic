@@ -1,5 +1,6 @@
 #include "NewAgentDialog.h"
 #include "AgentChoices.h"
+#include "GithubCloneDialog.h"
 #include "RunPanel.h"
 #include "Theme.h"
 #include "bondsymphonic-ide/src/qobjects/app_controller.cxxqt.h"
@@ -10,6 +11,7 @@
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFontMetrics>
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -130,6 +132,11 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
     repoRow->addWidget(m_repoPath, 1);
     repoRow->addWidget(m_recent, 0);
     repoRow->addWidget(browseButton, 0);
+    auto* githubButton = new QPushButton("From GitHub…", this);
+    githubButton->setObjectName("NewAgentFromGithubButton");
+    githubButton->setToolTip("Clone one of your GitHub repositories fresh, and start the agent "
+                             "in the new checkout");
+    repoRow->addWidget(githubButton, 0);
     form->addRow("Repository:", repoRow);
     buildRecentMenu();
 
@@ -376,6 +383,7 @@ NewAgentDialog::NewAgentDialog(AppController* controller, GroupModel* model,
 
     QObject::connect(m_name, &QLineEdit::textChanged, this, &NewAgentDialog::updateNameHint);
     QObject::connect(browseButton, &QPushButton::clicked, this, &NewAgentDialog::browse);
+    QObject::connect(githubButton, &QPushButton::clicked, this, &NewAgentDialog::cloneFromGithub);
     QObject::connect(m_stopReading, &QPushButton::clicked, this, &NewAgentDialog::stopReading);
     QObject::connect(m_repoPath, &QLineEdit::editingFinished, this, &NewAgentDialog::inspectRepo);
     QObject::connect(m_repoPath, &QLineEdit::textChanged, this, &NewAgentDialog::updateOkEnabled);
@@ -536,6 +544,22 @@ void NewAgentDialog::browse() {
         return;
     }
     m_repoPath->setText(QDir::toNativeSeparators(dir));
+    inspectRepo();
+}
+
+void NewAgentDialog::cloneFromGithub() {
+    // Next to the repository already in the field, which is where the user
+    // keeps their checkouts; their home folder on a first run.
+    const QString current = m_repoPath->text().trimmed();
+    const QString parentDir = current.isEmpty()
+                                  ? QDir::toNativeSeparators(QDir::homePath())
+                                  : QDir::toNativeSeparators(QFileInfo(current).absolutePath());
+    GithubCloneDialog dialog(m_controller, parentDir, this);
+    if (dialog.exec() != QDialog::Accepted || dialog.clonedPath().isEmpty()) {
+        return;
+    }
+    // The distro path the daemon answered with; `repoPath()` leaves it alone.
+    m_repoPath->setText(dialog.clonedPath());
     inspectRepo();
 }
 

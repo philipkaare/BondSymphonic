@@ -487,7 +487,7 @@ greyed out while the repository in the box has not been read.
 
 | Field | What it does |
 | --- | --- |
-| Repository | The git repository to branch from. **Browse…** picks one; **Recent** lists repositories you have used before. |
+| Repository | The git repository to branch from. **Browse…** picks one; **Recent** lists repositories you have used before; **From GitHub…** clones one fresh (see below). |
 | Work in | **Work in a new worktree** (the default) or **Work directly in this checkout**. See below. |
 | Base branch | The branch the workspace starts from and later merges back into. |
 | Name | Names the workspace and, for a workspace in a worktree of its own, its branch `bs/<name>/work` — a workspace working directly in the checkout has no branch of its own, so there the name names only the workspace. Defaults to `agent-<n>`. One word: letters, digits, `-` or `_`, starting with a letter or a digit, at most 64 characters. A space, a `/`, a `.` or a leading `-` is refused as you type, with the reason under the field, and **Create** stays greyed out until you fix it. The daemon applies the same rule, so nothing the dialog accepts can fail later inside git. |
@@ -542,6 +542,22 @@ initialised." Pressing **Create** is what agrees to it; there is nothing to
 tick. The worktree/direct choices and branch selector are hidden for these
 folders; the agent runs directly in the selected folder. Switching back to an
 existing repository restores the workspace choices and your previous selection.
+
+### Cloning a repository from GitHub
+
+**From GitHub…** next to the repository field opens **Clone from GitHub**. It
+lists the repositories `gh repo list` gives for your account (yours and your
+organisations', up to 300, with private ones marked), with a filter that
+matches names and descriptions. Pick one, or type `owner/name` or any GitHub
+URL in **Repository**. **Clone into** is the folder the clone gets a new
+subfolder in, named after the repository; it starts as the folder holding the
+repository already in the New Agent field, or your home folder. **Clone** runs
+`gh repo clone` on your machine, as you, so private repositories work and the
+agent never sees your token. The folder must exist and must not already hold
+a folder of that name; a clone can take up to 15 minutes. When it is done the
+dialog closes and the fresh checkout is in the New Agent field, read like any
+other repository. This needs the GitHub CLI, logged in under Settings > Setup;
+without it the list says why, and nothing is cloned.
 
 If the repository's `bondsymphonic.toml` extends the network allowlist, the
 dialog says so before you click **Create** — "This repository adds 2 hosts to
@@ -781,7 +797,7 @@ status bar and under **Settings > Setup**.
 - **View > Swap editor and agent** moves the Agent dock to the other side.
 - The **Workspace** menu gathers what used to be reachable only from the Changes
   tab's toolbar or a right-click: New Agent…, Restart agent (`Ctrl+Shift+R`),
-  Next/Previous agent, Merge, Rebase, Squash…, Create PR…, Discard…, Destroy
+  Next/Previous agent, Fetch from origin, Set task…, Network rules…, Merge, Rebase, Squash…, Create PR…, Discard…, Destroy
   workspace… and Close group….
 - The **Run** menu gathers the Run panel's buttons: Run (`F5`), Stop
   (`Shift+F5`), Restart run, the detected configurations as one checkable group,
@@ -993,6 +1009,8 @@ it had rather than starting empty.
 ### What agents can do with git and GitHub
 
 An agent in a sandbox has no GitHub credentials, so BondSymphonic gives it built-in tools that run on your machine instead. Through them an agent can fetch, push its own workspace's branch, open and update that branch's pull request, comment on pull requests, read CI status and failed logs, and read issues. Nothing hands the agent your GitHub token. Pushing and opening or editing a pull request are limited to the agent's own workspace branch; reading pull requests, CI runs and issues, and commenting on pull requests, work across the whole repository. In an in-place workspace the agent works on your own checkout and has no branch of its own, so pushing and opening pull requests are left to you, from that checkout. With Claude Code the read-only tools (fetch, viewing pull requests, CI logs and issues) run without asking and the others follow the agent's permission mode; Codex asks, or does not, according to its own approval setting. A push runs your repository's own `pre-push` hook on your machine, as your own push would (that is how Git LFS uploads files). A plain `git push`, `git fetch` or `gh` typed inside an agent will not work, by design. To use the tools, install the GitHub CLI and log in to GitHub under Settings > Setup.
+
+**What the agent is working on.** Each workspace has a task: a few words on what its agent is doing now. The agent sets it itself with its `set_task` tool, which runs without asking, when it starts on something and whenever its main task changes; it is told to do so in its system prompt. The task is shown under the workspace's name at the top of the Explorer and in its tab's tooltip, is kept across restarts, and is at most 120 characters. **Workspace > Set task…** lets you correct it or clear it.
 
 **Branches an agent can manage.** In a worktree workspace your repository's `.git` is read-only to the agent, apart from the workspace's own branches: everything under the prefix of the branch it was created with (`bs/<name>/…`). The agent can create, switch between and delete those (`git branch -d` works there even though git alone could not, because the sandbox does it for git), and can start one from a remote branch after a fetch, as in `git switch -c bs/<name>/topic origin/feature`. Such a branch does not track its remote, since tracking would be written to your repository's config. Push, Create PR, Merge, Rebase and Squash all take the branch the workspace is on now, when it is one of its own, and the workspace's original branch otherwise. The agent's `pr_create` tool can open the pull request against another base branch. Your other branches, tags, `git stash` and the repository's own config stay read-only. Destroying the workspace removes all of its branches.
 

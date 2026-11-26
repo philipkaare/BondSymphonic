@@ -642,6 +642,26 @@ pub mod qobject {
             has_origin: bool,
         );
 
+        /// `list_github_repos` answered: a JSON array of `GithubRepo`
+        /// (`name_with_owner`, `description`, `private`), the user's own and
+        /// their organisations', as `gh repo list` gives them.
+        #[qsignal]
+        fn github_repos_listed(self: Pin<&mut AppController>, repos_json: QString);
+
+        /// `list_github_repos` failed: `gh` missing, not logged in, or the
+        /// daemon down. The dialog says it in place; never a box.
+        #[qsignal]
+        fn github_repos_failed(self: Pin<&mut AppController>, message: QString);
+
+        /// `clone_github_repo` finished: `repo` is checked out at `path`, a
+        /// distro path ready for `inspect_repo`.
+        #[qsignal]
+        fn github_repo_cloned(self: Pin<&mut AppController>, repo: QString, path: QString);
+
+        /// `clone_github_repo` failed, with the reason.
+        #[qsignal]
+        fn github_repo_clone_failed(self: Pin<&mut AppController>, repo: QString, message: QString);
+
         /// A `fetch_workspace` call failed, with the reason. Emitted alongside
         /// `operation_failed`, in one step.
         #[qsignal]
@@ -987,6 +1007,23 @@ pub mod qobject {
         /// `workspace_fetch_failed`.
         #[qinvokable]
         fn fetch_workspace(self: Pin<&mut AppController>, workspace_id: QString);
+
+        /// Set or clear (empty `task`) what the workspace's agent is said to
+        /// be working on (`workspace.set_task`). The new task arrives with the
+        /// workspace's next state change; a failure is `operation_failed`.
+        #[qinvokable]
+        fn set_workspace_task(self: Pin<&mut AppController>, workspace_id: QString, task: QString);
+
+        /// The GitHub repositories the user can clone (`repo.github_list`).
+        /// Answers with `github_repos_listed` or `github_repos_failed`.
+        #[qinvokable]
+        fn list_github_repos(self: Pin<&mut AppController>);
+
+        /// Clone `repo` (`owner/name` or a GitHub URL) fresh into a new folder
+        /// under `parent_dir`, a distro path (`repo.clone`). Answers with
+        /// `github_repo_cloned` or `github_repo_clone_failed`.
+        #[qinvokable]
+        fn clone_github_repo(self: Pin<&mut AppController>, repo: QString, parent_dir: QString);
 
         /// Inspect a git repository. Answers with `repo_inspected` or
         /// `operation_failed`. Supersedes any inspection still out: only the
@@ -2363,6 +2400,14 @@ fn report_agent_failure(
 
 /// Queues `workspace_fetch_failed` and the `operation_failed` behind it, in
 /// one step, like the other typed failures.
+/// The daemon's own words for a refused request, or the transport's.
+fn client_error_message(e: ClientError) -> String {
+    match e {
+        ClientError::Rpc(rpc) => rpc.message,
+        other => other.to_string(),
+    }
+}
+
 fn report_fetch_failure(qt: &QtHandle, workspace: String, message: String) {
     tracing::warn!("workspace.fetch failed for {workspace}: {message}");
     let _ = qt.queue(move |mut q| {
@@ -4166,6 +4211,96 @@ impl qobject::AppController {
                     };
                     report_fetch_failure(&qt, id, message);
                 }
+            }
+        });
+    }
+
+    pub fn set_workspace_task(self: Pin<&mut Self>, workspace_id: QString, task: QString) {
+        let qt = self.qt_thread();
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                report_failure(&qt, "workspace.set_task", message.to_owned());
+                return;
+            }
+        };
+        let task = task.to_string();
+        let params = WorkspaceSetTaskParams {
+            workspace_id: WorkspaceId(workspace_id.to_string()),
+            task: (!task.trim().is_empty()).then_some(task),
+        };
+        runtime().spawn(async move {
+            if let Err(e) = shared
+                .client
+                .request::<WorkspaceInfo>(Request::WorkspaceSetTask(params))
+                .await
+            {
+                report_failure(&qt, "workspace.set_task", client_error_message(e));
+            }
+        });
+    }
+
+    pub fn list_github_repos(self: Pin<&mut Self>) {
+        let qt = self.qt_thread();
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                let message = message.to_owned();
+                let _ = qt.queue(move |q| q.github_repos_failed(QString::from(&message)));
+                return;
+            }
+        };
+        runtime().spawn(async move {
+            match shared
+                .client
+                .request::<GithubRepoListResult>(Request::RepoGithubList {})
+                .await
+            {
+                Ok(r) => {
+                    let json = serde_json::to_string(&r.repos).unwrap_or_else(|_| "[]".into());
+                    let _ = qt.queue(move |q| q.github_repos_listed(QString::from(&json)));
+                }
+                Err(e) => {
+                    let message = client_error_message(e);
+                    tracing::warn!("repo.github_list failed: {message}");
+                    let _ = qt.queue(move |q| q.github_repos_failed(QString::from(&message)));
+                }
+            }
+        });
+    }
+
+    pub fn clone_github_repo(self: Pin<&mut Self>, repo: QString, parent_dir: QString) {
+        let qt = self.qt_thread();
+        let repo = repo.to_string();
+        let fail = move |qt: &QtHandle, repo: String, message: String| {
+            tracing::warn!("repo.clone of {repo} failed: {message}");
+            let _ = qt.queue(move |q| {
+                q.github_repo_clone_failed(QString::from(&repo), QString::from(&message))
+            });
+        };
+        let shared = match require_connection() {
+            Ok(shared) => shared,
+            Err(message) => {
+                fail(&qt, repo, message.to_owned());
+                return;
+            }
+        };
+        let params = RepoCloneParams {
+            repo: repo.clone(),
+            parent_dir: parent_dir.to_string(),
+        };
+        runtime().spawn(async move {
+            match shared
+                .client
+                .request::<RepoCloneResult>(Request::RepoClone(params))
+                .await
+            {
+                Ok(r) => {
+                    let _ = qt.queue(move |q| {
+                        q.github_repo_cloned(QString::from(&repo), QString::from(&r.path))
+                    });
+                }
+                Err(e) => fail(&qt, repo, client_error_message(e)),
             }
         });
     }

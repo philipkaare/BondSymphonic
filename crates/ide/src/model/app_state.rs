@@ -258,6 +258,11 @@ pub struct AgentTab {
     /// existed still loads.
     #[serde(default)]
     pub agent_id: Option<AgentId>,
+    /// What the workspace's agent says it is working on, from
+    /// `WorkspaceInfo::task`, or `None`. Shown on the tab and the Explorer
+    /// header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
     /// The last status the agent itself reported, kept separately from
     /// `status` so a workspace event can take the badge for the duration of a
     /// sandbox outage and hand it back on recovery. `None` until the agent has
@@ -525,6 +530,7 @@ impl AgentTab {
             op_error: None,
             attention: String::new(),
             workspace_problem: workspace_problem_for(&info.state, info.kind),
+            task: info.task.clone(),
         }
     }
 }
@@ -1120,6 +1126,7 @@ impl Workspaces {
         tab.workspace_problem = workspace_problem_for(&info.state, info.kind);
         tab.branch = info.branch.clone();
         tab.kind = info.kind;
+        tab.task = info.task.clone();
         // Refreshed rather than set once: a tab restored from a session file
         // written before this field existed has none, and the Run panel cannot
         // detect anything without it.
@@ -1672,6 +1679,7 @@ mod tests {
             op_error: None,
             attention: String::new(),
             workspace_problem: None,
+            task: None,
         }
     }
 

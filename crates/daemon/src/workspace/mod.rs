@@ -32,6 +32,10 @@ pub struct Workspace {
     /// in-place workspaces existed, which only ever held worktrees.
     #[serde(default)]
     pub kind: WorkspaceKind,
+    /// What the agent says it is working on (its `set_task` tool), or what
+    /// the user set. Absent from a registry written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
 }
 
 impl Workspace {
@@ -59,6 +63,7 @@ impl Workspace {
             agents: Vec::new(),
             agent_records: Vec::new(),
             runs: self.runs.clone(),
+            task: self.task.clone(),
         }
     }
 }

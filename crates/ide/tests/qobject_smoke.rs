@@ -37,6 +37,7 @@ fn info(id: &str, name: &str, state: WorkspaceState) -> WorkspaceInfo {
         agents: Vec::new(),
         agent_records: Vec::new(),
         runs: Vec::new(),
+        task: None,
     }
 }
 
@@ -62,6 +63,7 @@ fn tab(info: &WorkspaceInfo) -> AgentTab {
         op_error: None,
         attention: String::new(),
         workspace_problem: None,
+        task: None,
     }
 }
 
@@ -1616,6 +1618,8 @@ mod cpp_widgets {
         fn bs_widget_test_setup_page_says_what_was_pasted() -> i32;
         fn bs_widget_test_group_bar_names_the_repository() -> i32;
         fn bs_widget_test_new_agent_dialog_says_branches_are_loading() -> i32;
+        fn bs_widget_test_github_clone_dialog_clones_the_chosen_repo() -> i32;
+        fn bs_widget_test_explorer_header_shows_the_task() -> i32;
         fn bs_widget_test_agent_choices_are_one_list() -> i32;
         fn bs_widget_test_banner_offers_restart_only_to_a_dead_agent() -> i32;
         fn bs_widget_test_banner_remixes_its_red_for_a_new_palette() -> i32;
@@ -1682,7 +1686,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 72] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 74] = [
             // These four build a whole MainWindow, and each begins by pointing
             // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
             // is load-bearing rather than tidy: the state store settles its
@@ -1783,6 +1787,14 @@ mod cpp_widgets {
             (
                 "NewAgentDialog says the branch list is loading, and when it could not be read",
                 bs_widget_test_new_agent_dialog_says_branches_are_loading,
+            ),
+            (
+                "GithubCloneDialog lists, filters and clones the chosen repository",
+                bs_widget_test_github_clone_dialog_clones_the_chosen_repo,
+            ),
+            (
+                "The Explorer header shows the agent's task, and hides an empty one",
+                bs_widget_test_explorer_header_shows_the_task,
             ),
             (
                 "AgentChoices is one list of models and one of permission modes",

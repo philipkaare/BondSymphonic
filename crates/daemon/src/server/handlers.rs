@@ -123,6 +123,8 @@ impl Handler for WorkspaceHandler {
             }
             Request::McpRestorePreset {} => mcp_saved(d, d.mcp_servers.restore_preset()),
             Request::McpOverride(p) => mcp_saved(d, d.mcp_servers.set_override(p)),
+            Request::RepoGithubList {} => ok(crate::git::clone::list().await?),
+            Request::RepoClone(p) => ok(crate::git::clone::clone(&p.repo, &p.parent_dir).await?),
             Request::RepoInspect(p) => {
                 ok(crate::git::repo::inspect(&d.git, std::path::Path::new(&p.path)).await?)
             }
@@ -177,6 +179,10 @@ impl Handler for WorkspaceHandler {
                 ok(lifecycle::set_allowlist(d, &p.workspace_id, &p.hosts).await?)
             }
             Request::WorkspaceSetNetworkRules(p) => ok(lifecycle::set_network_rules(d, &p).await?),
+            Request::WorkspaceSetTask(p) => {
+                let ws = lifecycle::set_task(d, &p.workspace_id, p.task.as_deref()).await?;
+                ok(d.workspace_info(&ws))
+            }
             Request::WorkspaceBlockHost(p) => {
                 ok(lifecycle::block_host(d, &p.workspace_id, &p.host).await?)
             }

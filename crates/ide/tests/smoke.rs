@@ -656,6 +656,7 @@ fn workspace(id: &str, name: &str, state: WorkspaceState, allowlist: &[String]) 
         agents: Vec::new(),
         agent_records: Vec::new(),
         runs: Vec::new(),
+        task: None,
     }
 }
 

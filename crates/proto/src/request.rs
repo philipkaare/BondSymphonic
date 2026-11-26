@@ -110,6 +110,20 @@ params!(WorkspaceBlockHostParams {
     host: String
 });
 params!(WorkspaceSetAllowlistParams { workspace_id: WorkspaceId, hosts: Vec<String> });
+params!(WorkspaceSetTaskParams {
+    workspace_id: WorkspaceId,
+    /// What the workspace's agent is working on, in a few words. `None` (or
+    /// blank) clears it.
+    #[serde(default)]
+    task: Option<String>
+});
+params!(RepoCloneParams {
+    /// The GitHub repository, `owner/name` or its `https://github.com/...` URL.
+    repo: String,
+    /// The folder, as the daemon sees it, the clone is made in: the clone is
+    /// `<parent_dir>/<name>`, which must not exist yet.
+    parent_dir: String
+});
 params!(FsPathParams {
     workspace_id: WorkspaceId,
     path: String
@@ -341,6 +355,12 @@ pub enum Request {
     McpDisconnect(McpServerIdParams),
     #[serde(rename = "mcp.test")]
     McpTest(McpTestParams),
+    #[serde(rename = "workspace.set_task")]
+    WorkspaceSetTask(WorkspaceSetTaskParams),
+    #[serde(rename = "repo.github_list")]
+    RepoGithubList {},
+    #[serde(rename = "repo.clone")]
+    RepoClone(RepoCloneParams),
 }
 
 impl Request {
@@ -368,6 +388,9 @@ impl Request {
             WorkspaceMerge(_) => "workspace.merge",
             WorkspaceCreatePr(_) => "workspace.create_pr",
             WorkspaceSetAllowlist(_) => "workspace.set_allowlist",
+            WorkspaceSetTask(_) => "workspace.set_task",
+            RepoGithubList {} => "repo.github_list",
+            RepoClone(_) => "repo.clone",
             WorkspaceSetNetworkRules(_) => "workspace.set_network_rules",
             WorkspaceBlockHost(_) => "workspace.block_host",
             WorkspaceFetch(_) => "workspace.fetch",
@@ -487,6 +510,15 @@ impl Request {
             }),
             RepoInspect(RepoPathParams { path: "/r".into() }),
             RepoDetectRunConfigs(RepoPathParams { path: "/r".into() }),
+            RepoGithubList {},
+            RepoClone(RepoCloneParams {
+                repo: "o/r".into(),
+                parent_dir: "/g".into(),
+            }),
+            WorkspaceSetTask(WorkspaceSetTaskParams {
+                workspace_id: ws.clone(),
+                task: Some("Fix the login".into()),
+            }),
             WorkspaceCreate(WorkspaceCreateParams {
                 repo_path: "/r".into(),
                 base_branch: "main".into(),

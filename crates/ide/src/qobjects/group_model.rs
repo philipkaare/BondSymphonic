@@ -1169,6 +1169,10 @@ impl qobject::GroupModel {
         if tab.is_in_place() {
             text.push_str("\nworks in place: no branch or merge of its own");
         }
+        if let Some(task) = tab.task.as_deref() {
+            text.push_str("\ntask: ");
+            text.push_str(task);
+        }
         let detail = tab.display_detail();
         if !detail.is_empty() {
             text.push('\n');
@@ -1303,6 +1307,7 @@ mod tests {
             op_error: Some("Merge stopped: conflicts in README.md".to_owned()),
             attention: String::new(),
             workspace_problem: None,
+            task: None,
         }
     }
 
@@ -1338,6 +1343,7 @@ mod tests {
             agents: Vec::new(),
             agent_records: Vec::new(),
             runs: Vec::new(),
+            task: None,
         }
     }
 

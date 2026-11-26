@@ -265,6 +265,16 @@ QWidget* ExplorerDock::buildHeader() {
     m_headerName->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     lines->addWidget(m_headerName);
 
+    m_headerTask = new QLabel(header);
+    m_headerTask->setObjectName(QStringLiteral("ExplorerHeaderTask"));
+    // The agent wrote it: shown as text, never as markup.
+    m_headerTask->setTextFormat(Qt::PlainText);
+    m_headerTask->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_headerTask->setWordWrap(true);
+    m_headerTask->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    m_headerTask->hide();
+    lines->addWidget(m_headerTask);
+
     m_headerDetail = new QLabel(header);
     m_headerDetail->setObjectName(QStringLiteral("ExplorerHeaderDetail"));
     m_headerDetail->setTextInteractionFlags(Qt::TextSelectableByMouse);
@@ -320,6 +330,14 @@ void ExplorerDock::changeEvent(QEvent* event) {
     }
 }
 
+void ExplorerDock::setWorkspaceTask(const QString& task) {
+    const QString shown = task.trimmed();
+    m_headerTask->setText(shown);
+    m_headerTask->setToolTip(shown.isEmpty() ? QString()
+                                             : QStringLiteral("What the agent is working on"));
+    m_headerTask->setVisible(!shown.isEmpty());
+}
+
 void ExplorerDock::setWorkspaceHeader(const QString& name, const QString& branch,
                                       const QString& repoPath, const QString& baseBranch,
                                       const QString& worktreePath, bool inPlace) {
@@ -334,6 +352,7 @@ void ExplorerDock::setWorkspaceHeader(const QString& name, const QString& branch
     m_changesToolbar->setWorkspace(m_workspaceId, name, branch, baseBranch);
     if (name.isEmpty()) {
         m_headerName->setText(QStringLiteral("No workspace selected"));
+        setWorkspaceTask(QString());
         m_headerName->setToolTip(QString());
         m_headerDetail->clear();
         m_headerDetail->setToolTip(QString());
@@ -813,6 +832,30 @@ extern "C" std::int32_t bs_widget_test_explorer_editing_selection() {
     if (!dock.changesToolbar()->ignoreAction()->isEnabled()) return 6;
     changes.changesLoaded(QStringLiteral("[]"));
     if (dock.changesToolbar()->ignoreAction()->isEnabled()) return 7;
+    return 0;
+}
+
+/// The agent's task gets a line of its own under the name, as plain text, and
+/// the line goes away when the task is cleared or no workspace is shown.
+extern "C" std::int32_t bs_widget_test_explorer_header_shows_the_task() {
+    AppController controller;
+    FileTreeModel files;
+    ChangesModel changes;
+    ExplorerDock dock(&files, &changes, &controller);
+    dock.setWorkspace(QStringLiteral("ws_1"));
+    dock.setWorkspaceHeader(QStringLiteral("alpha"), QStringLiteral("bs/alpha"),
+                            QStringLiteral("/r"), QStringLiteral("main"), QStringLiteral("/w"));
+    auto* task = dock.findChild<QLabel*>(QStringLiteral("ExplorerHeaderTask"));
+    if (task == nullptr) return 1;
+    if (!task->isHidden()) return 2;
+    dock.setWorkspaceTask(QStringLiteral("  Fixing <b>login</b>  "));
+    if (task->isHidden() || task->text() != QLatin1String("Fixing <b>login</b>") ||
+        task->textFormat() != Qt::PlainText) return 3;
+    dock.setWorkspaceTask(QString());
+    if (!task->isHidden()) return 4;
+    dock.setWorkspaceTask(QStringLiteral("Something"));
+    dock.setWorkspaceHeader(QString(), QString(), QString(), QString(), QString());
+    if (!task->isHidden()) return 5;
     return 0;
 }
 

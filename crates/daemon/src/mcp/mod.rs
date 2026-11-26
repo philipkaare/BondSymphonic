@@ -111,6 +111,7 @@ pub fn claude_mcp_config(servers: &[ResolvedServer]) -> String {
 pub fn claude_allowed_tools() -> String {
     tools::READ_ONLY_TOOLS
         .iter()
+        .chain(tools::PROMPT_FREE_TOOLS.iter())
         .map(|t| format!("mcp__{SERVER_NAME}__{t}"))
         .collect::<Vec<_>>()
         .join(",")
@@ -302,7 +303,7 @@ mod tests {
         );
         assert_eq!(
             claude_allowed_tools(),
-            "mcp__bondsymphonic__git_fetch,mcp__bondsymphonic__pr_view,mcp__bondsymphonic__ci_logs,mcp__bondsymphonic__issue_view"
+            "mcp__bondsymphonic__git_fetch,mcp__bondsymphonic__pr_view,mcp__bondsymphonic__ci_logs,mcp__bondsymphonic__issue_view,mcp__bondsymphonic__set_task"
         );
     }
 
@@ -407,7 +408,7 @@ mod tests {
         // Discovered tools are the CLI's to prompt for.
         assert_eq!(
             claude_allowed_tools(),
-            "mcp__bondsymphonic__git_fetch,mcp__bondsymphonic__pr_view,mcp__bondsymphonic__ci_logs,mcp__bondsymphonic__issue_view"
+            "mcp__bondsymphonic__git_fetch,mcp__bondsymphonic__pr_view,mcp__bondsymphonic__ci_logs,mcp__bondsymphonic__issue_view,mcp__bondsymphonic__set_task"
         );
     }
 

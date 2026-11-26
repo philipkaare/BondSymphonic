@@ -17,6 +17,7 @@ fn sample(id: &str, name: &str) -> Workspace {
         state: WorkspaceState::Ready,
         agents: vec![],
         runs: vec![],
+        task: None,
     }
 }
 

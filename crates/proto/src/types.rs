@@ -272,6 +272,32 @@ pub struct WorkspaceInfo {
     #[serde(default)]
     pub agent_records: Vec<AgentSummary>,
     pub runs: Vec<RunId>,
+    /// What the workspace's agent says it is working on (its `set_task`
+    /// tool), or what the user set; `None` before either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+}
+
+/// One of the user's GitHub repositories, as `repo.github_list` lists them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GithubRepo {
+    /// `owner/name`, which `repo.clone` takes.
+    pub name_with_owner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub private: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GithubRepoListResult {
+    pub repos: Vec<GithubRepo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepoCloneResult {
+    /// The new checkout, as the daemon sees it.
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -103,6 +103,11 @@ pub const COMMIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 /// wait and not a failure.
 pub const REPOSITORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// `repo.clone`: a fresh `gh repo clone` of a whole repository, which the
+/// daemon itself gives fifteen minutes. A little more here, so the daemon's
+/// own timeout is the one that speaks.
+pub const CLONE_REQUEST_TIMEOUT: Duration = Duration::from_secs(16 * 60);
+
 /// What the `mcp.*` calls that go out to a remote MCP server get: two of the
 /// daemon's 60 s curl budgets, which is what a discovery or a test can chain.
 pub const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -138,6 +143,9 @@ pub fn default_timeout_for(method: &str) -> Duration {
         // a callback is the token exchange. Thirty seconds would give up on a
         // slow but working server.
         "mcp.test" | "mcp.connect" | "mcp.callback" => MCP_REQUEST_TIMEOUT,
+        // `gh repo list` goes to GitHub from the host.
+        "repo.github_list" => REPOSITORY_REQUEST_TIMEOUT,
+        "repo.clone" => CLONE_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
 }

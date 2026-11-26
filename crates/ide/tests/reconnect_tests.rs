@@ -509,6 +509,7 @@ fn workspace(id: &str, name: &str) -> WorkspaceInfo {
         agents: Vec::new(),
         agent_records: Vec::new(),
         runs: Vec::new(),
+        task: None,
     }
 }
 
