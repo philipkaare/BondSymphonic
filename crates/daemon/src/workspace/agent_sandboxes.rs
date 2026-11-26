@@ -336,7 +336,11 @@ impl AgentSandboxes {
             handle: None,
             committed: false,
         };
-        let handle = d.backend.start(&spec).await?;
+        let handle = crate::secrets::with_secrets(
+            d.backend.start(&spec).await?,
+            d.env_secrets.clone(),
+            &ws.repo_path,
+        );
         startup.handle = Some(handle.clone());
         let mut tunnels = HashMap::new();
         if d.backend.name() == "linux_bwrap" {

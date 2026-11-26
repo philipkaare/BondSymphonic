@@ -1,4 +1,5 @@
 #include "SettingsDialog.h"
+#include "SecretsPage.h"
 #include "AgentChoices.h"
 #include "McpPage.h"
 #include "SetupPage.h"
@@ -304,6 +305,9 @@ SettingsDialog::SettingsDialog(AppController *controller, QWidget *parent,
 
     QObject::connect(buttons, &QDialogButtonBox::accepted, this, &SettingsDialog::accept);
     QObject::connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+
+    // The IDE and the daemon are one build, so the daemon always has these.
+    m_tabs->addTab(new SecretsPage(m_controller, m_tabs), QStringLiteral("Secrets"));
 
     // Hidden against a daemon that predates the MCP requests (ruling R2), and
     // put in once one that offers them has said hello.
@@ -958,20 +962,22 @@ extern "C" std::int32_t bs_widget_test_settings_has_mcp_tab() {
     AppController controller;
     SettingsDialog dialog(&controller);
     auto* tabs = dialog.findChild<QTabWidget*>(QStringLiteral("SettingsTabs"));
-    if (tabs == nullptr || tabs->count() != 1 || tabs->tabText(0) != QLatin1String("General")) return 1;
+    // General and Secrets always; MCP servers once the daemon offers them.
+    if (tabs == nullptr || tabs->count() != 2 || tabs->tabText(0) != QLatin1String("General") ||
+        tabs->tabText(1) != QLatin1String("Secrets")) return 1;
     // No hello yet, so nothing says the daemon offers them.
     if (controller.mcpServersSupported() || dialog.findChild<QWidget*>(QStringLiteral("McpPage")) != nullptr) return 2;
     dialog.showMcpTab(true);
-    if (tabs->count() != 2 || tabs->tabText(1) != QLatin1String("MCP servers")) return 3;
-    auto* page = dynamic_cast<McpPage*>(tabs->widget(1));
+    if (tabs->count() != 3 || tabs->tabText(2) != QLatin1String("MCP servers")) return 3;
+    auto* page = dynamic_cast<McpPage*>(tabs->widget(2));
     if (page == nullptr || page->findChild<QWidget*>(QStringLiteral("McpServerList")) == nullptr) return 4;
     dialog.showMcpTab(true);
-    if (tabs->count() != 2) return 5;
-    tabs->setCurrentIndex(1);
+    if (tabs->count() != 3) return 5;
+    tabs->setCurrentIndex(2);
     dialog.revealSetup();
     if (tabs->currentIndex() != 0) return 6;
     dialog.showMcpTab(false);
-    if (tabs->count() != 1) return 7;
+    if (tabs->count() != 2) return 7;
     return 0;
 }
 

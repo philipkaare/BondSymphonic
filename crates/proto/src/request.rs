@@ -117,6 +117,22 @@ params!(WorkspaceSetTaskParams {
     #[serde(default)]
     task: Option<String>
 });
+params!(SecretSetParams {
+    /// The environment variable's name: letters, digits and `_`, not starting
+    /// with a digit.
+    name: String,
+    /// Its value. Sent to the daemon, never back.
+    value: String,
+    /// The repository it is for, as the daemon sees it; `None` for every
+    /// repository.
+    #[serde(default)]
+    repo: Option<String>
+});
+params!(SecretRemoveParams {
+    name: String,
+    #[serde(default)]
+    repo: Option<String>
+});
 params!(RepoCloneParams {
     /// The GitHub repository, `owner/name` or its `https://github.com/...` URL.
     repo: String,
@@ -361,6 +377,16 @@ pub enum Request {
     RepoGithubList {},
     #[serde(rename = "repo.clone")]
     RepoClone(RepoCloneParams),
+    /// The environment secrets the sandboxes get: names and scopes, never
+    /// values. Answers [`crate::SecretListResult`].
+    #[serde(rename = "secrets.list")]
+    SecretsList {},
+    /// Sets one, for every repository or for one. Answers the new list.
+    #[serde(rename = "secrets.set")]
+    SecretsSet(SecretSetParams),
+    /// Removes one. Answers the new list.
+    #[serde(rename = "secrets.remove")]
+    SecretsRemove(SecretRemoveParams),
 }
 
 impl Request {
@@ -391,6 +417,9 @@ impl Request {
             WorkspaceSetTask(_) => "workspace.set_task",
             RepoGithubList {} => "repo.github_list",
             RepoClone(_) => "repo.clone",
+            SecretsList {} => "secrets.list",
+            SecretsSet(_) => "secrets.set",
+            SecretsRemove(_) => "secrets.remove",
             WorkspaceSetNetworkRules(_) => "workspace.set_network_rules",
             WorkspaceBlockHost(_) => "workspace.block_host",
             WorkspaceFetch(_) => "workspace.fetch",
@@ -514,6 +543,16 @@ impl Request {
             RepoClone(RepoCloneParams {
                 repo: "o/r".into(),
                 parent_dir: "/g".into(),
+            }),
+            SecretsList {},
+            SecretsSet(SecretSetParams {
+                name: "API_TOKEN".into(),
+                value: "s3cret".into(),
+                repo: Some("/r".into()),
+            }),
+            SecretsRemove(SecretRemoveParams {
+                name: "API_TOKEN".into(),
+                repo: None,
             }),
             WorkspaceSetTask(WorkspaceSetTaskParams {
                 workspace_id: ws.clone(),

@@ -220,6 +220,8 @@ pub struct Daemon {
     /// sandbox, and the only place the allowlist is enforced.
     pub proxies: crate::net::proxy::ProxyRegistry,
     pub agent_sandboxes: crate::workspace::agent_sandboxes::AgentSandboxes,
+    /// The secrets every sandbox's processes get as environment variables.
+    pub env_secrets: Arc<crate::secrets::EnvSecrets>,
     /// The running runs, which is where `WorkspaceInfo.runs` comes from.
     pub runs: crate::runs::manager::RunManager,
     /// `system.list_models`'s in-memory cache of the Models API's last
@@ -251,6 +253,7 @@ impl Daemon {
         dirs.ensure()?;
         let registry = Registry::load(&dirs.registry_file())?;
         let mcp_servers = Arc::new(crate::mcp::servers::McpServers::load(&dirs.root)?);
+        let env_secrets = Arc::new(crate::secrets::EnvSecrets::load(&dirs.root));
         let agents =
             AgentManager::new(events.clone(), dirs.transcripts.clone(), dirs.agents_file());
         let daemon = Arc::new_cyclic(|me| Self {
@@ -271,6 +274,7 @@ impl Daemon {
                 bondsymphonic_proto::AgentAdapterKind::Claude,
             ),
             agent_sandboxes: Default::default(),
+            env_secrets,
             runs: crate::runs::manager::RunManager::new(events),
             models: crate::models::ModelsCache::new(),
             host: tokio::sync::OnceCell::new(),

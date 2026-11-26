@@ -125,6 +125,15 @@ impl Handler for WorkspaceHandler {
             Request::McpOverride(p) => mcp_saved(d, d.mcp_servers.set_override(p)),
             Request::RepoGithubList {} => ok(crate::git::clone::list().await?),
             Request::RepoClone(p) => ok(crate::git::clone::clone(&p.repo, &p.parent_dir).await?),
+            Request::SecretsList {} => ok(d.env_secrets.list()),
+            Request::SecretsSet(p) => {
+                d.env_secrets.set(&p.name, &p.value, p.repo.as_deref())?;
+                ok(d.env_secrets.list())
+            }
+            Request::SecretsRemove(p) => {
+                d.env_secrets.remove(&p.name, p.repo.as_deref())?;
+                ok(d.env_secrets.list())
+            }
             Request::RepoInspect(p) => {
                 ok(crate::git::repo::inspect(&d.git, std::path::Path::new(&p.path)).await?)
             }
