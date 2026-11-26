@@ -5,6 +5,7 @@ pub mod editing;
 pub mod in_place;
 pub mod lifecycle;
 pub mod registry;
+pub mod shared_tools;
 
 use bondsymphonic_proto::{
     AgentId, RunId, WorkspaceId, WorkspaceInfo, WorkspaceKind, WorkspaceState,
@@ -71,6 +72,10 @@ pub struct DataDirs {
     pub objects: PathBuf,
     pub homes: PathBuf,
     pub caches: PathBuf,
+    /// Tools agents installed, one directory per repository. See
+    /// [`shared_tools`]. Outlives every workspace: removing one leaves the
+    /// tools to the others on its repository.
+    pub tools: PathBuf,
     pub run: PathBuf,
     pub transcripts: PathBuf,
 }
@@ -83,6 +88,7 @@ impl DataDirs {
             objects: root.join("objects"),
             homes: root.join("homes"),
             caches: root.join("caches"),
+            tools: root.join("tools"),
             run: root.join("run"),
             transcripts: root.join("transcripts"),
             root,
@@ -143,6 +149,7 @@ impl DataDirs {
             &self.objects,
             &self.homes,
             &self.caches,
+            &self.tools,
             &self.run,
             &self.transcripts,
         ] {

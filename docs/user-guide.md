@@ -554,6 +554,26 @@ network only through an allowlisting proxy. (If the same repository also has a
 workspace working directly in the checkout, that one's agent *can* write the
 shared refs and objects — see "Working directly in a checkout" below.)
 
+**Installed tools are shared per repository.** The root filesystem is
+read-only, so whatever an agent installs lands in its home: the .NET SDK from
+`dotnet-install.sh`, a Rust toolchain from rustup, a CLI from `pip --user`.
+These home directories are shared by every workspace on the same repository,
+in-place ones included: `.dotnet`, `.cargo`, `.rustup`, `go`, `.nvm`, `.bun`,
+`.deno`, `.local/bin` and `.local/lib`. What one agent installs there is there
+for the next, with no flags and nothing to configure; `DOTNET_ROOT` is set, and
+`~/.dotnet`, `~/.dotnet/tools`, `~/go/bin`, `~/.bun/bin` and `~/.deno/bin` are
+on the `PATH`. The rest of the home (the agent's own state, `.local/share`, the
+cache) stays the workspace's own, and a workspace on another repository sees
+none of it. They live in the daemon data directory under `tools/<repository>-<hash>`
+and outlive the workspaces: destroying the last workspace on a repository keeps
+them for the next one, and deleting that folder is how you start over. A
+workspace that already had one of these directories in its own home, from
+before they were shared, moves it there on its next start if the repository
+has nothing there yet; otherwise its own copy stays hidden under the shared
+one. This makes the repository a trust boundary: an agent can put a program
+there that another agent on the same repository later runs. Only under the
+bubblewrap sandbox; the no-sandbox development backend shares nothing.
+
 **Work in a new worktree, or directly in this checkout.** The default keeps
 the agent off your own branch, in a worktree of its own — the paragraph above.
 Choosing **Work directly in this checkout** instead disables Base branch,
