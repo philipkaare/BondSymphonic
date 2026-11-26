@@ -87,7 +87,15 @@ mod symlink_races {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
+    /// Rounds every test runs, whatever it has seen by then.
     const ROUNDS: usize = 2000;
+    /// How far a test keeps going for the race to bite. Only a sliver of
+    /// rounds meet the symlink itself: most meet `notes` missing between
+    /// shapes, and on Linux a link refused by `O_DIRECTORY` is reported as
+    /// one only if it is still there for the second look. A few dozen in
+    /// 2000 is typical, and an unlucky run sees none, so a fixed count is
+    /// a coin toss. A service that never meets the link still fails here.
+    const MAX_ROUNDS: usize = 50 * ROUNDS;
 
     /// Alternates `wt/notes` between a real directory and a symlink to
     /// `outside`, as fast as the filesystem allows, until told to stop.
@@ -152,9 +160,14 @@ mod symlink_races {
 
         let stop = Arc::new(AtomicBool::new(false));
         let swap = swapper(&wt, &outside, stop.clone());
-        let mut outcomes = Vec::new();
+        let mut succeeded = 0;
         let mut links_refused = 0;
-        for i in 0..ROUNDS {
+        let mut rounds = 0;
+        for i in 0..MAX_ROUNDS {
+            if i >= ROUNDS && succeeded > 0 && links_refused > 0 {
+                break;
+            }
+            rounds += 1;
             let r = fs::write_file(&wt, "notes/config", &format!("round {i}"));
             assert!(
                 is_ok_or_refused(&r),
@@ -163,7 +176,9 @@ mod symlink_races {
             if r.as_ref().is_err_and(is_symlink_refusal) {
                 links_refused += 1;
             }
-            outcomes.push(r.is_ok());
+            if r.is_ok() {
+                succeeded += 1;
+            }
             let stray: Vec<_> = std::fs::read_dir(&outside)
                 .unwrap()
                 .flatten()
@@ -179,9 +194,8 @@ mod symlink_races {
         // The swapper was really racing, or the test proved nothing: some
         // writes went through, and some met the symlink and were refused for it.
         assert!(
-            outcomes.iter().any(|ok| *ok) && links_refused > 0,
-            "the race never bit: {} of {ROUNDS} writes succeeded, {links_refused} refused as links",
-            outcomes.iter().filter(|ok| **ok).count()
+            succeeded > 0 && links_refused > 0,
+            "the race never bit: {succeeded} of {rounds} writes succeeded, {links_refused} refused as links"
         );
     }
 
@@ -197,7 +211,12 @@ mod symlink_races {
         let stop = Arc::new(AtomicBool::new(false));
         let swap = swapper(&wt, &outside, stop.clone());
         let mut links_refused = 0;
-        for i in 0..ROUNDS {
+        let mut rounds = 0;
+        for i in 0..MAX_ROUNDS {
+            if i >= ROUNDS && links_refused > 0 {
+                break;
+            }
+            rounds += 1;
             match fs::read_file(&wt, "notes/secret") {
                 Ok(r) => panic!("round {i}: read a file from outside the worktree: {r:?}"),
                 Err(e) => {
@@ -215,7 +234,7 @@ mod symlink_races {
         swap.join().unwrap();
         assert!(
             links_refused > 0,
-            "the race never bit: no read met the symlink"
+            "the race never bit: none of {rounds} reads met the symlink"
         );
     }
 }
