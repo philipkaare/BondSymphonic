@@ -314,7 +314,7 @@ pub async fn start_sandbox(d: &Arc<Daemon>, ws: &Workspace) -> Result<(), RpcErr
     let started = d.backend.start(&spec).await;
     log_phase(&ws.id, "start_sandbox", "backend.start", phase);
     let handle = match started {
-        Ok(h) => h,
+        Ok(h) => crate::secrets::with_secrets(h, d.env_secrets.clone(), &ws.repo_path),
         // Nothing will ever connect to that listener now.
         Err(e) => {
             d.proxies.stop_generation(&ws.id, proxy);

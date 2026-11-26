@@ -1619,6 +1619,7 @@ mod cpp_widgets {
         fn bs_widget_test_group_bar_names_the_repository() -> i32;
         fn bs_widget_test_new_agent_dialog_says_branches_are_loading() -> i32;
         fn bs_widget_test_github_clone_dialog_clones_the_chosen_repo() -> i32;
+        fn bs_widget_test_secrets_page_lists_and_validates() -> i32;
         fn bs_widget_test_explorer_header_shows_the_task() -> i32;
         fn bs_widget_test_group_bar_drags_tabs_and_groups() -> i32;
         fn bs_widget_test_agent_choices_are_one_list() -> i32;
@@ -1687,7 +1688,7 @@ mod cpp_widgets {
         if skip_without_qt("qobject_smoke::cpp_widgets") {
             return;
         }
-        let checks: [(&str, unsafe extern "C" fn() -> i32); 75] = [
+        let checks: [(&str, unsafe extern "C" fn() -> i32); 76] = [
             // These four build a whole MainWindow, and each begins by pointing
             // BS_STATE_PATH at a throwaway file. They run FIRST, and the order
             // is load-bearing rather than tidy: the state store settles its
@@ -1790,6 +1791,9 @@ mod cpp_widgets {
                 bs_widget_test_new_agent_dialog_says_branches_are_loading,
             ),
             (
+                "SecretsPage lists names and scopes, and SecretDialog refuses what the daemon would",
+                bs_widget_test_secrets_page_lists_and_validates,
+            ),            (
                 "GithubCloneDialog lists, filters and clones the chosen repository",
                 bs_widget_test_github_clone_dialog_clones_the_chosen_repo,
             ),

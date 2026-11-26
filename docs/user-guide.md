@@ -1088,6 +1088,33 @@ An agent in a sandbox has no GitHub credentials, so BondSymphonic gives it built
 
 ---
 
+## Secrets
+
+**Settings > Secrets** holds environment variables every agent's sandbox gets:
+API tokens, registry credentials, anything a build or a test needs from the
+environment. Each one is either for **All repositories** or for one repository,
+and a repository's own wins over one of the same name for all of them. Every
+process started in the sandbox gets them — the agent, its terminals and runs,
+and local MCP servers — including the companion sandboxes of other agents.
+
+- **Add…** asks for the name, the value and which repository it is for (or all
+  of them). A name is letters, digits and `_`, not starting with a digit; names
+  the sandbox sets itself (`PATH`, `HOME`, the proxy variables, `GIT_*`, `BS_*`
+  and a few more) are refused.
+- **Change value…** gives one a new value; **Remove** deletes it.
+- A change reaches processes started after it. An agent that is already
+  running sees it once it is restarted (**Workspace > Restart agent**).
+
+The values are stored by the daemon in `~/.bondsymphonic/secrets/env.json`
+inside the Linux VM, readable only by you, and are never shown again or sent
+back to the IDE. No sandbox can read that file. The values reach a sandbox only
+as the environment of the processes started in it, and never appear on a
+command line. Anything in an agent's environment is the agent's to use: it can
+print it, or send it anywhere the workspace's network allowlist lets it reach.
+Add only what you would let the agent use.
+
+---
+
 ## MCP servers
 
 MCP servers give agents more tools: an issue tracker, a database, a search

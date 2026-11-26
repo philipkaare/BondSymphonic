@@ -294,6 +294,21 @@ pub struct GithubRepoListResult {
     pub repos: Vec<GithubRepo>,
 }
 
+/// One environment secret, as the daemon lists it: never its value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretInfo {
+    pub name: String,
+    /// The repository it is for, or `None` for every repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretListResult {
+    /// Every-repository secrets first, then by repository, each by name.
+    pub secrets: Vec<SecretInfo>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RepoCloneResult {
     /// The new checkout, as the daemon sees it.

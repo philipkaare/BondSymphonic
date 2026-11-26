@@ -658,6 +658,16 @@ pub mod qobject {
         #[qsignal]
         fn github_repo_cloned(self: Pin<&mut AppController>, repo: QString, path: QString);
 
+        /// The environment secrets the sandboxes get, as a JSON array of
+        /// `SecretInfo` (`name`, and `repo` for one repository's): the answer to
+        /// `list_secrets`, `set_secret` and `remove_secret` alike. Never values.
+        #[qsignal]
+        fn secrets_listed(self: Pin<&mut AppController>, secrets_json: QString);
+
+        /// One of those three failed: a refused name, or the daemon down.
+        #[qsignal]
+        fn secrets_failed(self: Pin<&mut AppController>, message: QString);
+
         /// `clone_github_repo` failed, with the reason.
         #[qsignal]
         fn github_repo_clone_failed(self: Pin<&mut AppController>, repo: QString, message: QString);
@@ -1024,6 +1034,21 @@ pub mod qobject {
         /// `github_repo_cloned` or `github_repo_clone_failed`.
         #[qinvokable]
         fn clone_github_repo(self: Pin<&mut AppController>, repo: QString, parent_dir: QString);
+
+        /// The environment secrets (`secrets.list`). Answers with
+        /// `secrets_listed` or `secrets_failed`.
+        #[qinvokable]
+        fn list_secrets(self: Pin<&mut AppController>);
+
+        /// Sets the secret `name` to `value`, for the repository at `repo` (a
+        /// distro path) or, with an empty `repo`, for every repository
+        /// (`secrets.set`). Answers like `list_secrets`.
+        #[qinvokable]
+        fn set_secret(self: Pin<&mut AppController>, name: QString, value: QString, repo: QString);
+
+        /// Removes one (`secrets.remove`). Answers like `list_secrets`.
+        #[qinvokable]
+        fn remove_secret(self: Pin<&mut AppController>, name: QString, repo: QString);
 
         /// Inspect a git repository. Answers with `repo_inspected` or
         /// `operation_failed`. Supersedes any inspection still out: only the
@@ -2400,6 +2425,31 @@ fn report_agent_failure(
 
 /// Queues `workspace_fetch_failed` and the `operation_failed` behind it, in
 /// one step, like the other typed failures.
+/// Sends one of the three `secrets.*` requests, all of which answer with the
+/// list. Never logs the request: a `secrets.set` carries the value.
+fn secrets_request(qt: QtHandle, request: Request) {
+    let fail = |qt: &QtHandle, message: String| {
+        tracing::warn!("a secrets request failed: {message}");
+        let _ = qt.queue(move |q| q.secrets_failed(QString::from(&message)));
+    };
+    let shared = match require_connection() {
+        Ok(shared) => shared,
+        Err(message) => {
+            fail(&qt, message.to_owned());
+            return;
+        }
+    };
+    runtime().spawn(async move {
+        match shared.client.request::<SecretListResult>(request).await {
+            Ok(r) => {
+                let json = serde_json::to_string(&r.secrets).unwrap_or_else(|_| "[]".into());
+                let _ = qt.queue(move |q| q.secrets_listed(QString::from(&json)));
+            }
+            Err(e) => fail(&qt, client_error_message(e)),
+        }
+    });
+}
+
 /// The daemon's own words for a refused request, or the transport's.
 fn client_error_message(e: ClientError) -> String {
     match e {
@@ -4303,6 +4353,36 @@ impl qobject::AppController {
                 Err(e) => fail(&qt, repo, client_error_message(e)),
             }
         });
+    }
+
+    pub fn list_secrets(self: Pin<&mut Self>) {
+        let qt = self.qt_thread();
+        secrets_request(qt, Request::SecretsList {});
+    }
+
+    pub fn set_secret(self: Pin<&mut Self>, name: QString, value: QString, repo: QString) {
+        let qt = self.qt_thread();
+        let repo = repo.to_string();
+        secrets_request(
+            qt,
+            Request::SecretsSet(SecretSetParams {
+                name: name.to_string(),
+                value: value.to_string(),
+                repo: (!repo.trim().is_empty()).then_some(repo),
+            }),
+        );
+    }
+
+    pub fn remove_secret(self: Pin<&mut Self>, name: QString, repo: QString) {
+        let qt = self.qt_thread();
+        let repo = repo.to_string();
+        secrets_request(
+            qt,
+            Request::SecretsRemove(SecretRemoveParams {
+                name: name.to_string(),
+                repo: (!repo.trim().is_empty()).then_some(repo),
+            }),
+        );
     }
 
     pub fn inspect_repo(self: Pin<&mut Self>, path: QString) {

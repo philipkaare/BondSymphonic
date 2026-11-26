@@ -568,6 +568,82 @@ async fn an_agent_manages_its_own_branches_and_merge_takes_the_one_it_is_on() {
     );
 }
 
+/// Secrets reach every process started in a sandbox as environment
+/// variables: every-repository ones, and the repository's own over them. A
+/// sandbox of another repository does not get that repository's, a change
+/// applies to the next process without a restart, the value is on no command
+/// line on the host, and the file holding it cannot be reached from inside.
+#[tokio::test]
+async fn secrets_reach_the_sandbox_as_environment_variables() {
+    if !bwrap_available() {
+        eprintln!("SKIP: bwrap unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let repo = common::init_repo(dir.path());
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = common::init_repo(other_dir.path());
+    let server = Server::bind(ServerConfig::default()).await.unwrap();
+    let data = dir.path().join("data");
+    let daemon = Daemon::new(
+        DataDirs::new(&data),
+        backend_for("linux_bwrap"),
+        server.event_bus(),
+    )
+    .unwrap();
+    let secrets = &daemon.env_secrets;
+    secrets
+        .set("SHARED_TOKEN", "for-everyone-7f3a", None)
+        .unwrap();
+    secrets.set("API_KEY", "global-key-1b2c", None).unwrap();
+    secrets
+        .set("API_KEY", "repo-key-9d8e", Some(repo.to_str().unwrap()))
+        .unwrap();
+    let create = |repo: &std::path::Path, name: &str| WorkspaceCreateParams {
+        repo_path: repo.to_string_lossy().into(),
+        name: name.into(),
+        base_branch: "main".into(),
+        init_if_missing: false,
+        in_place: false,
+    };
+    let ws = lifecycle::create(&daemon, create(&repo, "sec"))
+        .await
+        .unwrap();
+    let theirs = lifecycle::create(&daemon, create(&other, "oth"))
+        .await
+        .unwrap();
+    let handle = daemon.sandbox(&ws.id).unwrap();
+    let their_handle = daemon.sandbox(&theirs.id).unwrap();
+
+    let (code, out) = run_in(&handle, "echo \"$API_KEY|$SHARED_TOKEN\"").await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.trim(), "repo-key-9d8e|for-everyone-7f3a");
+    let (code, out) = run_in(&their_handle, "echo \"$API_KEY|$SHARED_TOKEN\"").await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.trim(), "global-key-1b2c|for-everyone-7f3a");
+
+    // Changed while the sandbox runs: the next process has it.
+    secrets.set("SHARED_TOKEN", "rotated-5e6f", None).unwrap();
+    let (_, out) = run_in(&handle, "echo \"$SHARED_TOKEN\"").await;
+    assert_eq!(out.trim(), "rotated-5e6f");
+
+    // Not on bwrap's command line, which every process on the host can read.
+    let pid = handle.host_pid().expect("the sandbox's bwrap");
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+    let cmdline = String::from_utf8_lossy(&cmdline);
+    assert!(!cmdline.contains("repo-key-9d8e"), "{cmdline}");
+    assert!(!cmdline.contains("for-everyone-7f3a"), "{cmdline}");
+    // And the file is out of reach.
+    let file = data.join("secrets/env.json");
+    assert!(file.is_file());
+    let (code, out) = run_in(&handle, &format!("cat '{}'", file.display())).await;
+    assert_ne!(code, 0, "{out}");
+    assert!(!out.contains("repo-key"), "{out}");
+
+    lifecycle::destroy(&daemon, &ws.id, true).await.unwrap();
+    lifecycle::destroy(&daemon, &theirs.id, true).await.unwrap();
+}
+
 /// The real Claude Code binary has to be reachable *inside* a workspace
 /// sandbox, which is the one thing the fake `claude` the rest of the suite runs
 /// can never show.

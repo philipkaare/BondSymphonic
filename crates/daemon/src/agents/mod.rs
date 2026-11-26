@@ -698,6 +698,10 @@ the user to fix it under {settings} › Setup. \
 Keep the user told what you are working on: call the bondsymphonic set_task tool with a short \
 summary (a few words) when you start on a task, and again whenever your main task changes -- not \
 for every small step. \
+When you need a credential (an API token, a registry password), do not ask the user to paste it \
+into the conversation: ask them to add it as a secret under {settings} › Secrets, for this \
+repository or all of them, and to restart you; it then reaches you as an environment variable of \
+the name they gave it. \
 In a worktree workspace, the repository's shared .git is read-only apart from your own branches: \
 those under the prefix of the branch the workspace started on (bs/<workspace>/...). Create, \
 switch between and delete them freely -- for work based on a remote branch, git_fetch and then \

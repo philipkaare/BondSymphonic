@@ -466,8 +466,12 @@ async fn a_restart_does_not_report_its_own_sandbox_dying() {
         daemon.registry.get(&ws.id).unwrap().state,
         WorkspaceState::Ready
     );
-    let current: Arc<dyn SandboxHandle> = backend.last();
-    assert!(Arc::ptr_eq(&daemon.sandbox(&ws.id).unwrap(), &current));
+    // The registered handle is the backend's newest. By its death watch, not
+    // by pointer: the daemon wraps what the backend returns (it adds the
+    // environment secrets to every spawn) and passes `died` through.
+    let current = backend.last();
+    let registered = daemon.sandbox(&ws.id).unwrap().died().unwrap();
+    assert!(registered.same_channel(&current.died.subscribe()));
     assert_eq!((backend.started(), backend.alive()), (2, 1));
     shut_down_sandboxes(&daemon).await;
 }
