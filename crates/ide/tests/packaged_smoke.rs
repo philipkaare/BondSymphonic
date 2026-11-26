@@ -314,5 +314,6 @@ fn workspace() -> WorkspaceInfo {
         agents: Vec::new(),
         agent_records: Vec::new(),
         runs: Vec::new(),
+        task: None,
     }
 }

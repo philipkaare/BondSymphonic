@@ -258,6 +258,11 @@ pub struct AgentTab {
     /// existed still loads.
     #[serde(default)]
     pub agent_id: Option<AgentId>,
+    /// What the workspace's agent says it is working on, from
+    /// `WorkspaceInfo::task`, or `None`. Shown on the tab and the Explorer
+    /// header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
     /// The last status the agent itself reported, kept separately from
     /// `status` so a workspace event can take the badge for the duration of a
     /// sandbox outage and hand it back on recovery. `None` until the agent has
@@ -525,7 +530,23 @@ impl AgentTab {
             op_error: None,
             attention: String::new(),
             workspace_problem: workspace_problem_for(&info.state, info.kind),
+            task: info.task.clone(),
         }
+    }
+}
+
+/// Where the item at `i` ends up when the one at `from` is taken out and put
+/// back at `to`: the moved item itself goes to `to`, and those it passed over
+/// shift one place towards where it came from.
+pub fn moved_index(i: usize, from: usize, to: usize) -> usize {
+    if i == from {
+        to
+    } else if from < i && i <= to {
+        i - 1
+    } else if to <= i && i < from {
+        i + 1
+    } else {
+        i
     }
 }
 
@@ -979,6 +1000,39 @@ impl Workspaces {
         true
     }
 
+    /// Moves the tab at `from` in group `group` to position `to` in the same
+    /// group, as dragging it along the agent row does. The active selection
+    /// stays on the tab it was on. False for an index that is not there, or a
+    /// move to where it already is.
+    pub fn move_tab(&mut self, group: usize, from: usize, to: usize) -> bool {
+        let Some(grp) = self.groups.get_mut(group) else {
+            return false;
+        };
+        if from == to || from >= grp.tabs.len() || to >= grp.tabs.len() {
+            return false;
+        }
+        let tab = grp.tabs.remove(from);
+        grp.tabs.insert(to, tab);
+        if self.active_group == group {
+            self.active_tab = moved_index(self.active_tab, from, to);
+        }
+        true
+    }
+
+    /// Moves the group at `from` to position `to`, as dragging its tab along
+    /// the group row does. The active selection stays on the same tab. False
+    /// for an index that is not there, or a move to where it already is.
+    pub fn move_group(&mut self, from: usize, to: usize) -> bool {
+        let len = self.groups.len();
+        if from == to || from >= len || to >= len {
+            return false;
+        }
+        let group = self.groups.remove(from);
+        self.groups.insert(to, group);
+        self.active_group = moved_index(self.active_group, from, to);
+        true
+    }
+
     /// Points the active selection at the first non-empty group, or leaves it
     /// at `(0, 0)` if every group is empty.
     fn fallback_active(&mut self) {
@@ -1120,6 +1174,7 @@ impl Workspaces {
         tab.workspace_problem = workspace_problem_for(&info.state, info.kind);
         tab.branch = info.branch.clone();
         tab.kind = info.kind;
+        tab.task = info.task.clone();
         // Refreshed rather than set once: a tab restored from a session file
         // written before this field existed has none, and the Run panel cannot
         // detect anything without it.
@@ -1672,6 +1727,7 @@ mod tests {
             op_error: None,
             attention: String::new(),
             workspace_problem: None,
+            task: None,
         }
     }
 

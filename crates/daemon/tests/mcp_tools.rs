@@ -131,7 +131,8 @@ async fn the_tool_list_marks_the_read_only_ones() {
             "pr_update",
             "pr_comment",
             "ci_logs",
-            "issue_view"
+            "issue_view",
+            "set_task"
         ]
     );
     for t in &tools {
@@ -520,5 +521,75 @@ async fn a_missing_gh_says_it_is_not_installed() {
     // the real one, and no test may ever run that.
     let err = text(tools.call("pr_view", json!({})).await).unwrap_err();
     assert!(err.contains("not installed on the host"), "{err}");
+    cancel.cancel();
+}
+
+/// `set_task` records what the agent is working on, for the workspace's tab:
+/// it is on the workspace and in the state event every client gets, it is
+/// allowed without a prompt, and the user's own `workspace.set_task` edits
+/// and clears it the same way. A task is kept as one short line.
+#[tokio::test]
+async fn set_task_puts_the_agents_task_on_the_workspace() {
+    let (_dir, d, ws, _o, cancel) = setup("task").await;
+    let tools = WorkspaceTools::new(Arc::downgrade(&d), ws.id.clone());
+    let spec = tools
+        .tools()
+        .into_iter()
+        .find(|t| t.name == "set_task")
+        .unwrap();
+    assert!(!spec.read_only);
+    assert!(bondsymphonic_daemon::mcp::claude_allowed_tools()
+        .split(',')
+        .any(|t| t == "mcp__bondsymphonic__set_task"));
+
+    let mut events = d.events.subscribe();
+    let out = text(
+        tools
+            .call("set_task", json!({"task": "  Fix the login\nredirect  "}))
+            .await,
+    )
+    .unwrap();
+    assert_eq!(out, "Task set: Fix the login redirect");
+    assert_eq!(
+        d.workspace(&ws.id).unwrap().task.as_deref(),
+        Some("Fix the login redirect")
+    );
+    let mut announced = None;
+    while let Ok(message) = events.try_recv() {
+        if let ServerMessage::Event {
+            event: Event::WorkspaceStateChanged { info },
+            ..
+        } = message
+        {
+            announced = info.task.clone();
+        }
+    }
+    assert_eq!(announced.as_deref(), Some("Fix the login redirect"));
+
+    // Long tasks are cut to one tab-sized line.
+    let long = "x".repeat(500);
+    text(tools.call("set_task", json!({"task": long})).await).unwrap();
+    let kept = d.workspace(&ws.id).unwrap().task.unwrap();
+    assert_eq!(
+        kept.chars().count(),
+        bondsymphonic_daemon::workspace::lifecycle::MAX_TASK_CHARS
+    );
+    assert!(kept.ends_with('…'));
+
+    // The user's edit, and a blank task clearing it.
+    let info = bondsymphonic_daemon::workspace::lifecycle::set_task(&d, &ws.id, Some("Review"))
+        .await
+        .unwrap();
+    assert_eq!(info.task.as_deref(), Some("Review"));
+    assert_eq!(
+        text(tools.call("set_task", json!({"task": "  "})).await).unwrap(),
+        "Task cleared."
+    );
+    assert_eq!(d.workspace(&ws.id).unwrap().task, None);
+    // An argument that is not a task is the agent's to fix.
+    assert!(matches!(
+        tools.call("set_task", json!({})).await,
+        ToolOutcome::InvalidArguments(_)
+    ));
     cancel.cancel();
 }

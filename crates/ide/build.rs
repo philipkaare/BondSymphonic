@@ -60,6 +60,7 @@ fn main() {
             "cpp/PrDialog.h",
             "cpp/PrDialog.cpp",
             "cpp/CommitDialog.cpp",
+            "cpp/GithubCloneDialog.cpp",
             "cpp/IgnoreDialog.cpp",
             "cpp/CloseGroupDialog.h",
             "cpp/CloseGroupDialog.cpp",
@@ -114,6 +115,7 @@ fn main() {
     for header in [
         "cpp/Theme.h",
         "cpp/CommitDialog.h",
+        "cpp/GithubCloneDialog.h",
         "cpp/IgnoreDialog.h",
         "cpp/McpPage.h",
         "cpp/AgentChoices.h",

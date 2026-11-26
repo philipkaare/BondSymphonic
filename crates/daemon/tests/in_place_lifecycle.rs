@@ -651,6 +651,7 @@ async fn destroy_refuses_a_worktree_path_the_daemon_would_never_have_made() {
             agents: vec![],
             runs: vec![],
             kind: WorkspaceKind::Worktree,
+            task: None,
         })
         .await
         .unwrap();

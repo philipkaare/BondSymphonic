@@ -283,6 +283,7 @@ fn workspace() -> WorkspaceInfo {
             permission_mode: Some(PERMISSION_MODE.to_owned()),
         }],
         runs: Vec::new(),
+        task: None,
     }
 }
 
@@ -356,6 +357,7 @@ mod task_9 {
             agents: Vec::new(),
             agent_records: Vec::new(),
             runs: Vec::new(),
+            task: None,
         }
     }
 
@@ -740,6 +742,7 @@ mod task_10 {
             agents: Vec::new(),
             agent_records: Vec::new(),
             runs: Vec::new(),
+            task: None,
         }
     }
 }
@@ -1029,6 +1032,7 @@ mod task_10_agent_state_race {
             agents: Vec::new(),
             agent_records: Vec::new(),
             runs: Vec::new(),
+            task: None,
         }
     }
 }

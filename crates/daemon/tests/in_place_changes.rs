@@ -39,6 +39,7 @@ async fn in_place_on(dir: &Path, root: &Path, base_branch: &str) -> (Arc<Daemon>
             agents: vec![],
             runs: vec![],
             kind: WorkspaceKind::InPlace,
+            task: None,
         })
         .await
         .unwrap();

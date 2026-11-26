@@ -695,6 +695,9 @@ issues, and commenting, work across the repository. In an in-place workspace the
 of its own to push: pushing and opening pull requests are done by the user from their own \
 checkout. If a tool says GitHub is not logged in, or that the GitHub CLI is not installed, tell \
 the user to fix it under {settings} › Setup. \
+Keep the user told what you are working on: call the bondsymphonic set_task tool with a short \
+summary (a few words) when you start on a task, and again whenever your main task changes -- not \
+for every small step. \
 In a worktree workspace, the repository's shared .git is read-only apart from your own branches: \
 those under the prefix of the branch the workspace started on (bs/<workspace>/...). Create, \
 switch between and delete them freely -- for work based on a remote branch, git_fetch and then \

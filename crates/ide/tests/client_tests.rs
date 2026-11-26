@@ -542,6 +542,15 @@ fn the_explorer_waits_two_minutes_for_the_tree() {
     );
 }
 
+/// A fresh clone of a big repository takes minutes, and the daemon gives it
+/// fifteen: the IDE must not give up first and report a clone that is still
+/// running as failed.
+#[test]
+fn a_clone_outlasts_the_daemons_own_budget() {
+    assert!(default_timeout_for("repo.clone") > Duration::from_secs(15 * 60));
+    assert!(default_timeout_for("repo.github_list") > DEFAULT_REQUEST_TIMEOUT);
+}
+
 /// Everything else keeps the 30 s default, including the status the Changes
 /// toolbar reads for its summary before a Discard.
 #[test]

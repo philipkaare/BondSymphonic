@@ -23,6 +23,11 @@ pub const TEXT_CAP: usize = 64 * 1024;
 /// asking (`annotations.readOnlyHint`).
 pub const READ_ONLY_TOOLS: [&str; 4] = ["git_fetch", "pr_view", "ci_logs", "issue_view"];
 
+/// The tools that change only BondSymphonic's own view of the workspace --
+/// nothing in a repository and nothing on a remote -- and so are allowed
+/// without asking, like the read-only ones.
+pub const PROMPT_FREE_TOOLS: [&str; 1] = ["set_task"];
+
 /// What `pr_view` asks `gh` for: enough to follow a review without a browser.
 const PR_FIELDS: &str = "number,url,state,title,body,isDraft,baseRefName,headRefName,\
 mergeable,reviewDecision,statusCheckRollup,reviews,comments";
@@ -207,6 +212,9 @@ enum Call {
     IssueView {
         number: u64,
     },
+    SetTask {
+        task: String,
+    },
 }
 
 /// The argument names each tool accepts; anything else is a mistake worth
@@ -221,6 +229,7 @@ fn allowed(name: &str) -> Option<&'static [&'static str]> {
         "pr_comment" => &["body", "number"],
         "ci_logs" => &["run_id"],
         "issue_view" => &["number"],
+        "set_task" => &["task"],
         _ => return None,
     })
 }
@@ -281,6 +290,14 @@ fn parse(name: &str, args: &Value) -> Result<Call, ToolOutcome> {
         },
         "issue_view" => Call::IssueView {
             number: req_number(a, "number")?,
+        },
+        "set_task" => Call::SetTask {
+            // Blank is allowed: it clears the task.
+            task: match a.get("task") {
+                Some(Value::String(s)) => s.clone(),
+                Some(_) => return Err(invalid("task must be a string")),
+                None => return Err(invalid("task is required")),
+            },
         },
         _ => unreachable!("allowed() names every tool"),
     })
@@ -575,6 +592,15 @@ impl WorkspaceTools {
                 }
                 Ok(text)
             }
+            Call::SetTask { task } => {
+                let ws = crate::workspace::lifecycle::set_task(&d, &ws.id, Some(&task))
+                    .await
+                    .map_err(failed)?;
+                Ok(match ws.task {
+                    Some(task) => format!("Task set: {task}"),
+                    None => "Task cleared.".to_owned(),
+                })
+            }
             Call::IssueView { number } => {
                 let slug = Self::slug(&d, &ws).await?;
                 let out = Self::gh(
@@ -696,6 +722,16 @@ impl ToolHost for WorkspaceTools {
                 "issue_view",
                 "Show a GitHub issue of this workspace's repository as JSON, with its comments.",
                 schema(json!({"number": number("Issue number")}), &["number"]),
+            ),
+            spec(
+                "set_task",
+                "Tell BondSymphonic, in a few words, what you are working on in this workspace; \
+                 the user sees it on the workspace's tab. Call it when you start on a task and \
+                 again whenever your main task changes. A blank task clears it.",
+                schema(
+                    json!({"task": {"type": "string", "description": "A short summary, under 80 characters, e.g. \"Fix the login redirect\""}}),
+                    &["task"],
+                ),
             ),
         ]
     }

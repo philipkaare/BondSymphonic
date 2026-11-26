@@ -278,6 +278,7 @@ impl Event {
                     agents: vec![],
                     agent_records: vec![],
                     runs: vec![],
+                    task: None,
                 }),
             },
             AgentStateChanged {

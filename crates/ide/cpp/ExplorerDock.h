@@ -88,6 +88,11 @@ public:
                             const QString& baseBranch, const QString& worktreePath,
                             bool inPlace = false);
 
+    /// What the workspace's agent says it is working on (its `set_task` tool,
+    /// or Workspace → Set task…), on a line of its own under the name. Empty
+    /// hides the line.
+    void setWorkspaceTask(const QString& task);
+
     /// The Changes tab's toolbar, so the window can connect its results to the
     /// status bar and to the workspace banners. Never null.
     ChangesToolbar* changesToolbar() const;
@@ -178,6 +183,8 @@ private:
     /// the palette changes.
     QWidget* m_header = nullptr;
     QLabel* m_headerName = nullptr;
+    /// Under the name: the agent's current task. Hidden while there is none.
+    QLabel* m_headerTask = nullptr;
     /// Its second line: the repository the work came from and the branch it
     /// will go back to.
     QLabel* m_headerDetail = nullptr;

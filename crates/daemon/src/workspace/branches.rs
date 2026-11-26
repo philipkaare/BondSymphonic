@@ -109,6 +109,7 @@ mod tests {
             agents: Vec::new(),
             runs: Vec::new(),
             kind,
+            task: None,
         }
     }
 

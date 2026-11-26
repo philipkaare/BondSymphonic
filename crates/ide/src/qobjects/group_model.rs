@@ -87,6 +87,25 @@ pub mod qobject {
         #[qinvokable]
         fn rename_agent(self: Pin<&mut GroupModel>, workspace_id: QString, name: QString) -> bool;
 
+        /// Moves tab `from` of group `group_idx` to position `to` in the same
+        /// group: dragging along the agent row. The active tab stays active.
+        #[qinvokable]
+        fn move_tab(self: Pin<&mut GroupModel>, group_idx: i32, from: i32, to: i32) -> bool;
+
+        /// Moves group `from` to position `to`: dragging along the group row.
+        #[qinvokable]
+        fn move_group(self: Pin<&mut GroupModel>, from: i32, to: i32) -> bool;
+
+        /// Moves the tab for `workspace_id` to the end of the group named
+        /// `group_name`: an agent tab dropped on a group's tab. False when the
+        /// workspace is not tracked or already in that group.
+        #[qinvokable]
+        fn move_tab_to_group(
+            self: Pin<&mut GroupModel>,
+            workspace_id: QString,
+            group_name: QString,
+        ) -> bool;
+
         /// Adds a tab for the `WorkspaceInfo` in `info_json` to the group named
         /// `group_name`, creating that group if it does not exist, and makes it
         /// active. An empty `group_name` is not a group called "": it means the
@@ -677,6 +696,49 @@ impl qobject::GroupModel {
         ok
     }
 
+    pub fn move_tab(mut self: Pin<&mut Self>, group_idx: i32, from: i32, to: i32) -> bool {
+        let (Some(group), Some(from), Some(to)) = (index(group_idx), index(from), index(to)) else {
+            return false;
+        };
+        let ok = self
+            .as_mut()
+            .rust_mut()
+            .workspaces
+            .move_tab(group, from, to);
+        if ok {
+            self.publish();
+        }
+        ok
+    }
+
+    pub fn move_group(mut self: Pin<&mut Self>, from: i32, to: i32) -> bool {
+        let (Some(from), Some(to)) = (index(from), index(to)) else {
+            return false;
+        };
+        let ok = self.as_mut().rust_mut().workspaces.move_group(from, to);
+        if ok {
+            self.publish();
+        }
+        ok
+    }
+
+    pub fn move_tab_to_group(
+        mut self: Pin<&mut Self>,
+        workspace_id: QString,
+        group_name: QString,
+    ) -> bool {
+        let id = WorkspaceId(workspace_id.to_string());
+        let ok = self
+            .as_mut()
+            .rust_mut()
+            .workspaces
+            .move_tab_to_group(&id, &group_name.to_string());
+        if ok {
+            self.publish();
+        }
+        ok
+    }
+
     pub fn rename_agent(mut self: Pin<&mut Self>, workspace_id: QString, name: QString) -> bool {
         let id = WorkspaceId(workspace_id.to_string());
         let ok = self
@@ -1169,6 +1231,10 @@ impl qobject::GroupModel {
         if tab.is_in_place() {
             text.push_str("\nworks in place: no branch or merge of its own");
         }
+        if let Some(task) = tab.task.as_deref() {
+            text.push_str("\ntask: ");
+            text.push_str(task);
+        }
         let detail = tab.display_detail();
         if !detail.is_empty() {
             text.push('\n');
@@ -1303,6 +1369,7 @@ mod tests {
             op_error: Some("Merge stopped: conflicts in README.md".to_owned()),
             attention: String::new(),
             workspace_problem: None,
+            task: None,
         }
     }
 
@@ -1338,6 +1405,7 @@ mod tests {
             agents: Vec::new(),
             agent_records: Vec::new(),
             runs: Vec::new(),
+            task: None,
         }
     }
 

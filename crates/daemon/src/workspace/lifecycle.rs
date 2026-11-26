@@ -438,6 +438,44 @@ const MAX_HOST_LEN: usize = 253;
 /// mistake in it leaves the old list in place rather than half-applying it. What
 /// gets stored is the canonical form [`HostPattern`] produces, so the IDE sees
 /// back exactly what the proxy will match.
+/// The longest task line kept, in characters: a tab's subtitle, not a plan.
+pub const MAX_TASK_CHARS: usize = 120;
+
+/// `task` as a workspace keeps it: one line, trimmed, at most
+/// [`MAX_TASK_CHARS`] characters; `None` for nothing left.
+pub fn normalize_task(task: Option<&str>) -> Option<String> {
+    let line: String = task?
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if line.is_empty() {
+        return None;
+    }
+    let mut kept: String = line.chars().take(MAX_TASK_CHARS).collect();
+    if kept.chars().count() < line.chars().count() {
+        kept.pop();
+        kept.push('…');
+    }
+    Some(kept)
+}
+
+/// Records what `id`'s agent is working on and tells every client, which is
+/// what puts it on the workspace's tab. From the agent's `set_task` tool and
+/// from the user's own edit alike.
+pub async fn set_task(
+    d: &Daemon,
+    id: &WorkspaceId,
+    task: Option<&str>,
+) -> Result<Workspace, RpcError> {
+    let task = normalize_task(task);
+    let ws = d.registry.update(id, |w| w.task = task.clone()).await?;
+    d.emit_state(&ws);
+    Ok(ws)
+}
+
 pub async fn set_allowlist(
     d: &Daemon,
     id: &WorkspaceId,
@@ -943,6 +981,7 @@ async fn create_the_workspace(
         state: WorkspaceState::Creating,
         agents: vec![],
         runs: vec![],
+        task: None,
     };
     d.registry
         .insert(ws.clone())
@@ -1059,6 +1098,7 @@ async fn create_in_place(
         state: WorkspaceState::Creating,
         agents: vec![],
         runs: vec![],
+        task: None,
     };
     d.registry
         .insert(ws.clone())
@@ -1853,6 +1893,7 @@ mod tests {
             state: WorkspaceState::Ready,
             agents: vec![],
             runs: vec![],
+            task: None,
         };
         let handle = d
             .backend
@@ -2009,6 +2050,7 @@ mod tests {
             state,
             agents: vec![],
             runs: vec![],
+            task: None,
         };
         d.registry.insert(ws.clone()).await.unwrap();
         (d, ws, rx)

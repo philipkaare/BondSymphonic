@@ -36,11 +36,13 @@
 #include <QDesktopServices>
 #include <QDockWidget>
 #include <QEvent>
+#include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLatin1Char>
+#include <QLineEdit>
 #include <QList>
 #include <QMenu>
 #include <QMenuBar>
@@ -406,6 +408,25 @@ void MainWindow::buildMenus() {
         m_controller->fetchWorkspace(id);
     });
     m_fetchAction->setObjectName(QStringLiteral("WorkspaceFetchAction"));
+    // The agent keeps this up to date itself through its `set_task` tool; this
+    // is for correcting it, or naming the work before the agent has.
+    m_setTaskAction = workspace->addAction("Set &task…", this, [this] {
+        const QString id = activeWorkspaceId();
+        if (id.isEmpty()) {
+            return;
+        }
+        bool ok = false;
+        const QString task = QInputDialog::getText(
+            this, QStringLiteral("Set task"),
+            QStringLiteral("What is \"%1\" working on? Leave it empty to clear it.\n"
+                           "The agent updates this itself when its main task changes.")
+                .arg(activeTab().value("name").toString()),
+            QLineEdit::Normal, activeTab().value("task").toString(), &ok);
+        if (ok) {
+            m_controller->setWorkspaceTask(id, task);
+        }
+    });
+    m_setTaskAction->setObjectName(QStringLiteral("WorkspaceSetTaskAction"));
     m_networkRulesAction = workspace->addAction("&Network rules…", this, [this] {
         const QString id = activeWorkspaceId();
         if (id.isEmpty()) { return; }
@@ -3224,6 +3245,7 @@ void MainWindow::onActiveTabChanged() {
                                    active.value("base_branch").toString(),
                                    active.value("worktree_path").toString(),
                                    workspacelabel::inPlace(active));
+    m_explorer->setWorkspaceTask(active.value("task").toString());
     // The tab's choice first, because `setWorkspace` publishes the list it
     // already has synchronously and the `configsChanged` slot above applies
     // this to it; the worktree path is the daemon's, from `WorkspaceInfo`.
@@ -3366,6 +3388,7 @@ void MainWindow::updateWorkspaceStatus() {
     const bool live = !active.isEmpty();
     m_restartAgentAction->setEnabled(live);
     m_fetchAction->setEnabled(live);
+    m_setTaskAction->setEnabled(live);
     m_networkRulesAction->setEnabled(live);
     m_mcpServersAction->setEnabled(live);
     m_destroyAction->setEnabled(live);

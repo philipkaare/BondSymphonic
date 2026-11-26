@@ -13,6 +13,12 @@
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QDialogButtonBox>
+#include <QDrag>
+#include <QDragMoveEvent>
+#include <QDropEvent>
+#include <QMimeData>
+#include <QMouseEvent>
+#include <QPixmap>
 #include <QPushButton>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -163,6 +169,11 @@ GroupBar::GroupBar(GroupModel* model, QWidget* parent) : QWidget(parent), m_mode
     m_groupTabs->setObjectName(QStringLiteral("GroupBarGroupTabs"));
     m_groupTabs->setExpanding(false);
     m_groupTabs->setContextMenuPolicy(Qt::CustomContextMenu);
+    // Drag a group along the row to reorder it, and drop an agent tab on one
+    // to move the agent there.
+    m_groupTabs->setMovable(true);
+    m_groupTabs->setAcceptDrops(true);
+    m_groupTabs->installEventFilter(this);
     captionRow->addWidget(m_groupTabs, 0, Qt::AlignBottom);
     captionRow->addStretch(1);
     layout->addLayout(captionRow);
@@ -175,6 +186,10 @@ GroupBar::GroupBar(GroupModel* model, QWidget* parent) : QWidget(parent), m_mode
     m_agentTabs->setExpanding(false);
     m_agentTabs->setDocumentMode(true);
     m_agentTabs->setContextMenuPolicy(Qt::CustomContextMenu);
+    // Drag along the row to reorder; pull a tab up out of the row to drop it
+    // on another group.
+    m_agentTabs->setMovable(true);
+    m_agentTabs->installEventFilter(this);
     // Taller and wider than a document tab: this is the row the user is meant
     // to find first, and a dot with a name and a branch behind it needs the
     // room. A stylesheet, because QTabBar takes its tab metrics from the style
@@ -202,6 +217,8 @@ GroupBar::GroupBar(GroupModel* model, QWidget* parent) : QWidget(parent), m_mode
     QObject::connect(m_addButton, &QToolButton::clicked, this, &GroupBar::newAgentRequested);
     QObject::connect(m_groupTabs, &QTabBar::currentChanged, this, &GroupBar::onGroupCurrentChanged);
     QObject::connect(m_agentTabs, &QTabBar::currentChanged, this, &GroupBar::onAgentCurrentChanged);
+    QObject::connect(m_agentTabs, &QTabBar::tabMoved, this, &GroupBar::onAgentTabMoved);
+    QObject::connect(m_groupTabs, &QTabBar::tabMoved, this, &GroupBar::onGroupTabMoved);
     QObject::connect(m_groupTabs, &QWidget::customContextMenuRequested, this, &GroupBar::showGroupMenu);
     QObject::connect(m_agentTabs, &QWidget::customContextMenuRequested, this, &GroupBar::showAgentMenu);
     // `changed` and not `arrangementChanged`: a rebuild repaints the status dot
@@ -334,7 +351,11 @@ QJsonArray GroupBar::displayedTabsJson() const {
 }
 
 void GroupBar::onGroupCurrentChanged(int index) {
-    if (m_rebuilding || index < 0) {
+    // The same group: `QTabBar::moveTab` reports the current tab's new index
+    // after a reorder, which `onGroupTabMoved` has already followed. Selecting
+    // it again would put the group's first agent in front of the one the user
+    // was on.
+    if (m_rebuilding || index < 0 || index == m_displayGroup) {
         return;
     }
     m_displayGroup = index;
@@ -350,6 +371,165 @@ void GroupBar::onAgentCurrentChanged(int index) {
         return;
     }
     m_model->setActive(m_displayGroup, index);
+}
+
+namespace {
+/// `Workspaces::moved_index` again, for the bar's own two indices: where the
+/// item at `i` is once the one at `from` has been moved to `to`.
+int movedIndex(int i, int from, int to) {
+    if (i == from) {
+        return to;
+    }
+    if (from < i && i <= to) {
+        return i - 1;
+    }
+    if (to <= i && i < from) {
+        return i + 1;
+    }
+    return i;
+}
+
+/// How far above or below the agent row the pointer has to go before a tab
+/// being dragged leaves the row for the groups, rather than sliding along it.
+constexpr int kTearOffPixels = 12;
+} // namespace
+
+void GroupBar::onAgentTabMoved(int from, int to) {
+    if (m_rebuilding) {
+        return;
+    }
+    m_model->moveTab(m_displayGroup, from, to);
+}
+
+void GroupBar::onGroupTabMoved(int from, int to) {
+    if (m_rebuilding) {
+        return;
+    }
+    // Both indices first: the model's move rebuilds the bar before it returns,
+    // and that rebuild must find the bar already showing the group that moved
+    // rather than read the shift as the model choosing another group.
+    m_displayGroup = movedIndex(m_displayGroup, from, to);
+    m_modelGroup = movedIndex(m_modelGroup, from, to);
+    m_model->moveGroup(from, to);
+}
+
+bool GroupBar::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == m_agentTabs) {
+        if (event->type() == QEvent::MouseButtonPress) {
+            auto* mouse = static_cast<QMouseEvent*>(event);
+            const int index = m_agentTabs->tabAt(mouse->position().toPoint());
+            if (mouse->button() == Qt::LeftButton && index >= 0) {
+                m_dragWorkspaceId = m_model->tabWorkspaceId(m_displayGroup, index);
+                m_dragPressPos = mouse->position().toPoint();
+            }
+        } else if (event->type() == QEvent::MouseButtonRelease) {
+            m_dragWorkspaceId.clear();
+        } else if (event->type() == QEvent::MouseMove && !m_dragWorkspaceId.isEmpty()) {
+            auto* mouse = static_cast<QMouseEvent*>(event);
+            const int y = mouse->position().toPoint().y();
+            if ((mouse->buttons() & Qt::LeftButton) &&
+                (y < -kTearOffPixels || y > m_agentTabs->height() + kTearOffPixels) &&
+                m_model->groupCount() > 1) {
+                startGroupDrag();
+                return true;
+            }
+        }
+        return false;
+    }
+    if (watched == m_groupTabs) {
+        switch (event->type()) {
+        case QEvent::DragEnter:
+        case QEvent::DragMove: {
+            auto* drag = static_cast<QDragMoveEvent*>(event);
+            const int target = dropGroupAt(drag->position().toPoint());
+            if (target >= 0) {
+                drag->setDropAction(Qt::MoveAction);
+                drag->accept();
+            } else {
+                drag->ignore();
+            }
+            if (target != m_dropHover) {
+                m_dropHover = target;
+                // The tab it would land in, shown the way a tab is shown when
+                // it is chosen; the displayed group comes back on leave or drop.
+                m_rebuilding = true;
+                m_groupTabs->setCurrentIndex(target >= 0 ? target : m_displayGroup);
+                m_rebuilding = false;
+            }
+            return true;
+        }
+        case QEvent::DragLeave:
+            m_dropHover = -1;
+            m_rebuilding = true;
+            m_groupTabs->setCurrentIndex(m_displayGroup);
+            m_rebuilding = false;
+            return true;
+        case QEvent::Drop: {
+            auto* drop = static_cast<QDropEvent*>(event);
+            const int target = dropGroupAt(drop->position().toPoint());
+            const QString id =
+                QString::fromUtf8(drop->mimeData()->data(QString::fromLatin1(kWorkspaceMime)));
+            m_dropHover = -1;
+            m_rebuilding = true;
+            m_groupTabs->setCurrentIndex(m_displayGroup);
+            m_rebuilding = false;
+            if (target < 0 || id.isEmpty()) {
+                drop->ignore();
+                return true;
+            }
+            drop->setDropAction(Qt::MoveAction);
+            drop->accept();
+            m_model->moveTabToGroup(id, m_model->groupName(target));
+            return true;
+        }
+        default:
+            return false;
+        }
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+int GroupBar::dropGroupAt(const QPoint& pos) const {
+    const int index = m_groupTabs->tabAt(pos);
+    if (index < 0) {
+        return -1;
+    }
+    // The agent is already there. The source group is the one the drag
+    // started in, which is the one on show.
+    if (index == m_displayGroup) {
+        return -1;
+    }
+    return index;
+}
+
+void GroupBar::startGroupDrag() {
+    const QString id = m_dragWorkspaceId;
+    m_dragWorkspaceId.clear();
+    // The row's own slide is over: a release where the press was lets it put
+    // the tab down, since the real release will go to the drag instead.
+    QMouseEvent release(QEvent::MouseButtonRelease, QPointF(m_dragPressPos),
+                        m_agentTabs->mapToGlobal(QPointF(m_dragPressPos)), Qt::LeftButton,
+                        Qt::NoButton, Qt::NoModifier);
+    QCoreApplication::sendEvent(m_agentTabs, &release);
+
+    int index = -1;
+    for (int i = 0; i < m_model->tabCount(m_displayGroup); ++i) {
+        if (m_model->tabWorkspaceId(m_displayGroup, i) == id) {
+            index = i;
+            break;
+        }
+    }
+    if (index < 0) {
+        return;
+    }
+    auto* mime = new QMimeData();
+    mime->setData(QString::fromLatin1(kWorkspaceMime), id.toUtf8());
+    auto* drag = new QDrag(this);
+    drag->setMimeData(mime);
+    const QRect rect = m_agentTabs->tabRect(index);
+    drag->setPixmap(m_agentTabs->grab(rect));
+    drag->setHotSpot(m_dragPressPos - rect.topLeft());
+    drag->exec(Qt::MoveAction);
 }
 
 void GroupBar::showGroupMenu(const QPoint& pos) {
@@ -691,6 +871,97 @@ extern "C" std::int32_t bs_widget_test_group_bar_does_not_lift_a_band_off_a_band
     }
     if (bar->palette().color(QPalette::Window) != first) {
         return 3;
+    }
+    return 0;
+}
+
+namespace {
+/// A tab for `id` in the group called `group`, through the model's own entry.
+bool addTestTab(GroupModel& model, const QString& id, const QString& group) {
+    const QJsonObject info{
+        { "id", id },           { "name", id },
+        { "repo_path", "/r" },  { "base_branch", "main" },
+        { "branch", "bs/" + id + "/work" }, { "worktree_path", "/w/" + id },
+        { "created_at", "now" }, { "allowlist", QJsonArray{} },
+        { "state", "creating" }, { "agents", QJsonArray{} },
+        { "runs", QJsonArray{} },
+    };
+    return model.addTab(QString::fromUtf8(QJsonDocument(info).toJson()), group,
+                        QStringLiteral("terminal"), QString(), QString());
+}
+
+/// The workspace ids of group `g`, in order, joined with commas.
+QString tabOrder(GroupModel& model, int g) {
+    QStringList ids;
+    for (int i = 0; i < model.tabCount(g); ++i) {
+        ids << model.tabWorkspaceId(g, i);
+    }
+    return ids.join(QLatin1Char(','));
+}
+} // namespace
+
+/// Dragging reorders: an agent tab along its row, a group along its row, and
+/// the active agent stays the one in front through both. An agent tab dropped
+/// on another group's tab moves there; dropped on its own group, nothing moves.
+extern "C" std::int32_t bs_widget_test_group_bar_drags_tabs_and_groups() {
+    GroupModel model;
+    model.loadState(QStringLiteral(
+        R"({"groups":[{"id":"g1","name":"One","tabs":[]},{"id":"g2","name":"Two","tabs":[]}],)"
+        R"("active_group":0,"active_tab":0})"));
+    if (!addTestTab(model, QStringLiteral("a"), QStringLiteral("One")) ||
+        !addTestTab(model, QStringLiteral("b"), QStringLiteral("One")) ||
+        !addTestTab(model, QStringLiteral("c"), QStringLiteral("Two"))) {
+        return 1;
+    }
+    model.setActive(0, 1); // b
+    GroupBar bar(&model);
+    auto* agents = bar.findChild<QTabBar*>(QStringLiteral("GroupBarAgentTabs"));
+    auto* groups = bar.findChild<QTabBar*>(QStringLiteral("GroupBarGroupTabs"));
+    if (agents == nullptr || groups == nullptr || !agents->isMovable() || !groups->isMovable() ||
+        !groups->acceptDrops()) {
+        return 2;
+    }
+
+    // Along the agent row: b to the front.
+    agents->moveTab(1, 0);
+    if (tabOrder(model, 0) != QLatin1String("b,a") || model.activeTabIndex() != 0 ||
+        agents->currentIndex() != 0) {
+        return 3;
+    }
+
+    // Along the group row: One after Two. b stays in front, and the bar keeps
+    // showing One where it now is.
+    groups->moveTab(0, 1);
+    if (model.groupName(0) != QLatin1String("Two") || model.groupName(1) != QLatin1String("One") ||
+        model.activeGroupIndex() != 1 || model.activeTabIndex() != 0 ||
+        bar.currentGroupName() != QLatin1String("One") || agents->count() != 2) {
+        return 4;
+    }
+
+    const auto dropOn = [&](int groupIndex, const QString& id) {
+        auto* mime = new QMimeData();
+        mime->setData(QString::fromLatin1(GroupBar::kWorkspaceMime), id.toUtf8());
+        const QPointF at = QRectF(groups->tabRect(groupIndex)).center();
+        QDragEnterEvent enter(at.toPoint(), Qt::MoveAction, mime, Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(groups, &enter);
+        const bool accepted = enter.isAccepted();
+        QDropEvent drop(at, Qt::MoveAction, mime, Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(groups, &drop);
+        delete mime;
+        return accepted;
+    };
+    // On its own group: refused, and nothing moves.
+    if (dropOn(1, QStringLiteral("a")) || tabOrder(model, 1) != QLatin1String("b,a")) {
+        return 5;
+    }
+    // On Two: a moves to the end of Two.
+    if (!dropOn(0, QStringLiteral("a")) || tabOrder(model, 0) != QLatin1String("c,a") ||
+        tabOrder(model, 1) != QLatin1String("b")) {
+        return 6;
+    }
+    // The hover highlight gave the displayed group back.
+    if (bar.currentGroupName() != QLatin1String("One")) {
+        return 7;
     }
     return 0;
 }

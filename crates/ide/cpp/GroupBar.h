@@ -61,6 +61,14 @@ protected:
     /// the grey of the two captions are derived from the window's own colours,
     /// so they have to be derived again rather than kept.
     void changeEvent(QEvent* event) override;
+    /// The drag from the agent row to a group: presses and moves on the agent
+    /// tabs, and drags arriving over the group tabs.
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
+public:
+    /// The MIME type an agent tab travels under while it is dragged to another
+    /// group: the workspace id, as UTF-8. Nothing outside the bar accepts it.
+    static constexpr const char* kWorkspaceMime = "application/x-bondsymphonic-workspace";
 
 private:
     /// Re-derives the band fill and the muted captions from the palette the
@@ -76,6 +84,16 @@ private:
     QJsonArray displayedTabsJson() const;
     void onGroupCurrentChanged(int index);
     void onAgentCurrentChanged(int index);
+    /// Dragging a tab along its own row reorders it. The bars are movable and
+    /// already show the new order; these make the model agree.
+    void onAgentTabMoved(int from, int to);
+    void onGroupTabMoved(int from, int to);
+    /// An agent tab pulled up or down out of its row: ends the row's own move
+    /// and starts a drag the group tabs can take.
+    void startGroupDrag();
+    /// The group a drag over the group row at `pos` would land in, or -1 for
+    /// one it cannot (no tab there, or the group the agent is already in).
+    int dropGroupAt(const QPoint& pos) const;
     /// The two context-menu slots. All they do is turn the click into a tab or
     /// group index and a screen position and hand both on, so that the two
     /// below can be opened over a named index by something that is not a mouse
@@ -136,6 +154,13 @@ private:
     /// Set while `rebuild()` writes into the tab bars, so the `currentChanged`
     /// signals it provokes are not read back as user clicks.
     bool m_rebuilding = false;
+    /// The agent tab under the last left press, by workspace id rather than
+    /// index because the row may reorder under the drag. Empty when no press is in progress.
+    QString m_dragWorkspaceId;
+    QPoint m_dragPressPos;
+    /// The group tab a dragged agent is over, painted as the current one, or
+    /// -1.
+    int m_dropHover = -1;
     /// The steps `BS_MENU_TEST` asks for, empty in every ordinary run.
     QStringList m_menuTestSteps;
     /// Whether [`runMenuTests`] has already been scheduled.

@@ -643,6 +643,8 @@ private:
     /// Workspace > Fetch from origin; see `AppController::fetchWorkspace`.
     QAction* m_fetchAction = nullptr;
     QAction* m_networkRulesAction = nullptr;
+    /// Workspace › Set task…, for the active workspace.
+    QAction* m_setTaskAction = nullptr;
     QPointer<QDialog> m_networkRulesDialog;
     /// Workspace > MCP servers…, shown only when the daemon offers them.
     QAction* m_mcpServersAction = nullptr;

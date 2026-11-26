@@ -51,7 +51,7 @@ async fn a_workspace_serves_its_tools_on_its_run_dir_socket_until_destroyed() {
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
     )
     .await;
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 8);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 9);
     let fetched = rpc(
         &mut lines,
         &mut w,

@@ -79,6 +79,17 @@ pub struct GhOutput {
 /// Runs `gh <args>` in `cwd`. `describe` is what an error names: the
 /// subcommand, never the agent's or the user's prose.
 pub async fn run_gh(cwd: &Path, args: &[String], describe: &str) -> Result<GhOutput, RpcError> {
+    run_gh_within(cwd, args, describe, GH_TIMEOUT).await
+}
+
+/// [`run_gh`] with a time limit of the caller's: a clone of a large
+/// repository takes longer than any other `gh` call the daemon makes.
+pub async fn run_gh_within(
+    cwd: &Path,
+    args: &[String],
+    describe: &str,
+    limit: Duration,
+) -> Result<GhOutput, RpcError> {
     let mut argv = gh_argv()?;
     let program = argv.remove(0);
     argv.extend(args.iter().cloned());
@@ -93,7 +104,7 @@ pub async fn run_gh(cwd: &Path, args: &[String], describe: &str) -> Result<GhOut
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let out = match tokio::time::timeout(GH_TIMEOUT, cmd.output()).await {
+    let out = match tokio::time::timeout(limit, cmd.output()).await {
         Ok(Ok(o)) => o,
         // Worded so a caller can tell "could not start gh at all" (above all:
         // not installed) from a `gh` that ran and failed: see
@@ -109,7 +120,7 @@ pub async fn run_gh(cwd: &Path, args: &[String], describe: &str) -> Result<GhOut
             return Err(git_error(
                 describe,
                 None,
-                &format!("timed out after {}s", GH_TIMEOUT.as_secs()),
+                &format!("timed out after {}s", limit.as_secs()),
             ))
         }
     };
