@@ -35,6 +35,7 @@
 #include <QCloseEvent>
 #include <QDesktopServices>
 #include <QDockWidget>
+#include <QFont>
 #include <QEvent>
 #include <QInputDialog>
 #include <QJsonArray>
@@ -815,9 +816,30 @@ void MainWindow::buildDocks() {
     // who wants the whole width for the code.
     m_agentDock = new QDockWidget("Agent", this);
     m_agentDock->setObjectName("AgentDock");
-    m_agentArea = new AgentArea(m_agentDock);
+    // The pane under a strip naming the agent's task, so what it is doing is
+    // the first thing read in it. The strip is hidden while there is no task.
+    auto* agentPane = new QWidget(m_agentDock);
+    auto* agentLayout = new QVBoxLayout(agentPane);
+    agentLayout->setContentsMargins(0, 0, 0, 0);
+    agentLayout->setSpacing(0);
+    m_agentTaskLabel = new QLabel(agentPane);
+    m_agentTaskLabel->setObjectName(QStringLiteral("AgentTaskLabel"));
+    // The agent wrote it: text, never markup.
+    m_agentTaskLabel->setTextFormat(Qt::PlainText);
+    m_agentTaskLabel->setWordWrap(true);
+    m_agentTaskLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_agentTaskLabel->setContentsMargins(8, 4, 8, 4);
+    m_agentTaskLabel->setToolTip(QStringLiteral("What the agent is working on. It keeps this up "
+                                                "to date; Workspace > Set task… changes it."));
+    QFont taskFont = m_agentTaskLabel->font();
+    taskFont.setBold(true);
+    m_agentTaskLabel->setFont(taskFont);
+    m_agentTaskLabel->hide();
+    agentLayout->addWidget(m_agentTaskLabel);
+    m_agentArea = new AgentArea(agentPane);
     m_agentArea->setPlaceholderText("No agent selected");
-    m_agentDock->setWidget(m_agentArea);
+    agentLayout->addWidget(m_agentArea, 1);
+    m_agentDock->setWidget(agentPane);
     addDockWidget(Qt::RightDockWidgetArea, m_agentDock);
 
     m_bottomDock = new QDockWidget("Output", this);
@@ -3295,6 +3317,9 @@ void MainWindow::updateWindowTitle(const QJsonObject& active) {
         agentTitle = agentTitle.arg(backend, active.value("name").toString());
     }
     m_agentDock->setWindowTitle(agentTitle);
+    const QString task = active.value("task").toString().trimmed();
+    m_agentTaskLabel->setText(task);
+    m_agentTaskLabel->setVisible(!task.isEmpty());
     const QString name = active.value("name").toString();
     if (name.isEmpty()) {
         setWindowTitle(QStringLiteral("BondSymphonic"));
@@ -3993,6 +4018,27 @@ extern "C" std::int32_t bs_widget_test_agent_title_follows_selected_tab() {
     if (dock->windowTitle() != title(QStringLiteral("Codex"), QStringLiteral("Fix login"))) { return 4; }
     auto* tabs = fixture.window.findChild<QTabBar*>(QStringLiteral("GroupBarAgentTabs"));
     if (tabs == nullptr || !tabs->tabText(1).contains(QLatin1String("Fix login"))) { return 8; }
+    // The task: a second line on the tab, and the strip atop the agent pane.
+    auto* taskLabel = fixture.window.findChild<QLabel*>(QStringLiteral("AgentTaskLabel"));
+    if (taskLabel == nullptr || !taskLabel->isHidden()) { return 9; }
+    const QJsonObject withTask{
+        {"id", "ws_beta"}, {"name", "beta"}, {"repo_path", "/repo"}, {"base_branch", "main"},
+        {"branch", "bs/test"}, {"worktree_path", "/worktree"}, {"created_at", "now"},
+        {"allowlist", QJsonArray{}}, {"state", "ready"}, {"agents", QJsonArray{}},
+        {"runs", QJsonArray{}}, {"task", "Fixing the <b>login</b> redirect"}
+    };
+    if (!fixture.groupModel.applyWorkspaceInfo(QString::fromUtf8(QJsonDocument(withTask).toJson()))) {
+        return 10;
+    }
+    if (taskLabel->isHidden() || taskLabel->text() != QLatin1String("Fixing the <b>login</b> redirect") ||
+        taskLabel->textFormat() != Qt::PlainText) { return 11; }
+    const QStringList lines = tabs->tabText(1).split(QLatin1Char('\n'));
+    if (lines.size() != 2 || !lines.at(0).contains(QLatin1String("Fix login")) ||
+        !lines.at(1).startsWith(QLatin1String("Fixing"))) { return 12; }
+    // The other tab has none, and selecting it hides the strip.
+    if (tabs->tabText(0).contains(QLatin1Char('\n'))) { return 13; }
+    fixture.groupModel.setActive(0, 0);
+    if (!taskLabel->isHidden()) { return 14; }
     fixture.groupModel.removeWorkspace(QStringLiteral("ws_alpha"));
     fixture.groupModel.removeWorkspace(QStringLiteral("ws_beta"));
     if (dock->windowTitle() != QLatin1String("Agent")) { return 5; }

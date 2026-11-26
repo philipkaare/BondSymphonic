@@ -10,6 +10,7 @@
 #include <QCoreApplication>
 #include <QEvent>
 #include <QFont>
+#include <QFontMetrics>
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QDialogButtonBox>
@@ -34,6 +35,7 @@
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
+#include <algorithm>
 
 namespace {
 
@@ -78,6 +80,9 @@ QString separator() {
 
 /// U+25CF, the black circle, at the head of an agent tab. It is painted in the
 /// tab's text colour, which is the one `statusColour` gives the status.
+/// The narrowest a task line under an agent's title is cut to, in pixels.
+constexpr int kMinTaskWidth = 160;
+
 QString statusDot() {
     return QString(QChar(0x25CF));
 }
@@ -321,6 +326,15 @@ void GroupBar::rebuild() {
         // the branch is spelled out beside the name.
         if (!tabJson.value(QStringLiteral("attention")).toString().isEmpty()) {
             label += attentionDot();
+        }
+        // The agent's task on a second line under its title, cut to the
+        // title's width (but never narrower than a few words) so a long task
+        // does not stretch the tab.
+        const QString task = tabJson.value(QStringLiteral("task")).toString().trimmed();
+        if (!task.isEmpty()) {
+            const QFontMetrics metrics(m_agentTabs->font());
+            const int width = std::max(metrics.horizontalAdvance(label), kMinTaskWidth);
+            label += QLatin1Char('\n') + metrics.elidedText(task, Qt::ElideRight, width);
         }
         m_agentTabs->setTabText(i, label);
         m_agentTabs->setTabToolTip(i, m_model->tabTooltip(m_displayGroup, i));

@@ -663,6 +663,8 @@ private:
     QDockWidget* m_agentDock = nullptr;
     /// The per-workspace agent pane inside it.
     AgentArea* m_agentArea = nullptr;
+    /// Above the agent pane: the active workspace's task, hidden without one.
+    QLabel* m_agentTaskLabel = nullptr;
     /// The bottom dock, holding the Run and Terminal tabs. A member rather than
     /// a local in `buildDocks` because the Window menu and `resetLayout` both
     /// have to reach it.
