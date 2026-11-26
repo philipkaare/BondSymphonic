@@ -22,6 +22,9 @@
 //! repository: the main object store is read-only in the sandbox, so a commit
 //! routed the plain way fails instead. The shim is about git working, not
 //! about what the sandbox allows.
+//!
+//! The shim also keeps the worktree's *common-directory view* current; see
+//! [`refresh_common_view`].
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
@@ -41,6 +44,14 @@ pub const ALTERNATES_ENV: &str = "BS_GIT_ALTERNATE_OBJECT_DIRECTORIES";
 pub const PREFIX_ENV: &str = "BS_GIT_BRANCH_PREFIX";
 /// The branch the workspace was created with, which is never deleted.
 pub const BRANCH_ENV: &str = "BS_GIT_WORKSPACE_BRANCH";
+/// The shared `.git` itself, when [`COMMON_ENV`] names its view.
+pub const REAL_COMMON_ENV: &str = "BS_GIT_REAL_COMMON_DIR";
+
+/// The view's name inside the worktree's own git directory.
+pub const COMMON_VIEW: &str = "bs-common-view";
+/// Beside the view's copy of `packed-refs`: what it was copied from, and what
+/// the copy was, so a change to either is seen.
+const PACKED_STAMP: &str = ".bs-packed-refs-stamp";
 
 const GIT_OBJECTS: &str = "GIT_OBJECT_DIRECTORY";
 const GIT_ALTERNATES: &str = "GIT_ALTERNATE_OBJECT_DIRECTORIES";
@@ -84,6 +95,25 @@ pub fn run() -> ! {
     // same way, like every other.
     cmd.env_remove(GIT_OBJECTS).env_remove(GIT_ALTERNATES);
     if let Some((objects, alternates)) = routing(&real, &args) {
+        // Before anything reads it: `packed-refs` as the host has it now.
+        if let (Some(view), Some(shared)) = (
+            std::env::var_os(COMMON_ENV),
+            std::env::var_os(REAL_COMMON_ENV),
+        ) {
+            if let Err(e) = refresh_common_view(Path::new(&shared), Path::new(&view)) {
+                eprintln!("git (BondSymphonic shim): could not refresh the repository view: {e}");
+            }
+        }
+        // Packing refs would write the view's private `packed-refs` and
+        // delete the loose refs it packed -- the agent's own branches among
+        // them -- for good, since the next refresh puts the host's back.
+        if split_globals(&args).1.and_then(|c| c.to_str()) == Some("pack-refs") {
+            eprintln!(
+                "error: git pack-refs is not available in this sandbox: the repository's \
+                 shared refs are read-only here"
+            );
+            std::process::exit(1);
+        }
         // Deleting one of the workspace's own branches is done here: git
         // insists on locking the shared `packed-refs` for every deletion, and
         // that file is read-only in the sandbox even when the branch is not.
@@ -98,6 +128,8 @@ pub fn run() -> ! {
         let mut routed = Command::new(&real);
         routed
             .args(["-c", "branch.autoSetupMerge=false"])
+            // `gc --auto` behind a commit packs refs too; see above.
+            .args(["-c", "gc.packRefs=false"])
             .args(&args)
             .env_remove(GIT_OBJECTS)
             .env_remove(GIT_ALTERNATES)
@@ -244,6 +276,96 @@ fn delete_own_branches(
         println!("Deleted branch {name} (was {short}).");
     }
     code
+}
+
+/// Brings the worktree's view of the shared `.git` up to date.
+///
+/// In a worktree workspace's sandbox the worktree's `commondir` names this
+/// view rather than the shared `.git` (the daemon binds a file of its own over
+/// it, read-only). The view is a directory of symlinks to every entry of the
+/// shared `.git`, so refs, objects, config and the rest are read -- and, where
+/// the sandbox allows, written -- exactly as before: a write that replaces a
+/// file through git's lock (`config`) follows the link and fails on the
+/// read-only original, as it always did.
+///
+/// What it changes is `packed-refs`, which is a *copy*, refreshed here before
+/// every command. Git before 2.48 locks `packed-refs` to delete any ref, the
+/// worktree's own `CHERRY_PICK_HEAD`, `REVERT_HEAD` and `AUTO_MERGE` included,
+/// and takes the lock beside the file it resolves `packed-refs` to; in the
+/// read-only shared `.git` it could not, and a cherry-pick committed but left
+/// `CHERRY_PICK_HEAD` behind and refused every later one. Here the lock is
+/// taken in the view, the root ref is found not to be packed -- root refs
+/// never are -- and the lock is let go. Anything git does write into the
+/// view's copy is the sandbox's own and is replaced by the host's on the next
+/// refresh; the host never reads the view.
+pub fn refresh_common_view(shared: &Path, view: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(view)?;
+    for entry in std::fs::read_dir(shared)? {
+        let name = entry?.file_name();
+        let text = name.to_string_lossy();
+        // A lock the host holds is the host's, and `packed-refs` is copied.
+        if text.ends_with(".lock") || text == "packed-refs" {
+            continue;
+        }
+        let link = view.join(&name);
+        let target = shared.join(&name);
+        match std::fs::symlink_metadata(&link) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if std::fs::read_link(&link)? == target {
+                    continue;
+                }
+                std::fs::remove_file(&link)?;
+            }
+            // Something the sandbox put in its place: the view is not its to
+            // keep, and nothing outside the sandbox reads it.
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&link)?,
+            Ok(_) => std::fs::remove_file(&link)?,
+            Err(_) => {}
+        }
+        match std::os::unix::fs::symlink(&target, &link) {
+            // Another command refreshing at the same moment.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            other => other?,
+        }
+    }
+    refresh_packed_refs(&shared.join("packed-refs"), &view.join("packed-refs"))
+}
+
+/// The view's `packed-refs` as a copy of the host's, or absent with it.
+fn refresh_packed_refs(source: &Path, copy: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let stamp_file = copy.with_file_name(PACKED_STAMP);
+    let stamp = |meta: &std::fs::Metadata| {
+        format!(
+            "{} {} {} {}.{}",
+            meta.dev(),
+            meta.ino(),
+            meta.size(),
+            meta.mtime(),
+            meta.mtime_nsec()
+        )
+    };
+    let Ok(source_meta) = std::fs::metadata(source) else {
+        let _ = std::fs::remove_file(copy);
+        let _ = std::fs::remove_file(&stamp_file);
+        return Ok(());
+    };
+    let wanted = stamp(&source_meta);
+    if let (Ok(recorded), Ok(copy_meta)) = (
+        std::fs::read_to_string(&stamp_file),
+        std::fs::symlink_metadata(copy),
+    ) {
+        if recorded == format!("{wanted}\n{}", stamp(&copy_meta)) {
+            return Ok(());
+        }
+    }
+    // Into place by rename, so a git reading it meanwhile sees one or the
+    // other whole.
+    let partial = copy.with_file_name(format!("packed-refs.bs-{}", std::process::id()));
+    std::fs::copy(source, &partial)?;
+    std::fs::rename(&partial, copy)?;
+    let copy_meta = std::fs::symlink_metadata(copy)?;
+    std::fs::write(&stamp_file, format!("{wanted}\n{}", stamp(&copy_meta)))
 }
 
 /// Whether `name` is under `prefix` with a name of its own, and nothing in it
@@ -399,6 +521,64 @@ mod tests {
         assert!(!set_elsewhere(ours, ours));
         assert!(set_elsewhere(Some(OsStr::new("/tmp/quarantine")), ours));
         assert!(set_elsewhere(Some(OsStr::new("/tmp/x")), None));
+    }
+
+    /// The view links every entry of the shared `.git` but its locks, copies
+    /// `packed-refs` and follows the host's changes to it, and undoes what the
+    /// sandbox put in place of a link or of the copy.
+    #[test]
+    fn the_common_view_links_the_shared_git_directory_and_copies_packed_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("repo.git");
+        let view = shared.join("worktrees/ws_1").join(COMMON_VIEW);
+        std::fs::create_dir_all(shared.join("refs/heads")).unwrap();
+        std::fs::create_dir_all(shared.join("worktrees/ws_1")).unwrap();
+        std::fs::write(shared.join("config"), "").unwrap();
+        std::fs::write(shared.join("index.lock"), "").unwrap();
+
+        refresh_common_view(&shared, &view).unwrap();
+        for name in ["config", "refs", "worktrees"] {
+            assert_eq!(
+                std::fs::read_link(view.join(name)).unwrap(),
+                shared.join(name),
+                "{name}"
+            );
+        }
+        assert!(std::fs::symlink_metadata(view.join("index.lock")).is_err());
+        assert!(!view.join("packed-refs").exists(), "none to copy yet");
+
+        // The host packs its refs: the view gets a copy, not a link.
+        std::fs::write(shared.join("packed-refs"), "one\n").unwrap();
+        refresh_common_view(&shared, &view).unwrap();
+        let copy = view.join("packed-refs");
+        assert!(!std::fs::symlink_metadata(&copy)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "one\n");
+
+        // The host rewrites it, by rename as git does.
+        std::fs::write(shared.join("packed-refs.new"), "two\n").unwrap();
+        std::fs::rename(shared.join("packed-refs.new"), shared.join("packed-refs")).unwrap();
+        refresh_common_view(&shared, &view).unwrap();
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "two\n");
+
+        // Git in the sandbox rewrote the copy, and replaced a link.
+        std::fs::write(view.join("packed-refs.tmp"), "mine\n").unwrap();
+        std::fs::rename(view.join("packed-refs.tmp"), &copy).unwrap();
+        std::fs::remove_file(view.join("config")).unwrap();
+        std::fs::write(view.join("config"), "[core]\n").unwrap();
+        refresh_common_view(&shared, &view).unwrap();
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "two\n");
+        assert_eq!(
+            std::fs::read_link(view.join("config")).unwrap(),
+            shared.join("config")
+        );
+
+        // The host's goes, and so does the copy.
+        std::fs::remove_file(shared.join("packed-refs")).unwrap();
+        refresh_common_view(&shared, &view).unwrap();
+        assert!(!copy.exists());
     }
 
     #[test]

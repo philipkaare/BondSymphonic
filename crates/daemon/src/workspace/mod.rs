@@ -122,6 +122,12 @@ impl DataDirs {
     pub fn in_place_record(&self, id: &WorkspaceId) -> PathBuf {
         self.root.join("in-place").join(format!("{id}.created"))
     }
+    /// The `commondir` a worktree workspace's sandbox reads in place of its
+    /// worktree's own, read-only: it names the worktree's common-directory
+    /// view. Under the data root, which no sandbox can write.
+    pub fn sandbox_commondir(&self, id: &WorkspaceId) -> PathBuf {
+        self.root.join("git-views").join(format!("{id}.commondir"))
+    }
     /// Where a merge puts its scratch checkout of the base branch when the
     /// user's own checkout is on some other branch.
     ///
@@ -186,6 +192,7 @@ impl DataDirs {
         ] {
             let _ = std::fs::remove_dir_all(p);
         }
+        let _ = std::fs::remove_file(self.sandbox_commondir(id));
     }
 }
 

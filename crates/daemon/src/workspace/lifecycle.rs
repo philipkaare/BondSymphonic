@@ -3,7 +3,7 @@
 
 use crate::daemon::Daemon;
 use crate::git::{
-    repo,
+    path_arg, repo,
     worktree::{self, Layout},
 };
 use crate::ids::new_id;
@@ -136,13 +136,26 @@ pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
     rw_binds.extend(layout.rw_git_paths().iter().map(|p| same(p)));
     // Read-only *after* the read-write bind of its parent gitdir, or the parent
     // would put the writable original straight back on top of it.
-    let late_ro_binds = vec![same(&layout.config_worktree())];
+    let mut late_ro_binds = vec![same(&layout.config_worktree())];
     // Under bubblewrap `git` is the shim, which routes only the workspace's
     // own repository to the private objects. Elsewhere there is no shim to
     // read the routing, so git is told directly, for every repository.
     #[cfg(unix)]
     let git_env = if d.backend.name() == BWRAP_BACKEND {
-        layout.sandbox_git_routing_env()
+        // The worktree's common directory, as the sandbox sees it, is a view
+        // of the shared `.git` its git can take a ref lock in. Without one the
+        // sandbox runs as it did before the view existed.
+        let viewed = match prepare_common_view(d, ws, layout) {
+            Ok(commondir) => {
+                late_ro_binds.push((commondir, layout.commondir_file()));
+                true
+            }
+            Err(e) => {
+                tracing::warn!(ws = %ws.id, "no common-directory view for the sandbox: {e}");
+                false
+            }
+        };
+        layout.sandbox_git_routing_env(viewed)
     } else {
         layout.sandbox_git_env()
     };
@@ -156,6 +169,26 @@ pub fn spec_for(d: &Daemon, ws: &Workspace, layout: &Layout) -> SandboxSpec {
         late_ro_binds,
         git_env,
     )
+}
+
+/// Builds the worktree's view of the shared `.git`
+/// ([`crate::sandbox::git_shim::refresh_common_view`]) and the daemon-owned
+/// `commondir` naming it, which the sandbox gets read-only over the
+/// worktree's own. Returns that file.
+///
+/// Read-only also keeps the agent from pointing the worktree at another
+/// common directory: git on the host, run by the daemon in this worktree,
+/// reads the worktree's real `commondir`, and a repository of the agent's
+/// choosing is a config of the agent's choosing.
+#[cfg(unix)]
+fn prepare_common_view(d: &Daemon, ws: &Workspace, layout: &Layout) -> std::io::Result<PathBuf> {
+    crate::sandbox::git_shim::refresh_common_view(&layout.git_common, &layout.common_view())?;
+    let file = d.dirs.sandbox_commondir(&ws.id);
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&file, format!("{}\n", path_arg(&layout.common_view())))?;
+    Ok(file)
 }
 
 /// The sandbox of an in-place workspace: the checkout and its `.git`
